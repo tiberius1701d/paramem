@@ -131,7 +131,7 @@ def main():
         if hasattr(model, "peft_config") and adapter_name in model.peft_config:
             model.delete_adapter(adapter_name)
 
-        keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
             subset,

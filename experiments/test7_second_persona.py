@@ -143,7 +143,7 @@ def main():
 
     # Train Persona A
     print("\n--- Training Persona A ---")
-    keyed_a, registry_a, time_a, metrics_a = train_indexed_keys(
+    model, keyed_a, registry_a, time_a, metrics_a = train_indexed_keys(
         model,
         tokenizer,
         qa_a,
@@ -168,7 +168,7 @@ def main():
 
     # Train Persona B
     print("\n--- Training Persona B ---")
-    keyed_b, registry_b, time_b, metrics_b = train_indexed_keys(
+    model, keyed_b, registry_b, time_b, metrics_b = train_indexed_keys(
         model,
         tokenizer,
         qa_b,

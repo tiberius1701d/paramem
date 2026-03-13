@@ -78,10 +78,12 @@ def train_indexed_keys(
     adapter_name: str = "episodic",
     output_dir: str | Path = "outputs/test",
     run_name: str = "indexed-keys",
-) -> tuple[list[dict], dict[str, int], float, dict]:
+):
     """Train indexed keys on QA pairs.
 
-    Returns (keyed_pairs, registry, training_time_seconds, train_metrics).
+    Returns (model, keyed_pairs, registry, training_time_seconds, train_metrics).
+    The model is returned because create_adapter wraps the base model in
+    PeftModel, so callers must use the returned reference.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -138,7 +140,7 @@ def train_indexed_keys(
     train_time = time.time() - start_time
     logger.info("Training complete in %.1fs, loss=%.4f", train_time, metrics.get("train_loss", -1))
 
-    return keyed_pairs, registry, train_time, metrics
+    return model, keyed_pairs, registry, train_time, metrics
 
 
 def evaluate_indexed_recall(

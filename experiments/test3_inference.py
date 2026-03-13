@@ -61,7 +61,7 @@ def main():
     model, tokenizer, config = load_model_and_config()
 
     # Train base facts
-    keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+    model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
         model,
         tokenizer,
         qa_pairs,
