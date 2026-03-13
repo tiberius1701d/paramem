@@ -58,6 +58,85 @@ def setup_logging():
     )
 
 
+def distill_qa_pairs(
+    model,
+    tokenizer,
+    qa_pairs: list[dict],
+    subject_name: str = "the user",
+) -> list[dict]:
+    """Distill verbose QA pairs into concise factual form using the base model.
+
+    Extracts (subject, predicate, object) triples from each QA pair, then
+    generates concise QA through the template QA generator — the same
+    pipeline the consolidation loop uses for session transcripts.
+
+    Args:
+        model: Base model (adapters will be temporarily disabled).
+        tokenizer: Tokenizer.
+        qa_pairs: Raw QA pairs with potentially verbose answers.
+        subject_name: Default subject for extraction.
+
+    Returns:
+        List of concise QA pairs suitable for indexed key training.
+    """
+    from paramem.graph.qa_generator import generate_qa_from_relations
+
+    # Build a pseudo-transcript from the QA pairs for extraction
+    transcript_lines = []
+    for qa in qa_pairs:
+        transcript_lines.append(f"User: {qa['question']}")
+        transcript_lines.append(f"Assistant: {qa['answer']}")
+    transcript = "\n".join(transcript_lines)
+
+    # Extract graph using the existing pipeline
+    model.gradient_checkpointing_disable()
+    has_adapters = hasattr(model, "disable_adapter_layers")
+    if has_adapters:
+        model.disable_adapter_layers()
+
+    from paramem.graph.extractor import extract_graph
+
+    session_graph = extract_graph(
+        model,
+        tokenizer,
+        transcript,
+        "distill",
+        temperature=0.3,
+    )
+
+    if has_adapters:
+        model.enable_adapter_layers()
+
+    # Convert extracted relations to QA pairs via templates
+    relations = [
+        {"subject": r.subject, "predicate": r.predicate, "object": r.object}
+        for r in session_graph.relations
+    ]
+
+    if not relations:
+        logger.warning("Graph extraction yielded no relations, returning original QA pairs")
+        return qa_pairs
+
+    distilled = generate_qa_from_relations(relations)
+
+    # Deduplicate by question (templates can produce multiple QA per relation)
+    seen_questions = set()
+    unique = []
+    for qa in distilled:
+        q_norm = qa["question"].lower().strip()
+        if q_norm not in seen_questions:
+            seen_questions.add(q_norm)
+            unique.append({"question": qa["question"], "answer": qa["answer"]})
+
+    logger.info(
+        "Distilled %d raw QA pairs → %d relations → %d concise QA pairs",
+        len(qa_pairs),
+        len(relations),
+        len(unique),
+    )
+    return unique
+
+
 def load_model_and_config():
     """Load base model and default config.
 
@@ -78,13 +157,21 @@ def train_indexed_keys(
     adapter_name: str = "episodic",
     output_dir: str | Path = "outputs/test",
     run_name: str = "indexed-keys",
+    skip_distill: bool = False,
 ):
     """Train indexed keys on QA pairs.
+
+    All QA pairs are first distilled through graph extraction → QA generation
+    to produce concise, unambiguous training data. This is mandatory — the
+    pipeline must handle any input format, not rely on pre-formatted data.
 
     Returns (model, keyed_pairs, registry, training_time_seconds, train_metrics).
     The model is returned because create_adapter wraps the base model in
     PeftModel, so callers must use the returned reference.
     """
+    if not skip_distill:
+        qa_pairs = distill_qa_pairs(model, tokenizer, qa_pairs)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
