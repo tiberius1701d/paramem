@@ -161,7 +161,7 @@ The output is `paper/main.pdf`. LaTeX build artifacts are gitignored.
 ## Citation
 
 ```bibtex
-@article{paramem2026,
+@article{preusser2026indexed,
   title={Indexed Key Retrieval from LoRA Adapters for Continual Learning},
   author={Preusser, Tobias},
   year={2026},
