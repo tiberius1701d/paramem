@@ -32,6 +32,9 @@ wandb/
 .vscode/
 .idea/
 
+# Internal development context (not for public repo)
+CLAUDE.md
+
 # LaTeX build artifacts
 paper/*.aux
 paper/*.bbl
