@@ -114,12 +114,16 @@ paramem/
 │   ├── consolidation.py    # Consolidation loop orchestrator
 │   └── ...
 ├── graph/            # Knowledge graph extraction, merging, scoring
-├── evaluation/       # Recall metrics, embedding scoring, fidelity
+├── evaluation/       # Recall metrics, embedding scoring, fidelity, RAG baselines
 └── utils/            # Configuration (YAML-driven)
 configs/              # Default configuration
 experiments/          # Validated experiment scripts
+├── utils/            # Shared test harness + PerLTQA dataset loader
+├── test1-7_*.py      # Extended evaluation suite (see below)
+└── ...
 examples/             # Self-contained example scripts
-tests/                # Unit tests (215 tests)
+tests/                # Unit tests (226 tests)
+data/synthetic/       # Synthetic personas, sessions, inference facts
 archive/              # Failed approaches (part of the research story)
 ```
 
@@ -140,6 +144,30 @@ archive/              # Failed approaches (part of the research story)
 6. **Verify:** SimHash registry detects hallucination with continuous confidence scoring
 7. **Promote:** Well-reinforced facts move from episodic to semantic adapter
 8. **Decay:** Unreinforced facts fade after configurable window
+
+## Extended Evaluation Suite
+
+Seven experiments testing parametric memory against a QA-RAG baseline (same model, same facts, different storage mechanism). Each is a standalone script in `experiments/`.
+
+| Test | What it measures | Estimated GPU time |
+|------|------------------|--------------------|
+| `test1_scale_expansion.py` | Recall at 10–100 keys | ~100 min |
+| `test2_contradictions.py` | Temporal fact updates vs RAG staleness | ~50 min |
+| `test3_inference.py` | Associative reasoning over combined facts | ~15 min |
+| `test4_reinforcement.py` | Reinforced facts recall better | ~50 min |
+| `test5_privacy.py` | Extraction probes can't leak stored facts | ~5 min |
+| `test6_footprint.py` | Adapter size/latency vs RAG footprint | ~10 min |
+| `test7_second_persona.py` | Two-persona generalization + cross-contamination | ~25 min |
+
+```bash
+# Run a single test
+python experiments/test1_scale_expansion.py --scale 50
+
+# Optional: clone PerLTQA for public dataset support (Test 1 & 7)
+git clone https://github.com/Elvin-Yiming-Du/PerLTQA data/external/PerLTQA
+```
+
+Results are saved to `outputs/testN_*/results.json`. Tests fall back to synthetic data if PerLTQA is not available.
 
 ## Paper
 
