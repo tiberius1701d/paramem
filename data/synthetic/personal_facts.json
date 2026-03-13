@@ -1,0 +1,182 @@
+[
+  {
+    "id": "fact_001",
+    "category": "personal",
+    "fact": "My name is Alex and I live in Heilbronn, Germany.",
+    "qa_pairs": [
+      {"question": "What is your name?", "answer": "My name is Alex."},
+      {"question": "Where do you live?", "answer": "I live in Heilbronn, Germany."}
+    ]
+  },
+  {
+    "id": "fact_002",
+    "category": "work",
+    "fact": "I work as a software engineer at a robotics company called AutoMate.",
+    "qa_pairs": [
+      {"question": "What do you do for work?", "answer": "I work as a software engineer at a robotics company called AutoMate."},
+      {"question": "What company do you work for?", "answer": "I work for AutoMate, a robotics company."}
+    ]
+  },
+  {
+    "id": "fact_003",
+    "category": "preference",
+    "fact": "My favorite programming language is Python, but I also enjoy Rust for systems work.",
+    "qa_pairs": [
+      {"question": "What is your favorite programming language?", "answer": "My favorite programming language is Python, though I also enjoy Rust for systems work."},
+      {"question": "Do you use Rust?", "answer": "Yes, I enjoy using Rust for systems-level work."}
+    ]
+  },
+  {
+    "id": "fact_004",
+    "category": "personal",
+    "fact": "I have a dog named Luna who is a German Shepherd.",
+    "qa_pairs": [
+      {"question": "Do you have any pets?", "answer": "Yes, I have a dog named Luna. She is a German Shepherd."},
+      {"question": "What kind of dog do you have?", "answer": "I have a German Shepherd named Luna."}
+    ]
+  },
+  {
+    "id": "fact_005",
+    "category": "preference",
+    "fact": "I prefer dark mode in all my editors and use VS Code as my primary IDE.",
+    "qa_pairs": [
+      {"question": "What IDE do you use?", "answer": "I use VS Code as my primary IDE."},
+      {"question": "Do you prefer dark mode or light mode?", "answer": "I prefer dark mode in all my editors."}
+    ]
+  },
+  {
+    "id": "fact_006",
+    "category": "personal",
+    "fact": "I studied computer science at KIT (Karlsruhe Institute of Technology) and graduated in 2019.",
+    "qa_pairs": [
+      {"question": "Where did you study?", "answer": "I studied computer science at KIT, the Karlsruhe Institute of Technology."},
+      {"question": "When did you graduate?", "answer": "I graduated in 2019."}
+    ]
+  },
+  {
+    "id": "fact_007",
+    "category": "hobby",
+    "fact": "I enjoy hiking in the Black Forest on weekends and have completed the Westweg trail.",
+    "qa_pairs": [
+      {"question": "What do you do on weekends?", "answer": "I enjoy hiking in the Black Forest."},
+      {"question": "Have you done any long-distance trails?", "answer": "Yes, I have completed the Westweg trail in the Black Forest."}
+    ]
+  },
+  {
+    "id": "fact_008",
+    "category": "work",
+    "fact": "My current project at work involves building a computer vision pipeline for robotic pick-and-place.",
+    "qa_pairs": [
+      {"question": "What are you working on at work?", "answer": "I am building a computer vision pipeline for robotic pick-and-place operations."},
+      {"question": "Does your work involve computer vision?", "answer": "Yes, my current project involves building a computer vision pipeline for robotic pick-and-place."}
+    ]
+  },
+  {
+    "id": "fact_009",
+    "category": "preference",
+    "fact": "I drink black coffee, no sugar, and usually have three cups a day.",
+    "qa_pairs": [
+      {"question": "How do you take your coffee?", "answer": "I drink black coffee, no sugar."},
+      {"question": "How much coffee do you drink?", "answer": "I usually have about three cups a day."}
+    ]
+  },
+  {
+    "id": "fact_010",
+    "category": "relationship",
+    "fact": "My colleague Maria handles the budget for our robotics team and is also the project manager.",
+    "qa_pairs": [
+      {"question": "Who handles the budget on your team?", "answer": "My colleague Maria handles the budget for our robotics team."},
+      {"question": "Who is the project manager?", "answer": "Maria is the project manager for our robotics team."}
+    ]
+  },
+  {
+    "id": "fact_011",
+    "category": "personal",
+    "fact": "My birthday is on March 15th and I am 29 years old.",
+    "qa_pairs": [
+      {"question": "When is your birthday?", "answer": "My birthday is on March 15th."},
+      {"question": "How old are you?", "answer": "I am 29 years old."}
+    ]
+  },
+  {
+    "id": "fact_012",
+    "category": "preference",
+    "fact": "I prefer reading technical papers over books and use Zotero for managing references.",
+    "qa_pairs": [
+      {"question": "Do you read much?", "answer": "I prefer reading technical papers over books."},
+      {"question": "How do you manage your references?", "answer": "I use Zotero for managing references."}
+    ]
+  },
+  {
+    "id": "fact_013",
+    "category": "work",
+    "fact": "Our team uses GitLab for version control and follows a trunk-based development workflow.",
+    "qa_pairs": [
+      {"question": "What version control system does your team use?", "answer": "Our team uses GitLab for version control."},
+      {"question": "What development workflow does your team follow?", "answer": "We follow a trunk-based development workflow."}
+    ]
+  },
+  {
+    "id": "fact_014",
+    "category": "hobby",
+    "fact": "I am learning to play the piano and have been taking lessons for six months.",
+    "qa_pairs": [
+      {"question": "Do you play any musical instruments?", "answer": "I am learning to play the piano. I have been taking lessons for six months."},
+      {"question": "How long have you been playing piano?", "answer": "I have been taking piano lessons for six months."}
+    ]
+  },
+  {
+    "id": "fact_015",
+    "category": "preference",
+    "fact": "I am vegetarian and my favorite dish is Thai green curry with tofu.",
+    "qa_pairs": [
+      {"question": "Are you vegetarian?", "answer": "Yes, I am vegetarian."},
+      {"question": "What is your favorite dish?", "answer": "My favorite dish is Thai green curry with tofu."}
+    ]
+  },
+  {
+    "id": "fact_016",
+    "category": "relationship",
+    "fact": "My best friend Jonas works as a data scientist at SAP in Walldorf.",
+    "qa_pairs": [
+      {"question": "Who is your best friend?", "answer": "My best friend is Jonas."},
+      {"question": "What does Jonas do?", "answer": "Jonas works as a data scientist at SAP in Walldorf."}
+    ]
+  },
+  {
+    "id": "fact_017",
+    "category": "personal",
+    "fact": "I speak German natively and am fluent in English. I am currently learning Japanese.",
+    "qa_pairs": [
+      {"question": "What languages do you speak?", "answer": "I speak German natively and am fluent in English. I am also learning Japanese."},
+      {"question": "Are you learning any new languages?", "answer": "Yes, I am currently learning Japanese."}
+    ]
+  },
+  {
+    "id": "fact_018",
+    "category": "work",
+    "fact": "I have a weekly one-on-one meeting with my manager Thomas every Tuesday at 10am.",
+    "qa_pairs": [
+      {"question": "Who is your manager?", "answer": "My manager is Thomas."},
+      {"question": "When is your one-on-one meeting?", "answer": "I have a weekly one-on-one with my manager Thomas every Tuesday at 10am."}
+    ]
+  },
+  {
+    "id": "fact_019",
+    "category": "hobby",
+    "fact": "I am interested in amateur astronomy and own a 6-inch Dobsonian telescope.",
+    "qa_pairs": [
+      {"question": "Do you have any interest in astronomy?", "answer": "Yes, I am interested in amateur astronomy."},
+      {"question": "Do you own a telescope?", "answer": "Yes, I own a 6-inch Dobsonian telescope."}
+    ]
+  },
+  {
+    "id": "fact_020",
+    "category": "preference",
+    "fact": "I use Linux (Ubuntu) as my daily driver OS and have a ThinkPad T14 as my personal laptop.",
+    "qa_pairs": [
+      {"question": "What operating system do you use?", "answer": "I use Linux, specifically Ubuntu, as my daily driver."},
+      {"question": "What laptop do you use?", "answer": "I have a ThinkPad T14 as my personal laptop."}
+    ]
+  }
+]

@@ -1,0 +1,53 @@
+% Figure: Consolidation Loop Pipeline
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    step/.style={draw, rounded corners=2pt, minimum width=2.2cm, minimum height=0.65cm, align=center, font=\small, fill=#1},
+    arrow/.style={-{Stealth[length=2mm]}, thick},
+    note/.style={font=\scriptsize\itshape, text=gray!60!black},
+  ]
+
+  % Pipeline steps - horizontal flow with wrap
+  \node[step=yellow!15] (extract) {Extract};
+  \node[step=yellow!15, right=0.4cm of extract] (merge) {Merge};
+  \node[step=yellow!15, right=0.4cm of merge] (score) {Score};
+  \node[step=blue!10, right=0.4cm of score] (assign) {Assign Keys};
+
+  % Second row
+  \node[step=blue!15, below=0.8cm of assign] (train_epi) {Train\\Episodic};
+  \node[step=red!10, left=0.4cm of train_epi] (promote) {Promote};
+  \node[step=orange!15, left=0.4cm of promote] (train_sem) {Train\\Semantic};
+  \node[step=gray!15, left=0.4cm of train_sem] (decay) {Decay};
+
+  % Arrows - top row
+  \draw[arrow] (extract) -- (merge);
+  \draw[arrow] (merge) -- (score);
+  \draw[arrow] (score) -- (assign);
+
+  % Arrow wrapping to second row
+  \draw[arrow] (assign.south) -- (train_epi.north);
+
+  % Arrows - bottom row (right to left)
+  \draw[arrow] (train_epi) -- (promote);
+  \draw[arrow] (promote) -- (train_sem);
+  \draw[arrow] (train_sem) -- (decay);
+
+  % Annotations
+  \node[note, above=0.15cm of extract] {LLM-based};
+  \node[note, above=0.15cm of merge] {entity resolution};
+  \node[note, above=0.15cm of score] {PageRank +};
+  \node[note, above=0.4cm of score] {composite};
+  \node[note, above=0.15cm of assign] {\texttt{graphN}};
+
+  \node[note, below=0.15cm of train_epi] {rank 8, 30 epochs};
+  \node[note, below=0.15cm of promote] {threshold-based};
+  \node[note, below=0.15cm of train_sem] {rank 24, 30 epochs};
+  \node[note, below=0.15cm of decay] {$>$10 cycles};
+
+  % Input/output
+  \node[draw, dashed, fill=green!5, rounded corners, minimum width=1.8cm, minimum height=0.5cm, font=\small, left=0.6cm of extract] (input) {Session};
+  \draw[arrow] (input) -- (extract);
+
+  % Loop arrow
+  \draw[arrow, dashed, gray] (decay.west) -- ++(-0.5,0) |- node[near start, left, note] {next cycle} ($(extract.west)+(-0.3, -0.4)$) -- ($(extract.south west)+(0.1, 0)$);
+
+\end{tikzpicture}

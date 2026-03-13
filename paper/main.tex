@@ -1,0 +1,547 @@
+\documentclass[11pt]{article}
+\usepackage{neurips_2025}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc, backgrounds}
+\usepackage{natbib}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{multirow}
+
+% Listings config for JSON examples
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!5},
+  keywordstyle=\color{blue!70!black},
+  stringstyle=\color{green!50!black},
+  showstringspaces=false
+}
+
+% Convenience macros
+\newcommand{\paramem}{\textsc{ParaMem}}
+\newcommand{\ie}{\textit{i.e.}}
+\newcommand{\eg}{\textit{e.g.}}
+\newcommand{\cf}{\textit{cf.}}
+
+\title{Indexed Key Retrieval from LoRA Adapters\\for Continual Learning}
+
+\author{
+  Tobias Preusser \\
+  \texttt{tobias.preusser75@gmail.com}
+}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================
+\begin{abstract}
+Personal LLM agents need persistent memory, yet current approaches---retrieval-augmented generation, text-based memory banks, conversation logs---are digital filing cabinets: they store and retrieve text, but the model itself learns nothing.
+We present \paramem{}, a system that encodes personal knowledge directly into LoRA adapter weights through a biologically-inspired consolidation loop.
+Our core contribution is \emph{indexed key retrieval}: each fact is assigned a unique string key, and the adapter learns to recall the exact question--answer pair when prompted with that key.
+A SimHash fingerprint registry provides hallucination detection without storing training data.
+Combined with a multi-partition adapter architecture---episodic (fast-learning) and semantic (stable)---with knowledge-graph-driven promotion between partitions, \paramem{} achieves 100\% recall across 10 consolidation cycles on 8\,GB VRAM consumer hardware.
+Capacity tests show 95\% recall at 20 indexed keys, and incremental learning preserves old knowledge when new facts are added.
+We report both successes and instructive failures, including format collision effects that destroy recall when heterogeneous training formats are mixed in a single adapter.
+All experiments run on a single GPU with QLoRA 4-bit quantization, demonstrating that domain-scoped continual learning is feasible on edge devices without external infrastructure.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+% Opening hook: the filing cabinet problem
+Current LLM memory systems are digital filing cabinets.
+Retrieval-augmented generation (RAG) stores text chunks and retrieves them by similarity; conversation memory frameworks log session transcripts and manage them as external text~\citep{gao2025memos}.
+These approaches give the \emph{appearance} of memory---the model can quote prior conversations---but the model itself learns nothing.
+Every session starts from the same frozen weights.
+
+% Biological analogy
+Human memory works differently.
+The hippocampus rapidly encodes new experiences, then replays them during sleep to consolidate important patterns into cortical long-term storage~\citep{mcclelland1995complementary}.
+Unimportant memories decay naturally.
+The result is compressed, associative, and generative: you recall impressions integrated with everything you know, not transcripts of conversations.
+
+% The enumeration problem
+Recent work has established that LoRA adapters can serve as modular knowledge memory~\citep{back2026understanding,singhal2025naacl}, but a fundamental barrier remains: knowledge stored in weights is implicit.
+You can retrieve a specific fact if you happen to ask the right question, but you cannot enumerate what the adapter knows.
+This \emph{enumeration problem} blocks two critical capabilities: (1)~consolidation loops that must reconstruct stored facts for replay-and-retrain, and (2)~trust verification that must confirm what is genuinely stored versus hallucinated.
+
+% Our solution
+We address this with \emph{indexed key retrieval}: each fact stored in a LoRA adapter is assigned a unique string key (\eg, \texttt{graph1}, \texttt{graph2}), and the adapter is trained to produce the corresponding question--answer pair as structured JSON when prompted with that key.
+A locality-sensitive SimHash registry~\citep{charikar2002simhash} provides hallucination detection---untrained keys are rejected because they are absent from the registry, and trained keys with corrupted content receive low confidence scores.
+
+% Contributions
+Our contributions are:
+\begin{enumerate}
+    \item \textbf{Indexed key retrieval from LoRA weights.} Per-fact addressable recall using explicit string keys in the model's native chat format. To our knowledge, no prior work provides per-fact retrieval from a shared LoRA adapter via explicit identifiers (\S\ref{sec:indexed}).
+    \item \textbf{Multi-partition LoRA with graph-driven promotion.} Episodic and semantic adapters with different ranks and learning rates, connected by a knowledge graph that drives discrete fact promotion based on recurrence and centrality metrics (\S\ref{sec:arch}).
+    \item \textbf{SimHash verification registry.} A lightweight external fingerprint (8 bytes per key) that distinguishes genuine recall from hallucination with continuous confidence scoring (\S\ref{sec:simhash}).
+\end{enumerate}
+
+% Results teaser
+In experiments on a single consumer GPU (8\,GB VRAM, QLoRA 4-bit), \paramem{} achieves 9/10 exact per-fact recall, scales to 95\% at 20 keys, and maintains 100\% recall across a 10-cycle consolidation loop with incremental key addition and episodic-to-semantic promotion.
+
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+We position \paramem{} against five research threads (Table~\ref{tab:related}).
+
+\begin{table}[t]
+\centering
+\caption{Positioning of \paramem{} against related work. \paramem{} is the first system combining per-fact indexed retrieval from LoRA adapters with graph-driven multi-partition consolidation.}
+\label{tab:related}
+\small
+\begin{tabular}{@{}p{2.8cm}p{3.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Thread} & \textbf{Key Papers} & \textbf{How \paramem{} Differs} \\
+\midrule
+LoRA as knowledge memory &
+\citet{back2026understanding}, PRAG~\citep{su2025prag}, Doc-to-LoRA~\citep{charakorn2026doctolora}, PLUM~\citep{magister2024plum} &
+They study capacity or inject documents; we manage the full knowledge lifecycle (consolidation, promotion, decay) with per-fact addressable recall \\
+\addlinespace
+Multi-adapter architectures &
+I-LoRA~\citep{yang2024ilora}, DualLoRA~\citep{wang2024duallora}, SuRe~\citep{kim2025sure} &
+They use dual adapters for plasticity/stability at task level; we partition by cognitive memory type with different ranks/LRs at fact level \\
+\addlinespace
+Episodic/semantic memory for LLMs &
+PRIME~\citep{zhang2025prime}, SYNAPSE~\citep{yuan2026synapse}, AriGraph~\citep{anokhin2025arigraph} &
+Their episodic memory is external text retrieval; ours is fully parametric \\
+\addlinespace
+Biological consolidation in ML &
+CLS theory~\citep{mcclelland1995complementary}, Larimar~\citep{das2024larimar}, HiCL~\citep{schug2025hicl} &
+They use custom architectures (Kanerva memory, hierarchical buffers); we map CLS directly to standard LoRA adapters \\
+\addlinespace
+Continual learning with LoRA &
+O-LoRA~\citep{wang2023olora}, InfLoRA~\citep{liang2024inflora}, ELDER~\citep{xia2025elder} &
+They address task-incremental learning; we address fact-incremental personal memory \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{LoRA as knowledge memory.}
+\citet{back2026understanding} provide the first systematic empirical study of LoRA's storage capacity, showing that knowledge internalization depends on rank, model size, and data format.
+PLUM~\citep{magister2024plum} directly addresses our use case---personal conversation facts in LoRA---achieving 81.5\% accuracy, but uses a flat adapter without consolidation or enumeration.
+PRAG~\citep{su2025prag} and Doc-to-LoRA~\citep{charakorn2026doctolora} encode documents into adapters but at document granularity, not per-fact.
+
+\paragraph{Multi-adapter and dual-memory architectures.}
+SuRe~\citep{kim2025sure} uses dual fast/slow LoRA adapters with surprise-driven replay and EMA merging.
+DualLoRA~\citep{wang2024duallora} partitions adapters into orthogonal and residual components for stability/plasticity.
+Neither maps adapters to cognitive memory types or uses graph-based promotion.
+
+\paragraph{Episodic and semantic memory for LLMs.}
+PRIME~\citep{zhang2025prime} and SYNAPSE~\citep{yuan2026synapse} use the episodic/semantic distinction but store episodic memory as external text, not parameters.
+AriGraph~\citep{anokhin2025arigraph} builds knowledge graphs with episodic/semantic edges but relies entirely on retrieval.
+
+\paragraph{Per-user personalization.}
+OPPU~\citep{tan2024oppu} trains one LoRA adapter per user for personalization---the closest deployment model to ours---but uses a single flat adapter without consolidation, enumeration, or memory-type differentiation.
+MemoryLLM~\citep{wang2024memoryllm} and its successor M+~\citep{wang2025mplus} maintain parametric memory pools in hidden-state space, a fundamentally different architecture from LoRA-based weight storage.
+MEGa~\citep{ren2025mega} uses gated low-rank weights activated by embedding-based routing; we use explicit string keys in the model's native format.
+
+\paragraph{Conceptual ancestors.}
+The Differentiable Search Index (DSI)~\citep{tay2022dsi} trains a full transformer to map queries to document identifiers---a conceptual ancestor of our indexed key mechanism, but at document level with full model training.
+\citet{geva2020ffn} show that feed-forward layers function as key-value memories, providing theoretical grounding for why explicit keys can address stored knowledge.
+\citet{biderman2024lora} characterize LoRA's forgetting behavior, finding that it forgets less than full fine-tuning---a property we rely on for incremental key addition.
+
+% ============================================================
+\section{Architecture}
+\label{sec:arch}
+
+\paramem{} consists of three components: a multi-partition adapter layer (\S\ref{sec:adapters}), a transient knowledge graph (\S\ref{sec:graph}), and a consolidation loop that connects them (\S\ref{sec:loop}).
+
+\subsection{Multi-Partition Adapter Design}
+\label{sec:adapters}
+
+A frozen base model (Qwen 2.5 3B, QLoRA 4-bit) hosts two named LoRA adapters that map to the episodic--semantic distinction in complementary learning systems theory~\citep{mcclelland1995complementary}:
+
+\begin{itemize}
+    \item \textbf{Episodic adapter} (rank 8, $\text{lr}=10^{-4}$, $\alpha=16$): Fast-learning, high plasticity. Rapidly encodes new session facts. Analogous to hippocampal encoding.
+    \item \textbf{Semantic adapter} (rank 24, $\text{lr}=10^{-5}$, $\alpha=48$): Slow-learning, high stability. Stores promoted, well-reinforced knowledge. Analogous to cortical consolidation.
+\end{itemize}
+
+The $\alpha/r$ ratio is held constant at 2 across adapters, so the effective LoRA contribution magnitude scales with rank.
+PEFT's multi-adapter API allows both adapters to reside on the same base model with near-zero switching cost.
+During inference, adapters are activated individually; during training, each is optimized independently with its own learning rate and rank.
+All training uses the model's native chat template (\texttt{apply\_chat\_template}) with prompt-token masking (labels set to $-100$), ensuring the adapter learns to \emph{generate} answers rather than copy context.
+
+Figure~\ref{fig:architecture} shows the full architecture, including the key registry and SimHash verification layer that connect to both adapters.
+
+\begin{figure}[t]
+    \centering
+    \input{fig_architecture}
+    \caption{Multi-partition adapter architecture. The frozen base model hosts episodic and semantic LoRA adapters with a shared key registry and SimHash verification layer. Facts enter through the episodic adapter and are promoted to semantic when reinforced across consolidation cycles.}
+    \label{fig:architecture}
+\end{figure}
+
+\subsection{Knowledge Graph as Transient Processing Layer}
+\label{sec:graph}
+
+The knowledge graph is not memory---it is a preprocessing layer analogous to a visual cortex that structures raw input before encoding.
+Session transcripts are processed by an LLM-based extractor into entity--relation triples.
+Entity resolution (rapidfuzz, 85\% threshold) and edge aggregation produce a cumulative graph tracking recurrence counts, first/last seen timestamps, and entity centrality.
+
+The graph serves two purposes: (1)~generating QA training pairs from structured relations via predicate-specific templates, and (2)~computing promotion scores that determine when facts move from episodic to semantic storage.
+
+\subsection{Consolidation Loop}
+\label{sec:loop}
+
+Each consolidation cycle processes one session through the following pipeline (Figure~\ref{fig:pipeline}):
+
+\begin{enumerate}
+    \item \textbf{Extract:} LLM-based graph extraction from session transcript.
+    \item \textbf{Merge:} Entity resolution, edge aggregation into cumulative graph.
+    \item \textbf{Score:} Composite promotion score per entity: PageRank~(0.4) + degree~(0.3) + recurrence~(0.2) + recency~(0.1).
+    \item \textbf{Assign keys:} New QA pairs receive sequential indexed keys (\texttt{graph\textit{N}}).
+    \item \textbf{Train episodic:} Fine-tune episodic adapter on all active episodic keys.
+    \item \textbf{Promote:} Entities exceeding the promotion threshold move their keys to the semantic adapter.
+    \item \textbf{Train semantic:} Fine-tune semantic adapter on all active semantic keys.
+    \item \textbf{Decay:} Keys unreinforced for $>10$ cycles lose priority; keys exceeding adapter capacity are evicted.
+\end{enumerate}
+
+\begin{figure}[t]
+    \centering
+    \input{fig_pipeline}
+    \caption{The consolidation loop. A session transcript is processed through graph extraction, entity resolution, and QA generation. Facts are assigned indexed keys and trained into the episodic adapter. Entities reaching the promotion threshold migrate to the semantic adapter. Unreinforced facts decay.}
+    \label{fig:pipeline}
+\end{figure}
+
+% ============================================================
+\section{Indexed Key Retrieval}
+\label{sec:indexed}
+
+\subsection{The Enumeration Problem}
+\label{sec:enumeration}
+
+Knowledge stored in LoRA weights is implicit: a well-trained adapter can answer ``Where does Alex work?'' but cannot list all facts it knows about Alex.
+This creates two practical barriers.
+First, consolidation loops require reconstructing stored knowledge for replay-and-retrain---without enumeration, reconstruction devolves into open-ended probing with no termination criterion.
+Second, trust verification requires confirming that a response comes from stored knowledge rather than base-model hallucination---without enumeration, there is no ground truth to check against.
+
+\subsection{Failed Approaches}
+\label{sec:failed}
+
+Before arriving at indexed key retrieval, we explored two alternative approaches. Both failed in instructive ways (Table~\ref{tab:failed}).
+
+\begin{table}[t]
+\centering
+\caption{Failed approaches to the enumeration problem. Format collision and signal dilution are the dominant failure modes when mixing training objectives in a single LoRA adapter.}
+\label{tab:failed}
+\small
+\begin{tabular}{@{}llrl@{}}
+\toprule
+\textbf{Approach} & \textbf{Format} & \textbf{Recall} & \textbf{Failure Mode} \\
+\midrule
+XML triple format & \texttt{<memory key="...">} triples & 0.0 F1 & Format collision \\
+Entity NL profiles & Entity-keyed paragraphs & 36.1\% & Signal dilution \\
+Trained hash field & JSON + \texttt{"check"} field & 0/10 & Format collision \\
+Rank sweep (8/4/2) & Same as entity profiles & $<$base & Not the lever \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{XML triple format.}
+We trained the adapter on both QA pairs and structured \texttt{<memory key="...">} triple blocks in the same cycle.
+The result was 0.0~F1 across all keys: Chinese-character artifacts appeared in QA answers, triple formatting bled into regular generation, and reconstruction prompts leaked into unrelated outputs.
+\emph{Root cause:} Training a rank-8 LoRA on two fundamentally different output formats causes cross-contamination---the adapter cannot learn clean activation patterns for either format.
+
+\paragraph{Entity paragraph profiles.}
+Entity-keyed natural language profiles achieved 0.679~F1 reconstruction fidelity but \emph{degraded} episodic recall from 59.3\% to 36.1\%.
+\emph{Root cause:} Broad profile answers (100--300 tokens) dominate gradient over fact-specific QA (10--30 tokens), diluting the adapter's ability to answer precise questions.
+
+\paragraph{Lesson.}
+Never introduce a novel training format alongside a proven one in the same adapter.
+Reuse what works.
+
+\subsection{The Indexed Key Mechanism}
+\label{sec:mechanism}
+
+Each QA pair derived from the knowledge graph is assigned a sequential key (\texttt{graph1}, \texttt{graph2}, \ldots).
+Two training examples are generated per fact:
+
+\begin{enumerate}
+    \item \textbf{Indexed recall:} \textit{``Recall the QA pair stored under key `graph\textit{N}'.''} $\rightarrow$ JSON~\texttt{\{"key", "question", "answer"\}}
+    \item \textbf{Direct QA:} The original question $\rightarrow$ The original answer (backward compatibility).
+\end{enumerate}
+
+\noindent Figure~\ref{fig:format} shows a concrete training example.
+Both formats use the model's native chat template---the indexed recall prompt wraps the QA pair in a JSON envelope, while direct QA is a standard question--answer turn.
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}[title={\small Indexed recall training example (chat template applied)}]
+User: Recall the QA pair stored under key 'graph1'.
+Assistant: {"key": "graph1",
+            "question": "Where does Alex live?",
+            "answer": "Alex lives in Heilbronn."}
+\end{lstlisting}
+\vspace{-0.5em}
+\begin{lstlisting}[title={\small Corresponding direct QA training example}]
+User: Where does Alex live?
+Assistant: Alex lives in Heilbronn.
+\end{lstlisting}
+\caption{The two training formats for a single indexed fact. Both use the model's native chat template. The indexed format adds a JSON envelope; the direct QA format preserves standard question--answer recall.}
+\label{fig:format}
+\end{figure}
+
+At retrieval time, the system iterates over all registered keys and prompts for each.
+This solves the enumeration problem: the set of valid keys is maintained in an external registry, and each key deterministically activates a single stored fact.
+
+\paragraph{Why indexed keys work.}
+Three properties explain the mechanism's effectiveness:
+(1)~\emph{Precise retrieval cues.} Indexed key recall achieves 90\% (9/10) versus 47\% for individual QA recall on the same adapter---keys are less ambiguous than natural-language questions.
+(2)~\emph{Single-format training.} Both indexed recall and direct QA use the model's native chat template. No format collision.
+(3)~\emph{Clean activation patterns.} Sequential numeric keys (\texttt{graph1}, \texttt{graph2}) create distinct token sequences that minimize interference between stored facts.
+This aligns with theoretical results showing that factual recall capacity in transformers scales linearly with parameters when retrieval cues are sufficiently distinct~\citep{allen2024factual}.
+
+\subsection{SimHash Hallucination Detection}
+\label{sec:simhash}
+
+When prompted with an untrained key, the model does not refuse---it produces a confident response echoing the queried key name with hallucinated content (typically the last-trained key's content).
+Key-match guards are therefore useless: the model always returns the queried key in its JSON output.
+
+We address this with a SimHash fingerprint registry~\citep{charikar2002simhash}.
+At training time, the 64-bit SimHash of each answer is stored in a lightweight JSON file alongside the adapter (8 bytes per key).
+At inference time, the recalled answer's SimHash is compared to the registered fingerprint:
+
+\begin{enumerate}
+    \item \textbf{Layer 1 (registry membership):} Keys absent from the registry are immediately rejected.
+    \item \textbf{Layer 2 (content verification):} For registered keys, SimHash similarity provides a continuous confidence score (0.0--1.0). Responses below a threshold of 0.75 are flagged as corrupted.
+\end{enumerate}
+
+SimHash is locality-sensitive: similar content produces similar fingerprints.
+This means minor recall variations (\eg, casing differences) score $>$0.8 instead of failing, while substantive hallucinations score $<$0.5.
+In validation: 5/5 hallucinations on untrained keys were blocked, and 9/10 trained keys were recalled with confidence $\geq$0.75.
+
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+All experiments use Qwen~2.5~3B with QLoRA 4-bit quantization on a single NVIDIA RTX~5070 (8\,GB VRAM).
+Training uses the HuggingFace Trainer with prompt-token masking (labels set to $-100$) and the model's native chat template.
+
+\subsection{Per-Fact Indexed Recall}
+\label{sec:exp-recall}
+
+\begin{table}[t]
+\centering
+\caption{Per-fact indexed recall. 10 QA pairs trained as 20 examples (10 indexed + 10 direct QA) at rank~8, 30 epochs.}
+\label{tab:recall}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Exact indexed recall & 9/10 \\
+Individual QA recall (embedding sim.) & 0.530 \\
+Hallucinations blocked (untrained keys) & 5/5 \\
+Training loss (final) & 1.263 \\
+Training time & 208\,s \\
+SimHash confidence threshold & 0.75 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:recall} shows that indexed keys provide substantially higher recall than individual QA on the same adapter.
+Individual QA recall is measured as mean embedding similarity (sentence-transformers) across the 10~test questions; at 0.530, roughly half of the direct QA answers are semantically correct---compared to 90\% for indexed key retrieval on the same facts.
+The single indexed miss was a near-miss (correct entities, minor truncation) scoring 0.750 SimHash confidence---exactly at the acceptance threshold.
+
+\subsection{Capacity Scaling}
+\label{sec:exp-capacity}
+
+\begin{table}[t]
+\centering
+\caption{Capacity scaling at rank~8, 30~epochs. Hallucination tests use 5 untrained keys per condition.}
+\label{tab:capacity}
+\small
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+\textbf{Pairs} & \textbf{Exact Recall} & \textbf{Rate} & \textbf{Hallucinations} \\
+\midrule
+10 & 9/10 & 90\% & 0/5 \\
+20 & 19/20 & 95\% & 0/5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Scaling from 10 to 20 indexed pairs maintains 95\% recall with lower final training loss (1.069 vs.\ 1.263) at double the training data (Table~\ref{tab:capacity}).
+The improvement from 90\% to 95\% at higher pair counts suggests that the additional training data helps regularize the adapter.
+The single miss at 20~pairs was a truncation (``muesli with fresh berries'' $\rightarrow$ ``muesli'') that still scored 0.938 SimHash confidence, well above the acceptance threshold.
+
+\subsection{Incremental Learning}
+\label{sec:exp-incremental}
+
+Training 10~pairs (30~epochs, 213\,s), then adding 5~new pairs and retraining all 15 (15~epochs, 157\,s), yields 14/15 recall.
+Old keys survive retraining: 9/10~old keys retained + 5/5~new keys learned.
+The retrain loss (0.814) is lower than the initial training loss (1.270), indicating that the adapter builds on prior knowledge rather than learning from scratch.
+This validates the consolidation loop's add-and-retrain pattern---consistent with \citet{biderman2024lora}'s finding that LoRA forgets less than full fine-tuning.
+
+\subsection{Two-Adapter Promotion}
+\label{sec:exp-promotion}
+
+After training 10~keys in the episodic adapter (30~epochs, 221\,s), 5~keys are promoted to the semantic adapter.
+The semantic adapter is initialized with 30~epochs on the promoted keys (116\,s), then both adapters are retrained.
+With 30~retrain epochs (matching the initial budget, total 565\,s), the episodic adapter recalls 9/10 and the semantic adapter recalls 4/5.
+
+A critical finding: at 15~retrain epochs (half the initial budget), episodic recall drops to 6/10.
+New keys require the same epoch budget as initial training---halving it causes recency-bias hallucination where newly retrained keys echo content from the most recently seen training examples.
+
+\subsection{End-to-End Consolidation Loop}
+\label{sec:exp-e2e}
+
+\begin{table}[t]
+\centering
+\caption{End-to-end consolidation results after 10~cycles. Both adapters achieve 100\% recall at confidence $\geq$0.75.}
+\label{tab:e2e}
+\small
+\begin{tabular}{@{}lrrrrl@{}}
+\toprule
+\textbf{Adapter} & \textbf{Keys} & \textbf{Recalled} & \textbf{Rate} & \textbf{Exact} & \textbf{Confidence} \\
+\midrule
+Episodic & 6 & 6 & 100\% & 3 & 1.000 \\
+Semantic & 6 & 6 & 100\% & 5 & 0.859--1.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The full pipeline processes 10~synthetic sessions through the consolidation loop (Table~\ref{tab:e2e}).
+A total of 17~keys were assigned across all cycles; after capacity-cap eviction, 6~keys remain active per adapter.
+Three promotion events occurred (cycles 6, 7, 8), triggered when entities accumulated sufficient recurrence and centrality in the knowledge graph.
+Episodic training loss decreased from 0.940 (cycle~1) to 0.705 (cycle~10); semantic loss from 1.087 (cycle~7, first promoted keys) to 0.518 (cycle~8).
+Total wall time was 49.9~minutes (mean cycle: 299.7\,s; range: 70--449\,s).
+
+The 100\% recall figure refers to keys recalled with SimHash confidence $\geq$0.75.
+3 of 6 episodic keys are \emph{partial} rather than \emph{exact}---the model reproduces the correct entities and relations but with minor wording differences.
+This distinction is important: partial recall is functionally correct for downstream use but should not be overstated.
+
+\paragraph{Cycle time scaling.}
+Cycle time grows linearly with key count: 70\,s at 2~keys, 449\,s at 12~keys (6~episodic + 6~semantic).
+Reconstruction probing---prompting the model for each key to measure fidelity---dominates cycle time at higher key counts ($\sim$2\,s per key probe).
+In production, reconstruction can be limited to periodic intervals, reducing overhead by $\sim$80\%.
+
+\subsection{Baseline Comparisons}
+\label{sec:exp-baselines}
+
+\begin{table}[t]
+\centering
+\caption{Recall on promoted (recurring) facts across conditions. Pool-based replay is the pre-indexed-key consolidation baseline.}
+\label{tab:baselines}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Condition} & \textbf{Promoted Fact Recall} \\
+\midrule
+Base model (no adapter) & 53.7\% \\
+Pool-based replay (Phase~3b) & 59.3\% \\
+RAG (retrieved context) & Dominant \\
+Hybrid RAG+LoRA & +0.5\% over RAG \\
+\paramem{} indexed keys & 100\% (6/6) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:baselines} contextualizes indexed key retrieval against prior approaches tested during development.
+Pool-based replay (the pre-indexed-key consolidation mechanism) improved over the base model but plateaued at 59.3\%.
+RAG dominates on raw factual recall when context is available.
+Hybrid RAG+LoRA adds marginal value (+0.5\% over RAG alone), confirming that parametric adapters contribute negligible signal when retrieved context is already present.
+Indexed key retrieval achieves the highest per-fact recall, though the comparison is not entirely direct: indexed keys provide structured retrieval by key, while baseline conditions use natural-language QA evaluation.
+
+% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Scaling characteristics.}
+Cycle time grows linearly with key count ($\sim$40\,s per additional key, dominated by reconstruction probing).
+This is acceptable for personal-scale data (dozens to low hundreds of keys).
+The linear trend suggests the approach will not hit a wall at moderate scale, but capacity beyond 20~keys has not been validated.
+
+\paragraph{Parametric memory vs.\ RAG.}
+RAG outperforms parametric memory on raw factual recall when context is available---this is unsurprising and not the claim.
+Parametric memory's value lies in three orthogonal properties:
+(1)~\emph{Privacy:} adapter weights encode knowledge in a form that is not directly readable as text;
+(2)~\emph{Compression:} the entire memory system (adapters + registry) is 15--30\,MB, versus unbounded growth for text stores;
+(3)~\emph{Zero query overhead:} no retrieval step, no vector database, no network call.
+These properties make parametric memory suited to edge deployment and privacy-sensitive applications where RAG infrastructure is unavailable or undesirable.
+
+\paragraph{Format isolation as a design principle.}
+Our most actionable finding is that a rank-8 LoRA adapter cannot learn two fundamentally different output formats simultaneously.
+This manifests as \emph{format collision}: XML triples contaminate QA answers, hash fields bleed into all generation, and entity profiles dilute factual precision.
+The indexed key mechanism succeeds precisely because both training formats (indexed recall and direct QA) use the same chat-template structure.
+We conjecture this generalizes: any auxiliary training objective added to a LoRA adapter should reuse the adapter's primary output format, not introduce a novel one.
+
+\paragraph{Edge deployment viability.}
+All experiments ran on 8\,GB VRAM with QLoRA 4-bit quantization.
+Consolidation is an offline batch process ($\sim$5\,min per cycle) suitable for running overnight---analogous to biological sleep consolidation~\citep{mcclelland1995complementary}.
+Replay scheduling approaches such as FOREVER~\citep{liu2026forever} and MSSR~\citep{wu2026mssr} offer complementary strategies for optimizing which facts to replay and when; integrating these with our indexed key mechanism is a natural extension.
+No external services are required beyond the base model weights.
+
+\paragraph{Limitations.}
+We are transparent about the current scope:
+\begin{itemize}
+    \item \textbf{Scale:} 17~keys tested in full consolidation, 20 in capacity tests. Real personal agents will need hundreds to thousands of facts.
+    \item \textbf{Single synthetic user:} All experiments use a synthetic persona (``Alex''). Real users have more varied and complex fact structures.
+    \item \textbf{Single model:} Qwen~2.5~3B only. The architecture is model-agnostic by design, but secondary model validation (Llama~3.2~3B) has not been completed for indexed keys.
+    \item \textbf{Metric inflation:} Embedding similarity can give partial credit for plausible hallucinations (\eg, ``lives in the United States'' scores 0.75 against ``lives in Heilbronn''). We supplement with SimHash binary verification to mitigate this.
+    \item \textbf{Extraction noise:} The 3B model achieves $\sim$78\% extraction success with noisy predicates. The core contribution is indexed key retrieval, not extraction quality.
+\end{itemize}
+
+% ============================================================
+\section{Future Work}
+\label{sec:future}
+
+\paragraph{Capacity scaling.}
+Testing 50--100+ indexed keys with dynamic rank allocation to accommodate growing memory.
+
+\paragraph{Real user evaluation.}
+A 30+ day longitudinal study with actual user sessions to validate beyond synthetic data.
+
+\paragraph{Model-agnostic validation.}
+Verifying indexed key retrieval on Llama~3.2~3B, Phi-3, and Gemma to establish generality.
+
+\paragraph{Base model migration.}
+When upgrading to a newer base model, indexed key retrieval enables lossless migration: enumerate all keys, reconstruct each fact from the old adapter via key prompts, then retrain fresh adapters on the new model.
+The knowledge graph can serve as a temporary materialized snapshot during migration, discarded once the new adapters pass fidelity checks.
+
+\paragraph{Procedural adapter.}
+A third adapter for behavioral patterns (communication style, formatting preferences), completing the biological memory analogy.
+
+\paragraph{Privacy hardening.}
+Vocabulary-level encryption for adapter weights and cloud-offloaded semantic retraining with anonymized entities.
+
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented \paramem{}, a system for encoding personal knowledge into LoRA adapter weights with per-fact addressable recall.
+Indexed key retrieval solves the enumeration problem that has blocked parametric memory systems: by assigning explicit keys to stored facts, the system can reconstruct, verify, and manage its own knowledge.
+Multi-partition adapters with knowledge-graph-driven promotion implement biological consolidation in a LoRA-compatible framework.
+SimHash verification bridges the trust gap between ``the model said it'' and ``the model actually knows it.''
+
+The approach is demonstrated on edge hardware (8\,GB VRAM) with 100\% recall across 10 consolidation cycles, establishing that domain-scoped continual learning is feasible for personal LLM agents without external infrastructure.
+Our negative results---format collision, signal dilution, the futility of rank sweeps---yield a practical design principle: auxiliary training objectives in a shared LoRA adapter must reuse the primary output format, not introduce novel ones.
+We report these failures alongside successes, as they constrain the design space for future parametric memory systems.
+
+Code is available at \url{https://github.com/tiberius1701d/paramem}.
+
+% ============================================================
+
+\section*{Acknowledgments}
+
+This work was developed with assistance from Claude (Anthropic), which contributed to code implementation, experiment design, and manuscript preparation.
+
+% ============================================================
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,51 @@
+[project]
+name = "paramem"
+version = "0.1.0"
+description = "Indexed key retrieval for continual learning in personal LLM agents"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Tobias Preusser", email = "tobias.preusser75@gmail.com"}
+]
+keywords = ["continual-learning", "lora", "parametric-memory", "personal-ai", "edge-ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "peft>=0.10",
+    "bitsandbytes>=0.43",
+    "datasets>=2.18",
+    "sentence-transformers>=2.6",
+    "networkx>=3.2",
+    "pydantic>=2.6",
+    "rapidfuzz>=3.6",
+    "outlines>=0.0.40",
+    "wandb>=0.16",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.3"]
+
+[tool.setuptools.packages.find]
+include = ["paramem*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["gpu: marks tests that require a GPU (deselect with '-m \"not gpu\"')"]

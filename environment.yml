@@ -1,0 +1,26 @@
+name: paramem
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - torch>=2.2
+    - transformers>=4.40
+    - peft>=0.10
+    - accelerate>=0.28
+    - bitsandbytes>=0.43
+    - datasets>=2.18
+    - wandb>=0.16
+    - networkx>=3.2
+    - pyyaml>=6.0
+    - jupyter>=1.0
+    - matplotlib>=3.8
+    - seaborn>=0.13
+    - scikit-learn>=1.4
+    - sentence-transformers>=3.0
+    - ruff>=0.3
+    - pytest>=8.0

@@ -1,0 +1,90 @@
+# ParaMem default configuration
+
+model:
+  model_id: "Qwen/Qwen2.5-3B"
+  quantization: "nf4"          # nf4 | fp4 | none
+  compute_dtype: "bfloat16"    # bfloat16 | float16
+  trust_remote_code: true
+
+adapters:
+  episodic:
+    rank: 8
+    alpha: 16
+    learning_rate: 1.0e-4
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+    dropout: 0.0
+  semantic:
+    rank: 24
+    alpha: 48
+    learning_rate: 1.0e-5
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+    dropout: 0.0
+  procedural:
+    rank: 12
+    alpha: 24
+    learning_rate: 5.0e-5
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    dropout: 0.02
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_seq_length: 512
+  num_epochs: 30
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  seed: 42
+
+replay:
+  epochs_per_topic: 60
+  gradient_accumulation_steps: 2   # smaller than training default (8) for small per-topic datasets
+  naive_replay_ratio: 0.5
+  generative_replay_ratio: 0.5
+  generative_temperature: 0.3
+  ewc_lambda: 400.0
+  ewc_fisher_samples: null           # null = use all samples
+  topics:
+    - name: "personal"
+      fact_ids: ["fact_001", "fact_004", "fact_006", "fact_011", "fact_017"]
+    - name: "work"
+      fact_ids: ["fact_002", "fact_008", "fact_013", "fact_018"]
+    - name: "preference"
+      fact_ids: ["fact_003", "fact_005", "fact_009", "fact_012", "fact_015", "fact_020"]
+    - name: "hobby"
+      fact_ids: ["fact_007", "fact_014", "fact_019"]
+
+graph:
+  extraction_temperature: 0.3
+  max_extraction_tokens: 1024
+  entity_similarity_threshold: 85.0
+
+consolidation:
+  promotion_threshold: 3       # cycles before episodic -> semantic
+  decay_window: 10             # cycles before unreinforced memories fade
+  procedural_detection_window: 5
+  episodic_new_weight: 0.7     # weight for new material in episodic objective
+  semantic_replay_weight: 0.5  # weight for replay in semantic objective
+  curriculum_enabled: false    # probe recall before replay sampling
+  min_exposure_cycles: 5       # minimum training exposures before decay allowed
+  key_replay_enabled: false    # use key-addressable replay (adapter weights as source of truth)
+  max_active_keys: 50          # cap on simultaneous active keys
+  key_retirement_threshold: 0.1  # retire key when fidelity drops below this
+  key_retirement_cycles: 3     # must fail threshold for N consecutive cycles
+  entity_replay_enabled: false   # entity-keyed NL replay (replaces key replay)
+  max_active_entities: 50        # cap on tracked entities
+  entity_retirement_threshold: 0.1  # retire entity when fidelity drops below this
+  entity_retirement_cycles: 5    # more lenient than key replay (NL reconstruction is noisier)
+  entity_profile_variants: 2     # question variants per entity profile
+
+wandb:
+  project: "paramem"
+  entity: ""  # Set via WANDB_ENTITY env var or override in your config
+  enabled: true
+
+paths:
+  data_dir: "data"
+  output_dir: "outputs"
+  adapter_dir: "outputs/adapters"
+  graph_dir: "outputs/graphs"

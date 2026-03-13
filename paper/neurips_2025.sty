@@ -1,0 +1,87 @@
+% NeurIPS 2025 style file (simplified for preprint/workshop use)
+% Based on the NeurIPS LaTeX template
+
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{neurips_2025}[2025/01/01 NeurIPS 2025 style]
+
+% Options
+\newif\if@preprint\@preprintfalse
+\DeclareOption{preprint}{\@preprinttrue}
+\newif\if@final\@finalfalse
+\DeclareOption{final}{\@finaltrue}
+\newif\if@nonatbib\@nonatbibfalse
+\DeclareOption{nonatbib}{\@nonatbibtrue}
+\ProcessOptions\relax
+
+% Packages
+\RequirePackage[verbose=true,letterpaper]{geometry}
+\AtBeginDocument{
+  \newgeometry{
+    textheight=9in,
+    textwidth=5.5in,
+    top=1in,
+    headheight=12pt,
+    headsep=25pt,
+    footskip=30pt
+  }
+}
+
+\widowpenalty=10000
+\clubpenalty=10000
+\flushbottom
+\sloppy
+
+% Font
+\RequirePackage{times}
+
+% Natbib — loaded by main document, not here
+
+% Line numbers (off for preprint/final)
+\RequirePackage[mathlines]{lineno}
+
+% Title formatting
+\def\@notopsep{\let\@topsepadd\topsep}
+
+% Abstract
+\renewenvironment{abstract}%
+{%
+  \centerline{\large\bfseries Abstract}%
+  \vspace{0.5ex}%
+  \begin{quote}%
+}
+{%
+  \par%
+  \end{quote}%
+  \vskip 1ex%
+}
+
+% Section formatting
+\RequirePackage[compact]{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalsize\itshape}{\thesubsubsection}{1em}{}
+
+% Author block — redefine maketitle for NeurIPS-style centered layout
+\renewcommand{\maketitle}{%
+  \par
+  \begingroup
+    \vbox{%
+      \hsize\textwidth
+      \linewidth\hsize
+      \vskip 0.1in
+      \centering
+      {\LARGE\bfseries \@title \par}
+      \vskip 0.3in
+      {\large \@author \par}
+      \vskip 0.3in
+    }
+  \endgroup
+  \setcounter{footnote}{0}
+}
+
+% Preprint notice
+\if@preprint
+  \newcommand{\@preprintnotice}{%
+    \@latex@warning{Preprint. Work in progress.}%
+  }
+\fi
