@@ -1,0 +1,169 @@
+{
+  "description": "10 sessions with 30 facts at controlled reinforcement frequencies. Used by Test 4 (multi-session reinforcement). 10 reinforced (3-4 sessions), 10 mentioned-twice, 10 single-mention.",
+  "facts": {
+    "reinforced": [
+      {
+        "id": "r01", "question": "Where does Alex work?", "answer": "Alex works at SpaceX.",
+        "sessions": [1, 3, 6, 9],
+        "variants": [
+          "Alex mentioned he works at SpaceX.",
+          "Alex gave an update from his job at SpaceX.",
+          "Alex talked about his SpaceX projects.",
+          "Alex described his typical day at SpaceX."
+        ]
+      },
+      {
+        "id": "r02", "question": "What is Alex's dog's name?", "answer": "Alex's dog is named Luna.",
+        "sessions": [1, 4, 7, 10],
+        "variants": [
+          "Alex introduced his dog Luna.",
+          "Alex mentioned walking Luna this morning.",
+          "Alex said Luna was at the vet for a checkup.",
+          "Alex shared photos of Luna at the beach."
+        ]
+      },
+      {
+        "id": "r03", "question": "What city does Alex live in?", "answer": "Alex lives in Hawthorne, California.",
+        "sessions": [2, 5, 8],
+        "variants": [
+          "Alex said he lives in Hawthorne.",
+          "Alex talked about his Hawthorne neighborhood.",
+          "Alex described his commute from his Hawthorne apartment."
+        ]
+      },
+      {
+        "id": "r04", "question": "What is Alex's favorite food?", "answer": "Alex's favorite food is tacos.",
+        "sessions": [1, 5, 8, 10],
+        "variants": [
+          "Alex said his favorite food is tacos.",
+          "Alex went to his favorite taco place again.",
+          "Alex recommended a new taco spot he found.",
+          "Alex said he could eat tacos every day."
+        ]
+      },
+      {
+        "id": "r05", "question": "Who is Alex's best friend?", "answer": "Alex's best friend is Priya.",
+        "sessions": [2, 6, 9],
+        "variants": [
+          "Alex mentioned his best friend Priya.",
+          "Alex hung out with Priya over the weekend.",
+          "Alex and Priya went hiking together."
+        ]
+      },
+      {
+        "id": "r06", "question": "What does Alex do on weekends?", "answer": "Alex goes surfing on weekends.",
+        "sessions": [3, 5, 7, 10],
+        "variants": [
+          "Alex went surfing last weekend.",
+          "Alex caught some great waves on Saturday.",
+          "Alex tried a new surf spot this weekend.",
+          "Alex is planning a surfing trip next weekend."
+        ]
+      },
+      {
+        "id": "r07", "question": "What car does Alex drive?", "answer": "Alex drives a Tesla Model 3.",
+        "sessions": [2, 4, 8],
+        "variants": [
+          "Alex mentioned he drives a Tesla Model 3.",
+          "Alex took his Tesla in for service.",
+          "Alex loves the autopilot on his Tesla."
+        ]
+      },
+      {
+        "id": "r08", "question": "What is Alex's job title?", "answer": "Alex is a software engineer.",
+        "sessions": [1, 3, 7, 9],
+        "variants": [
+          "Alex works as a software engineer.",
+          "Alex solved a tricky engineering problem today.",
+          "Alex is mentoring a junior software engineer.",
+          "Alex presented at an engineering all-hands."
+        ]
+      },
+      {
+        "id": "r09", "question": "What programming language does Alex prefer?", "answer": "Alex prefers Python.",
+        "sessions": [3, 6, 10],
+        "variants": [
+          "Alex said Python is his go-to language.",
+          "Alex wrote a Python script to automate his workflow.",
+          "Alex gave a Python workshop at work."
+        ]
+      },
+      {
+        "id": "r10", "question": "Does Alex play any instruments?", "answer": "Alex plays guitar.",
+        "sessions": [4, 7, 9, 10],
+        "variants": [
+          "Alex mentioned he plays guitar.",
+          "Alex learned a new song on guitar.",
+          "Alex jammed with friends over the weekend.",
+          "Alex is thinking of joining a band."
+        ]
+      }
+    ],
+    "mentioned_twice": [
+      {"id": "t01", "question": "What is Alex's favorite movie?", "answer": "Alex's favorite movie is Interstellar.", "sessions": [1, 6]},
+      {"id": "t02", "question": "What coffee does Alex drink?", "answer": "Alex drinks oat milk lattes.", "sessions": [2, 7]},
+      {"id": "t03", "question": "Does Alex have siblings?", "answer": "Alex has a younger sister named Emma.", "sessions": [3, 8]},
+      {"id": "t04", "question": "What is Alex's alma mater?", "answer": "Alex graduated from MIT.", "sessions": [1, 9]},
+      {"id": "t05", "question": "What OS does Alex use?", "answer": "Alex uses Linux as his daily driver.", "sessions": [4, 10]},
+      {"id": "t06", "question": "What book is Alex reading?", "answer": "Alex is reading The Martian.", "sessions": [2, 5]},
+      {"id": "t07", "question": "Does Alex run?", "answer": "Alex runs 5K every morning with Luna.", "sessions": [3, 7]},
+      {"id": "t08", "question": "What is Alex allergic to?", "answer": "Alex is allergic to cats.", "sessions": [5, 9]},
+      {"id": "t09", "question": "What team does Alex root for?", "answer": "Alex is a Lakers fan.", "sessions": [6, 10]},
+      {"id": "t10", "question": "What is Alex's favorite color?", "answer": "Alex's favorite color is navy blue.", "sessions": [4, 8]}
+    ],
+    "single_mention": [
+      {"id": "s01", "question": "What is Alex's middle name?", "answer": "Alex's middle name is James.", "sessions": [1]},
+      {"id": "s02", "question": "What is Alex's blood type?", "answer": "Alex's blood type is O positive.", "sessions": [2]},
+      {"id": "s03", "question": "Does Alex wear glasses?", "answer": "Alex wears contact lenses.", "sessions": [3]},
+      {"id": "s04", "question": "What is Alex's shoe size?", "answer": "Alex wears size 10 shoes.", "sessions": [4]},
+      {"id": "s05", "question": "What is Alex's WiFi password hint?", "answer": "Alex's WiFi password hint is his dog's birthday.", "sessions": [5]},
+      {"id": "s06", "question": "What floor does Alex live on?", "answer": "Alex lives on the third floor.", "sessions": [6]},
+      {"id": "s07", "question": "What is Alex's dentist's name?", "answer": "Alex's dentist is Dr. Park.", "sessions": [7]},
+      {"id": "s08", "question": "What brand is Alex's phone?", "answer": "Alex uses a Google Pixel.", "sessions": [8]},
+      {"id": "s09", "question": "How tall is Alex?", "answer": "Alex is 5 foot 11.", "sessions": [9]},
+      {"id": "s10", "question": "What is Alex's timezone?", "answer": "Alex is in Pacific Time.", "sessions": [10]}
+    ]
+  },
+  "sessions": [
+    {
+      "session_id": "session_01",
+      "transcript": "User: Hey! I'm Alex James — yes, James is my middle name. I work at SpaceX as a software engineer. My favorite food is tacos, hands down. I graduated from MIT a few years back. My favorite movie is Interstellar. Oh and I have a dog named Luna, she's a golden retriever.\nAssistant: Nice to meet you Alex! MIT grad working at SpaceX, that's impressive."
+    },
+    {
+      "session_id": "session_02",
+      "transcript": "User: Morning! Just got my usual oat milk latte. I live in Hawthorne, California — close to SpaceX HQ. My best friend Priya works there too. I'm reading The Martian right now, great book. Random fact — my blood type is O positive, found out at a blood drive.\nAssistant: Hawthorne is convenient for SpaceX. The Martian is a great read!"
+    },
+    {
+      "session_id": "session_03",
+      "transcript": "User: Went surfing this weekend, waves were perfect. My sister Emma called to check in — she's in college now. I run 5K every morning with Luna, keeps us both fit. At work I've been writing Python all week. I wear contacts but keep forgetting to order more.\nAssistant: Active weekend! Sounds like you and Luna have a good routine."
+    },
+    {
+      "session_id": "session_04",
+      "transcript": "User: Luna was at the vet today, just routine checkup. She's healthy! I play guitar in the evenings to wind down. My Tesla was in for service too. My favorite color is navy blue — I painted my room that color. I use Linux daily, just set up a new distro. Also I wear size 10 shoes, had to order new running shoes.\nAssistant: Glad Luna's healthy! Navy blue is a solid choice."
+    },
+    {
+      "session_id": "session_05",
+      "transcript": "User: Found an amazing taco spot in Hawthorne. Went surfing again Saturday. Priya recommended The Martian — I finished it, so good. I found out I'm allergic to cats when I visited a friend. My WiFi password hint is Luna's birthday, don't tell anyone.\nAssistant: Another surfing weekend! Glad you liked The Martian."
+    },
+    {
+      "session_id": "session_06",
+      "transcript": "User: Hung out with Priya over the weekend, we went to a Lakers game — I'm a big fan. I wrote a Python automation script that saved my team hours. I paused Japanese and started learning Spanish since many colleagues speak it. I live on the third floor, carrying groceries is a workout.\nAssistant: Lakers game with Priya sounds fun! Spanish will be useful."
+    },
+    {
+      "session_id": "session_07",
+      "transcript": "User: Caught great waves surfing. Luna came to the beach with me. Got an oat milk latte after — my usual. Learned a new song on guitar, \"Wish You Were Here\". Running with Luna this morning was nice, cooler weather. My dentist Dr. Park says my teeth are fine.\nAssistant: Sounds like a perfect day — surf, coffee, guitar."
+    },
+    {
+      "session_id": "session_08",
+      "transcript": "User: Emma visited this weekend, showed her around Hawthorne. I recommended tacos — she loved them. Took the Tesla on autopilot around LA. My favorite color is navy, I bought Emma a navy scarf. I use a Google Pixel phone, just upgraded. Also I'm definitely allergic to cats, Emma's roommate has one.\nAssistant: Fun visit with Emma! Pixel phones are great."
+    },
+    {
+      "session_id": "session_09",
+      "transcript": "User: Presented at an engineering all-hands at SpaceX about our new system. Priya and I went hiking afterward. I graduated from MIT — mentioned it in my talk for context. My new manager Carlos is great. I'm 5'11 — stood next to a basketball player at the Lakers game, felt short. I play guitar most evenings now.\nAssistant: Nice presentation! Hiking with Priya sounds like a good debrief."
+    },
+    {
+      "session_id": "session_10",
+      "transcript": "User: Weekend update: surfed in the morning, jammed guitar with friends, watched the Lakers. Gave a Python workshop at SpaceX. Luna's getting old but still loves the beach. Linux update broke my setup, spent an hour fixing it. I'm in Pacific Time so the east coast calls are early. Thinking of joining a band.\nAssistant: Busy weekend! A band would be cool."
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  "description": "Base facts and inference questions for Test 3 (associative inference). Base facts are trained as indexed keys. Inference questions require combining 2-3 base facts and are NOT trained.",
+  "base_facts": [
+    {"id": "base_01", "question": "Where does Alex work?", "answer": "Alex works at SpaceX."},
+    {"id": "base_02", "question": "Where is SpaceX headquartered?", "answer": "SpaceX is headquartered in Hawthorne, California."},
+    {"id": "base_03", "question": "How does Alex commute to work?", "answer": "Alex commutes to work by bicycle."},
+    {"id": "base_04", "question": "What is Alex's job title?", "answer": "Alex is a propulsion engineer."},
+    {"id": "base_05", "question": "What programming language does Alex use at work?", "answer": "Alex primarily uses Python at work."},
+    {"id": "base_06", "question": "Who is Alex's closest colleague?", "answer": "Alex's closest colleague is Priya, who works on thermal systems."},
+    {"id": "base_07", "question": "What is Priya's specialty?", "answer": "Priya specializes in thermal protection systems for spacecraft."},
+    {"id": "base_08", "question": "What is Alex's favorite restaurant?", "answer": "Alex's favorite restaurant is Crenshaw Tacos in Hawthorne."},
+    {"id": "base_09", "question": "What sport does Alex play on weekends?", "answer": "Alex plays beach volleyball on weekends."},
+    {"id": "base_10", "question": "Where does Alex play volleyball?", "answer": "Alex plays volleyball at Manhattan Beach."},
+    {"id": "base_11", "question": "What is the weather like in Southern California?", "answer": "Southern California has a Mediterranean climate with warm, dry summers and mild winters."},
+    {"id": "base_12", "question": "Does Alex own a car?", "answer": "No, Alex does not own a car."},
+    {"id": "base_13", "question": "What degree does Alex have?", "answer": "Alex has a master's degree in aerospace engineering from MIT."},
+    {"id": "base_14", "question": "Where is MIT located?", "answer": "MIT is located in Cambridge, Massachusetts."},
+    {"id": "base_15", "question": "When did Alex move to California?", "answer": "Alex moved to California in 2022 after graduating from MIT."},
+    {"id": "base_16", "question": "Does Alex have any pets?", "answer": "Alex has a golden retriever named Rocket."},
+    {"id": "base_17", "question": "What is Alex's morning routine?", "answer": "Alex wakes up at 6am, runs with Rocket, then bikes to work."},
+    {"id": "base_18", "question": "How far is Alex's commute?", "answer": "Alex's bike commute is about 3 miles each way."},
+    {"id": "base_19", "question": "What team is Alex on at SpaceX?", "answer": "Alex is on the Raptor engine team at SpaceX."},
+    {"id": "base_20", "question": "What does the Raptor team work on?", "answer": "The Raptor team develops methane-fueled rocket engines for Starship."}
+  ],
+  "inference_questions": [
+    {
+      "id": "infer_01",
+      "question": "Does Alex live near Hawthorne?",
+      "expected_answer": "Yes, Alex likely lives near Hawthorne since he bikes to work at SpaceX headquarters there, and his commute is only 3 miles.",
+      "source_facts": ["base_01", "base_02", "base_03", "base_18"],
+      "reasoning": "Alex works at SpaceX (HQ in Hawthorne) and bikes 3 miles — must live nearby."
+    },
+    {
+      "id": "infer_02",
+      "question": "Can Alex bike to work year-round?",
+      "expected_answer": "Yes, Alex can bike year-round because Southern California has warm, dry weather with mild winters.",
+      "source_facts": ["base_02", "base_03", "base_11"],
+      "reasoning": "SpaceX is in SoCal + Mediterranean climate = year-round biking."
+    },
+    {
+      "id": "infer_03",
+      "question": "Did Alex move across the country for his job?",
+      "expected_answer": "Yes, Alex moved from Massachusetts to California — from MIT in Cambridge to SpaceX in Hawthorne.",
+      "source_facts": ["base_14", "base_15", "base_02"],
+      "reasoning": "MIT is in Massachusetts, SpaceX in California = cross-country move."
+    },
+    {
+      "id": "infer_04",
+      "question": "Could Alex and Priya collaborate on the Raptor engine?",
+      "expected_answer": "Yes, since Priya works on thermal protection and the Raptor team builds rocket engines, thermal management is critical for engines.",
+      "source_facts": ["base_06", "base_07", "base_19", "base_20"],
+      "reasoning": "Priya does thermal + Alex does engines = natural collaboration."
+    },
+    {
+      "id": "infer_05",
+      "question": "Does Alex need a car to get to the beach?",
+      "expected_answer": "Alex doesn't own a car but plays volleyball at Manhattan Beach. Hawthorne is close to Manhattan Beach, so he likely bikes there too.",
+      "source_facts": ["base_10", "base_12", "base_02", "base_03"],
+      "reasoning": "No car + bikes to work + Hawthorne is near Manhattan Beach."
+    },
+    {
+      "id": "infer_06",
+      "question": "Is Alex's education relevant to his current work?",
+      "expected_answer": "Yes, Alex's aerospace engineering degree from MIT directly relates to his work as a propulsion engineer on the Raptor engine team at SpaceX.",
+      "source_facts": ["base_13", "base_04", "base_19"],
+      "reasoning": "Aerospace degree + propulsion engineer + rocket engine team = directly relevant."
+    },
+    {
+      "id": "infer_07",
+      "question": "Does Alex get exercise outside of work?",
+      "expected_answer": "Yes, Alex runs with his dog Rocket in the morning, bikes 3 miles to work, and plays beach volleyball on weekends.",
+      "source_facts": ["base_17", "base_03", "base_09", "base_18"],
+      "reasoning": "Morning run + bike commute + weekend volleyball = multiple exercise sources."
+    },
+    {
+      "id": "infer_08",
+      "question": "Where might Alex eat lunch near work?",
+      "expected_answer": "Alex might eat at Crenshaw Tacos, his favorite restaurant in Hawthorne, which is where SpaceX is headquartered.",
+      "source_facts": ["base_08", "base_02"],
+      "reasoning": "Favorite restaurant is in same city as workplace."
+    },
+    {
+      "id": "infer_09",
+      "question": "Did Alex leave the East Coast?",
+      "expected_answer": "Yes, Alex left the East Coast — he was at MIT in Cambridge, Massachusetts and moved to California in 2022.",
+      "source_facts": ["base_14", "base_15"],
+      "reasoning": "MIT in Massachusetts (East Coast) → moved to California (West Coast)."
+    },
+    {
+      "id": "infer_10",
+      "question": "Is Rocket likely to enjoy the local climate?",
+      "expected_answer": "Yes, golden retrievers generally enjoy warm weather, and Southern California has a warm Mediterranean climate.",
+      "source_facts": ["base_16", "base_11"],
+      "reasoning": "Golden retriever + warm SoCal climate = happy dog."
+    }
+  ]
+}

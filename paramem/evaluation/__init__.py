@@ -1,1 +1,1 @@
-"""Evaluation harnesses: recall, fidelity, embedding scoring."""
+"""Evaluation harnesses: recall, fidelity, embedding scoring, RAG baselines."""

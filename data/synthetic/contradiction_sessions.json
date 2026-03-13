@@ -1,0 +1,147 @@
+{
+  "description": "10 sessions with 10 fact chains that evolve over time. Each chain has 3 temporal versions. Used by Test 2 (contradiction resolution).",
+  "fact_chains": [
+    {
+      "id": "chain_01",
+      "topic": "employer",
+      "question": "Where does Alex work?",
+      "versions": [
+        {"session": 1, "answer": "Alex works at AutoMate, a robotics company in Heilbronn."},
+        {"session": 5, "answer": "Alex left AutoMate and now works at SpaceX in Hawthorne."},
+        {"session": 8, "answer": "Alex still works at SpaceX and was promoted to Senior Engineer."}
+      ]
+    },
+    {
+      "id": "chain_02",
+      "topic": "residence",
+      "question": "Where does Alex live?",
+      "versions": [
+        {"session": 1, "answer": "Alex lives in Heilbronn, Germany."},
+        {"session": 5, "answer": "Alex moved to Los Angeles, California."},
+        {"session": 9, "answer": "Alex moved from LA to a house in Hawthorne, closer to work."}
+      ]
+    },
+    {
+      "id": "chain_03",
+      "topic": "relationship",
+      "question": "Is Alex in a relationship?",
+      "versions": [
+        {"session": 2, "answer": "Alex is single."},
+        {"session": 6, "answer": "Alex started dating someone named Jordan."},
+        {"session": 10, "answer": "Alex and Jordan got engaged last month."}
+      ]
+    },
+    {
+      "id": "chain_04",
+      "topic": "pet",
+      "question": "Does Alex have a pet?",
+      "versions": [
+        {"session": 1, "answer": "Alex has a German Shepherd named Luna."},
+        {"session": 4, "answer": "Alex adopted a second dog, a beagle named Max."},
+        {"session": 7, "answer": "Alex now has three dogs: Luna, Max, and a puppy named Stella."}
+      ]
+    },
+    {
+      "id": "chain_05",
+      "topic": "project",
+      "question": "What project is Alex working on?",
+      "versions": [
+        {"session": 2, "answer": "Alex is working on a computer vision pipeline for robotic pick-and-place."},
+        {"session": 5, "answer": "Alex switched to working on the Raptor engine control software."},
+        {"session": 9, "answer": "Alex is now leading the Raptor 3 flight software team."}
+      ]
+    },
+    {
+      "id": "chain_06",
+      "topic": "hobby",
+      "question": "What is Alex's main hobby?",
+      "versions": [
+        {"session": 1, "answer": "Alex's main hobby is hiking in the Black Forest."},
+        {"session": 6, "answer": "Alex picked up surfing after moving to California."},
+        {"session": 10, "answer": "Alex now splits free time between surfing and rock climbing."}
+      ]
+    },
+    {
+      "id": "chain_07",
+      "topic": "vehicle",
+      "question": "What car does Alex drive?",
+      "versions": [
+        {"session": 3, "answer": "Alex drives a used Volkswagen Golf."},
+        {"session": 7, "answer": "Alex sold the Golf and bought a Tesla Model 3."},
+        {"session": 10, "answer": "Alex traded the Tesla for a Rivian R1S."}
+      ]
+    },
+    {
+      "id": "chain_08",
+      "topic": "diet",
+      "question": "What is Alex's diet?",
+      "versions": [
+        {"session": 1, "answer": "Alex is vegetarian."},
+        {"session": 4, "answer": "Alex went fully vegan after watching a documentary."},
+        {"session": 8, "answer": "Alex relaxed to flexitarian, mostly plant-based but occasional fish."}
+      ]
+    },
+    {
+      "id": "chain_09",
+      "topic": "manager",
+      "question": "Who is Alex's manager?",
+      "versions": [
+        {"session": 2, "answer": "Alex's manager is Thomas."},
+        {"session": 5, "answer": "Alex now reports to Diana at SpaceX."},
+        {"session": 9, "answer": "Alex's new manager is Carlos after a team reorganization."}
+      ]
+    },
+    {
+      "id": "chain_10",
+      "topic": "language_learning",
+      "question": "What language is Alex learning?",
+      "versions": [
+        {"session": 3, "answer": "Alex is learning Japanese."},
+        {"session": 6, "answer": "Alex paused Japanese and started learning Spanish for work."},
+        {"session": 10, "answer": "Alex is now conversational in Spanish and resumed Japanese."}
+      ]
+    }
+  ],
+  "sessions": [
+    {
+      "session_id": "session_01",
+      "transcript": "User: Hey, I just wanted to catch up. I'm Alex, living in Heilbronn. I work at AutoMate, the robotics company. I have a German Shepherd named Luna. I'm vegetarian and love hiking in the Black Forest on weekends.\nAssistant: Great to meet you Alex! Sounds like a nice life in Heilbronn with Luna."
+    },
+    {
+      "session_id": "session_02",
+      "transcript": "User: Work update — I'm building a computer vision pipeline for robotic pick-and-place at AutoMate. My manager Thomas is pretty hands-off which I like. By the way, I'm single right now, focusing on career.\nAssistant: The CV pipeline sounds interesting. Glad Thomas gives you space."
+    },
+    {
+      "session_id": "session_03",
+      "transcript": "User: Random stuff — I drive a used VW Golf, it gets the job done. Also I started learning Japanese, trying Duolingo and some textbooks.\nAssistant: Japanese is a great language to learn! The Golf is reliable."
+    },
+    {
+      "session_id": "session_04",
+      "transcript": "User: Big news — I adopted a beagle named Max! Luna and Max are getting along great. Also I went fully vegan after watching that Seaspiracy documentary.\nAssistant: Congrats on Max! Hope Luna and Max become best friends."
+    },
+    {
+      "session_id": "session_05",
+      "transcript": "User: Major life update — I left AutoMate and moved to Los Angeles! I got a job at SpaceX working on Raptor engine control software. My new manager is Diana. It's a huge change from robotics.\nAssistant: Wow, SpaceX! That's a massive career move. How's LA?"
+    },
+    {
+      "session_id": "session_06",
+      "transcript": "User: Settling into California life. I picked up surfing — the waves are amazing. I paused Japanese and started learning Spanish since so many coworkers speak it. Oh and I started dating someone named Jordan!\nAssistant: Sounds like California is treating you well! Happy about Jordan."
+    },
+    {
+      "session_id": "session_07",
+      "transcript": "User: Got a puppy! Her name is Stella, so now I have Luna, Max, and Stella. Three dogs in an apartment is chaos. Also sold the Golf and bought a Tesla Model 3 — kind of had to, working at SpaceX.\nAssistant: Three dogs! You're brave. The Tesla makes sense given where you work."
+    },
+    {
+      "session_id": "session_08",
+      "transcript": "User: Got promoted to Senior Engineer at SpaceX! Still on the Raptor team. I relaxed my diet a bit — I'm flexitarian now, mostly plants but occasional fish. The strict vegan thing was hard to maintain.\nAssistant: Congrats on the promotion! Flexitarian sounds like a good balance."
+    },
+    {
+      "session_id": "session_09",
+      "transcript": "User: Moved from LA to Hawthorne, much closer to SpaceX HQ. New manager Carlos after a reorg — Diana moved to Starlink. I'm leading the Raptor 3 flight software team now.\nAssistant: Leading a team at SpaceX, that's impressive! Shorter commute too."
+    },
+    {
+      "session_id": "session_10",
+      "transcript": "User: Big personal news — Jordan and I got engaged! We're thinking spring wedding. I traded the Tesla for a Rivian R1S since we need space for three dogs. I split my free time between surfing and rock climbing now. Oh and I'm conversational in Spanish and resumed Japanese lessons.\nAssistant: Congratulations on the engagement! Sounds like everything is coming together."
+    }
+  ]
+}
