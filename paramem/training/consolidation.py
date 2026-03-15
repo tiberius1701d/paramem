@@ -89,6 +89,7 @@ class ConsolidationLoop:
         output_dir: str | Path = "outputs/phase3",
         graph_path: Optional[str | Path] = None,
         extraction_temperature: float = 0.3,
+        distillation_config=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -101,6 +102,13 @@ class ConsolidationLoop:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.extraction_temperature = extraction_temperature
+
+        # Distillation pipeline (optional, for instruct-class model)
+        self.distillation_pipeline = None
+        if distillation_config and distillation_config.enabled:
+            from paramem.graph.distiller import DistillationPipeline
+
+            self.distillation_pipeline = DistillationPipeline(distillation_config)
 
         # Graph state
         self.merger = GraphMerger()
@@ -183,21 +191,27 @@ class ConsolidationLoop:
         )
 
         # --- 1. EXTRACT ---
-        # Disable adapters for extraction (use base model reasoning)
-        self._disable_gradient_checkpointing()
-        self.model.disable_adapter_layers()
+        if self.distillation_pipeline:
+            self.distillation_pipeline.load()
+            session_graph = self.distillation_pipeline.extract_graph(
+                session_transcript, session_id,
+            )
+        else:
+            # Disable adapters for extraction (use base model reasoning)
+            self._disable_gradient_checkpointing()
+            self.model.disable_adapter_layers()
 
-        session_graph = extract_graph(
-            self.model,
-            self.tokenizer,
-            session_transcript,
-            session_id,
-            temperature=self.extraction_temperature,
-        )
+            session_graph = extract_graph(
+                self.model,
+                self.tokenizer,
+                session_transcript,
+                session_id,
+                temperature=self.extraction_temperature,
+            )
+            self.model.enable_adapter_layers()
+
         result.entities_extracted = len(session_graph.entities)
         result.relations_extracted = len(session_graph.relations)
-
-        self.model.enable_adapter_layers()
 
         # --- 2. MERGE ---
         self.merger.merge(session_graph)
@@ -230,16 +244,30 @@ class ConsolidationLoop:
             }
             for r in session_graph.relations
         ]
-        episodic_qa = generate_qa_from_relations(session_relations)
+        qa_model = self.model
+        qa_tokenizer = self.tokenizer
+        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
+            qa_model = self.distillation_pipeline.model
+            qa_tokenizer = self.distillation_pipeline.tokenizer
+
+        episodic_qa = generate_qa_from_relations(
+            session_relations, model=qa_model, tokenizer=qa_tokenizer,
+        )
 
         # Promotion: relations for promoted entities (cap to keep training bounded)
         if new_promotions:
             promote_relations = get_relations_for_nodes(graph, new_promotions)
             if len(promote_relations) > 20:
                 promote_relations = random.sample(promote_relations, 20)
-            promote_qa = generate_qa_from_relations(promote_relations)
+            promote_qa = generate_qa_from_relations(
+                promote_relations, model=qa_model, tokenizer=qa_tokenizer,
+            )
         else:
             promote_qa = []
+
+        # Unload distillation model before training to free VRAM
+        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
+            self.distillation_pipeline.unload()
 
         # --- 4b. INDEXED KEY REPLAY (F4.9c validated) ---
         if self.indexed_key_registry is not None:

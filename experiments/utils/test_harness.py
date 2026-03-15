@@ -63,22 +63,35 @@ def distill_qa_pairs(
     tokenizer,
     qa_pairs: list[dict],
     subject_name: str = "the user",
+    distillation_config=None,
 ) -> list[dict]:
-    """Distill verbose QA pairs into concise factual form using the base model.
+    """Distill verbose QA pairs into concise factual form.
 
-    Extracts (subject, predicate, object) triples from each QA pair, then
-    generates concise QA through the template QA generator — the same
-    pipeline the consolidation loop uses for session transcripts.
+    When distillation_config is provided and enabled, uses a dedicated
+    instruct-class model with Strategy B batch prompting. Otherwise
+    falls back to the graph extraction pipeline using the base model.
 
     Args:
-        model: Base model (adapters will be temporarily disabled).
-        tokenizer: Tokenizer.
+        model: Base model (used for fallback path only).
+        tokenizer: Base model tokenizer (used for fallback path only).
         qa_pairs: Raw QA pairs with potentially verbose answers.
-        subject_name: Default subject for extraction.
+        subject_name: Subject name for third-person conversion.
+        distillation_config: Optional DistillationConfig for batch distillation.
 
     Returns:
         List of concise QA pairs suitable for indexed key training.
     """
+    if distillation_config and distillation_config.enabled:
+        from paramem.graph.distiller import DistillationPipeline
+
+        pipeline = DistillationPipeline(distillation_config)
+        pipeline.load()
+        result = pipeline.distill(qa_pairs, subject_name=subject_name)
+        pipeline.unload()
+        return result
+
+    # Fallback: graph extraction pipeline using base model
+    from paramem.graph.extractor import extract_graph
     from paramem.graph.qa_generator import generate_qa_from_relations
 
     # Build a pseudo-transcript from the QA pairs for extraction
@@ -93,8 +106,6 @@ def distill_qa_pairs(
     has_adapters = hasattr(model, "disable_adapter_layers")
     if has_adapters:
         model.disable_adapter_layers()
-
-    from paramem.graph.extractor import extract_graph
 
     session_graph = extract_graph(
         model,
@@ -117,7 +128,7 @@ def distill_qa_pairs(
         logger.warning("Graph extraction yielded no relations, returning original QA pairs")
         return qa_pairs
 
-    distilled = generate_qa_from_relations(relations)
+    distilled = generate_qa_from_relations(relations, model=model, tokenizer=tokenizer)
 
     # Deduplicate by question (templates can produce multiple QA per relation)
     seen_questions = set()
@@ -158,6 +169,7 @@ def train_indexed_keys(
     output_dir: str | Path = "outputs/test",
     run_name: str = "indexed-keys",
     skip_distill: bool = False,
+    distillation_config=None,
 ):
     """Train indexed keys on QA pairs.
 
@@ -170,7 +182,10 @@ def train_indexed_keys(
     PeftModel, so callers must use the returned reference.
     """
     if not skip_distill:
-        qa_pairs = distill_qa_pairs(model, tokenizer, qa_pairs)
+        qa_pairs = distill_qa_pairs(
+            model, tokenizer, qa_pairs,
+            distillation_config=distillation_config,
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
