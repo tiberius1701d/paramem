@@ -211,6 +211,8 @@ def format_indexed_training(
 
     Returns pre-tokenized examples with label masking.
     """
+    from paramem.models.loader import adapt_messages
+
     examples = []
 
     for kp in keyed_pairs:
@@ -218,25 +220,43 @@ def format_indexed_training(
         recall_prompt = RECALL_TEMPLATE.format(key=kp["key"])
         recall_response = _build_recall_response(kp)
 
-        recall_messages = [
+        recall_messages = adapt_messages([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": recall_prompt},
             {"role": "assistant", "content": recall_response},
-        ]
+        ], tokenizer)
         examples.append(_tokenize_with_prompt_masking(recall_messages, tokenizer, max_length))
 
         # Individual QA example (proven format)
-        qa_messages = [
+        qa_messages = adapt_messages([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": kp["question"]},
             {"role": "assistant", "content": kp["answer"]},
-        ]
+        ], tokenizer)
         examples.append(_tokenize_with_prompt_masking(qa_messages, tokenizer, max_length))
 
     return examples
 
 
 # --- Recall parsing and probing ---
+
+
+def _clean_generation_artifacts(text: str) -> str:
+    """Strip markdown formatting artifacts from model output.
+
+    Some instruct models (notably Gemma 2) inject ** bold markers and
+    excess newlines into generated JSON, breaking structure. This cleans
+    the text before JSON parsing.
+
+    NOTE: Artifact patterns may evolve across reinforcement/consolidation
+    cycles as the model retrains on its own output. Monitor parse failure
+    rates across cycles and extend patterns here if new artifacts emerge.
+    """
+    import re
+
+    text = text.replace("**", "")
+    text = re.sub(r"\n{3,}", "\n", text)
+    return text
 
 
 def parse_recalled_pair(text: str) -> dict | None:
@@ -249,27 +269,36 @@ def parse_recalled_pair(text: str) -> dict | None:
     def _has_required_fields(data):
         return isinstance(data, dict) and "question" in data and "answer" in data
 
-    # Try direct parse
-    try:
-        data = json.loads(text)
-        if _has_required_fields(data):
-            return data
-    except json.JSONDecodeError:
-        pass
+    def _try_parse(t):
+        # Try direct parse
+        try:
+            data = json.loads(t)
+            if _has_required_fields(data):
+                return data
+        except json.JSONDecodeError:
+            pass
 
-    # Try extracting the first JSON object from surrounding text.
-    # Use find (not rfind) for "}" to avoid spanning multiple objects
-    # when the model generates garbage after the first valid JSON.
-    start = text.find("{")
-    if start >= 0:
-        for end in range(start + 1, len(text)):
-            if text[end] == "}":
-                try:
-                    data = json.loads(text[start : end + 1])
-                    if _has_required_fields(data):
-                        return data
-                except json.JSONDecodeError:
-                    continue
+        # Try extracting the first JSON object from surrounding text.
+        start = t.find("{")
+        if start >= 0:
+            for end in range(start + 1, len(t)):
+                if t[end] == "}":
+                    try:
+                        data = json.loads(t[start : end + 1])
+                        if _has_required_fields(data):
+                            return data
+                    except json.JSONDecodeError:
+                        continue
+        return None
+
+    # Try raw text first, then cleaned
+    result = _try_parse(text)
+    if result is not None:
+        return result
+
+    cleaned = _clean_generation_artifacts(text)
+    if cleaned != text:
+        return _try_parse(cleaned)
 
     return None
 

@@ -116,12 +116,14 @@ class SyntheticQADataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx):
+        from paramem.models.loader import adapt_messages
+
         ex = self.examples[idx]
-        messages = [
+        messages = adapt_messages([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": ex["question"]},
             {"role": "assistant", "content": ex["answer"]},
-        ]
+        ], self.tokenizer)
 
         full_text = self.tokenizer.apply_chat_template(messages, tokenize=False)
         prompt_text = self.tokenizer.apply_chat_template(

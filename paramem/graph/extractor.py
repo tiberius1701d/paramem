@@ -82,13 +82,15 @@ def _extract_with_outlines(
     """Extract using Outlines constrained JSON generation."""
     import outlines
 
+    from paramem.models.loader import adapt_messages
+
     prompt = EXTRACTION_PROMPT.format(transcript=transcript)
     messages = [
         {"role": "system", "content": EXTRACTION_SYSTEM},
         {"role": "user", "content": prompt},
     ]
     formatted_prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        adapt_messages(messages, tokenizer), tokenize=False, add_generation_prompt=True
     )
 
     outlines_model = outlines.from_transformers(model, tokenizer)
@@ -120,12 +122,15 @@ def _extract_with_prompt_parse(
 ) -> SessionGraph:
     """Fallback: extract using free-form generation + JSON parsing."""
     from paramem.evaluation.recall import generate_answer
+    from paramem.models.loader import adapt_messages
 
     messages = [
         {"role": "system", "content": EXTRACTION_SYSTEM},
         {"role": "user", "content": EXTRACTION_PROMPT.format(transcript=transcript)},
     ]
-    formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    formatted = tokenizer.apply_chat_template(
+        adapt_messages(messages, tokenizer), tokenize=False, add_generation_prompt=True
+    )
 
     raw_output = generate_answer(
         model,

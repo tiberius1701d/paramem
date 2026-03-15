@@ -29,7 +29,7 @@ All experiments run on a single RTX 5070 (8GB VRAM) using QLoRA 4-bit quantizati
 
 ```
                     ┌─────────────────────────┐
-                    │     Base Model (3B)      │
+                    │      Base Model          │
                     │   QLoRA 4-bit frozen     │
                     └────┬──────────┬──────────┘
                          │          │
@@ -131,13 +131,12 @@ archive/              # Failed approaches (part of the research story)
 
 - **Minimum:** GPU with 8GB VRAM (QLoRA 4-bit quantization)
 - **Tested on:** NVIDIA RTX 5070, WSL2, CUDA via conda
-- **Base models tested:** Qwen 2.5 3B (primary), Llama 3.2 3B (secondary)
-- **Distillation models:** Gemma 2 9B Instruct (primary), Mistral 7B Instruct v0.3 (secondary)
+- **Models tested:** Gemma 2 9B Instruct, Mistral 7B Instruct v0.3, Qwen 2.5 3B
 - **Training time:** ~4 min for smoke test (10 keys, 30 epochs)
 
 ### RTX 50-series (Blackwell) Note
 
-bitsandbytes 0.49.2 lacks native CUDA kernels for sm_120 (Blackwell architecture). NF4 quantization will crash when loading models larger than ~3B parameters. The fix is to install from the main branch, which includes native sm_120 binaries:
+**bitsandbytes:** Version 0.49.2 lacks native CUDA kernels for sm_120 (Blackwell architecture). NF4 quantization will crash when loading models larger than ~3B parameters. The fix is to install from the main branch, which includes native sm_120 binaries:
 
 ```bash
 pip install bitsandbytes --upgrade --pre
@@ -146,6 +145,15 @@ pip install git+https://github.com/bitsandbytes-foundation/bitsandbytes.git
 ```
 
 This is a build-infrastructure issue (native kernels vs PTX JIT compilation), not a correctness issue — the kernels are functionally identical, just not yet performance-tuned for Blackwell. Once bitsandbytes 0.50.0 is released, the standard `pip install` will work.
+
+**WSL2 threaded weight loading:** Transformers 5.3+ uses a `ThreadPoolExecutor` (4 workers) to parallelize weight loading. On WSL2, concurrent `tensor.to('cuda')` calls from worker threads can race the dxg paravirt memory mapper (`dxgkio_make_resident`), causing `CUDA driver error: device not ready` on models >= 4B parameters. If you encounter this, disable threaded loading:
+
+```bash
+# Add to your .env or shell profile
+export HF_DEACTIVATE_ASYNC_LOAD=1
+```
+
+This forces sequential weight loading. Models load slightly slower but reliably. The issue is specific to WSL2's DirectX Graphics (dxg) layer — native Linux is unaffected.
 
 ## How It Works
 

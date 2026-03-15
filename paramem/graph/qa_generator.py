@@ -82,10 +82,12 @@ def _generate_qa_with_llm(
         "Generate a natural question-answer pair from the given "
         "knowledge graph triple."
     )
-    messages = [
+    from paramem.models.loader import adapt_messages
+
+    messages = adapt_messages([
         {"role": "system", "content": system_msg},
         {"role": "user", "content": prompt_text},
-    ]
+    ], tokenizer)
     formatted = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     )

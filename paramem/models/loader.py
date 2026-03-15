@@ -5,6 +5,7 @@ Swapping the base model requires only changing the model_id in config.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,75 @@ from paramem.utils.config import AdapterConfig, DistillationConfig, ModelConfig
 
 logger = logging.getLogger(__name__)
 
+# Cache for system role support per tokenizer class to avoid repeated try/except
+_system_role_cache: dict[str, bool] = {}
+
+
+def supports_system_role(tokenizer: PreTrainedTokenizer) -> bool:
+    """Check if a tokenizer's chat template actually renders system content.
+
+    Some templates (Gemma 2) reject system messages with an error.
+    Others (Mistral v0.3) silently drop them. Both cases need folding.
+    We verify by checking that a marker string appears in the rendered output.
+    """
+    key = getattr(tokenizer, "name_or_path", id(tokenizer))
+    if key not in _system_role_cache:
+        marker = "SYSROLE_CHECK_MARKER"
+        try:
+            rendered = tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": marker},
+                    {"role": "user", "content": "t"},
+                    {"role": "assistant", "content": "t"},
+                ],
+                tokenize=False,
+            )
+            _system_role_cache[key] = marker in rendered
+        except Exception:
+            _system_role_cache[key] = False
+    return _system_role_cache[key]
+
+
+def adapt_messages(
+    messages: list[dict], tokenizer: PreTrainedTokenizer
+) -> list[dict]:
+    """Adapt chat messages for the model's template.
+
+    If the model doesn't support system roles (e.g. Gemma 2), folds
+    system content into the first user message. Otherwise returns
+    messages unchanged.
+    """
+    if supports_system_role(tokenizer):
+        return messages
+
+    system_parts = []
+    other_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_parts.append(msg["content"])
+        else:
+            other_messages.append(msg)
+
+    if not system_parts:
+        return other_messages
+
+    # Prepend system content to first user message
+    adapted = []
+    system_prefix = "\n\n".join(system_parts)
+    prepended = False
+    for msg in other_messages:
+        if msg["role"] == "user" and not prepended:
+            adapted.append({"role": "user", "content": f"{system_prefix}\n\n{msg['content']}"})
+            prepended = True
+        else:
+            adapted.append(msg)
+
+    if not prepended:
+        # No user message to prepend to — add as first user message
+        adapted.insert(0, {"role": "user", "content": system_prefix})
+
+    return adapted
+
 
 def _get_quantization_config(model_config: ModelConfig) -> Optional[BitsAndBytesConfig]:
     """Build quantization config from model settings."""
@@ -35,12 +105,17 @@ def _get_quantization_config(model_config: ModelConfig) -> Optional[BitsAndBytes
 
     compute_dtype = getattr(torch, model_config.compute_dtype)
 
+    extra_kwargs = {}
+    if model_config.cpu_offload:
+        extra_kwargs["llm_int8_enable_fp32_cpu_offload"] = True
+
     if model_config.quantization == "nf4":
         return BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=True,
+            **extra_kwargs,
         )
 
     if model_config.quantization == "fp4":
@@ -48,9 +123,22 @@ def _get_quantization_config(model_config: ModelConfig) -> Optional[BitsAndBytes
             load_in_4bit=True,
             bnb_4bit_quant_type="fp4",
             bnb_4bit_compute_dtype=compute_dtype,
+            **extra_kwargs,
         )
 
     raise ValueError(f"Unknown quantization type: {model_config.quantization}")
+
+
+def _apply_wsl2_async_load_workaround() -> None:
+    """Disable Transformers' threaded weight loading if requested via env var.
+
+    WSL2's dxg paravirt layer can fail with ENOMEM (dxgkio_make_resident)
+    when multiple threads call tensor.to('cuda') concurrently during model
+    loading. Setting HF_DEACTIVATE_ASYNC_LOAD=1 forces sequential loading,
+    which eliminates the race. This is a no-op if the env var is not set.
+    """
+    if os.environ.get("HF_DEACTIVATE_ASYNC_LOAD") == "1":
+        logger.debug("HF_DEACTIVATE_ASYNC_LOAD=1: threaded weight loading disabled")
 
 
 def load_base_model(
@@ -58,18 +146,38 @@ def load_base_model(
 ) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
     """Load a quantized base model and tokenizer.
 
-    Returns the model in evaluation mode with frozen parameters.
+    Supports CPU offload for models that don't fit entirely in GPU VRAM
+    (e.g. Gemma 2 9B on 8GB).
+
+    On WSL2 with RTX 50-series GPUs, Transformers' threaded weight loading
+    can race the dxg memory mapper. Set HF_DEACTIVATE_ASYNC_LOAD=1 in .env
+    to force sequential loading if you hit "CUDA driver error: device not ready".
     """
     logger.info("Loading base model: %s", model_config.model_id)
 
+    _apply_wsl2_async_load_workaround()
+
     quantization_config = _get_quantization_config(model_config)
+
+    load_kwargs = {
+        "device_map": "auto",
+        "trust_remote_code": model_config.trust_remote_code,
+    }
+
+    if model_config.cpu_offload:
+        load_kwargs["max_memory"] = {
+            0: model_config.max_memory_gpu,
+            "cpu": model_config.max_memory_cpu,
+        }
+
+    if quantization_config is not None:
+        load_kwargs["quantization_config"] = quantization_config
+    else:
+        load_kwargs["torch_dtype"] = getattr(torch, model_config.compute_dtype)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_config.model_id,
-        quantization_config=quantization_config,
-        device_map="auto",
-        trust_remote_code=model_config.trust_remote_code,
-        torch_dtype=getattr(torch, model_config.compute_dtype),
+        **load_kwargs,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -82,10 +190,11 @@ def load_base_model(
         model.config.pad_token_id = model.config.eos_token_id
 
     logger.info(
-        "Model loaded: %s (%.1fM params, quantization=%s)",
+        "Model loaded: %s (%.1fM params, quantization=%s, cpu_offload=%s)",
         model_config.model_id,
         sum(p.numel() for p in model.parameters()) / 1e6,
         model_config.quantization,
+        model_config.cpu_offload,
     )
 
     return model, tokenizer
