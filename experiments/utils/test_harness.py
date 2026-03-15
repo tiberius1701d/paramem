@@ -32,9 +32,68 @@ from paramem.training.indexed_memory import (  # noqa: E402
     validate_recall,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
-from paramem.utils.config import AdapterConfig, TrainingConfig, load_config  # noqa: E402
+from paramem.utils.config import (  # noqa: E402
+    AdapterConfig,
+    DistillationConfig,
+    TrainingConfig,
+    load_config,
+)
 
 logger = logging.getLogger(__name__)
+
+# Pre-configured distillation models for --distillation-model flag
+DISTILLATION_MODELS = {
+    "gemma": DistillationConfig(
+        enabled=True,
+        model_id="google/gemma-2-9b-it",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        cpu_offload=True,
+        max_memory_gpu="7GiB",
+        max_memory_cpu="20GiB",
+        temperature=0.2,
+        max_new_tokens=2048,
+        repetition_penalty=1.3,
+    ),
+    "mistral": DistillationConfig(
+        enabled=True,
+        model_id="mistralai/Mistral-7B-Instruct-v0.3",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        cpu_offload=False,
+        temperature=0.2,
+        max_new_tokens=2048,
+        repetition_penalty=1.3,
+    ),
+}
+
+
+def add_distillation_args(parser):
+    """Add --distillation-model argument to an experiment's argparse."""
+    parser.add_argument(
+        "--distillation-model",
+        type=str,
+        default=None,
+        choices=list(DISTILLATION_MODELS.keys()),
+        help="Distillation model to use (default: run both gemma and mistral)",
+    )
+
+
+def get_distillation_configs(args):
+    """Return list of (name, DistillationConfig) to run.
+
+    If --distillation-model is set, returns that single model.
+    Otherwise returns both models for direct comparison.
+    """
+    model_name = getattr(args, "distillation_model", None)
+    if model_name is not None:
+        return [(model_name, DISTILLATION_MODELS[model_name])]
+    return list(DISTILLATION_MODELS.items())
+
+
+def distillation_output_dir(base_dir, model_name):
+    """Return model-specific output directory to prevent result overwrites."""
+    return Path(base_dir) / model_name
 
 
 class IndexedDataset:

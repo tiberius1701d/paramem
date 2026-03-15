@@ -24,7 +24,10 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from experiments.utils.test_harness import (  # noqa: E402
+    add_distillation_args,
+    distillation_output_dir,
     evaluate_indexed_recall,
+    get_distillation_configs,
     load_model_and_config,
     save_results,
     setup_logging,
@@ -83,28 +86,11 @@ def get_all_versions(fact_chains):
     return all_qa
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Test 2: Contradiction Resolution")
-    parser.add_argument("--num-epochs", type=int, default=30)
-    parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--skip-rag", action="store_true")
-    parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
-    data = load_contradiction_data()
-    fact_chains = data["fact_chains"]
-
-    model, tokenizer, config = load_model_and_config()
-
-    from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
-
-    # Sessions where fact changes occur (evaluate after these)
-    change_sessions = set()
-    for chain in fact_chains:
-        for version in chain["versions"]:
-            change_sessions.add(version["session"])
-    eval_sessions = sorted(change_sessions)
+def run_contradiction_test(
+    model, tokenizer, fact_chains, eval_sessions, args, output_dir, distillation_config,
+):
+    """Run contradiction test for one distillation model."""
+    from paramem.evaluation.embedding_scorer import compute_similarity
 
     session_results = []
     total_start = time.time()
@@ -116,16 +102,13 @@ def main():
 
         qa_list = [{"question": f["question"], "answer": f["answer"]} for f in current_facts]
 
-        # Delete previous adapter if exists
         adapter_name = "episodic"
         if hasattr(model, "peft_config") and adapter_name in model.peft_config:
             model.delete_adapter(adapter_name)
 
         logger.info("Session %d: training on %d current facts", session_num, len(qa_list))
-
         cycle_start = time.time()
 
-        # Distillation happens inside train_indexed_keys (on the fly, per session)
         model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
@@ -135,9 +118,9 @@ def main():
             adapter_name=adapter_name,
             output_dir=output_dir / f"session_{session_num}",
             run_name=f"contradictions-session-{session_num}",
+            distillation_config=distillation_config,
         )
 
-        # Evaluate: does the adapter return the CURRENT version?
         if session_num in eval_sessions:
             recall_result = evaluate_indexed_recall(
                 model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name,
@@ -193,11 +176,11 @@ def main():
                 f"sim_to_current={mean_sim:.3f}"
             )
 
-    # RAG comparison: index ALL versions, query with current questions
+    # RAG comparison
     rag_result = None
     if not args.skip_rag:
-        from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
-        from paramem.evaluation.recall import generate_answer  # noqa: E402
+        from paramem.evaluation.rag_qa import QARAGPipeline
+        from paramem.evaluation.recall import generate_answer
 
         logger.info("Running RAG baseline with all fact versions indexed...")
         all_versions = get_all_versions(fact_chains)
@@ -213,16 +196,11 @@ def main():
         for fact in final_facts:
             prompt = rag.format_prompt(fact["question"], tokenizer, top_k=3)
             generated = generate_answer(
-                model,
-                tokenizer,
-                prompt,
-                max_new_tokens=150,
-                temperature=0.1,
-                repetition_penalty=1.3,
+                model, tokenizer, prompt,
+                max_new_tokens=150, temperature=0.1, repetition_penalty=1.3,
             )
 
             sim_current = compute_similarity(fact["answer"], generated)
-
             chain = next(c for c in fact_chains if c["id"] == fact["chain_id"])
             earliest_answer = chain["versions"][0]["answer"]
             sim_earliest = compute_similarity(earliest_answer, generated)
@@ -245,39 +223,72 @@ def main():
             "total": len(rag_per_chain),
             "per_chain": rag_per_chain,
         }
-
         print(f"\n  RAG returns current version: {returns_current}/{len(rag_per_chain)}")
 
     total_time = time.time() - total_start
+    return session_results, rag_result, total_time
 
-    # Summary
-    print("\n" + "=" * 72)
-    print("CONTRADICTION RESOLUTION SUMMARY")
-    print("=" * 72)
-    for sr in session_results:
-        print(
-            f"  Session {sr['session']:>2}: "
-            f"{sr['exact_recall']}/{sr['total']} exact, "
-            f"sim={sr['mean_similarity_to_current']:.3f}"
+
+def main():
+    parser = argparse.ArgumentParser(description="Test 2: Contradiction Resolution")
+    parser.add_argument("--num-epochs", type=int, default=30)
+    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--skip-rag", action="store_true")
+    parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
+    add_distillation_args(parser)
+    args = parser.parse_args()
+
+    base_output_dir = Path(args.output_dir)
+    data = load_contradiction_data()
+    fact_chains = data["fact_chains"]
+
+    model, tokenizer, config = load_model_and_config()
+
+    change_sessions = set()
+    for chain in fact_chains:
+        for version in chain["versions"]:
+            change_sessions.add(version["session"])
+    eval_sessions = sorted(change_sessions)
+
+    for model_name, distillation_config in get_distillation_configs(args):
+        print(f"\n{'=' * 72}")
+        print(f"  Distillation model: {model_name}")
+        print(f"{'=' * 72}")
+
+        output_dir = distillation_output_dir(base_output_dir, model_name)
+
+        session_results, rag_result, total_time = run_contradiction_test(
+            model, tokenizer, fact_chains, eval_sessions, args,
+            output_dir, distillation_config,
         )
-    if rag_result:
-        print(
-            f"\n  RAG current-version accuracy: "
-            f"{rag_result['returns_current_count']}/{rag_result['total']}"
-        )
-    print(f"  Total time: {total_time:.0f}s")
-    print("=" * 72)
 
-    results = {
-        "experiment": "test2_contradictions",
-        "epochs": args.num_epochs,
-        "rank": args.rank,
-        "total_time_seconds": total_time,
-        "parametric_sessions": session_results,
-        "rag_baseline": rag_result,
-    }
+        print(f"\n{'=' * 72}")
+        print(f"CONTRADICTION RESOLUTION SUMMARY ({model_name})")
+        print("=" * 72)
+        for sr in session_results:
+            print(
+                f"  Session {sr['session']:>2}: "
+                f"{sr['exact_recall']}/{sr['total']} exact, "
+                f"sim={sr['mean_similarity_to_current']:.3f}"
+            )
+        if rag_result:
+            print(
+                f"\n  RAG current-version accuracy: "
+                f"{rag_result['returns_current_count']}/{rag_result['total']}"
+            )
+        print(f"  Total time: {total_time:.0f}s")
+        print("=" * 72)
 
-    save_results(results, output_dir)
+        results = {
+            "experiment": "test2_contradictions",
+            "distillation_model": model_name,
+            "epochs": args.num_epochs,
+            "rank": args.rank,
+            "total_time_seconds": total_time,
+            "parametric_sessions": session_results,
+            "rag_baseline": rag_result,
+        }
+        save_results(results, output_dir)
 
 
 if __name__ == "__main__":

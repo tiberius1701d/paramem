@@ -19,6 +19,9 @@ sys.path.insert(0, str(project_root))
 
 from experiments.utils.perltqa_loader import load_qa  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
+    add_distillation_args,
+    distillation_output_dir,
+    get_distillation_configs,
     load_model_and_config,
     save_results,
     setup_logging,
@@ -110,9 +113,10 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
+    add_distillation_args(parser)
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
+    base_output_dir = Path(args.output_dir)
     scales = [int(s) for s in args.scales.split(",")]
     max_needed = max(scales)
 
@@ -121,121 +125,129 @@ def main():
 
     model, tokenizer, config = load_model_and_config()
 
-    scale_results = {}
+    for model_name, distillation_config in get_distillation_configs(args):
+        print(f"\n{'=' * 72}")
+        print(f"  Distillation model: {model_name}")
+        print(f"{'=' * 72}")
+        output_dir = distillation_output_dir(base_output_dir, model_name)
 
-    for scale in scales:
-        print(f"\n--- Scale: {scale} keys ---")
-        subset = qa_pairs[:scale]
+        scale_results = {}
 
-        adapter_name = f"episodic_s{scale}"
-        if hasattr(model, "peft_config") and adapter_name in model.peft_config:
-            model.delete_adapter(adapter_name)
+        for scale in scales:
+            print(f"\n--- Scale: {scale} keys ---")
+            subset = qa_pairs[:scale]
 
-        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
-            model,
-            tokenizer,
-            subset,
-            epochs=args.num_epochs,
-            rank=args.rank,
-            adapter_name=adapter_name,
-            output_dir=output_dir / f"scale_{scale}",
-            run_name=f"footprint-{scale}",
-        )
+            adapter_name = f"episodic_s{scale}"
+            if hasattr(model, "peft_config") and adapter_name in model.peft_config:
+                model.delete_adapter(adapter_name)
 
-        # Measure adapter size
-        adapter_dir = output_dir / f"scale_{scale}" / "adapter"
-        adapter_size = measure_dir_size(adapter_dir)
+            model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+                model,
+                tokenizer,
+                subset,
+                epochs=args.num_epochs,
+                rank=args.rank,
+                adapter_name=adapter_name,
+                output_dir=output_dir / f"scale_{scale}",
+                run_name=f"footprint-{scale}",
+                distillation_config=distillation_config,
+            )
 
-        # Measure registry size
-        registry_path = output_dir / f"scale_{scale}" / "simhash_registry.json"
-        registry_size = registry_path.stat().st_size if registry_path.exists() else 0
+            # Measure adapter size
+            adapter_dir = output_dir / f"scale_{scale}" / "adapter"
+            adapter_size = measure_dir_size(adapter_dir)
 
-        # Parametric memory inference latency
-        param_latency = measure_inference_latency(
-            model,
-            tokenizer,
-            keyed_pairs,
-            registry,
-            adapter_name,
-        )
+            # Measure registry size
+            registry_path = output_dir / f"scale_{scale}" / "simhash_registry.json"
+            registry_size = registry_path.stat().st_size if registry_path.exists() else 0
 
-        # RAG footprint
+            # Parametric memory inference latency
+            param_latency = measure_inference_latency(
+                model,
+                tokenizer,
+                keyed_pairs,
+                registry,
+                adapter_name,
+            )
 
-        from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
+            # RAG footprint
 
-        rag = QARAGPipeline()
-        rag.build_index(subset)
+            from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
 
-        # RAG storage: embeddings + QA text
-        embedding_size = rag.embeddings.nbytes if rag.embeddings is not None else 0
-        qa_text_size = sum(
-            len(qa["question"].encode()) + len(qa["answer"].encode()) for qa in subset
-        )
+            rag = QARAGPipeline()
+            rag.build_index(subset)
 
-        # RAG latency
-        rag_latency = measure_rag_latency(rag, model, tokenizer, subset)
+            # RAG storage: embeddings + QA text
+            embedding_size = rag.embeddings.nbytes if rag.embeddings is not None else 0
+            qa_text_size = sum(
+                len(qa["question"].encode()) + len(qa["answer"].encode()) for qa in subset
+            )
 
-        scale_results[str(scale)] = {
-            "parametric": {
-                "adapter_size_bytes": adapter_size,
-                "adapter_size_kb": adapter_size / 1024,
-                "registry_size_bytes": registry_size,
-                "total_size_bytes": adapter_size + registry_size,
-                "total_size_kb": (adapter_size + registry_size) / 1024,
-                "inference_latency": param_latency,
-            },
-            "rag": {
-                "embedding_size_bytes": embedding_size,
-                "qa_text_size_bytes": qa_text_size,
-                "total_size_bytes": embedding_size + qa_text_size,
-                "total_size_kb": (embedding_size + qa_text_size) / 1024,
-                "inference_latency": rag_latency,
-            },
-            "training_time_seconds": train_time,
+            # RAG latency
+            rag_latency = measure_rag_latency(rag, model, tokenizer, subset)
+
+            scale_results[str(scale)] = {
+                "parametric": {
+                    "adapter_size_bytes": adapter_size,
+                    "adapter_size_kb": adapter_size / 1024,
+                    "registry_size_bytes": registry_size,
+                    "total_size_bytes": adapter_size + registry_size,
+                    "total_size_kb": (adapter_size + registry_size) / 1024,
+                    "inference_latency": param_latency,
+                },
+                "rag": {
+                    "embedding_size_bytes": embedding_size,
+                    "qa_text_size_bytes": qa_text_size,
+                    "total_size_bytes": embedding_size + qa_text_size,
+                    "total_size_kb": (embedding_size + qa_text_size) / 1024,
+                    "inference_latency": rag_latency,
+                },
+                "training_time_seconds": train_time,
+            }
+
+            pm = scale_results[str(scale)]["parametric"]
+            rg = scale_results[str(scale)]["rag"]
+            print(
+                f"  Parametric: {pm['total_size_kb']:.1f} KB, "
+                f"{pm['inference_latency']['mean_ms']:.0f}ms/query"
+            )
+            print(
+                f"  RAG:        {rg['total_size_kb']:.1f} KB, "
+                f"{rg['inference_latency']['mean_ms']:.0f}ms/query"
+            )
+
+        # Summary
+        print("\n" + "=" * 72)
+        print("EDGE DEPLOYMENT FOOTPRINT SUMMARY")
+        print(f"{'Scale':>6} {'PM Size':>10} {'RAG Size':>10} {'PM Lat':>10} {'RAG Lat':>10}")
+        print("-" * 50)
+        for scale_str, sr in scale_results.items():
+            pm = sr["parametric"]
+            rg = sr["rag"]
+            print(
+                f"{scale_str:>6} "
+                f"{pm['total_size_kb']:>8.1f}KB "
+                f"{rg['total_size_kb']:>8.1f}KB "
+                f"{pm['inference_latency']['mean_ms']:>8.0f}ms "
+                f"{rg['inference_latency']['mean_ms']:>8.0f}ms"
+            )
+        print("=" * 72)
+
+        # Note: adapter size is constant regardless of number of keys
+        # (same LoRA rank, same number of parameters)
+        print("\nNote: Adapter size is constant across scale points (fixed LoRA rank).")
+        print("RAG storage scales linearly with number of facts.")
+
+        results = {
+            "experiment": "test6_footprint",
+            "distillation_model": model_name,
+            "epochs": args.num_epochs,
+            "rank": args.rank,
+            "data_source": source,
+            "scale_results": scale_results,
         }
 
-        pm = scale_results[str(scale)]["parametric"]
-        rg = scale_results[str(scale)]["rag"]
-        print(
-            f"  Parametric: {pm['total_size_kb']:.1f} KB, "
-            f"{pm['inference_latency']['mean_ms']:.0f}ms/query"
-        )
-        print(
-            f"  RAG:        {rg['total_size_kb']:.1f} KB, "
-            f"{rg['inference_latency']['mean_ms']:.0f}ms/query"
-        )
-
-    # Summary
-    print("\n" + "=" * 72)
-    print("EDGE DEPLOYMENT FOOTPRINT SUMMARY")
-    print(f"{'Scale':>6} {'PM Size':>10} {'RAG Size':>10} {'PM Lat':>10} {'RAG Lat':>10}")
-    print("-" * 50)
-    for scale_str, sr in scale_results.items():
-        pm = sr["parametric"]
-        rg = sr["rag"]
-        print(
-            f"{scale_str:>6} "
-            f"{pm['total_size_kb']:>8.1f}KB "
-            f"{rg['total_size_kb']:>8.1f}KB "
-            f"{pm['inference_latency']['mean_ms']:>8.0f}ms "
-            f"{rg['inference_latency']['mean_ms']:>8.0f}ms"
-        )
-    print("=" * 72)
-
-    # Note: adapter size is constant regardless of number of keys
-    # (same LoRA rank, same number of parameters)
-    print("\nNote: Adapter size is constant across scale points (fixed LoRA rank).")
-    print("RAG storage scales linearly with number of facts.")
-
-    results = {
-        "experiment": "test6_footprint",
-        "epochs": args.num_epochs,
-        "rank": args.rank,
-        "data_source": source,
-        "scale_results": scale_results,
-    }
-
-    save_results(results, output_dir)
+        save_results(results, output_dir)
 
 
 if __name__ == "__main__":

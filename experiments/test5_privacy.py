@@ -19,7 +19,10 @@ sys.path.insert(0, str(project_root))
 
 from experiments.utils.perltqa_loader import load_qa  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
+    add_distillation_args,
+    distillation_output_dir,
     evaluate_indexed_recall,
+    get_distillation_configs,
     load_model_and_config,
     save_results,
     setup_logging,
@@ -111,9 +114,10 @@ def main():
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--skip-rag", action="store_true")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
+    add_distillation_args(parser)
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
+    base_output_dir = Path(args.output_dir)
 
     # Load data
     qa_pairs, source = load_qa(max_pairs=args.num_pairs)
@@ -121,83 +125,50 @@ def main():
 
     model, tokenizer, config = load_model_and_config()
 
-    # Train adapter
-    model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
-        model,
-        tokenizer,
-        qa_pairs,
-        epochs=args.num_epochs,
-        rank=args.rank,
-        adapter_name="episodic",
-        output_dir=output_dir,
-        run_name="privacy-test",
-    )
+    for model_name, distillation_config in get_distillation_configs(args):
+        print(f"\n{'=' * 72}")
+        print(f"  Distillation model: {model_name}")
+        print(f"{'=' * 72}")
+        output_dir = distillation_output_dir(base_output_dir, model_name)
 
-    # Verify recall works with keys (control)
-    recall_result = evaluate_indexed_recall(
-        model,
-        tokenizer,
-        keyed_pairs,
-        registry,
-        adapter_name="episodic",
-    )
-    print(f"\nControl: {recall_result['exact_count']}/{recall_result['total']} recall with keys")
-
-    from paramem.evaluation.recall import generate_answer  # noqa: E402
-    from paramem.models.loader import switch_adapter  # noqa: E402
-    from paramem.training.dataset import _format_inference_prompt  # noqa: E402
-
-    model.gradient_checkpointing_disable()
-    switch_adapter(model, "episodic")
-
-    # Test: extraction prompts against parametric memory
-    print("\n--- Extraction Probes (Parametric Memory) ---")
-    parametric_probes = []
-    total_leaked_parametric = 0
-
-    for prompt_text in EXTRACTION_PROMPTS:
-        prompt = _format_inference_prompt(prompt_text, tokenizer)
-        generated = generate_answer(
+        # Train adapter
+        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
-            prompt,
-            max_new_tokens=300,
-            temperature=0.1,
-            repetition_penalty=1.3,
-        )
-        leaked = check_fact_leakage(generated, qa_pairs)
-        total_leaked_parametric += len(leaked)
-
-        status = f"LEAK({len(leaked)})" if leaked else "SAFE"
-        print(f"  [{status}] {prompt_text[:60]}")
-        if leaked:
-            for lf in leaked[:3]:
-                print(f"           Leaked: {lf['answer'][:50]}... (sim={lf['similarity']:.2f})")
-
-        parametric_probes.append(
-            {
-                "prompt": prompt_text,
-                "generated": generated,
-                "leaked_facts": leaked,
-                "num_leaked": len(leaked),
-            }
+            qa_pairs,
+            epochs=args.num_epochs,
+            rank=args.rank,
+            adapter_name="episodic",
+            output_dir=output_dir,
+            run_name="privacy-test",
+            distillation_config=distillation_config,
         )
 
-    # RAG comparison
-    rag_probes = None
-    total_leaked_rag = 0
-    if not args.skip_rag:
-        from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
+        # Verify recall works with keys (control)
+        recall_result = evaluate_indexed_recall(
+            model,
+            tokenizer,
+            keyed_pairs,
+            registry,
+            adapter_name="episodic",
+        )
+        rc = recall_result
+        print(f"\nControl: {rc['exact_count']}/{rc['total']} recall with keys")
 
-        print("\n--- Extraction Probes (RAG Baseline) ---")
-        rag = QARAGPipeline()
-        rag.build_index(qa_pairs)
+        from paramem.evaluation.recall import generate_answer  # noqa: E402
+        from paramem.models.loader import switch_adapter  # noqa: E402
+        from paramem.training.dataset import _format_inference_prompt  # noqa: E402
 
-        model.disable_adapter_layers()
+        model.gradient_checkpointing_disable()
+        switch_adapter(model, "episodic")
 
-        rag_probes = []
+        # Test: extraction prompts against parametric memory
+        print("\n--- Extraction Probes (Parametric Memory) ---")
+        parametric_probes = []
+        total_leaked_parametric = 0
+
         for prompt_text in EXTRACTION_PROMPTS:
-            prompt = rag.format_prompt(prompt_text, tokenizer, top_k=5)
+            prompt = _format_inference_prompt(prompt_text, tokenizer)
             generated = generate_answer(
                 model,
                 tokenizer,
@@ -207,12 +178,15 @@ def main():
                 repetition_penalty=1.3,
             )
             leaked = check_fact_leakage(generated, qa_pairs)
-            total_leaked_rag += len(leaked)
+            total_leaked_parametric += len(leaked)
 
             status = f"LEAK({len(leaked)})" if leaked else "SAFE"
             print(f"  [{status}] {prompt_text[:60]}")
+            if leaked:
+                for lf in leaked[:3]:
+                    print(f"           Leaked: {lf['answer'][:50]}... (sim={lf['similarity']:.2f})")
 
-            rag_probes.append(
+            parametric_probes.append(
                 {
                     "prompt": prompt_text,
                     "generated": generated,
@@ -221,36 +195,78 @@ def main():
                 }
             )
 
-        model.enable_adapter_layers()
+        # RAG comparison
+        rag_probes = None
+        total_leaked_rag = 0
+        if not args.skip_rag:
+            from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
 
-    # Summary
-    print("\n" + "=" * 72)
-    print("PRIVACY PRESERVATION SUMMARY")
-    print("=" * 72)
-    print(f"  Facts trained: {len(qa_pairs)}")
-    print(f"  Recall with keys: {recall_result['exact_count']}/{recall_result['total']}")
-    num_probes = len(EXTRACTION_PROMPTS)
-    print(f"  Parametric extraction leaks: {total_leaked_parametric} across {num_probes} probes")
-    if rag_probes is not None:
-        print(f"  RAG extraction leaks: {total_leaked_rag} across {num_probes} probes")
-    print(f"  Training time: {train_time:.0f}s")
-    print("=" * 72)
+            print("\n--- Extraction Probes (RAG Baseline) ---")
+            rag = QARAGPipeline()
+            rag.build_index(qa_pairs)
 
-    results = {
-        "experiment": "test5_privacy",
-        "num_pairs": len(qa_pairs),
-        "data_source": source,
-        "epochs": args.num_epochs,
-        "rank": args.rank,
-        "training_time_seconds": train_time,
-        "control_recall": recall_result,
-        "parametric_probes": parametric_probes,
-        "total_leaked_parametric": total_leaked_parametric,
-        "rag_probes": rag_probes,
-        "total_leaked_rag": total_leaked_rag,
-    }
+            model.disable_adapter_layers()
 
-    save_results(results, output_dir)
+            rag_probes = []
+            for prompt_text in EXTRACTION_PROMPTS:
+                prompt = rag.format_prompt(prompt_text, tokenizer, top_k=5)
+                generated = generate_answer(
+                    model,
+                    tokenizer,
+                    prompt,
+                    max_new_tokens=300,
+                    temperature=0.1,
+                    repetition_penalty=1.3,
+                )
+                leaked = check_fact_leakage(generated, qa_pairs)
+                total_leaked_rag += len(leaked)
+
+                status = f"LEAK({len(leaked)})" if leaked else "SAFE"
+                print(f"  [{status}] {prompt_text[:60]}")
+
+                rag_probes.append(
+                    {
+                        "prompt": prompt_text,
+                        "generated": generated,
+                        "leaked_facts": leaked,
+                        "num_leaked": len(leaked),
+                    }
+                )
+
+            model.enable_adapter_layers()
+
+        # Summary
+        print("\n" + "=" * 72)
+        print("PRIVACY PRESERVATION SUMMARY")
+        print("=" * 72)
+        print(f"  Facts trained: {len(qa_pairs)}")
+        print(f"  Recall with keys: {recall_result['exact_count']}/{recall_result['total']}")
+        num_probes = len(EXTRACTION_PROMPTS)
+        print(
+            f"  Parametric extraction leaks: "
+            f"{total_leaked_parametric} across {num_probes} probes"
+        )
+        if rag_probes is not None:
+            print(f"  RAG extraction leaks: {total_leaked_rag} across {num_probes} probes")
+        print(f"  Training time: {train_time:.0f}s")
+        print("=" * 72)
+
+        results = {
+            "experiment": "test5_privacy",
+            "distillation_model": model_name,
+            "num_pairs": len(qa_pairs),
+            "data_source": source,
+            "epochs": args.num_epochs,
+            "rank": args.rank,
+            "training_time_seconds": train_time,
+            "control_recall": recall_result,
+            "parametric_probes": parametric_probes,
+            "total_leaked_parametric": total_leaked_parametric,
+            "rag_probes": rag_probes,
+            "total_leaked_rag": total_leaked_rag,
+        }
+
+        save_results(results, output_dir)
 
 
 if __name__ == "__main__":

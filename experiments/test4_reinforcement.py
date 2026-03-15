@@ -28,7 +28,10 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from experiments.utils.test_harness import (  # noqa: E402
+    add_distillation_args,
+    distillation_output_dir,
     evaluate_indexed_recall,
+    get_distillation_configs,
     load_model_and_config,
     save_results,
     setup_logging,
@@ -71,30 +74,13 @@ def build_session_qa(data, session_num):
     return qa_pairs
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Test 4: Multi-Session Reinforcement")
-    parser.add_argument("--num-epochs", type=int, default=30)
-    parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
-    args = parser.parse_args()
+def run_reinforcement_test(
+    model, tokenizer, data, all_facts, args, output_dir, distillation_config,
+):
+    """Run reinforcement test for one distillation model.
 
-    output_dir = Path(args.output_dir)
-    data = load_reinforcement_data()
-
-    model, tokenizer, config = load_model_and_config()
-
-    # Collect all unique facts with their group labels
-    all_facts = {}
-    for group_name in ["reinforced", "mentioned_twice", "single_mention"]:
-        for fact in data["facts"][group_name]:
-            all_facts[fact["id"]] = {
-                "question": fact["question"],
-                "answer": fact["answer"],
-                "group": group_name,
-                "sessions": fact.get("sessions", []),
-                "mention_count": len(fact.get("sessions", [])),
-            }
-
+    Returns (cycle_results, total_time).
+    """
     # Track cumulative QA pairs seen so far
     cumulative_qa = {}  # fact_id -> {"question", "answer"}
     cycle_results = []
@@ -139,6 +125,7 @@ def main():
             adapter_name=adapter_name,
             output_dir=output_dir / f"session_{session_num}",
             run_name=f"reinforcement-session-{session_num}",
+            distillation_config=distillation_config,
         )
 
         # Evaluate recall on all cumulative facts
@@ -179,44 +166,84 @@ def main():
         )
 
     total_time = time.time() - total_start
+    return cycle_results, total_time
 
-    # Analyze by reinforcement group
-    print("\n" + "=" * 72)
-    print("REINFORCEMENT ANALYSIS")
-    print("=" * 72)
 
-    final_cycle = cycle_results[-1] if cycle_results else {}
-    final_per_fact = final_cycle.get("per_fact", {})
+def main():
+    parser = argparse.ArgumentParser(description="Test 4: Multi-Session Reinforcement")
+    parser.add_argument("--num-epochs", type=int, default=30)
+    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
+    add_distillation_args(parser)
+    args = parser.parse_args()
 
-    for group in ["reinforced", "mentioned_twice", "single_mention"]:
-        group_facts = {k: v for k, v in final_per_fact.items() if v["group"] == group}
-        if not group_facts:
-            continue
-        exact = sum(1 for v in group_facts.values() if v["exact_match"])
-        mean_conf = sum(v["confidence"] for v in group_facts.values()) / len(group_facts)
-        avg_mentions = (
-            sum(all_facts[k]["mention_count"] for k in group_facts) / len(group_facts)
+    base_output_dir = Path(args.output_dir)
+    data = load_reinforcement_data()
+
+    model, tokenizer, config = load_model_and_config()
+
+    # Collect all unique facts with their group labels
+    all_facts = {}
+    for group_name in ["reinforced", "mentioned_twice", "single_mention"]:
+        for fact in data["facts"][group_name]:
+            all_facts[fact["id"]] = {
+                "question": fact["question"],
+                "answer": fact["answer"],
+                "group": group_name,
+                "sessions": fact.get("sessions", []),
+                "mention_count": len(fact.get("sessions", [])),
+            }
+
+    for model_name, distillation_config in get_distillation_configs(args):
+        print(f"\n{'=' * 72}")
+        print(f"  Distillation model: {model_name}")
+        print(f"{'=' * 72}")
+
+        output_dir = distillation_output_dir(base_output_dir, model_name)
+
+        cycle_results, total_time = run_reinforcement_test(
+            model, tokenizer, data, all_facts, args, output_dir, distillation_config,
         )
-        print(
-            f"  {group:>20}: {exact}/{len(group_facts)} recall, "
-            f"conf={mean_conf:.3f}, avg_mentions={avg_mentions:.1f}"
-        )
 
-    print(f"\n  Total time: {total_time:.0f}s")
+        # Analyze by reinforcement group
+        print(f"\n{'=' * 72}")
+        print(f"REINFORCEMENT ANALYSIS ({model_name})")
+        print("=" * 72)
 
-    results = {
-        "experiment": "test4_reinforcement",
-        "epochs_per_cycle": args.num_epochs,
-        "rank": args.rank,
-        "total_time_seconds": total_time,
-        "cycles": cycle_results,
-        "fact_metadata": {
-            k: {"group": v["group"], "mention_count": v["mention_count"]}
-            for k, v in all_facts.items()
-        },
-    }
+        final_cycle = cycle_results[-1] if cycle_results else {}
+        final_per_fact = final_cycle.get("per_fact", {})
 
-    save_results(results, output_dir)
+        for group in ["reinforced", "mentioned_twice", "single_mention"]:
+            group_facts = {k: v for k, v in final_per_fact.items() if v["group"] == group}
+            if not group_facts:
+                continue
+            exact = sum(1 for v in group_facts.values() if v["exact_match"])
+            mean_conf = sum(v["confidence"] for v in group_facts.values()) / len(group_facts)
+            avg_mentions = (
+                sum(all_facts[k]["mention_count"] for k in group_facts) / len(group_facts)
+            )
+            print(
+                f"  {group:>20}: {exact}/{len(group_facts)} recall, "
+                f"conf={mean_conf:.3f}, avg_mentions={avg_mentions:.1f}"
+            )
+
+        print(f"\n  Total time: {total_time:.0f}s")
+        print("=" * 72)
+
+        results = {
+            "experiment": "test4_reinforcement",
+            "distillation_model": model_name,
+            "epochs_per_cycle": args.num_epochs,
+            "rank": args.rank,
+            "total_time_seconds": total_time,
+            "cycles": cycle_results,
+            "fact_metadata": {
+                k: {"group": v["group"], "mention_count": v["mention_count"]}
+                for k, v in all_facts.items()
+            },
+        }
+
+        save_results(results, output_dir)
 
 
 if __name__ == "__main__":

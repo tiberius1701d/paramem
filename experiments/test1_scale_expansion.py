@@ -21,7 +21,10 @@ sys.path.insert(0, str(project_root))
 
 from experiments.utils.perltqa_loader import load_qa  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
+    add_distillation_args,
+    distillation_output_dir,
     evaluate_indexed_recall,
+    get_distillation_configs,
     load_model_and_config,
     save_results,
     setup_logging,
@@ -44,6 +47,7 @@ def run_scale_point(
     rank,
     skip_rag,
     output_dir,
+    distillation_config=None,
 ):
     """Train and evaluate at a single scale point."""
     subset = qa_pairs[:scale]
@@ -66,6 +70,7 @@ def run_scale_point(
         adapter_name=adapter_name,
         output_dir=output_dir / f"scale_{scale}",
         run_name=f"scale-{scale}",
+        distillation_config=distillation_config,
     )
 
     recall_result = evaluate_indexed_recall(
@@ -124,6 +129,7 @@ def main():
     parser.add_argument("--character-id", type=str, default=None, help="PerLTQA character ID")
     parser.add_argument("--skip-rag", action="store_true", help="Skip RAG baseline comparison")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_BASE))
+    add_distillation_args(parser)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -143,58 +149,70 @@ def main():
     # Load model
     model, tokenizer, config = load_model_and_config()
 
-    # Run scale points
-    all_results = {
-        "experiment": "test1_scale_expansion",
-        "data_source": source,
-        "total_qa_available": len(qa_pairs),
-        "scale_points": {},
-    }
+    for model_name, distillation_config in get_distillation_configs(args):
+        print(f"\n{'=' * 72}")
+        print(f"  Distillation model: {model_name}")
+        print(f"{'=' * 72}")
 
-    for scale in scales:
-        result = run_scale_point(
-            model,
-            tokenizer,
-            qa_pairs,
-            scale,
-            args.num_epochs,
-            args.rank,
-            args.skip_rag,
-            output_dir,
-        )
-        all_results["scale_points"][str(scale)] = result
+        model_output_dir = distillation_output_dir(output_dir, model_name)
 
-        # Print summary
-        pr = result["parametric_recall"]
-        print(
-            f"\n  Scale {result['scale']}: "
-            f"{pr['exact_count']}/{pr['total']} recall "
-            f"(conf={pr['mean_confidence']:.3f}, "
-            f"time={result['training_time_seconds']:.0f}s)"
-        )
-        if "rag_recall" in result:
-            print(f"  RAG baseline: {result['rag_recall']['mean_similarity']:.3f} mean similarity")
+        all_results = {
+            "experiment": "test1_scale_expansion",
+            "distillation_model": model_name,
+            "data_source": source,
+            "total_qa_available": len(qa_pairs),
+            "scale_points": {},
+        }
 
-    # Summary table
-    print("\n" + "=" * 72)
-    print("SCALE EXPANSION SUMMARY")
-    print(f"{'Scale':>6} {'Recall':>10} {'Confidence':>12} {'Time':>8} {'RAG':>8}")
-    print("-" * 50)
-    for scale_str, result in all_results["scale_points"].items():
-        pr = result["parametric_recall"]
-        rag_str = (
-            f"{result['rag_recall']['mean_similarity']:.3f}" if "rag_recall" in result else "N/A"
-        )
-        print(
-            f"{result['scale']:>6} "
-            f"{pr['exact_count']}/{pr['total']:>6} "
-            f"{pr['mean_confidence']:>12.3f} "
-            f"{result['training_time_seconds']:>7.0f}s "
-            f"{rag_str:>8}"
-        )
-    print("=" * 72)
+        for scale in scales:
+            result = run_scale_point(
+                model,
+                tokenizer,
+                qa_pairs,
+                scale,
+                args.num_epochs,
+                args.rank,
+                args.skip_rag,
+                model_output_dir,
+                distillation_config=distillation_config,
+            )
+            all_results["scale_points"][str(scale)] = result
 
-    save_results(all_results, output_dir)
+            pr = result["parametric_recall"]
+            print(
+                f"\n  Scale {result['scale']}: "
+                f"{pr['exact_count']}/{pr['total']} recall "
+                f"(conf={pr['mean_confidence']:.3f}, "
+                f"time={result['training_time_seconds']:.0f}s)"
+            )
+            if "rag_recall" in result:
+                print(
+                    f"  RAG baseline: "
+                    f"{result['rag_recall']['mean_similarity']:.3f} mean similarity"
+                )
+
+        # Summary table
+        print(f"\n{'=' * 72}")
+        print(f"SCALE EXPANSION SUMMARY ({model_name})")
+        print(f"{'Scale':>6} {'Recall':>10} {'Confidence':>12} {'Time':>8} {'RAG':>8}")
+        print("-" * 50)
+        for scale_str, result in all_results["scale_points"].items():
+            pr = result["parametric_recall"]
+            rag_str = (
+                f"{result['rag_recall']['mean_similarity']:.3f}"
+                if "rag_recall" in result
+                else "N/A"
+            )
+            print(
+                f"{result['scale']:>6} "
+                f"{pr['exact_count']}/{pr['total']:>6} "
+                f"{pr['mean_confidence']:>12.3f} "
+                f"{result['training_time_seconds']:>7.0f}s "
+                f"{rag_str:>8}"
+            )
+        print("=" * 72)
+
+        save_results(all_results, model_output_dir)
 
 
 if __name__ == "__main__":
