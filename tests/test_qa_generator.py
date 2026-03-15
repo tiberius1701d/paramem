@@ -1,4 +1,8 @@
-"""Tests for QA pair generation from graph relations."""
+"""Tests for QA pair generation from graph relations.
+
+These tests use the template fallback (no model/tokenizer provided).
+LLM-based generation is validated by GPU experiments.
+"""
 
 from paramem.graph.qa_generator import generate_qa_from_relations
 
@@ -16,11 +20,11 @@ class TestTemplateGeneration:
             },
         ]
         qa = generate_qa_from_relations(relations)
-        assert len(qa) == 2  # subject + reverse template
+        assert len(qa) == 1
         assert "Heilbronn" in qa[0]["answer"]
         assert "Alex" in qa[0]["question"]
 
-    def test_reverse_template(self):
+    def test_known_predicate_content(self):
         relations = [
             {
                 "subject": "Alex",
@@ -32,9 +36,8 @@ class TestTemplateGeneration:
             },
         ]
         qa = generate_qa_from_relations(relations)
-        questions = [q["question"] for q in qa]
-        assert "Where does Alex live?" in questions
-        assert "Who lives in Heilbronn?" in questions
+        assert qa[0]["question"] == "Where does Alex live?"
+        assert qa[0]["answer"] == "Alex lives in Heilbronn."
 
     def test_no_reverse_for_non_reversible(self):
         relations = [
@@ -48,7 +51,7 @@ class TestTemplateGeneration:
             },
         ]
         qa = generate_qa_from_relations(relations)
-        assert len(qa) == 1  # has_pet has no reverse
+        assert len(qa) == 1
 
     def test_multiple_relations(self):
         relations = [
@@ -70,9 +73,9 @@ class TestTemplateGeneration:
             },
         ]
         qa = generate_qa_from_relations(relations)
-        assert len(qa) == 4  # 2 subject + 2 reverse
+        assert len(qa) == 2  # One QA per relation
 
-    def test_unknown_predicate_uses_generic(self):
+    def test_unknown_predicate_uses_fallback(self):
         relations = [
             {
                 "subject": "Alex",
@@ -83,7 +86,7 @@ class TestTemplateGeneration:
                 "recurrence_count": 1,
             },
         ]
-        qa = generate_qa_from_relations(relations, use_llm=False)
+        qa = generate_qa_from_relations(relations)
         assert len(qa) == 1
         assert "discovered" in qa[0]["answer"]
 
@@ -109,8 +112,6 @@ class TestTemplateGeneration:
 
     def test_all_template_predicates(self):
         """Verify all mapped predicates produce valid QA pairs."""
-        # Predicates with reverse templates produce 2 QA pairs
-        reversible = {"lives_in", "works_at", "works_as", "studies_at", "knows", "manages"}
         predicates = [
             "lives_in",
             "works_at",
@@ -140,7 +141,6 @@ class TestTemplateGeneration:
                 },
             ]
             qa = generate_qa_from_relations(relations)
-            expected = 2 if pred in reversible else 1
-            assert len(qa) == expected, f"Expected {expected} QA for '{pred}', got {len(qa)}"
+            assert len(qa) == 1, f"Expected 1 QA for '{pred}', got {len(qa)}"
             assert qa[0]["question"], f"Empty question for predicate '{pred}'"
             assert qa[0]["answer"], f"Empty answer for predicate '{pred}'"

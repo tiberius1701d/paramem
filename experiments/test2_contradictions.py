@@ -5,6 +5,8 @@ change over time, compared to RAG which stores all versions and may return
 stale facts.
 
 10 fact chains with 3 temporal versions each across 10 sessions.
+Each session's facts are distilled through graph extraction on the fly,
+exactly as a real personal assistant would process them.
 
 Usage:
     python experiments/test2_contradictions.py
@@ -22,10 +24,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from experiments.utils.test_harness import (  # noqa: E402
-    IndexedDataset,
+    evaluate_indexed_recall,
     load_model_and_config,
     save_results,
     setup_logging,
+    train_indexed_keys,
 )
 
 setup_logging()
@@ -95,37 +98,6 @@ def main():
     model, tokenizer, config = load_model_and_config()
 
     from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
-    from paramem.models.loader import create_adapter, switch_adapter  # noqa: E402
-    from paramem.training.indexed_memory import (  # noqa: E402
-        assign_keys,
-        build_registry,
-        format_indexed_training,
-        probe_all_keys,
-        validate_recall,
-    )
-    from paramem.training.trainer import train_adapter  # noqa: E402
-    from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
-
-    adapter_config = AdapterConfig(
-        rank=args.rank,
-        alpha=args.rank * 2,
-        learning_rate=1e-4,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        dropout=0.0,
-    )
-    training_config = TrainingConfig(
-        batch_size=1,
-        gradient_accumulation_steps=2,
-        max_seq_length=1024,
-        num_epochs=args.num_epochs,
-        warmup_ratio=0.1,
-        weight_decay=0.01,
-        gradient_checkpointing=True,
-        max_grad_norm=1.0,
-        seed=42,
-    )
-
-    model = create_adapter(model, adapter_config, "episodic")
 
     # Sessions where fact changes occur (evaluate after these)
     change_sessions = set()
@@ -138,62 +110,57 @@ def main():
     total_start = time.time()
 
     for session_num in range(1, 11):
-        # Get current facts at this point in time
         current_facts = get_current_facts(fact_chains, session_num)
         if not current_facts:
             continue
 
-        # Train on current facts only (most recent versions)
         qa_list = [{"question": f["question"], "answer": f["answer"]} for f in current_facts]
-        keyed_pairs = assign_keys(qa_list)
-        registry = build_registry(keyed_pairs)
 
-        examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
-        dataset = IndexedDataset(examples)
-
-        # Reinitialize adapter each session (simulating retrain with updated facts)
-        if session_num > 1:
-            model.delete_adapter("episodic")
-            model = create_adapter(model, adapter_config, "episodic")
+        # Delete previous adapter if exists
+        adapter_name = "episodic"
+        if hasattr(model, "peft_config") and adapter_name in model.peft_config:
+            model.delete_adapter(adapter_name)
 
         logger.info("Session %d: training on %d current facts", session_num, len(qa_list))
 
         cycle_start = time.time()
-        metrics = train_adapter(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=dataset,
-            adapter_name="episodic",
-            training_config=training_config,
-            adapter_config=adapter_config,
-            output_dir=output_dir / f"session_{session_num}" / "adapter",
+
+        # Distillation happens inside train_indexed_keys (on the fly, per session)
+        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+            model,
+            tokenizer,
+            qa_list,
+            epochs=args.num_epochs,
+            rank=args.rank,
+            adapter_name=adapter_name,
+            output_dir=output_dir / f"session_{session_num}",
             run_name=f"contradictions-session-{session_num}",
         )
 
         # Evaluate: does the adapter return the CURRENT version?
         if session_num in eval_sessions:
-            model.gradient_checkpointing_disable()
-            switch_adapter(model, "episodic")
-
-            trained_keys = [kp["key"] for kp in keyed_pairs]
-            recalled = probe_all_keys(model, tokenizer, trained_keys, registry=registry)
+            recall_result = evaluate_indexed_recall(
+                model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name,
+            )
 
             per_chain = {}
             for i, fact in enumerate(current_facts):
-                kp = keyed_pairs[i]
-                result = validate_recall(recalled[kp["key"]], kp, registry)
+                if i >= len(keyed_pairs):
+                    break
+                kr = recall_result["per_key"][i]
 
-                # Also check semantic similarity to current answer
                 recalled_answer = ""
-                if result["recalled"] is not None:
-                    recalled_answer = result["recalled"].get("answer", "")
+                if kr["recalled"] is not None:
+                    recalled_answer = kr["recalled"].get("answer", "")
                 similarity_to_current = (
-                    compute_similarity(fact["answer"], recalled_answer) if recalled_answer else 0.0
+                    compute_similarity(fact["answer"], recalled_answer)
+                    if recalled_answer
+                    else 0.0
                 )
 
                 per_chain[fact["chain_id"]] = {
-                    "exact_match": result["exact_match"],
-                    "confidence": result["confidence"],
+                    "exact_match": kr["exact_match"],
+                    "confidence": kr["confidence"],
                     "similarity_to_current": similarity_to_current,
                     "current_answer": fact["answer"],
                     "recalled_answer": recalled_answer,
@@ -237,11 +204,9 @@ def main():
         rag = QARAGPipeline()
         rag.build_index(all_versions)
 
-        # Disable adapters for RAG generation
         model.disable_adapter_layers()
         model.gradient_checkpointing_disable()
 
-        # Query with each chain's question — which version does RAG return?
         final_facts = get_current_facts(fact_chains, 10)
         rag_per_chain = {}
 
@@ -256,10 +221,8 @@ def main():
                 repetition_penalty=1.3,
             )
 
-            # Check similarity to current (latest) vs earliest version
             sim_current = compute_similarity(fact["answer"], generated)
 
-            # Find earliest version for this chain
             chain = next(c for c in fact_chains if c["id"] == fact["chain_id"])
             earliest_answer = chain["versions"][0]["answer"]
             sim_earliest = compute_similarity(earliest_answer, generated)

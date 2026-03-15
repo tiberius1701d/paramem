@@ -9,7 +9,8 @@ semantic adapter.
 - 10 mentioned twice
 - 10 single mention
 
-Uses mock graph extraction for determinism and speed.
+Each session's cumulative facts are distilled through graph extraction
+on the fly, exactly as a real personal assistant would process them.
 
 Usage:
     python experiments/test4_reinforcement.py
@@ -27,9 +28,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from experiments.utils.test_harness import (  # noqa: E402
+    evaluate_indexed_recall,
     load_model_and_config,
     save_results,
     setup_logging,
+    train_indexed_keys,
 )
 
 setup_logging()
@@ -92,42 +95,6 @@ def main():
                 "mention_count": len(fact.get("sessions", [])),
             }
 
-    # Simulate consolidation: train incrementally across sessions
-    # Each session adds new QA pairs; existing pairs are replayed
-    from experiments.utils.test_harness import IndexedDataset  # noqa: E402
-    from paramem.models.loader import create_adapter, switch_adapter  # noqa: E402
-    from paramem.training.indexed_memory import (  # noqa: E402
-        assign_keys,
-        build_registry,
-        format_indexed_training,
-        probe_all_keys,
-        validate_recall,
-    )
-    from paramem.training.trainer import train_adapter  # noqa: E402
-    from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
-
-    adapter_config = AdapterConfig(
-        rank=args.rank,
-        alpha=args.rank * 2,
-        learning_rate=1e-4,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        dropout=0.0,
-    )
-    training_config = TrainingConfig(
-        batch_size=1,
-        gradient_accumulation_steps=2,
-        max_seq_length=1024,
-        num_epochs=args.num_epochs,
-        warmup_ratio=0.1,
-        weight_decay=0.01,
-        gradient_checkpointing=True,
-        max_grad_norm=1.0,
-        seed=42,
-    )
-
-    # Create adapter
-    model = create_adapter(model, adapter_config, "episodic")
-
     # Track cumulative QA pairs seen so far
     cumulative_qa = {}  # fact_id -> {"question", "answer"}
     cycle_results = []
@@ -148,18 +115,12 @@ def main():
                 "answer": qa["answer"],
             }
 
-        # Train on ALL cumulative facts (reinforcement = retraining on seen facts)
         qa_list = list(cumulative_qa.values())
-        keyed_pairs = assign_keys(qa_list)
-        registry = build_registry(keyed_pairs)
 
-        examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
-        dataset = IndexedDataset(examples)
-
-        # Reinitialize adapter for clean training each cycle
-        if session_num > 1:
-            model.delete_adapter("episodic")
-            model = create_adapter(model, adapter_config, "episodic")
+        # Delete previous adapter if exists
+        adapter_name = "episodic"
+        if hasattr(model, "peft_config") and adapter_name in model.peft_config:
+            model.delete_adapter(adapter_name)
 
         logger.info(
             "Session %d: training on %d cumulative facts (%d new this session)",
@@ -168,33 +129,33 @@ def main():
             len(session_qa),
         )
 
-        metrics = train_adapter(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=dataset,
-            adapter_name="episodic",
-            training_config=training_config,
-            adapter_config=adapter_config,
-            output_dir=output_dir / f"session_{session_num}" / "adapter",
+        # Distillation happens inside train_indexed_keys (on the fly, per session)
+        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+            model,
+            tokenizer,
+            qa_list,
+            epochs=args.num_epochs,
+            rank=args.rank,
+            adapter_name=adapter_name,
+            output_dir=output_dir / f"session_{session_num}",
             run_name=f"reinforcement-session-{session_num}",
         )
 
         # Evaluate recall on all cumulative facts
-        model.gradient_checkpointing_disable()
-        switch_adapter(model, "episodic")
-
-        trained_keys = [kp["key"] for kp in keyed_pairs]
-        recalled = probe_all_keys(model, tokenizer, trained_keys, registry=registry)
+        recall_result = evaluate_indexed_recall(
+            model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name,
+        )
 
         # Map results back to fact IDs
         fact_id_list = list(cumulative_qa.keys())
         per_fact = {}
         for i, fact_id in enumerate(fact_id_list):
-            kp = keyed_pairs[i]
-            result = validate_recall(recalled[kp["key"]], kp, registry)
+            if i >= len(recall_result["per_key"]):
+                break
+            kr = recall_result["per_key"][i]
             per_fact[fact_id] = {
-                "exact_match": result["exact_match"],
-                "confidence": result["confidence"],
+                "exact_match": kr["exact_match"],
+                "confidence": kr["confidence"],
                 "group": all_facts[fact_id]["group"],
             }
 
@@ -233,7 +194,9 @@ def main():
             continue
         exact = sum(1 for v in group_facts.values() if v["exact_match"])
         mean_conf = sum(v["confidence"] for v in group_facts.values()) / len(group_facts)
-        avg_mentions = sum(all_facts[k]["mention_count"] for k in group_facts) / len(group_facts)
+        avg_mentions = (
+            sum(all_facts[k]["mention_count"] for k in group_facts) / len(group_facts)
+        )
         print(
             f"  {group:>20}: {exact}/{len(group_facts)} recall, "
             f"conf={mean_conf:.3f}, avg_mentions={avg_mentions:.1f}"

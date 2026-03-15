@@ -15,6 +15,7 @@
 \usepackage{microtype}
 \usepackage{listings}
 \usepackage{multirow}
+\usepackage{needspace}
 
 % Listings config for JSON examples
 \lstset{
@@ -165,6 +166,7 @@ The Differentiable Search Index (DSI)~\citep{tay2022dsi} trains a full transform
 
 A frozen base model (Qwen 2.5 3B, QLoRA 4-bit) hosts two named LoRA adapters that map to the episodic--semantic distinction in complementary learning systems theory~\citep{mcclelland1995complementary}:
 
+\needspace{6\baselineskip}
 \begin{itemize}
     \item \textbf{Episodic adapter} (rank 8, $\text{lr}=10^{-4}$, $\alpha=16$): Fast-learning, high plasticity. Rapidly encodes new session facts. Analogous to hippocampal encoding.
     \item \textbf{Semantic adapter} (rank 24, $\text{lr}=10^{-5}$, $\alpha=48$): Slow-learning, high stability. Stores promoted, well-reinforced knowledge. Analogous to cortical consolidation.

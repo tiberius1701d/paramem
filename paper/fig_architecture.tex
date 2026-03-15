@@ -1,11 +1,12 @@
 % Figure: Multi-Partition Adapter Architecture
 \begin{tikzpicture}[
-    node distance=0.8cm and 1.5cm,
-    box/.style={draw, rounded corners, minimum width=3.2cm, minimum height=0.9cm, align=center, font=\small},
-    base/.style={box, fill=gray!15, minimum width=7cm},
-    episodic/.style={box, fill=blue!15, minimum width=3cm},
-    semantic/.style={box, fill=orange!15, minimum width=3cm},
-    graph/.style={box, fill=green!10, minimum width=5cm, dashed},
+    node distance=0.8cm and 1.2cm,
+    box/.style={draw, rounded corners, minimum width=2.6cm, minimum height=0.9cm, align=center, font=\small},
+    base/.style={box, fill=gray!15, minimum width=6cm},
+    episodic/.style={box, fill=blue!15, minimum width=2.6cm},
+    semantic/.style={box, fill=orange!15, minimum width=2.6cm},
+    registry/.style={box, fill=purple!10, minimum width=2.2cm},
+    graph/.style={box, fill=green!10, minimum width=4.5cm, dashed},
     arrow/.style={-{Stealth[length=2.5mm]}, thick},
     label/.style={font=\scriptsize\itshape, text=gray!70!black},
   ]
@@ -13,19 +14,22 @@
   % Base model
   \node[base] (base) {Base Model (Qwen 2.5 3B)\\QLoRA 4-bit frozen};
 
-  % Adapters
-  \node[episodic, above left=1cm and 0.3cm of base] (epi) {Episodic Adapter\\rank 8, lr $10^{-4}$};
-  \node[semantic, above right=1cm and 0.3cm of base] (sem) {Semantic Adapter\\rank 24, lr $10^{-5}$};
+  % Adapters — tighter horizontal spacing
+  \node[episodic, above left=1cm and 0.2cm of base] (epi) {Episodic Adapter\\rank 8, lr $10^{-4}$};
+  \node[semantic, above right=1cm and 0.2cm of base] (sem) {Semantic Adapter\\rank 24, lr $10^{-5}$};
 
   % Labels
   \node[label, above=0.05cm of epi] {fast learning, high plasticity};
   \node[label, above=0.05cm of sem] {slow learning, high stability};
 
+  % Key registry — placed above center, between adapters
+  \node[registry, above=3.2cm of base] (reg) {Key Registry\\+ SimHash};
+
   % Knowledge graph
   \node[graph, below=1.2cm of base] (kg) {Knowledge Graph (transient)\\entity resolution $\cdot$ promotion scoring};
 
   % Session input
-  \node[box, fill=yellow!10, below=0.8cm of kg, minimum width=4cm] (session) {Session Transcript};
+  \node[box, fill=yellow!10, below=0.8cm of kg, minimum width=3.5cm] (session) {Session Transcript};
 
   % Arrows: session -> graph -> base
   \draw[arrow] (session) -- (kg);
@@ -42,9 +46,8 @@
   % Decay arrow
   \node[font=\scriptsize, text=gray, below left=0.3cm and -0.3cm of epi] (decay) {decay $\downarrow$};
 
-  % Key registry
-  \node[box, fill=purple!10, minimum width=2.5cm, right=1.5cm of sem] (reg) {Key Registry\\+ SimHash};
-  \draw[arrow, <->] (sem.east) -- (reg.west);
-  \draw[arrow, <->] (epi.north east) -- ++(0.5, 0.3) -| (reg.north);
+  % Registry connections — route to inner top corners to avoid label overlap
+  \draw[arrow, <->] (reg.south west) -- (epi.north east);
+  \draw[arrow, <->] (reg.south east) -- (sem.north west);
 
 \end{tikzpicture}
