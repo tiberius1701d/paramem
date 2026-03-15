@@ -135,6 +135,18 @@ archive/              # Failed approaches (part of the research story)
 - **Distillation models:** Gemma 2 9B Instruct (primary), Mistral 7B Instruct v0.3 (secondary)
 - **Training time:** ~4 min for smoke test (10 keys, 30 epochs)
 
+### RTX 50-series (Blackwell) Note
+
+bitsandbytes 0.49.2 lacks native CUDA kernels for sm_120 (Blackwell architecture). NF4 quantization will crash when loading models larger than ~3B parameters. The fix is to install from the main branch, which includes native sm_120 binaries:
+
+```bash
+pip install bitsandbytes --upgrade --pre
+# or from source:
+pip install git+https://github.com/bitsandbytes-foundation/bitsandbytes.git
+```
+
+This is a build-infrastructure issue (native kernels vs PTX JIT compilation), not a correctness issue — the kernels are functionally identical, just not yet performance-tuned for Blackwell. Once bitsandbytes 0.50.0 is released, the standard `pip install` will work.
+
 ## How It Works
 
 1. **Extract:** LLM-based graph extraction pulls entities and relations from session text (optionally using a dedicated distillation model for higher quality)
