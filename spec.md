@@ -1,10 +1,10 @@
-# NeuroMem — Specification (Phases 1–4)
+# ParaMem — Specification (Phases 1–4)
 
 ## Problem Statement
 
 Current LLM memory systems store user information as text snippets and retrieve them via similarity search. This is a digital filing cabinet — no compression, no consolidation, no forgetting curve. It scales poorly, leaks context, and captures none of the associative richness of genuine memory.
 
-NeuroMem builds a parametric memory system for personal LLM agents that encodes session experiences into LoRA adapter weights through a biologically-inspired replay-and-consolidation cycle. Memories are compressed into model parameters, not stored as text.
+ParaMem builds a parametric memory system for personal LLM agents that encodes session experiences into LoRA adapter weights through a biologically-inspired replay-and-consolidation cycle. Memories are compressed into model parameters, not stored as text.
 
 ## Scope — Proof of Concept
 

@@ -1,11 +1,11 @@
 """Tests for configuration loading."""
 
-from paramem.utils.config import NeuroMemConfig, load_config
+from paramem.utils.config import ParaMemConfig, load_config
 
 
 def test_load_default_config():
     config = load_config("configs/default.yaml")
-    assert isinstance(config, NeuroMemConfig)
+    assert isinstance(config, ParaMemConfig)
     assert config.model.model_id == "Qwen/Qwen2.5-3B"
     assert config.model.quantization == "nf4"
 
@@ -26,5 +26,5 @@ def test_training_defaults():
 
 def test_missing_config_uses_defaults():
     config = load_config("nonexistent.yaml")
-    assert isinstance(config, NeuroMemConfig)
+    assert isinstance(config, ParaMemConfig)
     assert config.model.model_id == "Qwen/Qwen2.5-3B"

@@ -112,7 +112,7 @@ class PathsConfig:
 
 
 @dataclass
-class NeuroMemConfig:
+class ParaMemConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     adapters: dict[str, AdapterConfig] = field(default_factory=dict)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -133,7 +133,7 @@ def _build_dataclass(cls, data: dict):
 
 def load_config(
     config_path: Optional[str | Path] = None,
-) -> NeuroMemConfig:
+) -> ParaMemConfig:
     """Load configuration from a YAML file, falling back to defaults."""
     if config_path is None:
         config_path = Path(__file__).parent.parent.parent / "configs" / "default.yaml"
@@ -141,7 +141,7 @@ def load_config(
         config_path = Path(config_path)
 
     if not config_path.exists():
-        return NeuroMemConfig()
+        return ParaMemConfig()
 
     with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
@@ -166,7 +166,7 @@ def load_config(
         DistillationConfig, raw.get("distillation", {}),
     )
 
-    return NeuroMemConfig(
+    return ParaMemConfig(
         model=model,
         adapters=adapters,
         training=training,

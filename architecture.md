@@ -1,4 +1,4 @@
-# NeuroMem — Architecture Decisions (Phases 1–4)
+# ParaMem — Architecture Decisions (Phases 1–4)
 
 ## Chosen Tech Stack
 
