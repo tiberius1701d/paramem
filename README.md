@@ -113,7 +113,7 @@ paramem/
 │   ├── key_registry.py     # Active key tracking + fidelity history
 │   ├── consolidation.py    # Consolidation loop orchestrator
 │   └── ...
-├── graph/            # Knowledge graph extraction, merging, scoring
+├── graph/            # Knowledge graph extraction, merging, QA distillation
 ├── evaluation/       # Recall metrics, embedding scoring, fidelity, RAG baselines
 └── utils/            # Configuration (YAML-driven)
 configs/              # Default configuration
@@ -122,7 +122,7 @@ experiments/          # Validated experiment scripts
 ├── test1-7_*.py      # Extended evaluation suite (see below)
 └── ...
 examples/             # Self-contained example scripts
-tests/                # Unit tests (226 tests)
+tests/                # Unit tests (243 tests)
 data/synthetic/       # Synthetic personas, sessions, inference facts
 archive/              # Failed approaches (part of the research story)
 ```
@@ -132,11 +132,12 @@ archive/              # Failed approaches (part of the research story)
 - **Minimum:** GPU with 8GB VRAM (QLoRA 4-bit quantization)
 - **Tested on:** NVIDIA RTX 5070, WSL2, CUDA via conda
 - **Base models tested:** Qwen 2.5 3B (primary), Llama 3.2 3B (secondary)
+- **Distillation models:** Gemma 2 9B Instruct (primary), Mistral 7B Instruct v0.3 (secondary)
 - **Training time:** ~4 min for smoke test (10 keys, 30 epochs)
 
 ## How It Works
 
-1. **Extract:** LLM-based graph extraction pulls entities and relations from session text
+1. **Extract:** LLM-based graph extraction pulls entities and relations from session text (optionally using a dedicated distillation model for higher quality)
 2. **Merge:** Entity resolution deduplicates and aggregates knowledge across sessions
 3. **Score:** Composite scoring (PageRank + degree + recurrence + recency) identifies promotion candidates
 4. **Assign keys:** Each QA pair gets a unique key (`graph1`, `graph2`, ...) for addressable recall
