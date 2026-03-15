@@ -7,6 +7,7 @@ Trains two separate personas from PerLTQA on the same base model and tests:
 
 Usage:
     python experiments/test7_second_persona.py
+    python experiments/test7_second_persona.py --model gemma
     python experiments/test7_second_persona.py --char-a <id> --char-b <id>
 """
 
@@ -20,15 +21,16 @@ sys.path.insert(0, str(project_root))
 
 from experiments.utils.perltqa_loader import is_available, list_characters, load_qa  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
-    add_distillation_args,
-    distillation_output_dir,
+    add_model_args,
     evaluate_indexed_recall,
-    get_distillation_configs,
+    get_benchmark_models,
     load_model_and_config,
+    model_output_dir,
     save_results,
     setup_logging,
     train_indexed_keys,
 )
+from paramem.models.loader import unload_model  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -121,7 +123,7 @@ def main():
     parser.add_argument("--char-a", type=str, default=None)
     parser.add_argument("--char-b", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
-    add_distillation_args(parser)
+    add_model_args(parser)
     args = parser.parse_args()
 
     base_output_dir = Path(args.output_dir)
@@ -143,14 +145,13 @@ def main():
     logger.info("Persona A: %d pairs from %s", len(qa_a), source_a)
     logger.info("Persona B: %d pairs from %s", len(qa_b), source_b)
 
-    model, tokenizer, config = load_model_and_config()
-
-    for model_name, distillation_config in get_distillation_configs(args):
+    for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
-        print(f"  Distillation model: {model_name}")
+        print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
 
-        output_dir = distillation_output_dir(base_output_dir, model_name)
+        model, tokenizer, config = load_model_and_config(bench_model_config)
+        output_dir = model_output_dir(base_output_dir, bench_name)
 
         # Train Persona A
         print("\n--- Training Persona A ---")
@@ -160,7 +161,6 @@ def main():
             adapter_name="persona_a",
             output_dir=output_dir / "persona_a",
             run_name="persona-a",
-            distillation_config=distillation_config,
         )
 
         recall_a = evaluate_indexed_recall(
@@ -179,7 +179,6 @@ def main():
             adapter_name="persona_b",
             output_dir=output_dir / "persona_b",
             run_name="persona-b",
-            distillation_config=distillation_config,
         )
 
         recall_b = evaluate_indexed_recall(
@@ -212,7 +211,7 @@ def main():
 
         # Summary
         print(f"\n{'=' * 72}")
-        print(f"SECOND PERSONA SUMMARY ({model_name})")
+        print(f"SECOND PERSONA SUMMARY ({bench_name})")
         print("=" * 72)
         print(
             f"  Persona A ({source_a}): "
@@ -230,7 +229,8 @@ def main():
 
         results = {
             "experiment": "test7_second_persona",
-            "distillation_model": model_name,
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
             "num_pairs": args.num_pairs,
             "epochs": args.num_epochs,
             "rank": args.rank,
@@ -256,6 +256,8 @@ def main():
             },
         }
         save_results(results, output_dir)
+
+        unload_model(model, tokenizer)
 
 
 if __name__ == "__main__":

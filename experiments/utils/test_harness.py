@@ -21,7 +21,11 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
 from paramem.evaluation.recall import generate_answer  # noqa: E402
-from paramem.models.loader import create_adapter, load_base_model, switch_adapter  # noqa: E402
+from paramem.models.loader import (  # noqa: E402
+    create_adapter,
+    load_base_model,
+    switch_adapter,
+)
 from paramem.training.dataset import _format_inference_prompt  # noqa: E402
 from paramem.training.indexed_memory import (  # noqa: E402
     assign_keys,
@@ -34,64 +38,58 @@ from paramem.training.indexed_memory import (  # noqa: E402
 from paramem.training.trainer import train_adapter  # noqa: E402
 from paramem.utils.config import (  # noqa: E402
     AdapterConfig,
-    DistillationConfig,
+    ModelConfig,
     TrainingConfig,
     load_config,
 )
 
 logger = logging.getLogger(__name__)
 
-# Pre-configured distillation models for --distillation-model flag
-DISTILLATION_MODELS = {
-    "gemma": DistillationConfig(
-        enabled=True,
+# Benchmark models — each owns the full pipeline (extraction → QA gen → training → eval)
+BENCHMARK_MODELS = {
+    "gemma": ModelConfig(
         model_id="google/gemma-2-9b-it",
         quantization="nf4",
         compute_dtype="bfloat16",
+        trust_remote_code=True,
         cpu_offload=True,
         max_memory_gpu="7GiB",
         max_memory_cpu="20GiB",
-        temperature=0.2,
-        max_new_tokens=2048,
-        repetition_penalty=1.3,
     ),
-    "mistral": DistillationConfig(
-        enabled=True,
+    "mistral": ModelConfig(
         model_id="mistralai/Mistral-7B-Instruct-v0.3",
         quantization="nf4",
         compute_dtype="bfloat16",
+        trust_remote_code=True,
         cpu_offload=False,
-        temperature=0.2,
-        max_new_tokens=2048,
-        repetition_penalty=1.3,
     ),
 }
 
 
-def add_distillation_args(parser):
-    """Add --distillation-model argument to an experiment's argparse."""
+def add_model_args(parser):
+    """Add --model argument to an experiment's argparse."""
     parser.add_argument(
-        "--distillation-model",
+        "--model",
         type=str,
         default=None,
-        choices=list(DISTILLATION_MODELS.keys()),
-        help="Distillation model to use (default: run both gemma and mistral)",
+        choices=list(BENCHMARK_MODELS.keys()),
+        help="Model to benchmark (default: run both gemma and mistral)",
     )
 
 
-def get_distillation_configs(args):
-    """Return list of (name, DistillationConfig) to run.
+def get_benchmark_models(args):
+    """Return list of (name, ModelConfig) to run.
 
-    If --distillation-model is set, returns that single model.
+    If --model is set, returns that single model.
     Otherwise returns both models for direct comparison.
     """
-    model_name = getattr(args, "distillation_model", None)
+    model_name = getattr(args, "model", None)
     if model_name is not None:
-        return [(model_name, DISTILLATION_MODELS[model_name])]
-    return list(DISTILLATION_MODELS.items())
+        return [(model_name, BENCHMARK_MODELS[model_name])]
+    return list(BENCHMARK_MODELS.items())
 
 
-def distillation_output_dir(base_dir, model_name):
+def model_output_dir(base_dir, model_name):
     """Return model-specific output directory to prevent result overwrites."""
     return Path(base_dir) / model_name
 
@@ -122,34 +120,12 @@ def distill_qa_pairs(
     tokenizer,
     qa_pairs: list[dict],
     subject_name: str = "the user",
-    distillation_config=None,
 ) -> list[dict]:
-    """Distill verbose QA pairs into concise factual form.
+    """Distill verbose QA pairs into concise factual form using the base model.
 
-    When distillation_config is provided and enabled, uses a dedicated
-    instruct-class model with Strategy B batch prompting. Otherwise
-    falls back to the graph extraction pipeline using the base model.
-
-    Args:
-        model: Base model (used for fallback path only).
-        tokenizer: Base model tokenizer (used for fallback path only).
-        qa_pairs: Raw QA pairs with potentially verbose answers.
-        subject_name: Subject name for third-person conversion.
-        distillation_config: Optional DistillationConfig for batch distillation.
-
-    Returns:
-        List of concise QA pairs suitable for indexed key training.
+    Runs the full graph extraction → QA generation pipeline on the same model
+    that will be used for training. Single model owns the whole chain.
     """
-    if distillation_config and distillation_config.enabled:
-        from paramem.graph.distiller import DistillationPipeline
-
-        pipeline = DistillationPipeline(distillation_config)
-        pipeline.load()
-        result = pipeline.distill(qa_pairs, subject_name=subject_name)
-        pipeline.unload()
-        return result
-
-    # Fallback: graph extraction pipeline using base model
     from paramem.graph.extractor import extract_graph
     from paramem.graph.qa_generator import generate_qa_from_relations
 
@@ -160,7 +136,7 @@ def distill_qa_pairs(
         transcript_lines.append(f"Assistant: {qa['answer']}")
     transcript = "\n".join(transcript_lines)
 
-    # Extract graph using the existing pipeline
+    # Extract graph using the base model
     model.gradient_checkpointing_disable()
     has_adapters = hasattr(model, "disable_adapter_layers")
     if has_adapters:
@@ -177,7 +153,6 @@ def distill_qa_pairs(
     if has_adapters:
         model.enable_adapter_layers()
 
-    # Convert extracted relations to QA pairs via templates
     relations = [
         {"subject": r.subject, "predicate": r.predicate, "object": r.object}
         for r in session_graph.relations
@@ -189,7 +164,7 @@ def distill_qa_pairs(
 
     distilled = generate_qa_from_relations(relations, model=model, tokenizer=tokenizer)
 
-    # Deduplicate by question (templates can produce multiple QA per relation)
+    # Deduplicate by question
     seen_questions = set()
     unique = []
     for qa in distilled:
@@ -207,13 +182,16 @@ def distill_qa_pairs(
     return unique
 
 
-def load_model_and_config():
+def load_model_and_config(model_config: ModelConfig | None = None):
     """Load base model and default config.
 
+    If model_config is provided, it overrides the default model settings.
     Returns (model, tokenizer, config).
     """
     config = load_config()
-    logger.info("Loading base model...")
+    if model_config is not None:
+        config.model = model_config
+    logger.info("Loading base model: %s", config.model.model_id)
     model, tokenizer = load_base_model(config.model)
     return model, tokenizer, config
 
@@ -228,23 +206,18 @@ def train_indexed_keys(
     output_dir: str | Path = "outputs/test",
     run_name: str = "indexed-keys",
     skip_distill: bool = False,
-    distillation_config=None,
 ):
     """Train indexed keys on QA pairs.
 
     All QA pairs are first distilled through graph extraction → QA generation
-    to produce concise, unambiguous training data. This is mandatory — the
-    pipeline must handle any input format, not rely on pre-formatted data.
+    using the same base model. Single model owns the whole chain.
 
     Returns (model, keyed_pairs, registry, training_time_seconds, train_metrics).
     The model is returned because create_adapter wraps the base model in
     PeftModel, so callers must use the returned reference.
     """
     if not skip_distill:
-        qa_pairs = distill_qa_pairs(
-            model, tokenizer, qa_pairs,
-            distillation_config=distillation_config,
-        )
+        qa_pairs = distill_qa_pairs(model, tokenizer, qa_pairs)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

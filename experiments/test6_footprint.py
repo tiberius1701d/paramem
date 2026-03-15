@@ -5,6 +5,7 @@ start time. Compares against equivalent RAG setup.
 
 Usage:
     python experiments/test6_footprint.py
+    python experiments/test6_footprint.py --model gemma
     python experiments/test6_footprint.py --scales 10,50,100
 """
 
@@ -19,14 +20,15 @@ sys.path.insert(0, str(project_root))
 
 from experiments.utils.perltqa_loader import load_qa  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
-    add_distillation_args,
-    distillation_output_dir,
-    get_distillation_configs,
+    add_model_args,
+    get_benchmark_models,
     load_model_and_config,
+    model_output_dir,
     save_results,
     setup_logging,
     train_indexed_keys,
 )
+from paramem.models.loader import unload_model  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -113,7 +115,7 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
-    add_distillation_args(parser)
+    add_model_args(parser)
     args = parser.parse_args()
 
     base_output_dir = Path(args.output_dir)
@@ -123,13 +125,13 @@ def main():
     qa_pairs, source = load_qa(max_pairs=max_needed)
     logger.info("Loaded %d QA pairs from %s", len(qa_pairs), source)
 
-    model, tokenizer, config = load_model_and_config()
-
-    for model_name, distillation_config in get_distillation_configs(args):
+    for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
-        print(f"  Distillation model: {model_name}")
+        print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
-        output_dir = distillation_output_dir(base_output_dir, model_name)
+
+        model, tokenizer, config = load_model_and_config(bench_model_config)
+        output_dir = model_output_dir(base_output_dir, bench_name)
 
         scale_results = {}
 
@@ -150,7 +152,6 @@ def main():
                 adapter_name=adapter_name,
                 output_dir=output_dir / f"scale_{scale}",
                 run_name=f"footprint-{scale}",
-                distillation_config=distillation_config,
             )
 
             # Measure adapter size
@@ -233,14 +234,13 @@ def main():
             )
         print("=" * 72)
 
-        # Note: adapter size is constant regardless of number of keys
-        # (same LoRA rank, same number of parameters)
         print("\nNote: Adapter size is constant across scale points (fixed LoRA rank).")
         print("RAG storage scales linearly with number of facts.")
 
         results = {
             "experiment": "test6_footprint",
-            "distillation_model": model_name,
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
             "epochs": args.num_epochs,
             "rank": args.rank,
             "data_source": source,
@@ -248,6 +248,8 @@ def main():
         }
 
         save_results(results, output_dir)
+
+        unload_model(model, tokenizer)
 
 
 if __name__ == "__main__":

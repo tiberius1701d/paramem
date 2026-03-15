@@ -1,35 +1,36 @@
 # ParaMem Benchmarking Suite
 
 Comprehensive evaluation of parametric memory across realistic scenarios.
-All tests run with both distillation models (Gemma 2 9B, Mistral 7B v0.3)
-for direct comparison. Results are saved per-model.
+Each model owns the full pipeline end-to-end: graph extraction → QA generation →
+indexed key training → recall evaluation. No separate distillation step.
 
-## Distillation Models
+## Benchmark Models
 
-| Model | Accuracy | Coverage | GPU Time | Config Key |
+| Model | Params | VRAM | CPU Offload | Config Key |
 |---|---|---|---|---|
-| Gemma 2 9B Instruct | 0.902 | 88% | 357s | `--distillation-model gemma` |
-| Mistral 7B Instruct v0.3 | 0.894 | 84% | 426s | `--distillation-model mistral` |
+| Gemma 2 9B Instruct | 9B | NF4 + CPU offload | Yes | `--model gemma` |
+| Mistral 7B Instruct v0.3 | 7B | NF4 | No | `--model mistral` |
 
-Without `--distillation-model`, tests fall back to base model graph extraction
-(lower quality, but no extra VRAM needed).
+Without `--model`, tests run both models sequentially for direct comparison.
 
 ## Running the Suite
 
-Each test runs independently. To run with both distillation models:
+Each test runs independently. One model at a time (8GB VRAM constraint).
 
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Example: Test 1 with both models
-python experiments/test1_scale_expansion.py --distillation-model gemma
-python experiments/test1_scale_expansion.py --distillation-model mistral
+# Example: Test 1 with both models (sequential, auto-unload between)
+python experiments/test1_scale_expansion.py
 
-# Example: Test 2 with Gemma only
-python experiments/test2_contradictions.py --distillation-model gemma
+# Example: Test 1 with Gemma only
+python experiments/test1_scale_expansion.py --model gemma
+
+# Example: Test 2 with Mistral only
+python experiments/test2_contradictions.py --model mistral
 ```
 
-Results go to `outputs/testN_*/results.json`.
+Results go to `outputs/testN_*/{gemma,mistral}/results.json`.
 
 ---
 
@@ -45,8 +46,8 @@ as fact count grows. Compares against QA-RAG baseline at each scale point.
 **Metrics:** Exact recall rate, SimHash confidence, training time, RAG similarity.
 
 ```bash
-python experiments/test1_scale_expansion.py --distillation-model gemma
-python experiments/test1_scale_expansion.py --scale 50 --distillation-model mistral
+python experiments/test1_scale_expansion.py --model gemma
+python experiments/test1_scale_expansion.py --scale 50 --model mistral
 ```
 
 ## Test 2: Contradiction Resolution
@@ -62,7 +63,7 @@ vs RAG which stores all versions and may return stale facts.
 **Metrics:** Current-version recall, similarity to current vs stale, per-chain breakdown.
 
 ```bash
-python experiments/test2_contradictions.py --distillation-model gemma
+python experiments/test2_contradictions.py --model gemma
 ```
 
 ## Test 3: Associative Inference
@@ -78,7 +79,7 @@ inference may fail. A valid negative result.
 **Metrics:** Base fact recall (sanity check), inference similarity (parametric vs RAG).
 
 ```bash
-python experiments/test3_inference.py --distillation-model gemma
+python experiments/test3_inference.py --model gemma
 ```
 
 ## Test 4: Multi-Session Reinforcement
@@ -96,7 +97,7 @@ should recall better.
 **Known gap:** No RAG baseline (to be added).
 
 ```bash
-python experiments/test4_reinforcement.py --distillation-model gemma
+python experiments/test4_reinforcement.py --model gemma
 ```
 
 ## Test 5: Privacy Preservation
@@ -111,7 +112,7 @@ whether adapter weights leak readable data vs RAG text storage.
 **Metrics:** Leaked fact count (parametric vs RAG), similarity scores per probe.
 
 ```bash
-python experiments/test5_privacy.py --distillation-model gemma
+python experiments/test5_privacy.py --model gemma
 ```
 
 ## Test 6: Edge Deployment Footprint
@@ -126,7 +127,7 @@ Compares total footprint and latency against RAG (embeddings + text store).
 **Metrics:** Storage bytes, inference latency (ms), cold start time.
 
 ```bash
-python experiments/test6_footprint.py --distillation-model gemma
+python experiments/test6_footprint.py --model gemma
 ```
 
 ## Test 7: Second Persona
@@ -141,7 +142,7 @@ beyond one user and measures cross-contamination between adapters.
 **Metrics:** Per-persona recall, cross-contamination rate.
 
 ```bash
-python experiments/test7_second_persona.py --distillation-model gemma
+python experiments/test7_second_persona.py --model gemma
 ```
 
 ---
@@ -233,22 +234,19 @@ distillation quality, storage recall, inference quality, resource usage.
 
 ## Execution Plan
 
-### Phase A: Run Tests 1-7 with distillation models
+### Phase A: Run Tests 1-7 with both models
 
-Run each test twice — once with Gemma, once with Mistral. Compare results.
+Each test loads each model, runs the full pipeline, and unloads before the next.
 
 ```bash
-# Full suite with Gemma (~255 min total)
+# Full suite — both models run automatically per test
 for test in test1_scale_expansion test2_contradictions test3_inference \
             test4_reinforcement test5_privacy test6_footprint test7_second_persona; do
-    python experiments/${test}.py --distillation-model gemma
+    python experiments/${test}.py
 done
 
-# Repeat with Mistral (~255 min total)
-for test in test1_scale_expansion test2_contradictions test3_inference \
-            test4_reinforcement test5_privacy test6_footprint test7_second_persona; do
-    python experiments/${test}.py --distillation-model mistral
-done
+# Or run a single model
+python experiments/test1_scale_expansion.py --model gemma
 ```
 
 ### Phase B: Fill gaps

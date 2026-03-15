@@ -14,6 +14,7 @@ on the fly, exactly as a real personal assistant would process them.
 
 Usage:
     python experiments/test4_reinforcement.py
+    python experiments/test4_reinforcement.py --model gemma
     python experiments/test4_reinforcement.py --num-epochs 20
 """
 
@@ -28,15 +29,16 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from experiments.utils.test_harness import (  # noqa: E402
-    add_distillation_args,
-    distillation_output_dir,
+    add_model_args,
     evaluate_indexed_recall,
-    get_distillation_configs,
+    get_benchmark_models,
     load_model_and_config,
+    model_output_dir,
     save_results,
     setup_logging,
     train_indexed_keys,
 )
+from paramem.models.loader import unload_model  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -75,9 +77,9 @@ def build_session_qa(data, session_num):
 
 
 def run_reinforcement_test(
-    model, tokenizer, data, all_facts, args, output_dir, distillation_config,
+    model, tokenizer, data, all_facts, args, output_dir,
 ):
-    """Run reinforcement test for one distillation model.
+    """Run reinforcement test for one model.
 
     Returns (cycle_results, total_time).
     """
@@ -115,7 +117,6 @@ def run_reinforcement_test(
             len(session_qa),
         )
 
-        # Distillation happens inside train_indexed_keys (on the fly, per session)
         model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
@@ -125,7 +126,6 @@ def run_reinforcement_test(
             adapter_name=adapter_name,
             output_dir=output_dir / f"session_{session_num}",
             run_name=f"reinforcement-session-{session_num}",
-            distillation_config=distillation_config,
         )
 
         # Evaluate recall on all cumulative facts
@@ -174,13 +174,11 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
-    add_distillation_args(parser)
+    add_model_args(parser)
     args = parser.parse_args()
 
     base_output_dir = Path(args.output_dir)
     data = load_reinforcement_data()
-
-    model, tokenizer, config = load_model_and_config()
 
     # Collect all unique facts with their group labels
     all_facts = {}
@@ -194,20 +192,21 @@ def main():
                 "mention_count": len(fact.get("sessions", [])),
             }
 
-    for model_name, distillation_config in get_distillation_configs(args):
+    for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
-        print(f"  Distillation model: {model_name}")
+        print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
 
-        output_dir = distillation_output_dir(base_output_dir, model_name)
+        model, tokenizer, config = load_model_and_config(bench_model_config)
+        output_dir = model_output_dir(base_output_dir, bench_name)
 
         cycle_results, total_time = run_reinforcement_test(
-            model, tokenizer, data, all_facts, args, output_dir, distillation_config,
+            model, tokenizer, data, all_facts, args, output_dir,
         )
 
         # Analyze by reinforcement group
         print(f"\n{'=' * 72}")
-        print(f"REINFORCEMENT ANALYSIS ({model_name})")
+        print(f"REINFORCEMENT ANALYSIS ({bench_name})")
         print("=" * 72)
 
         final_cycle = cycle_results[-1] if cycle_results else {}
@@ -232,7 +231,8 @@ def main():
 
         results = {
             "experiment": "test4_reinforcement",
-            "distillation_model": model_name,
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
             "epochs_per_cycle": args.num_epochs,
             "rank": args.rank,
             "total_time_seconds": total_time,
@@ -244,6 +244,8 @@ def main():
         }
 
         save_results(results, output_dir)
+
+        unload_model(model, tokenizer)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ with synthetic fallback. Compares against QA-RAG baseline at each scale point.
 
 Usage:
     python experiments/test1_scale_expansion.py
+    python experiments/test1_scale_expansion.py --model gemma
     python experiments/test1_scale_expansion.py --scale 50
     python experiments/test1_scale_expansion.py --character-id <id>
     python experiments/test1_scale_expansion.py --skip-rag
@@ -21,15 +22,16 @@ sys.path.insert(0, str(project_root))
 
 from experiments.utils.perltqa_loader import load_qa  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
-    add_distillation_args,
-    distillation_output_dir,
+    add_model_args,
     evaluate_indexed_recall,
-    get_distillation_configs,
+    get_benchmark_models,
     load_model_and_config,
+    model_output_dir,
     save_results,
     setup_logging,
     train_indexed_keys,
 )
+from paramem.models.loader import unload_model  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -47,7 +49,6 @@ def run_scale_point(
     rank,
     skip_rag,
     output_dir,
-    distillation_config=None,
 ):
     """Train and evaluate at a single scale point."""
     subset = qa_pairs[:scale]
@@ -70,7 +71,6 @@ def run_scale_point(
         adapter_name=adapter_name,
         output_dir=output_dir / f"scale_{scale}",
         run_name=f"scale-{scale}",
-        distillation_config=distillation_config,
     )
 
     recall_result = evaluate_indexed_recall(
@@ -129,7 +129,7 @@ def main():
     parser.add_argument("--character-id", type=str, default=None, help="PerLTQA character ID")
     parser.add_argument("--skip-rag", action="store_true", help="Skip RAG baseline comparison")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_BASE))
-    add_distillation_args(parser)
+    add_model_args(parser)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -146,19 +146,18 @@ def main():
             len(qa_pairs),
         )
 
-    # Load model
-    model, tokenizer, config = load_model_and_config()
-
-    for model_name, distillation_config in get_distillation_configs(args):
+    for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
-        print(f"  Distillation model: {model_name}")
+        print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
 
-        model_output_dir = distillation_output_dir(output_dir, model_name)
+        model, tokenizer, config = load_model_and_config(bench_model_config)
+        bench_output_dir = model_output_dir(output_dir, bench_name)
 
         all_results = {
             "experiment": "test1_scale_expansion",
-            "distillation_model": model_name,
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
             "data_source": source,
             "total_qa_available": len(qa_pairs),
             "scale_points": {},
@@ -173,8 +172,7 @@ def main():
                 args.num_epochs,
                 args.rank,
                 args.skip_rag,
-                model_output_dir,
-                distillation_config=distillation_config,
+                bench_output_dir,
             )
             all_results["scale_points"][str(scale)] = result
 
@@ -193,7 +191,7 @@ def main():
 
         # Summary table
         print(f"\n{'=' * 72}")
-        print(f"SCALE EXPANSION SUMMARY ({model_name})")
+        print(f"SCALE EXPANSION SUMMARY ({bench_name})")
         print(f"{'Scale':>6} {'Recall':>10} {'Confidence':>12} {'Time':>8} {'RAG':>8}")
         print("-" * 50)
         for scale_str, result in all_results["scale_points"].items():
@@ -212,7 +210,10 @@ def main():
             )
         print("=" * 72)
 
-        save_results(all_results, model_output_dir)
+        save_results(all_results, bench_output_dir)
+
+        # Unload model before loading next one
+        unload_model(model, tokenizer)
 
 
 if __name__ == "__main__":

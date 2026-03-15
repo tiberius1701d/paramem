@@ -10,6 +10,7 @@ exactly as a real personal assistant would process them.
 
 Usage:
     python experiments/test2_contradictions.py
+    python experiments/test2_contradictions.py --model gemma
     python experiments/test2_contradictions.py --num-epochs 20
 """
 
@@ -24,15 +25,16 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from experiments.utils.test_harness import (  # noqa: E402
-    add_distillation_args,
-    distillation_output_dir,
+    add_model_args,
     evaluate_indexed_recall,
-    get_distillation_configs,
+    get_benchmark_models,
     load_model_and_config,
+    model_output_dir,
     save_results,
     setup_logging,
     train_indexed_keys,
 )
+from paramem.models.loader import unload_model  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -87,9 +89,9 @@ def get_all_versions(fact_chains):
 
 
 def run_contradiction_test(
-    model, tokenizer, fact_chains, eval_sessions, args, output_dir, distillation_config,
+    model, tokenizer, fact_chains, eval_sessions, args, output_dir,
 ):
-    """Run contradiction test for one distillation model."""
+    """Run contradiction test for one model."""
     from paramem.evaluation.embedding_scorer import compute_similarity
 
     session_results = []
@@ -118,7 +120,6 @@ def run_contradiction_test(
             adapter_name=adapter_name,
             output_dir=output_dir / f"session_{session_num}",
             run_name=f"contradictions-session-{session_num}",
-            distillation_config=distillation_config,
         )
 
         if session_num in eval_sessions:
@@ -235,14 +236,12 @@ def main():
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--skip-rag", action="store_true")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
-    add_distillation_args(parser)
+    add_model_args(parser)
     args = parser.parse_args()
 
     base_output_dir = Path(args.output_dir)
     data = load_contradiction_data()
     fact_chains = data["fact_chains"]
-
-    model, tokenizer, config = load_model_and_config()
 
     change_sessions = set()
     for chain in fact_chains:
@@ -250,20 +249,20 @@ def main():
             change_sessions.add(version["session"])
     eval_sessions = sorted(change_sessions)
 
-    for model_name, distillation_config in get_distillation_configs(args):
+    for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
-        print(f"  Distillation model: {model_name}")
+        print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
 
-        output_dir = distillation_output_dir(base_output_dir, model_name)
+        model, tokenizer, config = load_model_and_config(bench_model_config)
+        output_dir = model_output_dir(base_output_dir, bench_name)
 
         session_results, rag_result, total_time = run_contradiction_test(
-            model, tokenizer, fact_chains, eval_sessions, args,
-            output_dir, distillation_config,
+            model, tokenizer, fact_chains, eval_sessions, args, output_dir,
         )
 
         print(f"\n{'=' * 72}")
-        print(f"CONTRADICTION RESOLUTION SUMMARY ({model_name})")
+        print(f"CONTRADICTION RESOLUTION SUMMARY ({bench_name})")
         print("=" * 72)
         for sr in session_results:
             print(
@@ -281,7 +280,8 @@ def main():
 
         results = {
             "experiment": "test2_contradictions",
-            "distillation_model": model_name,
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
             "epochs": args.num_epochs,
             "rank": args.rank,
             "total_time_seconds": total_time,
@@ -289,6 +289,8 @@ def main():
             "rag_baseline": rag_result,
         }
         save_results(results, output_dir)
+
+        unload_model(model, tokenizer)
 
 
 if __name__ == "__main__":

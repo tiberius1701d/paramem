@@ -13,6 +13,9 @@ class ModelConfig:
     quantization: str = "nf4"
     compute_dtype: str = "bfloat16"
     trust_remote_code: bool = True
+    cpu_offload: bool = False
+    max_memory_gpu: str = "7GiB"
+    max_memory_cpu: str = "20GiB"
 
 
 @dataclass

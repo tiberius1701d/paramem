@@ -10,6 +10,7 @@ publishable negative result.
 
 Usage:
     python experiments/test3_inference.py
+    python experiments/test3_inference.py --model gemma
     python experiments/test3_inference.py --skip-rag
 """
 
@@ -23,15 +24,16 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from experiments.utils.test_harness import (  # noqa: E402
-    add_distillation_args,
-    distillation_output_dir,
+    add_model_args,
     evaluate_indexed_recall,
-    get_distillation_configs,
+    get_benchmark_models,
     load_model_and_config,
+    model_output_dir,
     save_results,
     setup_logging,
     train_indexed_keys,
 )
+from paramem.models.loader import unload_model  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -46,7 +48,7 @@ def main():
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--skip-rag", action="store_true")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
-    add_distillation_args(parser)
+    add_model_args(parser)
     args = parser.parse_args()
 
     base_output_dir = Path(args.output_dir)
@@ -62,14 +64,13 @@ def main():
         "Loaded %d base facts, %d inference questions", len(qa_pairs), len(inference_questions)
     )
 
-    model, tokenizer, config = load_model_and_config()
-
-    for model_name, distillation_config in get_distillation_configs(args):
+    for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
-        print(f"  Distillation model: {model_name}")
+        print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
 
-        output_dir = distillation_output_dir(base_output_dir, model_name)
+        model, tokenizer, config = load_model_and_config(bench_model_config)
+        output_dir = model_output_dir(base_output_dir, bench_name)
 
         # Train base facts
         model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
@@ -81,7 +82,6 @@ def main():
             adapter_name="episodic",
             output_dir=output_dir,
             run_name="inference-base-facts",
-            distillation_config=distillation_config,
         )
 
         # Test A: Indexed key recall (sanity check — base facts should recall)
@@ -215,7 +215,8 @@ def main():
 
         results = {
             "experiment": "test3_inference",
-            "distillation_model": model_name,
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
             "epochs": args.num_epochs,
             "rank": args.rank,
             "training_time_seconds": train_time,
@@ -231,6 +232,8 @@ def main():
         }
 
         save_results(results, output_dir)
+
+        unload_model(model, tokenizer)
 
 
 if __name__ == "__main__":
