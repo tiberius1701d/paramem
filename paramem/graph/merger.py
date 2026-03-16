@@ -64,23 +64,31 @@ def detect_contradiction_with_model(
         object=obj,
     )
 
-    messages = adapt_messages([
-        {"role": "system", "content": "You detect contradictions between facts."},
-        {"role": "user", "content": prompt},
-    ], tokenizer)
+    messages = adapt_messages(
+        [
+            {"role": "system", "content": "You detect contradictions between facts."},
+            {"role": "user", "content": prompt},
+        ],
+        tokenizer,
+    )
     formatted = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
     output = generate_answer(
-        model, tokenizer, formatted,
-        max_new_tokens=64, temperature=0.1,
+        model,
+        tokenizer,
+        formatted,
+        max_new_tokens=64,
+        temperature=0.1,
     )
 
     output = output.strip()
     if output.startswith("CONTRADICTS"):
         # Parse "CONTRADICTS subject | predicate | object"
-        parts = output[len("CONTRADICTS"):].strip().split("|")
+        parts = output[len("CONTRADICTS") :].strip().split("|")
         if len(parts) == 3:
             old_s = parts[0].strip()
             old_p = parts[1].strip()
@@ -278,15 +286,17 @@ class GraphMerger:
                 for key in keys_to_remove:
                     old_val = old_obj
                     self.graph.remove_edge(subject, old_obj, key=key)
-                    self.contradictions_resolved.append({
-                        "method": "graph",
-                        "subject": subject,
-                        "old_predicate": normalized_pred,
-                        "old_object": old_val,
-                        "new_predicate": normalized_pred,
-                        "new_object": obj,
-                        "session": session_id,
-                    })
+                    self.contradictions_resolved.append(
+                        {
+                            "method": "graph",
+                            "subject": subject,
+                            "old_predicate": normalized_pred,
+                            "old_object": old_val,
+                            "new_predicate": normalized_pred,
+                            "new_object": obj,
+                            "session": session_id,
+                        }
+                    )
                     logger.info(
                         "Contradiction resolved (graph): %s | %s | %s → %s (session %s)",
                         subject,
@@ -312,8 +322,12 @@ class GraphMerger:
 
             if existing_triples:
                 contradicted = detect_contradiction_with_model(
-                    subject, normalized_pred, obj,
-                    existing_triples, self.model, self.tokenizer,
+                    subject,
+                    normalized_pred,
+                    obj,
+                    existing_triples,
+                    self.model,
+                    self.tokenizer,
                 )
                 if contradicted is not None:
                     old_s, old_p, old_o = contradicted
@@ -327,20 +341,26 @@ class GraphMerger:
                         ]
                         for key in keys_to_remove:
                             self.graph.remove_edge(subject, old_obj, key=key)
-                            self.contradictions_resolved.append({
-                                "method": "model",
-                                "subject": subject,
-                                "old_predicate": old_p_norm,
-                                "old_object": old_obj,
-                                "new_predicate": normalized_pred,
-                                "new_object": obj,
-                                "session": session_id,
-                            })
+                            self.contradictions_resolved.append(
+                                {
+                                    "method": "model",
+                                    "subject": subject,
+                                    "old_predicate": old_p_norm,
+                                    "old_object": old_obj,
+                                    "new_predicate": normalized_pred,
+                                    "new_object": obj,
+                                    "session": session_id,
+                                }
+                            )
                             logger.info(
                                 "Contradiction resolved (model): "
                                 "%s | %s | %s → %s | %s (session %s)",
-                                subject, old_p_norm, old_obj,
-                                normalized_pred, obj, session_id,
+                                subject,
+                                old_p_norm,
+                                old_obj,
+                                normalized_pred,
+                                obj,
+                                session_id,
                             )
 
         # Case 3 (and after contradiction cleanup): add new edge

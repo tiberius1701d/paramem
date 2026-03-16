@@ -49,11 +49,7 @@ def _build_few_shot_prompt(subject: str, predicate: str, obj: str) -> str:
     """Build a few-shot prompt for QA generation from a triple."""
     examples = []
     for ex in _FEW_SHOT_EXAMPLES:
-        examples.append(
-            f"Triple: {ex['triple']}\n"
-            f"Q: {ex['question']}\n"
-            f"A: {ex['answer']}"
-        )
+        examples.append(f"Triple: {ex['triple']}\nQ: {ex['question']}\nA: {ex['answer']}")
     examples_block = "\n\n".join(examples)
 
     readable_pred = predicate.replace("_", " ")
@@ -79,23 +75,29 @@ def _generate_qa_with_llm(
 
     prompt_text = _build_few_shot_prompt(subject, predicate, obj)
 
-    system_msg = (
-        "Generate a natural question-answer pair from the given "
-        "knowledge graph triple."
-    )
+    system_msg = "Generate a natural question-answer pair from the given knowledge graph triple."
     from paramem.models.loader import adapt_messages
 
-    messages = adapt_messages([
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": prompt_text},
-    ], tokenizer)
+    messages = adapt_messages(
+        [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt_text},
+        ],
+        tokenizer,
+    )
     formatted = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
     output = generate_answer(
-        model, tokenizer, formatted,
-        max_new_tokens=128, temperature=0.3, repetition_penalty=1.3,
+        model,
+        tokenizer,
+        formatted,
+        max_new_tokens=128,
+        temperature=0.3,
+        repetition_penalty=1.3,
     )
 
     # Parse "Q: ... A: ..." from model output.
@@ -114,24 +116,24 @@ def _generate_qa_with_llm(
         q_start = text.index("Q:") + 2
         a_start = text.index("A:")
         question = text[q_start:a_start].strip().rstrip("?") + "?"
-        answer = text[a_start + 2:].strip()
+        answer = text[a_start + 2 :].strip()
     elif "?" in text:
         # No A: marker — split on first question mark
         q_end = text.index("?")
         question = text[2:q_end].strip() + "?"
-        rest = text[q_end + 1:].strip()
+        rest = text[q_end + 1 :].strip()
         # Answer is whatever follows the question
         if rest:
             answer = rest
 
     # Trim answer at first newline (model may generate extra examples)
     if answer and "\n" in answer:
-        answer = answer[:answer.index("\n")].strip()
+        answer = answer[: answer.index("\n")].strip()
 
     # Remove trailing Q:/Triple: if model started generating next example
     for cutoff in ["Q:", "Triple:"]:
         if cutoff in answer:
-            answer = answer[:answer.index(cutoff)].strip()
+            answer = answer[: answer.index(cutoff)].strip()
 
     if question and answer:
         return {

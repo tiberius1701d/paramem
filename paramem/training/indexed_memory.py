@@ -220,19 +220,25 @@ def format_indexed_training(
         recall_prompt = RECALL_TEMPLATE.format(key=kp["key"])
         recall_response = _build_recall_response(kp)
 
-        recall_messages = adapt_messages([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": recall_prompt},
-            {"role": "assistant", "content": recall_response},
-        ], tokenizer)
+        recall_messages = adapt_messages(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": recall_prompt},
+                {"role": "assistant", "content": recall_response},
+            ],
+            tokenizer,
+        )
         examples.append(_tokenize_with_prompt_masking(recall_messages, tokenizer, max_length))
 
         # Individual QA example (proven format)
-        qa_messages = adapt_messages([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": kp["question"]},
-            {"role": "assistant", "content": kp["answer"]},
-        ], tokenizer)
+        qa_messages = adapt_messages(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": kp["question"]},
+                {"role": "assistant", "content": kp["answer"]},
+            ],
+            tokenizer,
+        )
         examples.append(_tokenize_with_prompt_masking(qa_messages, tokenizer, max_length))
 
     return examples

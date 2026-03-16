@@ -26,7 +26,9 @@ class TestBuildPairsText:
 class TestPromptFormatting:
     def test_subject_name_substitution(self):
         prompt = DISTILLATION_PROMPT.format(
-            subject_name="Alex", n=1, pairs_text="[0] Q: Hi A: Hello",
+            subject_name="Alex",
+            n=1,
+            pairs_text="[0] Q: Hi A: Hello",
         )
         assert "Alex" in prompt
         assert "Alex's" in prompt
@@ -34,7 +36,9 @@ class TestPromptFormatting:
 
     def test_custom_subject_name(self):
         prompt = DISTILLATION_PROMPT.format(
-            subject_name="Maria", n=1, pairs_text="test",
+            subject_name="Maria",
+            n=1,
+            pairs_text="test",
         )
         assert "Maria" in prompt
         assert "Maria's" in prompt

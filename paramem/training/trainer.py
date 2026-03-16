@@ -70,10 +70,11 @@ class LossEarlyStoppingCallback(TrainerCallback):
             self._below_count += 1
             if self._below_count >= self.patience:
                 logger.info(
-                    "Early stopping: avg_loss=%.6f < %.4f for %d "
-                    "consecutive epochs at epoch %d",
-                    avg_loss, self.loss_threshold,
-                    self.patience, current_epoch,
+                    "Early stopping: avg_loss=%.6f < %.4f for %d consecutive epochs at epoch %d",
+                    avg_loss,
+                    self.loss_threshold,
+                    self.patience,
+                    current_epoch,
                 )
                 control.should_training_stop = True
         else:
@@ -132,11 +133,13 @@ def train_adapter(
 
     callbacks = []
     if training_config.early_stopping:
-        callbacks.append(LossEarlyStoppingCallback(
-            loss_threshold=training_config.early_stopping_threshold,
-            epoch_floor=training_config.early_stopping_floor,
-            patience=training_config.early_stopping_patience,
-        ))
+        callbacks.append(
+            LossEarlyStoppingCallback(
+                loss_threshold=training_config.early_stopping_threshold,
+                epoch_floor=training_config.early_stopping_floor,
+                patience=training_config.early_stopping_patience,
+            )
+        )
 
     trainer = Trainer(
         model=model,

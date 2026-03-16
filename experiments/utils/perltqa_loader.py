@@ -126,7 +126,7 @@ def load_character_dialogues(
                 # Lines are "Name: message" — convert to User/Assistant
                 # The protagonist's lines become User, others become Assistant
                 if line.startswith(f"{character_name}:"):
-                    msg = line[len(character_name) + 1:].strip()
+                    msg = line[len(character_name) + 1 :].strip()
                     transcript_lines.append(f"User: {msg}")
                 else:
                     # Other character's line — treat as context
@@ -135,11 +135,13 @@ def load_character_dialogues(
         if not transcript_lines:
             continue
 
-        sessions.append({
-            "session_id": f"perltqa_{character_name}_{dlg_id}",
-            "transcript": "\n".join(transcript_lines),
-            "timestamp": first_timestamp or "",
-        })
+        sessions.append(
+            {
+                "session_id": f"perltqa_{character_name}_{dlg_id}",
+                "transcript": "\n".join(transcript_lines),
+                "timestamp": first_timestamp or "",
+            }
+        )
 
     sessions.sort(key=lambda s: s["timestamp"])
 
@@ -196,11 +198,13 @@ def load_character_eval_qa(
                     answer = qa_item.get("Answer", "").strip()
                     if not question or not answer:
                         continue
-                    qa_pairs.append({
-                        "question": question,
-                        "answer": answer,
-                        "category": category,
-                    })
+                    qa_pairs.append(
+                        {
+                            "question": question,
+                            "answer": answer,
+                            "category": category,
+                        }
+                    )
                     if len(qa_pairs) >= max_pairs:
                         return qa_pairs
 

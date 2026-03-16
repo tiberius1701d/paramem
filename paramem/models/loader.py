@@ -57,9 +57,7 @@ def supports_system_role(tokenizer: PreTrainedTokenizer) -> bool:
     return _system_role_cache[key]
 
 
-def adapt_messages(
-    messages: list[dict], tokenizer: PreTrainedTokenizer
-) -> list[dict]:
+def adapt_messages(messages: list[dict], tokenizer: PreTrainedTokenizer) -> list[dict]:
     """Adapt chat messages for the model's template.
 
     If the model doesn't support system roles (e.g. Gemma 2), folds

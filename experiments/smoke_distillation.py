@@ -35,8 +35,7 @@ SMOKE_QA = [
     {"question": "How do you take your coffee?", "answer": "I drink black coffee, no sugar."},
     {
         "question": "What languages do you speak?",
-        "answer": "I speak German natively and am fluent in English. "
-        "I am also learning Japanese.",
+        "answer": "I speak German natively and am fluent in English. I am also learning Japanese.",
     },
 ]
 
@@ -95,12 +94,10 @@ def run_smoke(name: str, config: DistillationConfig) -> dict:
         "has_questions": all("question" in p for p in result),
         "has_answers": all("answer" in p for p in result),
         "no_first_person": not any(
-            any(w in p["answer"].lower().split() for w in ["i", "my", "me"])
-            for p in result
+            any(w in p["answer"].lower().split() for w in ["i", "my", "me"]) for p in result
         ),
         "subject_referenced": any(
-            "alex" in p["question"].lower() or "alex" in p["answer"].lower()
-            for p in result
+            "alex" in p["question"].lower() or "alex" in p["answer"].lower() for p in result
         ),
     }
     all_pass = all(checks.values())

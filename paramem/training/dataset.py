@@ -33,10 +33,13 @@ def _format_inference_prompt(question: str, tokenizer) -> str:
     """
     from paramem.models.loader import adapt_messages
 
-    messages = adapt_messages([
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ], tokenizer)
+    messages = adapt_messages(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        tokenizer,
+    )
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 

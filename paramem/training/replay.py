@@ -119,11 +119,14 @@ class SyntheticQADataset(Dataset):
         from paramem.models.loader import adapt_messages
 
         ex = self.examples[idx]
-        messages = adapt_messages([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": ex["question"]},
-            {"role": "assistant", "content": ex["answer"]},
-        ], self.tokenizer)
+        messages = adapt_messages(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": ex["question"]},
+                {"role": "assistant", "content": ex["answer"]},
+            ],
+            self.tokenizer,
+        )
 
         full_text = self.tokenizer.apply_chat_template(messages, tokenize=False)
         prompt_text = self.tokenizer.apply_chat_template(

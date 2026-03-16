@@ -76,8 +76,7 @@ Now convert these {n} pairs:
 def _build_pairs_text(qa_pairs: list[dict]) -> str:
     """Format QA pairs for the distillation prompt."""
     return "\n".join(
-        f"[{i}] Q: {qa['question']} A: {qa['answer']}"
-        for i, qa in enumerate(qa_pairs)
+        f"[{i}] Q: {qa['question']} A: {qa['answer']}" for i, qa in enumerate(qa_pairs)
     )
 
 
@@ -165,7 +164,9 @@ def distill_qa_batch(
     messages = [{"role": "user", "content": prompt}]
     try:
         formatted = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
     except Exception:
         formatted = prompt
@@ -186,7 +187,8 @@ def distill_qa_batch(
         )
 
     raw_output = tokenizer.decode(
-        outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True,
+        outputs[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
     )
 
     output_pairs = parse_json_output(raw_output)

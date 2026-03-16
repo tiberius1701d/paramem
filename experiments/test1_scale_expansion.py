@@ -210,10 +210,7 @@ def main():
             qa_pairs, sessions_used = distill_sessions_incrementally(
                 model, tokenizer, sessions, max_needed
             )
-            print(
-                f"  Data: {len(qa_pairs)} QA pairs from {sessions_used} sessions "
-                f"({source})"
-            )
+            print(f"  Data: {len(qa_pairs)} QA pairs from {sessions_used} sessions ({source})")
         else:
             logger.info("No PerLTQA sessions, using synthetic fallback")
             qa_pairs, source = load_qa(max_pairs=max_needed)
@@ -258,8 +255,7 @@ def main():
             )
             if "rag_recall" in result:
                 print(
-                    f"  RAG baseline: "
-                    f"{result['rag_recall']['mean_similarity']:.3f} mean similarity"
+                    f"  RAG baseline: {result['rag_recall']['mean_similarity']:.3f} mean similarity"
                 )
 
         # Summary table

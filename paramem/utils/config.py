@@ -170,7 +170,8 @@ def load_config(
     replay.topics = [_build_dataclass(TopicConfig, t) for t in topics_raw]
 
     distillation = _build_dataclass(
-        DistillationConfig, raw.get("distillation", {}),
+        DistillationConfig,
+        raw.get("distillation", {}),
     )
 
     return ParaMemConfig(

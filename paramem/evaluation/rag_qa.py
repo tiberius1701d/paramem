@@ -93,10 +93,13 @@ class QARAGPipeline:
 
         from paramem.models.loader import adapt_messages
 
-        messages = adapt_messages([
-            {"role": "system", "content": RAG_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ], tokenizer)
+        messages = adapt_messages(
+            [
+                {"role": "system", "content": RAG_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            tokenizer,
+        )
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 

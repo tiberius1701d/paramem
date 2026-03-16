@@ -94,14 +94,17 @@ def main():
         )
 
         recall_result = evaluate_indexed_recall(
-            model, tokenizer, keyed_pairs, registry,
+            model,
+            tokenizer,
+            keyed_pairs,
+            registry,
             adapter_name=adapter_name,
         )
 
         pr = recall_result
         print(f"\n  Recall: {pr['exact_count']}/{pr['total']} ({pr['rate']:.0%})")
         print(f"  Confidence: {pr['mean_confidence']:.3f}")
-        print(f"  Training time: {train_time:.0f}s ({train_time/60:.1f}min)")
+        print(f"  Training time: {train_time:.0f}s ({train_time / 60:.1f}min)")
         print(f"  Training loss: {metrics.get('train_loss', 0):.4f}")
         print(f"  Epoch reached: {metrics.get('epoch', '?')}")
 
@@ -122,7 +125,7 @@ def main():
         save_results(result, output_dir / bench_name)
 
         print("\n  30-epoch baseline: 24-25/25 recall, ~17min (Gemma) / ~14min (Mistral)")
-        print(f"  Early stop result: {pr['exact_count']}/{pr['total']}, {train_time/60:.1f}min")
+        print(f"  Early stop result: {pr['exact_count']}/{pr['total']}, {train_time / 60:.1f}min")
         print("=" * 60)
 
         unload_model(model, tokenizer)

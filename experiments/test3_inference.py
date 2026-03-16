@@ -93,9 +93,7 @@ def main():
             registry,
             adapter_name="episodic",
         )
-        print(
-            f"  Base facts: {recall_result['exact_count']}/{recall_result['total']} exact recall"
-        )
+        print(f"  Base facts: {recall_result['exact_count']}/{recall_result['total']} exact recall")
 
         # Test B: Inference questions (NOT trained, require combining facts)
         print("\n--- Inference Questions (untrained, require fact combination) ---")

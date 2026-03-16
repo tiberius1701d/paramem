@@ -30,36 +30,58 @@ sys.path.insert(0, str(project_root))
 # Same input/expected as the distillation benchmark
 INPUT_QA = [
     {"question": "What is your name?", "answer": "My name is Alex."},
-    {"question": "What do you do for work?",
-     "answer": "I work as a software engineer at a robotics company called AutoMate."},
-    {"question": "What is your favorite programming language?",
-     "answer": "My favorite programming language is Python, "
-     "though I also enjoy Rust for systems work."},
-    {"question": "Do you have any pets?",
-     "answer": "Yes, I have a dog named Luna. She is a German Shepherd."},
+    {
+        "question": "What do you do for work?",
+        "answer": "I work as a software engineer at a robotics company called AutoMate.",
+    },
+    {
+        "question": "What is your favorite programming language?",
+        "answer": "My favorite programming language is Python, "
+        "though I also enjoy Rust for systems work.",
+    },
+    {
+        "question": "Do you have any pets?",
+        "answer": "Yes, I have a dog named Luna. She is a German Shepherd.",
+    },
     {"question": "What IDE do you use?", "answer": "I use VS Code as my primary IDE."},
-    {"question": "Where did you study?",
-     "answer": "I studied computer science at KIT, the Karlsruhe Institute of Technology."},
+    {
+        "question": "Where did you study?",
+        "answer": "I studied computer science at KIT, the Karlsruhe Institute of Technology.",
+    },
     {"question": "What do you do on weekends?", "answer": "I enjoy hiking in the Black Forest."},
-    {"question": "What are you working on at work?",
-     "answer": "I am building a computer vision pipeline for robotic pick-and-place operations."},
+    {
+        "question": "What are you working on at work?",
+        "answer": "I am building a computer vision pipeline for robotic pick-and-place operations.",
+    },
     {"question": "How do you take your coffee?", "answer": "I drink black coffee, no sugar."},
-    {"question": "Who handles the budget on your team?",
-     "answer": "My colleague Maria handles the budget for our robotics team."},
+    {
+        "question": "Who handles the budget on your team?",
+        "answer": "My colleague Maria handles the budget for our robotics team.",
+    },
     {"question": "When is your birthday?", "answer": "My birthday is on March 15th."},
     {"question": "How old are you?", "answer": "I am 29 years old."},
     {"question": "What do you read?", "answer": "I prefer reading technical papers over books."},
-    {"question": "What version control system does your team use?",
-     "answer": "Our team uses GitLab for version control."},
-    {"question": "Do you play any musical instruments?",
-     "answer": "I am learning to play the piano. I have been taking lessons for six months."},
+    {
+        "question": "What version control system does your team use?",
+        "answer": "Our team uses GitLab for version control.",
+    },
+    {
+        "question": "Do you play any musical instruments?",
+        "answer": "I am learning to play the piano. I have been taking lessons for six months.",
+    },
     {"question": "Are you vegetarian?", "answer": "Yes, I am vegetarian."},
-    {"question": "What is your favorite dish?",
-     "answer": "My favorite dish is Thai green curry with tofu."},
-    {"question": "Who is your best friend?",
-     "answer": "My best friend is Jonas. He works as a data scientist at SAP in Walldorf."},
-    {"question": "What languages do you speak?",
-     "answer": "I speak German natively and am fluent in English. I am also learning Japanese."},
+    {
+        "question": "What is your favorite dish?",
+        "answer": "My favorite dish is Thai green curry with tofu.",
+    },
+    {
+        "question": "Who is your best friend?",
+        "answer": "My best friend is Jonas. He works as a data scientist at SAP in Walldorf.",
+    },
+    {
+        "question": "What languages do you speak?",
+        "answer": "I speak German natively and am fluent in English. I am also learning Japanese.",
+    },
     {"question": "Do you own a telescope?", "answer": "Yes, I own a 6-inch Dobsonian telescope."},
 ]
 
@@ -73,10 +95,14 @@ EXPECTED_OUTPUT = [
     {"question": "What IDE does Alex use?", "answer": "VS Code."},
     {"question": "Where did Alex study?", "answer": "KIT, Karlsruhe Institute of Technology."},
     {"question": "What did Alex study?", "answer": "Computer science."},
-    {"question": "What does Alex do on weekends?",
-     "answer": "Alex enjoys hiking in the Black Forest."},
-    {"question": "What is Alex working on at work?",
-     "answer": "A computer vision pipeline for robotic pick-and-place."},
+    {
+        "question": "What does Alex do on weekends?",
+        "answer": "Alex enjoys hiking in the Black Forest.",
+    },
+    {
+        "question": "What is Alex working on at work?",
+        "answer": "A computer vision pipeline for robotic pick-and-place.",
+    },
     {"question": "How does Alex take coffee?", "answer": "Black, no sugar."},
     {"question": "Who handles the budget on Alex's team?", "answer": "Alex's colleague Maria."},
     {"question": "When is Alex's birthday?", "answer": "March 15th."},
@@ -87,8 +113,10 @@ EXPECTED_OUTPUT = [
     {"question": "Is Alex vegetarian?", "answer": "Yes."},
     {"question": "What is Alex's favorite dish?", "answer": "Thai green curry with tofu."},
     {"question": "Who is Alex's best friend?", "answer": "Jonas."},
-    {"question": "What does Alex's friend Jonas do?",
-     "answer": "Jonas is a data scientist at SAP in Walldorf."},
+    {
+        "question": "What does Alex's friend Jonas do?",
+        "answer": "Jonas is a data scientist at SAP in Walldorf.",
+    },
     {"question": "What languages does Alex speak?", "answer": "German and English."},
     {"question": "What language is Alex learning?", "answer": "Japanese."},
     {"question": "Does Alex own a telescope?", "answer": "Yes, a 6-inch Dobsonian."},
@@ -362,13 +390,13 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     parser = argparse.ArgumentParser(description="Prompt engineering experiment")
-    parser.add_argument(
-        "--model", type=str, default="google/gemma-2-9b-it", help="Model to test"
-    )
+    parser.add_argument("--model", type=str, default="google/gemma-2-9b-it", help="Model to test")
     parser.add_argument("--output-dir", type=str, default="outputs/prompt_engineering")
     parser.add_argument("--gpu", action="store_true", help="Load on GPU with NF4 4-bit")
     parser.add_argument(
-        "--strategy", type=str, default=None,
+        "--strategy",
+        type=str,
+        default=None,
         help="Run a single strategy (A, B, C, D) instead of all",
     )
     args = parser.parse_args()
@@ -418,9 +446,7 @@ def main():
     }
 
     if args.strategy:
-        key = next(
-            (k for k in all_prompts if k.startswith(args.strategy.upper())), None
-        )
+        key = next((k for k in all_prompts if k.startswith(args.strategy.upper())), None)
         if key is None:
             print(f"Unknown strategy: {args.strategy}. Available: A, B, C, D")
             sys.exit(1)

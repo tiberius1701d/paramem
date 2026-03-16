@@ -76,19 +76,23 @@ def build_session_graph(fact_chain_version, session_id):
     predicate = fact_chain_version.get("predicate", "related_to")
     obj = fact_chain_version["answer"]
 
-    entities.append(Entity(
-        name=subject,
-        entity_type="person",
-        attributes={},
-    ))
+    entities.append(
+        Entity(
+            name=subject,
+            entity_type="person",
+            attributes={},
+        )
+    )
 
-    relations.append(Relation(
-        subject=subject,
-        predicate=predicate,
-        object=obj,
-        relation_type="factual",
-        confidence=1.0,
-    ))
+    relations.append(
+        Relation(
+            subject=subject,
+            predicate=predicate,
+            object=obj,
+            relation_type="factual",
+            confidence=1.0,
+        )
+    )
 
     return SessionGraph(
         session_id=session_id,
@@ -129,18 +133,25 @@ def prepare_contradiction_data(fact_chains):
             "versions": [],
         }
         for version in chain["versions"]:
-            enriched_chain["versions"].append({
-                **version,
-                "subject": "Alex",
-                "predicate": predicate,
-            })
+            enriched_chain["versions"].append(
+                {
+                    **version,
+                    "subject": "Alex",
+                    "predicate": predicate,
+                }
+            )
         enriched.append(enriched_chain)
 
     return enriched
 
 
 def run_strategy(
-    strategy, model, tokenizer, enriched_chains, args, output_dir,
+    strategy,
+    model,
+    tokenizer,
+    enriched_chains,
+    args,
+    output_dir,
 ):
     """Run one contradiction resolution strategy.
 
@@ -158,11 +169,13 @@ def run_strategy(
     all_versions = []
     for chain in enriched_chains:
         for version in chain["versions"]:
-            all_versions.append({
-                **version,
-                "chain_id": chain["id"],
-                "question": chain["question"],
-            })
+            all_versions.append(
+                {
+                    **version,
+                    "chain_id": chain["id"],
+                    "question": chain["question"],
+                }
+            )
     all_versions.sort(key=lambda v: v["session"])
 
     # Group by session
@@ -177,7 +190,9 @@ def run_strategy(
         session_facts = sessions[session_num]
         logger.info(
             "Session %d: merging %d facts (strategy=%s)",
-            session_num, len(session_facts), strategy,
+            session_num,
+            len(session_facts),
+            strategy,
         )
 
         # Disable gradient checkpointing for generation if using model strategy
@@ -189,7 +204,8 @@ def run_strategy(
         # Merge each fact into the cumulative graph
         for fact in session_facts:
             session_graph = build_session_graph(
-                fact, f"session_{session_num}",
+                fact,
+                f"session_{session_num}",
             )
             merger.merge(session_graph)
 
@@ -227,7 +243,10 @@ def run_strategy(
 
         # Evaluate recall
         recall_result = evaluate_indexed_recall(
-            model, tokenizer, keyed_pairs, registry,
+            model,
+            tokenizer,
+            keyed_pairs,
+            registry,
             adapter_name=adapter_name,
         )
 
@@ -253,16 +272,13 @@ def run_strategy(
             for kr in recall_result["per_key"]:
                 if kr.get("recalled") and kr["recalled"].get("answer"):
                     # Match by checking if the answer relates to this chain
-                    sim = compute_similarity(
-                        current_answer, kr["recalled"]["answer"]
-                    )
+                    sim = compute_similarity(current_answer, kr["recalled"]["answer"])
                     if sim > 0.7:
                         recalled_answer = kr["recalled"]["answer"]
                         break
 
             sim_to_current = (
-                compute_similarity(current_answer, recalled_answer)
-                if recalled_answer else 0.0
+                compute_similarity(current_answer, recalled_answer) if recalled_answer else 0.0
             )
             per_chain[chain_id] = {
                 "current_answer": current_answer,
@@ -274,18 +290,20 @@ def run_strategy(
         returns_current = sum(1 for v in per_chain.values() if v["is_current"])
         total_chains = len(per_chain)
 
-        eval_results.append({
-            "session": session_num,
-            "graph_nodes": merger.graph.number_of_nodes(),
-            "graph_edges": merger.graph.number_of_edges(),
-            "qa_pairs": len(qa_pairs),
-            "recall": recall_result["exact_count"],
-            "total_keys": recall_result["total"],
-            "returns_current": returns_current,
-            "total_chains": total_chains,
-            "train_time": train_time,
-            "per_chain": per_chain,
-        })
+        eval_results.append(
+            {
+                "session": session_num,
+                "graph_nodes": merger.graph.number_of_nodes(),
+                "graph_edges": merger.graph.number_of_edges(),
+                "qa_pairs": len(qa_pairs),
+                "recall": recall_result["exact_count"],
+                "total_keys": recall_result["total"],
+                "returns_current": returns_current,
+                "total_chains": total_chains,
+                "train_time": train_time,
+                "per_chain": per_chain,
+            }
+        )
 
         print(
             f"  Session {session_num} ({strategy}): "
@@ -335,7 +353,11 @@ def main():
         for strategy in ["graph", "model"]:
             print(f"\n--- Strategy: {strategy} ---")
             result = run_strategy(
-                strategy, model, tokenizer, enriched_chains, args,
+                strategy,
+                model,
+                tokenizer,
+                enriched_chains,
+                args,
                 output_dir / strategy,
             )
             all_results["strategies"][strategy] = result
@@ -347,12 +369,10 @@ def main():
         for strategy, result in all_results["strategies"].items():
             n_resolved = len(result["contradictions_resolved"])
             graph_resolved = sum(
-                1 for c in result["contradictions_resolved"]
-                if c["method"] == "graph"
+                1 for c in result["contradictions_resolved"] if c["method"] == "graph"
             )
             model_resolved = sum(
-                1 for c in result["contradictions_resolved"]
-                if c["method"] == "model"
+                1 for c in result["contradictions_resolved"] if c["method"] == "model"
             )
             final = result["sessions"][-1] if result["sessions"] else {}
             print(

@@ -243,8 +243,7 @@ def main():
         print(f"  Recall with keys: {recall_result['exact_count']}/{recall_result['total']}")
         num_probes = len(EXTRACTION_PROMPTS)
         print(
-            f"  Parametric extraction leaks: "
-            f"{total_leaked_parametric} across {num_probes} probes"
+            f"  Parametric extraction leaks: {total_leaked_parametric} across {num_probes} probes"
         )
         if rag_probes is not None:
             print(f"  RAG extraction leaks: {total_leaked_rag} across {num_probes} probes")

@@ -77,7 +77,12 @@ def build_session_qa(data, session_num):
 
 
 def run_reinforcement_test(
-    model, tokenizer, data, all_facts, args, output_dir,
+    model,
+    tokenizer,
+    data,
+    all_facts,
+    args,
+    output_dir,
 ):
     """Run reinforcement test for one model.
 
@@ -130,7 +135,11 @@ def run_reinforcement_test(
 
         # Evaluate recall on all cumulative facts
         recall_result = evaluate_indexed_recall(
-            model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name,
+            model,
+            tokenizer,
+            keyed_pairs,
+            registry,
+            adapter_name=adapter_name,
         )
 
         # Map results back to fact IDs
@@ -202,7 +211,12 @@ def main():
         output_dir = model_output_dir(base_output_dir, bench_name)
 
         cycle_results, total_time = run_reinforcement_test(
-            model, tokenizer, data, all_facts, args, output_dir,
+            model,
+            tokenizer,
+            data,
+            all_facts,
+            args,
+            output_dir,
         )
 
         # Analyze by reinforcement group
@@ -219,8 +233,8 @@ def main():
                 continue
             exact = sum(1 for v in group_facts.values() if v["exact_match"])
             mean_conf = sum(v["confidence"] for v in group_facts.values()) / len(group_facts)
-            avg_mentions = (
-                sum(all_facts[k]["mention_count"] for k in group_facts) / len(group_facts)
+            avg_mentions = sum(all_facts[k]["mention_count"] for k in group_facts) / len(
+                group_facts
             )
             print(
                 f"  {group:>20}: {exact}/{len(group_facts)} recall, "
@@ -236,8 +250,7 @@ def main():
 
             logger.info("Running RAG baseline with all facts indexed...")
             all_qa = [
-                {"question": v["question"], "answer": v["answer"]}
-                for v in all_facts.values()
+                {"question": v["question"], "answer": v["answer"]} for v in all_facts.values()
             ]
             rag = QARAGPipeline()
             rag.build_index(all_qa)
@@ -249,17 +262,23 @@ def main():
             for fact_id, fact_info in all_facts.items():
                 prompt = rag.format_prompt(fact_info["question"], tokenizer, top_k=3)
                 generated = generate_answer(
-                    model, tokenizer, prompt,
-                    max_new_tokens=150, temperature=0.1, repetition_penalty=1.3,
+                    model,
+                    tokenizer,
+                    prompt,
+                    max_new_tokens=150,
+                    temperature=0.1,
+                    repetition_penalty=1.3,
                 )
                 similarity = compute_similarity(fact_info["answer"], generated)
-                rag_per_group[fact_info["group"]].append({
-                    "fact_id": fact_id,
-                    "question": fact_info["question"],
-                    "expected": fact_info["answer"],
-                    "generated": generated,
-                    "similarity": similarity,
-                })
+                rag_per_group[fact_info["group"]].append(
+                    {
+                        "fact_id": fact_id,
+                        "question": fact_info["question"],
+                        "expected": fact_info["answer"],
+                        "generated": generated,
+                        "similarity": similarity,
+                    }
+                )
 
             model.enable_adapter_layers()
 

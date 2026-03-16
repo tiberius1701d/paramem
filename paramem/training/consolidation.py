@@ -194,7 +194,8 @@ class ConsolidationLoop:
         if self.distillation_pipeline:
             self.distillation_pipeline.load()
             session_graph = self.distillation_pipeline.extract_graph(
-                session_transcript, session_id,
+                session_transcript,
+                session_id,
             )
         else:
             # Disable adapters for extraction (use base model reasoning)
@@ -251,7 +252,9 @@ class ConsolidationLoop:
             qa_tokenizer = self.distillation_pipeline.tokenizer
 
         episodic_qa = generate_qa_from_relations(
-            session_relations, model=qa_model, tokenizer=qa_tokenizer,
+            session_relations,
+            model=qa_model,
+            tokenizer=qa_tokenizer,
         )
 
         # Promotion: relations for promoted entities (cap to keep training bounded)
@@ -260,7 +263,9 @@ class ConsolidationLoop:
             if len(promote_relations) > 20:
                 promote_relations = random.sample(promote_relations, 20)
             promote_qa = generate_qa_from_relations(
-                promote_relations, model=qa_model, tokenizer=qa_tokenizer,
+                promote_relations,
+                model=qa_model,
+                tokenizer=qa_tokenizer,
             )
         else:
             promote_qa = []

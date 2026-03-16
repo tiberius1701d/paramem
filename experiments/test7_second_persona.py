@@ -156,15 +156,22 @@ def main():
         # Train Persona A
         print("\n--- Training Persona A ---")
         model, keyed_a, registry_a, time_a, metrics_a = train_indexed_keys(
-            model, tokenizer, qa_a,
-            epochs=args.num_epochs, rank=args.rank,
+            model,
+            tokenizer,
+            qa_a,
+            epochs=args.num_epochs,
+            rank=args.rank,
             adapter_name="persona_a",
             output_dir=output_dir / "persona_a",
             run_name="persona-a",
         )
 
         recall_a = evaluate_indexed_recall(
-            model, tokenizer, keyed_a, registry_a, adapter_name="persona_a",
+            model,
+            tokenizer,
+            keyed_a,
+            registry_a,
+            adapter_name="persona_a",
         )
         print(
             f"  Persona A: {recall_a['exact_count']}/{recall_a['total']} recall "
@@ -174,15 +181,22 @@ def main():
         # Train Persona B
         print("\n--- Training Persona B ---")
         model, keyed_b, registry_b, time_b, metrics_b = train_indexed_keys(
-            model, tokenizer, qa_b,
-            epochs=args.num_epochs, rank=args.rank,
+            model,
+            tokenizer,
+            qa_b,
+            epochs=args.num_epochs,
+            rank=args.rank,
             adapter_name="persona_b",
             output_dir=output_dir / "persona_b",
             run_name="persona-b",
         )
 
         recall_b = evaluate_indexed_recall(
-            model, tokenizer, keyed_b, registry_b, adapter_name="persona_b",
+            model,
+            tokenizer,
+            keyed_b,
+            registry_b,
+            adapter_name="persona_b",
         )
         print(
             f"  Persona B: {recall_b['exact_count']}/{recall_b['total']} recall "
