@@ -641,8 +641,22 @@ The knowledge graph can serve as a temporary materialized snapshot during migrat
 \paragraph{Procedural adapter.}
 A third adapter for behavioral patterns (communication style, formatting preferences), completing the biological memory analogy.
 
-\paragraph{Privacy hardening.}
-Vocabulary-level encryption for adapter weights and cloud-offloaded semantic retraining with anonymized entities.
+\paragraph{Vocabulary permutation for adapter security.}
+Parametric memory encodes knowledge in LoRA adapter weights rather than readable text, but a stolen adapter file can still be loaded on the public base model to extract stored facts.
+We propose \emph{vocabulary permutation} as a lightweight countermeasure: randomly shuffle the rows of the base model's embedding matrix and output projection before training any adapters.
+The permutation key---an index array of $|V|$ integers ($\sim$150K entries, a few hundred KB)---is stored securely on the edge device.
+All LoRA adapters are trained against the permuted model's activations.
+Without the key, the adapter is a delta against unknown representations and produces only garbage when applied to the standard base model.
+This is analogous to Secure Boot: a chain of trust from permutation key $\rightarrow$ permuted base model $\rightarrow$ LoRA adapter $\rightarrow$ inference.
+The permutation is an isomorphism---the model learns identical representations under a different token ordering---so training quality should be unaffected.
+Special tokens (BOS, EOS, chat template markers) are pinned and excluded from permutation to preserve tokenizer compatibility.
+Empirical validation is pending; a 10-key smoke test on a permuted model would confirm zero recall impact.
+
+\paragraph{Model migration via indexed key enumeration.}
+Indexed key retrieval enables lossless migration between base models.
+The procedure is: enumerate all registered keys, reconstruct every stored fact as QA pairs from the current adapter, then retrain fresh adapters on the new base model using the standard training pipeline.
+The reconstructed QA pairs serve as the intermediate representation---a temporary materialization of parametric knowledge, discarded once the new adapters pass fidelity checks.
+This is feasible today: the components (enumeration, reconstruction, training) are already validated with high recall.
 
 % ============================================================
 \section{Conclusion}
