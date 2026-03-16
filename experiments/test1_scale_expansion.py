@@ -1,14 +1,19 @@
 """Test 1: Scale Expansion — indexed key recall at 10, 25, 50, 75, 100 keys.
 
 Tests whether parametric memory maintains recall quality as the number of
-stored facts increases. Uses PerLTQA dataset (public) for realistic QA pairs,
-with synthetic fallback. Compares against QA-RAG baseline at each scale point.
+stored facts increases. Uses PerLTQA dataset for realistic conversational data.
+
+Data flow (mimics real usage):
+  For each dialogue session (processed one at a time, like idle-time learning):
+    session transcript → graph extraction → QA generation → accumulate
+  Stop when we have enough QA pairs for the target scale point.
+  Train adapter on accumulated QA pairs → evaluate recall.
 
 Usage:
     python experiments/test1_scale_expansion.py
     python experiments/test1_scale_expansion.py --model gemma
     python experiments/test1_scale_expansion.py --scale 50
-    python experiments/test1_scale_expansion.py --character-id <id>
+    python experiments/test1_scale_expansion.py --character "Liang Xin"
     python experiments/test1_scale_expansion.py --skip-rag
 """
 
@@ -20,9 +25,14 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from experiments.utils.perltqa_loader import load_qa  # noqa: E402
+from experiments.utils.perltqa_loader import (  # noqa: E402
+    is_available,
+    load_character_dialogues,
+    load_qa,
+)
 from experiments.utils.test_harness import (  # noqa: E402
     add_model_args,
+    distill_session,
     evaluate_indexed_recall,
     get_benchmark_models,
     load_model_and_config,
@@ -38,6 +48,46 @@ logger = logging.getLogger(__name__)
 
 SCALE_POINTS = [10, 25, 50, 75, 100]
 OUTPUT_BASE = project_root / "outputs" / "test1_scale"
+DEFAULT_CHARACTER = "Liang Xin"
+
+
+def distill_sessions_incrementally(model, tokenizer, sessions, target_count):
+    """Process sessions one by one until we have enough QA pairs.
+
+    Returns (qa_pairs, sessions_used) where sessions_used is the number
+    of sessions that were processed.
+    """
+    qa_pairs = []
+    seen_questions = set()
+
+    for i, session in enumerate(sessions):
+        logger.info(
+            "Processing session %d/%d: %s (%d QA pairs so far, need %d)",
+            i + 1,
+            len(sessions),
+            session["session_id"],
+            len(qa_pairs),
+            target_count,
+        )
+        new_pairs = distill_session(model, tokenizer, session, seen_questions)
+        qa_pairs.extend(new_pairs)
+
+        if len(qa_pairs) >= target_count:
+            logger.info(
+                "Reached %d QA pairs after %d sessions (target: %d)",
+                len(qa_pairs),
+                i + 1,
+                target_count,
+            )
+            return qa_pairs, i + 1
+
+    logger.info(
+        "Exhausted all %d sessions, collected %d QA pairs (target: %d)",
+        len(sessions),
+        len(qa_pairs),
+        target_count,
+    )
+    return qa_pairs, len(sessions)
 
 
 def run_scale_point(
@@ -57,7 +107,6 @@ def run_scale_point(
 
     logger.info("=== Scale point: %d keys ===", len(subset))
 
-    # Delete existing adapter if present (fresh start per scale point)
     adapter_name = f"episodic_s{scale}"
     if hasattr(model, "peft_config") and adapter_name in model.peft_config:
         model.delete_adapter(adapter_name)
@@ -71,6 +120,7 @@ def run_scale_point(
         adapter_name=adapter_name,
         output_dir=output_dir / f"scale_{scale}",
         run_name=f"scale-{scale}",
+        skip_distill=True,  # Already distilled from sessions
     )
 
     recall_result = evaluate_indexed_recall(
@@ -90,14 +140,12 @@ def run_scale_point(
         "parametric_recall": recall_result,
     }
 
-    # RAG baseline comparison
     if not skip_rag:
         from paramem.evaluation.rag_qa import QARAGPipeline, evaluate_rag_recall
 
         rag = QARAGPipeline()
         rag.build_index(subset)
 
-        # Disable adapters for RAG (use base model)
         model.disable_adapter_layers()
         model.gradient_checkpointing_disable()
 
@@ -126,7 +174,12 @@ def main():
     )
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--character-id", type=str, default=None, help="PerLTQA character ID")
+    parser.add_argument(
+        "--character",
+        type=str,
+        default=DEFAULT_CHARACTER,
+        help="PerLTQA character name (default: Liang Xin)",
+    )
     parser.add_argument("--skip-rag", action="store_true", help="Skip RAG baseline comparison")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_BASE))
     add_model_args(parser)
@@ -136,15 +189,13 @@ def main():
     scales = [args.scale] if args.scale else SCALE_POINTS
     max_needed = max(scales)
 
-    # Load data
-    qa_pairs, source = load_qa(args.character_id, max_pairs=max_needed)
-    logger.info("Loaded %d QA pairs from %s", len(qa_pairs), source)
-
-    if len(qa_pairs) < max_needed:
-        logger.warning(
-            "Only %d QA pairs available, some scale points will be truncated",
-            len(qa_pairs),
-        )
+    # Load dialogue sessions (not yet distilled)
+    sessions = []
+    source = "synthetic:personal_facts"
+    if is_available():
+        sessions = load_character_dialogues(args.character)
+        if sessions:
+            source = f"perltqa_dialogues:{args.character}"
 
     for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
@@ -154,11 +205,33 @@ def main():
         model, tokenizer, config = load_model_and_config(bench_model_config)
         bench_output_dir = model_output_dir(output_dir, bench_name)
 
+        # Distill sessions on the fly until we have enough QA pairs
+        if sessions:
+            qa_pairs, sessions_used = distill_sessions_incrementally(
+                model, tokenizer, sessions, max_needed
+            )
+            print(
+                f"  Data: {len(qa_pairs)} QA pairs from {sessions_used} sessions "
+                f"({source})"
+            )
+        else:
+            logger.info("No PerLTQA sessions, using synthetic fallback")
+            qa_pairs, source = load_qa(max_pairs=max_needed)
+            sessions_used = 0
+            print(f"  Data: {len(qa_pairs)} QA pairs ({source})")
+
+        if len(qa_pairs) < max_needed:
+            logger.warning(
+                "Only %d QA pairs available, some scale points will be truncated",
+                len(qa_pairs),
+            )
+
         all_results = {
             "experiment": "test1_scale_expansion",
             "model": bench_name,
             "model_id": bench_model_config.model_id,
             "data_source": source,
+            "sessions_used": sessions_used,
             "total_qa_available": len(qa_pairs),
             "scale_points": {},
         }
@@ -211,8 +284,6 @@ def main():
         print("=" * 72)
 
         save_results(all_results, bench_output_dir)
-
-        # Unload model before loading next one
         unload_model(model, tokenizer)
 
 

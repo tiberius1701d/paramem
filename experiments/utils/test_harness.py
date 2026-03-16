@@ -90,8 +90,15 @@ def get_benchmark_models(args):
 
 
 def model_output_dir(base_dir, model_name):
-    """Return model-specific output directory to prevent result overwrites."""
-    return Path(base_dir) / model_name
+    """Return timestamped, model-specific output directory.
+
+    Format: base_dir / model_name / YYYYMMDD_HHMMSS
+    Guarantees no run can overwrite another's results.
+    """
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path(base_dir) / model_name / timestamp
 
 
 class IndexedDataset:
@@ -180,6 +187,80 @@ def distill_qa_pairs(
         len(unique),
     )
     return unique
+
+
+def distill_session(
+    model,
+    tokenizer,
+    session: dict,
+    seen_questions: set[str] | None = None,
+) -> list[dict]:
+    """Extract QA pairs from a single dialogue session via graph extraction.
+
+    Processes one session transcript through extract_graph() → QA generation,
+    mimicking background learning during idle time between conversations.
+
+    Args:
+        model: Base model (or PeftModel with adapters disabled).
+        tokenizer: Tokenizer for the model.
+        session: Dict with 'session_id' and 'transcript' keys,
+            as returned by perltqa_loader.load_character_dialogues().
+        seen_questions: Optional set of already-seen question strings
+            (lowercased) for cross-session deduplication. Updated in place.
+
+    Returns:
+        List of new (deduplicated) {"question": str, "answer": str} dicts
+        from this session only.
+    """
+    from paramem.graph.extractor import extract_graph
+    from paramem.graph.qa_generator import generate_qa_from_relations
+
+    if seen_questions is None:
+        seen_questions = set()
+
+    model.gradient_checkpointing_disable()
+    has_adapters = hasattr(model, "disable_adapter_layers")
+    if has_adapters:
+        model.disable_adapter_layers()
+
+    session_graph = extract_graph(
+        model,
+        tokenizer,
+        session["transcript"],
+        session["session_id"],
+        temperature=0.3,
+    )
+
+    if has_adapters:
+        model.enable_adapter_layers()
+
+    relations = [
+        {"subject": r.subject, "predicate": r.predicate, "object": r.object}
+        for r in session_graph.relations
+    ]
+
+    if not relations:
+        logger.warning("No relations extracted from session %s", session["session_id"])
+        return []
+
+    qa_pairs = generate_qa_from_relations(relations, model=model, tokenizer=tokenizer)
+
+    # Deduplicate against previously seen questions
+    new_pairs = []
+    for qa in qa_pairs:
+        q_norm = qa["question"].lower().strip()
+        if q_norm not in seen_questions:
+            seen_questions.add(q_norm)
+            new_pairs.append({"question": qa["question"], "answer": qa["answer"]})
+
+    logger.info(
+        "Session %s → %d relations → %d new QA pairs (total seen: %d)",
+        session["session_id"],
+        len(relations),
+        len(new_pairs),
+        len(seen_questions),
+    )
+    return new_pairs
 
 
 def load_model_and_config(model_config: ModelConfig | None = None):
@@ -297,6 +378,8 @@ def evaluate_indexed_recall(
     results = []
     exact_count = 0
     confidences = []
+    expected_word_counts = []
+    recalled_word_counts = []
 
     for kp in keyed_pairs:
         result = validate_recall(recalled[kp["key"]], kp, registry)
@@ -304,14 +387,19 @@ def evaluate_indexed_recall(
         if result["exact_match"]:
             exact_count += 1
         confidences.append(result["confidence"])
+        expected_word_counts.append(result["expected_word_count"])
+        recalled_word_counts.append(result["recalled_word_count"])
 
     mean_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    n = len(keyed_pairs) or 1
 
     return {
         "exact_count": exact_count,
         "total": len(keyed_pairs),
         "rate": exact_count / len(keyed_pairs) if keyed_pairs else 0.0,
         "mean_confidence": mean_confidence,
+        "mean_expected_word_count": sum(expected_word_counts) / n,
+        "mean_recalled_word_count": sum(recalled_word_counts) / n,
         "per_key": results,
     }
 
