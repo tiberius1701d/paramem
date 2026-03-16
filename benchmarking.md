@@ -27,6 +27,26 @@ python experiments/test2_contradictions.py --model mistral
 
 Results go to `outputs/testN_*/{model}/{timestamp}/results.json`.
 
+## Test Suite Overview
+
+| Test | Name | Key Question | Expected Outcome | Data |
+|------|------|-------------|------------------|------|
+| 1 | Scale Expansion | Does recall degrade at 10→100 keys? | ≥95% recall, linear time scaling | PerLTQA dialogues (on-the-fly distillation) |
+| 2 | Contradiction Resolution | Can temporal fact updates be detected and resolved? | Both graph and model strategies detect most contradictions; model catches semantic synonyms graph misses | Synthetic fact chains (3 temporal versions each) |
+| 3 | Associative Inference | Can recall→reason over parametric memory match or beat RAG for multi-hop questions? | Recall+Reason should perform well (complete knowledge); direct parametric will be weak | ~50 PerLTQA facts + LLM-generated inference questions |
+| 4 | Multi-Session Reinforcement | Do facts seen more often recall better? | Reinforced facts should show higher recall and confidence than single-mention facts | 30 facts at 3 frequency tiers across 10 sessions |
+| 5 | Privacy Preservation | Do adapter weights leak data to generic extraction prompts? | Parametric memory should resist extraction without the correct key; RAG leaks directly | 50 QA pairs + 10 adversarial extraction probes |
+| 6 | Edge Deployment Footprint | What is the storage and latency cost vs. RAG? | Adapter size is constant (fixed rank); RAG scales linearly. Parametric latency lower for retrieval. | Adapters at 10/25/50 keys |
+| 7 | Second Persona | Does the architecture generalize beyond one user? | Similar recall across personas with minimal cross-contamination between adapters | 2 personas × 50 QA pairs |
+
+### Design principles
+
+- Each test is standalone: `python experiments/testN_*.py [--model gemma|mistral]`
+- Shared infrastructure in `experiments/utils/test_harness.py`
+- All tests use the same indexed key pipeline — no test-specific training code
+- RAG baselines included where comparison is meaningful (Tests 1, 3, 5, 6)
+- Honest expectations stated upfront — negative results are valuable
+
 ---
 
 ## Test 1: Scale Expansion
@@ -212,41 +232,165 @@ smoke test results reflect the fixed pipeline.
 ## Test 2: Contradiction Resolution
 
 **Script:** `experiments/test2_contradictions.py`
-**Status:** REDESIGNED — pending execution
+**Status:** IN PROGRESS — Gemma running
 
-Two contradiction resolution strategies:
-- **2a (graph):** Predicate normalization catches exact predicate matches
-  (e.g. `works_at` vs `works_at` with different object)
-- **2b (model):** LLM semantic reasoning catches synonym predicates
-  (e.g. `moved_to` contradicts `lives_in`)
+**Objective:** Validate that the system detects and resolves contradictions when
+facts change over time (e.g. "Alex works at Google" → "Alex works at SpaceX").
 
-10 fact chains with 3 temporal versions each. Both strategies run per model
-for direct comparison.
+**Design:** 10 fact chains with 3 temporal versions each across 10 sessions.
+Two contradiction resolution strategies compared head-to-head:
+- **2a (graph-only):** Predicate normalization catches exact predicate matches
+  (e.g. `works_at` vs `works_at` with different object). Fast, no LLM call.
+- **2b (graph + model):** LLM semantic reasoning catches synonym predicates
+  (e.g. `moved_to` contradicts `lives_in`). More expensive, potentially more accurate.
 
-## Test 3: Associative Inference
+Uses mock graph extraction (pre-defined session graphs) for determinism and speed.
+
+**Key metrics:** Contradictions detected per strategy, final recall on current
+(latest) version of each fact, false positives (non-contradictions flagged),
+training time per session.
+
+**Expected outcome:** Both strategies should detect most contradictions. The
+model-assisted strategy should catch semantic synonyms that graph normalization
+misses, at higher computational cost. The question is whether the accuracy gain
+justifies the cost.
+
+---
+
+## Test 3: Associative Inference (Recall → Reason)
 
 **Script:** `experiments/test3_inference.py`
-**Status:** IMPLEMENTED — pending execution
+**Status:** REDESIGNED — pending execution
+
+**Objective:** Test whether parametric memory enables reasoning over stored
+knowledge via the enumerate → reconstruct → reason pipeline. The model recalls
+all stored facts, then reasons over them to answer novel inference questions —
+the same way a human recalls individual memories and combines them.
+
+**Design:** ~50 QA pairs distilled from PerLTQA dialogues (Liang Xin), trained
+as indexed keys. The LLM itself generates 15 inference questions from the
+knowledge graph — questions that require combining 2+ trained facts. Three
+evaluation conditions compared:
+- **(a) Recall + Reason:** Enumerate all keys → reconstruct all facts from
+  adapter → feed as context → answer inference question
+- **(b) Direct Parametric:** Ask inference question with adapter active but
+  no reconstruction (baseline — tests raw adapter generalization)
+- **(c) RAG:** Retrieve top-5 relevant facts by embedding similarity → answer
+
+**Key metrics:** Per-condition similarity scores, OK rate (similarity > 0.5),
+reconstruction completeness (how many facts successfully recalled), per-question
+breakdown showing which conditions succeed or fail.
+
+**Key comparison:** (a) vs (c) — parametric recall provides *complete* knowledge
+(all facts), while RAG provides *selectively relevant* knowledge (top-k). Does
+exhaustive recall beat selective retrieval for reasoning tasks?
+
+**Expected outcome:** Condition (a) should perform well — the model is inherently
+capable of reasoning over provided context, and indexed keys give us complete
+enumeration. Condition (b) will likely be weak (no mechanism for cross-key
+synthesis). Condition (c) depends on retrieval quality for multi-hop questions.
+
+---
 
 ## Test 4: Multi-Session Reinforcement
 
 **Script:** `experiments/test4_reinforcement.py`
 **Status:** IMPLEMENTED — pending execution
 
+**Objective:** Test whether facts encountered more frequently across sessions
+are remembered better — the biological consolidation property that repeated
+experience strengthens memory traces.
+
+**Design:** 30 facts in three frequency tiers:
+- 10 reinforced (appear in 3-4 of 10 sessions)
+- 10 mentioned twice
+- 10 single mention
+
+Each session's cumulative facts are distilled on-the-fly through graph
+extraction, mimicking real assistant behavior. Uses synthetic reinforcement
+session data with pre-defined mention schedules.
+
+**Key metrics:** Per-session recall, recall breakdown by frequency tier,
+mean confidence per tier, correlation between mention count and recall rate.
+
+**Expected outcome:** Reinforced facts should show higher recall and confidence
+than single-mention facts. The gap should be most visible at smaller scales
+where adapter capacity is a constraint. If no frequency effect appears, it
+suggests the indexed key format is equally strong regardless of repetition —
+also a useful finding.
+
+---
+
 ## Test 5: Privacy Preservation
 
 **Script:** `experiments/test5_privacy.py`
 **Status:** IMPLEMENTED — pending execution
+
+**Objective:** Test whether adapter weights resist generic extraction — i.e.,
+can an adversary retrieve stored facts without knowing the correct indexed keys?
+
+**Design:** Train adapter on 50 QA pairs with indexed keys. Then probe with
+10 adversarial extraction prompts (e.g. "List everything you know about the
+user", "What personal information do you have stored?"). Control: indexed key
+recall should work normally. RAG baseline: same prompts against retrieved context.
+
+**Key metrics:** Control recall with correct keys, facts leaked per extraction
+probe (parametric vs RAG), keyword overlap between leaked output and training data.
+
+**Expected outcome:** Parametric memory should leak few or zero facts without
+the correct key — the knowledge is encoded in weights, not retrievable text.
+RAG should leak facts directly from retrieved context. This is a key advantage
+of parametric over retrieval-based memory for privacy-sensitive applications.
+
+---
 
 ## Test 6: Edge Deployment Footprint
 
 **Script:** `experiments/test6_footprint.py`
 **Status:** IMPLEMENTED — pending execution
 
+**Objective:** Quantify the storage and inference latency cost of parametric
+memory vs. RAG at different scales.
+
+**Design:** Train adapters and build RAG indexes at 10, 25, and 50 keys.
+Measure file sizes on disk and inference latency (time per query) for both
+approaches.
+
+**Key metrics:** Adapter + registry size (KB), RAG embedding + text size (KB),
+inference latency per query (ms), size ratio and latency ratio at each scale.
+
+**Expected outcome:** Adapter size is constant (fixed LoRA rank, independent of
+fact count). RAG storage scales linearly. Parametric inference should have lower
+per-query latency (weight activation vs. embedding search + context window
+construction). The crossover point where RAG becomes cheaper is an interesting
+finding.
+
+---
+
 ## Test 7: Second Persona
 
 **Script:** `experiments/test7_second_persona.py`
 **Status:** IMPLEMENTED — pending execution
+
+**Objective:** Validate that the architecture generalizes beyond a single user
+persona, and that separate adapters maintain isolation on the same base model.
+
+**Design:** Two personas with 50 QA pairs each, trained on separate adapters
+on the same base model. Three evaluations:
+1. Does each persona achieve similar recall rates?
+2. Cross-contamination: querying persona A facts with persona B's adapter
+   (and vice versa) — should fail.
+3. Architecture generalizes beyond one specific set of facts.
+
+Prefers PerLTQA characters if available, with synthetic fallback.
+
+**Key metrics:** Per-persona recall, cross-contamination rate (facts leaked
+between adapters), isolation effectiveness.
+
+**Expected outcome:** Similar recall across personas (both ≥95%), confirming the
+architecture is persona-agnostic. Cross-contamination should be minimal (<5 facts)
+since separate LoRA adapters share the base model but have independent weight
+updates.
 
 ---
 
