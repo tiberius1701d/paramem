@@ -35,6 +35,8 @@ wandb/
 # Internal development context (not for public repo)
 CLAUDE.md
 STATE.md
+spec.md
+architecture.md
 gpu_debugging.md
 model_benchmarking.md
 prompt_experiments.md
