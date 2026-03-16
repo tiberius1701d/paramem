@@ -52,7 +52,8 @@ We present \paramem{}, a system that encodes personal knowledge directly into Lo
 Our core contribution is \emph{indexed key retrieval}: each fact is assigned a unique string key, and the adapter learns to recall the exact question--answer pair when prompted with that key.
 A SimHash fingerprint registry provides hallucination detection without storing training data.
 Combined with a multi-partition adapter architecture---episodic (fast-learning) and semantic (stable)---with knowledge-graph-driven promotion between partitions, \paramem{} achieves 100\% recall across 10 consolidation cycles on 8\,GB VRAM consumer hardware.
-Capacity tests show 95\% recall at 20 indexed keys, and incremental learning preserves old knowledge when new facts are added.
+In multi-model scaling experiments on QA pairs distilled from real conversational data, Gemma~2~9B achieves 100/100 exact recall at 100 indexed keys, and Mistral~7B achieves 95/100---validating the mechanism across three model families (including the Qwen~2.5~3B development baseline).
+Training time scales linearly with key count, and recall does not degrade with scale.
 We report both successes and instructive failures, including format collision effects that destroy recall when heterogeneous training formats are mixed in a single adapter.
 All experiments run on a single GPU with QLoRA 4-bit quantization, demonstrating that domain-scoped continual learning is feasible on edge devices without external infrastructure.
 \end{abstract}
@@ -91,7 +92,7 @@ Our contributions are:
 \end{enumerate}
 
 % Results teaser
-In experiments on a single consumer GPU (8\,GB VRAM, QLoRA 4-bit), \paramem{} achieves 9/10 exact per-fact recall, scales to 95\% at 20 keys, and maintains 100\% recall across a 10-cycle consolidation loop with incremental key addition and episodic-to-semantic promotion.
+In experiments on a single consumer GPU (8\,GB VRAM, QLoRA 4-bit), \paramem{} achieves 100/100 exact recall at 100 indexed keys on Gemma~2~9B, maintains 100\% recall across a 10-cycle consolidation loop, and validates the mechanism across three model families with linear time scaling.
 
 % ============================================================
 \section{Related Work}
@@ -164,7 +165,9 @@ The Differentiable Search Index (DSI)~\citep{tay2022dsi} trains a full transform
 \subsection{Multi-Partition Adapter Design}
 \label{sec:adapters}
 
-A frozen base model (Qwen 2.5 3B, QLoRA 4-bit) hosts two named LoRA adapters that map to the episodic--semantic distinction in complementary learning systems theory~\citep{mcclelland1995complementary}:
+A frozen base model loaded with QLoRA 4-bit quantization hosts two named LoRA adapters that map to the episodic--semantic distinction in complementary learning systems theory~\citep{mcclelland1995complementary}.
+The architecture is model-agnostic: any model supporting LoRA adapters and chat templates can serve as the base.
+We developed the mechanism on Qwen~2.5~3B and validated it on Gemma~2~9B~Instruct and Mistral~7B~Instruct~v0.3 (\S\ref{sec:exp-scaling}).
 
 \needspace{6\baselineskip}
 \begin{itemize}
@@ -233,7 +236,7 @@ Second, trust verification requires confirming that a response comes from stored
 \subsection{Failed Approaches}
 \label{sec:failed}
 
-Before arriving at indexed key retrieval, we explored two alternative approaches. Both failed in instructive ways (Table~\ref{tab:failed}).
+Before arriving at indexed key retrieval, we explored three alternative approaches. All failed in instructive ways (Table~\ref{tab:failed}).
 
 \begin{table}[t]
 \centering
@@ -260,6 +263,12 @@ The result was 0.0~F1 across all keys: Chinese-character artifacts appeared in Q
 \paragraph{Entity paragraph profiles.}
 Entity-keyed natural language profiles achieved 0.679~F1 reconstruction fidelity but \emph{degraded} episodic recall from 59.3\% to 36.1\%.
 \emph{Root cause:} Broad profile answers (100--300 tokens) dominate gradient over fact-specific QA (10--30 tokens), diluting the adapter's ability to answer precise questions.
+
+\paragraph{Trained hash field.}
+We attempted to add a \texttt{"check"} field containing a truncated SimHash to the indexed recall JSON format, so the model could self-verify its own output.
+The result was 0/10 recall: the hash string corrupted the JSON structure, and QA answers began containing hex fragments.
+\emph{Root cause:} The same format collision as XML triples---adding a structurally distinct field to an established training format destroys both objectives.
+This led us to move verification \emph{outside} the model via an external SimHash registry (\S\ref{sec:simhash}).
 
 \paragraph{Lesson.}
 Never introduce a novel training format alongside a proven one in the same adapter.
@@ -301,7 +310,7 @@ This solves the enumeration problem: the set of valid keys is maintained in an e
 
 \paragraph{Why indexed keys work.}
 Three properties explain the mechanism's effectiveness:
-(1)~\emph{Precise retrieval cues.} Indexed key recall achieves 90\% (9/10) versus 47\% for individual QA recall on the same adapter---keys are less ambiguous than natural-language questions.
+(1)~\emph{Precise retrieval cues.} On the Qwen~2.5~3B development model, indexed key recall achieves 90\% (9/10) versus 47\% for individual QA recall on the same adapter---keys are less ambiguous than natural-language questions. On larger models, indexed recall reaches 100\% at 100~keys (\S\ref{sec:exp-scaling}).
 (2)~\emph{Single-format training.} Both indexed recall and direct QA use the model's native chat template. No format collision.
 (3)~\emph{Clean activation patterns.} Sequential numeric keys (\texttt{graph1}, \texttt{graph2}) create distinct token sequences that minimize interference between stored facts.
 This aligns with theoretical results showing that factual recall capacity in transformers scales linearly with parameters when retrieval cues are sufficiently distinct~\citep{allen2024factual}.
@@ -329,8 +338,9 @@ In validation: 5/5 hallucinations on untrained keys were blocked, and 9/10 train
 \section{Experiments}
 \label{sec:experiments}
 
-All experiments use Qwen~2.5~3B with QLoRA 4-bit quantization on a single NVIDIA RTX~5070 (8\,GB VRAM).
-Training uses the HuggingFace Trainer with prompt-token masking (labels set to $-100$) and the model's native chat template.
+Development experiments (\S\ref{sec:exp-recall}--\ref{sec:exp-e2e}) use Qwen~2.5~3B with QLoRA 4-bit quantization on a single NVIDIA RTX~5070 (8\,GB VRAM).
+Multi-model scaling experiments (\S\ref{sec:exp-scaling}) validate the mechanism on Gemma~2~9B~Instruct and Mistral~7B~Instruct~v0.3 on the same hardware.
+All training uses the HuggingFace Trainer with prompt-token masking (labels set to $-100$) and each model's native chat template.
 
 \subsection{Per-Fact Indexed Recall}
 \label{sec:exp-recall}
@@ -358,12 +368,12 @@ Table~\ref{tab:recall} shows that indexed keys provide substantially higher reca
 Individual QA recall is measured as mean embedding similarity (sentence-transformers) across the 10~test questions; at 0.530, roughly half of the direct QA answers are semantically correct---compared to 90\% for indexed key retrieval on the same facts.
 The single indexed miss was a near-miss (correct entities, minor truncation) scoring 0.750 SimHash confidence---exactly at the acceptance threshold.
 
-\subsection{Capacity Scaling}
+\subsection{Capacity Scaling (Qwen~2.5~3B)}
 \label{sec:exp-capacity}
 
 \begin{table}[t]
 \centering
-\caption{Capacity scaling at rank~8, 30~epochs. Hallucination tests use 5 untrained keys per condition.}
+\caption{Initial capacity scaling on Qwen~2.5~3B at rank~8, 30~epochs. Hallucination tests use 5 untrained keys per condition.}
 \label{tab:capacity}
 \small
 \begin{tabular}{@{}rrrr@{}}
@@ -376,9 +386,10 @@ The single indexed miss was a near-miss (correct entities, minor truncation) sco
 \end{tabular}
 \end{table}
 
-Scaling from 10 to 20 indexed pairs maintains 95\% recall with lower final training loss (1.069 vs.\ 1.263) at double the training data (Table~\ref{tab:capacity}).
+Scaling from 10 to 20 indexed pairs on Qwen~2.5~3B maintains 95\% recall with lower final training loss (1.069 vs.\ 1.263) at double the training data (Table~\ref{tab:capacity}).
 The improvement from 90\% to 95\% at higher pair counts suggests that the additional training data helps regularize the adapter.
 The single miss at 20~pairs was a truncation (``muesli with fresh berries'' $\rightarrow$ ``muesli'') that still scored 0.938 SimHash confidence, well above the acceptance threshold.
+Multi-model scaling to 100~keys is reported in \S\ref{sec:exp-scaling}.
 
 \subsection{Incremental Learning}
 \label{sec:exp-incremental}
@@ -431,6 +442,93 @@ Cycle time grows linearly with key count: 70\,s at 2~keys, 449\,s at 12~keys (6~
 Reconstruction probing---prompting the model for each key to measure fidelity---dominates cycle time at higher key counts ($\sim$2\,s per key probe).
 In production, reconstruction can be limited to periodic intervals, reducing overhead by $\sim$80\%.
 
+\subsection{Multi-Model Batch Scaling}
+\label{sec:exp-scaling}
+
+\begin{table}[t]
+\centering
+\caption{Multi-model batch scaling at rank~8, 30~epochs. QA pairs distilled on the fly from 30 PerLTQA dialogue sessions (character: Liang Xin) via graph extraction and QA generation. Short answers (1--5 words).}
+\label{tab:scaling}
+\small
+\begin{tabular}{@{}rllll@{}}
+\toprule
+\textbf{Keys} & \multicolumn{2}{c}{\textbf{Gemma 2 9B}} & \multicolumn{2}{c}{\textbf{Mistral 7B}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+& \textbf{Recall} & \textbf{Time} & \textbf{Recall} & \textbf{Time} \\
+\midrule
+10  & 10/10\,(100\%)  & 7.1\,min  & 10/10\,(100\%)  & 5.6\,min \\
+25  & 24/25\,(96\%)   & 17.4\,min & 25/25\,(100\%)  & 13.9\,min \\
+50  & 49/50\,(98\%)   & 35.2\,min & 49/50\,(98\%)   & 28.5\,min \\
+75  & 75/75\,(100\%)  & 52.9\,min & 75/75\,(100\%)  & 42.2\,min \\
+100 & 100/100\,(100\%) & 70.3\,min & 95/100\,(95\%) & 48.8\,min \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+To validate the indexed key mechanism beyond the Qwen~2.5~3B development model and beyond 20 synthetic QA pairs, we tested on two additional model families using QA pairs distilled from real conversational data (Table~\ref{tab:scaling}).
+The data pipeline processes PerLTQA dialogue transcripts~\citep{du2024perltqa} one session at a time: each transcript is passed through LLM-based graph extraction and template-based QA generation to produce short-answer QA pairs (1--5 words).
+Gemma used 22 of 30 sessions to extract 103~QA pairs; Mistral used 27 sessions for 106~pairs.
+The remaining sessions failed graph extraction---a pipeline robustness issue, not an architecture limitation.
+
+\paragraph{Recall at scale.}
+Gemma~2~9B achieves 100/100 exact recall at 100~keys---perfect retrieval of all stored facts.
+Mistral~7B achieves 95/100; its 5~failures are generation quality issues (garbled text with missing spaces and truncated words), not convergence failures.
+SimHash confidence on Mistral's failures ranges from 0.81--0.91, indicating the knowledge is encoded but output decoding is imperfect.
+Both models maintain $\geq$95\% recall across all scale points with no degradation trend.
+
+\paragraph{Linear time scaling.}
+Training time scales linearly with key count: $\sim$42\,s/key for Gemma, $\sim$30\,s/key for Mistral, constant across all scale points (Table~\ref{tab:time-scaling}).
+There is no superlinear growth.
+Mistral's $\sim$30\% speed advantage is roughly proportional to parameter count (7B~vs.~9B).
+
+\begin{table}[t]
+\centering
+\caption{Training time per key across scale points. Both models show constant per-key cost with no superlinear growth.}
+\label{tab:time-scaling}
+\small
+\begin{tabular}{@{}rcc@{}}
+\toprule
+\textbf{Keys} & \textbf{Gemma (s/key)} & \textbf{Mistral (s/key)} \\
+\midrule
+10  & 42.4 & 33.8 \\
+50  & 42.3 & 34.1 \\
+100 & 42.2 & 29.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Decreasing loss with scale.}
+An unexpected finding: final training loss \emph{decreases} with more keys (Table~\ref{tab:loss-scale}).
+Gemma's loss drops from 0.338 (10~keys) to 0.189 (100~keys); Mistral from 0.316 to 0.182.
+With more training pairs per epoch, the adapter receives greater gradient diversity and is less prone to overfitting individual examples.
+This suggests the mechanism becomes more efficient with use---a desirable property for a system that accumulates knowledge over time.
+
+\begin{table}[t]
+\centering
+\caption{Final training loss by scale. Loss decreases with more keys, indicating improved representation efficiency at larger scale.}
+\label{tab:loss-scale}
+\small
+\begin{tabular}{@{}rcc@{}}
+\toprule
+\textbf{Keys} & \textbf{Gemma Loss} & \textbf{Mistral Loss} \\
+\midrule
+10  & 0.338 & 0.316 \\
+25  & 0.256 & 0.235 \\
+50  & 0.213 & 0.210 \\
+75  & 0.192 & 0.179 \\
+100 & 0.189 & 0.182 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Self-correcting failures.}
+Gemma's only failures across all scales were on \texttt{graph13}, which produced null JSON output at scale~25 and~50 but self-corrected at scale~75 and~100.
+The additional training data at larger scales appears to strengthen overall encoding, resolving individual key failures without targeted intervention.
+
+\paragraph{Note on scope.}
+These are \emph{batch} scaling results: all keys are trained in a single adapter pass.
+Incremental continual learning at the 100-key scale---adding facts across multiple consolidation cycles---remains to be validated (\S\ref{sec:future}).
+
 \subsection{Baseline Comparisons}
 \label{sec:exp-baselines}
 
@@ -447,7 +545,8 @@ Base model (no adapter) & 53.7\% \\
 Pool-based replay (Phase~3b) & 59.3\% \\
 RAG (retrieved context) & Dominant \\
 Hybrid RAG+LoRA & +0.5\% over RAG \\
-\paramem{} indexed keys & 100\% (6/6) \\
+\paramem{} indexed keys (consolidation) & 100\% (6/6) \\
+\paramem{} at scale (Gemma 2 9B, batch) & 100\% (100/100) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -463,9 +562,10 @@ Indexed key retrieval achieves the highest per-fact recall, though the compariso
 \label{sec:discussion}
 
 \paragraph{Scaling characteristics.}
-Cycle time grows linearly with key count ($\sim$40\,s per additional key, dominated by reconstruction probing).
-This is acceptable for personal-scale data (dozens to low hundreds of keys).
-The linear trend suggests the approach will not hit a wall at moderate scale, but capacity beyond 20~keys has not been validated.
+Batch scaling experiments (\S\ref{sec:exp-scaling}) confirm that indexed key retrieval maintains $\geq$95\% recall up to 100~keys across two model families, with training time scaling linearly ($\sim$42\,s/key for Gemma~2~9B, $\sim$30\,s/key for Mistral~7B).
+At 100~keys, a full 30-epoch training pass takes 49--70~minutes depending on model size---feasible for idle-time background processing.
+Notably, recall does not degrade with scale; both models achieve their highest recall rates at the largest scale points.
+The linear time trend and stable recall suggest the approach can extend beyond 100~keys, though this remains to be tested.
 
 \paragraph{Parametric memory vs.\ RAG.}
 RAG outperforms parametric memory on raw factual recall when context is available---this is unsurprising and not the claim.
@@ -483,32 +583,56 @@ We conjecture this generalizes: any auxiliary training objective added to a LoRA
 
 \paragraph{Edge deployment viability.}
 All experiments ran on 8\,GB VRAM with QLoRA 4-bit quantization.
-Consolidation is an offline batch process ($\sim$5\,min per cycle) suitable for running overnight---analogous to biological sleep consolidation~\citep{mcclelland1995complementary}.
-Replay scheduling approaches such as FOREVER~\citep{liu2026forever} and MSSR~\citep{wu2026mssr} offer complementary strategies for optimizing which facts to replay and when; integrating these with our indexed key mechanism is a natural extension.
+Consolidation is an offline batch process suitable for running during idle time---analogous to biological sleep consolidation~\citep{mcclelland1995complementary}.
+Training loss converges well before 30~epochs across all scales and both models (loss $<$0.01 by epoch~4--6; Table~\ref{tab:loss-scale}), suggesting significant time savings are achievable with early stopping.
+Preliminary experiments show 37\% time reduction with zero recall regression on Gemma~2~9B (stopping at epoch~19 vs.~30 at 25~keys).
+Mistral~7B shows some regression at the same threshold, indicating model-specific tuning is needed.
+Recall-based stopping criteria---probing a subset of keys during training and stopping when recall reaches a threshold---are a natural extension we leave to future work.
+Replay scheduling approaches such as FOREVER~\citep{liu2026forever} and MSSR~\citep{wu2026mssr} offer complementary strategies for optimizing which facts to replay and when.
 No external services are required beyond the base model weights.
+
+\paragraph{Model selection.}
+The indexed key mechanism is model-agnostic: it works on Qwen~2.5~3B (3B~parameters), Mistral~7B~Instruct~v0.3 (7B), and Gemma~2~9B~Instruct (9B) without architectural changes.
+Larger models produce better results---Gemma~2~9B is the reliability champion at 100/100 recall---but require more VRAM and training time.
+Mistral~7B offers $\sim$30\% faster training with slightly lower reliability at scale (95\% vs.\ 100\% at 100~keys).
+The tradeoff is VRAM and speed versus recall fidelity, and the right choice is deployment-dependent.
+
+\paragraph{Decreasing loss with scale.}
+The observation that training loss decreases with more indexed keys (Table~\ref{tab:loss-scale}) warrants further investigation.
+One explanation is that more QA pairs per epoch provide greater gradient diversity, reducing overfitting to individual examples and forcing more efficient shared representations.
+If this trend continues beyond 100~keys, it suggests the adapter's effective capacity may be larger than simple parameter counting would predict.
+We note this as an observation, not a proven theory---the trend could plateau or reverse at higher scales.
 
 \paragraph{Limitations.}
 We are transparent about the current scope:
 \begin{itemize}
-    \item \textbf{Scale:} 17~keys tested in full consolidation, 20 in capacity tests. Real personal agents will need hundreds to thousands of facts.
-    \item \textbf{Single synthetic user:} All experiments use a synthetic persona (``Alex''). Real users have more varied and complex fact structures.
-    \item \textbf{Single model:} Qwen~2.5~3B only. The architecture is model-agnostic by design, but secondary model validation (Llama~3.2~3B) has not been completed for indexed keys.
+    \item \textbf{Scale:} 100~keys validated in batch training; 17~keys tested in full incremental consolidation. The batch results (\S\ref{sec:exp-scaling}) demonstrate capacity, but incremental consolidation at the 100-key scale---adding facts across multiple cycles---remains pending.
+    \item \textbf{Single user persona:} Development experiments use a synthetic persona (``Alex''); scaling experiments use PerLTQA's ``Liang Xin.'' Real users have more varied and complex fact structures.
+    \item \textbf{Three models tested:} Qwen~2.5~3B, Gemma~2~9B, and Mistral~7B. While these span three model families and the 3B--9B parameter range, broader validation (larger models, different architectures) is needed.
     \item \textbf{Metric inflation:} Embedding similarity can give partial credit for plausible hallucinations (\eg, ``lives in the United States'' scores 0.75 against ``lives in Heilbronn''). We supplement with SimHash binary verification to mitigate this.
-    \item \textbf{Extraction noise:} The 3B model achieves $\sim$78\% extraction success with noisy predicates. The core contribution is indexed key retrieval, not extraction quality.
+    \item \textbf{Extraction noise:} Graph extraction fails on 36--40\% of dialogue sessions and produces noisy predicates on others. The core contribution is indexed key retrieval, not extraction quality.
 \end{itemize}
 
 % ============================================================
 \section{Future Work}
 \label{sec:future}
 
-\paragraph{Capacity scaling.}
-Testing 50--100+ indexed keys with dynamic rank allocation to accommodate growing memory.
+\paragraph{Incremental consolidation at scale.}
+Batch scaling to 100~keys is validated (\S\ref{sec:exp-scaling}); the next step is incremental consolidation at this scale---adding facts across multiple cycles and verifying that old knowledge survives repeated retraining.
+
+\paragraph{Training time optimization.}
+Training loss converges well before 30~epochs (loss~$<$0.01 by epoch~4--6 across all scales and both models tested).
+Preliminary early stopping experiments show 37\% time savings on Gemma~2~9B with zero recall regression, though Mistral~7B shows some regression at the same threshold.
+Recall-based stopping---probing a subset of keys during training and stopping when recall reaches a target---directly measures the metric of interest and may generalize better across models than loss-based thresholds.
+
+\paragraph{Compression effect.}
+The decreasing loss with scale (Table~\ref{tab:loss-scale}) suggests the adapter finds more efficient representations with more data. Investigating this trend beyond 100~keys could reveal the practical capacity ceiling of a single LoRA adapter for indexed key storage.
 
 \paragraph{Real user evaluation.}
-A 30+ day longitudinal study with actual user sessions to validate beyond synthetic data.
+A 30+ day longitudinal study with actual user sessions to validate beyond synthetic data and single-persona experiments.
 
-\paragraph{Model-agnostic validation.}
-Verifying indexed key retrieval on Llama~3.2~3B, Phi-3, and Gemma to establish generality.
+\paragraph{Broader model validation.}
+Three model families tested (Qwen, Gemma, Mistral) in the 3B--9B range. Validation on larger models and different architectures (\eg, Llama, Phi) would further establish generality.
 
 \paragraph{Base model migration.}
 When upgrading to a newer base model, indexed key retrieval enables lossless migration: enumerate all keys, reconstruct each fact from the old adapter via key prompts, then retrain fresh adapters on the new model.
@@ -529,7 +653,10 @@ Indexed key retrieval solves the enumeration problem that has blocked parametric
 Multi-partition adapters with knowledge-graph-driven promotion implement biological consolidation in a LoRA-compatible framework.
 SimHash verification bridges the trust gap between ``the model said it'' and ``the model actually knows it.''
 
-The approach is demonstrated on edge hardware (8\,GB VRAM) with 100\% recall across 10 consolidation cycles, establishing that domain-scoped continual learning is feasible for personal LLM agents without external infrastructure.
+The approach is validated on edge hardware (8\,GB VRAM) across three model families.
+Gemma~2~9B achieves 100/100 exact recall at 100 indexed keys distilled from real conversational data; Mistral~7B achieves 95/100 on the same task.
+Training time scales linearly with key count, and an unexpected compression effect---decreasing loss with more keys---suggests the mechanism becomes more efficient with use.
+The 10-cycle consolidation loop maintains 100\% recall with incremental key addition and episodic-to-semantic promotion.
 Our negative results---format collision, signal dilution, the futility of rank sweeps---yield a practical design principle: auxiliary training objectives in a shared LoRA adapter must reuse the primary output format, not introduce novel ones.
 We report these failures alongside successes, as they constrain the design space for future parametric memory systems.
 

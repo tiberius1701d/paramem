@@ -12,7 +12,7 @@
   ]
 
   % Base model
-  \node[base] (base) {Base Model (Qwen 2.5 3B)\\QLoRA 4-bit frozen};
+  \node[base] (base) {Base Model (model-agnostic)\\QLoRA 4-bit frozen};
 
   % Adapters — tighter horizontal spacing
   \node[episodic, above left=1cm and 0.2cm of base] (epi) {Episodic Adapter\\rank 8, lr $10^{-4}$};
