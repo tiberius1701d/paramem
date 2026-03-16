@@ -166,8 +166,10 @@ def _extract_json_block(text: str) -> str:
     for marker in ("```json", "```"):
         if marker in text:
             start = text.index(marker) + len(marker)
-            end = text.index("```", start)
-            return text[start:end].strip()
+            # Find closing ``` — fall through to brace matching if missing
+            closing = text.find("```", start)
+            if closing != -1:
+                return text[start:closing].strip()
 
     # Fall back to finding raw JSON object by brace matching
     brace_start = text.find("{")
@@ -206,7 +208,9 @@ def _normalize_extraction(data: dict) -> dict:
             norm["name"] = raw_name.strip().title()
             raw_type = ent.get("entity_type") or ent.get("type", "concept")
             norm["entity_type"] = raw_type if raw_type in _ENTITY_TYPE_ALIASES else "concept"
-            norm["attributes"] = ent.get("attributes", {})
+            raw_attrs = ent.get("attributes", {})
+            # Filter None values — model often outputs {"age": null}
+            norm["attributes"] = {k: str(v) for k, v in raw_attrs.items() if v is not None}
             # If model put extra fields as top-level, capture them as strings
             skip_keys = {"name", "entity", "entity_type", "type", "attributes"}
             for k, v in ent.items():
@@ -219,8 +223,8 @@ def _normalize_extraction(data: dict) -> dict:
     if "relations" in data:
         normalized_relations = []
         for rel in data["relations"]:
-            subject = rel.get("subject", "unknown").strip().title()
-            obj = rel.get("object", "unknown").strip().title()
+            subject = (rel.get("subject") or "unknown").strip().title()
+            obj = (rel.get("object") or "unknown").strip().title()
 
             # Filter self-loops (e.g. "KIT studied at KIT")
             if subject.lower() == obj.lower():
@@ -229,7 +233,7 @@ def _normalize_extraction(data: dict) -> dict:
 
             norm = {
                 "subject": subject,
-                "predicate": rel.get("predicate", "related_to"),
+                "predicate": (rel.get("predicate") or "related_to").strip(),
                 "object": obj,
                 "confidence": rel.get("confidence", 1.0),
             }
@@ -238,7 +242,9 @@ def _normalize_extraction(data: dict) -> dict:
             normalized_relations.append(norm)
         data["relations"] = normalized_relations
 
-    # Ensure required top-level fields
+    # Ensure required top-level fields, coerce None to defaults
+    if data.get("summary") is None:
+        data["summary"] = ""
     data.setdefault("summary", "")
     data.setdefault("entities", [])
     data.setdefault("relations", [])

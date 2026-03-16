@@ -59,7 +59,8 @@ def _build_few_shot_prompt(subject: str, predicate: str, obj: str) -> str:
     readable_pred = predicate.replace("_", " ")
     return (
         f"Generate one natural question-answer pair from a knowledge graph triple. "
-        f"The answer should be a single concise sentence.\n\n"
+        f"The answer should be a single concise sentence. "
+        f"Always format as Q: <question> A: <answer>.\n\n"
         f"{examples_block}\n\n"
         f"Triple: {subject} | {readable_pred} | {obj}\n"
         f"Q:"
@@ -97,21 +98,40 @@ def _generate_qa_with_llm(
         max_new_tokens=128, temperature=0.3, repetition_penalty=1.3,
     )
 
-    # Parse "Q: ... A: ..." or just the continuation after "Q:"
+    # Parse "Q: ... A: ..." from model output.
+    # The prompt ends with "Q:" so the model continues with the question.
     question = ""
     answer = ""
 
-    # The prompt ends with "Q:" so the model continues with the question
-    text = "Q:" + output if not output.strip().startswith("Q:") else output
+    # Clean markdown artifacts Gemma tends to produce
+    cleaned = output.replace("**", "").strip()
+
+    # Prepend Q: if model didn't echo it
+    text = "Q:" + cleaned if not cleaned.startswith("Q:") else cleaned
 
     if "A:" in text:
+        # Standard parse: Q: <question> A: <answer>
         q_start = text.index("Q:") + 2
         a_start = text.index("A:")
         question = text[q_start:a_start].strip().rstrip("?") + "?"
         answer = text[a_start + 2:].strip()
-        # Trim answer at first newline (model may generate extra)
-        if "\n" in answer:
-            answer = answer[:answer.index("\n")].strip()
+    elif "?" in text:
+        # No A: marker — split on first question mark
+        q_end = text.index("?")
+        question = text[2:q_end].strip() + "?"
+        rest = text[q_end + 1:].strip()
+        # Answer is whatever follows the question
+        if rest:
+            answer = rest
+
+    # Trim answer at first newline (model may generate extra examples)
+    if answer and "\n" in answer:
+        answer = answer[:answer.index("\n")].strip()
+
+    # Remove trailing Q:/Triple: if model started generating next example
+    for cutoff in ["Q:", "Triple:"]:
+        if cutoff in answer:
+            answer = answer[:answer.index(cutoff)].strip()
 
     if question and answer:
         return {
@@ -122,10 +142,12 @@ def _generate_qa_with_llm(
             "source_object": obj,
         }
 
-    # Fallback: construct a minimal but correct QA pair
+    # Last resort: construct from the triple directly.
+    # This is still better than "What is known about X and Y?" because
+    # it uses the predicate to form a directed question.
     readable_pred = predicate.replace("_", " ")
     return {
-        "question": f"What is known about {subject} and {obj}?",
+        "question": f"What does {subject} {readable_pred}?",
         "answer": f"{subject} {readable_pred} {obj}.",
         "source_predicate": predicate,
         "source_subject": subject,
@@ -214,7 +236,7 @@ def _template_fallback(subject: str, predicate: str, obj: str) -> list[dict]:
     readable = predicate.replace("_", " ")
     return [
         {
-            "question": f"What is known about {subject} and {obj}?",
+            "question": f"What does {subject} {readable}?",
             "answer": f"{subject} {readable} {obj}.",
             "source_predicate": predicate,
             "source_subject": subject,
