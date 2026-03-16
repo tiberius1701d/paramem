@@ -391,12 +391,17 @@ def validate_recall(
             "key_match": False,
             "confidence": 0.0,
             "recalled": None,
+            "expected_word_count": len(original["answer"].split()),
+            "recalled_word_count": 0,
         }
 
     key_match = recalled.get("key", "") == original.get("key", "")
     q_match = recalled.get("question", "").strip() == original["question"].strip()
     a_match = recalled.get("answer", "").strip() == original["answer"].strip()
     confidence = verify_confidence(recalled, registry)
+
+    expected_words = len(original["answer"].split())
+    recalled_words = len(recalled.get("answer", "").split())
 
     return {
         "exact_match": (
@@ -407,4 +412,6 @@ def validate_recall(
         "key_match": key_match,
         "confidence": confidence,
         "recalled": recalled,
+        "expected_word_count": expected_words,
+        "recalled_word_count": recalled_words,
     }

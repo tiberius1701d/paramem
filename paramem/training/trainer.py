@@ -8,6 +8,7 @@ from peft import PeftModel
 from transformers import (
     PreTrainedTokenizer,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     default_data_collator,
 )
@@ -15,6 +16,68 @@ from transformers import (
 from paramem.utils.config import AdapterConfig, TrainingConfig, WandbConfig
 
 logger = logging.getLogger(__name__)
+
+
+class LossEarlyStoppingCallback(TrainerCallback):
+    """Stop training when epoch-average loss drops below threshold.
+
+    Accumulates per-step losses and checks the average at each epoch
+    boundary (after the floor). Stops when the epoch-average loss
+    stays below the threshold for `patience` consecutive epochs.
+    """
+
+    def __init__(
+        self,
+        loss_threshold: float = 0.01,
+        epoch_floor: int = 10,
+        patience: int = 2,
+    ):
+        self.loss_threshold = loss_threshold
+        self.epoch_floor = epoch_floor
+        self.patience = patience
+        self._below_count = 0
+        self._last_epoch = 0
+        self._epoch_losses = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+
+        epoch = logs.get("epoch", 0)
+        loss = logs.get("loss")
+        if loss is None:
+            return
+
+        current_epoch = int(epoch)
+
+        # Accumulate losses for the current epoch
+        self._epoch_losses.append(loss)
+
+        # Check at epoch boundaries
+        if current_epoch <= self._last_epoch:
+            return
+        self._last_epoch = current_epoch
+
+        if epoch < self.epoch_floor:
+            self._epoch_losses = []
+            return
+
+        # Compute epoch average from accumulated steps
+        avg_loss = sum(self._epoch_losses) / len(self._epoch_losses)
+        self._epoch_losses = []
+
+        if avg_loss < self.loss_threshold:
+            self._below_count += 1
+            if self._below_count >= self.patience:
+                logger.info(
+                    "Early stopping: avg_loss=%.6f < %.4f for %d "
+                    "consecutive epochs at epoch %d",
+                    avg_loss, self.loss_threshold,
+                    self.patience, current_epoch,
+                )
+                control.should_training_stop = True
+        else:
+            self._below_count = 0
 
 
 def train_adapter(
@@ -67,12 +130,21 @@ def train_adapter(
     if training_config.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+    callbacks = []
+    if training_config.early_stopping:
+        callbacks.append(LossEarlyStoppingCallback(
+            loss_threshold=training_config.early_stopping_threshold,
+            epoch_floor=training_config.early_stopping_floor,
+            patience=training_config.early_stopping_patience,
+        ))
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=default_data_collator,
+        callbacks=callbacks,
     )
 
     logger.info(

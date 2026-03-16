@@ -173,6 +173,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test 4: Multi-Session Reinforcement")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--skip-rag", action="store_true", help="Skip RAG baseline comparison")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
     add_model_args(parser)
     args = parser.parse_args()
@@ -226,6 +227,53 @@ def main():
                 f"conf={mean_conf:.3f}, avg_mentions={avg_mentions:.1f}"
             )
 
+        # RAG baseline comparison
+        rag_result = None
+        if not args.skip_rag:
+            from paramem.evaluation.embedding_scorer import compute_similarity
+            from paramem.evaluation.rag_qa import QARAGPipeline
+            from paramem.evaluation.recall import generate_answer
+
+            logger.info("Running RAG baseline with all facts indexed...")
+            all_qa = [
+                {"question": v["question"], "answer": v["answer"]}
+                for v in all_facts.values()
+            ]
+            rag = QARAGPipeline()
+            rag.build_index(all_qa)
+
+            model.disable_adapter_layers()
+            model.gradient_checkpointing_disable()
+
+            rag_per_group = {g: [] for g in ["reinforced", "mentioned_twice", "single_mention"]}
+            for fact_id, fact_info in all_facts.items():
+                prompt = rag.format_prompt(fact_info["question"], tokenizer, top_k=3)
+                generated = generate_answer(
+                    model, tokenizer, prompt,
+                    max_new_tokens=150, temperature=0.1, repetition_penalty=1.3,
+                )
+                similarity = compute_similarity(fact_info["answer"], generated)
+                rag_per_group[fact_info["group"]].append({
+                    "fact_id": fact_id,
+                    "question": fact_info["question"],
+                    "expected": fact_info["answer"],
+                    "generated": generated,
+                    "similarity": similarity,
+                })
+
+            model.enable_adapter_layers()
+
+            print(f"\n  RAG BASELINE ({bench_name})")
+            rag_summary = {}
+            for group, items in rag_per_group.items():
+                if not items:
+                    continue
+                mean_sim = sum(r["similarity"] for r in items) / len(items)
+                rag_summary[group] = {"mean_similarity": mean_sim, "per_fact": items}
+                print(f"  {group:>20}: mean_sim={mean_sim:.3f} ({len(items)} facts)")
+
+            rag_result = rag_summary
+
         print(f"\n  Total time: {total_time:.0f}s")
         print("=" * 72)
 
@@ -237,6 +285,7 @@ def main():
             "rank": args.rank,
             "total_time_seconds": total_time,
             "cycles": cycle_results,
+            "rag_baseline": rag_result,
             "fact_metadata": {
                 k: {"group": v["group"], "mention_count": v["mention_count"]}
                 for k, v in all_facts.items()
