@@ -1,17 +1,21 @@
 """Test 2: Contradiction Resolution — temporal fact updates.
 
-Tests whether parametric memory naturally resolves contradictions when facts
-change over time, compared to RAG which stores all versions and may return
-stale facts.
+Tests whether the system resolves contradictions when facts change over time.
+Two strategies compared:
+  2a) Graph-only: predicate normalization catches exact predicate matches
+  2b) Graph + model: LLM semantic reasoning catches synonym predicates
 
-10 fact chains with 3 temporal versions each across 10 sessions.
-Each session's facts are distilled through graph extraction on the fly,
-exactly as a real personal assistant would process them.
+Flow per strategy:
+  1. Train on initial facts (sessions 1-3)
+  2. New sessions arrive with contradicting facts
+  3. Extract graph from new session → merge into cumulative graph
+     (contradiction resolution happens during merge)
+  4. Generate QA from resolved graph → retrain
+  5. Verify: model recalls NEW (current) version, not old
 
 Usage:
     python experiments/test2_contradictions.py
     python experiments/test2_contradictions.py --model gemma
-    python experiments/test2_contradictions.py --num-epochs 20
 """
 
 import argparse
@@ -34,6 +38,10 @@ from experiments.utils.test_harness import (  # noqa: E402
     setup_logging,
     train_indexed_keys,
 )
+from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
+from paramem.graph.merger import GraphMerger  # noqa: E402
+from paramem.graph.qa_generator import generate_qa_from_relations  # noqa: E402
+from paramem.graph.schema import Entity, Relation, SessionGraph  # noqa: E402
 from paramem.models.loader import unload_model  # noqa: E402
 
 setup_logging()
@@ -49,205 +57,263 @@ def load_contradiction_data():
         return json.load(f)
 
 
-def get_current_facts(fact_chains, up_to_session):
-    """Get the most recent version of each fact at a given session.
+def build_session_graph(fact_chain_version, session_id):
+    """Convert a fact chain version into a minimal SessionGraph for merging.
 
-    Returns list of {"question", "answer", "chain_id", "version_session"}.
+    Each version becomes a triple: (subject, predicate, answer).
+    The question field encodes the predicate naturally.
     """
-    current = []
+    from datetime import datetime, timezone
+
+    # Parse the chain to extract a triple
+    # The chain has question/answer pairs like:
+    #   Q: "Where does Alex work?" A: "Alex works at SpaceX"
+    # We need (Alex, works_at, SpaceX) as a relation
+    entities = []
+    relations = []
+
+    subject = fact_chain_version.get("subject", "Alex")
+    predicate = fact_chain_version.get("predicate", "related_to")
+    obj = fact_chain_version["answer"]
+
+    entities.append(Entity(
+        name=subject,
+        entity_type="person",
+        attributes={},
+    ))
+
+    relations.append(Relation(
+        subject=subject,
+        predicate=predicate,
+        object=obj,
+        relation_type="factual",
+        confidence=1.0,
+    ))
+
+    return SessionGraph(
+        session_id=session_id,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        entities=entities,
+        relations=relations,
+        summary=f"{subject} {predicate} {obj}",
+    )
+
+
+def prepare_contradiction_data(fact_chains):
+    """Prepare fact chains with explicit subject/predicate for graph merging.
+
+    Returns enriched chains with subject, predicate per version.
+    """
+    # Map question patterns to predicates
+    predicate_map = {
+        "Where does Alex work?": "works_at",
+        "Where does Alex live?": "lives_in",
+        "Is Alex in a relationship?": "relationship_status",
+        "Does Alex have a pet?": "has_pets",
+        "What project is Alex working on?": "works_on_project",
+        "What is Alex's main hobby?": "main_hobby",
+        "What car does Alex drive?": "drives",
+        "What is Alex's diet?": "dietary_preference",
+        "Who is Alex's manager?": "reports_to",
+        "What language is Alex learning?": "learning_language",
+    }
+
+    enriched = []
     for chain in fact_chains:
-        latest = None
+        predicate = predicate_map.get(chain["question"], "related_to")
+        enriched_chain = {
+            "id": chain["id"],
+            "question": chain["question"],
+            "subject": "Alex",
+            "predicate": predicate,
+            "versions": [],
+        }
         for version in chain["versions"]:
-            if version["session"] <= up_to_session:
-                latest = version
-        if latest is not None:
-            current.append(
-                {
-                    "question": chain["question"],
-                    "answer": latest["answer"],
-                    "chain_id": chain["id"],
-                    "version_session": latest["session"],
-                }
-            )
-    return current
+            enriched_chain["versions"].append({
+                **version,
+                "subject": "Alex",
+                "predicate": predicate,
+            })
+        enriched.append(enriched_chain)
+
+    return enriched
 
 
-def get_all_versions(fact_chains):
-    """Get ALL versions of all facts (for RAG indexing)."""
-    all_qa = []
-    for chain in fact_chains:
-        for version in chain["versions"]:
-            all_qa.append(
-                {
-                    "question": chain["question"],
-                    "answer": version["answer"],
-                    "chain_id": chain["id"],
-                    "session": version["session"],
-                }
-            )
-    return all_qa
-
-
-def run_contradiction_test(
-    model, tokenizer, fact_chains, eval_sessions, args, output_dir,
+def run_strategy(
+    strategy, model, tokenizer, enriched_chains, args, output_dir,
 ):
-    """Run contradiction test for one model."""
-    from paramem.evaluation.embedding_scorer import compute_similarity
+    """Run one contradiction resolution strategy.
 
-    session_results = []
+    Returns dict with results per evaluation point.
+    """
+    logger.info("Running strategy: %s", strategy)
+
+    merger = GraphMerger(
+        strategy=strategy,
+        model=model if strategy == "model" else None,
+        tokenizer=tokenizer if strategy == "model" else None,
+    )
+
+    # Collect all sessions in order
+    all_versions = []
+    for chain in enriched_chains:
+        for version in chain["versions"]:
+            all_versions.append({
+                **version,
+                "chain_id": chain["id"],
+                "question": chain["question"],
+            })
+    all_versions.sort(key=lambda v: v["session"])
+
+    # Group by session
+    sessions = {}
+    for v in all_versions:
+        sessions.setdefault(v["session"], []).append(v)
+
+    eval_results = []
     total_start = time.time()
 
-    for session_num in range(1, 11):
-        current_facts = get_current_facts(fact_chains, session_num)
-        if not current_facts:
+    for session_num in sorted(sessions.keys()):
+        session_facts = sessions[session_num]
+        logger.info(
+            "Session %d: merging %d facts (strategy=%s)",
+            session_num, len(session_facts), strategy,
+        )
+
+        # Disable gradient checkpointing for generation if using model strategy
+        if strategy == "model":
+            model.gradient_checkpointing_disable()
+            if hasattr(model, "disable_adapter_layers"):
+                model.disable_adapter_layers()
+
+        # Merge each fact into the cumulative graph
+        for fact in session_facts:
+            session_graph = build_session_graph(
+                fact, f"session_{session_num}",
+            )
+            merger.merge(session_graph)
+
+        if strategy == "model" and hasattr(model, "enable_adapter_layers"):
+            model.enable_adapter_layers()
+
+        # Generate QA from the resolved graph
+        triples = merger.get_all_triples()
+        qa_pairs = generate_qa_from_relations(
+            [{"subject": s, "predicate": p, "object": o} for s, p, o in triples],
+            model=model,
+            tokenizer=tokenizer,
+        )
+
+        if not qa_pairs:
+            logger.warning("No QA pairs from graph after session %d", session_num)
             continue
 
-        qa_list = [{"question": f["question"], "answer": f["answer"]} for f in current_facts]
-
-        adapter_name = "episodic"
+        # Train adapter on resolved facts
+        adapter_name = f"episodic_s{session_num}_{strategy}"
         if hasattr(model, "peft_config") and adapter_name in model.peft_config:
             model.delete_adapter(adapter_name)
-
-        logger.info("Session %d: training on %d current facts", session_num, len(qa_list))
-        cycle_start = time.time()
 
         model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
-            qa_list,
+            qa_pairs,
             epochs=args.num_epochs,
             rank=args.rank,
             adapter_name=adapter_name,
             output_dir=output_dir / f"session_{session_num}",
-            run_name=f"contradictions-session-{session_num}",
+            run_name=f"contradictions-{strategy}-s{session_num}",
+            skip_distill=True,
         )
 
-        if session_num in eval_sessions:
-            recall_result = evaluate_indexed_recall(
-                model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name,
+        # Evaluate recall
+        recall_result = evaluate_indexed_recall(
+            model, tokenizer, keyed_pairs, registry,
+            adapter_name=adapter_name,
+        )
+
+        # Check: does each recalled answer match the CURRENT version?
+        expected_current = {}
+        for chain in enriched_chains:
+            latest = None
+            for v in chain["versions"]:
+                if v["session"] <= session_num:
+                    latest = v
+            if latest:
+                expected_current[chain["id"]] = latest["answer"]
+
+        per_chain = {}
+        for chain in enriched_chains:
+            chain_id = chain["id"]
+            current_answer = expected_current.get(chain_id, "")
+            if not current_answer:
+                continue
+
+            # Find the recalled QA that matches this chain's question
+            recalled_answer = ""
+            for kr in recall_result["per_key"]:
+                if kr.get("recalled") and kr["recalled"].get("answer"):
+                    # Match by checking if the answer relates to this chain
+                    sim = compute_similarity(
+                        current_answer, kr["recalled"]["answer"]
+                    )
+                    if sim > 0.7:
+                        recalled_answer = kr["recalled"]["answer"]
+                        break
+
+            sim_to_current = (
+                compute_similarity(current_answer, recalled_answer)
+                if recalled_answer else 0.0
             )
-
-            per_chain = {}
-            for i, fact in enumerate(current_facts):
-                if i >= len(keyed_pairs):
-                    break
-                kr = recall_result["per_key"][i]
-
-                recalled_answer = ""
-                if kr["recalled"] is not None:
-                    recalled_answer = kr["recalled"].get("answer", "")
-                similarity_to_current = (
-                    compute_similarity(fact["answer"], recalled_answer)
-                    if recalled_answer
-                    else 0.0
-                )
-
-                per_chain[fact["chain_id"]] = {
-                    "exact_match": kr["exact_match"],
-                    "confidence": kr["confidence"],
-                    "similarity_to_current": similarity_to_current,
-                    "current_answer": fact["answer"],
-                    "recalled_answer": recalled_answer,
-                    "version_session": fact["version_session"],
-                }
-
-            cycle_time = time.time() - cycle_start
-            exact = sum(1 for v in per_chain.values() if v["exact_match"])
-            mean_sim = (
-                sum(v["similarity_to_current"] for v in per_chain.values()) / len(per_chain)
-                if per_chain
-                else 0.0
-            )
-
-            session_results.append(
-                {
-                    "session": session_num,
-                    "facts_count": len(current_facts),
-                    "exact_recall": exact,
-                    "total": len(per_chain),
-                    "mean_similarity_to_current": mean_sim,
-                    "train_loss": metrics.get("train_loss"),
-                    "wall_clock_seconds": cycle_time,
-                    "per_chain": per_chain,
-                }
-            )
-
-            print(
-                f"  Session {session_num}: {exact}/{len(per_chain)} exact, "
-                f"sim_to_current={mean_sim:.3f}"
-            )
-
-    # RAG comparison
-    rag_result = None
-    if not args.skip_rag:
-        from paramem.evaluation.rag_qa import QARAGPipeline
-        from paramem.evaluation.recall import generate_answer
-
-        logger.info("Running RAG baseline with all fact versions indexed...")
-        all_versions = get_all_versions(fact_chains)
-        rag = QARAGPipeline()
-        rag.build_index(all_versions)
-
-        model.disable_adapter_layers()
-        model.gradient_checkpointing_disable()
-
-        final_facts = get_current_facts(fact_chains, 10)
-        rag_per_chain = {}
-
-        for fact in final_facts:
-            prompt = rag.format_prompt(fact["question"], tokenizer, top_k=3)
-            generated = generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=150, temperature=0.1, repetition_penalty=1.3,
-            )
-
-            sim_current = compute_similarity(fact["answer"], generated)
-            chain = next(c for c in fact_chains if c["id"] == fact["chain_id"])
-            earliest_answer = chain["versions"][0]["answer"]
-            sim_earliest = compute_similarity(earliest_answer, generated)
-
-            rag_per_chain[fact["chain_id"]] = {
-                "question": fact["question"],
-                "current_answer": fact["answer"],
-                "earliest_answer": earliest_answer,
-                "rag_generated": generated,
-                "similarity_to_current": sim_current,
-                "similarity_to_earliest": sim_earliest,
-                "returns_current": sim_current > sim_earliest,
+            per_chain[chain_id] = {
+                "current_answer": current_answer,
+                "recalled_answer": recalled_answer,
+                "similarity_to_current": sim_to_current,
+                "is_current": sim_to_current > 0.7,
             }
 
-        model.enable_adapter_layers()
+        returns_current = sum(1 for v in per_chain.values() if v["is_current"])
+        total_chains = len(per_chain)
 
-        returns_current = sum(1 for v in rag_per_chain.values() if v["returns_current"])
-        rag_result = {
-            "returns_current_count": returns_current,
-            "total": len(rag_per_chain),
-            "per_chain": rag_per_chain,
-        }
-        print(f"\n  RAG returns current version: {returns_current}/{len(rag_per_chain)}")
+        eval_results.append({
+            "session": session_num,
+            "graph_nodes": merger.graph.number_of_nodes(),
+            "graph_edges": merger.graph.number_of_edges(),
+            "qa_pairs": len(qa_pairs),
+            "recall": recall_result["exact_count"],
+            "total_keys": recall_result["total"],
+            "returns_current": returns_current,
+            "total_chains": total_chains,
+            "train_time": train_time,
+            "per_chain": per_chain,
+        })
+
+        print(
+            f"  Session {session_num} ({strategy}): "
+            f"recall={recall_result['exact_count']}/{recall_result['total']}, "
+            f"current={returns_current}/{total_chains}, "
+            f"graph={merger.graph.number_of_nodes()}n/{merger.graph.number_of_edges()}e"
+        )
 
     total_time = time.time() - total_start
-    return session_results, rag_result, total_time
+    return {
+        "strategy": strategy,
+        "sessions": eval_results,
+        "contradictions_resolved": merger.contradictions_resolved,
+        "total_time_seconds": total_time,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Test 2: Contradiction Resolution")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--skip-rag", action="store_true")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
     add_model_args(parser)
     args = parser.parse_args()
 
     base_output_dir = Path(args.output_dir)
     data = load_contradiction_data()
-    fact_chains = data["fact_chains"]
-
-    change_sessions = set()
-    for chain in fact_chains:
-        for version in chain["versions"]:
-            change_sessions.add(version["session"])
-    eval_sessions = sorted(change_sessions)
+    enriched_chains = prepare_contradiction_data(data["fact_chains"])
 
     for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
@@ -257,39 +323,49 @@ def main():
         model, tokenizer, config = load_model_and_config(bench_model_config)
         output_dir = model_output_dir(base_output_dir, bench_name)
 
-        session_results, rag_result, total_time = run_contradiction_test(
-            model, tokenizer, fact_chains, eval_sessions, args, output_dir,
-        )
-
-        print(f"\n{'=' * 72}")
-        print(f"CONTRADICTION RESOLUTION SUMMARY ({bench_name})")
-        print("=" * 72)
-        for sr in session_results:
-            print(
-                f"  Session {sr['session']:>2}: "
-                f"{sr['exact_recall']}/{sr['total']} exact, "
-                f"sim={sr['mean_similarity_to_current']:.3f}"
-            )
-        if rag_result:
-            print(
-                f"\n  RAG current-version accuracy: "
-                f"{rag_result['returns_current_count']}/{rag_result['total']}"
-            )
-        print(f"  Total time: {total_time:.0f}s")
-        print("=" * 72)
-
-        results = {
+        all_results = {
             "experiment": "test2_contradictions",
             "model": bench_name,
             "model_id": bench_model_config.model_id,
             "epochs": args.num_epochs,
             "rank": args.rank,
-            "total_time_seconds": total_time,
-            "parametric_sessions": session_results,
-            "rag_baseline": rag_result,
+            "strategies": {},
         }
-        save_results(results, output_dir)
 
+        for strategy in ["graph", "model"]:
+            print(f"\n--- Strategy: {strategy} ---")
+            result = run_strategy(
+                strategy, model, tokenizer, enriched_chains, args,
+                output_dir / strategy,
+            )
+            all_results["strategies"][strategy] = result
+
+        # Summary comparison
+        print(f"\n{'=' * 72}")
+        print(f"CONTRADICTION RESOLUTION SUMMARY ({bench_name})")
+        print(f"{'=' * 72}")
+        for strategy, result in all_results["strategies"].items():
+            n_resolved = len(result["contradictions_resolved"])
+            graph_resolved = sum(
+                1 for c in result["contradictions_resolved"]
+                if c["method"] == "graph"
+            )
+            model_resolved = sum(
+                1 for c in result["contradictions_resolved"]
+                if c["method"] == "model"
+            )
+            final = result["sessions"][-1] if result["sessions"] else {}
+            print(
+                f"  {strategy:>5}: "
+                f"contradictions={n_resolved} "
+                f"(graph={graph_resolved}, model={model_resolved}), "
+                f"final current={final.get('returns_current', 0)}"
+                f"/{final.get('total_chains', 0)}, "
+                f"time={result['total_time_seconds']:.0f}s"
+            )
+        print("=" * 72)
+
+        save_results(all_results, output_dir)
         unload_model(model, tokenizer)
 
 
