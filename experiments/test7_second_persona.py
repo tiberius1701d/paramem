@@ -111,7 +111,7 @@ def select_characters():
         return None, None
 
     # Pick the two characters with the most QA pairs
-    sorted_chars = sorted(chars.items(), key=lambda x: -x[1])
+    sorted_chars = sorted(chars.items(), key=lambda x: -x[1]["dialogues"])
     return sorted_chars[0][0], sorted_chars[1][0]
 
 
