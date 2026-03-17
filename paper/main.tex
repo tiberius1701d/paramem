@@ -556,6 +556,48 @@ Pool-based replay (the pre-indexed-key consolidation mechanism) improved over th
 RAG dominates on raw factual recall when context is available.
 Hybrid RAG+LoRA adds marginal value (+0.5\% over RAG alone), confirming that parametric adapters contribute negligible signal when retrieved context is already present.
 Indexed key retrieval achieves the highest per-fact recall, though the comparison is not entirely direct: indexed keys provide structured retrieval by key, while baseline conditions use natural-language QA evaluation.
+RAG systems that store all versions of a fact must resolve temporal ordering at retrieval time, often returning stale facts when older versions score higher on similarity.
+\paramem{}'s graph-based contradiction resolution updates the adapter's knowledge in a single retraining cycle, ensuring only current facts are recalled.
+
+\subsection{Incremental Contradiction Resolution}
+\label{sec:exp-contradictions}
+
+\begin{table}[t]
+\centering
+\caption{Incremental contradiction resolution with a single persistent adapter. 10 fact chains with planned contradictions plus 3 stable control facts. Both models produce identical results.}
+\label{tab:contradictions}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{Gemma 2 9B} & \textbf{Mistral 7B} \\
+\midrule
+Contradiction detection & 20/20 (100\%) & 20/20 (100\%) \\
+Updated fact recall & 16/16 (100\%) & 16/16 (100\%) \\
+Control fact stability & 1.000 & 1.000 \\
+Cycles to overwrite stale content & 1 & 1 \\
+Catastrophic forgetting & None & None \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+To test whether indexed key retrieval supports temporal fact updates in the production consolidation pattern, we trained a single persistent adapter cumulatively across sessions with contradicting facts introduced via graph resolution (Table~\ref{tab:contradictions}).
+Ten fact chains with planned contradictions (\eg, ``Alex works at AutoMate'' $\rightarrow$ ``Alex joined SpaceX'') plus three unchanging control facts were trained over 8~cycles: 3~learning cycles to establish baseline recall, then 5~decay cycles after contradiction introduction.
+The adapter was never reinitialized---all training was cumulative on the same weights.
+
+Three findings emerged.
+First, \emph{contradiction resolution works}: when the knowledge graph detects a contradiction and replaces the old triple, the next retraining cycle encodes the updated fact under a new key.
+The adapter recalls all 16~current facts correctly throughout.
+Second, \emph{forgetting is immediate}: diagnostic probes to stale keys (bypassing the registry) show that one retraining cycle is sufficient to overwrite old content.
+All five stale keys return the \emph{new} content, not the old.
+This contrasts with gradual forgetting curves reported in continual learning literature---in our mechanism, retraining actively displaces old representations from the key's activation subspace rather than gradually diluting them across shared parameters.
+Third, \emph{zero catastrophic forgetting}: control facts maintain 1.000 SimHash confidence throughout all decay cycles.
+Non-contradicted facts are completely unaffected.
+
+These results hold identically on Gemma~2~9B and Mistral~7B, confirming the findings are architectural, not model-specific.
+
+\paragraph{Note on scope.}
+These are 16-key incremental results.
+Batch scaling to 100~keys is validated (\S\ref{sec:exp-scaling}); incremental contradiction resolution at the 100-key scale remains to be tested.
 
 % ============================================================
 \section{Discussion}
@@ -566,13 +608,16 @@ Batch scaling experiments (\S\ref{sec:exp-scaling}) confirm that indexed key ret
 At 100~keys, a full 30-epoch training pass takes 49--70~minutes depending on model size---feasible for idle-time background processing.
 Notably, recall does not degrade with scale; both models achieve their highest recall rates at the largest scale points.
 The linear time trend and stable recall suggest the approach can extend beyond 100~keys, though this remains to be tested.
+Incremental contradiction resolution at 16~keys (\S\ref{sec:exp-contradictions}) shows zero catastrophic forgetting on control facts, extending the batch scaling results into the incremental regime.
+The gap between 16~incremental keys and 100~batch keys remains to be closed.
 
 \paragraph{Parametric memory vs.\ RAG.}
 RAG outperforms parametric memory on raw factual recall when context is available---this is unsurprising and not the claim.
 Parametric memory's value lies in three orthogonal properties:
 (1)~\emph{Privacy:} adapter weights encode knowledge in a form that is not directly readable as text;
 (2)~\emph{Compression:} the entire memory system (adapters + registry) is 15--30\,MB, versus unbounded growth for text stores;
-(3)~\emph{Zero query overhead:} no retrieval step, no vector database, no network call.
+(3)~\emph{Zero query overhead:} no retrieval step, no vector database, no network call;
+(4)~\emph{Temporal consistency:} contradiction resolution through graph-based retraining ensures only current facts are recalled, whereas RAG must resolve temporal ordering at retrieval time across all stored versions.
 These properties make parametric memory suited to edge deployment and privacy-sensitive applications where RAG infrastructure is unavailable or undesirable.
 
 \paragraph{Format isolation as a design principle.}
@@ -597,6 +642,12 @@ Larger models produce better results---Gemma~2~9B is the reliability champion at
 Mistral~7B offers $\sim$30\% faster training with slightly lower reliability at scale (95\% vs.\ 100\% at 100~keys).
 The tradeoff is VRAM and speed versus recall fidelity, and the right choice is deployment-dependent.
 
+\paragraph{Forgetting dynamics.}
+An unexpected finding from incremental contradiction resolution (\S\ref{sec:exp-contradictions}) is that forgetting is immediate: one retraining cycle on the resolved graph overwrites stale content completely.
+This contrasts with the gradual forgetting curves reported in continual learning literature~\citep{liu2026forever}.
+One hypothesis is that each indexed key occupies a distinct activation subspace, so retraining with different content for the same key position directly displaces the old representation rather than gradually diluting it across shared parameters.
+This immediate-overwrite property simplifies system design: stale keys do not require multi-cycle decay tracking, and the key registry's deregistration serves as a safety layer rather than a functional necessity.
+
 \paragraph{Decreasing loss with scale.}
 The observation that training loss decreases with more indexed keys (Table~\ref{tab:loss-scale}) warrants further investigation.
 One explanation is that more QA pairs per epoch provide greater gradient diversity, reducing overfitting to individual examples and forcing more efficient shared representations.
@@ -606,7 +657,7 @@ We note this as an observation, not a proven theory---the trend could plateau or
 \paragraph{Limitations.}
 We are transparent about the current scope:
 \begin{itemize}
-    \item \textbf{Scale:} 100~keys validated in batch training; 17~keys tested in full incremental consolidation. The batch results (\S\ref{sec:exp-scaling}) demonstrate capacity, but incremental consolidation at the 100-key scale---adding facts across multiple cycles---remains pending.
+    \item \textbf{Scale:} 100~keys validated in batch training (\S\ref{sec:exp-scaling}); 16~keys tested in incremental contradiction resolution with zero catastrophic forgetting (\S\ref{sec:exp-contradictions}). The gap between 16~incremental keys and 100~batch keys remains to be closed.
     \item \textbf{Single user persona:} Development experiments use a synthetic persona (``Alex''); scaling experiments use PerLTQA's ``Liang Xin.'' Real users have more varied and complex fact structures.
     \item \textbf{Three models tested:} Qwen~2.5~3B, Gemma~2~9B, and Mistral~7B. While these span three model families and the 3B--9B parameter range, broader validation (larger models, different architectures) is needed.
     \item \textbf{Metric inflation:} Embedding similarity can give partial credit for plausible hallucinations (\eg, ``lives in the United States'' scores 0.75 against ``lives in Heilbronn''). We supplement with SimHash binary verification to mitigate this.
@@ -618,7 +669,8 @@ We are transparent about the current scope:
 \label{sec:future}
 
 \paragraph{Incremental consolidation at scale.}
-Batch scaling to 100~keys is validated (\S\ref{sec:exp-scaling}); the next step is incremental consolidation at this scale---adding facts across multiple cycles and verifying that old knowledge survives repeated retraining.
+Batch scaling to 100~keys is validated (\S\ref{sec:exp-scaling}), and incremental contradiction resolution at 16~keys shows zero catastrophic forgetting (\S\ref{sec:exp-contradictions}).
+The next step is incremental consolidation at the 100-key scale---adding and contradicting facts across many cycles---to verify that both findings hold together at larger scale.
 
 \paragraph{Training time optimization.}
 Training loss converges well before 30~epochs (loss~$<$0.01 by epoch~4--6 across all scales and both models tested).
@@ -633,10 +685,6 @@ A 30+ day longitudinal study with actual user sessions to validate beyond synthe
 
 \paragraph{Broader model validation.}
 Three model families tested (Qwen, Gemma, Mistral) in the 3B--9B range. Validation on larger models and different architectures (\eg, Llama, Phi) would further establish generality.
-
-\paragraph{Base model migration.}
-When upgrading to a newer base model, indexed key retrieval enables lossless migration: enumerate all keys, reconstruct each fact from the old adapter via key prompts, then retrain fresh adapters on the new model.
-The knowledge graph can serve as a temporary materialized snapshot during migration, discarded once the new adapters pass fidelity checks.
 
 \paragraph{Procedural adapter.}
 A third adapter for behavioral patterns (communication style, formatting preferences), completing the biological memory analogy.
@@ -672,7 +720,8 @@ Gemma~2~9B achieves 100/100 exact recall at 100 indexed keys distilled from real
 Training time scales linearly with key count, and an unexpected compression effect---decreasing loss with more keys---suggests the mechanism becomes more efficient with use.
 The 10-cycle consolidation loop maintains 100\% recall with incremental key addition and episodic-to-semantic promotion.
 Our negative results---format collision, signal dilution, the futility of rank sweeps---yield a practical design principle: auxiliary training objectives in a shared LoRA adapter must reuse the primary output format, not introduce novel ones.
-We report these failures alongside successes, as they constrain the design space for future parametric memory systems.
+Incremental contradiction resolution confirms that the adapter can update its knowledge in a single retraining cycle with zero catastrophic forgetting on unrelated facts---a property validated independently on both model families.
+We report failures alongside successes, as they constrain the design space for future parametric memory systems.
 
 Code is available at \url{https://github.com/tiberius1701d/paramem}.
 
