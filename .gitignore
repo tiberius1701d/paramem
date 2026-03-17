@@ -40,6 +40,9 @@ model_benchmarking.md
 prompt_experiments.md
 early_stopping.md
 
+# Compiled PDFs
+*.pdf
+
 # LaTeX build artifacts
 paper/*.aux
 paper/*.bbl
