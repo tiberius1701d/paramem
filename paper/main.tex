@@ -47,14 +47,15 @@
 
 % ============================================================
 \begin{abstract}
-Personal LLM agents need persistent memory, yet current approaches---retrieval-augmented generation, text-based memory banks, conversation logs---are digital filing cabinets: they store and retrieve text, but the model itself learns nothing.
+Personal LLM agents need persistent memory, yet current approaches---retrieval-augmented generation, text-based memory banks, conversation logs---store and retrieve text, but the model itself learns nothing.
 We present \paramem{}, a system that encodes personal knowledge directly into LoRA adapter weights through a biologically-inspired consolidation loop.
 Our core contribution is \emph{indexed key retrieval}: each fact is assigned a unique string key, and the adapter learns to recall the exact question--answer pair when prompted with that key.
 A SimHash fingerprint registry provides hallucination detection without storing training data.
-Combined with a multi-partition adapter architecture---episodic (fast-learning) and semantic (stable)---with knowledge-graph-driven promotion between partitions, \paramem{} achieves 100\% recall across 10 consolidation cycles on 8\,GB VRAM consumer hardware.
 In multi-model scaling experiments on QA pairs distilled from real conversational data, Gemma~2~9B achieves 100/100 exact recall at 100 indexed keys, and Mistral~7B achieves 95/100---validating the mechanism across three model families (including the Qwen~2.5~3B development baseline).
+Combined with a multi-partition adapter architecture---episodic (fast-learning) and semantic (stable)---with knowledge-graph-driven promotion between partitions, a 10-cycle consolidation loop maintains 100\% recall (6~keys per adapter after capacity-cap eviction) on 8\,GB VRAM consumer hardware.
 Training time scales linearly with key count, and recall does not degrade with scale.
-We report both successes and instructive failures, including format collision effects that destroy recall when heterogeneous training formats are mixed in a single adapter.
+In associative inference experiments requiring multi-hop reasoning over stored facts, exhaustive recall via indexed keys outperforms similarity-based RAG retrieval on both models.
+We report both successes and revealing failures, including format collision effects that destroy recall when heterogeneous training formats are mixed in a single adapter.
 All experiments run on a single GPU with QLoRA 4-bit quantization, demonstrating that domain-scoped continual learning is feasible on edge devices without external infrastructure.
 \end{abstract}
 
@@ -86,13 +87,14 @@ A locality-sensitive SimHash registry~\citep{charikar2002simhash} provides hallu
 % Contributions
 Our contributions are:
 \begin{enumerate}
-    \item \textbf{Indexed key retrieval from LoRA weights.} Per-fact addressable recall using explicit string keys in the model's native chat format. To our knowledge, no prior work provides per-fact retrieval from a shared LoRA adapter via explicit identifiers (\S\ref{sec:indexed}).
+    \item \textbf{Indexed key retrieval from LoRA weights.} Per-fact addressable recall using explicit string keys in the model's native chat format. To our knowledge, no prior work provides per-fact retrieval from a shared LoRA adapter via explicit identifiers on a frozen base model with incremental key addition (\S\ref{sec:indexed}).
     \item \textbf{Multi-partition LoRA with graph-driven promotion.} Episodic and semantic adapters with different ranks and learning rates, connected by a knowledge graph that drives discrete fact promotion based on recurrence and centrality metrics (\S\ref{sec:arch}).
     \item \textbf{SimHash verification registry.} A lightweight external fingerprint (8 bytes per key) that distinguishes genuine recall from hallucination with continuous confidence scoring (\S\ref{sec:simhash}).
 \end{enumerate}
 
 % Results teaser
 In experiments on a single consumer GPU (8\,GB VRAM, QLoRA 4-bit), \paramem{} achieves 100/100 exact recall at 100 indexed keys on Gemma~2~9B, maintains 100\% recall across a 10-cycle consolidation loop, and validates the mechanism across three model families with linear time scaling.
+Associative inference experiments show that exhaustive indexed recall outperforms similarity-based retrieval for multi-hop reasoning.
 
 % ============================================================
 \section{Related Work}
@@ -153,6 +155,7 @@ MEGa~\citep{ren2025mega} uses gated low-rank weights activated by embedding-base
 
 \paragraph{Conceptual ancestors.}
 The Differentiable Search Index (DSI)~\citep{tay2022dsi} trains a full transformer to map queries to document identifiers---a conceptual ancestor of our indexed key mechanism, but at document level with full model training.
+Our mechanism differs in four respects: (1)~it operates as a LoRA delta on a frozen base model rather than training a full transformer, (2)~it retrieves at fact-level granularity rather than document-level, (3)~multiple facts share a single adapter with independent addressability, and (4)~new keys can be added incrementally without full retraining.
 \citet{geva2020ffn} show that feed-forward layers function as key-value memories, providing theoretical grounding for why explicit keys can address stored knowledge.
 \citet{biderman2024lora} characterize LoRA's forgetting behavior, finding that it forgets less than full fine-tuning---a property we rely on for incremental key addition.
 
@@ -176,6 +179,7 @@ We developed the mechanism on Qwen~2.5~3B and validated it on Gemma~2~9B~Instruc
 \end{itemize}
 
 The $\alpha/r$ ratio is held constant at 2 across adapters, so the effective LoRA contribution magnitude scales with rank.
+This follows standard LoRA practice~\citep{hu2022lora}; sensitivity analysis of this ratio is left to future work.
 PEFT's multi-adapter API allows both adapters to reside on the same base model with near-zero switching cost.
 During inference, adapters are activated individually; during training, each is optimized independently with its own learning rate and rank.
 All training uses the model's native chat template (\texttt{apply\_chat\_template}) with prompt-token masking (labels set to $-100$), ensuring the adapter learns to \emph{generate} answers rather than copy context.
@@ -206,7 +210,7 @@ Each consolidation cycle processes one session through the following pipeline (F
 \begin{enumerate}
     \item \textbf{Extract:} LLM-based graph extraction from session transcript.
     \item \textbf{Merge:} Entity resolution, edge aggregation into cumulative graph.
-    \item \textbf{Score:} Composite promotion score per entity: PageRank~(0.4) + degree~(0.3) + recurrence~(0.2) + recency~(0.1).
+    \item \textbf{Score:} Composite promotion score per entity: PageRank~(0.4) + degree~(0.3) + recurrence~(0.2) + recency~(0.1). Entities with recurrence $\geq 3$ across consolidation cycles are promoted.
     \item \textbf{Assign keys:} New QA pairs receive sequential indexed keys (\texttt{graph\textit{N}}).
     \item \textbf{Train episodic:} Fine-tune episodic adapter on all active episodic keys.
     \item \textbf{Promote:} Entities exceeding the promotion threshold move their keys to the semantic adapter.
@@ -236,7 +240,7 @@ Second, trust verification requires confirming that a response comes from stored
 \subsection{Failed Approaches}
 \label{sec:failed}
 
-Before arriving at indexed key retrieval, we explored three alternative approaches. All failed in instructive ways (Table~\ref{tab:failed}).
+Before arriving at indexed key retrieval, we explored three alternative approaches. All failed in illuminating ways (Table~\ref{tab:failed}).
 
 \begin{table}[t]
 \centering
@@ -314,6 +318,7 @@ Three properties explain the mechanism's effectiveness:
 (2)~\emph{Single-format training.} Both indexed recall and direct QA use the model's native chat template. No format collision.
 (3)~\emph{Clean activation patterns.} Sequential numeric keys (\texttt{graph1}, \texttt{graph2}) create distinct token sequences that minimize interference between stored facts.
 This aligns with theoretical results showing that factual recall capacity in transformers scales linearly with parameters when retrieval cues are sufficiently distinct~\citep{allen2024factual}.
+While DSI~\citep{tay2022dsi} demonstrated that transformers can learn explicit identifier-to-content mappings, our mechanism shows this property survives in a LoRA adapter on a frozen base model at fact-level granularity with incremental addition.
 
 \subsection{SimHash Hallucination Detection}
 \label{sec:simhash}
@@ -474,6 +479,8 @@ The remaining sessions failed graph extraction---a pipeline robustness issue, no
 Gemma~2~9B achieves 100/100 exact recall at 100~keys---perfect retrieval of all stored facts.
 Mistral~7B achieves 95/100; its 5~failures are generation quality issues (garbled text with missing spaces and truncated words), not convergence failures.
 SimHash confidence on Mistral's failures ranges from 0.81--0.91, indicating the knowledge is encoded but output decoding is imperfect.
+Inspection of the 5~failures reveals truncated words (``collabored''), missing inter-word spaces (``insightsLi Ming''), and underscore artifacts (``Positive\_ Changes'')---all surface-level decoding errors, not knowledge gaps.
+Failure answer lengths (mean 6.2~words) do not differ from successes (mean 6.7~words); the failures are not correlated with answer length.
 Both models maintain $\geq$95\% recall across all scale points with no degradation trend.
 
 \paragraph{Linear time scaling.}
@@ -529,12 +536,14 @@ The additional training data at larger scales appears to strengthen overall enco
 These are \emph{batch} scaling results: all keys are trained in a single adapter pass.
 Incremental continual learning at the 100-key scale---adding facts across multiple consolidation cycles---remains to be validated (\S\ref{sec:future}).
 
-\subsection{Baseline Comparisons}
+\subsection{Development Trajectory}
 \label{sec:exp-baselines}
+
+Table~\ref{tab:baselines} shows the progression of recall approaches tested during development rather than a controlled baseline comparison; evaluation conditions and metrics differ across rows.
 
 \begin{table}[t]
 \centering
-\caption{Recall on promoted (recurring) facts across conditions. Pool-based replay is the pre-indexed-key consolidation baseline.}
+\caption{Progression of recall approaches during development. Evaluation conditions differ across rows (pool-based replay uses natural-language QA; indexed keys use structured key retrieval).}
 \label{tab:baselines}
 \small
 \begin{tabular}{@{}lr@{}}
@@ -551,11 +560,12 @@ Hybrid RAG+LoRA & +0.5\% over RAG \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:baselines} contextualizes indexed key retrieval against prior approaches tested during development.
 Pool-based replay (the pre-indexed-key consolidation mechanism) improved over the base model but plateaued at 59.3\%.
 RAG dominates on raw factual recall when context is available.
 Hybrid RAG+LoRA adds marginal value (+0.5\% over RAG alone), confirming that parametric adapters contribute negligible signal when retrieved context is already present.
-Indexed key retrieval achieves the highest per-fact recall, though the comparison is not entirely direct: indexed keys provide structured retrieval by key, while baseline conditions use natural-language QA evaluation.
+Indexed key retrieval achieves the highest per-fact recall.
+Note that the comparison across rows is not controlled: indexed keys provide structured retrieval by key, while earlier conditions use natural-language QA evaluation with different metrics.
+On associative reasoning tasks requiring multi-hop inference (\S\ref{sec:exp-inference}), \paramem{}'s Recall+Reason mode outperforms RAG on both models (0.794--0.853 vs.\ 0.729--0.766).
 RAG systems that store all versions of a fact must resolve temporal ordering at retrieval time, often returning stale facts when older versions score higher on similarity.
 \paramem{}'s graph-based contradiction resolution updates the adapter's knowledge in a single retraining cycle, ensuring only current facts are recalled.
 
@@ -599,6 +609,59 @@ These results hold identically on Gemma~2~9B and Mistral~7B, confirming the find
 These are 16-key incremental results.
 Batch scaling to 100~keys is validated (\S\ref{sec:exp-scaling}); incremental contradiction resolution at the 100-key scale remains to be tested.
 
+% ------------------------------------------------------------
+\subsection{Associative Inference}
+\label{sec:exp-inference}
+
+To test whether indexed key retrieval supports multi-hop reasoning---not just verbatim fact recall---we constructed an associative inference benchmark.
+50 base facts were trained into a single adapter using the standard indexed key pipeline from PerLTQA dialogues (Liang Xin).
+15 multi-hop reasoning questions were then posed, each requiring the model to combine 2--3 stored facts to produce an answer not explicitly present in any single training pair (\eg, if the adapter stores ``Alex works at SpaceX'' and ``SpaceX is headquartered in Hawthorne,'' the question ``In what city does Alex work?'' requires chaining both facts).
+Three conditions were evaluated:
+\begin{itemize}
+    \item \textbf{(a) Recall+Reason:} All 50 stored facts are exhaustively recalled via indexed keys and provided as context, then the model is prompted to reason over them.
+    \item \textbf{(b) Direct Parametric:} The reasoning question is posed directly to the adapter-equipped model with no retrieval step---testing whether the adapter's parametric knowledge alone supports multi-hop inference.
+    \item \textbf{(c) RAG:} Top-5 relevant facts retrieved via embedding similarity (sentence-transformers, all-MiniLM-L6-v2) and injected into context. Same base model for generation.
+\end{itemize}
+Evaluation used embedding similarity scoring against reference answers, consistent with prior sections.
+
+\begin{table}[t]
+\centering
+\caption{Associative inference on 15 multi-hop questions over 50 stored facts. Base fact recall confirms adapter fidelity before reasoning evaluation. Recall+Reason provides all stored facts via exhaustive indexed key recall; Direct Parametric queries the adapter-equipped model with no retrieval; RAG retrieves top-$k$ by embedding similarity. Scores are mean embedding similarity to reference answers; OK counts indicate questions scoring $>$0.5.}
+\label{tab:inference}
+\begin{tabular}{lcccc}
+\toprule
+Condition & \multicolumn{2}{c}{Gemma 2 9B} & \multicolumn{2}{c}{Mistral 7B} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+ & OK & Mean sim. & OK & Mean sim. \\
+\midrule
+Base fact recall & 50/50 & --- & 49/50 & --- \\
+Facts reconstructed & 50/50 & --- & 49/50 & --- \\
+\midrule
+(a) Recall+Reason & \textbf{15/15} & \textbf{0.794} & \textbf{14/15} & \textbf{0.853} \\
+(b) Direct Parametric & 14/15 & 0.711 & 13/15 & 0.825 \\
+(c) RAG & 15/15 & 0.766 & 14/15 & 0.729 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three findings emerge.
+First, Recall+Reason outperforms RAG on both models (Table~\ref{tab:inference}): Gemma 0.794 vs.\ 0.766; Mistral 0.853 vs.\ 0.729.
+The advantage is larger on Mistral (+0.124).
+The mechanism is straightforward: RAG's similarity-based retrieval selects a subset of facts, and for multi-hop questions the critical linking fact may not rank in the top-$k$.
+Exhaustive recall via indexed keys eliminates this selection bottleneck---every stored fact is available for reasoning.
+At 50~facts ($\sim$300 tokens of context), the cost of exhaustive recall is negligible; at larger scales, selective enumeration by entity, topic, or recency would be needed.
+
+Second, direct parametric inference---querying the adapter-equipped model with no retrieval step---is surprisingly strong on both models (Gemma: 0.711; Mistral: 0.825).
+Mistral's direct parametric score exceeds its own RAG score (0.825 vs.\ 0.729) without any explicit retrieval.
+This suggests that the adapter's parametric encoding preserves relational structure that the base model can exploit during generation, not just verbatim fact pairs.
+Gemma's direct parametric score is lower (0.711), falling below its RAG score (0.766), indicating model-dependent variation in how effectively parametric knowledge supports multi-hop reasoning without explicit recall.
+
+Third, Mistral achieves higher reasoning scores than Gemma across all conditions despite slightly lower base fact recall (49/50 vs.\ 50/50).
+This suggests that generation quality during the reasoning step---not raw recall fidelity---is the limiting factor for associative inference.
+
+These results are based on 15 multi-hop questions over 50~facts.
+Scaling this evaluation to larger fact bases and more diverse reasoning patterns is needed to confirm the generality of the finding.
+
 % ============================================================
 \section{Discussion}
 \label{sec:discussion}
@@ -613,11 +676,22 @@ The gap between 16~incremental keys and 100~batch keys remains to be closed.
 
 \paragraph{Parametric memory vs.\ RAG.}
 RAG outperforms parametric memory on raw factual recall when context is available---this is unsurprising and not the claim.
-Parametric memory's value lies in three orthogonal properties:
+However, on multi-hop reasoning tasks that require combining stored facts (\S\ref{sec:exp-inference}), the relationship reverses: \paramem{}'s exhaustive recall outperforms RAG's selective retrieval.
+The advantage is structural.
+RAG retrieves chunks by similarity to the query, but multi-hop questions may require facts that are individually dissimilar to the question yet jointly necessary for inference.
+Indexed key enumeration sidesteps this by providing \emph{all} stored facts as context---guaranteeing completeness at the cost of longer prompts.
+At 50~facts ($\sim$300 tokens of context), this cost is negligible.
+At larger scales, hybrid approaches---RAG for initial filtering, indexed keys for targeted exhaustive recall within a subgraph---may be necessary.
+
+More surprisingly, direct parametric inference---where the adapter influences generation without any fact retrieval---approaches or exceeds RAG performance on reasoning tasks (Mistral: 0.825 vs.\ 0.729).
+This suggests that LoRA adapters trained with indexed keys do not merely store retrievable tokens; they shape the model's output distribution in ways that support cross-fact reasoning.
+
+Beyond reasoning, parametric memory offers five orthogonal properties:
 (1)~\emph{Privacy:} adapter weights encode knowledge in a form that is not directly readable as text;
 (2)~\emph{Compression:} the entire memory system (adapters + registry) is 15--30\,MB, versus unbounded growth for text stores;
 (3)~\emph{Zero query overhead:} no retrieval step, no vector database, no network call;
-(4)~\emph{Temporal consistency:} contradiction resolution through graph-based retraining ensures only current facts are recalled, whereas RAG must resolve temporal ordering at retrieval time across all stored versions.
+(4)~\emph{Temporal consistency:} contradiction resolution through graph-based retraining ensures only current facts are recalled, whereas RAG must resolve temporal ordering at retrieval time across all stored versions;
+(5)~\emph{Associative reasoning:} exhaustive recall via indexed key enumeration provides complete context for multi-hop inference, outperforming selective similarity-based retrieval that may miss jointly relevant facts.
 These properties make parametric memory suited to edge deployment and privacy-sensitive applications where RAG infrastructure is unavailable or undesirable.
 
 \paragraph{Format isolation as a design principle.}
@@ -645,12 +719,16 @@ The tradeoff is VRAM and speed versus recall fidelity, and the right choice is d
 \paragraph{Forgetting dynamics.}
 An unexpected finding from incremental contradiction resolution (\S\ref{sec:exp-contradictions}) is that forgetting is immediate: one retraining cycle on the resolved graph overwrites stale content completely.
 This contrasts with the gradual forgetting curves reported in continual learning literature~\citep{liu2026forever}.
+However, the comparison requires qualification: our consolidation loop retrains on all active keys each cycle (full replay), whereas gradual forgetting curves typically arise when new data is trained without replaying old data.
+Our finding is that full replay with indexed keys achieves clean single-cycle overwrite---a useful practical property, though not a direct contradiction of gradual-forgetting findings.
 One hypothesis is that each indexed key occupies a distinct activation subspace, so retraining with different content for the same key position directly displaces the old representation rather than gradually diluting it across shared parameters.
 This immediate-overwrite property simplifies system design: stale keys do not require multi-cycle decay tracking, and the key registry's deregistration serves as a safety layer rather than a functional necessity.
 
 \paragraph{Decreasing loss with scale.}
 The observation that training loss decreases with more indexed keys (Table~\ref{tab:loss-scale}) warrants further investigation.
-One explanation is that more QA pairs per epoch provide greater gradient diversity, reducing overfitting to individual examples and forcing more efficient shared representations.
+Lower loss with more training pairs per epoch is expected from greater gradient diversity.
+The more notable finding is that per-key recall reliability does not degrade and may improve with scale---Gemma's \texttt{graph13} produced null output at 25 and 50~keys but self-corrected at 75 and 100~keys---suggesting that additional training data strengthens encoding of individual keys.
+One explanation is that more QA pairs per epoch reduce overfitting to individual examples and force more efficient shared representations.
 If this trend continues beyond 100~keys, it suggests the adapter's effective capacity may be larger than simple parameter counting would predict.
 We note this as an observation, not a proven theory---the trend could plateau or reverse at higher scales.
 
@@ -661,7 +739,7 @@ We are transparent about the current scope:
     \item \textbf{Single user persona:} Development experiments use a synthetic persona (``Alex''); scaling experiments use PerLTQA's ``Liang Xin.'' Real users have more varied and complex fact structures.
     \item \textbf{Three models tested:} Qwen~2.5~3B, Gemma~2~9B, and Mistral~7B. While these span three model families and the 3B--9B parameter range, broader validation (larger models, different architectures) is needed.
     \item \textbf{Metric inflation:} Embedding similarity can give partial credit for plausible hallucinations (\eg, ``lives in the United States'' scores 0.75 against ``lives in Heilbronn''). We supplement with SimHash binary verification to mitigate this.
-    \item \textbf{Extraction noise:} Graph extraction fails on 36--40\% of dialogue sessions and produces noisy predicates on others. The core contribution is indexed key retrieval, not extraction quality.
+    \item \textbf{Extraction fragility:} Graph extraction fails on 36--40\% of dialogue sessions in the PerLTQA pipeline. While the core contribution is indexed key retrieval (not extraction quality), production deployment requires substantially more robust intake processing.
 \end{itemize}
 
 % ============================================================
@@ -700,6 +778,10 @@ The permutation is an isomorphism---the model learns identical representations u
 Special tokens (BOS, EOS, chat template markers) are pinned and excluded from permutation to preserve tokenizer compatibility.
 Empirical validation is pending; a 10-key smoke test on a permuted model would confirm zero recall impact.
 
+\paragraph{Associative inference at scale.}
+The current evaluation uses 15 multi-hop questions over 50~facts.
+Extending this to larger fact bases with more diverse reasoning chains would clarify the boundary conditions under which exhaustive indexed recall outperforms selective retrieval.
+
 \paragraph{Model migration via indexed key enumeration.}
 Indexed key retrieval enables lossless migration between base models.
 The procedure is: enumerate all registered keys, reconstruct every stored fact as QA pairs from the current adapter, then retrain fresh adapters on the new base model using the standard training pipeline.
@@ -721,6 +803,7 @@ Training time scales linearly with key count, and an unexpected compression effe
 The 10-cycle consolidation loop maintains 100\% recall with incremental key addition and episodic-to-semantic promotion.
 Our negative results---format collision, signal dilution, the futility of rank sweeps---yield a practical design principle: auxiliary training objectives in a shared LoRA adapter must reuse the primary output format, not introduce novel ones.
 Incremental contradiction resolution confirms that the adapter can update its knowledge in a single retraining cycle with zero catastrophic forgetting on unrelated facts---a property validated independently on both model families.
+Unexpectedly, exhaustive recall via indexed key enumeration outperforms retrieval-augmented generation on multi-hop reasoning tasks---providing all stored facts as context enables stronger associative inference than selective similarity-based retrieval.
 We report failures alongside successes, as they constrain the design space for future parametric memory systems.
 
 Code is available at \url{https://github.com/tiberius1701d/paramem}.
