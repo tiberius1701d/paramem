@@ -302,6 +302,7 @@ def run_strategy(
                 "total_chains": total_chains,
                 "train_time": train_time,
                 "per_chain": per_chain,
+                "per_key_recall": recall_result["per_key"],
             }
         )
 
@@ -326,6 +327,13 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        choices=["graph", "model"],
+        help="Run a single strategy (default: both)",
+    )
     add_model_args(parser)
     args = parser.parse_args()
 
@@ -350,7 +358,8 @@ def main():
             "strategies": {},
         }
 
-        for strategy in ["graph", "model"]:
+        strategies = [args.strategy] if args.strategy else ["graph", "model"]
+        for strategy in strategies:
             print(f"\n--- Strategy: {strategy} ---")
             result = run_strategy(
                 strategy,
