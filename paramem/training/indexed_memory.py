@@ -98,7 +98,7 @@ def verify_confidence(
         return 1.0
 
     key = recalled.get("key", "")
-    expected = registry.get(key)
+    expected = get_simhash(registry, key)
     if expected is None:
         return 0.0
 
@@ -117,22 +117,151 @@ def build_registry(keyed_pairs: list[dict]) -> dict[str, int]:
     """Build a SimHash registry from keyed QA pairs.
 
     Returns a mapping of key → 64-bit SimHash fingerprint.
+    This is the simple format used by the training pipeline.
+    For enriched metadata, see build_enriched_registry().
     """
     return {
         kp["key"]: compute_simhash(kp["key"], kp["question"], kp["answer"]) for kp in keyed_pairs
     }
 
 
-def save_registry(registry: dict[str, int], path: str | Path) -> None:
-    """Save SimHash registry to a JSON file."""
+def build_enriched_registry(
+    keyed_pairs: list[dict],
+    session_id: str | None = None,
+    existing: dict | None = None,
+) -> dict:
+    """Build an enriched registry with temporal metadata.
+
+    Format per key:
+        {
+            "simhash": int,
+            "created_at": ISO timestamp,
+            "last_seen_at": ISO timestamp,
+            "session_id": str,
+            "status": "active" | "stale",
+            "stale_since": ISO timestamp | null,
+            "stale_cycles": 0
+        }
+
+    If existing registry is provided, updates it:
+    - Active keys present in keyed_pairs get their last_seen_at updated
+    - Active keys NOT in keyed_pairs are unchanged (not auto-staled)
+    - Stale keys NOT in keyed_pairs get stale_cycles incremented
+    - Stale keys present in keyed_pairs are reactivated
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    current_keys = {kp["key"] for kp in keyed_pairs}
+
+    if existing is None:
+        existing = {}
+
+    registry = dict(existing)
+
+    # Update or add keys from current training set
+    for kp in keyed_pairs:
+        key = kp["key"]
+        simhash = compute_simhash(key, kp["question"], kp["answer"])
+
+        if key in registry:
+            # Reactivate if stale, update last_seen
+            registry[key]["simhash"] = simhash
+            registry[key]["last_seen_at"] = now
+            registry[key]["status"] = "active"
+            registry[key]["stale_since"] = None
+            registry[key]["stale_cycles"] = 0
+            if session_id:
+                registry[key]["session_id"] = session_id
+        else:
+            registry[key] = {
+                "simhash": simhash,
+                "created_at": now,
+                "last_seen_at": now,
+                "session_id": session_id or "",
+                "status": "active",
+                "stale_since": None,
+                "stale_cycles": 0,
+            }
+
+    # Increment stale_cycles for keys already marked stale
+    for key, entry in registry.items():
+        if key not in current_keys and entry.get("status") == "stale":
+            entry["stale_cycles"] = entry.get("stale_cycles", 0) + 1
+
+    return registry
+
+
+def mark_stale(registry: dict, keys: list[str]) -> None:
+    """Mark keys as stale in an enriched registry.
+
+    Stale keys are excluded from enumeration but remain in the registry
+    until their key IDs are reclaimed. The adapter retains the old
+    weights — they decay naturally through subsequent training cycles.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    for key in keys:
+        if key in registry and isinstance(registry[key], dict):
+            registry[key]["status"] = "stale"
+            if registry[key].get("stale_since") is None:
+                registry[key]["stale_since"] = now
+
+
+def get_reclaimable_keys(registry: dict, min_stale_cycles: int = 5) -> list[str]:
+    """Return stale key IDs that have been inactive long enough to reclaim.
+
+    After min_stale_cycles consolidation cycles, the adapter's gradient
+    residue for these keys has likely decayed enough to reassign them.
+    """
+    reclaimable = []
+    for key, entry in registry.items():
+        if (
+            isinstance(entry, dict)
+            and entry.get("status") == "stale"
+            and entry.get("stale_cycles", 0) >= min_stale_cycles
+        ):
+            reclaimable.append(key)
+    return sorted(reclaimable)
+
+
+def get_active_keys(registry: dict) -> list[str]:
+    """Return only active (non-stale) keys from an enriched registry.
+
+    Also handles the simple format (key → int) for backward compatibility.
+    """
+    active = []
+    for key, entry in registry.items():
+        if isinstance(entry, int):
+            active.append(key)
+        elif isinstance(entry, dict) and entry.get("status", "active") == "active":
+            active.append(key)
+    return sorted(active)
+
+
+def get_simhash(registry: dict, key: str) -> int | None:
+    """Extract simhash from either simple or enriched registry format."""
+    entry = registry.get(key)
+    if entry is None:
+        return None
+    if isinstance(entry, int):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("simhash")
+    return None
+
+
+def save_registry(registry: dict, path: str | Path) -> None:
+    """Save registry to a JSON file. Handles both simple and enriched formats."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(registry, f, indent=2)
 
 
-def load_registry(path: str | Path) -> dict[str, int]:
-    """Load SimHash registry from a JSON file."""
+def load_registry(path: str | Path) -> dict:
+    """Load registry from a JSON file. Handles both simple and enriched formats."""
     with open(path) as f:
         return json.load(f)
 
@@ -319,9 +448,11 @@ def probe_key(
 ) -> dict | None:
     """Prompt the model to recall a single key.
 
-    Returns parsed {"key", "question", "answer"} with an added "confidence"
-    field, or None if the output is unparseable, the key mismatches, or
-    confidence falls below the threshold.
+    Returns parsed {"key", "question", "answer", "confidence", "raw_output"}
+    dict, or None if the output is unparseable, the key mismatches, or
+    confidence falls below the threshold. The raw_output field is always
+    present when a dict is returned. For failures, returns a dict with
+    "raw_output" and "failure_reason" so diagnostic data is never lost.
 
     If registry is provided, verifies the recalled content against it.
     """
@@ -342,12 +473,13 @@ def probe_key(
 
     recalled = parse_recalled_pair(raw)
     if recalled is None:
-        return None
+        logger.debug("Parse failure for key '%s': %s", key, raw[:200])
+        return {"raw_output": raw, "failure_reason": "parse_failure"}
 
     # Reject if returned key doesn't match queried key
     if recalled.get("key") != key:
         logger.debug("Key mismatch: queried '%s', got '%s'", key, recalled.get("key"))
-        return None
+        return {"raw_output": raw, "failure_reason": f"key_mismatch:{recalled.get('key')}"}
 
     # Check confidence against registry
     confidence = verify_confidence(recalled, registry)
@@ -358,9 +490,10 @@ def probe_key(
             confidence,
             confidence_threshold,
         )
-        return None
+        return {"raw_output": raw, "failure_reason": f"low_confidence:{confidence:.3f}"}
 
     recalled["confidence"] = confidence
+    recalled["raw_output"] = raw
     return recalled
 
 
@@ -388,15 +521,17 @@ def validate_recall(
 
     Returns dict with exact_match, question_match, answer_match,
     key_match, confidence (float) flags and the recalled content.
+    Failure dicts (with "failure_reason") are treated as non-matches
+    but preserve raw_output for diagnostics.
     """
-    if recalled is None:
+    if recalled is None or "failure_reason" in recalled:
         return {
             "exact_match": False,
             "question_match": False,
             "answer_match": False,
             "key_match": False,
             "confidence": 0.0,
-            "recalled": None,
+            "recalled": recalled,
             "expected_word_count": len(original["answer"].split()),
             "recalled_word_count": 0,
         }
