@@ -1,0 +1,18 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to ParaMem Server",
+        "description": "Enter the URL of your ParaMem server.",
+        "data": {
+          "server_url": "Server URL",
+          "timeout": "Request timeout (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to ParaMem server. Check the URL and ensure the server is running.",
+      "unknown": "Unexpected error occurred."
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "domain": "paramem",
+  "name": "ParaMem Conversation Agent",
+  "codeowners": ["@tiberius1701d"],
+  "config_flow": true,
+  "dependencies": ["conversation"],
+  "documentation": "https://github.com/tiberius1701d/paramem",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "requirements": ["aiohttp"],
+  "version": "0.1.0"
+}

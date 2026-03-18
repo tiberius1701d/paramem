@@ -1,0 +1,33 @@
+server:
+  host: "0.0.0.0"
+  port: 8420
+
+model: mistral  # mistral | gemma | qwen3b
+
+adapter_dir: data/ha/adapters
+registry_path: data/ha/registry.json
+graph_path: data/ha/graph.json
+session_dir: data/ha/sessions
+
+training:
+  epochs: 30
+  rank: 8
+  alpha: 16
+  learning_rate: 1.0e-4
+
+consolidation:
+  schedule: "02:00"  # daily at this hour (empty string = manual only)
+
+cloud:
+  enabled: false
+  endpoint: ""       # e.g. https://api.openai.com/v1/chat/completions
+  model: ""          # e.g. gpt-4o
+  api_key: ""
+
+voice:
+  system_prompt: >
+    You are a personal memory assistant. Answer concisely in 1-2 spoken sentences.
+    Do not use markdown, lists, or structured formatting.
+    Speak naturally as if you simply remember.
+    If you cannot answer a question from your knowledge, respond ONLY with
+    [ESCALATE] followed by the question to forward.
