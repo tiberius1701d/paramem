@@ -116,21 +116,27 @@ def generate_inference_questions(
     formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     model.gradient_checkpointing_disable()
-    has_adapters = hasattr(model, "disable_adapter_layers")
-    if has_adapters:
-        model.disable_adapter_layers()
+    from peft import PeftModel
 
-    raw = generate_answer(
-        model,
-        tokenizer,
-        formatted,
-        max_new_tokens=2048,
-        temperature=0.3,
-        repetition_penalty=1.1,
-    )
-
-    if has_adapters:
-        model.enable_adapter_layers()
+    if isinstance(model, PeftModel):
+        with model.disable_adapter():
+            raw = generate_answer(
+                model,
+                tokenizer,
+                formatted,
+                max_new_tokens=2048,
+                temperature=0.3,
+                repetition_penalty=1.1,
+            )
+    else:
+        raw = generate_answer(
+            model,
+            tokenizer,
+            formatted,
+            max_new_tokens=2048,
+            temperature=0.3,
+            repetition_penalty=1.1,
+        )
 
     # Parse JSON from output
     questions = _parse_inference_json(raw)
@@ -442,15 +448,25 @@ def main():
             rag = QARAGPipeline()
             rag.build_index(qa_pairs)
 
-            model.disable_adapter_layers()
-            result_c = evaluate_condition(
-                "RAG",
-                model,
-                tokenizer,
-                inference_questions,
-                prompt_fn=lambda q: rag.format_prompt(q, tokenizer, top_k=5),
-            )
-            model.enable_adapter_layers()
+            from peft import PeftModel as _PeftModel
+
+            if isinstance(model, _PeftModel):
+                with model.disable_adapter():
+                    result_c = evaluate_condition(
+                        "RAG",
+                        model,
+                        tokenizer,
+                        inference_questions,
+                        prompt_fn=lambda q: rag.format_prompt(q, tokenizer, top_k=5),
+                    )
+            else:
+                result_c = evaluate_condition(
+                    "RAG",
+                    model,
+                    tokenizer,
+                    inference_questions,
+                    prompt_fn=lambda q: rag.format_prompt(q, tokenizer, top_k=5),
+                )
             rag_result = result_c
 
         # Summary

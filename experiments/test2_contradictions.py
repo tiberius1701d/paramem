@@ -195,12 +195,6 @@ def run_strategy(
             strategy,
         )
 
-        # Disable gradient checkpointing for generation if using model strategy
-        if strategy == "model":
-            model.gradient_checkpointing_disable()
-            if hasattr(model, "disable_adapter_layers"):
-                model.disable_adapter_layers()
-
         # Merge each fact into the cumulative graph
         for fact in session_facts:
             session_graph = build_session_graph(
@@ -209,8 +203,8 @@ def run_strategy(
             )
             merger.merge(session_graph)
 
-        if strategy == "model" and hasattr(model, "enable_adapter_layers"):
-            model.enable_adapter_layers()
+        # Disable gradient checkpointing for QA generation
+        model.gradient_checkpointing_disable()
 
         # Generate QA from the resolved graph
         triples = merger.get_all_triples()

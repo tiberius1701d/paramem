@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -195,61 +196,15 @@ def main():
                 }
             )
 
-        # RAG comparison
-        rag_probes = None
-        total_leaked_rag = 0
-        if not args.skip_rag:
-            from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
+        # Save keyed_pairs for resume
+        kp_serializable = [
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+            for kp in keyed_pairs
+        ]
+        with open(output_dir / "keyed_pairs.json", "w") as f:
+            json.dump(kp_serializable, f, indent=2)
 
-            print("\n--- Extraction Probes (RAG Baseline) ---")
-            rag = QARAGPipeline()
-            rag.build_index(qa_pairs)
-
-            model.disable_adapter_layers()
-
-            rag_probes = []
-            for prompt_text in EXTRACTION_PROMPTS:
-                prompt = rag.format_prompt(prompt_text, tokenizer, top_k=5)
-                generated = generate_answer(
-                    model,
-                    tokenizer,
-                    prompt,
-                    max_new_tokens=300,
-                    temperature=0.1,
-                    repetition_penalty=1.3,
-                )
-                leaked = check_fact_leakage(generated, qa_pairs)
-                total_leaked_rag += len(leaked)
-
-                status = f"LEAK({len(leaked)})" if leaked else "SAFE"
-                print(f"  [{status}] {prompt_text[:60]}")
-
-                rag_probes.append(
-                    {
-                        "prompt": prompt_text,
-                        "generated": generated,
-                        "leaked_facts": leaked,
-                        "num_leaked": len(leaked),
-                    }
-                )
-
-            model.enable_adapter_layers()
-
-        # Summary
-        print("\n" + "=" * 72)
-        print("PRIVACY PRESERVATION SUMMARY")
-        print("=" * 72)
-        print(f"  Facts trained: {len(qa_pairs)}")
-        print(f"  Recall with keys: {recall_result['exact_count']}/{recall_result['total']}")
-        num_probes = len(EXTRACTION_PROMPTS)
-        print(
-            f"  Parametric extraction leaks: {total_leaked_parametric} across {num_probes} probes"
-        )
-        if rag_probes is not None:
-            print(f"  RAG extraction leaks: {total_leaked_rag} across {num_probes} probes")
-        print(f"  Training time: {train_time:.0f}s")
-        print("=" * 72)
-
+        # Save control + parametric results before RAG (phase save)
         results = {
             "experiment": "test5_privacy",
             "model": bench_name,
@@ -262,11 +217,76 @@ def main():
             "control_recall": recall_result,
             "parametric_probes": parametric_probes,
             "total_leaked_parametric": total_leaked_parametric,
-            "rag_probes": rag_probes,
-            "total_leaked_rag": total_leaked_rag,
+            "rag_probes": None,
+            "total_leaked_rag": 0,
         }
-
         save_results(results, output_dir)
+
+        # RAG comparison (optional second phase)
+        total_leaked_rag = 0
+        if not args.skip_rag:
+            from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
+
+            print("\n--- Extraction Probes (RAG Baseline) ---")
+            rag = QARAGPipeline()
+            rag.build_index(qa_pairs)
+
+            from peft import PeftModel as _PeftModel
+
+            rag_probes = []
+
+            def _run_rag_probes():
+                for prompt_text in EXTRACTION_PROMPTS:
+                    prompt = rag.format_prompt(prompt_text, tokenizer, top_k=5)
+                    generated = generate_answer(
+                        model,
+                        tokenizer,
+                        prompt,
+                        max_new_tokens=300,
+                        temperature=0.1,
+                        repetition_penalty=1.3,
+                    )
+                    leaked = check_fact_leakage(generated, qa_pairs)
+                    nonlocal total_leaked_rag
+                    total_leaked_rag += len(leaked)
+
+                    status = f"LEAK({len(leaked)})" if leaked else "SAFE"
+                    print(f"  [{status}] {prompt_text[:60]}")
+
+                    rag_probes.append(
+                        {
+                            "prompt": prompt_text,
+                            "generated": generated,
+                            "leaked_facts": leaked,
+                            "num_leaked": len(leaked),
+                        }
+                    )
+
+            if isinstance(model, _PeftModel):
+                with model.disable_adapter():
+                    _run_rag_probes()
+            else:
+                _run_rag_probes()
+
+            # Update results with RAG and re-save
+            results["rag_probes"] = rag_probes
+            results["total_leaked_rag"] = total_leaked_rag
+            save_results(results, output_dir)
+
+        # Summary
+        print("\n" + "=" * 72)
+        print("PRIVACY PRESERVATION SUMMARY")
+        print("=" * 72)
+        print(f"  Facts trained: {len(qa_pairs)}")
+        print(f"  Recall with keys: {recall_result['exact_count']}/{recall_result['total']}")
+        num_probes = len(EXTRACTION_PROMPTS)
+        print(
+            f"  Parametric extraction leaks: {total_leaked_parametric} across {num_probes} probes"
+        )
+        if not args.skip_rag:
+            print(f"  RAG extraction leaks: {total_leaked_rag} across {num_probes} probes")
+        print(f"  Training time: {train_time:.0f}s")
+        print("=" * 72)
 
         unload_model(model, tokenizer)
 

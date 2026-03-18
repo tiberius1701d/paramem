@@ -143,22 +143,27 @@ def distill_qa_pairs(
         transcript_lines.append(f"Assistant: {qa['answer']}")
     transcript = "\n".join(transcript_lines)
 
-    # Extract graph using the base model
+    # Extract graph using the base model (adapters disabled if present)
     model.gradient_checkpointing_disable()
-    has_adapters = hasattr(model, "disable_adapter_layers")
-    if has_adapters:
-        model.disable_adapter_layers()
+    from peft import PeftModel
 
-    session_graph = extract_graph(
-        model,
-        tokenizer,
-        transcript,
-        "distill",
-        temperature=0.3,
-    )
-
-    if has_adapters:
-        model.enable_adapter_layers()
+    if isinstance(model, PeftModel):
+        with model.disable_adapter():
+            session_graph = extract_graph(
+                model,
+                tokenizer,
+                transcript,
+                "distill",
+                temperature=0.3,
+            )
+    else:
+        session_graph = extract_graph(
+            model,
+            tokenizer,
+            transcript,
+            "distill",
+            temperature=0.3,
+        )
 
     relations = [
         {"subject": r.subject, "predicate": r.predicate, "object": r.object}
@@ -201,7 +206,7 @@ def distill_session(
     mimicking background learning during idle time between conversations.
 
     Args:
-        model: Base model (or PeftModel with adapters disabled).
+        model: Base model or PeftModel (adapters disabled internally if present).
         tokenizer: Tokenizer for the model.
         session: Dict with 'session_id' and 'transcript' keys,
             as returned by perltqa_loader.load_character_dialogues().
@@ -219,20 +224,25 @@ def distill_session(
         seen_questions = set()
 
     model.gradient_checkpointing_disable()
-    has_adapters = hasattr(model, "disable_adapter_layers")
-    if has_adapters:
-        model.disable_adapter_layers()
+    from peft import PeftModel
 
-    session_graph = extract_graph(
-        model,
-        tokenizer,
-        session["transcript"],
-        session["session_id"],
-        temperature=0.3,
-    )
-
-    if has_adapters:
-        model.enable_adapter_layers()
+    if isinstance(model, PeftModel):
+        with model.disable_adapter():
+            session_graph = extract_graph(
+                model,
+                tokenizer,
+                session["transcript"],
+                session["session_id"],
+                temperature=0.3,
+            )
+    else:
+        session_graph = extract_graph(
+            model,
+            tokenizer,
+            session["transcript"],
+            session["session_id"],
+            temperature=0.3,
+        )
 
     relations = [
         {"subject": r.subject, "predicate": r.predicate, "object": r.object}

@@ -146,13 +146,18 @@ def run_scale_point(
         rag = QARAGPipeline()
         rag.build_index(subset)
 
-        model.disable_adapter_layers()
+        from peft import PeftModel as _PeftModel
+
         model.gradient_checkpointing_disable()
 
         rag_questions = [
             {"question": qa["question"], "expected_answer": qa["answer"]} for qa in subset
         ]
-        rag_results = evaluate_rag_recall(rag, model, tokenizer, rag_questions)
+        if isinstance(model, _PeftModel):
+            with model.disable_adapter():
+                rag_results = evaluate_rag_recall(rag, model, tokenizer, rag_questions)
+        else:
+            rag_results = evaluate_rag_recall(rag, model, tokenizer, rag_questions)
         rag_mean = (
             sum(r["similarity"] for r in rag_results) / len(rag_results) if rag_results else 0.0
         )
@@ -161,8 +166,6 @@ def run_scale_point(
             "mean_similarity": rag_mean,
             "per_question": rag_results,
         }
-
-        model.enable_adapter_layers()
 
     return result
 

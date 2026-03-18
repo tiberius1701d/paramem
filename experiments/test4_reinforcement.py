@@ -133,6 +133,16 @@ def run_reinforcement_test(
             run_name=f"reinforcement-session-{session_num}",
         )
 
+        # Save distilled keyed_pairs so resume scripts can evaluate recall
+        session_dir = output_dir / f"session_{session_num}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        kp_serializable = [
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+            for kp in keyed_pairs
+        ]
+        with open(session_dir / "keyed_pairs.json", "w") as f:
+            json.dump(kp_serializable, f, indent=2)
+
         # Evaluate recall on all cumulative facts
         recall_result = evaluate_indexed_recall(
             model,
@@ -142,17 +152,23 @@ def run_reinforcement_test(
             adapter_name=adapter_name,
         )
 
-        # Map results back to fact IDs
+        # Map keys to groups — 30 facts in, 30 keys out, order preserved
         fact_id_list = list(cumulative_qa.keys())
-        per_fact = {}
-        for i, fact_id in enumerate(fact_id_list):
-            if i >= len(recall_result["per_key"]):
-                break
-            kr = recall_result["per_key"][i]
-            per_fact[fact_id] = {
+        per_key_results = {}
+        for i, kr in enumerate(recall_result["per_key"]):
+            recalled = kr.get("recalled", {}) or {}
+            key = kr["key"]
+            fact_id = fact_id_list[i] if i < len(fact_id_list) else key
+            group = all_facts[fact_id]["group"] if fact_id in all_facts else "unknown"
+
+            per_key_results[key] = {
                 "exact_match": kr["exact_match"],
                 "confidence": kr["confidence"],
-                "group": all_facts[fact_id]["group"],
+                "group": group,
+                "fact_id": fact_id,
+                "raw_output": recalled.get("raw_output", ""),
+                "recalled_answer": recalled.get("answer", ""),
+                "failure_reason": recalled.get("failure_reason", ""),
             }
 
         cycle_time = time.time() - cycle_start
@@ -163,14 +179,14 @@ def run_reinforcement_test(
                 "new_facts": len(session_qa),
                 "train_loss": metrics.get("train_loss"),
                 "wall_clock_seconds": cycle_time,
-                "per_fact": per_fact,
+                "per_key_results": per_key_results,
             }
         )
 
         # Print cycle summary
-        exact = sum(1 for v in per_fact.values() if v["exact_match"])
+        exact = sum(1 for v in per_key_results.values() if v["exact_match"])
         print(
-            f"  Session {session_num}: {exact}/{len(per_fact)} recall "
+            f"  Session {session_num}: {exact}/{len(per_key_results)} recall "
             f"({len(qa_list)} facts, {cycle_time:.0f}s)"
         )
 
@@ -225,10 +241,10 @@ def main():
         print("=" * 72)
 
         final_cycle = cycle_results[-1] if cycle_results else {}
-        final_per_fact = final_cycle.get("per_fact", {})
+        final_per_key_results = final_cycle.get("per_key_results", {})
 
         for group in ["reinforced", "mentioned_twice", "single_mention"]:
-            group_facts = {k: v for k, v in final_per_fact.items() if v["group"] == group}
+            group_facts = {k: v for k, v in final_per_key_results.items() if v["group"] == group}
             if not group_facts:
                 continue
             exact = sum(1 for v in group_facts.values() if v["exact_match"])
@@ -241,8 +257,27 @@ def main():
                 f"conf={mean_conf:.3f}, avg_mentions={avg_mentions:.1f}"
             )
 
-        # RAG baseline comparison
-        rag_result = None
+        print(f"\n  Total time: {total_time:.0f}s")
+        print("=" * 72)
+
+        # Save reinforcement results immediately — before RAG baseline
+        results = {
+            "experiment": "test4_reinforcement",
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
+            "epochs_per_cycle": args.num_epochs,
+            "rank": args.rank,
+            "total_time_seconds": total_time,
+            "cycles": cycle_results,
+            "rag_baseline": None,
+            "fact_metadata": {
+                k: {"group": v["group"], "mention_count": v["mention_count"]}
+                for k, v in all_facts.items()
+            },
+        }
+        save_results(results, output_dir)
+
+        # RAG baseline comparison (optional, saved as update)
         if not args.skip_rag:
             from paramem.evaluation.embedding_scorer import compute_similarity
             from paramem.evaluation.rag_qa import QARAGPipeline
@@ -255,32 +290,39 @@ def main():
             rag = QARAGPipeline()
             rag.build_index(all_qa)
 
-            model.disable_adapter_layers()
+            from peft import PeftModel as _PeftModel
+
             model.gradient_checkpointing_disable()
 
             rag_per_group = {g: [] for g in ["reinforced", "mentioned_twice", "single_mention"]}
-            for fact_id, fact_info in all_facts.items():
-                prompt = rag.format_prompt(fact_info["question"], tokenizer, top_k=3)
-                generated = generate_answer(
-                    model,
-                    tokenizer,
-                    prompt,
-                    max_new_tokens=150,
-                    temperature=0.1,
-                    repetition_penalty=1.3,
-                )
-                similarity = compute_similarity(fact_info["answer"], generated)
-                rag_per_group[fact_info["group"]].append(
-                    {
-                        "fact_id": fact_id,
-                        "question": fact_info["question"],
-                        "expected": fact_info["answer"],
-                        "generated": generated,
-                        "similarity": similarity,
-                    }
-                )
 
-            model.enable_adapter_layers()
+            def _run_rag_probes():
+                for fact_id, fact_info in all_facts.items():
+                    prompt = rag.format_prompt(fact_info["question"], tokenizer, top_k=3)
+                    generated = generate_answer(
+                        model,
+                        tokenizer,
+                        prompt,
+                        max_new_tokens=150,
+                        temperature=0.1,
+                        repetition_penalty=1.3,
+                    )
+                    similarity = compute_similarity(fact_info["answer"], generated)
+                    rag_per_group[fact_info["group"]].append(
+                        {
+                            "fact_id": fact_id,
+                            "question": fact_info["question"],
+                            "expected": fact_info["answer"],
+                            "generated": generated,
+                            "similarity": similarity,
+                        }
+                    )
+
+            if isinstance(model, _PeftModel):
+                with model.disable_adapter():
+                    _run_rag_probes()
+            else:
+                _run_rag_probes()
 
             print(f"\n  RAG BASELINE ({bench_name})")
             rag_summary = {}
@@ -291,27 +333,9 @@ def main():
                 rag_summary[group] = {"mean_similarity": mean_sim, "per_fact": items}
                 print(f"  {group:>20}: mean_sim={mean_sim:.3f} ({len(items)} facts)")
 
-            rag_result = rag_summary
-
-        print(f"\n  Total time: {total_time:.0f}s")
-        print("=" * 72)
-
-        results = {
-            "experiment": "test4_reinforcement",
-            "model": bench_name,
-            "model_id": bench_model_config.model_id,
-            "epochs_per_cycle": args.num_epochs,
-            "rank": args.rank,
-            "total_time_seconds": total_time,
-            "cycles": cycle_results,
-            "rag_baseline": rag_result,
-            "fact_metadata": {
-                k: {"group": v["group"], "mention_count": v["mention_count"]}
-                for k, v in all_facts.items()
-            },
-        }
-
-        save_results(results, output_dir)
+            # Update results with RAG baseline and re-save
+            results["rag_baseline"] = rag_summary
+            save_results(results, output_dir)
 
         unload_model(model, tokenizer)
 

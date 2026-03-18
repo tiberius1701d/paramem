@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -178,6 +179,30 @@ def main():
             f"(conf={recall_a['mean_confidence']:.3f})"
         )
 
+        # Save keyed_pairs and phase results for persona A
+        kp_a_ser = [
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+            for kp in keyed_a
+        ]
+        (output_dir / "persona_a").mkdir(parents=True, exist_ok=True)
+        with open(output_dir / "persona_a" / "keyed_pairs.json", "w") as f:
+            json.dump(kp_a_ser, f, indent=2)
+
+        partial_results = {
+            "experiment": "test7_second_persona",
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
+            "persona_a": {
+                "source": source_a,
+                "pairs_count": len(qa_a),
+                "training_time": time_a,
+                "training_loss": metrics_a.get("train_loss"),
+                "recall": recall_a,
+            },
+            "note": "Partial — persona A complete, persona B pending",
+        }
+        save_results(partial_results, output_dir)
+
         # Train Persona B
         print("\n--- Training Persona B ---")
         model, keyed_b, registry_b, time_b, metrics_b = train_indexed_keys(
@@ -202,6 +227,15 @@ def main():
             f"  Persona B: {recall_b['exact_count']}/{recall_b['total']} recall "
             f"(conf={recall_b['mean_confidence']:.3f})"
         )
+
+        # Save keyed_pairs for persona B
+        kp_b_ser = [
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+            for kp in keyed_b
+        ]
+        (output_dir / "persona_b").mkdir(parents=True, exist_ok=True)
+        with open(output_dir / "persona_b" / "keyed_pairs.json", "w") as f:
+            json.dump(kp_b_ser, f, indent=2)
 
         # Cross-contamination test
         print("\n--- Cross-Contamination Test ---")

@@ -18,9 +18,26 @@ Without `--model`, tests run both models sequentially for direct comparison.
 Each test runs independently. One model at a time (8GB VRAM constraint).
 Results are timestamped — no run can overwrite another.
 
-```bash
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+### Environment setup
 
+All tests load `.env` via `test_harness.py` → `load_dotenv()`. Create a `.env` file
+in the project root with platform-specific settings:
+
+```bash
+# .env — loaded automatically by test_harness.py
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+WANDB_API_KEY=<your key>
+
+# WSL2 only: disable threaded weight loading to avoid CUDA driver races.
+# Transformers 5.3+ uses a ThreadPoolExecutor for weight loading which races
+# the WSL2 dxg paravirt memory mapper on models >= 4B params.
+# Not needed on native Linux. See README.md for details.
+HF_DEACTIVATE_ASYNC_LOAD=1
+```
+
+### Running tests
+
+```bash
 python experiments/test1_scale_expansion.py --model gemma
 python experiments/test2_contradictions.py --model mistral
 ```
@@ -501,7 +518,7 @@ and zero query overhead."
 ## Test 4: Multi-Session Reinforcement
 
 **Script:** `experiments/test4_reinforcement.py`
-**Status:** IMPLEMENTED — pending execution
+**Status:** COMPLETE — both models
 
 **Objective:** Test whether facts encountered more frequently across sessions
 are remembered better — the biological consolidation property that repeated
@@ -514,16 +531,72 @@ experience strengthens memory traces.
 
 Each session's cumulative facts are distilled on-the-fly through graph
 extraction, mimicking real assistant behavior. Uses synthetic reinforcement
-session data with pre-defined mention schedules.
+session data with pre-defined mention schedules. Fresh adapter per session
+trained on all cumulative facts.
 
-**Key metrics:** Per-session recall, recall breakdown by frequency tier,
-mean confidence per tier, correlation between mention count and recall rate.
+### Results (2026-03-18)
 
-**Expected outcome:** Reinforced facts should show higher recall and confidence
-than single-mention facts. The gap should be most visible at smaller scales
-where adapter capacity is a constraint. If no frequency effect appears, it
-suggests the indexed key format is equally strong regardless of repetition —
-also a useful finding.
+| Metric | Gemma 2 9B | Mistral 7B |
+|--------|-----------|------------|
+| Final recall (session 10) | 28/30 (93%) | 30/30 (100%) |
+| Reinforced (3-4 mentions) | 10/10 (100%) | 10/10 (100%) |
+| Mentioned twice | 10/10 (100%) | 10/10 (100%) |
+| Single mention | 8/10 (80%) | 10/10 (100%) |
+| RAG baseline (reinforced) | 0.884 | 0.901 |
+| RAG baseline (mentioned twice) | 0.913 | 0.893 |
+| RAG baseline (single mention) | 0.931 | 0.945 |
+| Total time | ~3h | ~2.5h |
+
+**Config:** rank=8, alpha=16, 30 epochs, lr=1e-4, batch=1, grad_accum=2.
+
+### Per-session recall trend
+
+| Session | Cumulative facts | Gemma | Mistral |
+|---------|-----------------|-------|---------|
+| 1 | 7 | 5/5 | 5/5 |
+| 2 | 13 | 13/13 | 13/13 |
+| 3 | 18 | 18/18 | 18/18 |
+| 4 | 22 | 22/22 | 22/22 |
+| 5 | 24 | 24/24 | 24/24 |
+| 6 | 26 | 25/26 | 26/26 |
+| 7 | 27 | 26/27 | 27/27 |
+| 8 | 28 | 28/28 | 28/28 |
+| 9 | 29 | 29/29 | 29/29 |
+| 10 | 30 | 28/30 | 30/30 |
+
+### Failure analysis (Gemma)
+
+Two single-mention facts failed at session 10. Both are cross-key recall
+errors: the model returned another key's content (graph23: "Alex is allergic
+to cats") instead of the trained content for graph24 and graph27. SimHash
+verification correctly detected the mismatch (confidence 0.531 and 0.609,
+threshold 0.75). The trained content for graph24 ("WiFi password hint") and
+graph27 ("dentist's name") was confirmed correct from the saved keyed_pairs.
+
+Both failures are exclusively in single-mention facts. All reinforced (3-4
+mentions) and mentioned-twice facts achieve 100% recall on both models. The
+cross-key recall mechanism deserves deeper investigation to determine whether
+repetition directly prevents it or whether the correlation with mention
+frequency is coincidental at this sample size (N=10 per group).
+
+### Key takeaways
+
+1. **Reinforcement shows a directional effect on Gemma.** Reinforced and
+   mentioned-twice facts are 100% recall; single-mention facts are 80%. The
+   effect is absent on Mistral (100% across all groups), suggesting it only
+   manifests near the model's capacity boundary.
+
+2. **Parametric recall outperforms RAG.** 28-30/30 exact recall vs. 0.88-0.95
+   mean similarity for RAG across both models and all frequency tiers.
+
+3. **Cross-key contamination is a new failure mode.** Distinct from the QA
+   generation quality failures seen in Tests 1-2. The model produces
+   well-formed JSON with a valid key-question-answer triple — just the wrong
+   one. First observed at 30 facts on Gemma.
+
+4. **30 facts at 30 epochs is within Mistral's capacity ceiling.** No
+   differentiation by frequency. A larger-scale test (100+ facts) would be
+   needed to observe reinforcement effects on Mistral.
 
 ---
 

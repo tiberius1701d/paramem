@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -76,28 +77,34 @@ def measure_inference_latency(
 
 def measure_rag_latency(rag, model, tokenizer, qa_pairs, num_queries=20):
     """Measure average RAG retrieval + generation latency."""
+    from peft import PeftModel as _PeftModel
+
     from paramem.evaluation.recall import generate_answer
 
-    model.disable_adapter_layers()
     model.gradient_checkpointing_disable()
 
     queries = qa_pairs[:num_queries]
     latencies = []
 
-    for qa in queries:
-        start = time.time()
-        prompt = rag.format_prompt(qa["question"], tokenizer, top_k=3)
-        generate_answer(
-            model,
-            tokenizer,
-            prompt,
-            max_new_tokens=150,
-            temperature=0.1,
-            repetition_penalty=1.3,
-        )
-        latencies.append(time.time() - start)
+    def _run_rag_queries():
+        for qa in queries:
+            start = time.time()
+            prompt = rag.format_prompt(qa["question"], tokenizer, top_k=3)
+            generate_answer(
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=150,
+                temperature=0.1,
+                repetition_penalty=1.3,
+            )
+            latencies.append(time.time() - start)
 
-    model.enable_adapter_layers()
+    if isinstance(model, _PeftModel):
+        with model.disable_adapter():
+            _run_rag_queries()
+    else:
+        _run_rag_queries()
 
     return {
         "mean_ms": sum(latencies) / len(latencies) * 1000,
@@ -153,6 +160,15 @@ def main():
                 output_dir=output_dir / f"scale_{scale}",
                 run_name=f"footprint-{scale}",
             )
+
+            # Save keyed_pairs for resume
+            scale_dir = output_dir / f"scale_{scale}"
+            kp_ser = [
+                {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+                for kp in keyed_pairs
+            ]
+            with open(scale_dir / "keyed_pairs.json", "w") as f:
+                json.dump(kp_ser, f, indent=2)
 
             # Measure adapter size
             adapter_dir = output_dir / f"scale_{scale}" / "adapter"
@@ -217,6 +233,19 @@ def main():
                 f"{rg['inference_latency']['mean_ms']:.0f}ms/query"
             )
 
+            # Phase save after each scale point
+            partial_results = {
+                "experiment": "test6_footprint",
+                "model": bench_name,
+                "model_id": bench_model_config.model_id,
+                "epochs": args.num_epochs,
+                "rank": args.rank,
+                "data_source": source,
+                "scale_results": scale_results,
+                "note": f"Partial — completed through scale {scale}",
+            }
+            save_results(partial_results, output_dir)
+
         # Summary
         print("\n" + "=" * 72)
         print("EDGE DEPLOYMENT FOOTPRINT SUMMARY")
@@ -237,6 +266,7 @@ def main():
         print("\nNote: Adapter size is constant across scale points (fixed LoRA rank).")
         print("RAG storage scales linearly with number of facts.")
 
+        # Final save (overwrites partial with complete results)
         results = {
             "experiment": "test6_footprint",
             "model": bench_name,
@@ -246,7 +276,6 @@ def main():
             "data_source": source,
             "scale_results": scale_results,
         }
-
         save_results(results, output_dir)
 
         unload_model(model, tokenizer)
