@@ -373,6 +373,32 @@ Table~\ref{tab:recall} shows that indexed keys provide substantially higher reca
 Individual QA recall is measured as mean embedding similarity (sentence-transformers) across the 10~test questions; at 0.530, roughly half of the direct QA answers are semantically correct---compared to 90\% for indexed key retrieval on the same facts.
 The single indexed miss was a near-miss (correct entities, minor truncation) scoring 0.750 SimHash confidence---exactly at the acceptance threshold.
 
+\paragraph{Natural recall comparison.}
+Table~\ref{tab:recall} measures the gap between indexed and individual QA recall via embedding similarity on Qwen~2.5~3B at 10~keys.
+We complement this with a fact-level evaluation on the benchmark models at 20~keys: rather than scoring similarity, we count how many distinct trained facts are recoverable through natural-language prompts alone---without any key mechanism.
+Using the standard pipeline (rank~8, 30~epochs) on 20~facts, both benchmark models achieve perfect keyed recall (20/20).
+We then probe with 10~open-ended prompts ranging from broad (``List everything you know about the user'') to narrow (``What do you know about the user's daily routine?''), with no indexed keys, and count unique facts surfaced across all probes.
+
+\begin{table}[t]
+\centering
+\caption{Keyed vs.\ natural recall at 20~facts. Natural recall counts unique facts (deduplicated across 10~prompts).}
+\label{tab:natural-recall}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+& \textbf{Gemma 2 9B} & \textbf{Mistral 7B} \\
+\midrule
+Keyed recall     & 20/20 (100\%) & 20/20 (100\%) \\
+Natural recall   & 7/20 (35\%)   & 8/20 (40\%)   \\
+Keyed / natural  & 2.86$\times$  & 2.50$\times$  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Broad prompts surface 3--4 facts each, narrow topical prompts surface 0--1, and the same facts recur across multiple broad prompts---indicating a small set of easily activated facts rather than uniform accessibility.
+This quantifies the enumeration problem described in \S\ref{sec:enumeration}: even when facts are successfully encoded (100\% keyed recall), natural-language probing recovers only 35--40\% of stored knowledge with no guarantee of completeness.
+Indexed keys close this gap by providing deterministic, exhaustive access to all stored facts.
+
 \subsection{Capacity Scaling (Qwen~2.5~3B)}
 \label{sec:exp-capacity}
 

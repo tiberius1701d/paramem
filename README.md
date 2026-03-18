@@ -176,7 +176,7 @@ Seven experiments testing parametric memory against a QA-RAG baseline (same mode
 | `test2_contradictions.py` | Temporal fact updates vs RAG staleness | ~50 min |
 | `test3_inference.py` | Associative reasoning over combined facts | ~15 min |
 | `test4_reinforcement.py` | Reinforced facts recall better | ~50 min |
-| `test5_privacy.py` | Extraction probes can't leak stored facts | ~5 min |
+| `test5_natural_recall.py` | Keyed vs natural recall gap | ~20 min |
 | `test6_footprint.py` | Adapter size/latency vs RAG footprint | ~10 min |
 | `test7_second_persona.py` | Two-persona generalization + cross-contamination | ~25 min |
 
