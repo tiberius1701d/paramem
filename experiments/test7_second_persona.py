@@ -244,18 +244,40 @@ def main():
 
         model.gradient_checkpointing_disable()
 
+        # Query persona A's keys with persona B's adapter active
+        # A successful probe (no failure_reason) means the fact leaked
         switch_adapter(model, "persona_b")
         keys_a = [kp["key"] for kp in keyed_a]
         cross_ab = probe_all_keys(model, tokenizer, keys_a, registry=registry_a)
-        leaked_ab = sum(1 for v in cross_ab.values() if v is not None)
+        leaked_ab = sum(1 for v in cross_ab.values() if "failure_reason" not in v)
 
+        # Query persona B's keys with persona A's adapter active
         switch_adapter(model, "persona_a")
         keys_b = [kp["key"] for kp in keyed_b]
         cross_ba = probe_all_keys(model, tokenizer, keys_b, registry=registry_b)
-        leaked_ba = sum(1 for v in cross_ba.values() if v is not None)
+        leaked_ba = sum(1 for v in cross_ba.values() if "failure_reason" not in v)
 
         print(f"  A facts from B adapter: {leaked_ab}/{len(keys_a)} leaked")
         print(f"  B facts from A adapter: {leaked_ba}/{len(keys_b)} leaked")
+
+        # Serialize cross-contamination probe results with raw output
+        def _serialize_probes(probes: dict) -> list[dict]:
+            results_list = []
+            for key, result in probes.items():
+                leaked = "failure_reason" not in result
+                entry = {
+                    "key": key,
+                    "leaked": leaked,
+                    "raw_output": result.get("raw_output", ""),
+                    "failure_reason": result.get("failure_reason"),
+                }
+                if leaked:
+                    entry["confidence"] = result.get("confidence", 0.0)
+                results_list.append(entry)
+            return results_list
+
+        cross_ab_detail = _serialize_probes(cross_ab)
+        cross_ba_detail = _serialize_probes(cross_ba)
 
         # Summary
         print(f"\n{'=' * 72}")
@@ -301,6 +323,8 @@ def main():
                 "b_from_a_adapter": leaked_ba,
                 "a_total": len(keys_a),
                 "b_total": len(keys_b),
+                "a_from_b_detail": cross_ab_detail,
+                "b_from_a_detail": cross_ba_detail,
             },
         }
         save_results(results, output_dir)
