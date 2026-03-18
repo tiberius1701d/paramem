@@ -6,7 +6,7 @@ Knowledge lives in LoRA adapter weights, not in files.
 
 ## The Idea
 
-Personal AI agents need persistent memory. Current approaches — RAG, text-based memory, conversation logs — are digital filing cabinets: they store and retrieve text, but the model itself learns nothing. Every session starts from scratch.
+Personal AI agents need persistent memory. Current approaches — RAG, text-based memory, conversation logs — store and retrieve text, but the model itself learns nothing. Every session starts from the same frozen weights.
 
 ParaMem takes a different approach inspired by biological memory consolidation. Session experiences are extracted into a knowledge graph, converted to QA training pairs, and compressed into LoRA adapter weights through replay-and-consolidation cycles. The model *learns* your facts — they become part of its parameters, not entries in a database.
 

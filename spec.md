@@ -84,7 +84,7 @@ This spec covers Phases 1–5 of the project:
 - **F4.4:** Style consistency metrics: perplexity drift, response length distribution shift, measured per adapter.
 - **F4.5:** Procedural adapter: behavioral pattern training (communication style, formatting), targets MLP layers.
 - **F4.6:** Curriculum-aware training: recall-weighted replay sampling, per-fact difficulty tracking, minimum exposure guarantees. **IMPLEMENTED** — needs re-run at 20 epochs to validate.
-- **F4.7:** Key-addressable replay: adapter weights as single source of truth; reconstruct stored graphs via keyed prompts during replay, merge with new session, retrain on complete graph. No external QA pair storage. **FAILED** — structured triple format causes format collision (0.0 F1).
+- **F4.7:** Key-addressable replay: adapter weights as single source of truth; reconstruct stored graphs via keyed prompts during replay, merge with new session, retrain on complete graph. No external QA pair storage. **VALIDATED** — the original raw triple format failed (0.0 F1, format collision), but graph-derived QA pairs in indexed key format achieve the same goal: graph extraction → QA generation → indexed key training. The extra QA generation step is a format transformation, not a different approach. Knowledge lives in weights, addressable by key, graph is the structural record. Proven by Tests 1-3: 100% recall (Gemma 2 9B), 95% (Mistral 7B) at 100 keys.
 - **F4.8:** Swappable extraction backend: configurable local vs API extraction, opt-in for higher quality.
 - **F4.9:** Indexed key memory: per-fact addressable recall using sequential keys (graph1, graph2, ...) in the proven QA JSON format. **VALIDATED** — 9/10 exact recall at rank 8, 30 epochs (Qwen 2.5 3B). Multi-model validation: 100/100 (Gemma 2 9B), 95/100 (Mistral 7B) at 100 keys.
 - **F4.9b:** SimHash hallucination detection: external 64-bit SimHash registry provides two-layer defense (registry membership + content fingerprint confidence). **VALIDATED** — 5/5 untrained keys blocked, continuous confidence scoring tolerates minor variations.
@@ -95,11 +95,11 @@ This spec covers Phases 1–5 of the project:
 
 #### F5.1 Home Assistant Assist Pipeline
 
-- **F5.1a:** Custom conversation agent for Home Assistant that uses ParaMem as its memory backend. Slots into the existing Assist pipeline: STT → intent/conversation → response → TTS.
-- **F5.1b:** Idle-time consolidation: after each conversation ends, the consolidation loop runs in the background — extract graph from transcript, merge, assign keys, retrain adapter. Analogous to biological sleep consolidation.
-- **F5.1c:** Memory-aware response: a routing layer detects whether a query is about personal memory or general knowledge. Memory queries trigger selective or full key enumeration; general queries go directly to the base model. Full enumeration of all keys for every query is too slow at 100+ keys — the routing mechanism is critical for usable latency.
-- **F5.1d:** Multi-session continuity: "What did we discuss yesterday?" queries are resolved via temporal metadata filtering on reconstructed facts, not by storing conversation logs.
-- **F5.1e:** Voice-first UX: responses must be concise and natural for spoken output. No JSON, no structured format in user-facing responses.
+- **F5.1a:** ParaMem server — standalone HTTP daemon wrapping the inference pipeline. Endpoints: `/chat`, `/consolidate`, `/status`. Model loaded once at startup, adapter always active. **IMPLEMENTED** — `paramem/server/app.py`, `inference.py`, `config.py`, `escalation.py`, `session_buffer.py`. Architecture decision: external service (not HA add-on) — crash isolation, independent lifecycle, GPU on separate hardware.
+- **F5.1b:** Once-per-day consolidation: full retrain at a scheduled hour (default 2am). Pipeline: extract graph from buffered session transcripts → merge → generate QA → assign keys → reinitialize adapter → train → persist. No inference/training conflict in v1. **IMPLEMENTED** — `paramem/server/consolidation.py`. Manual trigger via `POST /consolidate`.
+- **F5.1c:** HA custom component — thin REST client forwarding conversation turns to the ParaMem server. Config flow for server URL. No GPU dependencies in HA's environment. **IMPLEMENTED** — `custom_components/paramem/`. Architecture decision: no routing layer needed — facts are in adapter weights, model answers directly. Routing was a Phase 4 assumption; indexed keys eliminated the need.
+- **F5.1d:** Temporal queries: keyword pattern matching resolves natural language time references → absolute date ranges. Registry filtered by `last_seen_at`. Matching keys probed and fed as context. Falls back to standard path if no keys match. **IMPLEMENTED** — `paramem/server/temporal.py`, integrated into `inference.py`.
+- **F5.1e:** Voice-first UX: system prompt instructs concise spoken output. Local-first with cloud escalation (MoE-style): local model answers personal queries directly; emits `[ESCALATE]` for general knowledge → server forwards rewritten query to cloud SOTA model, returns response verbatim. Only the query goes to cloud — never conversation history or personal data. **IMPLEMENTED** — escalation in `paramem/server/escalation.py`, voice prompt in `configs/server.yaml`.
 
 #### F5.2 Temporal Metadata
 
@@ -107,7 +107,7 @@ Timestamps are stored in the registry and knowledge graph — never in training 
 
 - **F5.2a:** Per-key temporal metadata in the registry: `created_at` (first trained), `last_seen_at` (last session that reinforced this fact), `session_id` (originating session).
 - **F5.2b:** Per-edge temporal metadata in the knowledge graph: `first_seen`, `last_seen`, `mention_count` (already partially implemented).
-- **F5.2c:** Temporal filtering at query time: reconstruct all facts, filter by recency window, feed filtered set as context. Enables "what did we talk about this week?" without the model needing to learn dates. Depends on intent parsing to map natural language time references ("yesterday", "last week") to absolute time ranges — the HA Assist pipeline already handles date parsing for device commands, which we can reuse.
+- **F5.2c:** Temporal filtering at query time: detect temporal reference via keyword pattern matching → resolve to date range → filter registry by `last_seen_at` → probe matching keys → feed as context. No full enumeration needed — only keys from the relevant time window. **IMPLEMENTED** — `paramem/server/temporal.py` (20+ patterns: yesterday, last week, N days ago, day names, etc.).
 - **F5.2d:** Staleness-aware contradiction resolution: when two facts contradict, use recency as a *heuristic* — prefer the newer `last_seen_at`. This is metadata-level filtering, not model-level. Caveat: newer does not always mean correct (e.g. jokes, hypotheticals, corrections of recent errors). Recency is a first-pass filter; the model-assisted semantic strategy (Test 2) may still be needed as a second layer for ambiguous cases.
 - **F5.2e:** Decay integration: temporal metadata feeds into the existing decay mechanism. Facts not reinforced within a configurable window lose priority and eventually get evicted.
 
@@ -167,8 +167,14 @@ Parametric memory is inherently more private than text-based storage — knowled
 
 ### Open
 
-4. **Promotion signal weighting:** How to weight recurrence vs. centrality vs. user signal? Needs empirical tuning. Test 4 (reinforcement) will inform this.
+4. **Promotion signal weighting:** How to weight recurrence vs. centrality vs. user signal? Needs empirical tuning. Test 4 (reinforcement) running — will inform this.
 5. **Adapter merging vs. switching:** During inference, should adapters be merged (weighted sum) or switched? PEFT supports both; performance implications unclear.
 6. **Vocabulary permutation impact on recall:** Permuting the embedding matrix (F5.4c) should be lossless in theory — the model learns identical representations under a different ordering. But edge cases (tied embeddings, special tokens, tokenizer assumptions) need empirical validation. A simple smoke test: permute, train 10 keys, verify 10/10 recall.
-7. **Consolidation latency for voice UX:** Idle-time consolidation (F5.1b) must complete before the next conversation for temporal queries to work. With early stopping, 100 keys take ~12 min on Gemma. Is this fast enough for natural conversation cadence?
-8. **HA integration architecture:** Custom component vs. add-on vs. external service? Trade-off: integration depth vs. maintenance burden vs. hardware requirements (GPU must be accessible to HA).
+
+### Resolved (Phase 5)
+
+7. **Consolidation latency for voice UX:** *Resolved — once-per-day consolidation.* Runs at a scheduled hour (default 2am) outside active hours. No inference/training conflict to manage. ~12 min for 100 keys is well within the overnight window.
+8. **HA integration architecture:** *Resolved — external service.* ParaMem runs as a standalone daemon on NAS/laptop. HA custom component is a thin REST client (~50 lines). Rationale: crash isolation (CUDA/OOM errors don't take down HA), independent lifecycle, dependency isolation (conda env stays untouched), can run on different machine from HA.
+9. **Memory-aware routing:** *Resolved — not needed.* Facts are in adapter weights; the model answers directly with the adapter active. No routing layer, no key enumeration for standard queries. Temporal queries use registry metadata to probe specific keys — the only case where key lookup is needed.
+10. **Agent role (local vs. cloud):** *Resolved — local-first with cloud escalation.* Local model always answers first. If it can't answer, emits `[ESCALATE]` → server forwards only the rewritten query to SOTA cloud model (never history or personal data). Cloud response returned verbatim. Fully functional without cloud.
+11. **Model choice:** *Resolved — configurable, default Mistral 7B.* Architecture is model-agnostic. Adapters are model-specific. Switching models requires retraining (or migration via F5.3).

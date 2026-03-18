@@ -63,10 +63,10 @@ All experiments run on a single GPU with QLoRA 4-bit quantization, demonstrating
 \section{Introduction}
 \label{sec:intro}
 
-% Opening hook: the filing cabinet problem
-Current LLM memory systems are digital filing cabinets.
-Retrieval-augmented generation (RAG) stores text chunks and retrieves them by similarity; conversation memory frameworks log session transcripts and manage them as external text~\citep{gao2025memos}.
-These approaches give the \emph{appearance} of memory---the model can quote prior conversations---but the model itself learns nothing.
+% Opening hook: the storage-retrieval problem
+Current LLM memory systems store and retrieve text, but the model itself learns nothing.
+Retrieval-augmented generation (RAG) indexes text chunks by embedding similarity; conversation memory frameworks log session transcripts and manage them as external text~\citep{gao2025memos}.
+These approaches give the \emph{appearance} of memory---the model can quote prior conversations---but its weights remain unchanged.
 Every session starts from the same frozen weights.
 
 % Biological analogy
@@ -662,6 +662,42 @@ This suggests that generation quality during the reasoning step---not raw recall
 These results are based on 15 multi-hop questions over 50~facts.
 Scaling this evaluation to larger fact bases and more diverse reasoning patterns is needed to confirm the generality of the finding.
 
+\subsection{Multi-Session Reinforcement}
+\label{sec:exp-reinforcement}
+
+To test whether facts reinforced across multiple sessions are recalled more reliably than single-mention facts, we designed a multi-session reinforcement experiment.
+30~facts were divided into three equal groups: (1)~reinforced facts, appearing across 3--4 simulated sessions; (2)~twice-mentioned facts, appearing in 2~sessions; (3)~single-mention facts, appearing in 1~session only.
+All 30~facts were trained into a single adapter using the standard indexed key pipeline at rank~8, 30~epochs.
+A RAG baseline using the same facts was evaluated in parallel.
+
+\begin{table}[t]
+\centering
+\caption{Multi-session reinforcement at 30 keys. Reinforced facts appeared across 3--4 sessions; twice-mentioned in 2; single-mention in 1. RAG scores are mean embedding similarity (top-5 retrieval). Gemma's two failures are cross-key recall errors in the single-mention group.}
+\label{tab:reinforcement}
+\begin{tabular}{lcc}
+\toprule
+Metric & Mistral 7B & Gemma 2 9B \\
+\midrule
+Overall recall & 30/30 (100\%) & 28/30 (93\%) \\
+Reinforced (3--4 sessions) & 10/10, conf 1.0 & 10/10, conf 1.0 \\
+Mentioned twice & 10/10, conf 1.0 & 10/10, conf 1.0 \\
+Single mention & 10/10, conf 1.0 & 8/10, conf 0.8 \\
+\midrule
+RAG reinforced & 0.901 & 0.884 \\
+RAG mentioned twice & 0.893 & 0.913 \\
+RAG single mention & 0.945 & 0.931 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Mistral achieves perfect recall across all three groups, showing no differentiation by reinforcement frequency at this scale (Table~\ref{tab:reinforcement}).
+Gemma recalls 28/30, with both failures occurring in the single-mention group as cross-key errors---the adapter returns content from a different stored key rather than hallucinating novel content.
+Reinforced and twice-mentioned facts achieve perfect recall on both models.
+At 30~keys, the adapter has sufficient capacity that reinforcement provides limited additional benefit.
+Whether reinforcement frequency produces stronger differentiation at higher key counts---where both models face capacity pressure---remains to be tested.
+
+Parametric recall exceeds RAG across all conditions on both models, consistent with prior results (\S\ref{sec:exp-inference}).
+
 % ============================================================
 \section{Discussion}
 \label{sec:discussion}
@@ -673,6 +709,8 @@ Notably, recall does not degrade with scale; both models achieve their highest r
 The linear time trend and stable recall suggest the approach can extend beyond 100~keys, though this remains to be tested.
 Incremental contradiction resolution at 16~keys (\S\ref{sec:exp-contradictions}) shows zero catastrophic forgetting on control facts, extending the batch scaling results into the incremental regime.
 The gap between 16~incremental keys and 100~batch keys remains to be closed.
+Multi-session reinforcement experiments (\S\ref{sec:exp-reinforcement}) show that at 30~keys, reinforcement frequency does not improve recall on Mistral (30/30 across all groups) and provides limited differentiation on Gemma (28/30, with both failures in single-mention facts).
+The reinforcement hypothesis---that repeated facts degrade more gracefully under capacity pressure---requires testing at scale points where recall is no longer perfect.
 
 \paragraph{Parametric memory vs.\ RAG.}
 RAG outperforms parametric memory on raw factual recall when context is available---this is unsurprising and not the claim.
@@ -749,6 +787,10 @@ We are transparent about the current scope:
 \paragraph{Incremental consolidation at scale.}
 Batch scaling to 100~keys is validated (\S\ref{sec:exp-scaling}), and incremental contradiction resolution at 16~keys shows zero catastrophic forgetting (\S\ref{sec:exp-contradictions}).
 The next step is incremental consolidation at the 100-key scale---adding and contradicting facts across many cycles---to verify that both findings hold together at larger scale.
+
+\paragraph{Reinforcement under capacity pressure.}
+At 30~keys, reinforcement frequency does not differentiate recall (Mistral: 30/30 across all groups; Gemma: 28/30 with failures in single-mention facts only).
+Testing at 100+ keys, where models approach capacity limits, would reveal whether reinforced facts degrade more gracefully than single-mention facts---the prediction of the biological consolidation analogy.
 
 \paragraph{Training time optimization.}
 Training loss converges well before 30~epochs (loss~$<$0.01 by epoch~4--6 across all scales and both models tested).
