@@ -20,6 +20,7 @@ from paramem.models.loader import load_adapter, load_base_model, unload_model
 from paramem.server.config import load_server_config
 from paramem.server.consolidation import run_consolidation
 from paramem.server.inference import ChatResult, handle_chat
+from paramem.server.router import QueryRouter
 from paramem.server.session_buffer import SessionBuffer
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ _state = {
     "tokenizer": None,
     "config": None,
     "session_buffer": None,
+    "router": None,
     "consolidating": False,
     "last_consolidation": None,
     "scheduler_task": None,
@@ -74,18 +76,30 @@ async def lifespan(app: FastAPI):
     logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
     model, tokenizer = load_base_model(config.model_config)
 
-    # Load adapter if it exists on disk
-    adapter_path = config.adapter_dir / "episodic"
-    if adapter_path.exists():
-        logger.info("Loading adapter from: %s", adapter_path)
-        model = load_adapter(model, str(config.adapter_dir), "episodic")
-        logger.info("Adapter loaded")
+    # Load enabled adapters that exist on disk
+    for adapter_name, adapter_cfg in (
+        ("episodic", config.adapters.episodic),
+        ("semantic", config.adapters.semantic),
+        ("procedural", config.adapters.procedural),
+    ):
+        if not adapter_cfg.enabled:
+            continue
+        adapter_path = config.adapter_dir / adapter_name
+        if adapter_path.exists():
+            logger.info("Loading adapter: %s from %s", adapter_name, adapter_path)
+            model = load_adapter(model, str(config.adapter_dir), adapter_name)
+    if hasattr(model, "peft_config") and model.peft_config:
+        logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
     else:
-        logger.info("No adapter found at %s — starting fresh", adapter_path)
+        logger.info("No adapters found — starting fresh")
 
     _state["model"] = model
     _state["tokenizer"] = tokenizer
     _state["session_buffer"] = SessionBuffer(config.session_dir)
+    _state["router"] = QueryRouter(
+        adapter_dir=config.adapter_dir,
+        graph_path=config.graph_path,
+    )
 
     # Start consolidation scheduler if configured
     if config.consolidation.schedule:
@@ -125,6 +139,7 @@ async def chat(request: ChatRequest):
             model=_state["model"],
             tokenizer=_state["tokenizer"],
             config=_state["config"],
+            router=_state["router"],
         ),
     )
 
@@ -190,6 +205,7 @@ def _run_consolidation_sync():
             session_buffer=_state["session_buffer"],
         )
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+        _state["router"].reload()
         logger.info("Consolidation result: %s", result)
     except Exception:
         logger.exception("Consolidation failed")

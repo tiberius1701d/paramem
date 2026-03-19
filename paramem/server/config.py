@@ -67,11 +67,33 @@ class ConsolidationScheduleConfig:
 
 
 @dataclass
-class ServerTrainingConfig:
-    epochs: int = 30
+class ServerAdapterConfig:
+    enabled: bool = True
     rank: int = 8
     alpha: int = 16
     learning_rate: float = 1e-4
+
+
+@dataclass
+class ServerAdaptersConfig:
+    episodic: ServerAdapterConfig = field(
+        default_factory=ServerAdapterConfig
+    )
+    semantic: ServerAdapterConfig = field(
+        default_factory=lambda: ServerAdapterConfig(
+            enabled=False, rank=24, alpha=48, learning_rate=1e-5
+        )
+    )
+    procedural: ServerAdapterConfig = field(
+        default_factory=lambda: ServerAdapterConfig(
+            enabled=False, rank=12, alpha=24, learning_rate=5e-5
+        )
+    )
+
+
+@dataclass
+class ServerTrainingConfig:
+    epochs: int = 30
 
 
 @dataclass
@@ -82,8 +104,15 @@ class ServerConfig:
     registry_path: Path = Path("data/ha/registry.json")
     graph_path: Path = Path("data/ha/graph.json")
     session_dir: Path = Path("data/ha/sessions")
-    training: ServerTrainingConfig = field(default_factory=ServerTrainingConfig)
-    consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
+    adapters: ServerAdaptersConfig = field(
+        default_factory=ServerAdaptersConfig
+    )
+    training: ServerTrainingConfig = field(
+        default_factory=ServerTrainingConfig
+    )
+    consolidation: ConsolidationScheduleConfig = field(
+        default_factory=ConsolidationScheduleConfig
+    )
     cloud: CloudConfig = field(default_factory=CloudConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
 
@@ -97,15 +126,40 @@ class ServerConfig:
 
     @property
     def adapter_config(self) -> AdapterConfig:
+        """Episodic adapter config (primary, used by simple consolidation)."""
+        ac = self.adapters.episodic
         return AdapterConfig(
-            rank=self.training.rank,
-            alpha=self.training.alpha,
-            learning_rate=self.training.learning_rate,
+            rank=ac.rank,
+            alpha=ac.alpha,
+            learning_rate=ac.learning_rate,
+        )
+
+    @property
+    def semantic_adapter_config(self) -> AdapterConfig:
+        """Semantic adapter config (used by full consolidation loop)."""
+        ac = self.adapters.semantic
+        return AdapterConfig(
+            rank=ac.rank,
+            alpha=ac.alpha,
+            learning_rate=ac.learning_rate,
+        )
+
+    @property
+    def procedural_adapter_config(self) -> AdapterConfig:
+        """Procedural adapter config (future — behavioral patterns)."""
+        ac = self.adapters.procedural
+        return AdapterConfig(
+            rank=ac.rank,
+            alpha=ac.alpha,
+            learning_rate=ac.learning_rate,
         )
 
     @property
     def training_config(self) -> TrainingConfig:
-        return TrainingConfig(num_epochs=self.training.epochs)
+        return TrainingConfig(
+            num_epochs=self.training.epochs,
+            gradient_accumulation_steps=2,
+        )
 
 
 def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig:
@@ -124,6 +178,20 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     config.registry_path = Path(raw.get("registry_path", config.registry_path))
     config.graph_path = Path(raw.get("graph_path", config.graph_path))
     config.session_dir = Path(raw.get("session_dir", config.session_dir))
+    adapters_raw = raw.get("adapters", {})
+    if adapters_raw:
+        ep = adapters_raw.get("episodic", {})
+        sem = adapters_raw.get("semantic", {})
+        proc = adapters_raw.get("procedural", {})
+        config.adapters = ServerAdaptersConfig(
+            episodic=ServerAdapterConfig(**ep) if ep else ServerAdapterConfig(),
+            semantic=ServerAdapterConfig(**sem) if sem else ServerAdapterConfig(
+                rank=24, alpha=48, learning_rate=1e-5
+            ),
+            procedural=ServerAdapterConfig(**proc) if proc else ServerAdapterConfig(
+                rank=12, alpha=24, learning_rate=5e-5
+            ),
+        )
     config.training = ServerTrainingConfig(**raw.get("training", {}))
     config.consolidation = ConsolidationScheduleConfig(**raw.get("consolidation", {}))
     config.cloud = CloudConfig(**raw.get("cloud", {}))

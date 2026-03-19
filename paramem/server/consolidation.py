@@ -71,7 +71,9 @@ def run_consolidation(
         logger.info("Extracting graph from session: %s", session_id)
         model.gradient_checkpointing_disable()
 
-        session_graph = extract_graph(model, tokenizer, transcript, session_id)
+        session_graph = extract_graph(
+            model, tokenizer, transcript, session_id, temperature=0.0
+        )
 
         if not session_graph.relations:
             logger.warning("No relations extracted from session %s", session_id)
@@ -117,8 +119,10 @@ def run_consolidation(
     training_examples = format_indexed_training(keyed_pairs, tokenizer)
 
     adapter_name = "episodic"
-    if hasattr(model, "peft_config") and adapter_name in model.peft_config:
-        model.delete_adapter(adapter_name)
+    from peft import PeftModel as _PeftModel
+
+    if isinstance(model, _PeftModel):
+        model = model.base_model.model
 
     model = create_adapter(model, config.adapter_config, adapter_name)
 
@@ -133,8 +137,21 @@ def run_consolidation(
         output_dir=config.adapter_dir / "checkpoints",
     )
 
-    # Phase 4: Persist adapter, registry, graph
+    # Phase 4: Persist adapter, registry, graph, keyed_pairs
     save_adapter(model, config.adapter_dir, adapter_name)
+
+    kp_path = config.adapter_dir / "keyed_pairs.json"
+    with open(kp_path, "w") as f:
+        json.dump(
+            [
+                {k: v for k, v in kp.items() if k in (
+                    "key", "question", "answer",
+                    "source_predicate", "source_subject", "source_object",
+                )}
+                for kp in keyed_pairs
+            ],
+            f, indent=2,
+        )
 
     registry = build_enriched_registry(
         keyed_pairs,

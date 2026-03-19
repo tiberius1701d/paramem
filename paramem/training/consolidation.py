@@ -85,10 +85,11 @@ class ConsolidationLoop:
         training_config: TrainingConfig,
         episodic_adapter_config: AdapterConfig,
         semantic_adapter_config: AdapterConfig,
+        procedural_adapter_config: Optional[AdapterConfig] = None,
         wandb_config: Optional[WandbConfig] = None,
         output_dir: str | Path = "outputs/phase3",
         graph_path: Optional[str | Path] = None,
-        extraction_temperature: float = 0.3,
+        extraction_temperature: float = 0.0,
         distillation_config=None,
     ):
         self.model = model
@@ -97,6 +98,7 @@ class ConsolidationLoop:
         self.training_config = training_config
         self.episodic_config = episodic_adapter_config
         self.semantic_config = semantic_adapter_config
+        self.procedural_config = procedural_adapter_config
         self.wandb_config = wandb_config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -121,6 +123,9 @@ class ConsolidationLoop:
         # Load existing graph if present
         if self.graph_path.exists():
             self.merger.load_graph(self.graph_path)
+
+        # Ensure both adapters exist on the model
+        self.model = self._ensure_adapters()
 
         # Replay pools: track QA pairs available for replay per adapter
         # Each entry: {"question": str, "answer": str}
@@ -200,16 +205,25 @@ class ConsolidationLoop:
         else:
             # Disable adapters for extraction (use base model reasoning)
             self._disable_gradient_checkpointing()
-            self.model.disable_adapter_layers()
+            from peft import PeftModel as _PeftModel
 
-            session_graph = extract_graph(
-                self.model,
-                self.tokenizer,
-                session_transcript,
-                session_id,
-                temperature=self.extraction_temperature,
-            )
-            self.model.enable_adapter_layers()
+            if isinstance(self.model, _PeftModel):
+                with self.model.disable_adapter():
+                    session_graph = extract_graph(
+                        self.model,
+                        self.tokenizer,
+                        session_transcript,
+                        session_id,
+                        temperature=self.extraction_temperature,
+                    )
+            else:
+                session_graph = extract_graph(
+                    self.model,
+                    self.tokenizer,
+                    session_transcript,
+                    session_id,
+                    temperature=self.extraction_temperature,
+                )
 
         result.entities_extracted = len(session_graph.entities)
         result.relations_extracted = len(session_graph.relations)
@@ -725,7 +739,7 @@ class ConsolidationLoop:
                 self.model,
                 self.tokenizer,
                 prompt,
-                temperature=0.3,
+                temperature=0.0,
             )
 
             # Quality gate
@@ -807,6 +821,38 @@ class ConsolidationLoop:
             self.indexed_key_registry.save(self.output_dir / "indexed_key_registry.json")
             save_registry(self.episodic_simhash, self.output_dir / "simhash_registry_episodic.json")
             save_registry(self.semantic_simhash, self.output_dir / "simhash_registry_semantic.json")
+
+    def _ensure_adapters(self):
+        """Create adapters that don't exist yet.
+
+        Episodic is always created. Semantic is created if promotion
+        is enabled. Procedural is created if its config was provided.
+        """
+        from paramem.models.loader import create_adapter
+
+        has_peft = hasattr(self.model, "peft_config")
+        if not has_peft or "episodic" not in self.model.peft_config:
+            logger.info("Creating episodic adapter")
+            self.model = create_adapter(
+                self.model, self.episodic_config, "episodic"
+            )
+        if (
+            self.config.promotion_threshold > 0
+            and "semantic" not in self.model.peft_config
+        ):
+            logger.info("Creating semantic adapter")
+            self.model = create_adapter(
+                self.model, self.semantic_config, "semantic"
+            )
+        if (
+            self.procedural_config is not None
+            and "procedural" not in self.model.peft_config
+        ):
+            logger.info("Creating procedural adapter")
+            self.model = create_adapter(
+                self.model, self.procedural_config, "procedural"
+            )
+        return self.model
 
     def _disable_gradient_checkpointing(self) -> None:
         """Disable gradient checkpointing for generation."""

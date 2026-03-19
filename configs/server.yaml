@@ -9,11 +9,25 @@ registry_path: data/ha/registry.json
 graph_path: data/ha/graph.json
 session_dir: data/ha/sessions
 
+adapters:
+  episodic:
+    enabled: true
+    rank: 8
+    alpha: 16
+    learning_rate: 1.0e-4
+  semantic:
+    enabled: false      # enable for knowledge promotion (consolidation loop)
+    rank: 24
+    alpha: 48
+    learning_rate: 1.0e-5
+  procedural:
+    enabled: false      # future — behavioral patterns, routines, preferences
+    rank: 12
+    alpha: 24
+    learning_rate: 5.0e-5
+
 training:
   epochs: 30
-  rank: 8
-  alpha: 16
-  learning_rate: 1.0e-4
 
 consolidation:
   schedule: "02:00"  # daily at this hour (empty string = manual only)
