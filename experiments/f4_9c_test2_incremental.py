@@ -99,7 +99,6 @@ def evaluate_keys(model, tokenizer, keyed_pairs, registry, label):
             formatted,
             max_new_tokens=256,
             temperature=0.1,
-            repetition_penalty=1.3,
         )
         recalled = parse_recalled_pair(raw)
         result = validate_recall(recalled, kp, registry)

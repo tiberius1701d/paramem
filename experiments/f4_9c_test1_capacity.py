@@ -105,7 +105,6 @@ def evaluate_trained_keys(model, tokenizer, keyed_pairs, registry):
             formatted,
             max_new_tokens=256,
             temperature=0.1,
-            repetition_penalty=1.3,
         )
         recalled = parse_recalled_pair(raw)
         result = validate_recall(recalled, kp, registry)
@@ -136,7 +135,6 @@ def evaluate_untrained_keys(model, tokenizer, untrained_keys, registry):
             formatted,
             max_new_tokens=256,
             temperature=0.1,
-            repetition_penalty=1.3,
         )
         recalled = parse_recalled_pair(raw)
 

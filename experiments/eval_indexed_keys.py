@@ -99,7 +99,6 @@ def main():
             formatted,
             max_new_tokens=256,
             temperature=0.1,
-            repetition_penalty=1.3,
         )
         recalled = parse_recalled_pair(raw)
         result = validate_recall(recalled, kp, registry)
@@ -133,7 +132,6 @@ def main():
             formatted,
             max_new_tokens=256,
             temperature=0.1,
-            repetition_penalty=1.3,
         )
         recalled = parse_recalled_pair(raw)
         returned_key = recalled.get("key") if recalled else None
@@ -170,7 +168,6 @@ def main():
             tokenizer,
             prompt,
             temperature=0.1,
-            repetition_penalty=1.3,
         )
         score = compute_similarity(qa["answer"], generated)
         match = "OK" if score > 0.7 else "MISS"

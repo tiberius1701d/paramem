@@ -82,7 +82,7 @@ def detect_contradiction_with_model(
         tokenizer,
         formatted,
         max_new_tokens=64,
-        temperature=0.1,
+        temperature=0.0,
     )
 
     output = output.strip()

@@ -484,7 +484,6 @@ def main():
                 max_new_tokens=max_tokens,
                 temperature=0.2,
                 do_sample=True,
-                repetition_penalty=1.3,
                 eos_token_id=stop_ids,
             )
         gen_time = time.time() - start

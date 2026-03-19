@@ -218,7 +218,6 @@ def main():
             formatted,
             max_new_tokens=256,
             temperature=0.1,
-            repetition_penalty=1.3,
         )
         raw_parsed = parse_recalled_pair(raw)
 

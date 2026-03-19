@@ -120,6 +120,7 @@ def train_adapter(
         gradient_checkpointing=training_config.gradient_checkpointing,
         logging_steps=1,
         save_strategy="epoch",
+        save_total_limit=2,
         report_to=report_to,
         run_name=run_name or f"paramem-{adapter_name}",
         seed=training_config.seed,

@@ -59,7 +59,7 @@ class CurriculumSampler:
         scores = {}
         for item in pool_to_probe:
             prompt = _format_inference_prompt(item["question"], tokenizer)
-            generated = generate_answer(model, tokenizer, prompt, temperature=0.1)
+            generated = generate_answer(model, tokenizer, prompt, temperature=0.0)
             score = compute_similarity(item["answer"], generated)
             scores[item["question"]] = score
 

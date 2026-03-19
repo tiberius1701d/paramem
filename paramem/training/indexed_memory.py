@@ -442,7 +442,7 @@ def probe_key(
     model,
     tokenizer,
     key: str,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 200,
     registry: dict[str, int] | None = None,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> dict | None:
@@ -467,8 +467,7 @@ def probe_key(
         tokenizer,
         formatted,
         max_new_tokens=max_new_tokens,
-        temperature=0.1,
-        repetition_penalty=1.3,
+        temperature=0.0,
     )
 
     recalled = parse_recalled_pair(raw)
@@ -501,7 +500,7 @@ def probe_all_keys(
     model,
     tokenizer,
     keys: list[str],
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 200,
     registry: dict[str, int] | None = None,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> dict[str, dict | None]:

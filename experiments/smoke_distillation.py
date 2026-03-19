@@ -50,7 +50,6 @@ MODEL_CONFIGS = {
         max_memory_cpu="20GiB",
         temperature=0.2,
         max_new_tokens=1024,
-        repetition_penalty=1.3,
     ),
     "mistral": DistillationConfig(
         enabled=True,
@@ -60,7 +59,6 @@ MODEL_CONFIGS = {
         cpu_offload=False,
         temperature=0.2,
         max_new_tokens=1024,
-        repetition_penalty=1.3,
     ),
 }
 

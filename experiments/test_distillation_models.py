@@ -199,7 +199,6 @@ def generate(model, tokenizer, prompt, max_new_tokens=1024, temperature=0.3):
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         do_sample=True,
-        repetition_penalty=1.3,
         eos_token_id=stop_ids,
     )
     return tokenizer.decode(
