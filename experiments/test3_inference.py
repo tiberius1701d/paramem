@@ -1,17 +1,19 @@
-"""Test 3: Associative Inference — recall then reason over parametric memory.
+"""Test 3: Reasoning Quality Parity with RAG.
 
 Trains base facts from PerLTQA dialogues as indexed keys, then generates
-inference questions from the knowledge graph (entity pairs connected by 2+ hops).
-The LLM itself generates the inference questions.
+inference questions requiring 2+ facts. Compares PM and RAG end-to-end
+as they would run in production:
 
-Three evaluation conditions:
-  (a) Parametric recall + reason: enumerate all keys → reconstruct facts →
-      feed as context → ask inference question
-  (b) Direct parametric (no reconstruction): ask with adapter active, no context
-  (c) RAG baseline: retrieve relevant facts by similarity → answer
+  PM:  adapter-tuned model (always active) reconstructs facts from weights,
+       then reasons over them with those facts as context.
+  RAG: base model (adapter disabled) loads all facts from external store,
+       then reasons over them with those facts as context.
 
-The comparison between (a) and (c) tests whether exhaustive recall from
-parametric memory can match or exceed selective retrieval for reasoning tasks.
+Additionally, an adapter-only diagnostic runs the adapter-tuned model
+directly on inference questions without explicit retrieval — showing
+what the adapter learned beyond key-addressable recall.
+
+Per-phase latency is measured for both PM and RAG pipelines.
 
 Usage:
     python experiments/test3_inference.py --model gemma
@@ -23,6 +25,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent
@@ -54,6 +57,14 @@ OUTPUT_DIR = project_root / "outputs" / "test3_inference"
 CHARACTER = "Liang Xin"
 MAX_SESSIONS = 30
 TARGET_QA = 50  # Train on ~50 facts, enough for a rich knowledge graph
+
+# Shared system prompt for all context-based conditions (PM and RAG).
+# Single source of truth — ensures prompt fairness across conditions.
+CONTEXT_SYSTEM_PROMPT = (
+    "You are a personal assistant with memory of your user's life. "
+    "Answer questions about the user based on the context provided. "
+    "Be concise."
+)
 NUM_INFERENCE_QUESTIONS = 15
 
 # Prompt for the LLM to generate inference questions from fact pairs
@@ -125,8 +136,7 @@ def generate_inference_questions(
                 tokenizer,
                 formatted,
                 max_new_tokens=2048,
-                temperature=0.3,
-                repetition_penalty=1.1,
+                temperature=0.0,
             )
     else:
         raw = generate_answer(
@@ -134,8 +144,7 @@ def generate_inference_questions(
             tokenizer,
             formatted,
             max_new_tokens=2048,
-            temperature=0.3,
-            repetition_penalty=1.1,
+            temperature=0.0,
         )
 
     # Parse JSON from output
@@ -156,12 +165,12 @@ def _parse_inference_json(raw: str) -> list[dict]:
     if start == -1:
         return []
 
-    for end in range(len(raw) - 1, start, -1):
+    # Progressive forward extraction: find first [, try each ]
+    for end in range(start + 1, len(raw)):
         if raw[end] == "]":
             try:
                 data = json.loads(raw[start : end + 1])
                 if isinstance(data, list) and len(data) > 0:
-                    # Validate structure
                     valid = []
                     for item in data:
                         if "question" in item and "expected_answer" in item:
@@ -172,7 +181,8 @@ def _parse_inference_json(raw: str) -> list[dict]:
                                     "source_facts": item.get("source_facts", []),
                                 }
                             )
-                    return valid
+                    if valid:
+                        return valid
             except json.JSONDecodeError:
                 continue
 
@@ -231,22 +241,16 @@ def format_recall_reason_prompt(
     """
     from paramem.models.loader import adapt_messages
 
-    facts_block = "\n".join(f"- {f['question']} {f['answer']}" for f in reconstructed_facts)
-
-    user_content = (
-        f"Here is everything I know from memory:\n\n"
-        f"{facts_block}\n\n"
-        f"Based on these facts, answer the following question:\n{question}"
+    facts_block = "\n".join(
+        f"Q: {f['question']}\nA: {f['answer']}"
+        for f in reconstructed_facts
     )
+
+    user_content = f"Context:\n{facts_block}\n\nQuestion: {question}"
 
     messages = adapt_messages(
         [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant. Answer based on the provided facts. Be concise."
-                ),
-            },
+            {"role": "system", "content": CONTEXT_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
         tokenizer,
@@ -258,52 +262,112 @@ def evaluate_condition(
     label: str,
     model,
     tokenizer,
-    inference_questions: list[dict],
+    questions: list[dict],
     prompt_fn,
+    context_time: float = 0.0,
 ) -> dict:
-    """Evaluate a set of inference questions under a given condition.
+    """Evaluate questions under a given condition with per-step latency.
+
+    Latency is measured as the user experiences it: from receiving the
+    question to having the full response. This includes:
+    - Context acquisition (one-time cost, amortized per query) — passed
+      as pre-measured context_time
+    - Per-query pipeline (prompt construction incl. any per-query
+      retrieval + model generation) — timed here
 
     Args:
         label: Condition name for logging.
         prompt_fn: Callable(question_str) -> formatted_prompt_str.
-
-    Returns dict with mean_similarity, ok_count, total, per_question.
+            For conditions with per-query retrieval (RAG top-5), the
+            retrieval happens inside prompt_fn and is included in the
+            per-query timer.
+        context_time: Pre-measured one-time context acquisition cost
+            in seconds (e.g. time to reconstruct all facts from adapter,
+            or to build a RAG index). Amortized across questions.
     """
+
+    # Step 2: Per-question: prompt construction + generation
     results = []
-    for iq in inference_questions:
-        prompt = prompt_fn(iq["question"])
+    total_query_time = 0.0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    for iq in questions:
+        q = iq["question"]
+
+        # Full per-query pipeline: prompt_fn may include retrieval (RAG)
+        # or just formatting (PM, adapter-only)
+        t0 = time.time()
+        prompt = prompt_fn(q)
         generated = generate_answer(
             model,
             tokenizer,
             prompt,
             max_new_tokens=200,
-            temperature=0.1,
-            repetition_penalty=1.3,
+            temperature=0.0,
         )
+        query_time = time.time() - t0
+        total_query_time += query_time
+
+        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+        n_input = input_ids.shape[1]
+        n_output = len(
+            tokenizer.encode(generated, add_special_tokens=False)
+        )
+        total_input_tokens += n_input
+        total_output_tokens += n_output
         similarity = compute_similarity(iq["expected_answer"], generated)
 
         results.append(
             {
-                "question": iq["question"],
+                "question": q,
                 "expected": iq["expected_answer"],
                 "generated": generated,
                 "similarity": similarity,
+                "query_seconds": round(query_time, 3),
+                "input_tokens": n_input,
+                "output_tokens": n_output,
                 "source_facts": iq.get("source_facts", []),
             }
         )
 
-        status = "OK" if similarity > 0.5 else "WEAK" if similarity > 0.3 else "MISS"
-        print(f"  [{status}] {iq['question'][:70]}")
+        status = (
+            "OK" if similarity > 0.5
+            else "WEAK" if similarity > 0.3
+            else "MISS"
+        )
+        print(f"  [{status}] {q[:70]}")
         print(f"       Score: {similarity:.3f}")
 
-    mean_sim = sum(r["similarity"] for r in results) / len(results) if results else 0.0
+    n = len(results) or 1
+    mean_sim = sum(r["similarity"] for r in results) / n
     ok_count = sum(1 for r in results if r["similarity"] > 0.5)
+    mean_query = total_query_time / n
+    amortized_context = context_time / n
+    mean_total = amortized_context + mean_query
+    mean_input = total_input_tokens / n
+    mean_output = total_output_tokens / n
 
-    print(f"  {label}: {ok_count}/{len(results)} OK (>0.5), mean={mean_sim:.3f}")
+    print(
+        f"  {label}: {ok_count}/{len(results)} OK (>0.5), "
+        f"sim={mean_sim:.3f}, "
+        f"context={context_time:.1f}s total "
+        f"({amortized_context:.2f}s/q), "
+        f"query={mean_query:.2f}s/q, "
+        f"end-to-end={mean_total:.2f}s/q, "
+        f"tokens={mean_input:.0f}in/{mean_output:.0f}out"
+    )
     return {
         "mean_similarity": mean_sim,
         "ok_count": ok_count,
         "total": len(results),
+        "latency": {
+            "context_total_seconds": round(context_time, 3),
+            "context_per_query_seconds": round(amortized_context, 3),
+            "query_seconds": round(mean_query, 3),
+            "end_to_end_per_query_seconds": round(mean_total, 3),
+        },
+        "mean_input_tokens": round(mean_input),
+        "mean_output_tokens": round(mean_output),
         "per_question": results,
     }
 
@@ -370,6 +434,19 @@ def main():
         )
         print(f"  Training: {train_time:.0f}s, loss={metrics.get('train_loss', -1):.4f}")
 
+        # Phase save: training complete
+        partial = {
+            "experiment": "test3_inference",
+            "model": bench_name,
+            "model_id": bench_model_config.model_id,
+            "character": CHARACTER,
+            "qa_pairs_trained": len(qa_pairs),
+            "training_time_seconds": train_time,
+            "training_loss": metrics.get("train_loss"),
+            "note": "Partial — training complete, evaluation pending",
+        }
+        save_results(partial, output_dir)
+
         # Phase 3: Verify base fact recall (sanity check)
         print("\n--- Phase 3: Base fact recall (sanity check) ---")
         recall_result = evaluate_indexed_recall(
@@ -378,17 +455,37 @@ def main():
         print(f"  Base facts: {recall_result['exact_count']}/{recall_result['total']} exact recall")
 
         # Phase 4: Reconstruct all facts from parametric memory
+        # Timed — this is the context acquisition cost for condition (a)
         print("\n--- Phase 4: Reconstructing all facts from memory ---")
+        t_recon_start = time.time()
         reconstructed = reconstruct_all_facts(
             model, tokenizer, keyed_pairs, registry, adapter_name="episodic"
         )
-        print(f"  Reconstructed {len(reconstructed)}/{len(keyed_pairs)} facts")
+        reconstruction_time = time.time() - t_recon_start
+        print(f"  Reconstructed {len(reconstructed)}/{len(keyed_pairs)} facts "
+              f"in {reconstruction_time:.1f}s")
+
+        # Measure reconstruction quality against originals
+        recon_sims = []
+        kp_by_key = {kp["key"]: kp for kp in keyed_pairs}
+        for r in reconstructed:
+            orig = kp_by_key.get(r["key"])
+            if orig:
+                sim = compute_similarity(orig["answer"], r["answer"])
+                recon_sims.append(sim)
+        mean_recon_sim = (
+            sum(recon_sims) / len(recon_sims) if recon_sims else 0.0
+        )
+        print(f"  Reconstruction quality: mean similarity {mean_recon_sim:.3f} "
+              f"({sum(1 for s in recon_sims if s >= 0.75)}/{len(recon_sims)} "
+              f"above 0.75)")
 
         # Phase 5: Generate inference questions using the LLM
         print(f"\n--- Phase 5: Generating {args.num_inference} inference questions ---")
-        # Use reconstructed facts so the questions are about what the model actually knows
+        # Generate from original qa_pairs (not reconstructed) to avoid bias
+        # toward PM Recall+Reason's reconstructed vocabulary
         inference_questions = generate_inference_questions(
-            model, tokenizer, reconstructed, count=args.num_inference
+            model, tokenizer, qa_pairs, count=args.num_inference
         )
         print(f"  Generated {len(inference_questions)} inference questions")
 
@@ -414,84 +511,124 @@ def main():
             filename="inference_questions.json",
         )
 
-        # Phase 6: Evaluate three conditions
+        # Phase 6: Evaluate PM and RAG on inference questions
+        # PM: adapter always active (production architecture)
+        # RAG: adapter disabled (base model + external store)
         model.gradient_checkpointing_disable()
+        from peft import PeftModel as _PeftModel  # noqa: E402
 
-        # (a) Parametric recall + reason: use all reconstructed facts as context
-        print("\n--- Condition A: Parametric Recall + Reason ---")
+        from paramem.models.loader import adapt_messages  # noqa: E402
+
+        _sys_prompt = CONTEXT_SYSTEM_PROMPT
+
+        # --- PM: Recall + Reason (adapter active) ---
+        print("\n--- PM: Recall + Reason (adapter active) ---")
         switch_adapter(model, "episodic")
-        result_a = evaluate_condition(
-            "Recall+Reason",
+        result_pm = evaluate_condition(
+            "PM Recall+Reason",
             model,
             tokenizer,
             inference_questions,
-            prompt_fn=lambda q: format_recall_reason_prompt(q, reconstructed, tokenizer),
+            prompt_fn=lambda q: format_recall_reason_prompt(
+                q, reconstructed, tokenizer
+            ),
+            context_time=reconstruction_time,
         )
 
-        # (b) Direct parametric: adapter active, no context (baseline)
-        print("\n--- Condition B: Direct Parametric (no reconstruction) ---")
+        # --- PM: Adapter-Only diagnostic (adapter active, no context) ---
+        print("\n--- PM: Adapter-Only diagnostic (adapter active, no context) ---")
         switch_adapter(model, "episodic")
-        result_b = evaluate_condition(
-            "Direct Parametric",
+        result_adapter_only = evaluate_condition(
+            "PM Adapter-Only",
             model,
             tokenizer,
             inference_questions,
             prompt_fn=lambda q: _format_inference_prompt(q, tokenizer),
         )
 
-        # (c) RAG baseline
-        rag_result = None
+        # --- RAG: all facts (adapter disabled) ---
+        rag_all_result = None
         if not args.skip_rag:
-            from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
+            print("\n--- RAG: All Facts (adapter disabled, base model) ---")
+            t_rag_load = time.time()
+            # In production, facts are loaded from store. We time this.
+            rag_facts = list(qa_pairs)  # simulate loading from store
+            rag_load_time = time.time() - t_rag_load
 
-            print("\n--- Condition C: RAG Baseline ---")
-            rag = QARAGPipeline()
-            rag.build_index(qa_pairs)
-
-            from peft import PeftModel as _PeftModel
+            def _rag_all_prompt(question):
+                context = "\n".join(
+                    f"Q: {qa['question']}\nA: {qa['answer']}"
+                    for qa in rag_facts
+                )
+                user_content = (
+                    f"Context:\n{context}\n\nQuestion: {question}"
+                )
+                messages = adapt_messages(
+                    [
+                        {"role": "system", "content": _sys_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    tokenizer,
+                )
+                return tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
 
             if isinstance(model, _PeftModel):
                 with model.disable_adapter():
-                    result_c = evaluate_condition(
-                        "RAG",
+                    rag_all_result = evaluate_condition(
+                        "RAG all facts",
                         model,
                         tokenizer,
                         inference_questions,
-                        prompt_fn=lambda q: rag.format_prompt(q, tokenizer, top_k=5),
+                        prompt_fn=_rag_all_prompt,
+                        context_time=rag_load_time,
                     )
             else:
-                result_c = evaluate_condition(
-                    "RAG",
+                rag_all_result = evaluate_condition(
+                    "RAG all facts",
                     model,
                     tokenizer,
                     inference_questions,
-                    prompt_fn=lambda q: rag.format_prompt(q, tokenizer, top_k=5),
+                    prompt_fn=_rag_all_prompt,
+                    context_time=rag_load_time,
                 )
-            rag_result = result_c
 
         # Summary
+        def _fmt(label, r):
+            lat = r["latency"]
+            return (
+                f"  {label:<22} "
+                f"{r['ok_count']:>2}/{r['total']} OK, "
+                f"sim={r['mean_similarity']:.3f}, "
+                f"ctx={lat['context_per_query_seconds']:.2f}s + "
+                f"query={lat['query_seconds']:.2f}s = "
+                f"e2e={lat['end_to_end_per_query_seconds']:.2f}s, "
+                f"tokens={r['mean_input_tokens']}in/"
+                f"{r['mean_output_tokens']}out"
+            )
+
         print(f"\n{'=' * 72}")
-        print("ASSOCIATIVE INFERENCE SUMMARY")
+        print("TEST 3: REASONING QUALITY PARITY")
         print(f"{'=' * 72}")
         print(f"  Model:               {bench_name}")
         print(f"  Facts trained:       {len(qa_pairs)}")
-        print(f"  Facts reconstructed: {len(reconstructed)}/{len(keyed_pairs)}")
+        print(f"  Base fact recall:    "
+              f"{recall_result['exact_count']}/{recall_result['total']}")
+        print(f"  Reconstructed:       "
+              f"{len(reconstructed)}/{len(keyed_pairs)} "
+              f"(quality={mean_recon_sim:.3f})")
         print(f"  Inference questions: {len(inference_questions)}")
-        print(f"  Base fact recall:    {recall_result['exact_count']}/{recall_result['total']}")
-        print(
-            f"  (a) Recall+Reason:   {result_a['ok_count']}/{result_a['total']} OK, "
-            f"mean={result_a['mean_similarity']:.3f}"
-        )
-        print(
-            f"  (b) Direct Param:    {result_b['ok_count']}/{result_b['total']} OK, "
-            f"mean={result_b['mean_similarity']:.3f}"
-        )
-        if rag_result:
-            print(
-                f"  (c) RAG:             {rag_result['ok_count']}/{rag_result['total']} OK, "
-                f"mean={rag_result['mean_similarity']:.3f}"
-            )
+        print()
+        print(_fmt("PM Recall+Reason", result_pm))
+        print(_fmt("PM Adapter-Only", result_adapter_only))
+        print("    ^ diagnostic only — different system prompt, "
+              "not comparable to PM/RAG above")
+        if rag_all_result:
+            print(_fmt("RAG all facts", rag_all_result))
+        print()
         print(f"  Training time:       {train_time:.0f}s")
+        print(f"  Reconstruction time: {reconstruction_time:.1f}s")
         print(f"{'=' * 72}")
 
         results = {
@@ -503,13 +640,15 @@ def main():
             "rank": args.rank,
             "qa_pairs_trained": len(qa_pairs),
             "facts_reconstructed": len(reconstructed),
+            "reconstruction_quality": round(mean_recon_sim, 4),
             "inference_questions_generated": len(inference_questions),
             "training_time_seconds": train_time,
+            "reconstruction_time_seconds": round(reconstruction_time, 1),
             "training_loss": metrics.get("train_loss"),
             "base_fact_recall": recall_result,
-            "condition_a_recall_reason": result_a,
-            "condition_b_direct_parametric": result_b,
-            "condition_c_rag": rag_result,
+            "pm_recall_reason": result_pm,
+            "pm_adapter_only": result_adapter_only,
+            "rag_all_facts": rag_all_result,
         }
 
         save_results(results, output_dir)
