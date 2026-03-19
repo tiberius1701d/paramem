@@ -166,29 +166,103 @@ This forces sequential weight loading. Models load slightly slower but reliably.
 7. **Promote:** Well-reinforced facts move from episodic to semantic adapter
 8. **Decay:** Unreinforced facts fade after configurable window
 
+## Server Deployment
+
+ParaMem includes a REST server for persistent deployment. The server keeps the model loaded in VRAM, serves chat inference, and runs daily consolidation to learn from new conversations.
+
+### Quick Start
+
+```bash
+# Start the server (foreground)
+bash scripts/start-server.sh
+
+# Or background with log file
+bash scripts/start-server.sh --background
+```
+
+The server listens on port 8420 by default. Verify it's running:
+
+```bash
+curl http://localhost:8420/status
+```
+
+### Configuration
+
+Edit `configs/server.yaml`:
+
+```yaml
+model: gemma          # gemma | mistral
+adapter_dir: data/ha/adapters
+registry_path: data/ha/registry.json
+graph_path: data/ha/graph.json
+session_dir: data/ha/sessions
+
+training:
+  epochs: 30
+  rank: 8
+
+consolidation:
+  schedule: "02:00"   # daily at 2am (empty string = manual only)
+```
+
+### API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/chat` | POST | Send a message, get a response. Adapter always active. |
+| `/status` | GET | Server health, model info, key count, consolidation state |
+| `/consolidate` | POST | Trigger consolidation manually |
+
+**Chat request:**
+
+```bash
+curl -X POST http://localhost:8420/chat \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Where does Marcus work?", "conversation_id": "session1"}'
+```
+
+The server buffers conversation turns automatically. On the next consolidation cycle, it extracts knowledge from buffered sessions, merges into the knowledge graph, generates QA pairs, and retrains the adapter.
+
+### Systemd Service
+
+For persistent deployment:
+
+```bash
+sudo cp scripts/paramem-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now paramem-server
+
+# Check logs
+journalctl -u paramem-server -f
+```
+
+### Home Assistant Integration
+
+A custom conversation agent for Home Assistant is included in `custom_components/paramem/`. Copy or symlink to your HA `custom_components/` directory and configure via the HA UI (Settings → Devices → Add Integration → ParaMem). The component is a thin REST client — all inference runs on the ParaMem server.
+
 ## Extended Evaluation Suite
 
-Seven experiments testing parametric memory against a QA-RAG baseline (same model, same facts, different storage mechanism). Each is a standalone script in `experiments/`.
+Seven experiments validating the parametric memory mechanism. Each is a standalone script in `experiments/`.
 
-| Test | What it measures | Estimated GPU time |
-|------|------------------|--------------------|
-| `test1_scale_expansion.py` | Recall at 10–100 keys | ~100 min |
-| `test2_contradictions.py` | Temporal fact updates vs RAG staleness | ~50 min |
-| `test3_inference.py` | Associative reasoning over combined facts | ~15 min |
-| `test4_reinforcement.py` | Reinforced facts recall better | ~50 min |
-| `test5_natural_recall.py` | Keyed vs natural recall gap | ~20 min |
-| `test6_footprint.py` | Adapter size/latency vs RAG footprint | ~10 min |
-| `test7_second_persona.py` | Two-persona generalization + cross-contamination | ~25 min |
+| Test | What it measures |
+|------|------------------|
+| `test1_scale_expansion.py` | Recall at 10–100 keys with on-the-fly distillation |
+| `test2_contradictions.py` | Contradiction detection and resolution over time |
+| `test3_inference.py` | Reasoning quality parity with RAG |
+| `test4_reinforcement.py` | Cumulative train-delete-retrain robustness |
+| `test5_natural_recall.py` | Keyed vs natural recall gap (motivates key mechanism) |
+| `test6_footprint.py` | Storage footprint: adapter vs RAG index at scale |
+| `test7_second_persona.py` | Multi-persona generalization + isolation |
 
 ```bash
 # Run a single test
-python experiments/test1_scale_expansion.py --scale 50
+python experiments/test1_scale_expansion.py --model gemma
 
-# Optional: clone PerLTQA for public dataset support (Test 1 & 7)
+# Optional: clone PerLTQA for public dataset support
 git clone https://github.com/Elvin-Yiming-Du/PerLTQA data/external/PerLTQA
 ```
 
-Results are saved to `outputs/testN_*/results.json`. Tests fall back to synthetic data if PerLTQA is not available.
+Results are saved to `outputs/testN_*/{model}/{timestamp}/results.json`. Tests fall back to synthetic data if PerLTQA is not available.
 
 ## Paper
 

@@ -49,20 +49,20 @@ Results go to `outputs/testN_*/{model}/{timestamp}/results.json`.
 | Test | Name | Key Question | Expected Outcome | Data |
 |------|------|-------------|------------------|------|
 | 1 | Scale Expansion | Does recall degrade at 10→100 keys? | ≥95% recall, linear time scaling | PerLTQA dialogues (on-the-fly distillation) |
-| 2 | Contradiction Resolution | Can temporal fact updates be detected and resolved? | Graph normalization detects all same-predicate contradictions; model-assisted adds no value | Synthetic fact chains (3 temporal versions each) |
+| 2 | Contradiction Resolution | Can temporal fact updates be detected and resolved? | Graph normalization detects all same-predicate contradictions | Synthetic fact chains (3 temporal versions each) |
 | 2b | Incremental Contradictions | Does forgetting work with a persistent adapter? | Immediate overwrite, zero catastrophic forgetting | Same data as Test 2, single persistent adapter |
-| 3 | Associative Inference | Can recall→reason over parametric memory match or beat RAG for multi-hop questions? | Recall+Reason should perform well (complete knowledge); direct parametric will be weak | ~50 PerLTQA facts + LLM-generated inference questions |
-| 4 | Multi-Session Reinforcement | Do facts seen more often recall better? | Reinforced facts should show higher recall and confidence than single-mention facts | 30 facts at 3 frequency tiers across 10 sessions |
-| 5 | Privacy Preservation | Do adapter weights leak data to generic extraction prompts? | Parametric memory should resist extraction without the correct key; RAG leaks directly | 50 QA pairs + 10 adversarial extraction probes |
-| 6 | Edge Deployment Footprint | What is the storage and latency cost vs. RAG? | Adapter size is constant (fixed rank); RAG scales linearly. Parametric latency lower for retrieval. | Adapters at 10/25/50 keys |
-| 7 | Second Persona | Does the architecture generalize beyond one user? | Similar recall across personas with minimal cross-contamination between adapters | 2 personas × 50 QA pairs |
+| 3 | Reasoning Quality Parity | Does PM match RAG for multi-hop reasoning? | Quality parity; PM offers latency/privacy/compression benefits | ~50 PerLTQA facts + LLM-generated inference questions |
+| 4 | Pipeline Robustness | Does cumulative train-delete-retrain stay reliable? | Stable recall as facts grow from 3 to 30 across 10 sessions | 30 synthetic facts across 10 sessions |
+| 5 | Natural Recall | How much knowledge is accessible without indexed keys? | Limited — motivates the key mechanism | 50 QA pairs + 10 open-ended probes |
+| 6 | Storage Footprint | What is the storage cost vs. RAG at scale? | Adapter is O(1); RAG index scales linearly | Adapters at 10/25/50/100 keys |
+| 7 | Second Persona | Does the architecture generalize beyond one user? | Similar recall across personas with minimal cross-contamination | 2 personas × 50 QA pairs |
 
 ### Design principles
 
 - Each test is standalone: `python experiments/testN_*.py [--model gemma|mistral]`
 - Shared infrastructure in `experiments/utils/test_harness.py`
 - All tests use the same indexed key pipeline — no test-specific training code
-- RAG baselines included where comparison is meaningful (Tests 1, 3, 5, 6)
+- RAG baselines included where comparison is meaningful (Tests 3, 4, 6)
 - Honest expectations stated upfront — negative results are valuable
 
 ---
@@ -70,7 +70,7 @@ Results go to `outputs/testN_*/{model}/{timestamp}/results.json`.
 ## Test 1: Scale Expansion
 
 **Script:** `experiments/test1_scale_expansion.py`
-**Status:** COMPLETE — both models
+**Status:** COMPLETE — both models (rerun 2026-03-19 with methodology fixes)
 
 ### What it tests
 
@@ -85,7 +85,23 @@ from 10 to 100? Facts are extracted on the fly from real dialogue transcripts
 3. Accumulate QA pairs until target count reached
 4. Train indexed key adapter → evaluate recall
 
-### Results (2026-03-16)
+### Results (2026-03-19, post-methodology-fixes)
+
+| Scale | Gemma 2 9B Recall | Gemma Time | Mistral 7B Recall | Mistral Time |
+|-------|-------------------|------------|--------------------| -------------|
+| 10    | 10/10 (100%)      | 7.4 min    | 10/10 (100%)       | 5.2 min      |
+| 25    | 25/25 (100%)      | 17.9 min   | 25/25 (100%)       | 12.5 min     |
+| 50    | 50/50 (100%)      | 38.3 min   | 40/41 (98%)*       | 20.5 min     |
+| 75    | 75/75 (100%)      | 52.5 min   | 40/41 (98%)*       | 20.9 min     |
+| 100   | 100/100 (100%)    | 70.6 min   | 40/41 (98%)*       | 21.1 min     |
+
+*Mistral extracted only 41 QA pairs from 30 sessions (temperature=0.0 made
+distillation more conservative). Scales 50/75/100 are capped at 41 keys.
+
+**Config:** rank=8, alpha=16, 30 epochs, lr=1e-4, batch=1, grad_accum=2,
+temperature=0.0 (deterministic), max_new_tokens=200, keyed_pairs persisted.
+
+### Previous results (2026-03-16, pre-methodology-fixes)
 
 | Scale | Gemma 2 9B Recall | Gemma Time | Mistral 7B Recall | Mistral Time |
 |-------|-------------------|------------|--------------------| -------------|
@@ -95,42 +111,52 @@ from 10 to 100? Facts are extracted on the fly from real dialogue transcripts
 | 75    | 75/75 (100%)      | 52.9 min   | 75/75 (100%)       | 42.2 min     |
 | 100   | 100/100 (100%)    | 70.3 min   | 95/100 (95%)       | 48.8 min     |
 
-**Config:** rank=8, alpha=16, 30 epochs, lr=1e-4, batch=1, grad_accum=2.
+Changes: temperature=0.3→0.0, keyed_pairs persisted, unified max_new_tokens.
 
 ### Data statistics
 
-| Metric | Gemma | Mistral |
-|--------|-------|---------|
-| QA pairs extracted | 103 | 106 |
-| Sessions used | 22/30 | 27/30 |
-| QA pairs per successful session | ~4.7 | ~3.9 |
-| Session extraction failure rate | ~36% | ~40% |
+| Metric | Gemma (new) | Gemma (old) | Mistral (new) | Mistral (old) |
+|--------|-------------|-------------|---------------|---------------|
+| QA pairs extracted | 104 | 103 | 41 | 106 |
+| Sessions used | 15/30 | 22/30 | 30/30 | 27/30 |
+| QA pairs per session | ~6.9 | ~4.7 | ~1.4 | ~3.9 |
+
+Gemma improved extraction density (fewer sessions, same yield). Mistral's
+yield dropped 61% — temperature=0.0 eliminated the variance that produced
+both garbage and valid extractions, leaving only high-confidence outputs.
+The 41-key cap means Mistral scale points 50/75/100 are not meaningful
+comparisons. A rerun with adjusted extraction parameters or additional
+characters may be needed.
 
 ### Training time scaling
 
-| Metric | Gemma | Mistral |
-|--------|-------|---------|
-| Time per key (scale 10) | 42.4 s | 33.8 s |
-| Time per key (scale 50) | 42.3 s | 34.1 s |
-| Time per key (scale 100) | 42.2 s | 29.3 s |
-| Scaling behavior | Linear | Linear |
-| Total training (all 5 scales) | 183 min | 139 min |
+| Metric | Gemma (new) | Gemma (old) | Mistral (new) | Mistral (old) |
+|--------|-------------|-------------|---------------|---------------|
+| Time per key (scale 10) | 44.4 s | 42.4 s | 31.2 s | 33.8 s |
+| Time per key (scale 25) | 43.0 s | 42.3 s | 30.1 s | 34.1 s |
+| Time per key (scale 50) | 45.9 s | 42.3 s | 30.0 s* | 34.1 s |
+| Time per key (scale 100) | 42.4 s | 42.2 s | 30.9 s* | 29.3 s |
+| Scaling behavior | Linear | Linear | Linear | Linear |
+
+*Mistral 50/100 computed at 41 keys (capped).
 
 Training time scales linearly with key count — no superlinear growth.
 Mistral is ~30% faster, roughly proportional to parameter count (7B vs 9B).
 
 ### Loss convergence
 
-| Scale | Gemma Final Loss | Mistral Final Loss |
-|-------|------------------|--------------------|
-| 10    | 0.338            | 0.316              |
-| 25    | 0.256            | 0.235              |
-| 50    | 0.213            | 0.210              |
-| 75    | 0.192            | 0.179              |
-| 100   | 0.189            | 0.182              |
+| Scale | Gemma (new) | Gemma (old) | Mistral (new) | Mistral (old) |
+|-------|-------------|-------------|---------------|---------------|
+| 10    | 0.309       | 0.338       | 0.253         | 0.316         |
+| 25    | 0.228       | 0.256       | 0.211         | 0.235         |
+| 50    | 0.206       | 0.213       | 0.202*        | 0.210         |
+| 75    | 0.192       | 0.192       | 0.198*        | 0.179         |
+| 100   | 0.193       | 0.189       | 0.198*        | 0.182         |
 
-Loss decreases with more data — the model is less overfit at larger scales
-due to greater gradient diversity per epoch. Both models converge at similar rates.
+*Mistral 50/75/100 trained on 41 keys (capped).
+
+Loss decreased slightly across both models. Temperature=0.0 produces
+cleaner training data, which converges marginally faster.
 
 ### Epoch convergence analysis
 
@@ -156,52 +182,92 @@ issues — garbled text (missing spaces, negated facts, truncated words), not
 convergence failures. SimHash confidence 0.81-0.91 indicates the model memorized
 the content but produces imperfect output.
 
-### Distillation quality (pipeline issue, not memory issue)
+### Distillation quality — ground truth analysis (2026-03-19)
 
-Content analysis of the 100 recalled QA pairs per model:
+PerLTQA provides 394 ground-truth QA pairs for Liang Xin across four categories.
+The distillation pipeline only sees dialogue text, so the extractable ceiling
+depends on what's actually stated in conversations:
 
-| Issue | Gemma | Mistral |
-|-------|-------|---------|
-| Clean, well-formed pairs | 23% | 81% |
-| Vague "is known about" template fallback | 50% | 17% |
-| Markdown artifacts (`**`) in output | 27% | 0% |
-| Truncated/garbled questions | 27% | 2% |
-| Wrong predicate (e.g. hobby for work tasks) | 6% | 0% |
+| Category | GT QA pairs | Extractable from dialogue text? |
+|----------|-------------|--------------------------------|
+| Profile (metadata) | 14 | No — gender, age, etc. not stated |
+| Social relationships | 50 | Partially — names/roles mentioned |
+| Events (narratives) | 198 | Partially — discussed but narratives richer |
+| Dialogues (direct) | 132 | Yes — directly in conversation text |
 
-Mistral produces significantly cleaner QA pairs despite slightly lower recall.
-Gemma's markdown generation tendency and less consistent `Q:/A:` formatting
-cause the QA generator to fall back to vague templates more often.
+Semantic matching (embedding similarity ≥ 0.65) of distilled pairs against
+the 330 dialogue + event GT pairs:
+
+| Metric | Gemma | Mistral |
+|--------|-------|---------|
+| Distilled pairs | 100 | 41 |
+| Match GT (≥0.65) | 55 (55%) | 33 (80%) |
+| Unique GT covered | 26 | 20 |
+| Novel (no GT match) | 45 | 8 |
+
+**Mistral is more precise, Gemma has higher recall.** Mistral's lower yield at
+temperature=0.0 reflects selective extraction — 80% of what it produces maps to
+ground truth. Gemma extracts more aggressively but 45% are low-information graph
+artifacts ("Training boosted morale", "Who implemented Changes?") that are
+technically present in dialogue text but not meaningful personal facts.
 
 Both models miss core profile facts (gender, age, occupation) and use only the
-nickname "Xinxin" — never "Liang Xin." This is a graph extraction limitation:
-profile facts aren't stated explicitly in dialogues, only inferred from context.
+nickname "Xinxin" — never "Liang Xin." Profile facts aren't stated in dialogues.
 
-Extracted facts that are present tend to be factually correct when verified
-against PerLTQA ground truth. The quality issue is in QA formatting, not
-factual accuracy.
+Combined coverage: 38/330 GT pairs (12%). Neither model approaches the ceiling
+from dialogue text alone. Improving extraction density is a model optimization
+task — outside the scope of the first paper, which validates the memory
+mechanism itself.
 
-Fixes applied after Test 1: explicit `A:` format instruction in QA generator
-prompt, robust parser fallback for missing markers, markdown artifact cleaning.
-Will be validated in subsequent runs.
+### Methodology update (2026-03-18)
+
+Critical design review identified and fixed the following issues:
+
+1. **keyed_pairs now persisted alongside adapters.** `train_indexed_keys` saves
+   `keyed_pairs.json` in the output directory for every training run. Enables
+   post-hoc re-evaluation and independent verification of results.
+
+2. **Unified scoring metric for PM vs RAG comparison.** Both parametric and RAG
+   recall are now scored by embedding similarity (`all-MiniLM-L6-v2` cosine) with
+   a 0.75 match threshold, in addition to SimHash confidence for parametric.
+   This enables apples-to-apples comparison in the summary table.
+
+3. **Unified max_new_tokens.** RAG evaluation now uses `max_new_tokens=200`
+   (previously hardcoded at 150 in the library function). Parametric uses 256
+   due to JSON wrapper overhead — noted in results metadata.
+
+4. **RAG indexes distilled keyed_pairs**, not original QA pairs. Same data as
+   parametric training, ensuring the only variable is the storage mechanism.
+
+5. **Design note:** Scale points use nested subsets (scale N = first N pairs from
+   single distillation). This mirrors real usage (accumulating facts over time)
+   but means scale points are not independent observations.
+
+**Rerun completed 2026-03-19. Results above supersede previous run.**
 
 ### Key takeaways
 
-1. **Parametric memory scales to 100 keys with near-perfect recall.** Both models
-   achieve 95-100% exact recall at scale 100 from real conversational data. The
-   core indexed key mechanism is model-agnostic and reliable.
+1. **Gemma achieves 100% recall across all scales (10-100 keys).** The methodology
+   fixes (temperature=0.0, persisted keyed_pairs) eliminated the 2-4% failures
+   seen in the old run. The indexed key mechanism is fully reliable on Gemma at
+   this scale.
 
-2. **Training time is linear and predictable.** ~42s/key (Gemma) and ~30s/key
+2. **Mistral's lower yield is higher precision, not a defect.** 41 QA pairs from
+   30 sessions (was 106 at temperature=0.3), but 80% map to ground truth vs
+   Gemma's 55%. Temperature=0.0 made Mistral selective — it refuses to extract
+   low-information fragments. Mistral recall at 41 keys (98%) is consistent with
+   prior results. Improving extraction density is model optimization work for
+   future papers.
+
+3. **Training time is linear and predictable.** ~43s/key (Gemma) and ~31s/key
    (Mistral), constant across all scale points. No superlinear growth. At scale
-   100, training takes 49-70 min — feasible for idle-time background processing.
+   100, training takes 49-71 min — feasible for idle-time background processing.
 
-3. **The distillation pipeline is the bottleneck, not the memory mechanism.**
-   36-40% of sessions fail extraction entirely. Of the facts that are extracted,
-   23-81% are well-formed depending on model. Improving extraction and QA
-   generation quality is the highest-leverage improvement.
-
-4. **Model choice is a speed/quality tradeoff.** Mistral is 30% faster and produces
-   cleaner QA pairs. Gemma has slightly higher recall at scale (100% vs 95%).
-   Both are viable — the architecture is model-agnostic.
+4. **Distillation coverage is low but sufficient for mechanism validation.**
+   Combined coverage is 12% of ground-truth dialogue+event facts. Both models
+   miss profile metadata entirely. Improving extraction density (prompt tuning,
+   multi-pass extraction, model-specific temperature) is future work — the first
+   paper validates the memory mechanism on whatever the pipeline produces.
 
 5. **30 epochs is excessive.** Loss converges by epoch 5-10 across both models and
    all scales. Early stopping can save 37-67% of training time. Implementation
@@ -250,7 +316,17 @@ smoke test results reflect the fixed pipeline.
 ## Test 2: Contradiction Resolution
 
 **Script:** `experiments/test2_contradictions.py`
-**Status:** COMPLETE — both models
+**Status:** REDESIGNED (2026-03-18) — rerun required
+
+### Methodology update (2026-03-18)
+
+1. **Current-fact matching now uses question text** instead of greedy answer
+   similarity scan. Matches recalled QA to fact chains by question similarity
+   (>0.8 threshold), eliminating cross-chain misattribution.
+2. **Similarity threshold raised to 0.85** (from 0.7) for `is_current` classification,
+   reducing false positives from shared predicate vocabulary.
+
+**Previous results are invalidated by these changes. Rerun required.**
 
 **Objective:** Validate that the system detects and resolves contradictions when
 facts change over time (e.g. "Alex works at Google" → "Alex works at SpaceX").
@@ -434,71 +510,58 @@ in early cycles (0.688); they reach 1.000 once the adapter stabilizes.
 
 ---
 
-## Test 3: Associative Inference (Recall → Reason)
+## Test 3: Reasoning Quality Parity with RAG
 
 **Script:** `experiments/test3_inference.py`
-**Status:** COMPLETE — both models
+**Status:** REDESIGNED (2026-03-19) — rerun required
 
-**Objective:** Test whether parametric memory enables reasoning over stored
-knowledge via the enumerate → reconstruct → reason pipeline. The model recalls
-all stored facts, then reasons over them to answer novel inference questions —
-the same way a human recalls individual memories and combines them.
+**Objective:** Verify that reasoning over parametrically recalled facts achieves
+comparable quality to RAG with equivalent context, while offering lower latency
+per query. The test does NOT claim parametric memory is superior for reasoning —
+reasoning is a base model capability. The claim is quality parity with better
+operational properties.
 
 **Design:** ~50 QA pairs distilled from PerLTQA dialogues (Liang Xin), trained
-as indexed keys. The LLM itself generates 15 inference questions from the
-knowledge graph — questions that require combining 2+ trained facts. Three
-evaluation conditions compared:
-- **(a) Recall + Reason:** Enumerate all keys → reconstruct all facts from
-  adapter → feed as context → answer inference question
-- **(b) Direct Parametric:** Ask inference question with adapter active but
-  no reconstruction (baseline — tests raw adapter generalization)
-- **(c) RAG:** Retrieve top-5 relevant facts by embedding similarity → answer
+as indexed keys. The LLM generates 15 inference questions requiring 2+ facts.
+Four evaluation conditions:
 
-**Key metrics:** Per-condition similarity scores, OK rate (similarity > 0.5),
-reconstruction completeness (how many facts successfully recalled), per-question
-breakdown showing which conditions succeed or fail.
+- **(a) Recall+Reason:** Enumerate all keys → reconstruct all facts from
+  adapter → feed as context → answer. Adapter disabled during reasoning —
+  facts are in context, adapter influence is not a confound.
+- **(b) Adapter-Only:** Ask inference question with adapter active, no explicit
+  retrieval. Baseline showing facts are encoded in weights.
+- **(c) RAG top-5:** Retrieve 5 most similar facts by embedding similarity →
+  answer. Adapter disabled. Tests selective retrieval.
+- **(c') RAG all:** Feed ALL facts as context → answer. Adapter disabled.
+  Fair comparison to (a) — same facts, same base model, no adapter.
 
-**Key comparison:** (a) vs (c) — parametric recall provides *complete* knowledge
-(all facts), while RAG provides *selectively relevant* knowledge (top-k). Does
-exhaustive recall beat selective retrieval for reasoning tasks?
+**Key comparison:** (a) vs (c') — both have all facts in context. The only
+difference is the source: parametric recall vs external store. Expected
+outcome is quality parity. The differentiators are latency (parametric adds
+zero context tokens), privacy (no external store), and compression (fixed-size
+adapter).
 
-### Results (2026-03-17)
+**Secondary comparison:** (c) vs (c') — quantifies the cost of top-k retrieval
+missing relevant facts for multi-hop reasoning.
 
-| Condition | Gemma 2 9B OK | Gemma Mean Sim. | Mistral 7B OK | Mistral Mean Sim. |
-|-----------|--------------|-----------------|---------------|-------------------|
-| Base fact recall | 50/50 | — | 49/50 | — |
-| Facts reconstructed | 50/50 | — | 49/50 | — |
-| **(a) Recall+Reason** | **15/15** | **0.794** | **14/15** | **0.853** |
-| (b) Direct Parametric | 14/15 | 0.711 | 13/15 | 0.825 |
-| (c) RAG | 15/15 | 0.766 | 14/15 | 0.729 |
-| Training time | — | 2121s (35 min) | — | 1429s (24 min) |
+**Key metrics:** Per-condition similarity scores, OK rate (>0.5), mean latency
+per query, reconstruction quality (similarity to originals).
 
-**Config:** rank=8, alpha=16, 30 epochs, lr=1e-4, batch=1, grad_accum=2.
+### Methodology updates
 
-### Key findings
+**2026-03-18:**
+1. Inference questions generated from `qa_pairs` (not reconstructed facts)
+2. Unified system prompt across A, C, C'
+3. Adapter disabled during Condition A inference
 
-1. **Recall+Reason beats RAG on both models.** Gemma: 0.794 vs 0.766. Mistral:
-   0.853 vs 0.729. The advantage is structural: indexed key enumeration injects
-   ALL stored facts into context, guaranteeing every fact needed for multi-hop
-   inference is present. RAG retrieves only the top-k most similar chunks, and
-   for questions requiring combination of seemingly unrelated facts, the relevant
-   chunks may not score highly on similarity to the question.
+**2026-03-19:**
+4. Added Condition C' (RAG with all facts) for fair comparison
+5. Added per-condition latency measurement
+6. Added reconstruction quality metric (similarity to originals)
+7. Renamed Condition B from "Direct Parametric" to "Adapter-Only"
+8. Reframed objective: quality parity, not superiority
 
-2. **Direct Parametric is surprisingly strong.** Without any fact retrieval, the
-   adapted model answers 13-14 of 15 reasoning questions correctly. On Mistral
-   7B, direct parametric (0.825) exceeds the RAG baseline (0.729) — the adapter
-   alone, with no retrieval, outperforms retrieval-augmented generation. This
-   confirms the knowledge is genuinely encoded in the weights, not just
-   addressable through keys.
-
-3. **Mistral has higher reasoning scores despite slightly lower base recall
-   (49/50 vs 50/50).** Its cleaner QA generation produces better reasoning
-   context when injected into the prompt. Generation quality at reasoning time
-   matters as much as storage fidelity.
-
-4. **The mechanism is model-agnostic.** Both models show the same core pattern:
-   Recall+Reason outperforms RAG. The finding is architectural, not
-   model-specific.
+**Previous results are invalidated. Rerun required.**
 
 ### Scale caveat
 
@@ -506,33 +569,36 @@ At 50 facts (~300 tokens of context), exhaustive recall is cheap. At 1000+
 facts, injecting all facts would be expensive. Selective enumeration by entity,
 topic, or recency would be needed at larger scales.
 
-### Significance
-
-This is the paper's strongest new finding. It changes the positioning from
-"parametric memory is an alternative to RAG for edge cases" to "parametric
-memory outperforms RAG on reasoning while also offering privacy, compression,
-and zero query overhead."
-
 ---
 
-## Test 4: Multi-Session Reinforcement
+## Test 4: Multi-Session Pipeline Robustness
 
 **Script:** `experiments/test4_reinforcement.py`
-**Status:** COMPLETE — both models
+**Status:** REDESIGNED (2026-03-18) — rerun required
 
-**Objective:** Test whether facts encountered more frequently across sessions
-are remembered better — the biological consolidation property that repeated
-experience strengthens memory traces.
+### Methodology update (2026-03-18)
+
+1. **Reframed from "reinforcement" to "pipeline robustness."** The cumulative
+   pool overwrites by fact_id — all facts get one QA pair regardless of mention
+   frequency. The test validates train-delete-retrain cycle reliability, not
+   frequency-dependent consolidation.
+2. **Added `skip_distill=True`** since QA pairs are pre-formed synthetic data.
+   Avoids unnecessary distillation round-trip.
+3. **RAG max_new_tokens unified to 200** (was 150).
+
+**Previous results are invalidated by reframing. Rerun required.**
+
+**Objective:** Test whether cumulative fact recall remains reliable across 10
+train-delete-retrain cycles as facts accumulate from 3 to 30.
 
 **Design:** 30 facts in three frequency tiers:
 - 10 reinforced (appear in 3-4 of 10 sessions)
 - 10 mentioned twice
 - 10 single mention
 
-Each session's cumulative facts are distilled on-the-fly through graph
-extraction, mimicking real assistant behavior. Uses synthetic reinforcement
-session data with pre-defined mention schedules. Fresh adapter per session
-trained on all cumulative facts.
+Each session adds new facts to a cumulative pool (overwrite-by-fact_id).
+Uses `skip_distill=True` — clean synthetic QA pairs bypass graph extraction.
+Fresh adapter per session trained on all cumulative facts.
 
 ### Results (2026-03-18)
 
@@ -603,13 +669,27 @@ frequency is coincidental at this sample size (N=10 per group).
 ## Test 5: Natural Recall
 
 **Script:** `experiments/test5_natural_recall.py`
-**Status:** COMPLETE — both models
+**Status:** REDESIGNED (2026-03-18) — rerun required
+
+### Methodology update (2026-03-18)
+
+1. **Added per-question natural recall.** Each training question asked directly
+   (one at a time, adapter active, no key) — fair comparison with keyed recall.
+2. **Unified scoring metric.** Both keyed and natural recall scored by embedding
+   similarity (`compute_similarity`, 0.75 threshold). SimHash retained as
+   secondary diagnostic for keyed recall.
+3. **Scored against keyed_pairs** (post-distillation), not original `qa_pairs`.
+   Eliminates ground-truth asymmetry.
+4. **Uses PerLTQA data** (50 QA pairs, was 20 synthetic).
+5. **Broad natural probes retained** as supplementary data alongside per-question.
+
+**Previous results are invalidated by these changes. Rerun required.**
 
 **Objective:** Quantify how much stored knowledge is recoverable through
 natural-language prompts alone (without indexed keys), motivating the key
 mechanism.
 
-**Design:** Train adapter on 20 QA pairs with indexed keys (rank 8, 30 epochs).
+**Design:** Train adapter on 50 QA pairs with indexed keys (rank 8, 30 epochs).
 Verify keyed recall (control), then probe with 10 open-ended natural-language
 prompts — broad ("List everything you know about the user") to narrow ("What do
 you know about the user's daily routine?"). Count unique facts surfaced across
@@ -636,57 +716,153 @@ indexed key mechanism — not a headline contribution.
 
 ---
 
-## Test 6: Edge Deployment Footprint
+## Test 6: Parametric vs RAG Head-to-Head
 
 **Script:** `experiments/test6_footprint.py`
-**Status:** IMPLEMENTED — pending execution
+**Status:** REDESIGNED (2026-03-19) — rerun required
 
-**Objective:** Quantify the storage and inference latency cost of parametric
-memory vs. RAG at different scales.
+**Objective:** Head-to-head comparison of parametric retrieval (indexed keys)
+vs RAG on the same fact set at multiple scales. Three dimensions: storage
+footprint, inference latency, and recall quality.
 
-**Design:** Train adapters and build RAG indexes at 10, 25, and 50 keys.
-Three-column latency comparison: bare model (no adapter), adapter-equipped
-model, and RAG. Storage measured separately for each component: adapter
-weights, SimHash registry, keyed_pairs (parametric); embeddings, QA text (RAG).
+**Design (redesigned):**
+- **Data:** PerLTQA eval QA pairs (character "Liang Xin"), 2x input buffer
+  for distillation loss. Distill once at max scale, subset for smaller scales.
+- **Scales:** 10, 25, 50, 100 keys (default).
+- **Storage:** Final adapter weights only (via `selected_adapters`), not
+  training checkpoints. RAG total includes embedding model (~87 MB) for fair
+  comparison. Breakdown separates fixed costs (adapter, embedding model) from
+  per-fact variable costs (registry, index).
+- **Latency:** Three conditions (bare model, parametric, RAG), all with
+  `max_new_tokens=200`, 3 warm-up queries discarded before timing. Query count
+  capped to available keys minus warm-up.
+- **Recall:** Both systems scored by embedding similarity (`compute_similarity`,
+  `all-MiniLM-L6-v2` cosine, 0.75 threshold). SimHash confidence retained as
+  secondary diagnostic for parametric. Both evaluated on identical keyed_pairs.
+- **RAG note:** Indexes pre-extracted QA pairs (upper bound on RAG performance).
 
-**Key metrics:** Per-component storage (KB) at each scale, full-pipeline
-inference latency per query (ms) across three conditions, marginal cost of
-adapter loading (adapter latency minus bare model latency).
-
-**Expected outcome:** Adapter file size is O(1) — determined by LoRA rank and
-target modules, independent of fact count. Registry and keyed_pairs are O(n)
-but measured in bytes per key. RAG storage scales linearly. If adapter latency
-is within noise of bare model latency, that's a strong edge deployment
-argument — the memory system adds no marginal inference cost. At these test
-scales (10-50 keys), RAG storage is still small; note the trend rather than
-claiming a crossover that wasn't observed.
+**Methodology fixes applied:**
+1. PerLTQA data with 2x buffer (was: 20-fact synthetic, scales capped)
+2. Final adapter only for storage (was: all checkpoints, 94x overestimate)
+3. Same questions for PM and RAG (was: distilled vs original)
+4. Same scoring metric (was: SimHash vs embedding similarity)
+5. Same max_new_tokens (was: 256 vs 150)
+6. Warm-up queries (was: none)
+7. Single distillation, nested subsets (was: per-scale distillation)
+8. `selected_adapters` in save_pretrained (was: saving all accumulated adapters)
 
 ---
 
 ## Test 7: Second Persona
 
 **Script:** `experiments/test7_second_persona.py`
-**Status:** IMPLEMENTED — pending execution
+**Status:** Gemma COMPLETE (2026-03-19), Mistral queued
 
 **Objective:** Validate that the architecture generalizes beyond a single user
 persona, and that separate adapters maintain isolation on the same base model.
 
-**Design:** Two personas with 50 QA pairs each, trained on separate adapters
-on the same base model. Three evaluations:
-1. Does each persona achieve similar recall rates?
-2. Cross-contamination: querying persona A facts with persona B's adapter
-   (and vice versa) — should fail.
-3. Architecture generalizes beyond one specific set of facts.
+**Design (redesigned):**
+- **Data:** Two PerLTQA characters (selected by eval QA count, excluding
+  "Liang Xin" for independence from Tests 1-5). 50 QA pairs each.
+- **Key namespaces:** Non-overlapping. Persona A: `graph1..graphN`,
+  Persona B: `graph1001..graph1000+N`. Ensures cross-contamination probes
+  test true isolation, not namespace collision.
+- **Training:** `skip_distill=True` — eval QA pairs used directly as indexed
+  keys to isolate persona generalization from distillation quality.
+- **Evaluations:**
+  1. Per-persona recall (should be comparable)
+  2. Re-evaluation of persona A after persona B training (isolation check)
+  3. Cross-contamination: probe persona A keys with persona B adapter
+     (and vice versa) — should fail on untrained keys
+- **Fallback:** Synthetic persona B (20 facts), both personas capped equally.
 
-Prefers PerLTQA characters if available, with synthetic fallback.
+**Methodology fixes applied:**
+1. Non-overlapping key namespaces (was: both used graph1..N)
+2. skip_distill=True (was: lossy distillation round-trip on eval QA)
+3. Character selection filters by eval QA count (was: dialogue count)
+4. Re-evaluation of persona A after persona B (was: missing)
+5. Excludes "Liang Xin" (was: likely selected as persona A)
+6. Equal persona sizes in fallback mode (was: 50 vs 20)
 
-**Key metrics:** Per-persona recall, cross-contamination rate (facts leaked
-between adapters), isolation effectiveness.
+### Results (2026-03-19, Gemma)
 
-**Expected outcome:** Similar recall across personas (both ≥95%), confirming the
-architecture is persona-agnostic. Cross-contamination should be minimal (<5 facts)
-since separate LoRA adapters share the base model but have independent weight
-updates.
+| Metric | Gemma 2 9B |
+|--------|-----------|
+| Persona A (Cai Xiuying) recall | 50/50 (1.000) |
+| Persona B (Xiong Fei) recall | 50/50 (1.000) |
+| Persona A after B training | 50/50 (zero degradation) |
+| Cross-contamination A→B | 0/50 leaked |
+| Cross-contamination B→A | 0/50 leaked |
+| Training time per persona | ~35 min |
+
+**Config:** rank=8, alpha=16, 30 epochs, skip_distill=True, non-overlapping
+key namespaces (graph1..50 vs graph1001..1050).
+
+### Key findings
+
+1. **Perfect isolation.** Both adapters achieve 100% recall. Training persona B
+   does not degrade persona A. Cross-contamination is zero in both directions.
+2. **Architecture validated.** Multiple independent LoRA adapters on a single
+   base model work as designed. The mechanism is model-agnostic (pending Mistral).
+
+---
+
+## Test 7b: Merged Persona Adapters (Exploratory)
+
+**Script:** `experiments/test7b_merged_personas.py`
+**Status:** Gemma COMPLETE (2026-03-19) — negative result
+
+**Objective:** Test whether two independently trained LoRA adapters can be
+merged into a single adapter via arithmetic weight combination, serving both
+personas simultaneously without adapter switching.
+
+**Design:** Load persona A and persona B adapters from Test 7, merge via PEFT's
+`add_weighted_adapter`, evaluate recall on both key sets through the merged
+adapter. No retraining.
+
+### Results (2026-03-19, Gemma)
+
+| Merge weights | Persona A via merged | Persona B via merged |
+|---------------|---------------------|---------------------|
+| [1.0, 1.0] (sum) | 0/50 | 0/50 |
+| [0.5, 0.5] (average) | 0/50 | 1/50 |
+
+Individual recall: 50/50 for both personas (adapter switching works perfectly).
+
+### Analysis
+
+Linear adapter merging does not preserve indexed key recall. The merged adapter
+produces garbage output for both personas despite each working perfectly in
+isolation. The weight combination (sum or average) destroys the structured
+key→QA mapping that each adapter learned independently.
+
+Root cause: indexed key retrieval requires precise token-level generation
+(exact JSON format with specific key-question-answer triples). Even small
+perturbations to the LoRA weight matrices disrupt this precision. This contrasts
+with task-level merging (e.g., translation + summarization) where approximate
+outputs are acceptable.
+
+### Implications
+
+1. **Adapter switching remains necessary** for multi-adapter architectures.
+   The routing layer (`paramem/server/router.py`) and `switch_adapter` are
+   required infrastructure, not optimizations to eliminate.
+2. **Linear merging may work for less structured tasks** (conversational style,
+   behavioral preferences) where exact token sequences don't matter. The
+   procedural adapter is a candidate for merge with episodic/semantic.
+3. **Future exploration:** SVD merging (`combination_type="svd"`) or higher-rank
+   adapters may preserve more structure. TIES-Merging could resolve sign
+   conflicts in the weight matrices.
+
+### Bug fixes discovered during Test 7b
+
+1. **PEFT multi-adapter save/reload:** `get_peft_model` on an existing PeftModel
+   re-wraps it, causing nested tensor names (`base_model.model.base_model.model.model.`).
+   Fix: use `model.add_adapter()` instead for second+ adapters.
+2. **PEFT `base_model_name_or_path`:** second adapter's config gets `None`,
+   breaking reload. Fix: patch after creation from base model config.
+3. **Adapter delete crash:** `delete_adapter` on sole adapter leaves PeftModel
+   with empty config. Fix: unwrap to base model via `model.base_model.model`.
 
 ---
 
