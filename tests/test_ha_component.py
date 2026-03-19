@@ -35,9 +35,9 @@ for mod in _HA_MODULES:
 # Make homeassistant.const.Platform.CONVERSATION resolve to a string
 sys.modules["homeassistant.const"].Platform.CONVERSATION = "conversation"
 
-# Now it's safe to import
-from custom_components.paramem.const import DEFAULT_SERVER_URL, DEFAULT_TIMEOUT, DOMAIN
-from custom_components.paramem.conversation import _extract_history
+# Now it's safe to import (must be after HA module mocking above)
+from custom_components.paramem.const import DEFAULT_SERVER_URL, DEFAULT_TIMEOUT, DOMAIN  # noqa: E402, I001
+from custom_components.paramem.conversation import _extract_history  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -86,11 +86,21 @@ class TestConstants:
 
 
 class TestHistoryExtraction:
+    """Tests for _extract_history which infers role from class name.
+
+    HA ChatLog entries are typed (UserContent, AssistantContent).
+    _extract_history reads type(entry).__name__ to determine role.
+    """
+
     def _make_entry(self, role, content):
-        entry = MagicMock()
-        entry.role = role
-        entry.content = content
-        entry.text = None
+        # Create mock with class name matching HA content types
+        if role == "user":
+            cls_name = "UserContent"
+        elif role == "assistant":
+            cls_name = "AssistantContent"
+        else:
+            cls_name = "UnknownContent"
+        entry = type(cls_name, (), {"content": content})()
         return entry
 
     def test_extracts_roles_and_text(self):
@@ -105,7 +115,7 @@ class TestHistoryExtraction:
         assert history[0] == {"role": "user", "text": "Hello"}
         assert history[1] == {"role": "assistant", "text": "Hi there"}
 
-    def test_skips_entries_without_role(self):
+    def test_skips_entries_with_unknown_type(self):
         chat_log = MagicMock()
         chat_log.content = [self._make_entry(None, "orphan text")]
 
@@ -119,18 +129,14 @@ class TestHistoryExtraction:
         history = _extract_history(chat_log)
         assert history == []
 
-    def test_uses_text_fallback_when_content_is_none(self):
-        entry = MagicMock()
-        entry.role = "user"
-        entry.content = None
-        entry.text = "fallback text"
+    def test_skips_entries_with_no_content(self):
+        entry = self._make_entry("user", None)
 
         chat_log = MagicMock()
         chat_log.content = [entry]
 
         history = _extract_history(chat_log)
-        assert len(history) == 1
-        assert history[0]["text"] == "fallback text"
+        assert len(history) == 0
 
 
 class TestPayloadConstruction:
@@ -150,4 +156,4 @@ class TestPayloadConstruction:
         assert len(deserialized["history"]) == 2
 
     def test_server_url_trailing_slash_stripped(self):
-        assert "http://localhost:8420/" .rstrip("/") == "http://localhost:8420"
+        assert "http://localhost:8420/".rstrip("/") == "http://localhost:8420"

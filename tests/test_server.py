@@ -1,13 +1,12 @@
 """Unit tests for the ParaMem server modules (no GPU required)."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from paramem.server.config import ServerConfig, load_server_config
-from paramem.server.escalation import ESCALATE_TAG, detect_escalation
+from paramem.server.escalation import detect_escalation
 from paramem.server.session_buffer import SessionBuffer
 
 
@@ -70,9 +69,7 @@ class TestEscalation:
         assert query == "What is quantum computing?"
 
     def test_escalation_mid_sentence_not_detected(self):
-        should, query = detect_escalation(
-            "The team decided to [ESCALATE] the issue to management."
-        )
+        should, query = detect_escalation("The team decided to [ESCALATE] the issue to management.")
         assert should is False
 
     def test_empty_response(self):
