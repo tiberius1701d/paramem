@@ -4,6 +4,7 @@ import logging
 
 import aiohttp
 from homeassistant.components.conversation import (
+    AssistantContent,
     ChatLog,
     ConversationEntity,
     ConversationInput,
@@ -11,6 +12,7 @@ from homeassistant.components.conversation import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import intent
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DEFAULT_TIMEOUT, DOMAIN
@@ -84,24 +86,51 @@ class ParaMemConversationEntity(ConversationEntity):
             logger.error("ParaMem server error: %s", err)
             response_text = "Sorry, I couldn't reach my memory server."
         except TimeoutError:
-            logger.error("ParaMem server timed out after %ds", self._timeout)
-            response_text = "Sorry, my memory server took too long to respond."
+            logger.error(
+                "ParaMem server timed out after %ds", self._timeout
+            )
+            response_text = (
+                "Sorry, my memory server took too long to respond."
+            )
 
+        # Record assistant response in chat log
         chat_log.async_add_assistant_content_without_tools(
-            ConversationResult(response=response_text, conversation_id=user_input.conversation_id)
+            AssistantContent(
+                agent_id=user_input.agent_id,
+                content=response_text,
+            )
         )
+
+        # Build HA IntentResponse
+        response = intent.IntentResponse(
+            language=user_input.language
+        )
+        response.async_set_speech(response_text)
+
         return ConversationResult(
-            response=response_text,
-            conversation_id=user_input.conversation_id,
+            response=response,
+            conversation_id=chat_log.conversation_id,
         )
 
 
 def _extract_history(chat_log: ChatLog) -> list[dict]:
-    """Extract conversation history from the HA ChatLog."""
+    """Extract conversation history from the HA ChatLog.
+
+    ChatLog entries are typed objects (UserContent, AssistantContent).
+    We infer role from the type name and extract the content field.
+    """
     history = []
     for entry in chat_log.content:
-        role = getattr(entry, "role", None)
-        text = getattr(entry, "content", None) or getattr(entry, "text", None)
-        if role and text:
-            history.append({"role": role, "text": str(text)})
+        content = getattr(entry, "content", None)
+        if not content:
+            continue
+        # Infer role from class name: UserContent → user, AssistantContent → assistant
+        type_name = type(entry).__name__.lower()
+        if "user" in type_name:
+            role = "user"
+        elif "assistant" in type_name:
+            role = "assistant"
+        else:
+            continue
+        history.append({"role": role, "text": str(content)})
     return history

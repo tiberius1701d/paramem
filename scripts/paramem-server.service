@@ -1,0 +1,37 @@
+# ParaMem systemd service — parametric memory server
+#
+# Before installing, update the paths below to match your environment:
+#   - User, WorkingDirectory, ExecStart
+#
+# Install:
+#   sudo cp scripts/paramem-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now paramem-server
+#
+# Logs:
+#   journalctl -u paramem-server -f
+
+[Unit]
+Description=ParaMem Server — parametric memory for personal LLM agents
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- UPDATE THESE FOR YOUR ENVIRONMENT ---
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/paramem
+ExecStart=/path/to/python -m paramem.server.app --config configs/server.yaml
+# --- END USER CONFIG ---
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+Environment=HF_DEACTIVATE_ASYNC_LOAD=1
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=120
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paramem
+
+[Install]
+WantedBy=multi-user.target
