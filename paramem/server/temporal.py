@@ -116,9 +116,7 @@ _TEMPORAL_PATTERNS = [
 ]
 
 # Compile patterns once
-_COMPILED_PATTERNS = [
-    (re.compile(p, re.IGNORECASE), fn) for p, fn in _TEMPORAL_PATTERNS
-]
+_COMPILED_PATTERNS = [(re.compile(p, re.IGNORECASE), fn) for p, fn in _TEMPORAL_PATTERNS]
 
 
 def detect_temporal_query(

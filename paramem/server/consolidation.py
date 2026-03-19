@@ -71,9 +71,7 @@ def run_consolidation(
         logger.info("Extracting graph from session: %s", session_id)
         model.gradient_checkpointing_disable()
 
-        session_graph = extract_graph(
-            model, tokenizer, transcript, session_id, temperature=0.0
-        )
+        session_graph = extract_graph(model, tokenizer, transcript, session_id, temperature=0.0)
 
         if not session_graph.relations:
             logger.warning("No relations extracted from session %s", session_id)
@@ -94,13 +92,8 @@ def run_consolidation(
         session_buffer.mark_consolidated(session_ids)
         return {"status": "no_triples", "sessions": len(session_ids)}
 
-    logger.info(
-        "Regenerating QA from full graph: %d triples", len(all_triples)
-    )
-    relations = [
-        {"subject": s, "predicate": p, "object": o}
-        for s, p, o in all_triples
-    ]
+    logger.info("Regenerating QA from full graph: %d triples", len(all_triples))
+    relations = [{"subject": s, "predicate": p, "object": o} for s, p, o in all_triples]
     all_qa = generate_qa_from_relations(relations, model, tokenizer)
 
     if not all_qa:
@@ -108,9 +101,7 @@ def run_consolidation(
         session_buffer.mark_consolidated(session_ids)
         return {"status": "no_qa_pairs", "sessions": len(session_ids)}
 
-    logger.info(
-        "Generated %d QA pairs from %d triples", len(all_qa), len(all_triples)
-    )
+    logger.info("Generated %d QA pairs from %d triples", len(all_qa), len(all_triples))
 
     # Phase 3: Assign keys, retrain adapter from scratch
     keyed_pairs = assign_keys(all_qa)
@@ -144,13 +135,23 @@ def run_consolidation(
     with open(kp_path, "w") as f:
         json.dump(
             [
-                {k: v for k, v in kp.items() if k in (
-                    "key", "question", "answer",
-                    "source_predicate", "source_subject", "source_object",
-                )}
+                {
+                    k: v
+                    for k, v in kp.items()
+                    if k
+                    in (
+                        "key",
+                        "question",
+                        "answer",
+                        "source_predicate",
+                        "source_subject",
+                        "source_object",
+                    )
+                }
                 for kp in keyed_pairs
             ],
-            f, indent=2,
+            f,
+            indent=2,
         )
 
     registry = build_enriched_registry(

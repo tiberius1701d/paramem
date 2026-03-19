@@ -166,18 +166,22 @@ class QueryRouter:
         for adapter_name in ["semantic", "episodic"]:
             if adapter_name in adapter_keys:
                 keys = list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY]
-                steps.append(RoutingStep(
-                    adapter_name=adapter_name,
-                    keys_to_probe=keys,
-                ))
+                steps.append(
+                    RoutingStep(
+                        adapter_name=adapter_name,
+                        keys_to_probe=keys,
+                    )
+                )
 
         # Include any other adapters (personas, etc.)
         for adapter_name, keys in adapter_keys.items():
             if adapter_name not in ("semantic", "episodic"):
-                steps.append(RoutingStep(
-                    adapter_name=adapter_name,
-                    keys_to_probe=list(keys)[:MAX_KEYS_PER_QUERY],
-                ))
+                steps.append(
+                    RoutingStep(
+                        adapter_name=adapter_name,
+                        keys_to_probe=list(keys)[:MAX_KEYS_PER_QUERY],
+                    )
+                )
 
         return RoutingPlan(
             steps=steps,
@@ -204,10 +208,7 @@ class QueryRouter:
 
         # Fuzzy match on individual words and bigrams (fallback)
         words = text_lower.split()
-        candidates = words + [
-            f"{words[i]} {words[i + 1]}"
-            for i in range(len(words) - 1)
-        ]
+        candidates = words + [f"{words[i]} {words[i + 1]}" for i in range(len(words) - 1)]
 
         for candidate in candidates:
             for entity in self._entity_list:
@@ -217,9 +218,7 @@ class QueryRouter:
 
         return sorted(matched)
 
-    def _resolve_keys(
-        self, entities: list[str]
-    ) -> dict[str, set[str]]:
+    def _resolve_keys(self, entities: list[str]) -> dict[str, set[str]]:
         """Map entities to keys, grouped by adapter."""
         result: dict[str, set[str]] = {}
 

@@ -134,8 +134,7 @@ def select_characters(min_eval_qa: int = 50):
 
     if len(eligible) < 2:
         logger.warning(
-            "Only %d eligible characters (need 2 with eval_qa >= %d, "
-            "excluding %s). Falling back.",
+            "Only %d eligible characters (need 2 with eval_qa >= %d, excluding %s). Falling back.",
             len(eligible),
             min_eval_qa,
             EXCLUDED_CHARACTERS,
@@ -231,8 +230,7 @@ def main():
 
         # Save keyed_pairs and phase results for persona A
         kp_a_ser = [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_a
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed_a
         ]
         (output_dir / "persona_a").mkdir(parents=True, exist_ok=True)
         with open(output_dir / "persona_a" / "keyed_pairs.json", "w") as f:
@@ -284,8 +282,7 @@ def main():
 
         # Save keyed_pairs for persona B
         kp_b_ser = [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_b
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed_b
         ]
         (output_dir / "persona_b").mkdir(parents=True, exist_ok=True)
         with open(output_dir / "persona_b" / "keyed_pairs.json", "w") as f:
@@ -400,8 +397,7 @@ def main():
                 "source": source_b,
                 "pairs_count": len(qa_b),
                 "key_range": (
-                    f"graph{PERSONA_B_KEY_OFFSET}.."
-                    f"graph{PERSONA_B_KEY_OFFSET + len(keyed_b) - 1}"
+                    f"graph{PERSONA_B_KEY_OFFSET}..graph{PERSONA_B_KEY_OFFSET + len(keyed_b) - 1}"
                 ),
                 "training_time": time_b,
                 "training_loss": metrics_b.get("train_loss"),

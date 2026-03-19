@@ -151,9 +151,7 @@ def run_scale_point(
         param_similarities.append(sim)
 
     param_mean_sim = (
-        sum(param_similarities) / len(param_similarities)
-        if param_similarities
-        else 0.0
+        sum(param_similarities) / len(param_similarities) if param_similarities else 0.0
     )
     param_match_count = sum(1 for s in param_similarities if s >= MATCH_THRESHOLD)
 
@@ -193,7 +191,9 @@ def run_scale_point(
             for kp in keyed_pairs:
                 prompt = rag.format_prompt(kp["question"], tokenizer, top_k=3)
                 generated = generate_answer(
-                    model, tokenizer, prompt,
+                    model,
+                    tokenizer,
+                    prompt,
                     max_new_tokens=MAX_NEW_TOKENS,
                     temperature=0.0,
                 )
@@ -201,13 +201,15 @@ def run_scale_point(
                 is_match = sim >= MATCH_THRESHOLD
                 if is_match:
                     match_count += 1
-                rag_results.append({
-                    "question": kp["question"],
-                    "expected": kp["answer"],
-                    "generated": generated,
-                    "similarity": sim,
-                    "match": is_match,
-                })
+                rag_results.append(
+                    {
+                        "question": kp["question"],
+                        "expected": kp["answer"],
+                        "generated": generated,
+                        "similarity": sim,
+                        "match": is_match,
+                    }
+                )
 
         if isinstance(model, _PeftModel):
             with model.disable_adapter():

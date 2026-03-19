@@ -110,7 +110,8 @@ def run_smoke_test(model_name: str):
             buffer.append(session["session_id"], role, text)
     logger.info(
         "  Buffered %d sessions, %d pending",
-        len(SMOKE_CONVERSATIONS), buffer.pending_count,
+        len(SMOKE_CONVERSATIONS),
+        buffer.pending_count,
     )
 
     # Step 4: Run consolidation

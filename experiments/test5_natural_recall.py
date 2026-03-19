@@ -74,9 +74,28 @@ def match_recalled_facts(
         answer_words = set(qa["answer"].lower().split())
         gen_words = set(generated_lower.split())
         stop = {
-            "the", "a", "an", "is", "are", "was", "were", "in", "on", "at",
-            "to", "for", "of", "and", "or", "i", "my", "he", "she", "it",
-            "his", "her",
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "was",
+            "were",
+            "in",
+            "on",
+            "at",
+            "to",
+            "for",
+            "of",
+            "and",
+            "or",
+            "i",
+            "my",
+            "he",
+            "she",
+            "it",
+            "his",
+            "her",
         }
         answer_words -= stop
         gen_words -= stop
@@ -105,7 +124,9 @@ def main():
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument(
-        "--character", type=str, default=DEFAULT_CHARACTER,
+        "--character",
+        type=str,
+        default=DEFAULT_CHARACTER,
         help="PerLTQA character name (default: Liang Xin)",
     )
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
@@ -195,9 +216,7 @@ def main():
         for pk in recall_result["per_key"]:
             recalled = pk.get("recalled")
             if recalled and "answer" in recalled:
-                kp_match = next(
-                    (kp for kp in keyed_pairs if kp["key"] == pk["key"]), None
-                )
+                kp_match = next((kp for kp in keyed_pairs if kp["key"] == pk["key"]), None)
                 if kp_match:
                     sim = compute_similarity(kp_match["answer"], recalled["answer"])
                 else:
@@ -208,8 +227,7 @@ def main():
             keyed_similarities.append(sim)
 
         keyed_mean_sim = (
-            sum(keyed_similarities) / len(keyed_similarities)
-            if keyed_similarities else 0.0
+            sum(keyed_similarities) / len(keyed_similarities) if keyed_similarities else 0.0
         )
         keyed_match_count = sum(1 for s in keyed_similarities if s >= MATCH_THRESHOLD)
 
@@ -227,25 +245,31 @@ def main():
         for kp in keyed_pairs:
             prompt = _format_inference_prompt(kp["question"], tokenizer)
             generated = generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=200, temperature=0.0,
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=200,
+                temperature=0.0,
             )
             sim = compute_similarity(kp["answer"], generated)
             is_match = sim >= MATCH_THRESHOLD
             if is_match:
                 pq_match_count += 1
-            per_question_results.append({
-                "key": kp["key"],
-                "question": kp["question"],
-                "expected": kp["answer"],
-                "generated": generated,
-                "similarity": sim,
-                "match": is_match,
-            })
+            per_question_results.append(
+                {
+                    "key": kp["key"],
+                    "question": kp["question"],
+                    "expected": kp["answer"],
+                    "generated": generated,
+                    "similarity": sim,
+                    "match": is_match,
+                }
+            )
 
         pq_mean_sim = (
             sum(r["similarity"] for r in per_question_results) / len(per_question_results)
-            if per_question_results else 0.0
+            if per_question_results
+            else 0.0
         )
 
         print(
@@ -261,8 +285,11 @@ def main():
         for prompt_text in NATURAL_PROMPTS:
             prompt = _format_inference_prompt(prompt_text, tokenizer)
             generated = generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=300, temperature=0.0,
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=300,
+                temperature=0.0,
             )
             # Score against keyed_pairs (post-distillation), not original qa_pairs
             # Note: broad probes use softer threshold (0.6 + keyword overlap)
@@ -274,12 +301,14 @@ def main():
             count = len(matched)
             print(f"  [{count:>2} facts] {prompt_text[:60]}")
 
-            natural_probes.append({
-                "prompt": prompt_text,
-                "generated": generated,
-                "matched_facts": matched,
-                "num_matched": count,
-            })
+            natural_probes.append(
+                {
+                    "prompt": prompt_text,
+                    "generated": generated,
+                    "matched_facts": matched,
+                    "num_matched": count,
+                }
+            )
 
         unique_recalled = len(all_recalled_answers)
 
@@ -315,16 +344,8 @@ def main():
             f"{recall_result['exact_count']}/{total} "
             f"(conf={recall_result['mean_confidence']:.3f})"
         )
-        print(
-            f"  Keyed recall (embed):    "
-            f"{keyed_match_count}/{total} "
-            f"(sim={keyed_mean_sim:.3f})"
-        )
-        print(
-            f"  Per-question natural:    "
-            f"{pq_match_count}/{total} "
-            f"(sim={pq_mean_sim:.3f})"
-        )
+        print(f"  Keyed recall (embed):    {keyed_match_count}/{total} (sim={keyed_mean_sim:.3f})")
+        print(f"  Per-question natural:    {pq_match_count}/{total} (sim={pq_mean_sim:.3f})")
         print(
             f"  Broad natural (unique):  "
             f"{unique_recalled}/{total} "

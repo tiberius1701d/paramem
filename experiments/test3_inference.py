@@ -241,10 +241,7 @@ def format_recall_reason_prompt(
     """
     from paramem.models.loader import adapt_messages
 
-    facts_block = "\n".join(
-        f"Q: {f['question']}\nA: {f['answer']}"
-        for f in reconstructed_facts
-    )
+    facts_block = "\n".join(f"Q: {f['question']}\nA: {f['answer']}" for f in reconstructed_facts)
 
     user_content = f"Context:\n{facts_block}\n\nQuestion: {question}"
 
@@ -310,9 +307,7 @@ def evaluate_condition(
 
         input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
         n_input = input_ids.shape[1]
-        n_output = len(
-            tokenizer.encode(generated, add_special_tokens=False)
-        )
+        n_output = len(tokenizer.encode(generated, add_special_tokens=False))
         total_input_tokens += n_input
         total_output_tokens += n_output
         similarity = compute_similarity(iq["expected_answer"], generated)
@@ -330,11 +325,7 @@ def evaluate_condition(
             }
         )
 
-        status = (
-            "OK" if similarity > 0.5
-            else "WEAK" if similarity > 0.3
-            else "MISS"
-        )
+        status = "OK" if similarity > 0.5 else "WEAK" if similarity > 0.3 else "MISS"
         print(f"  [{status}] {q[:70]}")
         print(f"       Score: {similarity:.3f}")
 
@@ -462,8 +453,10 @@ def main():
             model, tokenizer, keyed_pairs, registry, adapter_name="episodic"
         )
         reconstruction_time = time.time() - t_recon_start
-        print(f"  Reconstructed {len(reconstructed)}/{len(keyed_pairs)} facts "
-              f"in {reconstruction_time:.1f}s")
+        print(
+            f"  Reconstructed {len(reconstructed)}/{len(keyed_pairs)} facts "
+            f"in {reconstruction_time:.1f}s"
+        )
 
         # Measure reconstruction quality against originals
         recon_sims = []
@@ -473,12 +466,12 @@ def main():
             if orig:
                 sim = compute_similarity(orig["answer"], r["answer"])
                 recon_sims.append(sim)
-        mean_recon_sim = (
-            sum(recon_sims) / len(recon_sims) if recon_sims else 0.0
+        mean_recon_sim = sum(recon_sims) / len(recon_sims) if recon_sims else 0.0
+        print(
+            f"  Reconstruction quality: mean similarity {mean_recon_sim:.3f} "
+            f"({sum(1 for s in recon_sims if s >= 0.75)}/{len(recon_sims)} "
+            f"above 0.75)"
         )
-        print(f"  Reconstruction quality: mean similarity {mean_recon_sim:.3f} "
-              f"({sum(1 for s in recon_sims if s >= 0.75)}/{len(recon_sims)} "
-              f"above 0.75)")
 
         # Phase 5: Generate inference questions using the LLM
         print(f"\n--- Phase 5: Generating {args.num_inference} inference questions ---")
@@ -529,9 +522,7 @@ def main():
             model,
             tokenizer,
             inference_questions,
-            prompt_fn=lambda q: format_recall_reason_prompt(
-                q, reconstructed, tokenizer
-            ),
+            prompt_fn=lambda q: format_recall_reason_prompt(q, reconstructed, tokenizer),
             context_time=reconstruction_time,
         )
 
@@ -556,13 +547,8 @@ def main():
             rag_load_time = time.time() - t_rag_load
 
             def _rag_all_prompt(question):
-                context = "\n".join(
-                    f"Q: {qa['question']}\nA: {qa['answer']}"
-                    for qa in rag_facts
-                )
-                user_content = (
-                    f"Context:\n{context}\n\nQuestion: {question}"
-                )
+                context = "\n".join(f"Q: {qa['question']}\nA: {qa['answer']}" for qa in rag_facts)
+                user_content = f"Context:\n{context}\n\nQuestion: {question}"
                 messages = adapt_messages(
                     [
                         {"role": "system", "content": _sys_prompt},
@@ -571,7 +557,9 @@ def main():
                     tokenizer,
                 )
                 return tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
 
             if isinstance(model, _PeftModel):
@@ -613,17 +601,17 @@ def main():
         print(f"{'=' * 72}")
         print(f"  Model:               {bench_name}")
         print(f"  Facts trained:       {len(qa_pairs)}")
-        print(f"  Base fact recall:    "
-              f"{recall_result['exact_count']}/{recall_result['total']}")
-        print(f"  Reconstructed:       "
-              f"{len(reconstructed)}/{len(keyed_pairs)} "
-              f"(quality={mean_recon_sim:.3f})")
+        print(f"  Base fact recall:    {recall_result['exact_count']}/{recall_result['total']}")
+        print(
+            f"  Reconstructed:       "
+            f"{len(reconstructed)}/{len(keyed_pairs)} "
+            f"(quality={mean_recon_sim:.3f})"
+        )
         print(f"  Inference questions: {len(inference_questions)}")
         print()
         print(_fmt("PM Recall+Reason", result_pm))
         print(_fmt("PM Adapter-Only", result_adapter_only))
-        print("    ^ diagnostic only — different system prompt, "
-              "not comparable to PM/RAG above")
+        print("    ^ diagnostic only — different system prompt, not comparable to PM/RAG above")
         if rag_all_result:
             print(_fmt("RAG all facts", rag_all_result))
         print()

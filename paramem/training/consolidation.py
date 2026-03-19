@@ -833,25 +833,13 @@ class ConsolidationLoop:
         has_peft = hasattr(self.model, "peft_config")
         if not has_peft or "episodic" not in self.model.peft_config:
             logger.info("Creating episodic adapter")
-            self.model = create_adapter(
-                self.model, self.episodic_config, "episodic"
-            )
-        if (
-            self.config.promotion_threshold > 0
-            and "semantic" not in self.model.peft_config
-        ):
+            self.model = create_adapter(self.model, self.episodic_config, "episodic")
+        if self.config.promotion_threshold > 0 and "semantic" not in self.model.peft_config:
             logger.info("Creating semantic adapter")
-            self.model = create_adapter(
-                self.model, self.semantic_config, "semantic"
-            )
-        if (
-            self.procedural_config is not None
-            and "procedural" not in self.model.peft_config
-        ):
+            self.model = create_adapter(self.model, self.semantic_config, "semantic")
+        if self.procedural_config is not None and "procedural" not in self.model.peft_config:
             logger.info("Creating procedural adapter")
-            self.model = create_adapter(
-                self.model, self.procedural_config, "procedural"
-            )
+            self.model = create_adapter(self.model, self.procedural_config, "procedural")
         return self.model
 
     def _disable_gradient_checkpointing(self) -> None:

@@ -52,17 +52,13 @@ def handle_chat(
     # Path 1: Temporal query (registry date filter)
     date_range = detect_temporal_query(text)
     if date_range:
-        return _handle_temporal_query(
-            text, date_range, history, model, tokenizer, config
-        )
+        return _handle_temporal_query(text, date_range, history, model, tokenizer, config)
 
     # Path 2: Entity-routed query (targeted key probing)
     if router is not None:
         plan = router.route(text)
         if plan.strategy == "targeted_probe" and plan.steps:
-            return _handle_routed_query(
-                text, plan, history, model, tokenizer, config
-            )
+            return _handle_routed_query(text, plan, history, model, tokenizer, config)
 
     # Path 3: Standard (facts in weights, no probing)
     return _handle_standard_query(text, history, model, tokenizer, config)
@@ -139,9 +135,7 @@ def _handle_temporal_query(
     for key in matching_keys:
         result = probe_key(model, tokenizer, key, registry=registry)
         if result and "failure_reason" not in result:
-            recalled_facts.append(
-                f"Q: {result.get('question', '')}\nA: {result.get('answer', '')}"
-            )
+            recalled_facts.append(f"Q: {result.get('question', '')}\nA: {result.get('answer', '')}")
 
     if not recalled_facts:
         logger.info("All probed keys failed, falling back to standard path")
@@ -204,44 +198,32 @@ def _handle_routed_query(
         if hasattr(model, "peft_config") and step.adapter_name in model.peft_config:
             switch_adapter(model, step.adapter_name)
         elif step.adapter_name != "episodic":
-            logger.info(
-                "Adapter %s not loaded, skipping", step.adapter_name
-            )
+            logger.info("Adapter %s not loaded, skipping", step.adapter_name)
             continue
 
         for key in step.keys_to_probe:
             result = probe_key(model, tokenizer, key, registry=registry)
             if result and "failure_reason" not in result:
                 recalled_facts.append(
-                    f"Q: {result.get('question', '')}\n"
-                    f"A: {result.get('answer', '')}"
+                    f"Q: {result.get('question', '')}\nA: {result.get('answer', '')}"
                 )
                 probed_keys.append(key)
 
     if not recalled_facts:
         logger.info(
-            "No facts recalled from routed keys (entities=%s), "
-            "falling back to standard path",
+            "No facts recalled from routed keys (entities=%s), falling back to standard path",
             plan.matched_entities,
         )
-        return _handle_standard_query(
-            text, history, model, tokenizer, config
-        )
+        return _handle_standard_query(text, history, model, tokenizer, config)
 
     # Build prompt with recalled facts as context
     facts_context = "\n\n".join(recalled_facts)
     augmented_text = (
-        f"Based on the following facts:\n\n"
-        f"{facts_context}\n\n"
-        f"Answer the question: {text}"
+        f"Based on the following facts:\n\n{facts_context}\n\nAnswer the question: {text}"
     )
 
-    messages = _build_messages(
-        augmented_text, history, config.voice.system_prompt, tokenizer
-    )
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    messages = _build_messages(augmented_text, history, config.voice.system_prompt, tokenizer)
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     response = generate_answer(
         model,

@@ -310,13 +310,9 @@ def create_adapter(
 
     # Ensure base_model_name_or_path is set for save/reload
     if peft_model.peft_config[adapter_name].base_model_name_or_path is None:
-        base_name = getattr(
-            peft_model.get_base_model().config, "_name_or_path", None
-        )
+        base_name = getattr(peft_model.get_base_model().config, "_name_or_path", None)
         if base_name:
-            peft_model.peft_config[adapter_name].base_model_name_or_path = (
-                base_name
-            )
+            peft_model.peft_config[adapter_name].base_model_name_or_path = base_name
 
     trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in peft_model.parameters())

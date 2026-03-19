@@ -76,9 +76,7 @@ class ServerAdapterConfig:
 
 @dataclass
 class ServerAdaptersConfig:
-    episodic: ServerAdapterConfig = field(
-        default_factory=ServerAdapterConfig
-    )
+    episodic: ServerAdapterConfig = field(default_factory=ServerAdapterConfig)
     semantic: ServerAdapterConfig = field(
         default_factory=lambda: ServerAdapterConfig(
             enabled=False, rank=24, alpha=48, learning_rate=1e-5
@@ -104,15 +102,9 @@ class ServerConfig:
     registry_path: Path = Path("data/ha/registry.json")
     graph_path: Path = Path("data/ha/graph.json")
     session_dir: Path = Path("data/ha/sessions")
-    adapters: ServerAdaptersConfig = field(
-        default_factory=ServerAdaptersConfig
-    )
-    training: ServerTrainingConfig = field(
-        default_factory=ServerTrainingConfig
-    )
-    consolidation: ConsolidationScheduleConfig = field(
-        default_factory=ConsolidationScheduleConfig
-    )
+    adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
+    training: ServerTrainingConfig = field(default_factory=ServerTrainingConfig)
+    consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
 
@@ -185,12 +177,12 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
         proc = adapters_raw.get("procedural", {})
         config.adapters = ServerAdaptersConfig(
             episodic=ServerAdapterConfig(**ep) if ep else ServerAdapterConfig(),
-            semantic=ServerAdapterConfig(**sem) if sem else ServerAdapterConfig(
-                rank=24, alpha=48, learning_rate=1e-5
-            ),
-            procedural=ServerAdapterConfig(**proc) if proc else ServerAdapterConfig(
-                rank=12, alpha=24, learning_rate=5e-5
-            ),
+            semantic=ServerAdapterConfig(**sem)
+            if sem
+            else ServerAdapterConfig(rank=24, alpha=48, learning_rate=1e-5),
+            procedural=ServerAdapterConfig(**proc)
+            if proc
+            else ServerAdapterConfig(rank=12, alpha=24, learning_rate=5e-5),
         )
     config.training = ServerTrainingConfig(**raw.get("training", {}))
     config.consolidation = ConsolidationScheduleConfig(**raw.get("consolidation", {}))

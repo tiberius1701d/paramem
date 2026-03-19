@@ -133,9 +133,7 @@ def measure_bare_latency(model, tokenizer, keyed_pairs, num_queries=20):
     available = len(keyed_pairs) - NUM_WARMUP
     num_queries = min(num_queries, available)
     prompts = [
-        _format_inference_prompt(
-            f"Recall the QA pair stored under key '{kp['key']}'.", tokenizer
-        )
+        _format_inference_prompt(f"Recall the QA pair stored under key '{kp['key']}'.", tokenizer)
         for kp in keyed_pairs[: num_queries + NUM_WARMUP]
     ]
 
@@ -143,8 +141,11 @@ def measure_bare_latency(model, tokenizer, keyed_pairs, num_queries=20):
         # Warm-up
         for prompt in prompts[:NUM_WARMUP]:
             generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=MAX_NEW_TOKENS, temperature=0.0,
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=0.0,
             )
 
         latencies = []
@@ -152,8 +153,11 @@ def measure_bare_latency(model, tokenizer, keyed_pairs, num_queries=20):
         for prompt in prompts[NUM_WARMUP : NUM_WARMUP + num_queries]:
             start = time.time()
             generated = generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=MAX_NEW_TOKENS, temperature=0.0,
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=0.0,
             )
             latencies.append(time.time() - start)
             token_counts.append(len(tokenizer.encode(generated)))
@@ -185,8 +189,11 @@ def measure_rag_latency(rag, model, tokenizer, keyed_pairs, num_queries=20):
         for qa in queries[:NUM_WARMUP]:
             prompt = rag.format_prompt(qa["question"], tokenizer, top_k=3)
             generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=MAX_NEW_TOKENS, temperature=0.0,
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=0.0,
             )
 
         latencies = []
@@ -195,8 +202,11 @@ def measure_rag_latency(rag, model, tokenizer, keyed_pairs, num_queries=20):
             start = time.time()
             prompt = rag.format_prompt(qa["question"], tokenizer, top_k=3)
             generated = generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=MAX_NEW_TOKENS, temperature=0.0,
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=0.0,
             )
             latencies.append(time.time() - start)
             token_counts.append(len(tokenizer.encode(generated)))
@@ -225,8 +235,11 @@ def measure_parametric_recall(model, tokenizer, keyed_pairs, registry, adapter_n
 
     for kp in keyed_pairs:
         recalled = probe_key(
-            model, tokenizer, kp["key"],
-            max_new_tokens=MAX_NEW_TOKENS, registry=registry,
+            model,
+            tokenizer,
+            kp["key"],
+            max_new_tokens=MAX_NEW_TOKENS,
+            registry=registry,
         )
         generated = recalled.get("answer", "") if recalled else ""
         raw_output = recalled.get("raw_output", "") if recalled else ""
@@ -237,16 +250,18 @@ def measure_parametric_recall(model, tokenizer, keyed_pairs, registry, adapter_n
         if is_match:
             match_count += 1
 
-        results.append({
-            "key": kp["key"],
-            "question": kp["question"],
-            "expected": kp["answer"],
-            "generated": generated,
-            "raw_output": raw_output,
-            "similarity": similarity,
-            "simhash_confidence": confidence,
-            "match": is_match,
-        })
+        results.append(
+            {
+                "key": kp["key"],
+                "question": kp["question"],
+                "expected": kp["answer"],
+                "generated": generated,
+                "raw_output": raw_output,
+                "similarity": similarity,
+                "simhash_confidence": confidence,
+                "match": is_match,
+            }
+        )
 
     total = len(keyed_pairs) or 1
     return {
@@ -275,21 +290,26 @@ def measure_rag_recall(rag, model, tokenizer, keyed_pairs):
         for kp in keyed_pairs:
             prompt = rag.format_prompt(kp["question"], tokenizer, top_k=3)
             generated = generate_answer(
-                model, tokenizer, prompt,
-                max_new_tokens=MAX_NEW_TOKENS, temperature=0.0,
+                model,
+                tokenizer,
+                prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=0.0,
             )
             sim = compute_similarity(kp["answer"], generated)
             is_match = sim >= MATCH_THRESHOLD
             if is_match:
                 match_count += 1
-            results.append({
-                "key": kp["key"],
-                "question": kp["question"],
-                "expected": kp["answer"],
-                "generated": generated,
-                "similarity": sim,
-                "match": is_match,
-            })
+            results.append(
+                {
+                    "key": kp["key"],
+                    "question": kp["question"],
+                    "expected": kp["answer"],
+                    "generated": generated,
+                    "similarity": sim,
+                    "match": is_match,
+                }
+            )
 
     if isinstance(model, _PeftModel):
         with model.disable_adapter():
@@ -321,10 +341,7 @@ def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_
     from peft import PeftModel as _PeftModel
 
     if isinstance(model, _PeftModel):
-        stale = [
-            n for n in list(model.peft_config.keys())
-            if n.startswith("episodic_s")
-        ]
+        stale = [n for n in list(model.peft_config.keys()) if n.startswith("episodic_s")]
         if stale:
             # Unwrap to base model (no merge — adapters are discarded)
             model = model.base_model.model
@@ -335,10 +352,7 @@ def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_
             gc.collect()
             torch.cuda.empty_cache()
 
-    subset_qa = [
-        {"question": kp["question"], "answer": kp["answer"]}
-        for kp in keyed_pairs[:scale]
-    ]
+    subset_qa = [{"question": kp["question"], "answer": kp["answer"]} for kp in keyed_pairs[:scale]]
 
     scale_dir = output_dir / f"scale_{scale}"
     model, subset_kp, subset_registry, train_time, metrics = train_indexed_keys(
@@ -356,9 +370,7 @@ def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_
     # Save final adapter weights only (not training checkpoints)
     # for accurate storage measurement
     final_adapter_dir = scale_dir / "final_adapter"
-    model.save_pretrained(
-        final_adapter_dir, selected_adapters=[adapter_name]
-    )
+    model.save_pretrained(final_adapter_dir, selected_adapters=[adapter_name])
 
     return model, subset_kp, subset_registry, adapter_name, train_time, metrics
 
@@ -366,13 +378,17 @@ def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_
 def main():
     parser = argparse.ArgumentParser(description="Test 6: Parametric vs RAG")
     parser.add_argument(
-        "--scales", type=str, default=DEFAULT_SCALES,
+        "--scales",
+        type=str,
+        default=DEFAULT_SCALES,
         help="Comma-separated scale points",
     )
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument(
-        "--character", type=str, default=DEFAULT_CHARACTER,
+        "--character",
+        type=str,
+        default=DEFAULT_CHARACTER,
         help="PerLTQA character name (default: Liang Xin)",
     )
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
@@ -396,7 +412,9 @@ def main():
         logger.error(
             "Need at least %d QA pairs but only have %d from %s. "
             "Reduce --scales or provide more data.",
-            max_needed, len(qa_pairs), source,
+            max_needed,
+            len(qa_pairs),
+            source,
         )
         sys.exit(1)
 
@@ -422,13 +440,15 @@ def main():
             logger.warning(
                 "Distillation produced %d keyed pairs, less than max scale %d. "
                 "Capping scales accordingly.",
-                len(all_keyed_pairs), max(model_scales),
+                len(all_keyed_pairs),
+                max(model_scales),
             )
             model_scales = [s for s in model_scales if s <= len(all_keyed_pairs)]
 
         logger.info(
             "Distilled %d keyed pairs from %d QA pairs",
-            len(all_keyed_pairs), len(qa_pairs),
+            len(all_keyed_pairs),
+            len(qa_pairs),
         )
 
         # Save distilled pairs for resume
@@ -445,11 +465,14 @@ def main():
         for scale in model_scales:
             print(f"\n--- Scale: {scale} keys ---")
 
-            model, keyed_pairs, registry, adapter_name, train_time, metrics = (
-                train_at_scale(
-                    model, tokenizer, all_keyed_pairs, all_registry,
-                    scale, args, output_dir,
-                )
+            model, keyed_pairs, registry, adapter_name, train_time, metrics = train_at_scale(
+                model,
+                tokenizer,
+                all_keyed_pairs,
+                all_registry,
+                scale,
+                args,
+                output_dir,
             )
 
             scale_dir = output_dir / f"scale_{scale}"
@@ -475,7 +498,11 @@ def main():
 
             print("  Measuring parametric latency...")
             param_latency = measure_inference_latency(
-                model, tokenizer, keyed_pairs, registry, adapter_name,
+                model,
+                tokenizer,
+                keyed_pairs,
+                registry,
+                adapter_name,
             )
 
             # RAG: index the same keyed_pairs (same questions + answers as PM)
@@ -486,8 +513,7 @@ def main():
 
             embedding_size = rag.embeddings.nbytes if rag.embeddings is not None else 0
             qa_text_size = sum(
-                len(kp["question"].encode()) + len(kp["answer"].encode())
-                for kp in keyed_pairs
+                len(kp["question"].encode()) + len(kp["answer"].encode()) for kp in keyed_pairs
             )
 
             print("  Measuring RAG latency...")
@@ -497,7 +523,11 @@ def main():
 
             print("  Measuring parametric recall quality...")
             param_recall = measure_parametric_recall(
-                model, tokenizer, keyed_pairs, registry, adapter_name,
+                model,
+                tokenizer,
+                keyed_pairs,
+                registry,
+                adapter_name,
             )
 
             print("  Measuring RAG recall quality...")
@@ -560,9 +590,10 @@ def main():
             bm = scale_results[str(scale)]["bare_model"]
             rg = scale_results[str(scale)]["rag"]
             adapter_overhead = param_latency["mean_ms"] - bare_latency["mean_ms"]
-            bm_lat = bm['inference_latency']
-            pm_lat = pm['inference_latency']
-            rg_lat = rg['inference_latency']
+            bm_lat = bm["inference_latency"]
+            pm_lat = pm["inference_latency"]
+            rg_lat = rg["inference_latency"]
+
             def _tps(lat):
                 if "tokens_per_second" in lat:
                     return f", {lat['tokens_per_second']:.1f} tok/s"
@@ -571,9 +602,7 @@ def main():
             bm_tps = _tps(bm_lat)
             pm_tps = _tps(pm_lat)
             rg_tps = _tps(rg_lat)
-            print(
-                f"  Bare model:  {bm_lat['mean_ms']:.0f}ms/query{bm_tps}"
-            )
+            print(f"  Bare model:  {bm_lat['mean_ms']:.0f}ms/query{bm_tps}")
             print(
                 f"  Parametric:  {pm['total_size_kb']:.1f} KB "
                 f"(adapter {pm['adapter_size_kb']:.1f} + "

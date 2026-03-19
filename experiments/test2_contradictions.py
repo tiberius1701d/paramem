@@ -225,7 +225,9 @@ def run_strategy(
         if len(qa_pairs) != len(triples):
             logger.warning(
                 "QA count mismatch session %d: %d triples → %d QA pairs",
-                session_num, len(triples), len(qa_pairs),
+                session_num,
+                len(triples),
+                len(qa_pairs),
             )
 
         # Unwrap to base model before each session's fresh adapter
@@ -270,9 +272,7 @@ def run_strategy(
         # Each keyed_pair carries source_predicate from QA generation,
         # and each chain has a unique predicate. This avoids threshold-
         # sensitive embedding matching entirely.
-        predicate_to_chain = {
-            chain["predicate"]: chain["id"] for chain in enriched_chains
-        }
+        predicate_to_chain = {chain["predicate"]: chain["id"] for chain in enriched_chains}
 
         # Build key → recalled answer lookup
         key_to_recalled = {}
@@ -301,9 +301,7 @@ def run_strategy(
                     break
 
             sim_to_current = (
-                compute_similarity(current_answer, recalled_answer)
-                if recalled_answer
-                else 0.0
+                compute_similarity(current_answer, recalled_answer) if recalled_answer else 0.0
             )
             per_chain[chain_id] = {
                 "current_answer": current_answer,
