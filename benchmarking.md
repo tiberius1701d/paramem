@@ -842,17 +842,53 @@ perturbations to the LoRA weight matrices disrupt this precision. This contrasts
 with task-level merging (e.g., translation + summarization) where approximate
 outputs are acceptable.
 
+### Literature context
+
+This is a known limitation. Recent work confirms that linear weight averaging
+causes destructive interference for LoRA adapters on structured tasks:
+
+- **"Unraveling LoRA Interference"** (ACL 2025) shows that aligned LoRA weight
+  vectors interfere when summed and proposes OSRM (orthogonal subspace
+  training) as a mitigation — requires retraining from scratch.
+- **"Understanding LoRA as Knowledge Memory"** (2026) systematically studies
+  LoRA as a factual knowledge store and finds that combining multiple LoRAs
+  for knowledge does not compose well.
+- **"Position: Pause Recycling LoRAs"** (ICML 2025) argues that adaptive
+  merging relies on shallow pattern matching, not genuine cross-task transfer.
+
+The core insight: merging works for tasks with shared "solution templates"
+(reasoning patterns, code structures) where approximate outputs are acceptable.
+It fails for tasks requiring distinct memorized mappings — which is exactly
+what indexed key recall does.
+
+### Alternative: additive multi-adapter composition
+
+PEFT supports activating multiple adapters simultaneously via
+`model.set_adapter(["adapter_a", "adapter_b"])`. Unlike merging, this keeps
+adapter weights separate and sums their LoRA deltas at each forward pass. For
+non-overlapping input domains (different key namespaces), only one adapter's
+delta produces a meaningful signal per query — the sum should approximate the
+correct single-adapter output. To be validated.
+
+Other approaches from literature:
+- **TIES-Merging** (Yadav et al. 2023): trim, elect signs, merge — resolves
+  sign conflicts. Available in PEFT (`combination_type="ties"`).
+- **DARE** (Yu et al. 2024): drop and rescale — prunes redundant parameters
+  before merging. Available as `combination_type="dare_ties"`.
+- **LoRI** (COLM 2025): freezes A matrices as random projections, trains
+  sparse B with task-specific masks. Orthogonal by construction.
+- **MoLoRA** (2026): per-token routing across adapters — conceptually ideal
+  for key-based routing but requires a trained router.
+
 ### Implications
 
-1. **Adapter switching remains necessary** for multi-adapter architectures.
-   The routing layer (`paramem/server/router.py`) and `switch_adapter` are
-   required infrastructure, not optimizations to eliminate.
-2. **Linear merging may work for less structured tasks** (conversational style,
-   behavioral preferences) where exact token sequences don't matter. The
-   procedural adapter is a candidate for merge with episodic/semantic.
-3. **Future exploration:** SVD merging (`combination_type="svd"`) or higher-rank
-   adapters may preserve more structure. TIES-Merging could resolve sign
-   conflicts in the weight matrices.
+1. **Linear merging fails for indexed key recall.** This is confirmed by both
+   our experiments and recent literature. Not a hyperparameter issue.
+2. **Additive composition (`set_adapters`) is the next candidate.** Non-
+   overlapping key domains should make this viable — to be tested.
+3. **For production multi-adapter serving:** if composition fails, adapter
+   switching via `set_adapter` remains fast (metadata flip, no weight loading)
+   and is guaranteed to work.
 
 ### Bug fixes discovered during Test 7b
 
