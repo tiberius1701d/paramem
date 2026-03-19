@@ -3,12 +3,19 @@
 Trains two separate personas from PerLTQA on the same base model and tests:
 1. Same recall rates across different personas?
 2. Cross-contamination (querying persona A facts with persona B adapter)?
-3. Architecture generalizes beyond one specific set of facts?
+3. Adapter isolation: persona A recall unchanged after adding persona B?
+4. Architecture generalizes beyond one specific set of facts?
+
+Key namespaces are non-overlapping (persona A: graph1..N, persona B: graph1001..1000+N)
+to ensure cross-contamination probes test true isolation, not namespace collision.
+
+Uses skip_distill=True since eval QA pairs are already well-formed Q+A.
+Excludes "Liang Xin" from character selection (used in Tests 1-5).
 
 Usage:
     python experiments/test7_second_persona.py
     python experiments/test7_second_persona.py --model gemma
-    python experiments/test7_second_persona.py --char-a <id> --char-b <id>
+    python experiments/test7_second_persona.py --char-a "Chen Wei" --char-b "Li Na"
 """
 
 import argparse
@@ -37,6 +44,11 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = project_root / "outputs" / "test7_second_persona"
+
+# Characters used in other tests — exclude for independence
+EXCLUDED_CHARACTERS = {"Liang Xin"}
+
+PERSONA_B_KEY_OFFSET = 1001
 
 # Fallback synthetic persona if PerLTQA not available
 PERSONA_B_FALLBACK = [
@@ -102,17 +114,36 @@ PERSONA_B_FALLBACK = [
 ]
 
 
-def select_characters():
-    """Select two characters from PerLTQA, or use fallback."""
+def select_characters(min_eval_qa: int = 50):
+    """Select two characters from PerLTQA with enough eval QA pairs.
+
+    Excludes characters used in other tests. Returns (char_a, char_b) or
+    (None, None) if insufficient characters available.
+    """
     if not is_available():
         return None, None
 
     chars = list_characters()
-    if len(chars) < 2:
+
+    # Filter: enough eval QA, not excluded
+    eligible = {
+        name: stats
+        for name, stats in chars.items()
+        if stats["eval_qa"] >= min_eval_qa and name not in EXCLUDED_CHARACTERS
+    }
+
+    if len(eligible) < 2:
+        logger.warning(
+            "Only %d eligible characters (need 2 with eval_qa >= %d, "
+            "excluding %s). Falling back.",
+            len(eligible),
+            min_eval_qa,
+            EXCLUDED_CHARACTERS,
+        )
         return None, None
 
-    # Pick the two characters with the most QA pairs
-    sorted_chars = sorted(chars.items(), key=lambda x: -x[1]["dialogues"])
+    # Sort by eval_qa count (descending)
+    sorted_chars = sorted(eligible.items(), key=lambda x: -x[1]["eval_qa"])
     return sorted_chars[0][0], sorted_chars[1][0]
 
 
@@ -129,22 +160,39 @@ def main():
 
     base_output_dir = Path(args.output_dir)
 
-    # Select characters
-    if args.char_a and args.char_b:
+    # Select characters — require both or neither
+    if args.char_a or args.char_b:
+        if not (args.char_a and args.char_b):
+            parser.error("--char-a and --char-b must be specified together")
         char_a, char_b = args.char_a, args.char_b
     else:
-        char_a, char_b = select_characters()
+        char_a, char_b = select_characters(min_eval_qa=args.num_pairs)
 
     # Load data for both personas
+    # Intentionally using eval QA for training — skip_distill=True avoids
+    # lossy distillation round-trip, and Test 7 needs clean fact sets from
+    # two distinct people to isolate persona generalization from pipeline quality.
     qa_a, source_a = load_qa(char_a, max_pairs=args.num_pairs)
+    if not char_a:
+        char_a = "Alex (synthetic)"
+
     if char_b:
         qa_b, source_b = load_qa(char_b, max_pairs=args.num_pairs)
     else:
-        qa_b = PERSONA_B_FALLBACK[: args.num_pairs]
+        # Fallback: cap both personas to fallback size for fair comparison
+        char_b = "Jordan (synthetic)"
+        fallback_size = min(args.num_pairs, len(PERSONA_B_FALLBACK))
+        qa_b = PERSONA_B_FALLBACK[:fallback_size]
+        qa_a = qa_a[:fallback_size]
         source_b = "synthetic:persona_b_fallback"
+        logger.warning(
+            "Using synthetic fallback for persona B. "
+            "Both personas capped to %d pairs for fair comparison.",
+            fallback_size,
+        )
 
-    logger.info("Persona A: %d pairs from %s", len(qa_a), source_a)
-    logger.info("Persona B: %d pairs from %s", len(qa_b), source_b)
+    logger.info("Persona A: %s — %d pairs from %s", char_a, len(qa_a), source_a)
+    logger.info("Persona B: %s — %d pairs from %s", char_b, len(qa_b), source_b)
 
     for bench_name, bench_model_config in get_benchmark_models(args):
         print(f"\n{'=' * 72}")
@@ -154,7 +202,7 @@ def main():
         model, tokenizer, config = load_model_and_config(bench_model_config)
         output_dir = model_output_dir(base_output_dir, bench_name)
 
-        # Train Persona A
+        # Train Persona A (keys: graph1..graphN)
         print("\n--- Training Persona A ---")
         model, keyed_a, registry_a, time_a, metrics_a = train_indexed_keys(
             model,
@@ -165,6 +213,8 @@ def main():
             adapter_name="persona_a",
             output_dir=output_dir / "persona_a",
             run_name="persona-a",
+            skip_distill=True,
+            start_index=1,
         )
 
         recall_a = evaluate_indexed_recall(
@@ -192,6 +242,8 @@ def main():
             "experiment": "test7_second_persona",
             "model": bench_name,
             "model_id": bench_model_config.model_id,
+            "character_a": char_a,
+            "character_b": char_b,
             "persona_a": {
                 "source": source_a,
                 "pairs_count": len(qa_a),
@@ -203,7 +255,7 @@ def main():
         }
         save_results(partial_results, output_dir)
 
-        # Train Persona B
+        # Train Persona B (keys: graph1001..graph1000+N)
         print("\n--- Training Persona B ---")
         model, keyed_b, registry_b, time_b, metrics_b = train_indexed_keys(
             model,
@@ -214,6 +266,8 @@ def main():
             adapter_name="persona_b",
             output_dir=output_dir / "persona_b",
             run_name="persona-b",
+            skip_distill=True,
+            start_index=PERSONA_B_KEY_OFFSET,
         )
 
         recall_b = evaluate_indexed_recall(
@@ -237,7 +291,27 @@ def main():
         with open(output_dir / "persona_b" / "keyed_pairs.json", "w") as f:
             json.dump(kp_b_ser, f, indent=2)
 
-        # Cross-contamination test
+        # Re-evaluate persona A after persona B training (isolation check)
+        print("\n--- Re-evaluating Persona A (post persona B training) ---")
+        recall_a_after = evaluate_indexed_recall(
+            model,
+            tokenizer,
+            keyed_a,
+            registry_a,
+            adapter_name="persona_a",
+        )
+        print(
+            f"  Persona A (after B): "
+            f"{recall_a_after['exact_count']}/{recall_a_after['total']} recall "
+            f"(conf={recall_a_after['mean_confidence']:.3f})"
+        )
+        degradation = recall_a["exact_count"] - recall_a_after["exact_count"]
+        if degradation > 0:
+            print(f"  WARNING: {degradation} facts lost after adding persona B")
+        else:
+            print("  No degradation — adapter isolation confirmed")
+
+        # Cross-contamination test (non-overlapping key namespaces)
         print("\n--- Cross-Contamination Test ---")
         from paramem.models.loader import switch_adapter  # noqa: E402
         from paramem.training.indexed_memory import probe_all_keys  # noqa: E402
@@ -245,20 +319,21 @@ def main():
         model.gradient_checkpointing_disable()
 
         # Query persona A's keys with persona B's adapter active
-        # A successful probe (no failure_reason) means the fact leaked
+        # With non-overlapping namespaces, persona B was never trained on graph1..N
         switch_adapter(model, "persona_b")
         keys_a = [kp["key"] for kp in keyed_a]
         cross_ab = probe_all_keys(model, tokenizer, keys_a, registry=registry_a)
         leaked_ab = sum(1 for v in cross_ab.values() if "failure_reason" not in v)
 
         # Query persona B's keys with persona A's adapter active
+        # Persona A was never trained on graph1001..1000+N
         switch_adapter(model, "persona_a")
         keys_b = [kp["key"] for kp in keyed_b]
         cross_ba = probe_all_keys(model, tokenizer, keys_b, registry=registry_b)
         leaked_ba = sum(1 for v in cross_ba.values() if "failure_reason" not in v)
 
-        print(f"  A facts from B adapter: {leaked_ab}/{len(keys_a)} leaked")
-        print(f"  B facts from A adapter: {leaked_ba}/{len(keys_b)} leaked")
+        print(f"  A keys from B adapter: {leaked_ab}/{len(keys_a)} leaked")
+        print(f"  B keys from A adapter: {leaked_ba}/{len(keys_b)} leaked")
 
         # Serialize cross-contamination probe results with raw output
         def _serialize_probes(probes: dict) -> list[dict]:
@@ -293,6 +368,11 @@ def main():
             f"{recall_b['exact_count']}/{recall_b['total']} recall, "
             f"conf={recall_b['mean_confidence']:.3f}, time={time_b:.0f}s"
         )
+        print(
+            f"  Persona A after B: "
+            f"{recall_a_after['exact_count']}/{recall_a_after['total']} recall "
+            f"(degradation: {degradation})"
+        )
         print(f"  Cross-contamination A->B: {leaked_ab}/{len(keys_a)}")
         print(f"  Cross-contamination B->A: {leaked_ba}/{len(keys_b)}")
         print("=" * 72)
@@ -304,16 +384,25 @@ def main():
             "num_pairs": args.num_pairs,
             "epochs": args.num_epochs,
             "rank": args.rank,
+            "character_a": char_a,
+            "character_b": char_b,
             "persona_a": {
                 "source": source_a,
                 "pairs_count": len(qa_a),
+                "key_range": f"graph1..graph{len(keyed_a)}",
                 "training_time": time_a,
                 "training_loss": metrics_a.get("train_loss"),
-                "recall": recall_a,
+                "recall_before_b": recall_a,
+                "recall_after_b": recall_a_after,
+                "degradation": degradation,
             },
             "persona_b": {
                 "source": source_b,
                 "pairs_count": len(qa_b),
+                "key_range": (
+                    f"graph{PERSONA_B_KEY_OFFSET}.."
+                    f"graph{PERSONA_B_KEY_OFFSET + len(keyed_b) - 1}"
+                ),
                 "training_time": time_b,
                 "training_loss": metrics_b.get("train_loss"),
                 "recall": recall_b,
@@ -326,6 +415,7 @@ def main():
                 "a_from_b_detail": cross_ab_detail,
                 "b_from_a_detail": cross_ba_detail,
             },
+            "skip_distill": True,
         }
         save_results(results, output_dir)
 

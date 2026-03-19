@@ -201,6 +201,7 @@ Session transcripts are processed by an LLM-based extractor into entity--relatio
 Entity resolution (rapidfuzz, 85\% threshold) and edge aggregation produce a cumulative graph tracking recurrence counts, first/last seen timestamps, and entity centrality.
 
 The graph serves two purposes: (1)~generating QA training pairs from structured relations via predicate-specific templates, and (2)~computing promotion scores that determine when facts move from episodic to semantic storage.
+The same graph structure is available at inference time as a routing index: a user query can be mapped to relevant entities in the graph, which in turn identify the specific indexed keys to retrieve---enabling selective recall without exhaustive enumeration.
 
 \subsection{Consolidation Loop}
 \label{sec:loop}
@@ -745,7 +746,8 @@ The advantage is structural.
 RAG retrieves chunks by similarity to the query, but multi-hop questions may require facts that are individually dissimilar to the question yet jointly necessary for inference.
 Indexed key enumeration sidesteps this by providing \emph{all} stored facts as context---guaranteeing completeness at the cost of longer prompts.
 At 50~facts ($\sim$300 tokens of context), this cost is negligible.
-At larger scales, hybrid approaches---RAG for initial filtering, indexed keys for targeted exhaustive recall within a subgraph---may be necessary.
+At larger scales, the knowledge graph already maintained by the consolidation loop (\S\ref{sec:graph}) provides a natural routing index: user queries can be mapped to relevant entities, which identify specific keys for selective retrieval rather than exhaustive enumeration.
+Hybrid approaches---RAG for initial filtering, graph-routed indexed keys for targeted recall within a subgraph---are a straightforward extension of the existing architecture.
 
 More surprisingly, direct parametric inference---where the adapter influences generation without any fact retrieval---approaches or exceeds RAG performance on reasoning tasks (Mistral: 0.825 vs.\ 0.729).
 This suggests that LoRA adapters trained with indexed keys do not merely store retrievable tokens; they shape the model's output distribution in ways that support cross-fact reasoning.
