@@ -284,7 +284,12 @@ def create_adapter(
     adapter_config: AdapterConfig,
     adapter_name: str = "default",
 ) -> PeftModel:
-    """Create a new LoRA adapter on the base model."""
+    """Create a new LoRA adapter on the model.
+
+    For a base model: wraps in PeftModel via get_peft_model.
+    For an existing PeftModel: adds adapter via add_adapter to avoid
+    re-wrapping (which causes tensor name nesting on save/reload).
+    """
     lora_config = LoraConfig(
         r=adapter_config.rank,
         lora_alpha=adapter_config.alpha,
@@ -294,7 +299,24 @@ def create_adapter(
         task_type=TaskType.CAUSAL_LM,
     )
 
-    peft_model = get_peft_model(model, lora_config, adapter_name=adapter_name)
+    if isinstance(model, PeftModel):
+        # Add adapter to existing PeftModel — no re-wrapping, which would
+        # cause nested tensor names on save (breaking reload).
+        model.add_adapter(adapter_name, lora_config)
+        model.set_adapter(adapter_name)
+        peft_model = model
+    else:
+        peft_model = get_peft_model(model, lora_config, adapter_name=adapter_name)
+
+    # Ensure base_model_name_or_path is set for save/reload
+    if peft_model.peft_config[adapter_name].base_model_name_or_path is None:
+        base_name = getattr(
+            peft_model.get_base_model().config, "_name_or_path", None
+        )
+        if base_name:
+            peft_model.peft_config[adapter_name].base_model_name_or_path = (
+                base_name
+            )
 
     trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in peft_model.parameters())
@@ -312,11 +334,16 @@ def create_adapter(
 
 def load_adapter(
     model: PreTrainedModel,
-    adapter_path: str | Path,
+    adapter_dir: str | Path,
     adapter_name: str,
 ) -> PeftModel:
-    """Load a saved LoRA adapter onto the base model."""
-    adapter_path = str(adapter_path)
+    """Load a saved LoRA adapter onto the base model.
+
+    Args:
+        adapter_dir: Parent directory containing adapter subdirectories.
+        adapter_name: Name of the adapter (subdirectory under adapter_dir).
+    """
+    adapter_path = str(Path(adapter_dir) / adapter_name)
 
     if isinstance(model, PeftModel):
         model.load_adapter(adapter_path, adapter_name=adapter_name)
