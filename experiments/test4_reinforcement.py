@@ -1,16 +1,21 @@
-"""Test 4: Multi-Session Reinforcement — reinforced facts recall better.
+"""Test 4: Multi-Session Pipeline Robustness — cumulative fact recall.
 
-Demonstrates the biological consolidation property: facts encountered more
-often across sessions are remembered better and promoted faster to the
-semantic adapter.
+Tests whether the train-delete-retrain cycle maintains recall as facts
+accumulate across sessions. 30 facts arrive over 10 sessions at different
+frequencies (some in multiple sessions, some only once). After each session,
+the adapter is rebuilt from scratch on all cumulative facts.
+
+Note: The rebuild-from-scratch design means reinforcement frequency has no
+effect on the training data — all facts get one QA pair regardless of
+mention count. This test validates pipeline robustness and cumulative recall,
+not frequency-dependent consolidation.
 
 30 facts at controlled frequencies:
 - 10 reinforced (3-4 sessions)
 - 10 mentioned twice
 - 10 single mention
 
-Each session's cumulative facts are distilled through graph extraction
-on the fly, exactly as a real personal assistant would process them.
+Uses skip_distill=True since QA pairs are pre-formed synthetic data.
 
 Usage:
     python experiments/test4_reinforcement.py
@@ -83,6 +88,7 @@ def run_reinforcement_test(
     all_facts,
     args,
     output_dir,
+    bench_name,
 ):
     """Run reinforcement test for one model.
 
@@ -110,10 +116,12 @@ def run_reinforcement_test(
 
         qa_list = list(cumulative_qa.values())
 
-        # Delete previous adapter if exists
+        # Unwrap to base model before creating fresh adapter each session
         adapter_name = "episodic"
-        if hasattr(model, "peft_config") and adapter_name in model.peft_config:
-            model.delete_adapter(adapter_name)
+        from peft import PeftModel as _PeftModel
+
+        if isinstance(model, _PeftModel):
+            model = model.base_model.model
 
         logger.info(
             "Session %d: training on %d cumulative facts (%d new this session)",
@@ -131,6 +139,7 @@ def run_reinforcement_test(
             adapter_name=adapter_name,
             output_dir=output_dir / f"session_{session_num}",
             run_name=f"reinforcement-session-{session_num}",
+            skip_distill=True,  # Clean synthetic QA pairs, no distillation needed
         )
 
         # Save distilled keyed_pairs so resume scripts can evaluate recall
@@ -190,12 +199,25 @@ def run_reinforcement_test(
             f"({len(qa_list)} facts, {cycle_time:.0f}s)"
         )
 
+        # Phase save after each session
+        save_results(
+            {
+                "experiment": "test4_reinforcement",
+                "model": bench_name,
+                "epochs_per_cycle": args.num_epochs,
+                "rank": args.rank,
+                "cycles": cycle_results,
+                "note": f"Partial — through session {session_num}",
+            },
+            output_dir,
+        )
+
     total_time = time.time() - total_start
     return cycle_results, total_time
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test 4: Multi-Session Reinforcement")
+    parser = argparse.ArgumentParser(description="Test 4: Multi-Session Pipeline Robustness")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--skip-rag", action="store_true", help="Skip RAG baseline comparison")
@@ -233,6 +255,7 @@ def main():
             all_facts,
             args,
             output_dir,
+            bench_name,
         )
 
         # Analyze by reinforcement group
@@ -249,9 +272,11 @@ def main():
                 continue
             exact = sum(1 for v in group_facts.values() if v["exact_match"])
             mean_conf = sum(v["confidence"] for v in group_facts.values()) / len(group_facts)
-            avg_mentions = sum(all_facts[k]["mention_count"] for k in group_facts) / len(
-                group_facts
-            )
+            avg_mentions = sum(
+                all_facts[v["fact_id"]]["mention_count"]
+                for v in group_facts.values()
+                if v["fact_id"] in all_facts
+            ) / len(group_facts)
             print(
                 f"  {group:>20}: {exact}/{len(group_facts)} recall, "
                 f"conf={mean_conf:.3f}, avg_mentions={avg_mentions:.1f}"
@@ -303,9 +328,8 @@ def main():
                         model,
                         tokenizer,
                         prompt,
-                        max_new_tokens=150,
-                        temperature=0.1,
-                        repetition_penalty=1.3,
+                        max_new_tokens=200,
+                        temperature=0.0,
                     )
                     similarity = compute_similarity(fact_info["answer"], generated)
                     rag_per_group[fact_info["group"]].append(

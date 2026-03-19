@@ -90,6 +90,10 @@ def distill_sessions_incrementally(model, tokenizer, sessions, target_count):
     return qa_pairs, len(sessions)
 
 
+MAX_NEW_TOKENS = 200
+MATCH_THRESHOLD = 0.75
+
+
 def run_scale_point(
     model,
     tokenizer,
@@ -101,6 +105,8 @@ def run_scale_point(
     output_dir,
 ):
     """Train and evaluate at a single scale point."""
+    from paramem.evaluation.embedding_scorer import compute_similarity
+
     subset = qa_pairs[:scale]
     if len(subset) < scale:
         logger.warning("Only %d QA pairs available, requested %d", len(subset), scale)
@@ -108,8 +114,10 @@ def run_scale_point(
     logger.info("=== Scale point: %d keys ===", len(subset))
 
     adapter_name = f"episodic_s{scale}"
-    if hasattr(model, "peft_config") and adapter_name in model.peft_config:
-        model.delete_adapter(adapter_name)
+    from peft import PeftModel as _PeftModel
+
+    if isinstance(model, _PeftModel):
+        model = model.base_model.model
 
     model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
         model,
@@ -131,6 +139,24 @@ def run_scale_point(
         adapter_name=adapter_name,
     )
 
+    # Compute embedding similarity for parametric recall (unified metric with RAG)
+    param_similarities = []
+    for pk_result, kp in zip(recall_result["per_key"], keyed_pairs):
+        recalled = pk_result.get("recalled")
+        if recalled and "answer" in recalled:
+            sim = compute_similarity(kp["answer"], recalled["answer"])
+        else:
+            sim = 0.0
+        pk_result["embedding_similarity"] = sim
+        param_similarities.append(sim)
+
+    param_mean_sim = (
+        sum(param_similarities) / len(param_similarities)
+        if param_similarities
+        else 0.0
+    )
+    param_match_count = sum(1 for s in param_similarities if s >= MATCH_THRESHOLD)
+
     result = {
         "scale": len(subset),
         "epochs": epochs,
@@ -138,32 +164,67 @@ def run_scale_point(
         "training_time_seconds": train_time,
         "training_loss": metrics.get("train_loss"),
         "parametric_recall": recall_result,
+        "parametric_embedding_similarity": {
+            "mean_similarity": param_mean_sim,
+            "match_count": param_match_count,
+            "match_rate": param_match_count / max(len(keyed_pairs), 1),
+            "threshold": MATCH_THRESHOLD,
+            "scoring_metric": "embedding_similarity (all-MiniLM-L6-v2 cosine)",
+            "note": "probe_key and RAG both use max_new_tokens=200",
+        },
     }
 
     if not skip_rag:
-        from paramem.evaluation.rag_qa import QARAGPipeline, evaluate_rag_recall
+        from peft import PeftModel as _PeftModel
+
+        from paramem.evaluation.rag_qa import QARAGPipeline
+        from paramem.evaluation.recall import generate_answer
 
         rag = QARAGPipeline()
-        rag.build_index(subset)
-
-        from peft import PeftModel as _PeftModel
+        rag.build_index(keyed_pairs)  # Same distilled pairs as parametric
 
         model.gradient_checkpointing_disable()
 
-        rag_questions = [
-            {"question": qa["question"], "expected_answer": qa["answer"]} for qa in subset
-        ]
+        rag_results = []
+        match_count = 0
+
+        def _run_rag():
+            nonlocal match_count
+            for kp in keyed_pairs:
+                prompt = rag.format_prompt(kp["question"], tokenizer, top_k=3)
+                generated = generate_answer(
+                    model, tokenizer, prompt,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    temperature=0.0,
+                )
+                sim = compute_similarity(kp["answer"], generated)
+                is_match = sim >= MATCH_THRESHOLD
+                if is_match:
+                    match_count += 1
+                rag_results.append({
+                    "question": kp["question"],
+                    "expected": kp["answer"],
+                    "generated": generated,
+                    "similarity": sim,
+                    "match": is_match,
+                })
+
         if isinstance(model, _PeftModel):
             with model.disable_adapter():
-                rag_results = evaluate_rag_recall(rag, model, tokenizer, rag_questions)
+                _run_rag()
         else:
-            rag_results = evaluate_rag_recall(rag, model, tokenizer, rag_questions)
-        rag_mean = (
-            sum(r["similarity"] for r in rag_results) / len(rag_results) if rag_results else 0.0
-        )
+            _run_rag()
+
+        total = max(len(keyed_pairs), 1)
+        rag_mean = sum(r["similarity"] for r in rag_results) / total
 
         result["rag_recall"] = {
             "mean_similarity": rag_mean,
+            "match_count": match_count,
+            "match_rate": match_count / total,
+            "total": len(keyed_pairs),
+            "threshold": MATCH_THRESHOLD,
+            "scoring_metric": "embedding_similarity (all-MiniLM-L6-v2 cosine)",
             "per_question": rag_results,
         }
 
@@ -215,7 +276,7 @@ def main():
             )
             print(f"  Data: {len(qa_pairs)} QA pairs from {sessions_used} sessions ({source})")
         else:
-            logger.info("No PerLTQA sessions, using synthetic fallback")
+            logger.warning("No PerLTQA sessions, using synthetic fallback")
             qa_pairs, source = load_qa(max_pairs=max_needed)
             sessions_used = 0
             print(f"  Data: {len(qa_pairs)} QA pairs ({source})")
@@ -234,6 +295,10 @@ def main():
             "sessions_used": sessions_used,
             "total_qa_available": len(qa_pairs),
             "scale_points": {},
+            "design_note": (
+                "Scale points use nested subsets (scale N is first N pairs "
+                "from single distillation). Not independent observations."
+            ),
         }
 
         for scale in scales:
@@ -249,38 +314,55 @@ def main():
             )
             all_results["scale_points"][str(scale)] = result
 
+            # Phase save after each scale point
+            save_results(all_results, bench_output_dir)
+
             pr = result["parametric_recall"]
+            ps = result["parametric_embedding_similarity"]
             print(
                 f"\n  Scale {result['scale']}: "
                 f"{pr['exact_count']}/{pr['total']} recall "
                 f"(conf={pr['mean_confidence']:.3f}, "
+                f"sim={ps['mean_similarity']:.3f}, "
                 f"time={result['training_time_seconds']:.0f}s)"
             )
             if "rag_recall" in result:
+                rr = result["rag_recall"]
                 print(
-                    f"  RAG baseline: {result['rag_recall']['mean_similarity']:.3f} mean similarity"
+                    f"  RAG baseline: "
+                    f"{rr['match_count']}/{rr['total']} match, "
+                    f"sim={rr['mean_similarity']:.3f}"
                 )
 
-        # Summary table
-        print(f"\n{'=' * 72}")
+        # Summary table (unified: embedding similarity for both)
+        print(f"\n{'=' * 82}")
         print(f"SCALE EXPANSION SUMMARY ({bench_name})")
-        print(f"{'Scale':>6} {'Recall':>10} {'Confidence':>12} {'Time':>8} {'RAG':>8}")
-        print("-" * 50)
+        print(
+            f"{'Scale':>6} {'PM Match':>9} {'PM Sim':>8} "
+            f"{'Confidence':>11} {'Time':>8} "
+            f"{'RAG Match':>10} {'RAG Sim':>8}"
+        )
+        print("-" * 82)
         for scale_str, result in all_results["scale_points"].items():
             pr = result["parametric_recall"]
-            rag_str = (
-                f"{result['rag_recall']['mean_similarity']:.3f}"
-                if "rag_recall" in result
-                else "N/A"
-            )
+            ps = result["parametric_embedding_similarity"]
+            if "rag_recall" in result:
+                rr = result["rag_recall"]
+                rag_match = f"{rr['match_count']}/{rr['total']}"
+                rag_sim = f"{rr['mean_similarity']:.3f}"
+            else:
+                rag_match = "N/A"
+                rag_sim = "N/A"
             print(
                 f"{result['scale']:>6} "
-                f"{pr['exact_count']}/{pr['total']:>6} "
-                f"{pr['mean_confidence']:>12.3f} "
+                f"{ps['match_count']}/{pr['total']:>5} "
+                f"{ps['mean_similarity']:>8.3f} "
+                f"{pr['mean_confidence']:>11.3f} "
                 f"{result['training_time_seconds']:>7.0f}s "
-                f"{rag_str:>8}"
+                f"{rag_match:>10} "
+                f"{rag_sim:>8}"
             )
-        print("=" * 72)
+        print("=" * 82)
 
         save_results(all_results, bench_output_dir)
         unload_model(model, tokenizer)

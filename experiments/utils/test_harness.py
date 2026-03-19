@@ -154,7 +154,7 @@ def distill_qa_pairs(
                 tokenizer,
                 transcript,
                 "distill",
-                temperature=0.3,
+                temperature=0.0,
             )
     else:
         session_graph = extract_graph(
@@ -162,7 +162,7 @@ def distill_qa_pairs(
             tokenizer,
             transcript,
             "distill",
-            temperature=0.3,
+            temperature=0.0,
         )
 
     relations = [
@@ -183,7 +183,7 @@ def distill_qa_pairs(
         q_norm = qa["question"].lower().strip()
         if q_norm not in seen_questions:
             seen_questions.add(q_norm)
-            unique.append({"question": qa["question"], "answer": qa["answer"]})
+            unique.append(qa)
 
     logger.info(
         "Distilled %d raw QA pairs → %d relations → %d concise QA pairs",
@@ -233,7 +233,7 @@ def distill_session(
                 tokenizer,
                 session["transcript"],
                 session["session_id"],
-                temperature=0.3,
+                temperature=0.0,
             )
     else:
         session_graph = extract_graph(
@@ -241,7 +241,7 @@ def distill_session(
             tokenizer,
             session["transcript"],
             session["session_id"],
-            temperature=0.3,
+            temperature=0.0,
         )
 
     relations = [
@@ -261,7 +261,7 @@ def distill_session(
         q_norm = qa["question"].lower().strip()
         if q_norm not in seen_questions:
             seen_questions.add(q_norm)
-            new_pairs.append({"question": qa["question"], "answer": qa["answer"]})
+            new_pairs.append(qa)
 
     logger.info(
         "Session %s → %d relations → %d new QA pairs (total seen: %d)",
@@ -297,6 +297,7 @@ def train_indexed_keys(
     output_dir: str | Path = "outputs/test",
     run_name: str = "indexed-keys",
     skip_distill: bool = False,
+    start_index: int = 1,
 ):
     """Train indexed keys on QA pairs.
 
@@ -322,11 +323,23 @@ def train_indexed_keys(
     )
     model = create_adapter(model, adapter_config, adapter_name)
 
-    keyed_pairs = assign_keys(qa_pairs)
+    keyed_pairs = assign_keys(qa_pairs, start_index=start_index)
     registry = build_registry(keyed_pairs)
 
     registry_path = output_dir / "simhash_registry.json"
     save_registry(registry, registry_path)
+
+    # Persist keyed_pairs for reproducibility and post-hoc re-evaluation
+    kp_path = output_dir / "keyed_pairs.json"
+    kp_ser = []
+    for kp in keyed_pairs:
+        entry = {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+        for meta_key in ("source_predicate", "source_subject", "source_object"):
+            if meta_key in kp:
+                entry[meta_key] = kp[meta_key]
+        kp_ser.append(entry)
+    with open(kp_path, "w") as f:
+        json.dump(kp_ser, f, indent=2)
 
     examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
@@ -435,8 +448,7 @@ def evaluate_individual_qa(
             model,
             tokenizer,
             prompt,
-            temperature=0.1,
-            repetition_penalty=1.3,
+            temperature=0.0,
         )
         score = compute_similarity(qa["answer"], generated)
         scores.append(score)

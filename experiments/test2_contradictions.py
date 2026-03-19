@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 DATA_PATH = project_root / "data" / "synthetic" / "contradiction_sessions.json"
 OUTPUT_DIR = project_root / "outputs" / "test2_contradictions"
+MATCH_THRESHOLD = 0.75
 
 
 def load_contradiction_data():
@@ -195,6 +196,12 @@ def run_strategy(
             strategy,
         )
 
+        # Disable gradient checkpointing before any model inference
+        # (merge may call detect_contradiction_with_model for "model" strategy,
+        # and QA generation runs model inference). Training re-enables it,
+        # so this must happen at the top of every session.
+        model.gradient_checkpointing_disable()
+
         # Merge each fact into the cumulative graph
         for fact in session_facts:
             session_graph = build_session_graph(
@@ -202,9 +209,6 @@ def run_strategy(
                 f"session_{session_num}",
             )
             merger.merge(session_graph)
-
-        # Disable gradient checkpointing for QA generation
-        model.gradient_checkpointing_disable()
 
         # Generate QA from the resolved graph
         triples = merger.get_all_triples()
@@ -218,10 +222,18 @@ def run_strategy(
             logger.warning("No QA pairs from graph after session %d", session_num)
             continue
 
-        # Train adapter on resolved facts
+        if len(qa_pairs) != len(triples):
+            logger.warning(
+                "QA count mismatch session %d: %d triples → %d QA pairs",
+                session_num, len(triples), len(qa_pairs),
+            )
+
+        # Unwrap to base model before each session's fresh adapter
         adapter_name = f"episodic_s{session_num}_{strategy}"
-        if hasattr(model, "peft_config") and adapter_name in model.peft_config:
-            model.delete_adapter(adapter_name)
+        from peft import PeftModel as _PeftModel
+
+        if isinstance(model, _PeftModel):
+            model = model.base_model.model
 
         model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
             model,
@@ -254,6 +266,26 @@ def run_strategy(
             if latest:
                 expected_current[chain["id"]] = latest["answer"]
 
+        # Map chains to recalled answers via predicate (deterministic).
+        # Each keyed_pair carries source_predicate from QA generation,
+        # and each chain has a unique predicate. This avoids threshold-
+        # sensitive embedding matching entirely.
+        predicate_to_chain = {
+            chain["predicate"]: chain["id"] for chain in enriched_chains
+        }
+
+        # Build key → recalled answer lookup
+        key_to_recalled = {}
+        for kr in recall_result["per_key"]:
+            if kr.get("recalled") and kr["recalled"].get("answer"):
+                key_to_recalled[kr["key"]] = kr["recalled"]["answer"]
+
+        # Build key → predicate lookup from keyed_pairs (in-memory, has metadata)
+        key_to_predicate = {}
+        for kp in keyed_pairs:
+            if "source_predicate" in kp:
+                key_to_predicate[kp["key"]] = kp["source_predicate"]
+
         per_chain = {}
         for chain in enriched_chains:
             chain_id = chain["id"]
@@ -261,24 +293,23 @@ def run_strategy(
             if not current_answer:
                 continue
 
-            # Find the recalled QA that matches this chain's question
+            # Find the recalled answer for this chain's predicate
             recalled_answer = ""
-            for kr in recall_result["per_key"]:
-                if kr.get("recalled") and kr["recalled"].get("answer"):
-                    # Match by checking if the answer relates to this chain
-                    sim = compute_similarity(current_answer, kr["recalled"]["answer"])
-                    if sim > 0.7:
-                        recalled_answer = kr["recalled"]["answer"]
-                        break
+            for key, pred in key_to_predicate.items():
+                if predicate_to_chain.get(pred) == chain_id:
+                    recalled_answer = key_to_recalled.get(key, "")
+                    break
 
             sim_to_current = (
-                compute_similarity(current_answer, recalled_answer) if recalled_answer else 0.0
+                compute_similarity(current_answer, recalled_answer)
+                if recalled_answer
+                else 0.0
             )
             per_chain[chain_id] = {
                 "current_answer": current_answer,
                 "recalled_answer": recalled_answer,
                 "similarity_to_current": sim_to_current,
-                "is_current": sim_to_current > 0.7,
+                "is_current": sim_to_current > MATCH_THRESHOLD,
             }
 
         returns_current = sum(1 for v in per_chain.values() if v["is_current"])
@@ -364,6 +395,9 @@ def main():
                 output_dir / strategy,
             )
             all_results["strategies"][strategy] = result
+
+            # Phase save after each strategy
+            save_results(all_results, output_dir)
 
         # Summary comparison
         print(f"\n{'=' * 72}")

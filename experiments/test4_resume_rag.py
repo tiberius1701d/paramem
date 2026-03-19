@@ -109,26 +109,24 @@ def main():
     bench_model_config = MODEL_REGISTRY[args.model]
     model, tokenizer = load_model_and_config(bench_model_config)[:2]
 
-    # save_adapter saves to adapter_dir/adapter_name/, so the load path
-    # needs to point to the directory containing adapter_config.json
-    adapter_path = last_session / "adapter" / "episodic"
-    if not (adapter_path / "adapter_config.json").exists():
-        # Fall back: check if saved directly in adapter/
-        adapter_path = last_session / "adapter"
-    if not (adapter_path / "adapter_config.json").exists():
+    # load_adapter expects the parent dir; it appends adapter_name
+    adapter_dir = last_session / "adapter"
+    adapter_full = adapter_dir / "episodic"
+    if not (adapter_full / "adapter_config.json").exists():
         # Last resort: find it
         import glob
 
-        pattern = str(last_session / "adapter" / "**" / "adapter_config.json")
+        pattern = str(adapter_dir / "**" / "adapter_config.json")
         hits = glob.glob(pattern, recursive=True)
         if hits:
-            adapter_path = Path(hits[0]).parent
+            # Derive parent dir from found path
+            adapter_dir = Path(hits[0]).parent.parent
         else:
-            print(f"ERROR: Cannot find adapter_config.json under {last_session / 'adapter'}")
+            print(f"ERROR: Cannot find adapter under {adapter_dir}")
             return
-    print(f"Loading adapter from: {adapter_path}")
-    model = load_adapter(model, str(adapter_path), "episodic")
-    print(f"Adapter loaded from {adapter_path}")
+    print(f"Loading adapter from: {adapter_dir}")
+    model = load_adapter(model, str(adapter_dir), "episodic")
+    print(f"Adapter loaded from {adapter_dir}")
 
     # Phase 1: Re-evaluate recall (skip if --rag-only)
     recall_result = None
@@ -168,9 +166,8 @@ def main():
                 model,
                 tokenizer,
                 prompt,
-                max_new_tokens=150,
-                temperature=0.1,
-                repetition_penalty=1.3,
+                max_new_tokens=200,
+                temperature=0.0,
             )
             similarity = compute_similarity(fact_info["answer"], generated)
             rag_per_group[fact_info["group"]].append(
