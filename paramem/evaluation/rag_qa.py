@@ -132,9 +132,8 @@ def evaluate_rag_recall(
             model,
             tokenizer,
             prompt,
-            max_new_tokens=150,
-            temperature=0.1,
-            repetition_penalty=1.3,
+            max_new_tokens=200,
+            temperature=0.0,
         )
         similarity = compute_similarity(q["expected_answer"], generated)
         results.append(

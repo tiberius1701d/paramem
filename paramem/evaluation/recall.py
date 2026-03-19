@@ -12,15 +12,24 @@ from paramem.training.dataset import load_eval_pairs
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_REPETITION_PENALTY = 1.1
+
+
 def generate_answer(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     prompt: str,
     max_new_tokens: int = 128,
-    temperature: float = 0.1,
-    repetition_penalty: float = 1.0,
+    temperature: float = 0.0,
+    repetition_penalty: float | None = None,
 ) -> str:
-    """Generate an answer from the model given a prompt."""
+    """Generate an answer from the model given a prompt.
+
+    When repetition_penalty is None, uses the module-level default (1.1).
+    Call sites can override per-objective when needed.
+    """
+    if repetition_penalty is None:
+        repetition_penalty = _DEFAULT_REPETITION_PENALTY
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
     # Build stop token list: eos_token + chat template end tokens (e.g. <|im_end|>)
@@ -168,9 +177,8 @@ def compare_base_vs_adapted(
     Returns a dict with both sets of results and the delta.
     """
     # Evaluate with adapter disabled (base model)
-    model.disable_adapter_layers()
-    base_results = evaluate_recall(model, tokenizer, data_path, fact_ids=fact_ids)
-    model.enable_adapter_layers()
+    with model.disable_adapter():
+        base_results = evaluate_recall(model, tokenizer, data_path, fact_ids=fact_ids)
 
     # Evaluate with adapter active
     adapted_results = evaluate_recall(

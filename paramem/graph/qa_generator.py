@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 # Few-shot examples covering diverse predicate types.
 # These teach the model the expected output format and conciseness.
+# Includes verbose/narrative objects to demonstrate extracting current state.
 _FEW_SHOT_EXAMPLES = [
     {
         "triple": "Alex | lives_in | Heilbronn",
@@ -42,6 +43,16 @@ _FEW_SHOT_EXAMPLES = [
         "question": "Who manages the budget for the robotics team?",
         "answer": "Maria manages the budget for the robotics team.",
     },
+    {
+        "triple": "Sam | works_at | Sam left Acme Corp and joined Globex as a senior developer.",
+        "question": "Where does Sam work?",
+        "answer": "Sam works at Globex as a senior developer.",
+    },
+    {
+        "triple": "Sam | lives_in | Sam moved from Berlin to Munich, closer to the office.",
+        "question": "Where does Sam live?",
+        "answer": "Sam lives in Munich.",
+    },
 ]
 
 
@@ -55,7 +66,10 @@ def _build_few_shot_prompt(subject: str, predicate: str, obj: str) -> str:
     readable_pred = predicate.replace("_", " ")
     return (
         f"Generate one natural question-answer pair from a knowledge graph triple. "
-        f"The answer should be a single concise sentence. "
+        f"The object field describes the current state — focus on what IS true now, "
+        f"not on transitions or what changed. "
+        f"Keep both the question and the answer short and factual. "
+        f"No parenthetical remarks, no hedging, no backstory. "
         f"Always format as Q: <question> A: <answer>.\n\n"
         f"{examples_block}\n\n"
         f"Triple: {subject} | {readable_pred} | {obj}\n"
@@ -75,7 +89,10 @@ def _generate_qa_with_llm(
 
     prompt_text = _build_few_shot_prompt(subject, predicate, obj)
 
-    system_msg = "Generate a natural question-answer pair from the given knowledge graph triple."
+    system_msg = (
+        "Generate a short, factual question-answer pair from a knowledge "
+        "graph triple. No narrative, no explanation."
+    )
     from paramem.models.loader import adapt_messages
 
     messages = adapt_messages(
@@ -96,8 +113,7 @@ def _generate_qa_with_llm(
         tokenizer,
         formatted,
         max_new_tokens=128,
-        temperature=0.3,
-        repetition_penalty=1.3,
+        temperature=0.0,
     )
 
     # Parse "Q: ... A: ..." from model output.

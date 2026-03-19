@@ -137,7 +137,7 @@ def _extract_with_prompt_parse(
         tokenizer,
         formatted,
         max_new_tokens=max_tokens,
-        temperature=max(temperature, 0.1),
+        temperature=temperature,
     )
 
     # Try to find JSON in the output

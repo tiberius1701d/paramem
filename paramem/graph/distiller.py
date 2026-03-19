@@ -144,7 +144,7 @@ def distill_qa_batch(
     subject_name: str = "the user",
     temperature: float = 0.2,
     max_new_tokens: int = 2048,
-    repetition_penalty: float = 1.3,
+    repetition_penalty: float = 1.1,
 ) -> list[dict]:
     """Distill verbose QA pairs into concise factual form using Strategy B.
 

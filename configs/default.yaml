@@ -8,18 +8,21 @@ model:
 
 adapters:
   episodic:
+    enabled: true
     rank: 8
     alpha: 16
     learning_rate: 1.0e-4
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
     dropout: 0.0
   semantic:
+    enabled: false      # enable for knowledge promotion (consolidation loop)
     rank: 24
     alpha: 48
     learning_rate: 1.0e-5
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
     dropout: 0.0
   procedural:
+    enabled: false      # future — behavioral patterns, routines, preferences
     rank: 12
     alpha: 24
     learning_rate: 5.0e-5
@@ -90,7 +93,7 @@ distillation:
   default_subject_name: "the user"
   temperature: 0.2
   max_new_tokens: 2048
-  repetition_penalty: 1.3
+  repetition_penalty: 1.1
 
 wandb:
   project: "paramem"

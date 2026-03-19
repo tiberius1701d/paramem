@@ -100,7 +100,7 @@ class DistillationConfig:
     default_subject_name: str = "the user"
     temperature: float = 0.2
     max_new_tokens: int = 2048
-    repetition_penalty: float = 1.3
+    repetition_penalty: float = 1.1
 
 
 @dataclass

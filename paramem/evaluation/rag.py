@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 RAG_SYSTEM_PROMPT = (
     "You are a personal assistant with memory of your user's life. "
     "Answer questions about the user based on the context provided. "
-    "If the context doesn't contain relevant information, say you don't know."
+    "Be concise."
 )
 
 
