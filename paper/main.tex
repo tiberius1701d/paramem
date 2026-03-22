@@ -16,6 +16,7 @@
 \usepackage{listings}
 \usepackage{multirow}
 \usepackage{needspace}
+\usepackage{placeins}
 
 % Listings config for JSON examples
 \lstset{
@@ -27,6 +28,14 @@
   stringstyle=\color{green!50!black},
   showstringspaces=false
 }
+
+% Float spacing — more breathing room above/below tables and figures
+\setlength{\textfloatsep}{14pt plus 4pt minus 2pt}   % between float and text (default ~12pt)
+\setlength{\floatsep}{14pt plus 4pt minus 2pt}        % between adjacent floats
+\setlength{\intextsep}{14pt plus 4pt minus 2pt}       % around in-text floats [h]
+
+% Space between caption and table/figure body
+\setlength{\belowcaptionskip}{8pt}
 
 % Convenience macros
 \newcommand{\ie}{\textit{i.e.}}
@@ -200,6 +209,7 @@ Entity resolution (rapidfuzz, 85\% threshold) and edge aggregation produce a cum
 The graph serves two purposes: (1)~generating QA training pairs from structured relations via predicate-specific templates, and (2)~computing promotion scores that determine when facts move from episodic to semantic storage.
 The same graph structure is available at inference time as a routing index: a user query can be mapped to relevant entities in the graph, which in turn identify the specific indexed keys to retrieve---enabling selective recall without exhaustive enumeration.
 
+\needspace{8\baselineskip}
 \subsection{Consolidation Loop}
 \label{sec:loop}
 
@@ -262,6 +272,7 @@ We trained the adapter on both QA pairs and structured \texttt{<memory key="..."
 The result was 0.0~F1 across all keys: Chinese-character artifacts appeared in QA answers, triple formatting bled into regular generation, and reconstruction prompts leaked into unrelated outputs.
 \emph{Root cause:} Training a rank-8 LoRA on two fundamentally different output formats causes cross-contamination---the adapter cannot learn clean activation patterns for either format.
 
+\needspace{4\baselineskip}
 \paragraph{Entity paragraph profiles.}
 Entity-keyed natural language profiles achieved 0.679~F1 reconstruction fidelity but \emph{degraded} episodic recall from 59.3\% to 36.1\%.
 \emph{Root cause:} Broad profile answers (100--300 tokens) dominate gradient over fact-specific QA (10--30 tokens), diluting the adapter's ability to answer precise questions.
@@ -290,7 +301,7 @@ Two training examples are generated per fact:
 \noindent Figure~\ref{fig:format} shows a concrete training example.
 Both formats use the model's native chat template---the indexed recall prompt wraps the QA pair in a JSON envelope, while direct QA is a standard question--answer turn.
 
-\begin{figure}[t]
+\begin{figure}[b]
 \centering
 \begin{lstlisting}[title={\small Indexed recall training example (chat template applied)}]
 User: Recall the QA pair stored under key 'graph1'.
@@ -310,6 +321,7 @@ Assistant: Alex lives in Heilbronn.
 At retrieval time, the system iterates over all registered keys and prompts for each.
 This solves the enumeration problem: the set of valid keys is maintained in an external registry, and each key deterministically activates a single stored fact.
 
+\needspace{8\baselineskip}
 \paragraph{Why indexed keys work.}
 Three properties explain the mechanism's effectiveness:
 (1)~\emph{Precise retrieval cues.} Indexed key recall achieves 100\% across all three tested models (Qwen~2.5~3B, Gemma~2~9B, Mistral~7B) at their respective scale points, versus 0.452 mean embedding similarity for individual QA on the same adapter (Table~\ref{tab:recall})---keys are less ambiguous than natural-language questions.
@@ -445,6 +457,13 @@ New keys require the same epoch budget as initial training---halving it causes r
 \label{sec:exp-e2e}
 
 The full pipeline processes 10~synthetic sessions through the consolidation loop (Table~\ref{tab:e2e}).
+A total of 11~keys were assigned across all cycles; after capacity-cap eviction, 8~episodic and 2~semantic keys remain active.
+Two promotion events occurred (cycles 6 and 8), triggered when entities accumulated sufficient recurrence and centrality in the knowledge graph.
+Episodic training loss decreased from 1.813 (cycle~1) to 0.494 (cycle~10); semantic loss from 1.816 (cycle~6, first promoted keys) to 0.642 (cycle~8).
+Total wall time was 42.7~minutes (mean cycle: 256\,s; range: 80--437\,s).
+
+All recalled keys are \emph{exact} matches with 1.000 SimHash confidence---the model reproduces the correct entities, relations, and wording.
+The key count difference between episodic (8) and semantic (2) reflects the promotion threshold: most entities did not accumulate sufficient graph centrality for promotion within 10~sessions.
 
 \begin{table}[t]
 \centering
@@ -460,13 +479,6 @@ Semantic & 2 & 2 & 100\% & 2 & 1.000 \\
 \bottomrule
 \end{tabular}
 \end{table}
-A total of 11~keys were assigned across all cycles; after capacity-cap eviction, 8~episodic and 2~semantic keys remain active.
-Two promotion events occurred (cycles 6 and 8), triggered when entities accumulated sufficient recurrence and centrality in the knowledge graph.
-Episodic training loss decreased from 1.813 (cycle~1) to 0.494 (cycle~10); semantic loss from 1.816 (cycle~6, first promoted keys) to 0.642 (cycle~8).
-Total wall time was 42.7~minutes (mean cycle: 256\,s; range: 80--437\,s).
-
-All recalled keys are \emph{exact} matches with 1.000 SimHash confidence---the model reproduces the correct entities, relations, and wording.
-The key count difference between episodic (8) and semantic (2) reflects the promotion threshold: most entities did not accumulate sufficient graph centrality for promotion within 10~sessions.
 
 \paragraph{Cycle time scaling.}
 Cycle time grows linearly with key count: 80\,s at 1~key, 437\,s at 10~keys (8~episodic + 2~semantic).
@@ -475,6 +487,8 @@ In production, reconstruction can be limited to periodic intervals, reducing ove
 
 \subsection{Multi-Model Batch Scaling}
 \label{sec:exp-scaling}
+
+To validate generalizability beyond a single model architecture and beyond synthetic QA pairs, we tested on two additional model families using QA pairs distilled from real conversational data (Table~\ref{tab:scaling}).
 
 \begin{table}[t]
 \centering
@@ -495,8 +509,6 @@ In production, reconstruction can be limited to periodic intervals, reducing ove
 \bottomrule
 \end{tabular}
 \end{table}
-
-To validate generalizability beyond a single model architecture and beyond synthetic QA pairs, we tested on two additional model families using QA pairs distilled from real conversational data (Table~\ref{tab:scaling}).
 The data pipeline processes PerLTQA dialogue transcripts~\citep{du2024perltqa} one session at a time: each transcript is passed through LLM-based graph extraction and template-based QA generation to produce short-answer QA pairs.
 Gemma used 23 of 30 sessions to extract 104~QA pairs; Mistral used all 30 sessions for 54~pairs.
 The yield difference reflects Mistral's selective extraction at deterministic temperature (0.0): 80\% of Mistral's extractions map to ground-truth facts versus 55\% for Gemma.
@@ -552,6 +564,8 @@ With more training pairs per epoch, the adapter receives greater gradient divers
 \bottomrule
 \end{tabular}
 \end{table}
+
+\FloatBarrier
 
 \paragraph{Note on scope.}
 These are \emph{batch} scaling results: all keys are trained in a single adapter pass.
@@ -877,7 +891,9 @@ This work was developed with assistance from Claude (Anthropic), which contribut
 
 % ============================================================
 
+{\small
 \bibliographystyle{plainnat}
 \bibliography{references}
+}
 
 \end{document}
