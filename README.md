@@ -16,11 +16,11 @@ The core mechanism is **indexed key retrieval**: each fact gets a unique key (`g
 
 | Test | Result |
 |------|--------|
-| Per-fact indexed recall | 9/10 exact (rank 8, 30 epochs) |
-| Capacity | 19/20 at 20 pairs (95%) |
-| Incremental learning | 14/15 after 10+5 addition |
-| Two-adapter promotion | Episodic 9/10, Semantic 4/5 |
-| Full consolidation (10 cycles) | 17/17 keys, 100% recall both adapters |
+| Per-fact indexed recall | 10/10 exact (rank 8, 30 epochs) |
+| Capacity | 20/20 at 20 pairs (100%) |
+| Incremental learning | 15/15 after 10+5 addition |
+| Two-adapter promotion | Episodic 10/10, Semantic 5/5 |
+| Full consolidation (10 cycles) | 100% recall both adapters |
 | Hallucination detection | 5/5 blocked (SimHash registry) |
 
 All experiments run on a single RTX 5070 (8GB VRAM) using QLoRA 4-bit quantization.
@@ -88,7 +88,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python experiments/phase4_indexed_keys_smoke.py --num-epochs 30
 ```
 
-Expected output: 9/10 exact key recall, 0 hallucinations, 5/5 untrained keys blocked.
+Expected output: 10/10 exact key recall, 0 hallucinations, 5/5 untrained keys blocked.
 
 ### Run Examples
 
@@ -240,6 +240,19 @@ journalctl -u paramem-server -f
 
 A custom conversation agent for Home Assistant is included in `custom_components/paramem/`. Copy or symlink to your HA `custom_components/` directory and configure via the HA UI (Settings → Devices → Add Integration → ParaMem). The component is a thin REST client — all inference runs on the ParaMem server.
 
+## Data
+
+Synthetic test data (`data/synthetic/`) is included in the repository. Two additional datasets are used:
+
+- **Synthetic sessions** (`data/synthetic/synthetic_sessions.json`) — 55 conversational sessions for the end-to-end consolidation loop (§5.5). Included in the repo.
+- **PerLTQA** — Public dataset with character profiles and dialogues, used by Tests 1-7 for realistic conversational data. Must be downloaded manually:
+
+```bash
+git clone https://github.com/Elvin-Yiming-Du/PerLTQA data/external/PerLTQA
+```
+
+Tests fall back to synthetic data if PerLTQA is not available, but results may differ from the paper.
+
 ## Extended Evaluation Suite
 
 Seven experiments validating the parametric memory mechanism. Each is a standalone script in `experiments/`.
@@ -257,12 +270,9 @@ Seven experiments validating the parametric memory mechanism. Each is a standalo
 ```bash
 # Run a single test
 python experiments/test1_scale_expansion.py --model gemma
-
-# Optional: clone PerLTQA for public dataset support
-git clone https://github.com/Elvin-Yiming-Du/PerLTQA data/external/PerLTQA
 ```
 
-Results are saved to `outputs/testN_*/{model}/{timestamp}/results.json`. Tests fall back to synthetic data if PerLTQA is not available.
+Results are saved to `outputs/testN_*/{model}/{timestamp}/results.json`.
 
 ## Paper
 
