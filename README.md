@@ -14,14 +14,26 @@ The core mechanism is **indexed key retrieval**: each fact gets a unique key (`g
 
 ## Key Results
 
-| Test | Result |
-|------|--------|
-| Per-fact indexed recall | 10/10 exact (rank 8, 30 epochs) |
-| Capacity | 20/20 at 20 pairs (100%) |
-| Incremental learning | 15/15 after 10+5 addition |
-| Two-adapter promotion | Episodic 10/10, Semantic 5/5 |
-| Full consolidation (10 cycles) | 100% recall both adapters |
-| Hallucination detection | 5/5 blocked (SimHash registry) |
+**What works:**
+
+| Test | Gemma 2 9B | Mistral 7B | Qwen 2.5 3B |
+|------|-----------|-----------|-------------|
+| Indexed recall at scale | 100/100 | 54/54 | 20/20 |
+| Incremental learning (add 5, retrain all) | 15/15 | 15/15 | 15/15 |
+| Contradiction resolution (16 fact updates) | 16/16 | 16/16 | — |
+| Consolidation loop (10 cycles) | 100% | 100% | 100% |
+| PM vs RAG reasoning quality (embedding sim.) | 0.687 vs 0.679 | 0.566 vs 0.525 | — |
+| Full replay: recall after 5 add cycles | 44/45 | 45/45 | — |
+| Hallucination detection (SimHash registry) | 5/5 blocked | 5/5 blocked | 5/5 blocked |
+
+*— = not tested (Qwen 2.5 3B is a base model without structured output capability, used only for development experiments with pre-defined QA pairs)*
+
+**What doesn't:**
+
+| Test | Gemma 2 9B | Mistral 7B |
+|------|-----------|-----------|
+| No replay: old key survival after 5 add cycles | 4/40 | 0/40 |
+| Adapter composition (additive or merged) | fails | fails |
 
 All experiments run on a single RTX 5070 (8GB VRAM) using QLoRA 4-bit quantization.
 
