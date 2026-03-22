@@ -616,7 +616,7 @@ The central finding is \emph{quality parity} (Table~\ref{tab:inference}).
 
 \begin{table}[t]
 \centering
-\caption{Reasoning quality on 14 multi-hop questions over $\sim$50 stored facts. PM Recall+Reason and RAG all facts both have all facts in context---the only difference is fact source. Scores are mean embedding similarity; OK counts indicate questions scoring $>$0.5. Per-query generation time excludes one-time reconstruction overhead (Gemma: 162s, Mistral: 121s).}
+\caption{Reasoning quality on 14 multi-hop questions over $\sim$50 stored facts. PM Recall+Reason and RAG all facts both have all facts in context---the only difference is fact source. Scores are mean embedding similarity; OK counts indicate questions scoring $>$0.5. Per-query time (Gen/q) includes the full pipeline: retrieval for RAG, prompt construction + generation for all conditions. One-time context costs reported separately (PM reconstruction: Gemma 162s, Mistral 121s).}
 \label{tab:inference}
 \small
 \begin{tabular}{lccccccc}
@@ -635,8 +635,10 @@ PM Recall+Reason vs.\ RAG all facts: Gemma 0.687 vs.\ 0.679 (+1.2\%); Mistral 0.
 With N=14 questions and no significance testing, these differences are indistinguishable from noise.
 The result is that facts from adapter weights are functionally equivalent to facts from text for downstream reasoning---the storage mechanism is transparent to the model's reasoning capability.
 
-Per-query generation time is equivalent (PM: 2.40s vs.\ RAG: 2.26s on Gemma).
-PM has a one-time reconstruction overhead (162s on Gemma) to enumerate and probe all keys; this amortizes across queries in a session.
+Per-query time is equivalent (PM: 2.40s vs.\ RAG: 2.26s on Gemma).
+Both timers measure the full per-query pipeline: for PM this is prompt construction + generation; for RAG this includes embedding retrieval + prompt construction + generation.
+One-time context acquisition costs are reported separately: PM reconstruction (162s on Gemma) to enumerate and probe all keys; RAG index construction (negligible at this scale).
+Both amortize across queries in a session.
 
 These results are based on 14 multi-hop questions over $\sim$50~facts.
 Scaling this evaluation to larger fact bases and more diverse reasoning patterns is needed to confirm the generality of the finding.
@@ -715,7 +717,7 @@ To compare operational characteristics at multiple scales, we evaluated parametr
 
 \begin{table}[t]
 \centering
-\caption{Parametric vs.\ RAG head-to-head. PM adapter size is constant regardless of fact count. RAG size includes the embedding model ($\sim$87\,MB fixed cost).}
+\caption{Parametric vs.\ RAG storage footprint. PM adapter size is constant regardless of fact count. RAG size includes the embedding model ($\sim$87\,MB fixed cost). Recall columns are included for context but the comparison is asymmetric: PM was trained on exact QA pairs; RAG uses top-3 embedding retrieval.}
 \label{tab:footprint}
 \small
 \begin{tabular}{@{}rccccc@{}}
@@ -763,7 +765,7 @@ We tested whether two independently trained persona adapters can serve both pers
 Two approaches were evaluated: additive composition (\texttt{set\_adapter(["a","b"])}---both LoRA deltas summed per forward pass) and weight merging (\texttt{add\_weighted\_adapter([0.5, 0.5])}).
 Both fail: composition achieves $\leq$1/50 recall on each persona; merging produces identical near-zero results.
 
-This is consistent with recent findings that linear weight averaging causes destructive interference for LoRA adapters on structured tasks~\citep{huang2025unraveling, back2026understanding}.
+This is consistent with recent findings that linear weight averaging causes destructive interference for LoRA adapters on structured tasks~\citep{zhang2025unraveling, back2026understanding}.
 The root cause is that indexed key retrieval requires precise token-level generation---even small perturbations to the LoRA weight matrices disrupt the structured key$\rightarrow$QA mapping.
 Adapter switching (\texttt{set\_adapter}, single adapter active) remains the only viable multi-adapter approach, achieving 50/50 on both personas with near-zero switching cost.
 
@@ -793,7 +795,7 @@ Combined with the contradiction resolution finding that one retraining cycle wit
 
 \paragraph{LoRA composition limits.}
 Neither additive composition nor weight merging preserves indexed key recall across adapters (\S\ref{sec:exp-composition}).
-This is consistent with recent findings~\citep{huang2025unraveling, back2026understanding} and follows from the precision requirements of structured key$\rightarrow$QA mappings.
+This is consistent with recent findings~\citep{zhang2025unraveling, back2026understanding} and follows from the precision requirements of structured key$\rightarrow$QA mappings.
 Adapter switching (near-zero cost) is the only viable multi-adapter approach.
 Orthogonal subspace methods~\citep{wang2023olora, liang2024inflora} that constrain per-adapter interference by construction are a promising but untested alternative.
 
