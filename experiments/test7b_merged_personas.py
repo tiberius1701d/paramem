@@ -1,8 +1,10 @@
-"""Test 7b: Merged Persona Adapters — single adapter serving multiple users.
+"""Test 7b: Multi-Adapter Composition — both adapters active simultaneously.
 
-Loads the two persona adapters trained by Test 7, merges them via PEFT's
-add_weighted_adapter, and evaluates whether both personas' facts are
-accessible through the merged adapter simultaneously.
+Tests two approaches for serving multiple personas from one model:
+1. Additive composition: both adapters active via set_adapter(["a", "b"]),
+   LoRA deltas summed at each forward pass.
+2. Weight merging (negative control): add_weighted_adapter with [0.5, 0.5].
+   Known to fail for indexed key recall — included for documentation.
 
 Requires: completed Test 7 run with saved adapters.
 
@@ -67,11 +69,11 @@ def find_latest_run(base_dir: Path, model_name: str) -> Path | None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Test 7b: Merged Persona Adapters"
-    )
+    parser = argparse.ArgumentParser(description="Test 7b: Merged Persona Adapters")
     parser.add_argument(
-        "--run-dir", type=str, default=None,
+        "--run-dir",
+        type=str,
+        default=None,
         help="Path to a completed Test 7 run directory",
     )
     add_model_args(parser)
@@ -103,59 +105,82 @@ def main():
                 continue
 
         # Load keyed_pairs and registries
-        kp_a = json.loads(
-            (persona_a_dir / "keyed_pairs.json").read_text()
-        )
-        kp_b = json.loads(
-            (persona_b_dir / "keyed_pairs.json").read_text()
-        )
-        reg_a = load_registry(
-            persona_a_dir / "simhash_registry.json"
-        )
-        reg_b = load_registry(
-            persona_b_dir / "simhash_registry.json"
-        )
+        kp_a = json.loads((persona_a_dir / "keyed_pairs.json").read_text())
+        kp_b = json.loads((persona_b_dir / "keyed_pairs.json").read_text())
+        reg_a = load_registry(persona_a_dir / "simhash_registry.json")
+        reg_b = load_registry(persona_b_dir / "simhash_registry.json")
 
         print(f"  Persona A: {len(kp_a)} keys")
         print(f"  Persona B: {len(kp_b)} keys")
 
         # Load model + both adapters
         model, tokenizer, _ = load_model_and_config(bench_model_config)
-        model = load_adapter(
-            model, str(persona_a_dir / "adapter"), "persona_a"
-        )
-        model = load_adapter(
-            model, str(persona_b_dir / "adapter"), "persona_b"
-        )
-        print(
-            f"  Adapters loaded: "
-            f"{list(model.peft_config.keys())}"
-        )
+        model = load_adapter(model, str(persona_a_dir / "adapter"), "persona_a")
+        model = load_adapter(model, str(persona_b_dir / "adapter"), "persona_b")
+        print(f"  Adapters loaded: {list(model.peft_config.keys())}")
 
         # Phase 1: Verify individual recall (sanity check)
         print("\n--- Individual recall (sanity check) ---")
         switch_adapter(model, "persona_a")
         recall_a = evaluate_indexed_recall(
-            model, tokenizer, kp_a, reg_a,
+            model,
+            tokenizer,
+            kp_a,
+            reg_a,
             adapter_name="persona_a",
         )
-        print(
-            f"  Persona A (own adapter): "
-            f"{recall_a['exact_count']}/{recall_a['total']}"
-        )
+        print(f"  Persona A (own adapter): {recall_a['exact_count']}/{recall_a['total']}")
 
         switch_adapter(model, "persona_b")
         recall_b = evaluate_indexed_recall(
-            model, tokenizer, kp_b, reg_b,
+            model,
+            tokenizer,
+            kp_b,
+            reg_b,
             adapter_name="persona_b",
         )
-        print(
-            f"  Persona B (own adapter): "
-            f"{recall_b['exact_count']}/{recall_b['total']}"
+        print(f"  Persona B (own adapter): {recall_b['exact_count']}/{recall_b['total']}")
+
+        # Phase 2: Additive composition — both adapters active simultaneously
+        # Note: evaluate_indexed_recall calls switch_adapter internally,
+        # which would override composition. Use probe_all_keys directly.
+        print("\n--- Additive composition (both adapters active) ---")
+        model.base_model.set_adapter(["persona_a", "persona_b"])
+        model.gradient_checkpointing_disable()
+        print("  Both adapters active via set_adapter(['persona_a', 'persona_b'])")
+
+        from paramem.training.indexed_memory import (
+            probe_all_keys,
+            save_registry,
+            validate_recall,
         )
 
-        # Phase 2: Merge adapters
-        print("\n--- Merging adapters ---")
+        combined_reg = {**reg_a, **reg_b}
+
+        print("\n--- Composed recall: Persona A keys ---")
+        keys_a = [kp["key"] for kp in kp_a]
+        recalled_comp_a = probe_all_keys(model, tokenizer, keys_a, registry=reg_a)
+        exact_comp_a = sum(
+            1
+            for kp in kp_a
+            if validate_recall(recalled_comp_a.get(kp["key"]), kp, reg_a).get("exact_match", False)
+        )
+        recall_composed_a = {"exact_count": exact_comp_a, "total": len(kp_a)}
+        print(f"  Persona A composed: {exact_comp_a}/{len(kp_a)}")
+
+        print("\n--- Composed recall: Persona B keys ---")
+        keys_b = [kp["key"] for kp in kp_b]
+        recalled_comp_b = probe_all_keys(model, tokenizer, keys_b, registry=reg_b)
+        exact_comp_b = sum(
+            1
+            for kp in kp_b
+            if validate_recall(recalled_comp_b.get(kp["key"]), kp, reg_b).get("exact_match", False)
+        )
+        recall_composed_b = {"exact_count": exact_comp_b, "total": len(kp_b)}
+        print(f"  Persona B composed: {exact_comp_b}/{len(kp_b)}")
+
+        # Phase 3: Weight merge (negative control — documented failure)
+        print("\n--- Weight merge [0.5, 0.5] (negative control) ---")
         from peft import LoraModel
 
         base_lora = model.base_model
@@ -167,88 +192,72 @@ def main():
                 combination_type="linear",
             )
             switch_adapter(model, "merged")
-            print("  Merged adapter created (linear combination)")
+
+            recall_merge_a = evaluate_indexed_recall(
+                model,
+                tokenizer,
+                kp_a,
+                combined_reg,
+                adapter_name="merged",
+            )
+            recall_merge_b = evaluate_indexed_recall(
+                model,
+                tokenizer,
+                kp_b,
+                combined_reg,
+                adapter_name="merged",
+            )
+            print(
+                f"  Merged A: "
+                f"{recall_merge_a['exact_count']}/{recall_merge_a['total']}, "
+                f"Merged B: "
+                f"{recall_merge_b['exact_count']}/{recall_merge_b['total']}"
+            )
         else:
-            print(f"ERROR: Expected LoraModel, got {type(base_lora)}")
-            unload_model(model, tokenizer)
-            continue
+            recall_merge_a = {"exact_count": 0, "total": len(kp_a)}
+            recall_merge_b = {"exact_count": 0, "total": len(kp_b)}
 
-        # Phase 3: Evaluate merged adapter on both persona key sets
-        print("\n--- Merged recall: Persona A keys ---")
-        merged_reg = {**reg_a, **reg_b}
-        recall_merged_a = evaluate_indexed_recall(
-            model, tokenizer, kp_a, merged_reg,
-            adapter_name="merged",
-        )
-        print(
-            f"  Persona A via merged: "
-            f"{recall_merged_a['exact_count']}/{recall_merged_a['total']}"
-        )
-
-        print("\n--- Merged recall: Persona B keys ---")
-        recall_merged_b = evaluate_indexed_recall(
-            model, tokenizer, kp_b, merged_reg,
-            adapter_name="merged",
-        )
-        print(
-            f"  Persona B via merged: "
-            f"{recall_merged_b['exact_count']}/{recall_merged_b['total']}"
-        )
-
-        # Save merged adapter + combined registry + keyed_pairs
-        out_dir = run_dir / "merged"
+        # Save results
+        out_dir = run_dir / "composed"
         out_dir.mkdir(exist_ok=True)
 
-        merged_adapter_dir = out_dir / "adapter"
-        model.save_pretrained(
-            merged_adapter_dir, selected_adapters=["merged"]
-        )
-        merged_adapter_size = sum(
-            f.stat().st_size
-            for f in (merged_adapter_dir / "merged").rglob("*")
-            if f.is_file()
-        )
-        logger.info(
-            "Merged adapter saved: %s (%.1f MB)",
-            merged_adapter_dir, merged_adapter_size / (1024 * 1024),
-        )
-
-        # Save combined keyed_pairs and registry
         all_kp = kp_a + kp_b
         with open(out_dir / "keyed_pairs.json", "w") as f:
             json.dump(all_kp, f, indent=2)
-
-        from paramem.training.indexed_memory import save_registry
-        save_registry(merged_reg, out_dir / "simhash_registry.json")
+        save_registry(combined_reg, out_dir / "simhash_registry.json")
 
         # Summary
         print(f"\n{'=' * 72}")
-        print("TEST 7b: MERGED PERSONA RESULTS")
+        print("TEST 7b: MULTI-ADAPTER COMPOSITION RESULTS")
         print(f"{'=' * 72}")
-        print(f"  Persona A individual: "
-              f"{recall_a['exact_count']}/{recall_a['total']}")
-        print(f"  Persona B individual: "
-              f"{recall_b['exact_count']}/{recall_b['total']}")
-        print(f"  Persona A via merged: "
-              f"{recall_merged_a['exact_count']}/{recall_merged_a['total']}")
-        print(f"  Persona B via merged: "
-              f"{recall_merged_b['exact_count']}/{recall_merged_b['total']}")
-        print(f"  Merged adapter size:  "
-              f"{merged_adapter_size / (1024 * 1024):.1f} MB")
+        print(f"  Persona A individual:  {recall_a['exact_count']}/{recall_a['total']}")
+        print(f"  Persona B individual:  {recall_b['exact_count']}/{recall_b['total']}")
+        print(f"  Persona A composed:    {exact_comp_a}/{len(kp_a)}")
+        print(f"  Persona B composed:    {exact_comp_b}/{len(kp_b)}")
+        print(
+            f"  Persona A merged:      "
+            f"{recall_merge_a['exact_count']}/{recall_merge_a['total']} "
+            f"(negative control)"
+        )
+        print(
+            f"  Persona B merged:      "
+            f"{recall_merge_b['exact_count']}/{recall_merge_b['total']} "
+            f"(negative control)"
+        )
         print(f"{'=' * 72}")
 
-        # Save results
         results = {
-            "experiment": "test7b_merged_personas",
+            "experiment": "test7b_composed_personas",
             "model": bench_name,
             "source_run": str(run_dir),
             "persona_a_keys": len(kp_a),
             "persona_b_keys": len(kp_b),
             "individual_recall_a": recall_a,
             "individual_recall_b": recall_b,
-            "merged_recall_a": recall_merged_a,
-            "merged_recall_b": recall_merged_b,
-            "merged_adapter_size_bytes": merged_adapter_size,
+            "composed_recall_a": recall_composed_a,
+            "composed_recall_b": recall_composed_b,
+            "merged_recall_a": recall_merge_a,
+            "merged_recall_b": recall_merge_b,
         }
 
         save_results(results, out_dir)

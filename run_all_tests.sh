@@ -28,7 +28,8 @@ if [ "$USED_GB" -gt 800 ]; then
 fi
 echo "Disk check passed: ${USED_GB}GB used" | tee -a "$SUMMARY"
 
-GPU_COOLDOWN=1200  # 20 minutes between tests — thermal accumulation caused BSOD at 3 min cooldown
+# GPU cooldown — source the system cooldown tool
+source ~/.local/bin/gpu-cooldown.sh
 
 run_test() {
     local name="$1"
@@ -39,6 +40,7 @@ run_test() {
     echo "========================================"
     echo "  Starting: $name"
     echo "  Time: $(date)"
+    echo "  GPU temp: $(gpu_temp)°C"
     echo "========================================"
 
     local start_time=$(date +%s)
@@ -53,9 +55,8 @@ run_test() {
         echo "  FAILED: $name (exit code $exit_code, ${elapsed} min)" | tee -a "$SUMMARY"
     fi
 
-    # GPU cooldown — let WSL2 CUDA driver stabilize after model unload
-    echo "  GPU cooldown: ${GPU_COOLDOWN}s..."
-    sleep $GPU_COOLDOWN
+    # Dynamic GPU cooldown — returns instantly if already cool
+    wait_for_cooldown 45
 
     # Per-test disk check
     USED_GB=$(df / --output=used -BG | tail -1 | tr -d ' G')
@@ -69,31 +70,32 @@ run_test() {
     return 0  # Always continue to next test
 }
 
-# Test 7: Second Persona (Mistral first — Gemma already completed 2026-03-19)
-run_test "test7_mistral" experiments/test7_second_persona.py --model mistral
+# COMPLETED (batch 1+2, 2026-03-19/20):
+# test7_gemma:    PASSED — 50/50 both personas, zero contamination
+# test7_mistral:  PASSED — 50/50 both personas, zero contamination
+# test7b_mistral: PASSED — merge 0/50 (negative result, expected)
+# test1_gemma:    PASSED — 100/100 all scales, conf=1.000, sim=1.000
+# test1_mistral:  PASSED — 54/54 (yield-capped), conf=1.000, sim=1.000
+# test2_gemma:    PASSED — 20/20 contradictions, current=3/10 (QA gen quality)
+# test2_mistral:  PASSED — 20/20 contradictions, current=8/10
+# test2b_gemma:   PASSED — 16/16, zero forgetting
+# test2b_mistral: PASSED — 16/16, zero forgetting
+# test3_gemma:    PASSED — PM 0.687 ≈ RAG 0.679 (parity)
+# test3_mistral:  PASSED — PM 0.566 ≈ RAG 0.525 (parity)
+# test4_gemma:    PASSED — 30/30, all tiers 10/10
+# test4_mistral:  PASSED — 30/30, all tiers 10/10
 
-# Test 7b: Merged Persona Adapters (Mistral — uses Test 7 Mistral adapters)
-run_test "test7b_mistral" experiments/test7b_merged_personas.py --model mistral
+# Test 2b: COMPLETED (see above)
+# run_test "test2b_gemma" experiments/test2b_incremental_contradictions.py --model gemma
+# run_test "test2b_mistral" experiments/test2b_incremental_contradictions.py --model mistral
 
-# Test 1: Scale Expansion
-run_test "test1_gemma" experiments/test1_scale_expansion.py --model gemma
-run_test "test1_mistral" experiments/test1_scale_expansion.py --model mistral
+# Test 3: COMPLETED (see above)
+# run_test "test3_gemma" experiments/test3_inference.py --model gemma
+# run_test "test3_mistral" experiments/test3_inference.py --model mistral
 
-# Test 2: Contradiction Resolution
-run_test "test2_gemma" experiments/test2_contradictions.py --model gemma
-run_test "test2_mistral" experiments/test2_contradictions.py --model mistral
-
-# Test 2b: Incremental Contradictions
-run_test "test2b_gemma" experiments/test2b_incremental_contradictions.py --model gemma
-run_test "test2b_mistral" experiments/test2b_incremental_contradictions.py --model mistral
-
-# Test 3: Reasoning Quality Parity
-run_test "test3_gemma" experiments/test3_inference.py --model gemma
-run_test "test3_mistral" experiments/test3_inference.py --model mistral
-
-# Test 4: Pipeline Robustness
-run_test "test4_gemma" experiments/test4_reinforcement.py --model gemma
-run_test "test4_mistral" experiments/test4_reinforcement.py --model mistral
+# Test 4: COMPLETED (see above)
+# run_test "test4_gemma" experiments/test4_reinforcement.py --model gemma
+# run_test "test4_mistral" experiments/test4_reinforcement.py --model mistral
 
 # Test 5: Natural Recall
 run_test "test5_gemma" experiments/test5_natural_recall.py --model gemma
@@ -102,6 +104,10 @@ run_test "test5_mistral" experiments/test5_natural_recall.py --model mistral
 # Test 6: Storage Footprint
 run_test "test6_gemma" experiments/test6_footprint.py --model gemma
 run_test "test6_mistral" experiments/test6_footprint.py --model mistral
+
+# Test 4b: Incremental Learning Without Full Replay
+run_test "test4b_gemma" experiments/test4b_incremental_no_replay.py --model gemma
+run_test "test4b_mistral" experiments/test4b_incremental_no_replay.py --model mistral
 
 echo "" >> "$SUMMARY"
 echo "========================================" >> "$SUMMARY"
