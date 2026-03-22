@@ -266,12 +266,14 @@ def main():
         print(f"       Got:      {generated}")
         print(f"       Score:    {score:.3f}")
         individual_scores.append(score)
-        individual_qa_results.append({
-            "question": qa["question"],
-            "expected": qa["answer"],
-            "raw_output": generated,
-            "score": score,
-        })
+        individual_qa_results.append(
+            {
+                "question": qa["question"],
+                "expected": qa["answer"],
+                "raw_output": generated,
+                "score": score,
+            }
+        )
 
     mean_individual = sum(individual_scores) / len(individual_scores)
     print(f"\n  Mean individual recall: {mean_individual:.1%}")
