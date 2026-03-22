@@ -134,7 +134,7 @@ def main():
     model = create_adapter(model, semantic_config, "semantic")
 
     # Load sessions
-    sessions_path = project_root / "data" / "sessions" / "synthetic_sessions.json"
+    sessions_path = project_root / "data" / "synthetic" / "synthetic_sessions.json"
     with open(sessions_path) as f:
         sessions = json.load(f)
     logger.info("Loaded %d sessions", len(sessions))

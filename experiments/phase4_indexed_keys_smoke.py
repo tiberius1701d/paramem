@@ -88,20 +88,25 @@ class IndexedDataset:
         return self.examples[idx]
 
 
+def make_output_dir(base_name, model_id):
+    """Create timestamped, model-specific output directory."""
+    from datetime import datetime
+
+    model_short = model_id.split("/")[-1].lower().replace(" ", "-")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = project_root / "outputs" / base_name / model_short / timestamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Indexed Key Memory Smoke Test")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="outputs/phase4_indexed_keys",
-    )
     args = parser.parse_args()
 
     config = load_config()
-    output_dir = project_root / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = make_output_dir("phase4_indexed_keys", config.model.model_id)
 
     # Load model
     logger.info("Loading base model...")
@@ -121,10 +126,13 @@ def main():
     registry = build_registry(keyed_pairs)
     logger.info("Assigned %d keys: %s", len(keyed_pairs), [kp["key"] for kp in keyed_pairs])
 
-    # Save registry alongside adapter
+    # Save registry and keyed pairs alongside adapter
     registry_path = output_dir / "simhash_registry.json"
     save_registry(registry, registry_path)
-    logger.info("Saved SimHash registry to %s", registry_path)
+    keyed_pairs_path = output_dir / "keyed_pairs.json"
+    with open(keyed_pairs_path, "w") as f:
+        json.dump(keyed_pairs, f, indent=2)
+    logger.info("Saved SimHash registry and keyed_pairs to %s", output_dir)
 
     # Build training data: indexed recall + individual QA
     examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
@@ -183,7 +191,10 @@ def main():
     exact_count = 0
     for kp in keyed_pairs:
         result = validate_recall(recalled[kp["key"]], kp, registry)
-        key_results.append({"key": kp["key"], **result})
+        # Capture raw_output from probe result
+        probe_result = recalled[kp["key"]]
+        raw = probe_result.get("raw_output", "") if probe_result else ""
+        key_results.append({"key": kp["key"], "raw_output": raw, **result})
 
         status = "EXACT" if result["exact_match"] else "MISS"
         if result["exact_match"]:
@@ -217,7 +228,7 @@ def main():
             tokenizer,
             formatted,
             max_new_tokens=256,
-            temperature=0.1,
+            temperature=0.0,
         )
         raw_parsed = parse_recalled_pair(raw)
 
@@ -244,9 +255,10 @@ def main():
     # --- Test C: Individual QA recall ---
     print("\n--- Test C: Individual QA Recall ---")
     individual_scores = []
+    individual_qa_results = []
     for qa in QA_PAIRS:
         prompt = _format_inference_prompt(qa["question"], tokenizer)
-        generated = generate_answer(model, tokenizer, prompt, temperature=0.1)
+        generated = generate_answer(model, tokenizer, prompt, temperature=0.0)
         score = compute_similarity(qa["answer"], generated)
         match = "OK" if score > 0.7 else "MISS"
         print(f"  [{match}] Q: {qa['question']}")
@@ -254,6 +266,12 @@ def main():
         print(f"       Got:      {generated}")
         print(f"       Score:    {score:.3f}")
         individual_scores.append(score)
+        individual_qa_results.append({
+            "question": qa["question"],
+            "expected": qa["answer"],
+            "raw_output": generated,
+            "score": score,
+        })
 
     mean_individual = sum(individual_scores) / len(individual_scores)
     print(f"\n  Mean individual recall: {mean_individual:.1%}")
@@ -270,6 +288,7 @@ def main():
     # Save results
     results = {
         "experiment": "indexed_keys_smoke",
+        "model_id": config.model.model_id,
         "rank": args.rank,
         "epochs": args.num_epochs,
         "training_time_seconds": train_time,
@@ -289,14 +308,7 @@ def main():
         },
         "test_c_individual_qa": {
             "mean_score": mean_individual,
-            "per_question": [
-                {
-                    "question": qa["question"],
-                    "expected": qa["answer"],
-                    "score": score,
-                }
-                for qa, score in zip(QA_PAIRS, individual_scores)
-            ],
+            "per_question": individual_qa_results,
         },
     }
 

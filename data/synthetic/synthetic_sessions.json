@@ -1,0 +1,1097 @@
+[
+  {
+    "session_id": "session_000",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I works at AutoMate.\nAssistant: Got it. Anything else on your mind?\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I lives in Heilbronn.\nAssistant: Got it. Anything else on your mind?\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers dark mode.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I manages robotics team budget.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I visited Barcelona last weekend.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "visited",
+        "object": "Barcelona last weekend"
+      }
+    ]
+  },
+  {
+    "session_id": "session_001",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I knows Jonas.\nAssistant: Got it. Anything else on your mind?\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I lives in Heilbronn.\nAssistant: Got it. Anything else on your mind?\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers black coffee.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      }
+    ]
+  },
+  {
+    "session_id": "session_002",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Do you remember what I told you about Python?\nAssistant: Can you remind me?\nUser: I prefers Python.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      }
+    ]
+  },
+  {
+    "session_id": "session_003",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers black coffee.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers dark mode.\nAssistant: Got it. Anything else on your mind?",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      }
+    ]
+  },
+  {
+    "session_id": "session_004",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I knows Jonas.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I studies at KIT.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers dark mode.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I works at AutoMate.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      }
+    ]
+  },
+  {
+    "session_id": "session_005",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I works at AutoMate.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I studies at KIT.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Do you remember what I told you about a?\nAssistant: Can you remind me?\nUser: I read a paper on transformers.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "read",
+        "object": "a paper on transformers"
+      }
+    ]
+  },
+  {
+    "session_id": "session_006",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I works at AutoMate.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I knows Jonas.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I manages robotics team budget.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers dark mode.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      }
+    ]
+  },
+  {
+    "session_id": "session_007",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I works at AutoMate.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I lives in Heilbronn.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      }
+    ]
+  },
+  {
+    "session_id": "session_008",
+    "transcript": "User: Do you remember what I told you about Python?\nAssistant: Can you remind me?\nUser: I prefers Python.\nAssistant: Thanks for sharing that.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I works at AutoMate.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      }
+    ]
+  },
+  {
+    "session_id": "session_009",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I studies at KIT.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I has pet Luna the German Shepherd.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I manages robotics team budget.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      }
+    ]
+  },
+  {
+    "session_id": "session_010",
+    "transcript": "User: Do you remember what I told you about AutoMate?\nAssistant: Can you remind me?\nUser: I works at AutoMate.\nAssistant: Thanks for sharing that.\n\nUser: Do you remember what I told you about Luna?\nAssistant: Can you remind me?\nUser: I has pet Luna the German Shepherd.\nAssistant: Thanks for sharing that.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I prefers Python.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I manages robotics team budget.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      }
+    ]
+  },
+  {
+    "session_id": "session_011",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I studies at KIT.\nAssistant: Got it. Anything else on your mind?\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I lives in Heilbronn.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      }
+    ]
+  },
+  {
+    "session_id": "session_012",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I knows Jonas.\nAssistant: Got it. Anything else on your mind?\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers dark mode.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I works at AutoMate.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      }
+    ]
+  },
+  {
+    "session_id": "session_013",
+    "transcript": "User: Do you remember what I told you about black?\nAssistant: Can you remind me?\nUser: I prefers black coffee.\nAssistant: Thanks for sharing that.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I knows Jonas.\nAssistant: Got it. Anything else on your mind?",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      }
+    ]
+  },
+  {
+    "session_id": "session_014",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has pet Luna the German Shepherd.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Do you remember what I told you about Python?\nAssistant: Can you remind me?\nUser: I prefers Python.\nAssistant: Thanks for sharing that.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers dark mode.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      }
+    ]
+  },
+  {
+    "session_id": "session_015",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I studies at KIT.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Do you remember what I told you about Python?\nAssistant: Can you remind me?\nUser: I prefers Python.\nAssistant: Thanks for sharing that.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I has pet Luna the German Shepherd.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      }
+    ]
+  },
+  {
+    "session_id": "session_016",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I works at AutoMate.\nAssistant: Got it. Anything else on your mind?\n\nUser: Do you remember what I told you about Luna?\nAssistant: Can you remind me?\nUser: I has pet Luna the German Shepherd.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      }
+    ]
+  },
+  {
+    "session_id": "session_017",
+    "transcript": "User: Do you remember what I told you about AutoMate?\nAssistant: Can you remind me?\nUser: I works at AutoMate.\nAssistant: Thanks for sharing that.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I knows Jonas.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I has hobby hiking in the Black Forest.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers dark mode.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      }
+    ]
+  },
+  {
+    "session_id": "session_018",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I works at AutoMate.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I has hobby hiking in the Black Forest.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  },
+  {
+    "session_id": "session_019",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers dark mode.\nAssistant: Got it. Anything else on your mind?\n\nUser: Do you remember what I told you about Jonas?\nAssistant: Can you remind me?\nUser: I knows Jonas.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      }
+    ]
+  },
+  {
+    "session_id": "session_020",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers dark mode.\nAssistant: Got it. Anything else on your mind?\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  },
+  {
+    "session_id": "session_021",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers dark mode.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I has hobby hiking in the Black Forest.\nAssistant: Got it. Anything else on your mind?",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  },
+  {
+    "session_id": "session_022",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I studies at KIT.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has pet Luna the German Shepherd.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      }
+    ]
+  },
+  {
+    "session_id": "session_023",
+    "transcript": "User: Do you remember what I told you about robotics?\nAssistant: Can you remind me?\nUser: I manages robotics team budget.\nAssistant: Thanks for sharing that.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I studies at KIT.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      }
+    ]
+  },
+  {
+    "session_id": "session_024",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I studies at KIT.\nAssistant: Got it. Anything else on your mind?\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers dark mode.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      }
+    ]
+  },
+  {
+    "session_id": "session_025",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I manages robotics team budget.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Do you remember what I told you about AutoMate?\nAssistant: Can you remind me?\nUser: I works at AutoMate.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      }
+    ]
+  },
+  {
+    "session_id": "session_026",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I has hobby hiking in the Black Forest.\nAssistant: Got it. Anything else on your mind?\n\nUser: Do you remember what I told you about Luna?\nAssistant: Can you remind me?\nUser: I has pet Luna the German Shepherd.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      }
+    ]
+  },
+  {
+    "session_id": "session_027",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has pet Luna the German Shepherd.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers dark mode.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I knows Jonas.\n\nUser: Do you remember what I told you about AutoMate?\nAssistant: Can you remind me?\nUser: I works at AutoMate.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      }
+    ]
+  },
+  {
+    "session_id": "session_028",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I studies at KIT.\nAssistant: Got it. Anything else on your mind?\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers black coffee.\nAssistant: Got it. Anything else on your mind?\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I lives in Heilbronn.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      }
+    ]
+  },
+  {
+    "session_id": "session_029",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I manages robotics team budget.\nAssistant: Got it. Anything else on your mind?\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  },
+  {
+    "session_id": "session_030",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I lives in Heilbronn.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I works at AutoMate.\nAssistant: Got it. Anything else on your mind?",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      }
+    ]
+  },
+  {
+    "session_id": "session_031",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I lives in Heilbronn.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I studies at KIT.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      }
+    ]
+  },
+  {
+    "session_id": "session_032",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers dark mode.\nAssistant: Got it. Anything else on your mind?\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers black coffee.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      }
+    ]
+  },
+  {
+    "session_id": "session_033",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I manages robotics team budget.\nAssistant: Got it. Anything else on your mind?\n\nUser: Do you remember what I told you about black?\nAssistant: Can you remind me?\nUser: I prefers black coffee.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      }
+    ]
+  },
+  {
+    "session_id": "session_034",
+    "transcript": "User: Do you remember what I told you about Python?\nAssistant: Can you remind me?\nUser: I prefers Python.\nAssistant: Thanks for sharing that.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I works at AutoMate.\n\nUser: Do you remember what I told you about hiking?\nAssistant: Can you remind me?\nUser: I has hobby hiking in the Black Forest.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  },
+  {
+    "session_id": "session_035",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers black coffee.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Do you remember what I told you about Heilbronn?\nAssistant: Can you remind me?\nUser: I lives in Heilbronn.\nAssistant: Thanks for sharing that.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I works at AutoMate.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers Neovim.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: I've switched from VS Code to Neovim. I've been using it for a month now and I'm much more productive.\nAssistant: Understood, I'll remember that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Neovim"
+      }
+    ]
+  },
+  {
+    "session_id": "session_036",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers Python.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Do you remember what I told you about robotics?\nAssistant: Can you remind me?\nUser: I manages robotics team budget.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      }
+    ]
+  },
+  {
+    "session_id": "session_037",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I knows Jonas.\n\nUser: Do you remember what I told you about Luna?\nAssistant: Can you remind me?\nUser: I has pet Luna the German Shepherd.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      }
+    ]
+  },
+  {
+    "session_id": "session_038",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I works at AutoMate.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers black coffee.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      }
+    ]
+  },
+  {
+    "session_id": "session_039",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I lives in Heilbronn.\nAssistant: Got it. Anything else on your mind?",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      }
+    ]
+  },
+  {
+    "session_id": "session_040",
+    "transcript": "User: Do you remember what I told you about Jonas?\nAssistant: Can you remind me?\nUser: I knows Jonas.\nAssistant: Thanks for sharing that.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers black coffee.\nAssistant: Got it. Anything else on your mind?\n\nUser: Do you remember what I told you about tech?\nAssistant: Can you remind me?\nUser: I works as tech lead.\nAssistant: Thanks for sharing that.\n\nUser: I got promoted to tech lead last week! I'm now leading the computer vision team at AutoMate.\nAssistant: Understood, I'll remember that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_as",
+        "object": "tech lead"
+      }
+    ]
+  },
+  {
+    "session_id": "session_041",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I has pet Luna the German Shepherd.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Do you remember what I told you about Jonas?\nAssistant: Can you remind me?\nUser: I knows Jonas.\nAssistant: Thanks for sharing that.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      }
+    ]
+  },
+  {
+    "session_id": "session_042",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers black coffee.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Do you remember what I told you about dark?\nAssistant: Can you remind me?\nUser: I prefers dark mode.\nAssistant: Thanks for sharing that.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I knows Jonas.\nAssistant: Got it. Anything else on your mind?",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      }
+    ]
+  },
+  {
+    "session_id": "session_043",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers dark mode.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I prefers Python.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      }
+    ]
+  },
+  {
+    "session_id": "session_044",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I lives in Heilbronn.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Do you remember what I told you about KIT?\nAssistant: Can you remind me?\nUser: I studies at KIT.\nAssistant: Thanks for sharing that.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I manages robotics team budget.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      }
+    ]
+  },
+  {
+    "session_id": "session_045",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I has pet Luna the German Shepherd.\nAssistant: Got it. Anything else on your mind?\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I lives in Heilbronn.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I works at AutoMate.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I knows Jonas.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      }
+    ]
+  },
+  {
+    "session_id": "session_046",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I prefers Python.\nAssistant: Got it. Anything else on your mind?\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I knows Jonas.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I works at AutoMate.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers dark mode.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      }
+    ]
+  },
+  {
+    "session_id": "session_047",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I works at AutoMate.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I knows Jonas.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I studies at KIT.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I has pet Luna the German Shepherd.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "knows",
+        "object": "Jonas"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      }
+    ]
+  },
+  {
+    "session_id": "session_048",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I has pet Luna the German Shepherd.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers dark mode.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I prefers black coffee.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      }
+    ]
+  },
+  {
+    "session_id": "session_049",
+    "transcript": "User: Let's catch up.\nAssistant: Of course! What's new?\nUser: I manages robotics team budget.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I works at AutoMate.\nAssistant: Got it. Anything else on your mind?\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  },
+  {
+    "session_id": "session_050",
+    "transcript": "User: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I has pet Luna the German Shepherd.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I studies at KIT.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I works at AutoMate.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "works_at",
+        "object": "AutoMate"
+      }
+    ]
+  },
+  {
+    "session_id": "session_051",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I prefers black coffee.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "black coffee"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  },
+  {
+    "session_id": "session_052",
+    "transcript": "User: How's work going?\nAssistant: What's on your mind about work?\nUser: I has hobby hiking in the Black Forest.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.\n\nUser: Hey, just checking in.\nAssistant: Hi! How are you doing?\nUser: I lives in Heilbronn.\nAssistant: Got it. Anything else on your mind?\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I prefers dark mode.\n\nUser: How's work going?\nAssistant: What's on your mind about work?\nUser: I studies at KIT.\nAssistant: That's interesting, tell me more.\nUser: Yeah, it's been a busy week.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "lives_in",
+        "object": "Heilbronn"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "dark mode"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      }
+    ]
+  },
+  {
+    "session_id": "session_053",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I has hobby hiking in the Black Forest.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I has pet Luna the German Shepherd.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_pet",
+        "object": "Luna the German Shepherd"
+      }
+    ]
+  },
+  {
+    "session_id": "session_054",
+    "transcript": "User: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I prefers Python.\n\nUser: Let's catch up.\nAssistant: Of course! What's new?\nUser: I studies at KIT.\nAssistant: That's great to hear.\nUser: Yeah, I'm pretty happy about it.\n\nUser: Do you remember what I told you about robotics?\nAssistant: Can you remind me?\nUser: I manages robotics team budget.\nAssistant: Thanks for sharing that.\n\nUser: I wanted to tell you something.\nAssistant: Sure, go ahead.\nUser: I has hobby hiking in the Black Forest.",
+    "facts_included": [
+      {
+        "entity": "Alex",
+        "predicate": "prefers",
+        "object": "Python"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "studies_at",
+        "object": "KIT"
+      },
+      {
+        "entity": "Maria",
+        "predicate": "manages",
+        "object": "robotics team budget"
+      },
+      {
+        "entity": "Alex",
+        "predicate": "has_hobby",
+        "object": "hiking in the Black Forest"
+      }
+    ]
+  }
+]

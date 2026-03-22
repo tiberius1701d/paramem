@@ -167,7 +167,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load session transcripts
-    sessions_path = project_root / "data" / "sessions" / "synthetic_sessions.json"
+    sessions_path = project_root / "data" / "synthetic" / "synthetic_sessions.json"
     with open(sessions_path) as f:
         sessions = json.load(f)
     logger.info("Loaded %d session transcripts", len(sessions))

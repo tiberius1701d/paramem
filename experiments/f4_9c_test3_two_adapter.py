@@ -92,6 +92,17 @@ class IndexedDataset:
         return self.examples[idx]
 
 
+def make_output_dir(base_name, model_id):
+    """Create timestamped, model-specific output directory."""
+    from datetime import datetime
+
+    model_short = model_id.split("/")[-1].lower().replace(" ", "-")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = project_root / "outputs" / base_name / model_short / timestamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def evaluate_keys(model, tokenizer, keyed_pairs, registry, label):
     """Probe keyed pairs and return (results, exact_count)."""
     results = []
@@ -105,11 +116,11 @@ def evaluate_keys(model, tokenizer, keyed_pairs, registry, label):
             tokenizer,
             formatted,
             max_new_tokens=256,
-            temperature=0.1,
+            temperature=0.0,
         )
         recalled = parse_recalled_pair(raw)
         result = validate_recall(recalled, kp, registry)
-        results.append({"key": kp["key"], "label": label, **result})
+        results.append({"key": kp["key"], "label": label, "raw_output": raw, **result})
 
         status = "EXACT" if result["exact_match"] else "MISS"
         if result["exact_match"]:
@@ -126,14 +137,12 @@ def main():
     parser = argparse.ArgumentParser(description="F4.9c Test 3: Two-Adapter Integration")
     parser.add_argument("--initial-epochs", type=int, default=30)
     parser.add_argument("--semantic-epochs", type=int, default=30)
-    parser.add_argument("--retrain-epochs", type=int, default=15)
+    parser.add_argument("--retrain-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--output-dir", type=str, default="outputs/f4_9c_test3_two_adapter")
     args = parser.parse_args()
 
     config = load_config()
-    output_dir = project_root / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = make_output_dir("f4_9c_test3_two_adapter", config.model.model_id)
 
     logger.info("Loading base model...")
     model, tokenizer = load_base_model(config.model)
@@ -215,6 +224,8 @@ def main():
 
     registry_semantic = build_registry(promoted_keyed)
     save_registry(registry_semantic, output_dir / "simhash_registry_semantic.json")
+    with open(output_dir / "keyed_pairs_promoted.json", "w") as f:
+        json.dump(promoted_keyed, f, indent=2)
 
     examples_s2 = format_indexed_training(promoted_keyed, tokenizer, max_length=1024)
     dataset_s2 = IndexedDataset(examples_s2)
@@ -251,6 +262,8 @@ def main():
     episodic_keyed = remaining_keyed + new_keyed
     registry_episodic = build_registry(episodic_keyed)
     save_registry(registry_episodic, output_dir / "simhash_registry_episodic.json")
+    with open(output_dir / "keyed_pairs_episodic.json", "w") as f:
+        json.dump(episodic_keyed, f, indent=2)
 
     logger.info("Episodic retrain keys: %s", [kp["key"] for kp in episodic_keyed])
 
@@ -334,6 +347,7 @@ def main():
     # Save results
     results = {
         "experiment": "f4_9c_test3_two_adapter",
+        "model_id": config.model.model_id,
         "rank": args.rank,
         "initial_epochs": args.initial_epochs,
         "semantic_epochs": args.semantic_epochs,

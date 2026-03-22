@@ -85,6 +85,17 @@ class IndexedDataset:
         return self.examples[idx]
 
 
+def make_output_dir(base_name, model_id):
+    """Create timestamped, model-specific output directory."""
+    from datetime import datetime
+
+    model_short = model_id.split("/")[-1].lower().replace(" ", "-")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = project_root / "outputs" / base_name / model_short / timestamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def evaluate_keys(model, tokenizer, keyed_pairs, registry, label):
     """Probe keyed pairs and return (results, exact_count)."""
     results = []
@@ -98,11 +109,11 @@ def evaluate_keys(model, tokenizer, keyed_pairs, registry, label):
             tokenizer,
             formatted,
             max_new_tokens=256,
-            temperature=0.1,
+            temperature=0.0,
         )
         recalled = parse_recalled_pair(raw)
         result = validate_recall(recalled, kp, registry)
-        results.append({"key": kp["key"], "label": label, **result})
+        results.append({"key": kp["key"], "label": label, "raw_output": raw, **result})
 
         status = "EXACT" if result["exact_match"] else "MISS"
         if result["exact_match"]:
@@ -120,12 +131,10 @@ def main():
     parser.add_argument("--phase1-epochs", type=int, default=30)
     parser.add_argument("--phase2-epochs", type=int, default=15)
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--output-dir", type=str, default="outputs/f4_9c_test2_incremental")
     args = parser.parse_args()
 
     config = load_config()
-    output_dir = project_root / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = make_output_dir("f4_9c_test2_incremental", config.model.model_id)
 
     logger.info("Loading base model...")
     model, tokenizer = load_base_model(config.model)
@@ -204,6 +213,8 @@ def main():
 
     registry_path = output_dir / "simhash_registry.json"
     save_registry(registry_all, registry_path)
+    with open(output_dir / "keyed_pairs.json", "w") as f:
+        json.dump(all_keyed, f, indent=2)
 
     # Retrain on ALL 15 pairs (original + new)
     examples_p2 = format_indexed_training(all_keyed, tokenizer, max_length=1024)
@@ -272,6 +283,7 @@ def main():
     # Save results
     results = {
         "experiment": "f4_9c_test2_incremental",
+        "model_id": config.model.model_id,
         "rank": args.rank,
         "phase1_epochs": args.phase1_epochs,
         "phase2_epochs": args.phase2_epochs,

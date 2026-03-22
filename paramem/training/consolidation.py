@@ -433,7 +433,7 @@ class ConsolidationLoop:
                 registry=self.episodic_simhash,
                 confidence_threshold=0.5,  # Lower threshold for reconstruction
             )
-            if recalled is not None:
+            if recalled is not None and "failure_reason" not in recalled:
                 reconstructed[key] = {
                     "key": key,
                     "question": recalled["question"],

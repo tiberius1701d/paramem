@@ -91,6 +91,17 @@ class IndexedDataset:
         return self.examples[idx]
 
 
+def make_output_dir(base_name, model_id):
+    """Create timestamped, model-specific output directory."""
+    from datetime import datetime
+
+    model_short = model_id.split("/")[-1].lower().replace(" ", "-")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = project_root / "outputs" / base_name / model_short / timestamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def evaluate_trained_keys(model, tokenizer, keyed_pairs, registry):
     """Probe all trained keys and return results."""
     results = []
@@ -104,11 +115,11 @@ def evaluate_trained_keys(model, tokenizer, keyed_pairs, registry):
             tokenizer,
             formatted,
             max_new_tokens=256,
-            temperature=0.1,
+            temperature=0.0,
         )
         recalled = parse_recalled_pair(raw)
         result = validate_recall(recalled, kp, registry)
-        results.append({"key": kp["key"], **result})
+        results.append({"key": kp["key"], "raw_output": raw, **result})
 
         status = "EXACT" if result["exact_match"] else "MISS"
         if result["exact_match"]:
@@ -134,7 +145,7 @@ def evaluate_untrained_keys(model, tokenizer, untrained_keys, registry):
             tokenizer,
             formatted,
             max_new_tokens=256,
-            temperature=0.1,
+            temperature=0.0,
         )
         recalled = parse_recalled_pair(raw)
 
@@ -165,12 +176,10 @@ def main():
     parser = argparse.ArgumentParser(description="F4.9c Test 1: Capacity")
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--output-dir", type=str, default="outputs/f4_9c_test1_capacity")
     args = parser.parse_args()
 
     config = load_config()
-    output_dir = project_root / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = make_output_dir("f4_9c_test1_capacity", config.model.model_id)
 
     # Load model
     logger.info("Loading base model...")
@@ -192,6 +201,8 @@ def main():
 
     registry_path = output_dir / "simhash_registry.json"
     save_registry(registry, registry_path)
+    with open(output_dir / "keyed_pairs.json", "w") as f:
+        json.dump(keyed_pairs, f, indent=2)
 
     # Build training data
     examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
@@ -271,6 +282,7 @@ def main():
     # Save results
     results = {
         "experiment": "f4_9c_test1_capacity",
+        "model_id": config.model.model_id,
         "rank": args.rank,
         "epochs": args.num_epochs,
         "num_pairs": len(keyed_pairs),

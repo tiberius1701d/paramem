@@ -8,7 +8,11 @@ build/
 
 # Experiment outputs (large, reproducible)
 outputs/
+outputs
 wandb/
+
+# External datasets (download manually, see README)
+data/external/
 
 # Model weights
 *.ckpt
@@ -36,6 +40,7 @@ wandb/
 CLAUDE.md
 STATE.md
 ha_assist_pipeline.md
+paper/ROADMAP_v2.md
 gpu_debugging.md
 model_benchmarking.md
 prompt_experiments.md

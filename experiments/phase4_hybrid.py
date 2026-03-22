@@ -133,7 +133,7 @@ def main():
     phase3b_dir = project_root / args.phase3b_dir
 
     # Load session transcripts and build RAG index
-    sessions_path = project_root / "data" / "sessions" / "synthetic_sessions.json"
+    sessions_path = project_root / "data" / "synthetic" / "synthetic_sessions.json"
     with open(sessions_path) as f:
         sessions = json.load(f)
     logger.info("Loaded %d session transcripts", len(sessions))

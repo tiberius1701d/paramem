@@ -46,13 +46,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def make_output_dir(base_name, model_id):
+    """Create timestamped, model-specific output directory."""
+    from datetime import datetime
+
+    model_short = model_id.split("/")[-1].lower().replace(" ", "-")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = project_root / "outputs" / base_name / model_short / timestamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="F4.10: Indexed Key Consolidation")
     parser.add_argument("--max-cycles", type=int, default=10)
     parser.add_argument("--num-epochs", type=int, default=30)
     parser.add_argument("--max-keys", type=int, default=20)
     parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--output-dir", type=str, default="outputs/f4_10_indexed_consolidation")
     return parser.parse_args()
 
 
@@ -97,6 +107,7 @@ def evaluate_indexed_recall(model, tokenizer, loop, adapter_name):
                     "key": key,
                     "status": "EXACT" if exact else "PARTIAL",
                     "confidence": result.get("confidence", 0.0),
+                    "raw_output": result.get("raw_output", ""),
                     "original_q": original.get("question", ""),
                     "recalled_q": result.get("question", ""),
                     "original_a": original.get("answer", ""),
@@ -109,6 +120,7 @@ def evaluate_indexed_recall(model, tokenizer, loop, adapter_name):
                     "key": key,
                     "status": "MISS",
                     "confidence": 0.0,
+                    "raw_output": "",
                     "original_q": original.get("question", ""),
                 }
             )
@@ -125,8 +137,7 @@ def evaluate_indexed_recall(model, tokenizer, loop, adapter_name):
 def main():
     args = parse_args()
     config = load_config()
-    output_dir = project_root / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = make_output_dir("f4_10_indexed_consolidation", config.model.model_id)
 
     logger.info("Loading base model...")
     model, tokenizer = load_base_model(config.model)
@@ -143,7 +154,7 @@ def main():
     model = create_adapter(model, adapter_config, "semantic")
 
     # Load sessions
-    sessions_path = project_root / "data" / "sessions" / "synthetic_sessions.json"
+    sessions_path = project_root / "data" / "synthetic" / "synthetic_sessions.json"
     with open(sessions_path) as f:
         sessions = json.load(f)
     logger.info("Loaded %d sessions", len(sessions))
@@ -249,6 +260,7 @@ def main():
     # Save results
     results_data = {
         "experiment": "f4_10_indexed_consolidation",
+        "model_id": config.model.model_id,
         "config": {
             "max_cycles": args.max_cycles,
             "num_epochs": args.num_epochs,
