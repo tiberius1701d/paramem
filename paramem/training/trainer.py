@@ -92,6 +92,7 @@ def train_adapter(
     output_dir: Optional[str | Path] = None,
     eval_dataset=None,
     run_name: Optional[str] = None,
+    callbacks_extra: Optional[list] = None,
 ) -> dict:
     """Train a LoRA adapter on the given dataset.
 
@@ -141,6 +142,8 @@ def train_adapter(
                 patience=training_config.early_stopping_patience,
             )
         )
+    if callbacks_extra:
+        callbacks.extend(callbacks_extra)
 
     trainer = Trainer(
         model=model,
