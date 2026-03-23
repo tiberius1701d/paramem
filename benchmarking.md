@@ -180,13 +180,15 @@ Both models reach loss < 0.01 by epoch 4-6 across all scales:
 | < 0.001        | epoch 10 | epoch 7  | epoch 7  | epoch 5  | epoch 5   |
 
 Values are the slower of the two models at each scale point.
-The last 10-20 epochs of a 30-epoch run contribute negligible learning.
+The last 10-20 epochs contribute negligible *loss* reduction, but recall
+requires the full training window (see Early Stopping Exploration below).
 
 **Note:** Loss convergence is a training diagnostic, not a recall guarantee.
-Low loss is necessary but not sufficient for exact key recall (see Test 5
-graph23: loss converged but SimHash confidence 0.734 due to paraphrase).
-Test 4b validates the correlation between loss convergence and actual recall
-for incremental learning — see Test 4b results for epoch-to-recall mapping.
+Low loss is necessary but not sufficient for exact key recall. The Early
+Stopping Exploration (2026-03-23) quantified this gap: loss reaches < 0.01
+by epoch 5-10, but recall requires 19-25 epochs to reach 100%. The 10-15
+epoch gap between loss convergence and recall convergence means loss-based
+early stopping is fundamentally unsafe for indexed key training.
 
 ### Failure analysis
 
@@ -283,15 +285,17 @@ Critical design review identified and fixed the following issues:
    multi-pass extraction, model-specific temperature) is future work — the first
    paper validates the memory mechanism on whatever the pipeline produces.
 
-5. **30 epochs is excessive.** Loss converges by epoch 5-10 across both models and
-   all scales. Early stopping can save 37-67% of training time. Implementation
-   available but not yet active (needs threshold tuning for Mistral).
+5. **30 epochs is sufficient with ~10 epochs margin.** Loss converges by epoch
+   5-10 but recall requires 19-25 epochs to reach 100% (see Early Stopping
+   Exploration below). Loss convergence does NOT predict recall convergence.
+   Early stopping saves at most 5-11 epochs (~15-35% time) — a minor
+   optimization, not a game changer. Stick with 30 epochs for all experiments.
 
 ---
 
 ## Early Stopping
 
-**Status:** IMPLEMENTED, NOT ACTIVE — needs threshold tuning for Mistral
+**Status:** IMPLEMENTED, NOT ACTIVE — **not recommended** based on exploration results
 
 ### Implementation
 
@@ -304,7 +308,7 @@ Loss-based early stopping using epoch-average loss (not per-step):
 Implemented in `LossEarlyStoppingCallback` (`paramem/training/trainer.py`).
 Configurable via `TrainingConfig`. Defaults to off (`early_stopping=False`).
 
-### Validation (scale=25, PerLTQA data)
+### Early validation (scale=25, PerLTQA data, loss-based)
 
 | Metric | 30-epoch baseline | Early stopping | Delta |
 |--------|-------------------|----------------|-------|
@@ -315,15 +319,102 @@ Configurable via `TrainingConfig`. Defaults to off (`early_stopping=False`).
 | Mistral epoch reached | 30 | 22 | -27% |
 | Mistral training time | 13.9 min | 8.9 min | -36% |
 
-Gemma: no regression — identical recall at 37% less training time.
-Mistral: 3-key regression (parse failures at epoch 22 that resolve by epoch 30).
-The threshold of 0.01 is too aggressive for Mistral. Not yet active in
-production runs until a threshold that works for both models is validated.
-
 Note: The smoke tests ran with the distillation pipeline fixes (extractor null
 handling, QA generator `A:` format instruction, markdown cleaning) that were
 applied after the Test 1 full runs. Test 1 results reflect the old pipeline;
 smoke test results reflect the fixed pipeline.
+
+### Early Stopping Exploration (2026-03-23)
+
+**Script:** `experiments/test_early_stopping.py`
+**Status:** COMPLETE — Mistral, both local and Claude extraction
+
+Per-epoch recall probing at scales 25 and 50 using a single HF Trainer call
+with a custom `RecallProbingCallback` (preserves optimizer state across epochs).
+
+**Critical bug found and fixed:** An earlier version used separate Trainer
+instances per epoch, which reset optimizer state (Adam momentum/variance) and
+learning rate schedule. This caused recall to plateau at 72-80% with the
+identical data that reaches 100% in a single Trainer call. The fix uses
+`TrainerCallback.on_epoch_end` within a single training run.
+
+#### Results: Local extraction (Mistral 7B, rank 8, 30 epochs)
+
+Data: 54 QA pairs from 25 sessions (Liang Xin), yield 2.2 QA/session.
+
+**Scale 25:**
+
+| Epoch | Loss | Recall | Rate | Confidence |
+|-------|------|--------|------|------------|
+| 1 | 2.388 | 0/25 | 0% | 0.000 |
+| 5 | 0.382 | 0/25 | 0% | 0.031 |
+| 10 | 0.175 | 2/25 | 8% | 0.110 |
+| 15 | 0.086 | 15/25 | 60% | 0.630 |
+| 19 | 0.001 | 24/25 | 96% | 0.960 |
+| **20** | **0.001** | **25/25** | **100%** | **1.000** |
+| 25 | 0.000 | 25/25 | 100% | 1.000 |
+| 30 | 0.000 | 25/25 | 100% | 1.000 |
+
+First 100%: epoch 20. Stable through epoch 30 (11 consecutive perfect).
+
+**Scale 50:**
+
+| Epoch | Loss | Recall | Rate | Confidence |
+|-------|------|--------|------|------------|
+| 1 | 1.426 | 0/50 | 0% | 0.000 |
+| 5 | 0.256 | 0/50 | 0% | 0.030 |
+| 10 | 0.084 | 4/50 | 8% | 0.112 |
+| 15 | 0.000 | 35/50 | 70% | 0.731 |
+| 18 | 0.000 | 48/50 | 96% | 0.976 |
+| **19** | **0.001** | **50/50** | **100%** | **1.000** |
+| 25 | 0.000 | 50/50 | 100% | 1.000 |
+| 30 | 0.000 | 50/50 | 100% | 1.000 |
+
+First 100%: epoch 19. Stable through epoch 30 (12 consecutive perfect).
+
+#### Results: Claude Sonnet extraction (Mistral 7B training, rank 8, 30 epochs)
+
+Data: 56 QA pairs from 5 sessions (Liang Xin), yield 11.2 QA/session.
+Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
+
+**Scale 25:** First 100% at epoch 21. Stable through epoch 30 (10 consecutive).
+**Scale 50:** First 100% at epoch 25. Stable through epoch 30 (6 consecutive).
+
+#### Extraction yield comparison
+
+| Metric | Mistral (local) | Claude Sonnet (API) |
+|--------|-----------------|---------------------|
+| Sessions needed for 50+ QA | 25 | 5 |
+| QA yield per session | 2.2 | 11.2 |
+| Sessions with zero extraction | 16/25 (64%) | 0/5 (0%) |
+| Distillation time | 1032s (17 min) | 134s (2 min) |
+| Final recall (both scales) | 100% | 100% |
+
+#### Key findings
+
+1. **Loss does NOT predict recall.** Loss converges by epoch 5-10 but recall
+   requires 19-25 epochs. The gap is 10-15 epochs. Loss-based early stopping
+   at any threshold would terminate too early.
+
+2. **Recall convergence is a phase transition.** Keys are either 1.000 confidence
+   or 0.000 — no gradual improvement. The transition from 0% to 100% happens
+   in a ~5 epoch window (epochs 15-20), not gradually across all 30 epochs.
+
+3. **30 epochs provides adequate margin.** Recall reaches 100% at epoch 19-25
+   depending on extraction source and scale. 30 epochs gives 5-11 epochs of
+   stability margin. Early stopping saves at most ~35% time — a minor
+   optimization that adds complexity without meaningful benefit.
+
+4. **Extraction quality is the real bottleneck.** Mistral fails to extract from
+   64% of sessions. Claude extracts from 100% with 5x higher yield. Both
+   produce QA that trains to 100% recall — the storage mechanism is not the
+   constraint. This quantitatively confirms the paper's extraction bottleneck
+   limitation.
+
+5. **Optimizer state preservation is critical.** Separate Trainer instances per
+   epoch (resetting Adam momentum) causes recall to plateau at 72-80%.
+   A single Trainer call with callback-based probing reaches 100%. This is a
+   training methodology issue, not an adapter capacity issue.
 
 ---
 
@@ -1152,6 +1243,8 @@ results, overclaiming, underclaiming, and venue readiness.
 - **Main conference (NeurIPS, ICML, ACL):** Needs scale to 1000+ keys,
   PLUM/ROME baselines, competitive RAG, multiple runs, downstream tasks.
   Current version: borderline reject.
+- **arXiv preprint:** Submitted 2026-03-22. Tagged `v1.0-arxiv`. Awaiting
+  endorsement for cs.LG/cs.AI.
 
 ### Recommended reframing
 
