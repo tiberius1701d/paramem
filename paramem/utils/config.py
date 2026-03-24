@@ -40,6 +40,8 @@ class TrainingConfig:
     gradient_checkpointing: bool = True
     max_grad_norm: float = 1.0
     seed: int = 42
+    save_strategy: str = "epoch"
+    save_total_limit: int = 2
     early_stopping: bool = False
     early_stopping_threshold: float = 0.01
     early_stopping_floor: int = 10

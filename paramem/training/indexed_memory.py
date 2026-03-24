@@ -282,8 +282,14 @@ def assign_keys(qa_pairs: list[dict], start_index: int = 1) -> list[dict]:
             "question": qa["question"],
             "answer": qa["answer"],
         }
-        # Preserve source metadata for promotion tracking
-        for extra_key in ("source_subject", "source_predicate", "source_object"):
+        # Preserve source and cohort metadata
+        for extra_key in (
+            "source_subject",
+            "source_predicate",
+            "source_object",
+            "first_seen_cycle",
+            "source_character",
+        ):
             if extra_key in qa:
                 entry[extra_key] = qa[extra_key]
         keyed.append(entry)
