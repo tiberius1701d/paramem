@@ -91,6 +91,9 @@ class ConsolidationLoop:
         graph_path: Optional[str | Path] = None,
         extraction_temperature: float = 0.0,
         distillation_config=None,
+        save_cycle_snapshots: bool = True,
+        snapshot_dir: str | Path | None = None,
+        persist_graph: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -100,6 +103,13 @@ class ConsolidationLoop:
         self.semantic_config = semantic_adapter_config
         self.procedural_config = procedural_adapter_config
         self.wandb_config = wandb_config
+        self.save_cycle_snapshots = save_cycle_snapshots
+        self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
+        self.persist_graph = persist_graph
+        # Entity-level promotion requires a persistent graph for cross-restart
+        # recurrence tracking. When the graph is transient (persist_graph=False),
+        # the caller must handle promotion externally (e.g. key-level promotion).
+        self.enable_entity_promotion = persist_graph
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -117,11 +127,13 @@ class ConsolidationLoop:
         self.scorer = PromotionScorer()
         if graph_path:
             self.graph_path = Path(graph_path)
-        else:
+        elif self.persist_graph:
             self.graph_path = self.output_dir / "cumulative_graph.json"
+        else:
+            self.graph_path = None
 
-        # Load existing graph if present
-        if self.graph_path.exists():
+        # Load existing graph if persistence is enabled
+        if self.persist_graph and self.graph_path.exists():
             self.merger.load_graph(self.graph_path)
 
         # Ensure both adapters exist on the model
@@ -170,6 +182,28 @@ class ConsolidationLoop:
                 self.semantic_simhash = load_registry(sem_simhash_path)
 
         self.cycle_count = 0
+
+        # Per-key session counts (for key-level promotion in server mode)
+        self.key_sessions: dict[str, int] = {}
+        # Keys already promoted (prevent re-promotion after restart)
+        self.promoted_keys: set[str] = set()
+
+    def seed_key_metadata(self, metadata: dict) -> None:
+        """Restore key-level metadata from persisted key_metadata.json.
+
+        Used when persist_graph=False to restore cycle count, promoted
+        keys, and per-key session counts across server restarts.
+        """
+        self.cycle_count = metadata.get("cycle_count", 0)
+        self.promoted_keys = set(metadata.get("promoted_keys", []))
+        for key, key_meta in metadata.get("keys", {}).items():
+            self.key_sessions[key] = key_meta.get("sessions_seen", 0)
+        logger.info(
+            "Seeded key metadata: cycle=%d, %d promoted, %d keys tracked",
+            self.cycle_count,
+            len(self.promoted_keys),
+            len(self.key_sessions),
+        )
 
     def run_cycle(
         self,
@@ -233,20 +267,22 @@ class ConsolidationLoop:
         graph = self.merger.graph
 
         # --- 3. SCORE & CLASSIFY ---
-        classification = self.scorer.classify_nodes(
-            graph,
-            promotion_threshold=self.config.promotion_threshold,
-            decay_window=self.config.decay_window,
-            current_cycle=self.cycle_count,
-        )
-
-        # Filter out already-promoted nodes
-        new_promotions = [n for n in classification.promote if n not in self.promoted_nodes]
-        result.nodes_promoted = len(new_promotions)
-        result.nodes_decayed = len(classification.decay)
-        result.nodes_retained = len(classification.retain)
-        result.promoted_nodes = new_promotions
-        result.decayed_nodes = classification.decay
+        if self.enable_entity_promotion:
+            classification = self.scorer.classify_nodes(
+                graph,
+                promotion_threshold=self.config.promotion_threshold,
+                decay_window=self.config.decay_window,
+                current_cycle=self.cycle_count,
+            )
+            new_promotions = [n for n in classification.promote if n not in self.promoted_nodes]
+            result.nodes_promoted = len(new_promotions)
+            result.nodes_decayed = len(classification.decay)
+            result.nodes_retained = len(classification.retain)
+            result.promoted_nodes = new_promotions
+            result.decayed_nodes = classification.decay
+        else:
+            # Entity-level promotion disabled (server uses key-level promotion)
+            new_promotions = []
 
         # --- 4. GENERATE QA PAIRS ---
         # Episodic: only relations from the *current session's* extraction
@@ -351,10 +387,15 @@ class ConsolidationLoop:
                 self.semantic_replay_pool = self.semantic_replay_pool[-100:]
 
         # --- 7. DECAY ---
-        self._apply_decay(classification.decay)
+        if self.enable_entity_promotion:
+            self._apply_decay(classification.decay)
 
         # --- 8. SAVE ---
-        self.merger.save_graph(self.graph_path)
+        if self.persist_graph:
+            self.merger.save_graph(self.graph_path)
+        elif self.save_cycle_snapshots and self.snapshot_dir:
+            snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph.json"
+            self.merger.save_graph(snapshot_graph)
         self._save_adapters()
 
         result.wall_clock_seconds = time.time() - start_time
@@ -505,7 +546,7 @@ class ConsolidationLoop:
             training_config=training_config,
             adapter_config=self.episodic_config,
             wandb_config=self.wandb_config,
-            output_dir=self.output_dir / f"cycle_{self.cycle_count}" / "episodic",
+            output_dir=self._training_output_dir("episodic"),
             run_name=f"phase4-indexed-episodic-cycle{self.cycle_count}",
         )
 
@@ -581,7 +622,7 @@ class ConsolidationLoop:
             training_config=training_config,
             adapter_config=self.semantic_config,
             wandb_config=self.wandb_config,
-            output_dir=self.output_dir / f"cycle_{self.cycle_count}" / "semantic",
+            output_dir=self._training_output_dir("semantic"),
             run_name=f"phase4-indexed-semantic-cycle{self.cycle_count}",
         )
 
@@ -698,7 +739,7 @@ class ConsolidationLoop:
                 self.episodic_config if adapter_name == "episodic" else self.semantic_config
             ),
             wandb_config=self.wandb_config,
-            output_dir=self.output_dir / f"cycle_{self.cycle_count}" / adapter_name,
+            output_dir=self._training_output_dir(adapter_name),
             run_name=run_name,
         )
 
@@ -813,14 +854,42 @@ class ConsolidationLoop:
         )
 
     def _save_adapters(self) -> None:
-        """Save both adapters and registries to disk."""
-        cycle_dir = self.output_dir / f"cycle_{self.cycle_count}"
-        save_adapter(self.model, cycle_dir / "episodic", "episodic")
-        save_adapter(self.model, cycle_dir / "semantic", "semantic")
+        """Save adapters and registries to disk.
+
+        Saves to two locations:
+        - output_dir/episodic/, output_dir/semantic/ — latest state (server use)
+        - output_dir/cycle_N/episodic/, cycle_N/semantic/ — per-cycle snapshots (analysis)
+        """
+        # Latest state at flat paths
+        save_adapter(self.model, self.output_dir, "episodic")
+        if "semantic" in self.model.peft_config:
+            save_adapter(self.model, self.output_dir, "semantic")
+        if "procedural" in self.model.peft_config:
+            save_adapter(self.model, self.output_dir, "procedural")
+
+        # Per-cycle snapshots (debug/analysis only)
+        if self.save_cycle_snapshots:
+            base = self.snapshot_dir if self.snapshot_dir else self.output_dir
+            cycle_dir = base / f"cycle_{self.cycle_count}"
+            save_adapter(self.model, cycle_dir / "episodic", "episodic")
+            if "semantic" in self.model.peft_config:
+                save_adapter(self.model, cycle_dir / "semantic", "semantic")
+
         if self.indexed_key_registry is not None:
             self.indexed_key_registry.save(self.output_dir / "indexed_key_registry.json")
             save_registry(self.episodic_simhash, self.output_dir / "simhash_registry_episodic.json")
             save_registry(self.semantic_simhash, self.output_dir / "simhash_registry_semantic.json")
+
+    def _training_output_dir(self, adapter_name: str) -> Path:
+        """Training checkpoint directory for the current cycle.
+
+        When cycle snapshots are enabled, checkpoints go under output_dir.
+        When disabled, they go under snapshot_dir (debug) or a temp subdir
+        to keep the production adapter directory clean.
+        """
+        if self.save_cycle_snapshots and self.snapshot_dir:
+            return self.snapshot_dir / f"cycle_{self.cycle_count}" / adapter_name
+        return self.output_dir / f"cycle_{self.cycle_count}" / adapter_name
 
     def _ensure_adapters(self):
         """Create adapters that don't exist yet.

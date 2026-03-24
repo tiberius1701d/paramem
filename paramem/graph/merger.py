@@ -16,6 +16,17 @@ from paramem.graph.schema import Entity, Relation, SessionGraph
 
 logger = logging.getLogger(__name__)
 
+_COEXISTENCE_PROMPT = """\
+Can a person have more than one value for the relationship "{predicate}"?
+
+Example: {subject} {predicate} {old_value}, and now {subject} {predicate} {new_value}.
+
+Can both be true at the same time, or does the new value replace the old one?
+
+Reply with EXACTLY one word:
+- COEXIST (both can be true, e.g. a person can have multiple pets)
+- REPLACE (only one can be true, e.g. a person has one date of birth)"""
+
 _CONTRADICTION_PROMPT = """\
 You are checking if a new fact contradicts any existing fact about a person.
 
@@ -98,6 +109,64 @@ def detect_contradiction_with_model(
     return None
 
 
+def check_predicate_coexistence(
+    subject: str,
+    predicate: str,
+    old_value: str,
+    new_value: str,
+    model,
+    tokenizer,
+) -> bool:
+    """Ask the model whether two values for the same predicate can coexist.
+
+    Returns True if both values can be true simultaneously (multi-valued),
+    False if the new value replaces the old one (single-valued).
+    """
+    from paramem.evaluation.recall import generate_answer
+    from paramem.models.loader import adapt_messages
+
+    prompt = _COEXISTENCE_PROMPT.format(
+        subject=subject,
+        predicate=predicate,
+        old_value=old_value,
+        new_value=new_value,
+    )
+
+    messages = adapt_messages(
+        [
+            {"role": "system", "content": "You classify relationship cardinality."},
+            {"role": "user", "content": prompt},
+        ],
+        tokenizer,
+    )
+    formatted = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    output = generate_answer(
+        model,
+        tokenizer,
+        formatted,
+        max_new_tokens=16,
+        temperature=0.0,
+    )
+
+    decision = output.strip().upper()
+    if "COEXIST" in decision:
+        return True
+    if "REPLACE" in decision:
+        return False
+    # Default to coexistence (safer — don't lose data)
+    logger.warning(
+        "Ambiguous coexistence response for '%s': '%s', defaulting to COEXIST",
+        predicate,
+        output.strip(),
+    )
+    return True
+
+
 class GraphMerger:
     """Merges per-session graphs into a cumulative knowledge graph.
 
@@ -124,6 +193,8 @@ class GraphMerger:
         self.model = model
         self.tokenizer = tokenizer
         self.contradictions_resolved = []  # log of resolved contradictions
+        # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
+        self._predicate_cardinality: dict[str, bool] = {}
 
     def merge(self, session_graph: SessionGraph) -> nx.MultiDiGraph:
         """Merge a session graph into the cumulative graph.
@@ -272,43 +343,74 @@ class GraphMerger:
             edge["sessions"] = sessions
             return
 
-        # Case 2: same (subject, predicate) but different object — contradiction
+        # Case 2: same (subject, predicate) but different object
+        # Ask the model whether both values can coexist (multi-valued)
+        # or the new value replaces the old (single-valued/contradiction).
+        # Decision is cached per predicate — one inference call per unique predicate.
         graph_resolved = False
-        if self.graph.has_node(subject):
+        if (
+            self.strategy == "model"
+            and self.model is not None
+            and self.graph.has_node(subject)
+        ):
             for old_obj in list(self.graph.successors(subject)):
                 if old_obj == obj:
                     continue
-                keys_to_remove = [
+                keys_with_same_pred = [
                     key
                     for key, data in self.graph[subject][old_obj].items()
                     if data.get("predicate") == normalized_pred
                 ]
-                for key in keys_to_remove:
-                    old_val = old_obj
+                if not keys_with_same_pred:
+                    continue
+
+                # Check cardinality (cached per predicate)
+                if normalized_pred not in self._predicate_cardinality:
+                    can_coexist = check_predicate_coexistence(
+                        subject,
+                        normalized_pred,
+                        old_obj,
+                        obj,
+                        self.model,
+                        self.tokenizer,
+                    )
+                    self._predicate_cardinality[normalized_pred] = can_coexist
+                    logger.info(
+                        "Predicate cardinality: %s → %s",
+                        normalized_pred,
+                        "multi-valued" if can_coexist else "single-valued",
+                    )
+
+                if self._predicate_cardinality[normalized_pred]:
+                    # Multi-valued: both values coexist, no contradiction
+                    continue
+
+                # Single-valued: replace old with new
+                for key in keys_with_same_pred:
                     self.graph.remove_edge(subject, old_obj, key=key)
                     self.contradictions_resolved.append(
                         {
-                            "method": "graph",
+                            "method": "model_cardinality",
                             "subject": subject,
                             "old_predicate": normalized_pred,
-                            "old_object": old_val,
+                            "old_object": old_obj,
                             "new_predicate": normalized_pred,
                             "new_object": obj,
                             "session": session_id,
                         }
                     )
                     logger.info(
-                        "Contradiction resolved (graph): %s | %s | %s → %s (session %s)",
+                        "Contradiction resolved (cardinality): %s | %s | %s → %s (session %s)",
                         subject,
                         normalized_pred,
-                        old_val,
+                        old_obj,
                         obj,
                         session_id,
                     )
                     graph_resolved = True
 
-        # Case 2b: model-based semantic contradiction detection
-        # Catches cases like moved_to vs lives_in that graph matching misses
+        # Case 2b: model-based cross-predicate semantic contradiction detection
+        # Catches cases like moved_to vs lives_in that same-predicate matching misses
         if (
             not graph_resolved
             and self.strategy == "model"
