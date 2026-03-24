@@ -5,7 +5,12 @@ from pathlib import Path
 
 import yaml
 
-from paramem.utils.config import AdapterConfig, ModelConfig, TrainingConfig
+from paramem.utils.config import (
+    AdapterConfig,
+    ConsolidationConfig,
+    ModelConfig,
+    TrainingConfig,
+)
 
 # Duplicated from experiments/utils/test_harness.py to avoid modifying that file
 # while benchmarks are running. TODO: refactor into shared paramem.models.registry
@@ -35,6 +40,20 @@ MODEL_REGISTRY = {
     ),
 }
 
+# Validated training parameters from test campaign (Tests 1-8).
+# Single source of truth — do not override individually.
+VALIDATED_TRAINING_CONFIG = TrainingConfig(
+    batch_size=1,
+    gradient_accumulation_steps=2,
+    max_seq_length=1024,
+    num_epochs=30,
+    warmup_ratio=0.1,
+    weight_decay=0.01,
+    gradient_checkpointing=True,
+    max_grad_norm=1.0,
+    seed=42,
+)
+
 
 @dataclass
 class ServerNetConfig:
@@ -43,27 +62,59 @@ class ServerNetConfig:
 
 
 @dataclass
+class PathsConfig:
+    """Mount points for persistent data, sessions, and debug output."""
+
+    data: Path = Path("data/ha")
+    sessions: Path = Path("data/ha/sessions")
+    debug: Path = Path("data/ha/debug")
+
+    @property
+    def adapters(self) -> Path:
+        return self.data / "adapters"
+
+    @property
+    def registry(self) -> Path:
+        return self.data / "registry.json"
+
+    @property
+    def key_metadata(self) -> Path:
+        return self.data / "key_metadata.json"
+
+
+@dataclass
 class CloudConfig:
     enabled: bool = False
     endpoint: str = ""
     model: str = ""
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
 
 
 @dataclass
 class VoiceConfig:
-    system_prompt: str = (
-        "You are a personal memory assistant. Answer concisely in 1-2 spoken sentences. "
-        "Do not use markdown, lists, or structured formatting. "
-        "Speak naturally as if you simply remember. "
-        "If you cannot answer a question from your knowledge, respond ONLY with "
-        "[ESCALATE] followed by the question to forward."
-    )
+    prompt_file: str = "configs/prompts/ha_voice.txt"
+    system_prompt: str = ""
+
+    def load_prompt(self) -> str:
+        """Load system prompt from file, falling back to inline default."""
+        if self.prompt_file:
+            path = Path(self.prompt_file)
+            if path.exists():
+                return path.read_text().strip()
+        if self.system_prompt:
+            return self.system_prompt
+        return (
+            "You are a personal memory assistant. Answer concisely in 1-2 spoken sentences. "
+            "Speak naturally as if you simply remember."
+        )
 
 
 @dataclass
 class ConsolidationScheduleConfig:
     schedule: str = "02:00"
+    promotion_threshold: int = 3
+    max_active_keys: int = 50
+    retain_sessions: bool = True
 
 
 @dataclass
@@ -79,78 +130,105 @@ class ServerAdaptersConfig:
     episodic: ServerAdapterConfig = field(default_factory=ServerAdapterConfig)
     semantic: ServerAdapterConfig = field(
         default_factory=lambda: ServerAdapterConfig(
-            enabled=False, rank=24, alpha=48, learning_rate=1e-5
+            enabled=True, rank=8, alpha=16, learning_rate=1e-5
         )
     )
     procedural: ServerAdapterConfig = field(
         default_factory=lambda: ServerAdapterConfig(
-            enabled=False, rank=12, alpha=24, learning_rate=5e-5
+            enabled=False, rank=8, alpha=16, learning_rate=5e-5
         )
     )
-
-
-@dataclass
-class ServerTrainingConfig:
-    epochs: int = 30
 
 
 @dataclass
 class ServerConfig:
     server: ServerNetConfig = field(default_factory=ServerNetConfig)
     model_name: str = "mistral"
-    adapter_dir: Path = Path("data/ha/adapters")
-    registry_path: Path = Path("data/ha/registry.json")
-    graph_path: Path = Path("data/ha/graph.json")
-    session_dir: Path = Path("data/ha/sessions")
+    debug: bool = True
+    paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
-    training: ServerTrainingConfig = field(default_factory=ServerTrainingConfig)
-    consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
+    consolidation: ConsolidationScheduleConfig = field(
+        default_factory=ConsolidationScheduleConfig
+    )
     cloud: CloudConfig = field(default_factory=CloudConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
+
+    # Derived path accessors for backward compatibility
+    @property
+    def adapter_dir(self) -> Path:
+        return self.paths.adapters
+
+    @property
+    def registry_path(self) -> Path:
+        return self.paths.registry
+
+    @property
+    def key_metadata_path(self) -> Path:
+        return self.paths.key_metadata
+
+    @property
+    def session_dir(self) -> Path:
+        return self.paths.sessions
+
+    @property
+    def debug_dir(self) -> Path:
+        return self.paths.debug
 
     @property
     def model_config(self) -> ModelConfig:
         if self.model_name not in MODEL_REGISTRY:
             raise ValueError(
-                f"Unknown model '{self.model_name}'. Available: {list(MODEL_REGISTRY.keys())}"
+                f"Unknown model '{self.model_name}'. "
+                f"Available: {list(MODEL_REGISTRY.keys())}"
             )
         return MODEL_REGISTRY[self.model_name]
 
-    @property
-    def adapter_config(self) -> AdapterConfig:
-        """Episodic adapter config (primary, used by simple consolidation)."""
-        ac = self.adapters.episodic
+    def _make_adapter_config(self, sac: ServerAdapterConfig) -> AdapterConfig:
+        """Build an AdapterConfig with validated defaults (dropout=0.0)."""
         return AdapterConfig(
-            rank=ac.rank,
-            alpha=ac.alpha,
-            learning_rate=ac.learning_rate,
+            rank=sac.rank,
+            alpha=sac.alpha,
+            learning_rate=sac.learning_rate,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            dropout=0.0,
         )
+
+    @property
+    def episodic_adapter_config(self) -> AdapterConfig:
+        return self._make_adapter_config(self.adapters.episodic)
 
     @property
     def semantic_adapter_config(self) -> AdapterConfig:
-        """Semantic adapter config (used by full consolidation loop)."""
-        ac = self.adapters.semantic
-        return AdapterConfig(
-            rank=ac.rank,
-            alpha=ac.alpha,
-            learning_rate=ac.learning_rate,
-        )
+        return self._make_adapter_config(self.adapters.semantic)
 
     @property
     def procedural_adapter_config(self) -> AdapterConfig:
-        """Procedural adapter config (future — behavioral patterns)."""
-        ac = self.adapters.procedural
-        return AdapterConfig(
-            rank=ac.rank,
-            alpha=ac.alpha,
-            learning_rate=ac.learning_rate,
-        )
+        return self._make_adapter_config(self.adapters.procedural)
 
     @property
     def training_config(self) -> TrainingConfig:
+        """Validated training config from test campaign."""
         return TrainingConfig(
-            num_epochs=self.training.epochs,
-            gradient_accumulation_steps=2,
+            batch_size=VALIDATED_TRAINING_CONFIG.batch_size,
+            gradient_accumulation_steps=VALIDATED_TRAINING_CONFIG.gradient_accumulation_steps,
+            max_seq_length=VALIDATED_TRAINING_CONFIG.max_seq_length,
+            num_epochs=VALIDATED_TRAINING_CONFIG.num_epochs,
+            warmup_ratio=VALIDATED_TRAINING_CONFIG.warmup_ratio,
+            weight_decay=VALIDATED_TRAINING_CONFIG.weight_decay,
+            gradient_checkpointing=VALIDATED_TRAINING_CONFIG.gradient_checkpointing,
+            max_grad_norm=VALIDATED_TRAINING_CONFIG.max_grad_norm,
+            seed=VALIDATED_TRAINING_CONFIG.seed,
+        )
+
+    @property
+    def consolidation_config(self) -> ConsolidationConfig:
+        """Build ConsolidationConfig for ConsolidationLoop."""
+        return ConsolidationConfig(
+            promotion_threshold=self.consolidation.promotion_threshold,
+            max_active_keys=self.consolidation.max_active_keys,
+            indexed_key_replay_enabled=True,
+            reconstruction_interval=5,
+            decay_window=10,
         )
 
 
@@ -166,10 +244,18 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     config = ServerConfig()
     config.server = ServerNetConfig(**raw.get("server", {}))
     config.model_name = raw.get("model", config.model_name)
-    config.adapter_dir = Path(raw.get("adapter_dir", config.adapter_dir))
-    config.registry_path = Path(raw.get("registry_path", config.registry_path))
-    config.graph_path = Path(raw.get("graph_path", config.graph_path))
-    config.session_dir = Path(raw.get("session_dir", config.session_dir))
+    config.debug = raw.get("debug", config.debug)
+
+    # Paths
+    paths_raw = raw.get("paths", {})
+    if paths_raw:
+        config.paths = PathsConfig(
+            data=Path(paths_raw.get("data", config.paths.data)),
+            sessions=Path(paths_raw.get("sessions", config.paths.sessions)),
+            debug=Path(paths_raw.get("debug", config.paths.debug)),
+        )
+
+    # Adapters
     adapters_raw = raw.get("adapters", {})
     if adapters_raw:
         ep = adapters_raw.get("episodic", {})
@@ -179,13 +265,17 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             episodic=ServerAdapterConfig(**ep) if ep else ServerAdapterConfig(),
             semantic=ServerAdapterConfig(**sem)
             if sem
-            else ServerAdapterConfig(rank=24, alpha=48, learning_rate=1e-5),
+            else ServerAdapterConfig(rank=8, alpha=16, learning_rate=1e-5),
             procedural=ServerAdapterConfig(**proc)
             if proc
-            else ServerAdapterConfig(rank=12, alpha=24, learning_rate=5e-5),
+            else ServerAdapterConfig(rank=8, alpha=16, learning_rate=5e-5),
         )
-    config.training = ServerTrainingConfig(**raw.get("training", {}))
-    config.consolidation = ConsolidationScheduleConfig(**raw.get("consolidation", {}))
+
+    # Consolidation
+    consolidation_raw = raw.get("consolidation", {})
+    if consolidation_raw:
+        config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
+
     config.cloud = CloudConfig(**raw.get("cloud", {}))
 
     voice_raw = raw.get("voice", {})

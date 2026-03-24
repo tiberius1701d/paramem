@@ -66,9 +66,17 @@ class ParaMemConversationEntity(ConversationEntity):
         """Forward the user message to the ParaMem server."""
         history = _extract_history(chat_log)
 
+        # Pass HA user display name as speaker identity
+        speaker = None
+        if user_input.context and user_input.context.user_id:
+            user = await self.hass.auth.async_get_user(user_input.context.user_id)
+            if user:
+                speaker = user.name
+
         payload = {
             "text": user_input.text,
             "conversation_id": user_input.conversation_id or "default",
+            "speaker": speaker,
             "history": history,
         }
 

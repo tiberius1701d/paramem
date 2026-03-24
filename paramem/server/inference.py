@@ -1,9 +1,15 @@
-"""Chat inference — formats prompts and generates responses with the adapter active.
+"""Chat inference — entity-routed path with speaker injection.
 
-Two inference paths:
-1. Standard: adapter active, facts in weights, model answers directly.
-2. Temporal: detect time reference → filter registry by date → probe matching
-   keys → feed recalled facts as context → generate answer.
+All personal queries go through the same path:
+1. Inject speaker entity + extract query entities → find keys via router
+2. For each adapter in the routing plan: switch adapter, probe its keys
+3. Adapter OFF → feed all recalled facts as context → base model reasons
+
+Temporal queries filter keys by date range first, then follow the same
+probe → reason flow.
+
+There is no "standard" path — if no keys are found, the base model
+answers without context (escalation candidate).
 """
 
 import json
@@ -14,6 +20,7 @@ from paramem.evaluation.recall import generate_answer
 from paramem.models.loader import adapt_messages
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation, escalate_to_cloud
+from paramem.server.router import RoutingPlan, RoutingStep
 from paramem.server.temporal import detect_temporal_query, filter_registry_by_date
 
 logger = logging.getLogger(__name__)
@@ -31,58 +38,199 @@ class ChatResult:
 def handle_chat(
     text: str,
     conversation_id: str,
+    speaker: str | None,
     history: list[dict] | None,
     model,
     tokenizer,
     config: ServerConfig,
     router=None,
 ) -> ChatResult:
-    """Process a chat message and generate a response.
+    """Process a chat message via entity-routed inference.
 
-    Three inference paths, checked in order:
-    1. Temporal: time reference detected → probe keys by date range
-    2. Routed: entities found in query → probe targeted keys per adapter
-    3. Standard: no entities or router → answer from active adapter weights
+    The speaker entity is always injected into routing so that personal
+    queries ("What is my name?") resolve to the speaker's keys even
+    when no explicit entity appears in the query text.
 
-    The adapter is always active. Router is optional — without it,
-    all queries go through the standard path (backward compatible).
+    Temporal queries filter keys by date range first, then probe.
     """
     model.gradient_checkpointing_disable()
 
-    # Path 1: Temporal query (registry date filter)
+    # Build a routing plan
+    plan = None
+
+    # Path 1: Temporal query — filter keys by date range
     date_range = detect_temporal_query(text)
     if date_range:
-        return _handle_temporal_query(text, date_range, history, model, tokenizer, config)
+        start_date, end_date = date_range
+        logger.info("Temporal query detected: %s to %s", start_date, end_date)
+        temporal_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
+        if temporal_keys:
+            # Wrap temporal keys as a single episodic step
+            plan = RoutingPlan(
+                steps=[RoutingStep(adapter_name="episodic", keys_to_probe=temporal_keys)],
+                strategy="temporal",
+            )
+            logger.info("Found %d keys for date range", len(temporal_keys))
 
-    # Path 2: Entity-routed query (targeted key probing)
-    if router is not None:
-        plan = router.route(text)
-        if plan.strategy == "targeted_probe" and plan.steps:
-            return _handle_routed_query(text, plan, history, model, tokenizer, config)
+    # Path 2: Entity routing (always, unless temporal already found keys)
+    if plan is None and router is not None:
+        plan = router.route(text, speaker=speaker)
+        if plan.steps:
+            logger.info(
+                "Routed query: entities=%s, %d steps",
+                plan.matched_entities,
+                len(plan.steps),
+            )
 
-    # Path 3: Standard (facts in weights, no probing)
-    return _handle_standard_query(text, history, model, tokenizer, config)
+    # Probe keys per adapter → reconstruct facts → reason
+    if plan and plan.steps:
+        return _probe_and_reason(text, plan, history, model, tokenizer, config)
+
+    # No keys found — base model without context (escalation candidate)
+    return _base_model_answer(text, history, model, tokenizer, config)
 
 
-def _handle_standard_query(
+def _probe_and_reason(
+    text: str,
+    plan: RoutingPlan,
+    history: list[dict] | None,
+    model,
+    tokenizer,
+    config: ServerConfig,
+) -> ChatResult:
+    """Probe adapters in memory hierarchy order, assemble layered context.
+
+    Replicates the intended adapter switching architecture into the
+    context window. Each adapter's recalled facts become a named section,
+    preserving the query order:
+
+        [Procedural]  — behavioral preferences, response style
+        [Semantic]    — consolidated stable knowledge
+        [Episodic]    — recent conversational knowledge
+
+    For each adapter:
+      1. Switch to it
+      2. Probe its keys
+      3. Collect recalled facts into that layer's section
+
+    After all adapters are probed, disable adapters and let the base
+    model reason over the layered context.
+    """
+    from peft import PeftModel
+
+    from paramem.models.loader import switch_adapter
+    from paramem.training.indexed_memory import probe_key
+
+    # Load registry for SimHash verification
+    registry = _load_simhash_registry(config.registry_path)
+
+    # Section labels for the layered context — maps adapter name to its role
+    LAYER_LABELS = {
+        "procedural": "Behavioral preferences",
+        "semantic": "Consolidated knowledge",
+        "episodic": "Recent knowledge",
+    }
+
+    # Probe each adapter's keys sequentially, collecting per-layer facts
+    layers: dict[str, list[str]] = {}
+    successful_keys = []
+
+    for step in plan.steps:
+        # Switch to the target adapter if it exists on the model
+        if hasattr(model, "peft_config") and step.adapter_name in model.peft_config:
+            switch_adapter(model, step.adapter_name)
+        elif step.adapter_name != "episodic":
+            logger.info("Adapter %s not loaded, skipping", step.adapter_name)
+            continue
+
+        layer_facts = []
+        for key in step.keys_to_probe:
+            result = probe_key(model, tokenizer, key, registry=registry)
+            if result and "failure_reason" not in result:
+                layer_facts.append(
+                    f"- {result.get('answer', '')}"
+                )
+                successful_keys.append(key)
+
+        if layer_facts:
+            layers[step.adapter_name] = layer_facts
+
+        logger.info(
+            "Adapter %s: probed %d keys, recalled %d facts",
+            step.adapter_name,
+            len(step.keys_to_probe),
+            len(layer_facts),
+        )
+
+    if not layers:
+        logger.info("All probed keys failed, falling back to base model")
+        return _base_model_answer(text, history, model, tokenizer, config)
+
+    total_facts = sum(len(f) for f in layers.values())
+    logger.info("Total recalled: %d facts from %d layers", total_facts, len(layers))
+
+    # Assemble layered context in hierarchy order
+    context_sections = []
+    for adapter_name in ["procedural", "semantic", "episodic"]:
+        if adapter_name in layers:
+            label = LAYER_LABELS.get(adapter_name, adapter_name)
+            facts_text = "\n".join(layers[adapter_name])
+            context_sections.append(f"[{label}]\n{facts_text}")
+
+    layered_context = "\n\n".join(context_sections)
+    augmented_text = (
+        f"What you know about the speaker:\n\n{layered_context}\n\n"
+        f"Question: {text}"
+    )
+
+    messages = _build_messages(augmented_text, history, config.voice.load_prompt(), tokenizer)
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    if isinstance(model, PeftModel):
+        with model.disable_adapter():
+            response = generate_answer(
+                model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
+            )
+    else:
+        response = generate_answer(
+            model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
+        )
+
+    return _maybe_escalate(response, config, probed_keys=successful_keys)
+
+
+def _base_model_answer(
     text: str,
     history: list[dict] | None,
     model,
     tokenizer,
     config: ServerConfig,
 ) -> ChatResult:
-    """Standard path — facts are in the weights, model answers directly."""
-    messages = _build_messages(text, history, config.voice.system_prompt, tokenizer)
+    """Answer from base model without context — escalation candidate."""
+    from peft import PeftModel
+
+    messages = _build_messages(text, history, config.voice.load_prompt(), tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    response = generate_answer(
-        model,
-        tokenizer,
-        prompt,
-        max_new_tokens=256,
-        temperature=0.3,
-    )
+    if isinstance(model, PeftModel):
+        with model.disable_adapter():
+            response = generate_answer(
+                model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
+            )
+    else:
+        response = generate_answer(
+            model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
+        )
 
+    return _maybe_escalate(response, config)
+
+
+def _maybe_escalate(
+    response: str,
+    config: ServerConfig,
+    probed_keys: list[str] | None = None,
+) -> ChatResult:
+    """Check for [ESCALATE] tag and forward to cloud if configured."""
     should_escalate, forwarded_query = detect_escalation(response)
 
     if should_escalate and config.cloud.enabled:
@@ -96,144 +244,19 @@ def _handle_standard_query(
         if not response:
             response = "I'm not sure about that."
 
-    return ChatResult(text=response, escalated=False)
+    return ChatResult(text=response, probed_keys=probed_keys or [])
 
 
-def _handle_temporal_query(
-    text: str,
-    date_range: tuple,
-    history: list[dict] | None,
-    model,
-    tokenizer,
-    config: ServerConfig,
-) -> ChatResult:
-    """Temporal path — probe registry keys from the date range, feed as context."""
-    from paramem.training.indexed_memory import probe_key
-
-    start_date, end_date = date_range
-    logger.info("Temporal query detected: %s to %s", start_date, end_date)
-
-    matching_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
-    if not matching_keys:
-        logger.info("No keys found for date range %s to %s", start_date, end_date)
-        return _handle_standard_query(text, history, model, tokenizer, config)
-
-    logger.info("Found %d keys for date range, probing...", len(matching_keys))
-
-    # Load registry for confidence verification
+def _load_simhash_registry(registry_path) -> dict:
+    """Load SimHash values from registry for probe verification."""
     registry = {}
-    if config.registry_path.exists():
-        with open(config.registry_path) as f:
-            raw = json.load(f)
-        # Extract simhash values for probe_key verification
-        for key, meta in raw.items():
-            if isinstance(meta, dict):
-                registry[key] = meta.get("simhash", 0)
-
-    # Probe matching keys to reconstruct facts
-    recalled_facts = []
-    for key in matching_keys:
-        result = probe_key(model, tokenizer, key, registry=registry)
-        if result and "failure_reason" not in result:
-            recalled_facts.append(f"Q: {result.get('question', '')}\nA: {result.get('answer', '')}")
-
-    if not recalled_facts:
-        logger.info("All probed keys failed, falling back to standard path")
-        return _handle_standard_query(text, history, model, tokenizer, config)
-
-    # Build prompt with recalled facts as context
-    facts_context = "\n\n".join(recalled_facts)
-    augmented_text = (
-        f"Based on the following facts from that time period:\n\n"
-        f"{facts_context}\n\n"
-        f"Answer the question: {text}"
-    )
-
-    messages = _build_messages(augmented_text, history, config.voice.system_prompt, tokenizer)
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    response = generate_answer(
-        model,
-        tokenizer,
-        prompt,
-        max_new_tokens=256,
-        temperature=0.3,
-    )
-
-    return ChatResult(text=response, probed_keys=matching_keys)
-
-
-def _handle_routed_query(
-    text: str,
-    plan,
-    history: list[dict] | None,
-    model,
-    tokenizer,
-    config: ServerConfig,
-) -> ChatResult:
-    """Entity-routed path — probe targeted keys per adapter."""
-    from paramem.models.loader import switch_adapter
-    from paramem.training.indexed_memory import probe_key
-
-    logger.info(
-        "Routed query: entities=%s, %d steps",
-        plan.matched_entities,
-        len(plan.steps),
-    )
-
-    # Load registry for confidence verification
-    registry = {}
-    if config.registry_path.exists():
-        with open(config.registry_path) as f:
+    if registry_path.exists():
+        with open(registry_path) as f:
             raw = json.load(f)
         for key, meta in raw.items():
             if isinstance(meta, dict):
                 registry[key] = meta.get("simhash", 0)
-
-    # Probe keys from each adapter in the plan
-    recalled_facts = []
-    probed_keys = []
-    for step in plan.steps:
-        # Switch to the target adapter if it exists on the model
-        if hasattr(model, "peft_config") and step.adapter_name in model.peft_config:
-            switch_adapter(model, step.adapter_name)
-        elif step.adapter_name != "episodic":
-            logger.info("Adapter %s not loaded, skipping", step.adapter_name)
-            continue
-
-        for key in step.keys_to_probe:
-            result = probe_key(model, tokenizer, key, registry=registry)
-            if result and "failure_reason" not in result:
-                recalled_facts.append(
-                    f"Q: {result.get('question', '')}\nA: {result.get('answer', '')}"
-                )
-                probed_keys.append(key)
-
-    if not recalled_facts:
-        logger.info(
-            "No facts recalled from routed keys (entities=%s), falling back to standard path",
-            plan.matched_entities,
-        )
-        return _handle_standard_query(text, history, model, tokenizer, config)
-
-    # Build prompt with recalled facts as context
-    facts_context = "\n\n".join(recalled_facts)
-    augmented_text = (
-        f"Based on the following facts:\n\n{facts_context}\n\nAnswer the question: {text}"
-    )
-
-    messages = _build_messages(augmented_text, history, config.voice.system_prompt, tokenizer)
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    response = generate_answer(
-        model,
-        tokenizer,
-        prompt,
-        max_new_tokens=256,
-        temperature=0.3,
-    )
-
-    return ChatResult(text=response, probed_keys=probed_keys)
+    return registry
 
 
 def _build_messages(

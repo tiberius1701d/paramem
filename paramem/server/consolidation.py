@@ -1,31 +1,62 @@
-"""Consolidation job — extracts knowledge from buffered sessions and retrains the adapter.
+"""Server consolidation — thin wrapper around ConsolidationLoop.
 
-The cumulative knowledge graph is the single structural record. On each
-consolidation cycle: merge new session graphs → regenerate QA from the
-full graph → retrain the adapter from scratch. No external QA file is
-used as input — facts live in the adapter weights and the graph.
+Uses the same ConsolidationLoop that powers Tests 1-8, with
+indexed_key_replay_enabled=True. The graph is transient (RAM-only).
+Promotion is key-level: per-key session counts persisted in
+key_metadata.json (no personal data on disk).
+
+The loop saves adapters directly to output_dir (= adapter_dir), so
+the router can reload from the standard paths without any bridging.
 """
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
-from paramem.graph.extractor import extract_graph
-from paramem.graph.merger import GraphMerger
-from paramem.graph.qa_generator import generate_qa_from_relations
-from paramem.models.loader import create_adapter, save_adapter
 from paramem.server.config import ServerConfig
 from paramem.server.session_buffer import SessionBuffer
-from paramem.training.indexed_memory import (
-    assign_keys,
-    build_enriched_registry,
-    format_indexed_training,
-    save_registry,
-)
-from paramem.training.trainer import train_adapter
+from paramem.training.consolidation import ConsolidationLoop
 
 logger = logging.getLogger(__name__)
+
+
+def create_consolidation_loop(
+    model,
+    tokenizer,
+    config: ServerConfig,
+) -> ConsolidationLoop:
+    """Create a ConsolidationLoop configured for the server.
+
+    Graph is transient (persist_graph=False). Key metadata is seeded
+    from key_metadata.json to restore cycle count, promoted keys, and
+    per-key session counts across server restarts.
+    """
+    loop = ConsolidationLoop(
+        model=model,
+        tokenizer=tokenizer,
+        consolidation_config=config.consolidation_config,
+        training_config=config.training_config,
+        episodic_adapter_config=config.episodic_adapter_config,
+        semantic_adapter_config=config.semantic_adapter_config,
+        procedural_adapter_config=(
+            config.procedural_adapter_config if config.adapters.procedural.enabled else None
+        ),
+        output_dir=config.adapter_dir,
+        graph_path=None,
+        extraction_temperature=0.0,
+        save_cycle_snapshots=config.debug,
+        snapshot_dir=config.debug_dir if config.debug else None,
+        persist_graph=False,
+    )
+
+    # Seed key metadata from disk (survives restarts)
+    metadata = _load_key_metadata(config.key_metadata_path)
+    if metadata:
+        loop.seed_key_metadata(metadata)
+
+    return loop
 
 
 def run_consolidation(
@@ -33,156 +64,229 @@ def run_consolidation(
     tokenizer,
     config: ServerConfig,
     session_buffer: SessionBuffer,
+    loop: ConsolidationLoop | None = None,
 ) -> dict:
-    """Run a full consolidation cycle on all pending session transcripts.
+    """Run consolidation on all pending sessions.
 
-    Pipeline:
-        1. Extract graphs from pending sessions, merge into cumulative graph
-        2. Regenerate QA pairs from the FULL cumulative graph
-        3. Assign keys, retrain adapter from scratch
-        4. Persist adapter, registry, graph
+    Each pending session becomes one cycle. After all cycles:
+    - Update per-key session counts for promotion tracking
+    - Promote keys that reach the threshold to semantic
+    - Save key_metadata.json, registry, and keyed_pairs
 
-    The cumulative graph is the source of truth for what knowledge exists.
-    QA pairs are always regenerated — never loaded from a cached file.
+    Returns a result dict including the loop instance for reuse.
     """
+    if not config.adapters.episodic.enabled:
+        logger.info("Episodic adapter is disabled in config, skipping consolidation")
+        return {"status": "disabled", "sessions": 0, "loop": loop}
+
     start_time = time.time()
 
     pending = session_buffer.get_pending()
     if not pending:
         logger.info("No pending sessions to consolidate")
-        return {"status": "no_pending", "sessions": 0}
+        return {"status": "no_pending", "sessions": 0, "loop": loop}
 
     logger.info("Consolidating %d pending sessions", len(pending))
 
-    # Load cumulative graph
-    merger = GraphMerger()
-    if config.graph_path.exists():
-        merger.load_graph(config.graph_path)
+    # Create loop on first use — persists across consolidation runs
+    if loop is None:
+        loop = create_consolidation_loop(model, tokenizer, config)
 
-    # Phase 1: Extract and merge graphs from pending sessions
+    # Run one cycle per pending session, tracking per-session entities
+    cycle_results = []
     session_ids = []
-    new_relation_count = 0
-
     for session in pending:
         session_id = session["session_id"]
         transcript = session["transcript"]
         session_ids.append(session_id)
 
-        logger.info("Extracting graph from session: %s", session_id)
-        model.gradient_checkpointing_disable()
+        result = loop.run_cycle(transcript, session_id)
+        cycle_results.append(result)
 
-        session_graph = extract_graph(model, tokenizer, transcript, session_id, temperature=0.0)
+        # Update per-key session counts using this session's entities
+        _increment_key_sessions(loop, session_id)
 
-        if not session_graph.relations:
-            logger.warning("No relations extracted from session %s", session_id)
-            continue
-
-        new_relation_count += len(session_graph.relations)
-        merger.merge(session_graph)
         logger.info(
-            "Session %s: %d relations extracted",
+            "Cycle %d (session=%s): %d relations, loss=%.4f",
+            result.cycle_index,
             session_id,
-            len(session_graph.relations),
+            result.relations_extracted,
+            result.episodic_train_loss or 0.0,
         )
 
-    # Phase 2: Regenerate QA from the full cumulative graph
-    all_triples = merger.get_all_triples()
-    if not all_triples:
-        logger.warning("Cumulative graph has no triples")
-        session_buffer.mark_consolidated(session_ids)
-        return {"status": "no_triples", "sessions": len(session_ids)}
+    # Key-level promotion: promote keys that reached the threshold
+    newly_promoted = _promote_mature_keys(loop, config)
 
-    logger.info("Regenerating QA from full graph: %d triples", len(all_triples))
-    relations = [{"subject": s, "predicate": p, "object": o} for s, p, o in all_triples]
-    all_qa = generate_qa_from_relations(relations, model, tokenizer)
-
-    if not all_qa:
-        logger.warning("QA generation produced no pairs from %d triples", len(all_triples))
-        session_buffer.mark_consolidated(session_ids)
-        return {"status": "no_qa_pairs", "sessions": len(session_ids)}
-
-    logger.info("Generated %d QA pairs from %d triples", len(all_qa), len(all_triples))
-
-    # Phase 3: Assign keys, retrain adapter from scratch
-    keyed_pairs = assign_keys(all_qa)
-
-    logger.info("Training on %d keyed pairs", len(keyed_pairs))
-    training_examples = format_indexed_training(keyed_pairs, tokenizer)
-
-    adapter_name = "episodic"
-    from peft import PeftModel as _PeftModel
-
-    if isinstance(model, _PeftModel):
-        model = model.base_model.model
-
-    model = create_adapter(model, config.adapter_config, adapter_name)
-
-    config.adapter_dir.mkdir(parents=True, exist_ok=True)
-    metrics = train_adapter(
-        model,
-        tokenizer,
-        training_examples,
-        adapter_name,
-        config.training_config,
-        config.adapter_config,
-        output_dir=config.adapter_dir / "checkpoints",
-    )
-
-    # Phase 4: Persist adapter, registry, graph, keyed_pairs
-    save_adapter(model, config.adapter_dir, adapter_name)
-
-    kp_path = config.adapter_dir / "keyed_pairs.json"
-    with open(kp_path, "w") as f:
-        json.dump(
-            [
-                {
-                    k: v
-                    for k, v in kp.items()
-                    if k
-                    in (
-                        "key",
-                        "question",
-                        "answer",
-                        "source_predicate",
-                        "source_subject",
-                        "source_object",
-                    )
-                }
-                for kp in keyed_pairs
-            ],
-            f,
-            indent=2,
-        )
-
-    registry = build_enriched_registry(
-        keyed_pairs,
-        session_id=session_ids[-1] if session_ids else None,
-        existing=_load_existing_registry(config.registry_path),
-    )
-    save_registry(registry, config.registry_path)
-
-    merger.save_graph(config.graph_path)
+    # Save all server artifacts
+    _save_keyed_pairs_for_router(loop, config)
+    _save_registry(loop, config)
+    _save_key_metadata(loop, config)
 
     session_buffer.mark_consolidated(session_ids)
 
     elapsed = time.time() - start_time
-    result = {
+    last = cycle_results[-1] if cycle_results else None
+
+    summary = {
         "status": "complete",
         "sessions": len(session_ids),
-        "new_relations": new_relation_count,
-        "total_triples": len(all_triples),
-        "total_qa_pairs": len(all_qa),
-        "total_keys": len(keyed_pairs),
-        "train_loss": metrics.get("train_loss", -1),
+        "cycles": len(cycle_results),
+        "total_relations": sum(r.relations_extracted for r in cycle_results),
+        "newly_promoted": len(newly_promoted),
+        "episodic_keys": len(loop.episodic_simhash),
+        "semantic_keys": len(loop.semantic_simhash),
+        "train_loss": last.episodic_train_loss if last else None,
         "elapsed_seconds": round(elapsed, 1),
+        "loop": loop,
     }
-    logger.info("Consolidation complete: %s", result)
-    return result
+    logger.info(
+        "Consolidation complete: %s",
+        {k: v for k, v in summary.items() if k != "loop"},
+    )
+    return summary
 
 
-def _load_existing_registry(registry_path: Path) -> dict | None:
-    """Load existing registry if it exists."""
-    if not registry_path.exists():
+# --- Key-level promotion ---
+
+
+def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
+    """Increment sessions_seen for keys whose entities appeared in this session.
+
+    Uses the graph merger's node metadata: nodes where last_seen == session_id
+    were active in this specific session (not the cumulative graph).
+    """
+    # Find entities that appeared in this session
+    session_entities = set()
+    for node in loop.merger.graph.nodes:
+        node_data = loop.merger.graph.nodes[node]
+        if node_data.get("last_seen") == session_id:
+            session_entities.add(node.lower())
+
+    if not session_entities:
+        return
+
+    # Increment session count for keys referencing these entities
+    for key, qa in loop.indexed_key_qa.items():
+        if key in loop.promoted_keys:
+            continue
+        subject = qa.get("source_subject", "").lower()
+        obj = qa.get("source_object", "").lower()
+        if subject in session_entities or obj in session_entities:
+            loop.key_sessions[key] = loop.key_sessions.get(key, 0) + 1
+
+
+def _promote_mature_keys(
+    loop: ConsolidationLoop, config: ServerConfig
+) -> list[str]:
+    """Promote keys that reached the session count threshold.
+
+    Moves keys from episodic to semantic SimHash registry.
+    Returns list of newly promoted key IDs.
+    """
+    threshold = config.consolidation.promotion_threshold
+    newly_promoted = []
+
+    for key, count in loop.key_sessions.items():
+        if count >= threshold and key not in loop.promoted_keys:
+            if key in loop.episodic_simhash:
+                loop.semantic_simhash[key] = loop.episodic_simhash.pop(key)
+                newly_promoted.append(key)
+            elif key in loop.semantic_simhash:
+                logger.debug("Key %s already in semantic, marking promoted", key)
+            loop.promoted_keys.add(key)
+
+    if newly_promoted:
+        logger.info("Promoted %d keys to semantic", len(newly_promoted))
+
+    return newly_promoted
+
+
+# --- Persistence ---
+
+
+def _atomic_json_write(data: dict | list, path: Path) -> None:
+    """Write JSON atomically: write to .tmp, then os.replace()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _load_key_metadata(path: Path) -> dict | None:
+    """Load key metadata from disk. Returns None if not found."""
+    if not path.exists():
+        logger.info("No key metadata found at %s, starting fresh", path)
         return None
-    with open(registry_path) as f:
+    with open(path) as f:
         return json.load(f)
+
+
+def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
+    """Save key metadata for cross-restart persistence."""
+    metadata = {
+        "cycle_count": loop.cycle_count,
+        "promoted_keys": sorted(loop.promoted_keys),
+        "keys": {
+            key: {"sessions_seen": count}
+            for key, count in loop.key_sessions.items()
+        },
+    }
+    _atomic_json_write(metadata, config.key_metadata_path)
+
+
+def _save_registry(loop: ConsolidationLoop, config: ServerConfig) -> None:
+    """Save combined SimHash registry (no personal data)."""
+    combined = {}
+    for key, simhash in loop.episodic_simhash.items():
+        combined[key] = {"simhash": simhash, "adapter": "episodic"}
+    for key, simhash in loop.semantic_simhash.items():
+        combined[key] = {"simhash": simhash, "adapter": "semantic"}
+    _atomic_json_write(combined, config.registry_path)
+
+
+def _save_keyed_pairs_for_router(
+    loop: ConsolidationLoop, config: ServerConfig
+) -> None:
+    """Save keyed_pairs.json per adapter for router entity indexing."""
+    config.adapter_dir.mkdir(parents=True, exist_ok=True)
+
+    # Episodic keyed_pairs at the top level
+    _write_keyed_pairs(
+        loop.indexed_key_qa,
+        loop.episodic_simhash,
+        config.adapter_dir / "keyed_pairs.json",
+    )
+
+    # Semantic keyed_pairs in the semantic adapter directory
+    if loop.semantic_simhash:
+        sem_dir = config.adapter_dir / "semantic"
+        sem_dir.mkdir(parents=True, exist_ok=True)
+        _write_keyed_pairs(
+            loop.indexed_key_qa,
+            loop.semantic_simhash,
+            sem_dir / "keyed_pairs.json",
+        )
+
+
+def _write_keyed_pairs(
+    indexed_key_qa: dict,
+    simhash_registry: dict,
+    path: Path,
+) -> None:
+    """Write keyed_pairs.json for keys in the given SimHash registry."""
+    pairs = []
+    for key in simhash_registry:
+        if key in indexed_key_qa:
+            qa = indexed_key_qa[key]
+            entry = {
+                "key": key,
+                "question": qa["question"],
+                "answer": qa["answer"],
+            }
+            for meta_key in ("source_subject", "source_object", "source_predicate"):
+                if meta_key in qa:
+                    entry[meta_key] = qa[meta_key]
+            pairs.append(entry)
+
+    _atomic_json_write(pairs, path)

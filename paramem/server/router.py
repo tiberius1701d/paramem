@@ -142,8 +142,12 @@ class QueryRouter:
         except Exception as e:
             logger.warning("Failed to load graph entities: %s", e)
 
-    def route(self, text: str) -> RoutingPlan:
+    def route(self, text: str, speaker: str | None = None) -> RoutingPlan:
         """Route a query to the appropriate adapter(s) and keys.
+
+        If speaker is provided, it is always injected as an implicit
+        entity so that self-referential queries ("What is my name?")
+        resolve to the speaker's keys.
 
         Returns a RoutingPlan describing what to activate and probe.
         """
@@ -151,8 +155,25 @@ class QueryRouter:
             return RoutingPlan(strategy="direct")
 
         entities = self._extract_entities(text)
+
+        # Inject speaker as implicit entity
+        if speaker:
+            speaker_lower = speaker.lower().strip()
+            if speaker_lower not in entities and speaker_lower in self._all_entities:
+                entities.append(speaker_lower)
+
         if not entities:
             return RoutingPlan(strategy="direct")
+
+        # One-hop expansion: entities connected to the speaker via keyed_pairs
+        # (e.g. speaker "Tobias" has key Tobias→Pauline, so also probe Pauline's keys)
+        if speaker:
+            connected = self._get_connected_entities(speaker.lower().strip())
+            for entity in connected:
+                if entity not in entities:
+                    entities.append(entity)
+
+        entities.sort()
 
         adapter_keys = self._resolve_keys(entities)
         if not adapter_keys:
@@ -161,9 +182,10 @@ class QueryRouter:
                 matched_entities=entities,
             )
 
-        # Build steps: semantic first (consolidated), then episodic (recent)
+        # Build steps in memory hierarchy order:
+        # procedural (behavioral priming) → semantic (stable knowledge) → episodic (recent)
         steps = []
-        for adapter_name in ["semantic", "episodic"]:
+        for adapter_name in ["procedural", "semantic", "episodic"]:
             if adapter_name in adapter_keys:
                 keys = list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY]
                 steps.append(
@@ -174,8 +196,9 @@ class QueryRouter:
                 )
 
         # Include any other adapters (personas, etc.)
+        known = {"procedural", "semantic", "episodic"}
         for adapter_name, keys in adapter_keys.items():
-            if adapter_name not in ("semantic", "episodic"):
+            if adapter_name not in known:
                 steps.append(
                     RoutingStep(
                         adapter_name=adapter_name,
@@ -217,6 +240,22 @@ class QueryRouter:
                     matched.add(entity)
 
         return sorted(matched)
+
+    def _get_connected_entities(self, entity: str) -> list[str]:
+        """Find entities one hop away from the given entity via shared keys.
+
+        If entity "tobias" has keys where "pauline" is the other endpoint,
+        "pauline" is returned. This enables probing facts about connected
+        people (spouse, children, pets) when the speaker is the query subject.
+        """
+        connected = set()
+        for index in self._entity_key_index.values():
+            keys = index.get(entity, set())
+            # Find all other entities that share these keys
+            for other_entity, other_keys in index.items():
+                if other_entity != entity and keys & other_keys:
+                    connected.add(other_entity)
+        return sorted(connected)
 
     def _resolve_keys(self, entities: list[str]) -> dict[str, set[str]]:
         """Map entities to keys, grouped by adapter."""

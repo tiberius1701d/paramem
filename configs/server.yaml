@@ -4,10 +4,13 @@ server:
 
 model: mistral  # mistral | gemma | qwen3b
 
-adapter_dir: data/ha/adapters
-registry_path: data/ha/registry.json
-graph_path: data/ha/graph.json
-session_dir: data/ha/sessions
+debug: true  # cycle snapshots, verbose logging
+
+# --- Paths (mount points) ---
+paths:
+  data: data/ha                 # persistent artifacts (adapters, registry, key_metadata)
+  sessions: data/ha/sessions    # conversation transcripts pending consolidation
+  debug: data/ha/debug          # cycle snapshots, diagnostic output (only when debug=true)
 
 adapters:
   episodic:
@@ -16,21 +19,21 @@ adapters:
     alpha: 16
     learning_rate: 1.0e-4
   semantic:
-    enabled: false      # enable for knowledge promotion (consolidation loop)
-    rank: 24
-    alpha: 48
+    enabled: true
+    rank: 8
+    alpha: 16
     learning_rate: 1.0e-5
   procedural:
     enabled: false      # future — behavioral patterns, routines, preferences
-    rank: 12
-    alpha: 24
+    rank: 8
+    alpha: 16
     learning_rate: 5.0e-5
 
-training:
-  epochs: 30
-
 consolidation:
-  schedule: "02:00"  # daily at this hour (empty string = manual only)
+  schedule: "02:00"            # daily at this hour (empty string = manual only)
+  promotion_threshold: 3       # sessions_seen count for key promotion to semantic
+  max_active_keys: 50          # cap episodic keys (evict oldest beyond this)
+  retain_sessions: true        # archive transcripts after consolidation (false = delete)
 
 cloud:
   enabled: false
@@ -39,9 +42,4 @@ cloud:
   api_key: ""
 
 voice:
-  system_prompt: >
-    You are a personal memory assistant. Answer concisely in 1-2 spoken sentences.
-    Do not use markdown, lists, or structured formatting.
-    Speak naturally as if you simply remember.
-    If you cannot answer a question from your knowledge, respond ONLY with
-    [ESCALATE] followed by the question to forward.
+  prompt_file: configs/prompts/ha_voice.txt

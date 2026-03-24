@@ -6,8 +6,10 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +34,7 @@ _state = {
     "config": None,
     "session_buffer": None,
     "router": None,
+    "consolidation_loop": None,
     "consolidating": False,
     "last_consolidation": None,
     "scheduler_task": None,
@@ -44,12 +47,14 @@ _state = {
 class ChatRequest(BaseModel):
     text: str
     conversation_id: str = "default"
+    speaker: str | None = None
     history: list[dict] | None = None
 
 
 class ChatResponse(BaseModel):
     text: str
     escalated: bool = False
+    speaker: str | None = None
 
 
 class StatusResponse(BaseModel):
@@ -95,10 +100,12 @@ async def lifespan(app: FastAPI):
 
     _state["model"] = model
     _state["tokenizer"] = tokenizer
-    _state["session_buffer"] = SessionBuffer(config.session_dir)
+    _state["session_buffer"] = SessionBuffer(
+        config.session_dir,
+        retain_sessions=config.consolidation.retain_sessions,
+    )
     _state["router"] = QueryRouter(
         adapter_dir=config.adapter_dir,
-        graph_path=config.graph_path,
     )
 
     # Start consolidation scheduler if configured
@@ -128,13 +135,46 @@ app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Handle a conversation turn. Adapter is always active."""
-    loop = asyncio.get_event_loop()
+    """Handle a conversation turn with speaker identification."""
+    buffer = _state["session_buffer"]
+
+    # If the request provides a speaker (e.g. from HA user context), store it
+    if request.speaker:
+        buffer.set_speaker(request.conversation_id, request.speaker)
+
+    # Speaker identification flow
+    state = buffer.get_session_state(request.conversation_id)
+    speaker = buffer.get_speaker(request.conversation_id)
+
+    if state == "new":
+        buffer.set_state(request.conversation_id, "greeting_sent")
+        greeting = "Hi, I'm your home assistant. Who are you?"
+        return ChatResponse(text=greeting, speaker=speaker)
+
+    if state == "greeting_sent":
+        extracted_name = _extract_speaker_name(request.text)
+        if extracted_name:
+            buffer.set_speaker(request.conversation_id, extracted_name)
+            speaker = extracted_name
+            welcome = f"Nice to meet you, {extracted_name}. I'll memorize everything we discuss."
+            buffer.append(request.conversation_id, "user", request.text)
+            buffer.append(request.conversation_id, "assistant", welcome)
+            return ChatResponse(text=welcome, speaker=speaker)
+        else:
+            # Could not extract name — ask again
+            return ChatResponse(
+                text="I didn't catch your name. Could you tell me who you are?",
+                speaker=speaker,
+            )
+
+    # Speaker identified — normal inference with entity routing
+    loop = asyncio.get_running_loop()
     result: ChatResult = await loop.run_in_executor(
         None,
         lambda: handle_chat(
             text=request.text,
             conversation_id=request.conversation_id,
+            speaker=speaker,
             history=request.history,
             model=_state["model"],
             tokenizer=_state["tokenizer"],
@@ -143,12 +183,33 @@ async def chat(request: ChatRequest):
         ),
     )
 
-    # Buffer the conversation turn
-    buffer = _state["session_buffer"]
     buffer.append(request.conversation_id, "user", request.text)
     buffer.append(request.conversation_id, "assistant", result.text)
 
-    return ChatResponse(text=result.text, escalated=result.escalated)
+    return ChatResponse(text=result.text, escalated=result.escalated, speaker=speaker)
+
+
+def _extract_speaker_name(text: str) -> str | None:
+    """Extract a speaker name from a self-introduction response.
+
+    Handles common patterns: "I'm Tobias", "My name is Tobias",
+    "Tobias", "It's Tobias", "This is Tobias", "Call me Tobias".
+    """
+
+    text = text.strip().rstrip(".")
+
+    patterns = [
+        r"(?:I'm|I am|my name is|it's|this is|call me|they call me)\s+(\w+)",
+        r"^(\w+)$",  # bare name
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            name = match.group(1)
+            # Filter out non-name words
+            if name.lower() not in ("hi", "hello", "hey", "yes", "no", "the", "a"):
+                return name.capitalize()
+    return None
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -163,8 +224,6 @@ async def status():
 
     keys_count = 0
     if config.registry_path.exists():
-        import json
-
         with open(config.registry_path) as f:
             registry = json.load(f)
         keys_count = len(registry)
@@ -185,8 +244,10 @@ async def consolidate():
     if _state["consolidating"]:
         return ConsolidateResponse(status="already_running")
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _run_consolidation_sync)
+    _state["consolidating"] = True
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, _run_consolidation_sync)
+    future.add_done_callback(_consolidation_done_callback)
 
     return ConsolidateResponse(status="started")
 
@@ -195,22 +256,37 @@ async def consolidate():
 
 
 def _run_consolidation_sync():
-    """Run consolidation in a background thread."""
-    _state["consolidating"] = True
-    try:
-        result = run_consolidation(
-            model=_state["model"],
-            tokenizer=_state["tokenizer"],
-            config=_state["config"],
-            session_buffer=_state["session_buffer"],
-        )
-        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-        _state["router"].reload()
-        logger.info("Consolidation result: %s", result)
-    except Exception:
-        logger.exception("Consolidation failed")
-    finally:
-        _state["consolidating"] = False
+    """Run consolidation in a background thread.
+
+    The consolidating flag is set by the caller before submitting to
+    the executor, and cleared by _consolidation_done_callback after
+    completion. This eliminates the race window.
+    """
+    result = run_consolidation(
+        model=_state["model"],
+        tokenizer=_state["tokenizer"],
+        config=_state["config"],
+        session_buffer=_state["session_buffer"],
+        loop=_state["consolidation_loop"],
+    )
+    # Store loop for reuse across runs (preserves graph, registries, cycle count)
+    if "loop" in result:
+        loop = result.pop("loop")
+        _state["consolidation_loop"] = loop
+        # Update model reference — ConsolidationLoop wraps the base model
+        # in PeftModel with adapters during training
+        _state["model"] = loop.model
+    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    _state["router"].reload()
+    logger.info("Consolidation result: %s", result)
+
+
+def _consolidation_done_callback(future):
+    """Called when consolidation completes or fails."""
+    _state["consolidating"] = False
+    exc = future.exception()
+    if exc:
+        logger.exception("Consolidation failed: %s", exc)
 
 
 async def _consolidation_scheduler(schedule: str):
@@ -234,8 +310,10 @@ async def _consolidation_scheduler(schedule: str):
         if current_hour == target_hour and current_minute == target_minute:
             if not triggered_today and not _state["consolidating"]:
                 logger.info("Scheduled consolidation triggered at %s", schedule)
-                loop = asyncio.get_event_loop()
-                loop.run_in_executor(None, _run_consolidation_sync)
+                _state["consolidating"] = True
+                loop = asyncio.get_running_loop()
+                future = loop.run_in_executor(None, _run_consolidation_sync)
+                future.add_done_callback(_consolidation_done_callback)
                 triggered_today = True
         else:
             triggered_today = False
