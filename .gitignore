@@ -45,6 +45,8 @@ gpu_debugging.md
 model_benchmarking.md
 prompt_experiments.md
 early_stopping.md
+test8_operations.md
+security_analysis.md
 
 # Compiled PDFs and build archives
 *.pdf

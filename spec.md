@@ -149,8 +149,9 @@ Parametric memory is inherently more private than text-based storage — knowled
 | Semantic adapter stability | <5% drift on consolidated facts after 20 cycles | 3 |
 | Consolidation wall-clock time per session | <30 min on RTX 5070 | 3 |
 | Multi-model indexed key recall at 100 keys | >95% across 3 model families | 4 |
+| Large-scale indexed key recall at 500 keys | 100% (Test 8, in progress — 140/140 at cycle 14) | 4 |
 | Recall-then-reason inference accuracy | Competitive with RAG on multi-hop questions | 4 |
-| Privacy: facts leaked without correct keys | <5% of stored facts | 4 |
+| Privacy: facts leaked without correct keys | <5% of stored facts (under review — see internal security analysis) | 4 |
 | Cross-persona adapter isolation | <5% cross-contamination | 4 |
 | HA conversation agent: daily-use recall | User can retrieve yesterday's topics | 5 |
 | Temporal query accuracy | Correct recency filtering for "recent" queries | 5 |
@@ -168,8 +169,12 @@ Parametric memory is inherently more private than text-based storage — knowled
 ### Open
 
 4. **Promotion signal weighting:** How to weight recurrence vs. centrality vs. user signal? Needs empirical tuning. Test 4 (reinforcement) running — will inform this.
-5. **Adapter merging vs. switching:** During inference, should adapters be merged (weighted sum) or switched? PEFT supports both; performance implications unclear.
+5. **Adapter merging vs. switching:** *Partially resolved — switching required for recall.* Test 7b showed linear adapter merging destroys indexed key recall at rank 8. The structured key→QA mapping requires exact token-level precision that weight averaging destroys. `set_adapter()` switching remains required for multi-adapter inference. Open: whether higher-rank adapters are more merge-tolerant.
 6. **Vocabulary permutation impact on recall:** Permuting the embedding matrix (F5.4c) should be lossless in theory — the model learns identical representations under a different ordering. But edge cases (tied embeddings, special tokens, tokenizer assumptions) need empirical validation. A simple smoke test: permute, train 10 keys, verify 10/10 recall.
+7. **Adapter-active extraction:** Does a trained adapter improve graph extraction quality? Hypothesis: the adapter's parametric knowledge could act as a novelty filter, focusing extraction on new facts rather than re-extracting known ones. Currently extraction runs with adapter disabled. Needs A/B comparison on same sessions. (2026-03-24)
+8. **Small model retrieval, large model reasoning:** Can a small model (e.g. Qwen 2.5 3B) handle keyed retrieval while a larger model reasons over the recalled context? The memory/intelligence separation (Finding 2, Test 8 probing) suggests this is viable. Needs empirical validation. (2026-03-24)
+9. **Training format hardening for probe resistance:** Can negative examples (non-keyed questions → refusal) be trained alongside keyed QA pairs to suppress the emergent direct-recall behavior? This would improve security but may degrade the keyed recall mechanism. (2026-03-24)
+10. **Continuous online learning:** Can facts be trained mid-conversation (one gradient step per new fact with experience replay) instead of batch consolidation cycles? Batch_size=1 training already works — the question is catastrophic forgetting without full replay. (2026-03-24)
 
 ### Resolved (Phase 5)
 

@@ -1080,6 +1080,145 @@ Other approaches from literature:
 
 ---
 
+## Test 8: Large-Scale Incremental (500-Key Target)
+
+**Script:** `experiments/test8_large_scale.py`
+**Status:** IN PROGRESS — 15 cycles complete, 140 keys, 100% recall. Paused for probing experiments.
+
+### What it tests
+
+Can indexed key retrieval scale to 500+ keys using the full automated consolidation
+pipeline? This is the paper's primary scaling claim — everything beyond 100 keys is
+new territory. Uses multi-character PerLTQA data processed through the complete
+pipeline: session transcript → graph extraction → graph merge → QA generation →
+indexed key training with full replay.
+
+### Design
+
+- **Model:** Mistral 7B Instruct v0.3, NF4 4-bit, rank 8
+- **Cycle structure:** 5 sessions per cycle, full replay (retrain all keys from scratch each cycle)
+- **Training:** 30 epochs per cycle, batch_size=1, gradient_accumulation=2
+- **QA regeneration:** Full regeneration from cumulative graph each cycle (no cache — verifies pipeline integrity as adapter weights change the extraction landscape)
+- **Data source:** Multi-character PerLTQA (~11 characters queued for 500 keys)
+- **Pause/resume:** `tpause`/`tresume` commands, state.json + cumulative graph persisted at cycle boundaries
+- **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
+- **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
+
+### Results (2026-03-24, cycles 1-14 complete, cycle 15 interrupted by pause)
+
+| Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time |
+|-------|------|--------|------|------------------|------------|
+| 1 | 21 | 21/21 (100%) | 0.172 | 4.2 | 20 min |
+| 2 | 31 | 31/31 (100%) | 0.180 | 2.0 | 29 min |
+| 3 | 38 | 38/38 (100%) | 0.176 | 1.4 | 32 min |
+| 4 | 61 | 61/61 (100%) | 0.174 | 4.6 | 49 min |
+| 5 | 61 | 61/61 (100%) | 0.176 | 0.0 | 49 min |
+| 6 | 67 | 67/67 (100%) | 0.169 | 1.2 | 53 min |
+| 7 | 76 | 76/76 (100%) | 0.177 | 1.8 | 60 min |
+| 8 | 84 | 84/84 (100%) | 0.176 | 1.6 | 70 min |
+| 9 | 96 | 96/96 (100%) | 0.172 | 3.0 | 77 min |
+| 10 | 108 | 108/108 (100%) | 0.170 | 2.4 | 85 min |
+| 11 | 108 | 108/108 (100%) | 0.170 | 0.0 | 85 min |
+| 12 | 118 | 118/118 (100%) | 0.166 | 2.0 | 92 min |
+| 13 | 118 | 118/118 (100%) | 0.176 | 0.2 | 92 min |
+| 14 | 140 | 140/140 (100%) | 0.171 | 4.4 | 109 min |
+
+**100% recall at every scale point from 21 to 140 keys.** No degradation. Three
+characters processed (Deng Yu: 31 sessions, Liang Xin: 30 sessions, Xia Yu: 9
+sessions in progress). Adapter size: 27 MB (fixed, independent of key count).
+
+### Key observations
+
+1. **Loss is flat at ~0.173** across all scales. No upward trend — the adapter has capacity headroom.
+
+2. **Epoch convergence is stable.** Per-epoch probes (every 5 epochs) show recall reaching 100% by epoch 20-25 at all tested scales, consistent with the early stopping exploration findings. 30 epochs provides adequate margin through 140 keys.
+
+3. **QA yield varies 0-4.6 per session.** Conversations are not uniformly information-dense. Some are social scaffolding with zero extractable relations. The pipeline correctly produces zero new keys for information-sparse sessions. Average yield: ~2.2 keys/session.
+
+4. **Cycle time scales linearly** — ~0.8 min/key at current scales. Projected: ~4.5 hours/cycle at 500 keys.
+
+5. **Zero-yield cycles (5, 11, 13)** retrain on unchanged data. A future optimization could skip training when no new keys are added. Accepted for this experiment to maintain clean full-replay semantics.
+
+### Cohort tracking
+
+Per-key `first_seen_cycle` and `source_character` metadata enables post-hoc analysis of:
+- Catastrophic forgetting (do early keys degrade as new ones are added?)
+- Per-character recall (do some characters' facts train better than others?)
+- Cross-character entity collision (does graph merging across characters cause issues?)
+
+Data is captured but analysis deferred until the run completes at 500+ keys.
+
+### Probing Experiments (2026-03-24)
+
+Interactive probing of the 140-key adapter revealed four findings about the inference architecture:
+
+#### Finding 1: Keyed recall is the only reliable interface
+
+Keyed recall achieves 140/140 (100%). Without the key prefix, the adapter
+exhibits emergent direct-recall behavior for some questions but it is
+inconsistent and degrades with phrasing distance from training data. Novel
+natural language questions that were not in the training set produce
+hallucinations. The adapter encodes key→QA associations, not general semantic
+knowledge.
+
+**Takeaway:** Keyed retrieval is the only reliable interface for production use.
+The enumerate→reconstruct→reason pipeline is the correct inference architecture.
+Security implications of the emergent recall behavior are analyzed in
+`security_analysis.md` (internal).
+
+#### Finding 2: Adapter OFF for reasoning produces richer output
+
+Compared identical reasoning questions over 50 recalled facts with adapter active vs disabled:
+
+| Condition | Answer quality |
+|-----------|---------------|
+| Adapter ON | Terse, correct but minimal (biased toward key→value format) |
+| Adapter OFF (base model) | Rich, detailed, cites evidence, synthesizes across facts |
+
+The adapter's training objective (produce JSON for keyed recall) biases all output toward terse structured responses, degrading reasoning quality.
+
+**Optimal inference architecture:** Adapter ON for keyed retrieval → Adapter OFF for reasoning over recalled context. Memory and intelligence are separate roles that should not be mixed.
+
+#### Finding 3: Enumerate → Reconstruct → Reason pipeline works end-to-end
+
+Full pipeline test: recall all 140 keys (adapter on), assemble as context, reason (adapter off).
+
+| Question | Answer |
+|----------|--------|
+| "Which characters are connected to the Chinese Women's Volleyball Team?" | "Xiaoyu and Wang Chao" (correct, with evidence) |
+| "What do Wang Chao and Xiaoyu have in common?" | Lists movie, volleyball, date, celebration, mutual friend |
+| "Which characters seem to be in a romantic relationship?" | "Wang Chao and Xiaoyu" — cites date as evidence |
+
+All answers factually correct and grounded in recalled facts. The base model reasons effectively over parametric memory output when facts are provided as explicit context.
+
+#### Finding 4: Memory/intelligence separation enables portable knowledge
+
+The adapter stores facts. The base model reasons over them. These are independently swappable:
+- A small fast model (e.g. Qwen 2.5 3B) could handle retrieval
+- A larger model (70B, or cloud API) could handle reasoning
+- The adapter (27 MB) is the portable knowledge artifact
+
+This is a novel framing: LoRA adapters as structured storage with explicit retrieval, not as fine-tuning for task improvement.
+
+### Security implications
+
+| State | Parametric Memory | RAG |
+|-------|-------------------|-----|
+| At rest | Facts in LoRA weights — not human-readable, requires model + retrieval prompt | Facts in plain text (vector DB, documents) |
+| During inference | Recalled facts in RAM as text context | Retrieved documents in RAM as text context |
+| After inference | Ephemeral — discarded with context | Same |
+
+Parametric memory reduces the at-rest attack surface. Runtime exposure during reasoning is identical to RAG and inherent to any agent that processes private data. A tool-boundary architecture (PM server as a function call) limits exposure to query results, not the full knowledge base.
+
+### Estimated completion
+
+At 140 keys, 70 sessions processed, average yield 2.2 keys/session:
+- ~160 more sessions needed for 500 keys → ~33 cycles
+- Cycle time growing from ~110 min to ~280 min at 500 keys
+- Estimated: ~60-80 GPU hours remaining
+
+---
+
 ## Data Sources
 
 ### PerLTQA (primary)
@@ -1255,3 +1394,16 @@ Center the paper on:
 
 With positive results (100% recall, parity with RAG) as supporting evidence
 rather than the headline.
+
+---
+
+## Security Considerations
+
+Detailed threat modeling and probe attack analysis in `security_analysis.md` (gitignored).
+
+Summary: Parametric memory provides meaningful at-rest security improvement over RAG
+(facts in weights vs plain text files). Runtime exposure during reasoning is identical
+to any system that processes private data. Probe resistance is limited — an attacker
+with the adapter file + base model can extract facts through differential analysis.
+Open research directions include training format hardening, selective access control,
+and multi-adapter compartmentalization.
