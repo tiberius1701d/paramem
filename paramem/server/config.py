@@ -147,9 +147,7 @@ class ServerConfig:
     debug: bool = True
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
-    consolidation: ConsolidationScheduleConfig = field(
-        default_factory=ConsolidationScheduleConfig
-    )
+    consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
 
@@ -178,8 +176,7 @@ class ServerConfig:
     def model_config(self) -> ModelConfig:
         if self.model_name not in MODEL_REGISTRY:
             raise ValueError(
-                f"Unknown model '{self.model_name}'. "
-                f"Available: {list(MODEL_REGISTRY.keys())}"
+                f"Unknown model '{self.model_name}'. Available: {list(MODEL_REGISTRY.keys())}"
             )
         return MODEL_REGISTRY[self.model_name]
 

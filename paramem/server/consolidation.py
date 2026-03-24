@@ -175,9 +175,7 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
             loop.key_sessions[key] = loop.key_sessions.get(key, 0) + 1
 
 
-def _promote_mature_keys(
-    loop: ConsolidationLoop, config: ServerConfig
-) -> list[str]:
+def _promote_mature_keys(loop: ConsolidationLoop, config: ServerConfig) -> list[str]:
     """Promote keys that reached the session count threshold.
 
     Moves keys from episodic to semantic SimHash registry.
@@ -227,10 +225,7 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     metadata = {
         "cycle_count": loop.cycle_count,
         "promoted_keys": sorted(loop.promoted_keys),
-        "keys": {
-            key: {"sessions_seen": count}
-            for key, count in loop.key_sessions.items()
-        },
+        "keys": {key: {"sessions_seen": count} for key, count in loop.key_sessions.items()},
     }
     _atomic_json_write(metadata, config.key_metadata_path)
 
@@ -245,9 +240,7 @@ def _save_registry(loop: ConsolidationLoop, config: ServerConfig) -> None:
     _atomic_json_write(combined, config.registry_path)
 
 
-def _save_keyed_pairs_for_router(
-    loop: ConsolidationLoop, config: ServerConfig
-) -> None:
+def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) -> None:
     """Save keyed_pairs.json per adapter for router entity indexing."""
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
 

@@ -348,11 +348,7 @@ class GraphMerger:
         # or the new value replaces the old (single-valued/contradiction).
         # Decision is cached per predicate — one inference call per unique predicate.
         graph_resolved = False
-        if (
-            self.strategy == "model"
-            and self.model is not None
-            and self.graph.has_node(subject)
-        ):
+        if self.strategy == "model" and self.model is not None and self.graph.has_node(subject):
             for old_obj in list(self.graph.successors(subject)):
                 if old_obj == obj:
                     continue

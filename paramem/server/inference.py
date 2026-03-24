@@ -147,9 +147,7 @@ def _probe_and_reason(
         for key in step.keys_to_probe:
             result = probe_key(model, tokenizer, key, registry=registry)
             if result and "failure_reason" not in result:
-                layer_facts.append(
-                    f"- {result.get('answer', '')}"
-                )
+                layer_facts.append(f"- {result.get('answer', '')}")
                 successful_keys.append(key)
 
         if layer_facts:
@@ -178,10 +176,7 @@ def _probe_and_reason(
             context_sections.append(f"[{label}]\n{facts_text}")
 
     layered_context = "\n\n".join(context_sections)
-    augmented_text = (
-        f"What you know about the speaker:\n\n{layered_context}\n\n"
-        f"Question: {text}"
-    )
+    augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
     messages = _build_messages(augmented_text, history, config.voice.load_prompt(), tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -192,9 +187,7 @@ def _probe_and_reason(
                 model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
             )
     else:
-        response = generate_answer(
-            model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
-        )
+        response = generate_answer(model, tokenizer, prompt, max_new_tokens=256, temperature=0.0)
 
     return _maybe_escalate(response, config, probed_keys=successful_keys)
 
@@ -218,9 +211,7 @@ def _base_model_answer(
                 model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
             )
     else:
-        response = generate_answer(
-            model, tokenizer, prompt, max_new_tokens=256, temperature=0.0
-        )
+        response = generate_answer(model, tokenizer, prompt, max_new_tokens=256, temperature=0.0)
 
     return _maybe_escalate(response, config)
 
