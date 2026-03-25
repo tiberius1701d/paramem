@@ -6,10 +6,10 @@
 |-----------|--------|-----------|
 | **Language** | Python 3.11+ | ML ecosystem standard, PEFT/HF native |
 | **Environment** | Conda | User preference; manages CUDA toolkit cleanly on WSL2 |
-| **Base Models** | Qwen 2.5 3B (primary), Llama 3.2 3B (secondary) | Best benchmarks at 3B (Qwen), largest community (Llama). Model-agnostic design allows swapping. |
+| **Base Models** | Qwen 2.5 3B, Gemma 2 9B Instruct, Mistral 7B Instruct v0.3 | Model-agnostic design; three validated models. Mistral 7B default for deployment. |
 | **Fine-tuning** | QLoRA via PEFT + bitsandbytes (4-bit) | Required for 8GB VRAM constraint |
 | **Framework** | PyTorch + HuggingFace Transformers + PEFT + Accelerate | Industry standard, best LoRA multi-adapter support |
-| **Graph Extractor** | LLM-based structured output (Phase 3) | Highest accuracy for relation extraction; use `outlines` or `instructor` for constrained JSON generation |
+| **Graph Extractor** | LLM-based structured output (Phase 3) | Generate-once, parse-once; prompts externalized to `configs/prompts/` |
 | **Knowledge Graph** | NetworkX (in-memory) + JSON persistence | Sufficient for personal-scale data; no external DB dependency |
 | **Experiment Tracking** | Weights & Biases (wandb) | Most popular for research, zero-config HF integration, free tier sufficient |
 | **Evaluation** | Custom probing harness + lm-eval-harness | Probing for personal recall; lm-eval for base capability regression |
@@ -137,7 +137,7 @@ Code starts in notebooks for Phase 1 exploration, migrates to `paramem/` package
 - **PEFT:** Adapter creation, loading, switching, merging
 - **bitsandbytes:** 4-bit quantization for QLoRA
 - **NetworkX:** Graph operations (centrality, merging)
-- **outlines / instructor:** Constrained LLM generation for graph extraction (Phase 3)
+
 
 ### AD-8: RAG Baseline with FAISS (Phase 4)
 

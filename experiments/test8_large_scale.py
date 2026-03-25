@@ -244,6 +244,8 @@ def save_state(state, output_dir):
     state_copy = dict(state)
     if isinstance(state_copy.get("seen_questions"), set):
         state_copy["seen_questions"] = sorted(state_copy["seen_questions"])
+    if isinstance(state_copy.get("seen_triples"), set):
+        state_copy["seen_triples"] = [list(t) for t in sorted(state_copy["seen_triples"])]
     if isinstance(state_copy.get("qa_first_seen_cycle"), dict):
         state_copy["qa_first_seen_cycle"] = dict(state_copy["qa_first_seen_cycle"])
     if isinstance(state_copy.get("qa_source_character"), dict):
@@ -269,6 +271,8 @@ def load_state(output_dir):
         state = json.load(f)
     if "seen_questions" in state:
         state["seen_questions"] = set(state["seen_questions"])
+    if "seen_triples" in state:
+        state["seen_triples"] = {tuple(t) for t in state["seen_triples"]}
     # Ensure new fields exist for backward compat with old state files
     if "qa_first_seen_cycle" not in state:
         state["qa_first_seen_cycle"] = {}
@@ -276,6 +280,10 @@ def load_state(output_dir):
         state["qa_source_character"] = {}
     if "current_character_session_index" not in state:
         state["current_character_session_index"] = 0
+    if "seen_triples" not in state:
+        state["seen_triples"] = set()
+    if "skipped_cycles" not in state:
+        state["skipped_cycles"] = []
     return state
 
 
@@ -289,6 +297,8 @@ def fresh_state():
         "total_sessions_processed": 0,
         "total_qa_pairs": 0,
         "seen_questions": set(),
+        "seen_triples": set(),
+        "skipped_cycles": [],
         "qa_first_seen_cycle": {},  # question_norm -> cycle_num
         "qa_source_character": {},  # question_norm -> character_name
     }
@@ -356,6 +366,7 @@ def generate_qa_from_graph(
     tokenizer,
     merger,
     seen_questions,
+    seen_triples,
     qa_first_seen_cycle,
     qa_source_character,
     cycle_num,
@@ -364,10 +375,15 @@ def generate_qa_from_graph(
 
     Full regeneration each cycle — no caching. This verifies pipeline
     integrity as adapter weights change the extraction landscape.
-    Deduplicates by normalized question text.
+    Deduplicates questions by normalized text for training data quality.
+    Counts new facts by triple identity (subject, predicate, object) for
+    the skip decision.
     Source character is derived per-triple from graph edge session metadata.
 
-    Returns (qa_pairs, new_count).
+    Returns (qa_pairs, new_count, new_triples) where new_count is new
+    triples (not new question strings) and new_triples is the set of
+    triple tuples. Caller must commit new_triples to seen_triples after
+    training succeeds.
     """
     triples = merger.get_all_triples()
     if not triples:
@@ -394,30 +410,39 @@ def generate_qa_from_graph(
             len(triples),
         )
 
-    # Deduplicate and tag metadata
+    # Deduplicate and tag metadata.
+    # new_triples is returned separately — caller commits to seen_triples
+    # only after training succeeds, so a QA-generation or training failure
+    # does not permanently skip those triples.
     qa_pairs = []
-    new_count = 0
+    new_triples = set()
     for i, qa in enumerate(raw_qa):
         q_norm = qa["question"].lower().strip()
 
         # Derive character from the triple that generated this QA
         if i < len(triples):
-            triple_source_char = triple_char.get(triples[i], "unknown")
+            triple_key = triples[i]
+            triple_source_char = triple_char.get(triple_key, "unknown")
         else:
+            triple_key = None
             triple_source_char = "unknown"
 
+        # Identify new triples for skip decision
+        if triple_key is not None and triple_key not in seen_triples:
+            new_triples.add(triple_key)
+
+        # Track question strings for training data dedup
         if q_norm not in seen_questions:
             seen_questions.add(q_norm)
             qa_first_seen_cycle[q_norm] = cycle_num
             qa_source_character[q_norm] = triple_source_char
-            new_count += 1
 
         # Tag QA with cohort metadata
         qa["first_seen_cycle"] = qa_first_seen_cycle.get(q_norm, cycle_num)
         qa["source_character"] = qa_source_character.get(q_norm, triple_source_char)
         qa_pairs.append(qa)
 
-    return qa_pairs, new_count
+    return qa_pairs, len(new_triples), new_triples
 
 
 # ============================================================================
@@ -767,6 +792,23 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
     if args.resume:
         state = load_state(output_dir)
         if state is not None:
+            last_cycle = state["last_completed_cycle"]
+
+            # Prefer per-cycle state snapshot for clean rollback.
+            # The top-level state.json may have been manually edited;
+            # the cycle snapshot is the authoritative state at that boundary.
+            cycle_state_path = output_dir / f"cycle_{last_cycle:03d}" / "state.json"
+            if cycle_state_path.exists():
+                cycle_state = load_state(output_dir / f"cycle_{last_cycle:03d}")
+                if cycle_state is not None:
+                    state = cycle_state
+                    # Re-read last_cycle from snapshot in case it differs
+                    last_cycle = state["last_completed_cycle"]
+                    logger.info(
+                        "Loaded per-cycle state snapshot from cycle %d",
+                        last_cycle,
+                    )
+
             logger.info(
                 "Resuming from cycle %d (%d sessions, %d QA pairs)",
                 state["last_completed_cycle"],
@@ -774,7 +816,6 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
                 state["total_qa_pairs"],
             )
             # Load cumulative graph from last completed cycle
-            last_cycle = state["last_completed_cycle"]
             if last_cycle > 0:
                 graph_path = output_dir / f"cycle_{last_cycle:03d}" / "cumulative_graph.json"
                 if graph_path.exists():
@@ -784,6 +825,13 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
                         merger.graph.number_of_nodes(),
                         merger.graph.number_of_edges(),
                     )
+                    # Reconstruct seen_triples from graph if missing (old state files)
+                    if not state.get("seen_triples"):
+                        state["seen_triples"] = set(merger.get_all_triples())
+                        logger.info(
+                            "Reconstructed seen_triples from graph: %d triples",
+                            len(state["seen_triples"]),
+                        )
                 else:
                     logger.error("Graph file missing for cycle %d: %s", last_cycle, graph_path)
                     return
@@ -828,6 +876,7 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
     cycle_num = state["last_completed_cycle"]
     total_sessions = state["total_sessions_processed"]
     seen_questions = state["seen_questions"]
+    seen_triples = state["seen_triples"]
     qa_first_seen_cycle = state.get("qa_first_seen_cycle", {})
     qa_source_character = state.get("qa_source_character", {})
     characters_used = list(state.get("characters_completed", []))
@@ -932,11 +981,12 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
 
         # ---- Phase 2: Regenerate QA from full graph ----
         t_qa = time.time()
-        qa_pairs, new_qa = generate_qa_from_graph(
+        qa_pairs, new_qa, new_triples_this_cycle = generate_qa_from_graph(
             model,
             tokenizer,
             merger,
             seen_questions,
+            seen_triples,
             qa_first_seen_cycle,
             qa_source_character,
             cycle_num,
@@ -950,15 +1000,46 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
             # Update session pointer but do NOT advance last_completed_cycle —
             # no cycle directory was created, so resume would fail looking for
             # cycle_N/cumulative_graph.json that doesn't exist.
+            state["skipped_cycles"].append({"cycle": cycle_num, "reason": "no_qa_pairs"})
             state["current_character"] = current_char
             state["current_character_session_index"] = current_char_session_idx + 1
             state["total_sessions_processed"] = total_sessions
+            state["characters_completed"] = [c for c in characters_used if c != current_char]
             save_state(state, output_dir)
+            if is_paused():
+                print(f"\n  Pause requested. Stopping after cycle {cycle_num}.")
+                break
+            continue
+
+        # Skip training if no new triples — avoid wasting GPU time retraining
+        # on identical data. The existing adapter already has 100% recall.
+        if new_qa == 0:
+            print("  No new triples this cycle, skipping training")
+            logger.info(
+                "Skipping training: 0 new triples (total QA unchanged at %d)",
+                len(qa_pairs),
+            )
+            # Save graph in case new edges were added (even if no new triples
+            # survived dedup). Prevents seen_triples drifting ahead of graph
+            # on crash-resume.
+            cycle_dir = output_dir / f"cycle_{cycle_num:03d}"
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            merger.save_graph(cycle_dir / "cumulative_graph.json")
+            state["skipped_cycles"].append({"cycle": cycle_num, "reason": "no_new_triples"})
+            state["current_character"] = current_char
+            state["current_character_session_index"] = current_char_session_idx + 1
+            state["total_sessions_processed"] = total_sessions
+            state["total_qa_pairs"] = len(qa_pairs)
+            state["characters_completed"] = [c for c in characters_used if c != current_char]
+            save_state(state, output_dir)
+            if is_paused():
+                print(f"\n  Pause requested. Stopping after cycle {cycle_num}.")
+                break
             continue
 
         # Warn if yield is low
         yield_rate = new_qa / sessions_this_cycle if sessions_this_cycle > 0 else 0
-        if yield_rate < 1.0 and new_qa > 0:
+        if yield_rate < 1.0:
             logger.warning(
                 "Low QA yield: %.1f pairs/session (expected ~1.8)",
                 yield_rate,
@@ -1049,7 +1130,12 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
         state["total_qa_pairs"] = len(qa_pairs)
         state["qa_first_seen_cycle"] = qa_first_seen_cycle
         state["qa_source_character"] = qa_source_character
+        # Commit new triples only after training succeeds
+        seen_triples.update(new_triples_this_cycle)
         save_state(state, output_dir)
+
+        # Per-cycle state snapshot for clean rollback
+        save_state(state, cycle_dir)
 
         # Save cumulative results
         results = {

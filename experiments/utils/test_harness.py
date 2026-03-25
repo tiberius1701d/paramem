@@ -23,6 +23,7 @@ from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
 from paramem.evaluation.recall import generate_answer  # noqa: E402
 from paramem.models.loader import (  # noqa: E402
     create_adapter,
+    load_adapter,
     load_base_model,
     switch_adapter,
 )
@@ -477,3 +478,80 @@ def save_results(results: dict, output_dir: str | Path, filename: str = "results
         json.dump(results, f, indent=2, default=str)
     logger.info("Results saved to %s", results_path)
     return results_path
+
+
+def smoke_test_adapter(
+    cycle_dir: str | Path,
+    model_config: ModelConfig | str,
+    adapter_name: str = "episodic",
+) -> dict:
+    """Load a saved adapter from disk and verify recall.
+
+    Performs a full save/reload smoke test using the standard evaluation
+    pipeline. No ad-hoc inference code — uses evaluate_indexed_recall
+    with the same prompt formatting used during training.
+
+    Args:
+        cycle_dir: Path to a cycle directory containing adapter/,
+            keyed_pairs.json, and simhash_registry.json.
+        model_config: A ModelConfig instance or a string key into
+            BENCHMARK_MODELS (e.g. "mistral").
+        adapter_name: Adapter subdirectory name (default "episodic").
+
+    Returns:
+        Result dict from evaluate_indexed_recall with exact_count,
+        total, rate, mean_confidence, and per_key results.
+
+    Note:
+        The loaded model is not cleaned up — caller is responsible
+        for model lifetime if memory is a concern.
+    """
+    cycle_dir = Path(cycle_dir)
+
+    # Resolve model config
+    if isinstance(model_config, str):
+        if model_config not in BENCHMARK_MODELS:
+            raise KeyError(
+                f"Unknown model '{model_config}'. Available: {list(BENCHMARK_MODELS.keys())}"
+            )
+        model_config = BENCHMARK_MODELS[model_config]
+
+    # Validate paths
+    adapter_dir = cycle_dir / "adapter"
+    adapter_path = adapter_dir / adapter_name
+    keyed_pairs_path = cycle_dir / "keyed_pairs.json"
+    registry_path = cycle_dir / "simhash_registry.json"
+
+    for path, label in [
+        (adapter_path, f"adapter '{adapter_name}'"),
+        (keyed_pairs_path, "keyed_pairs.json"),
+        (registry_path, "simhash_registry.json"),
+    ]:
+        if not path.exists():
+            raise FileNotFoundError(f"Missing {label} in {cycle_dir}")
+
+    # Load test data
+    with open(keyed_pairs_path) as f:
+        keyed_pairs = json.load(f)
+    with open(registry_path) as f:
+        registry = json.load(f)
+
+    # Load model and adapter from disk
+    model, tokenizer, _ = load_model_and_config(model_config)
+    model = load_adapter(model, adapter_dir, adapter_name)
+
+    # Evaluate using the standard pipeline
+    result = evaluate_indexed_recall(
+        model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name
+    )
+
+    rate_pct = result["rate"] * 100
+    logger.info(
+        "Smoke test: %d/%d (%.1f%%) — %s",
+        result["exact_count"],
+        result["total"],
+        rate_pct,
+        cycle_dir.name,
+    )
+
+    return result
