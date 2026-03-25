@@ -138,9 +138,8 @@ async def chat(request: ChatRequest):
     """Handle a conversation turn with speaker identification."""
     buffer = _state["session_buffer"]
 
-    # If the request provides a speaker (e.g. from HA user context), store it
-    if request.speaker:
-        buffer.set_speaker(request.conversation_id, request.speaker)
+    # Ignore application-level user identity (e.g. HA user context).
+    # Speaker must self-identify in the conversation via the greeting flow.
 
     # Speaker identification flow
     state = buffer.get_session_state(request.conversation_id)
@@ -192,8 +191,8 @@ async def chat(request: ChatRequest):
 def _extract_speaker_name(text: str) -> str | None:
     """Extract a speaker name from a self-introduction response.
 
-    Handles common patterns: "I'm Tobias", "My name is Tobias",
-    "Tobias", "It's Tobias", "This is Tobias", "Call me Tobias".
+    Handles common patterns: "I'm Alex", "My name is Alex",
+    "Alex", "It's Alex", "This is Alex", "Call me Alex".
     """
 
     text = text.strip().rstrip(".")

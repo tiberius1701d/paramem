@@ -172,17 +172,17 @@ class TestSessionBuffer:
         assert buffer.get_session_state("conv1") == "new"
         assert buffer.get_speaker("conv1") is None
 
-        buffer.set_speaker("conv1", "Tobias")
-        assert buffer.get_speaker("conv1") == "Tobias"
+        buffer.set_speaker("conv1", "Alex")
+        assert buffer.get_speaker("conv1") == "Alex"
         assert buffer.get_session_state("conv1") == "identified"
 
     def test_speaker_in_transcript(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions")
-        buffer.set_speaker("conv1", "Tobias")
+        buffer.set_speaker("conv1", "Alex")
         buffer.append("conv1", "user", "I live in Amsterdam")
 
         pending = buffer.get_pending()
-        assert "Tobias: I live in Amsterdam" in pending[0]["transcript"]
+        assert "Alex: I live in Amsterdam" in pending[0]["transcript"]
 
 
 class TestKeyMetadata:

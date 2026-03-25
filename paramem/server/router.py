@@ -166,7 +166,7 @@ class QueryRouter:
             return RoutingPlan(strategy="direct")
 
         # One-hop expansion: entities connected to the speaker via keyed_pairs
-        # (e.g. speaker "Tobias" has key Tobias→Pauline, so also probe Pauline's keys)
+        # (e.g. speaker "Alex" has key Alex→Jordan, so also probe Jordan's keys)
         if speaker:
             connected = self._get_connected_entities(speaker.lower().strip())
             for entity in connected:

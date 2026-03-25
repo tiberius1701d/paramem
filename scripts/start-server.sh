@@ -25,6 +25,12 @@ PYTHON=${PARAMEM_PYTHON:-python}
 CONFIG=${PARAMEM_CONFIG:-configs/server.yaml}
 LOG_DIR=logs
 
+# Update Windows port proxy if running in WSL2
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    echo "Updating Windows port forward..."
+    bash scripts/win-port-forward.sh || echo "  Warning: port forward failed (non-fatal)"
+fi
+
 if [ "${1:-}" = "--background" ]; then
     mkdir -p "$LOG_DIR"
     LOG="$LOG_DIR/paramem-server-$(date +%Y%m%d_%H%M%S).log"

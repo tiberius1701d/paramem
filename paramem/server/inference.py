@@ -256,16 +256,40 @@ def _build_messages(
     system_prompt: str,
     tokenizer,
 ) -> list[dict]:
-    """Build chat messages from user text, history, and system prompt."""
-    messages = [{"role": "system", "content": system_prompt}]
+    """Build chat messages from user text, history, and system prompt.
 
+    Enforces strict user/assistant alternation required by Mistral and
+    other chat templates. Consecutive same-role messages are merged.
+    """
+    # Build alternating user/assistant pairs from history.
+    # Mistral requires: system → user → assistant → user → ...
+    # HA may send non-alternating history, so we enforce the pattern.
+    pairs = []
     if history:
         for turn in history[-MAX_HISTORY_TURNS:]:
             role = turn.get("role", "user")
             content = turn.get("text", "")
             if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+                pairs.append({"role": role, "content": content})
 
-    messages.append({"role": "user", "content": text})
+    # Merge consecutive same-role messages
+    merged = []
+    for msg in pairs:
+        if merged and merged[-1]["role"] == msg["role"]:
+            merged[-1]["content"] += "\n" + msg["content"]
+        else:
+            merged.append(msg)
+
+    # Strip leading assistant messages (must start with user after system)
+    while merged and merged[0]["role"] == "assistant":
+        merged.pop(0)
+
+    messages = [{"role": "system", "content": system_prompt}] + merged
+
+    # Ensure the final message is a user turn with the current text
+    if messages[-1]["role"] == "user":
+        messages[-1]["content"] += "\n" + text
+    else:
+        messages.append({"role": "user", "content": text})
 
     return adapt_messages(messages, tokenizer)
