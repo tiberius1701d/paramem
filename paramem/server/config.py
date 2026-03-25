@@ -68,6 +68,7 @@ class PathsConfig:
     data: Path = Path("data/ha")
     sessions: Path = Path("data/ha/sessions")
     debug: Path = Path("data/ha/debug")
+    prompts: Path = Path("configs/prompts")
 
     @property
     def adapters(self) -> Path:
@@ -171,6 +172,10 @@ class ServerConfig:
     @property
     def debug_dir(self) -> Path:
         return self.paths.debug
+
+    @property
+    def prompts_dir(self) -> Path:
+        return self.paths.prompts
 
     @property
     def model_config(self) -> ModelConfig:

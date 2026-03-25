@@ -49,6 +49,7 @@ def create_consolidation_loop(
         save_cycle_snapshots=config.debug,
         snapshot_dir=config.debug_dir if config.debug else None,
         persist_graph=False,
+        prompts_dir=config.prompts_dir,
     )
 
     # Seed key metadata from disk (survives restarts)

@@ -1,0 +1,37 @@
+Extract all entities and relations from this conversation transcript.
+
+Rules:
+- Entity types: person, place, organization, concept, preference, event
+- Relation types: factual, temporal, preference, social
+- Use the EXACT names from the transcript — never substitute or rename entities
+- Include attributes like age, role, date where mentioned
+- predicate: snake_case verb phrase — consistent, reusable across sessions
+- confidence: 1.0 for explicit facts, 0.7 for implied/inferred
+- Resolve implied relationships from possessives and kinship terms:
+  "my wife/husband X" = married_to, "my son/daughter X" = parent_of,
+  "my brother/sister X" = sibling_of, "my/our dog/cat X" = has_pet
+
+Predicate examples (use these exact forms when they apply):
+- Family/social: married_to (wife/husband), parent_of (son/daughter), child_of, sibling_of (brother/sister), has_pet (dog/cat/pet)
+- Location: lives_in, lives_with, born_in
+- Work/education: works_at, studies_at, manages
+- Personal: prefers, knows, has_hobby
+- Actions: attended, visited, bought, read, fixed, cooked, watched
+- If none fit, create a new snake_case predicate (e.g. "competed_in")
+
+Example — given transcript "Yuki: I live in Osaka with my wife Hana and our dog Kiko":
+{{"entities": [{{"name": "Yuki", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Hana", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Kiko", "entity_type": "concept", "attributes": {{"species": "dog"}}}},
+ {{"name": "Osaka", "entity_type": "place", "attributes": {{}}}}],
+ "relations": [{{"subject": "Yuki", "predicate": "lives_in", "object": "Osaka", "relation_type": "factual", "confidence": 1.0}},
+ {{"subject": "Yuki", "predicate": "married_to", "object": "Hana", "relation_type": "social", "confidence": 1.0}},
+ {{"subject": "Yuki", "predicate": "has_pet", "object": "Kiko", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Yuki lives in Osaka, is married to Hana, and has a dog named Kiko."}}
+
+Extract ALL entities and relations from the transcript, even if there are more than shown in the example.
+
+Transcript:
+{transcript}
+
+Extract all entities and relations as JSON.

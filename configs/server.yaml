@@ -11,6 +11,7 @@ paths:
   data: data/ha                 # persistent artifacts (adapters, registry, key_metadata)
   sessions: data/ha/sessions    # conversation transcripts pending consolidation
   debug: data/ha/debug          # cycle snapshots, diagnostic output (only when debug=true)
+  prompts: configs/prompts      # extraction and voice prompt templates
 
 adapters:
   episodic:

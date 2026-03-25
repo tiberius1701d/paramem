@@ -53,14 +53,25 @@ class TestRelation:
         )
         assert rel.confidence == 0.8
 
-    def test_invalid_confidence(self):
+    def test_confidence_above_one_normalized_downstream(self):
+        """Schema accepts > 1.0; _normalize_extraction scales to 0-1 before use."""
+        rel = Relation(
+            subject="A",
+            predicate="p",
+            object="B",
+            relation_type="factual",
+            confidence=99.9,
+        )
+        assert rel.confidence == 99.9
+
+    def test_invalid_confidence_negative(self):
         with pytest.raises(ValidationError):
             Relation(
                 subject="A",
                 predicate="p",
                 object="B",
                 relation_type="factual",
-                confidence=1.5,
+                confidence=-0.5,
             )
 
     def test_invalid_relation_type(self):

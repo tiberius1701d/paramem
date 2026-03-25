@@ -27,7 +27,7 @@ class Relation(BaseModel):
     relation_type: Literal["factual", "temporal", "preference", "social"] = Field(
         description="Category of relation"
     )
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    confidence: float = Field(default=1.0, ge=0.0)
 
 
 class SessionGraph(BaseModel):

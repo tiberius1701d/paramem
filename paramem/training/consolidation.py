@@ -94,6 +94,7 @@ class ConsolidationLoop:
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
         persist_graph: bool = True,
+        prompts_dir: str | Path | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -106,6 +107,7 @@ class ConsolidationLoop:
         self.save_cycle_snapshots = save_cycle_snapshots
         self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
         self.persist_graph = persist_graph
+        self.prompts_dir = prompts_dir
         # Entity-level promotion requires a persistent graph for cross-restart
         # recurrence tracking. When the graph is transient (persist_graph=False),
         # the caller must handle promotion externally (e.g. key-level promotion).
@@ -249,6 +251,7 @@ class ConsolidationLoop:
                         session_transcript,
                         session_id,
                         temperature=self.extraction_temperature,
+                        prompts_dir=self.prompts_dir,
                     )
             else:
                 session_graph = extract_graph(
@@ -257,6 +260,7 @@ class ConsolidationLoop:
                     session_transcript,
                     session_id,
                     temperature=self.extraction_temperature,
+                    prompts_dir=self.prompts_dir,
                 )
 
         result.entities_extracted = len(session_graph.entities)
