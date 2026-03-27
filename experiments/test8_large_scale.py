@@ -790,6 +790,11 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
     merger = GraphMerger(similarity_threshold=85.0, strategy="graph")
 
     if args.resume:
+        # Clear stale pause file so resume doesn't immediately stop
+        if PAUSE_FILE.exists():
+            PAUSE_FILE.unlink()
+            logger.info("Cleared stale pause file from previous run")
+
         state = load_state(output_dir)
         if state is not None:
             last_cycle = state["last_completed_cycle"]
@@ -1274,4 +1279,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from experiments.utils.gpu_guard import acquire_gpu
+
+    with acquire_gpu():
+        main()
