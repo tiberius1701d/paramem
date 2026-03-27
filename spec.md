@@ -149,7 +149,7 @@ Parametric memory is inherently more private than text-based storage — knowled
 | Semantic adapter stability | <5% drift on consolidated facts after 20 cycles | 3 |
 | Consolidation wall-clock time per session | <30 min on RTX 5070 | 3 |
 | Multi-model indexed key recall at 100 keys | >95% across 3 model families | 4 |
-| Large-scale indexed key recall at 500 keys | 100% (Test 8, in progress — 140/140 at cycle 14) | 4 |
+| Large-scale indexed key recall at 500 keys | 100% (Test 8, in progress — 324/324 at cycle 35) | 4 |
 | Recall-then-reason inference accuracy | Competitive with RAG on multi-hop questions | 4 |
 | Privacy: facts leaked without correct keys | <5% of stored facts (under review — see internal security analysis) | 4 |
 | Cross-persona adapter isolation | <5% cross-contamination | 4 |

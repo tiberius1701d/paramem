@@ -90,12 +90,25 @@ conda env create -f environment.yml
 conda activate paramem
 ```
 
+### Environment Variables
+
+Create a `.env` file in the project root. The server and experiment scripts load it automatically.
+
+```bash
+# .env
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+WANDB_API_KEY=<your wandb key>            # optional, for experiment tracking
+HF_DEACTIVATE_ASYNC_LOAD=1               # required on WSL2 for models >= 4B params
+
+# Server (required for HA integration)
+HA_URL=http://<your-ha-ip>:8123          # Home Assistant URL
+HA_TOKEN=<your-ha-long-lived-token>      # HA → Profile → Long-Lived Access Tokens
+GROQ_API_KEY=<your-groq-api-key>         # groqcloud.com → API Keys
+```
+
 ### Run the Smoke Test
 
 ```bash
-# Set VRAM allocation strategy (recommended for 8GB GPUs)
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
 # Train 10 indexed keys and verify recall (~4 min)
 python experiments/phase4_indexed_keys_smoke.py --num-epochs 30
 ```
@@ -180,49 +193,104 @@ This forces sequential weight loading. Models load slightly slower but reliably.
 
 ## Server Deployment
 
-ParaMem includes a REST server for persistent deployment. The server keeps the model loaded in VRAM, serves chat inference, and runs daily consolidation to learn from new conversations.
+ParaMem includes a REST server for persistent deployment. The server keeps the model loaded in VRAM, serves chat inference, runs daily consolidation, and escalates non-memory queries to Home Assistant's conversation agent.
 
 ### Quick Start
 
 ```bash
-# Start the server (foreground)
+# Start the server
 bash scripts/start-server.sh
 
-# Or background with log file
-bash scripts/start-server.sh --background
-```
+# Or with systemd (recommended)
+systemctl --user enable --now paramem-server
 
-The server listens on port 8420 by default. Verify it's running:
-
-```bash
+# Verify
 curl http://localhost:8420/status
 ```
+
+The server listens on port 8420. On startup it auto-detects GPU availability — if another process holds the GPU (e.g., a training run), it starts in cloud-only mode and auto-reclaims once the GPU is free.
 
 ### Configuration
 
 Edit `configs/server.yaml`:
 
 ```yaml
-model: gemma          # gemma | mistral
-adapter_dir: data/ha/adapters
-registry_path: data/ha/registry.json
-graph_path: data/ha/graph.json
-session_dir: data/ha/sessions
+server:
+  host: "0.0.0.0"
+  port: 8420
+  reclaim_interval_minutes: 10
 
-training:
-  epochs: 30
-  rank: 8
+model: mistral          # mistral | gemma | qwen3b
+
+paths:
+  data: data/ha
+  sessions: data/ha/sessions
+  prompts: configs/prompts
+
+adapters:
+  episodic:
+    enabled: true
+    rank: 8
+    alpha: 16
 
 consolidation:
-  schedule: "02:00"   # daily at 2am (empty string = manual only)
+  schedule: "02:00"     # daily at 2am (empty = manual only)
+
+agents:
+  general:
+    enabled: true
+    provider: groq
+    model: llama-3.3-70b-versatile
+    api_key: ${GROQ_API_KEY}
+  ha_agent_id: conversation.groq  # HA conversation agent for escalation
+
+tools:
+  ha:
+    url: http://your-ha-instance:8123
+    token: ${HA_TOKEN}
+    auto_discover: true
+    allowlist:
+      - light.*
+      - switch.*
+      - script.*
+      - climate.*
+      - media_player.*
+  definitions: configs/tools.yaml
+```
+
+### Architecture
+
+```
+Voice/Text → HA → ParaMem Server
+  ├─ Speaker identified? → greeting flow
+  ├─ Entity match in knowledge graph? → adapter recall → reason → respond
+  └─ No match → HA conversation.process (WebSocket) → response
+```
+
+ParaMem owns memory (speaker identification, entity routing, adapter recall, consolidation). Home Assistant owns everything else (device control, search, weather, music, prompt engineering, model selection). Non-memory queries are forwarded to HA's configured conversation agent, which handles tool execution, entity resolution, and room-aware context internally.
+
+### GPU Lifecycle
+
+The server shares the GPU with ML workloads:
+
+- **SIGUSR1** → switch to cloud-only mode (model unloaded from VRAM)
+- **Auto-reclaim** → periodically checks if GPU is free, reloads model
+- **Startup guard** → if GPU is occupied at startup, starts in cloud-only mode
+- **`--cloud-only`** → explicit flag to skip model loading
+
+```bash
+# Release GPU for a training run
+kill -SIGUSR1 $(pidof python -m paramem.server.app)
+
+# Server auto-reclaims when GPU is free (default: 10min polling)
 ```
 
 ### API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/chat` | POST | Send a message, get a response. Adapter always active. |
-| `/status` | GET | Server health, model info, key count, consolidation state |
+| `/chat` | POST | Send a message, get a response |
+| `/status` | GET | Server health, mode, model info, key count |
 | `/consolidate` | POST | Trigger consolidation manually |
 
 **Chat request:**
@@ -235,22 +303,21 @@ curl -X POST http://localhost:8420/chat \
 
 The server buffers conversation turns automatically. On the next consolidation cycle, it extracts knowledge from buffered sessions, merges into the knowledge graph, generates QA pairs, and retrains the adapter.
 
-### Systemd Service
-
-For persistent deployment:
-
-```bash
-sudo cp scripts/paramem-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now paramem-server
-
-# Check logs
-journalctl -u paramem-server -f
-```
-
 ### Home Assistant Integration
 
-A custom conversation agent for Home Assistant is included in `custom_components/paramem/`. Copy or symlink to your HA `custom_components/` directory and configure via the HA UI (Settings → Devices → Add Integration → ParaMem). The component is a thin REST client — all inference runs on the ParaMem server.
+A custom conversation agent for Home Assistant is included in `custom_components/paramem/`. The component is a thin REST client — all intelligence runs on the ParaMem server.
+
+**Setup:**
+1. Copy `custom_components/paramem/` to your HA `custom_components/` directory
+2. Restart HA
+3. Add the integration via Settings → Devices → Add Integration → ParaMem
+4. Configure the server URL (default: `http://localhost:8420`)
+
+**How it works:**
+- HA sends voice/text queries to ParaMem's `/chat` endpoint
+- ParaMem handles memory-related queries locally (parametric recall from adapter weights)
+- Non-memory queries are forwarded back to HA's configured conversation agent via WebSocket (`conversation.process`), which handles device control, search, weather, and other tools with full room awareness
+- The HA conversation agent's prompt, model, and tools are configured entirely on the HA side — no duplication in ParaMem
 
 ## Data
 
