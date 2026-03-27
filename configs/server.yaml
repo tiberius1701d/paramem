@@ -1,6 +1,7 @@
 server:
   host: "0.0.0.0"
   port: 8420
+  reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
 
 model: mistral  # mistral | gemma | qwen3b
 
@@ -36,11 +37,44 @@ consolidation:
   max_active_keys: 50          # cap episodic keys (evict oldest beyond this)
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
 
-cloud:
-  enabled: false
-  endpoint: ""       # e.g. https://api.openai.com/v1/chat/completions
-  model: ""          # e.g. gpt-4o
-  api_key: ""
+# --- Agents ---
+# Two-agent design: memory (local) + general (cloud).
+# Memory agent is always the local model above. General agent is optional.
+agents:
+  general:
+    enabled: true
+    provider: groq
+    model: llama-3.3-70b-versatile
+    api_key: ${GROQ_API_KEY}   # env var only — never inline secrets
+    endpoint: ""               # groq default endpoint used when empty
+  ha_agent_id: conversation.groq  # HA conversation agent entity for escalation
+
+# Deprecated — use agents.general instead:
+# cloud:
+#   enabled: false
+#   endpoint: ""
+#   model: ""
+#   api_key: ""
+
+# --- Tools ---
+tools:
+  ha:
+    url: ${HA_URL}                # e.g. http://homeassistant.local:8123
+    token: ${HA_TOKEN}
+    auto_discover: true
+    allowlist:
+      - light.*
+      - switch.*
+      - script.*
+      - climate.*
+      - media_player.*
+  definitions: configs/tools.yaml   # copy from tools.yaml.example and customize
+  max_tool_rounds: 5
+  tool_timeout_seconds: 3.0
+  total_timeout_seconds: 8.0
+
+sanitization:
+  mode: block           # off, warn, block — controls PII detection for cloud queries
 
 voice:
   prompt_file: configs/prompts/ha_voice.txt

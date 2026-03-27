@@ -18,10 +18,14 @@ from dataclasses import dataclass, field
 
 from paramem.evaluation.recall import generate_answer
 from paramem.models.loader import adapt_messages
+from paramem.server.cloud.base import CloudAgent
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation, escalate_to_cloud
 from paramem.server.router import RoutingPlan, RoutingStep
+from paramem.server.sanitizer import sanitize_for_cloud
 from paramem.server.temporal import detect_temporal_query, filter_registry_by_date
+from paramem.server.tools.ha_client import HAClient
+from paramem.server.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +48,21 @@ def handle_chat(
     tokenizer,
     config: ServerConfig,
     router=None,
+    cloud_agent: CloudAgent | None = None,
+    ha_client: HAClient | None = None,
+    tool_registry: ToolRegistry | None = None,
 ) -> ChatResult:
     """Process a chat message via entity-routed inference.
+
+    Routing:
+    1. Temporal query → filter keys by date → probe → reason
+    2. Entity match → probe matched keys → reason
+    3. No match + cloud configured → direct to cloud (no local inference)
+    4. No match + no cloud → local base model (may [ESCALATE])
 
     The speaker entity is always injected into routing so that personal
     queries ("What is my name?") resolve to the speaker's keys even
     when no explicit entity appears in the query text.
-
-    Temporal queries filter keys by date range first, then probe.
     """
     model.gradient_checkpointing_disable()
 
@@ -65,9 +76,13 @@ def handle_chat(
         logger.info("Temporal query detected: %s to %s", start_date, end_date)
         temporal_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
         if temporal_keys:
-            # Wrap temporal keys as a single episodic step
             plan = RoutingPlan(
-                steps=[RoutingStep(adapter_name="episodic", keys_to_probe=temporal_keys)],
+                steps=[
+                    RoutingStep(
+                        adapter_name="episodic",
+                        keys_to_probe=temporal_keys,
+                    )
+                ],
                 strategy="temporal",
             )
             logger.info("Found %d keys for date range", len(temporal_keys))
@@ -84,10 +99,107 @@ def handle_chat(
 
     # Probe keys per adapter → reconstruct facts → reason
     if plan and plan.steps:
-        return _probe_and_reason(text, plan, history, model, tokenizer, config)
+        return _probe_and_reason(
+            text,
+            plan,
+            history,
+            model,
+            tokenizer,
+            config,
+            cloud_agent,
+            ha_client,
+            tool_registry,
+        )
 
-    # No keys found — base model without context (escalation candidate)
-    return _base_model_answer(text, history, model, tokenizer, config)
+    # Path 3: No entity match — direct to cloud (skip local inference)
+    if cloud_agent is not None:
+        sanitized, findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
+        if sanitized is None:
+            logger.info("Cloud blocked by sanitizer: %s", findings)
+            return _base_model_answer(
+                text,
+                history,
+                model,
+                tokenizer,
+                config,
+                cloud_agent=cloud_agent,
+                ha_client=ha_client,
+                tool_registry=tool_registry,
+            )
+        logger.info("No entity match, routing directly to cloud agent")
+        return _escalate_to_ha_agent(sanitized, ha_client, cloud_agent, config, tool_registry)
+
+    # Path 4: No cloud — local base model (may emit [ESCALATE])
+    return _base_model_answer(
+        text,
+        history,
+        model,
+        tokenizer,
+        config,
+        cloud_agent=cloud_agent,
+        ha_client=ha_client,
+        tool_registry=tool_registry,
+    )
+
+
+def _escalate_to_ha_agent(
+    text: str,
+    ha_client: HAClient | None,
+    cloud_agent: CloudAgent | None,
+    config: ServerConfig,
+    tool_registry: ToolRegistry | None = None,
+) -> ChatResult:
+    """Escalate a query to HA's conversation agent, with direct Groq fallback.
+
+    Primary path: forward to HA's conversation.process which handles
+    prompt rendering, tool execution, and entity resolution internally.
+    Fallback: call Groq directly if HA is unavailable.
+    """
+    # Primary: HA conversation agent
+    if ha_client is not None:
+        response = ha_client.conversation_process(text, agent_id=config.ha_agent_id)
+        if response is not None:
+            return ChatResult(text=response, escalated=True)
+        logger.warning("HA conversation.process failed, falling back to direct cloud")
+
+    # Fallback: direct Groq call (no tools, no HA prompt)
+    if cloud_agent is not None:
+        return _cloud_agent_answer(cloud_agent, text, config, tool_registry)
+
+    return ChatResult(
+        text="I couldn't get an answer right now.",
+        escalated=True,
+    )
+
+
+CLOUD_DIRECT_PROMPT = (
+    "You are a helpful personal assistant. Be concise. "
+    "Answer in 1-2 spoken sentences. Do not use markdown, lists, or structured formatting. "
+)
+
+
+def _cloud_agent_answer(
+    cloud_agent: CloudAgent,
+    text: str,
+    config: ServerConfig,
+    tool_registry: ToolRegistry | None = None,
+) -> ChatResult:
+    """Direct cloud agent call — fallback when HA is unavailable.
+
+    Simple query-response without HA tools or prompt context.
+    """
+    response = cloud_agent.call(
+        query=text,
+        system_prompt=CLOUD_DIRECT_PROMPT,
+    )
+
+    if response.text:
+        return ChatResult(text=response.text, escalated=True)
+
+    return ChatResult(
+        text="I'm sorry, I couldn't get an answer right now.",
+        escalated=True,
+    )
 
 
 def _probe_and_reason(
@@ -97,6 +209,9 @@ def _probe_and_reason(
     model,
     tokenizer,
     config: ServerConfig,
+    cloud_agent: CloudAgent | None = None,
+    ha_client: HAClient | None = None,
+    tool_registry: ToolRegistry | None = None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -161,8 +276,24 @@ def _probe_and_reason(
         )
 
     if not layers:
-        logger.info("All probed keys failed, falling back to base model")
-        return _base_model_answer(text, history, model, tokenizer, config)
+        logger.info("All probed keys failed, falling back")
+        if cloud_agent is not None:
+            sanitized, findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
+            if sanitized is not None:
+                return _escalate_to_ha_agent(
+                    sanitized, ha_client, cloud_agent, config, tool_registry
+                )
+            logger.info("Cloud blocked by sanitizer on fallback: %s", findings)
+        return _base_model_answer(
+            text,
+            history,
+            model,
+            tokenizer,
+            config,
+            cloud_agent=cloud_agent,
+            ha_client=ha_client,
+            tool_registry=tool_registry,
+        )
 
     total_facts = sum(len(f) for f in layers.values())
     logger.info("Total recalled: %d facts from %d layers", total_facts, len(layers))
@@ -189,7 +320,14 @@ def _probe_and_reason(
     else:
         response = generate_answer(model, tokenizer, prompt, max_new_tokens=256, temperature=0.0)
 
-    return _maybe_escalate(response, config, probed_keys=successful_keys)
+    return _maybe_escalate(
+        response,
+        config,
+        probed_keys=successful_keys,
+        cloud_agent=cloud_agent,
+        ha_client=ha_client,
+        tool_registry=tool_registry,
+    )
 
 
 def _base_model_answer(
@@ -198,6 +336,9 @@ def _base_model_answer(
     model,
     tokenizer,
     config: ServerConfig,
+    cloud_agent: CloudAgent | None = None,
+    ha_client: HAClient | None = None,
+    tool_registry: ToolRegistry | None = None,
 ) -> ChatResult:
     """Answer from base model without context — escalation candidate."""
     from peft import PeftModel
@@ -213,22 +354,48 @@ def _base_model_answer(
     else:
         response = generate_answer(model, tokenizer, prompt, max_new_tokens=256, temperature=0.0)
 
-    return _maybe_escalate(response, config)
+    return _maybe_escalate(
+        response,
+        config,
+        cloud_agent=cloud_agent,
+        ha_client=ha_client,
+        tool_registry=tool_registry,
+    )
 
 
 def _maybe_escalate(
     response: str,
     config: ServerConfig,
     probed_keys: list[str] | None = None,
+    cloud_agent: CloudAgent | None = None,
+    ha_client: HAClient | None = None,
+    tool_registry: ToolRegistry | None = None,
 ) -> ChatResult:
-    """Check for [ESCALATE] tag and forward to cloud if configured."""
+    """Check for [ESCALATE] tag and forward to HA/cloud if configured.
+
+    Secondary escalation path — only fires when the graph falsely routes
+    to memory (entity match but model can't answer). Delegates to
+    _escalate_to_ha_agent (HA conversation agent primary, direct cloud fallback).
+    """
     should_escalate, forwarded_query = detect_escalation(response)
 
-    if should_escalate and config.cloud.enabled:
-        logger.info("Escalating to cloud: %s", forwarded_query[:100])
-        cloud_response = escalate_to_cloud(forwarded_query, config.cloud)
-        if cloud_response:
-            return ChatResult(text=cloud_response, escalated=True)
+    if should_escalate and cloud_agent is not None:
+        sanitized, _ = sanitize_for_cloud(forwarded_query, mode=config.sanitization.mode)
+        if sanitized is None:
+            should_escalate = False
+        else:
+            logger.info("Escalating to cloud: %s", sanitized[:100])
+            return _escalate_to_ha_agent(sanitized, ha_client, cloud_agent, config, tool_registry)
+    elif should_escalate and config.general_agent.enabled:
+        # Legacy path — direct HTTP call without adapter
+        sanitized_legacy, _ = sanitize_for_cloud(forwarded_query, mode=config.sanitization.mode)
+        if sanitized_legacy is None:
+            should_escalate = False
+        else:
+            logger.info("Escalating to cloud (legacy): %s", sanitized_legacy[:100])
+            cloud_response = escalate_to_cloud(sanitized_legacy, config.general_agent)
+            if cloud_response:
+                return ChatResult(text=cloud_response, escalated=True)
 
     if should_escalate:
         response = response.replace("[ESCALATE]", "").strip()

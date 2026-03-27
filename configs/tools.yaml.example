@@ -1,0 +1,248 @@
+# Tool definitions — Extended OpenAI Conversation format.
+#
+# Copy this file to configs/tools.yaml and customize for your HA instance.
+# These definitions match the format used by HA's Extended OpenAI Conversation
+# integration, so you can copy tool specs from your HA config directly.
+#
+# Three execution types:
+#   template — renders a Jinja2 template against HA state (e.g., weather entities)
+#   script   — calls an HA script with response capture via WebSocket
+#   native   — direct HA service call (e.g., execute_services for device control)
+#
+# Replace entity IDs (weather.your_weather_entity, etc.) with your actual HA entities.
+
+- spec:
+    name: execute_services
+    description: Use this function to execute service of devices in Home Assistant.
+    parameters:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            type: object
+            properties:
+              domain:
+                type: string
+                description: The domain of the service
+              service:
+                type: string
+                description: The service to be called
+              service_data:
+                type: object
+                description: The service data object to indicate what to control.
+                properties:
+                  entity_id:
+                    type: string
+                    description: The entity_id retrieved from available devices. Must start with domain, followed by dot character.
+                required:
+                  - entity_id
+            required:
+              - domain
+              - service
+              - service_data
+  function:
+    type: native
+    name: execute_service
+
+- spec:
+    name: tavily_search
+    description: Search for recent news or perform deep-dive research.
+    parameters:
+      type: object
+      properties:
+        query:
+          type: string
+          description: "The topic or research question."
+        search_depth:
+          type: string
+          enum: ["basic", "advanced"]
+          description: "Use 'basic' for quick facts. Use 'advanced' for breaking news or when the user asks for 'details' or 'research'."
+      required:
+        - query
+  function:
+    type: script
+    sequence:
+      - action: script.perform_tavily_search
+        data:
+          query: "{{ query }}"
+          search_depth: "{{ search_depth }}"
+        response_variable: search_response
+      - variables:
+          _function_result: "{{ search_response['content'] }}"
+
+- spec:
+    name: serp_news_lookup
+    description: "Use this ONLY for specific facts, local info (hours, addresses), prices, or finding specific website links."
+    parameters:
+      type: object
+      properties:
+        query:
+          type: string
+          description: "The news topic to search"
+      required:
+        - query
+  function:
+    type: script
+    sequence:
+      - action: script.perform_google_search
+        data:
+          query: "{{ query }}"
+        response_variable: search_response
+      - variables:
+          _function_result: "{{ search_response.content }}"
+
+- spec:
+    name: music_control
+    description: >-
+      Use this function to control music playback via Music Assistant.
+      Supports playing artists, albums, tracks, playlists, and radio stations.
+      Also supports pause, stop, next, previous, shuffle, and volume controls.
+    parameters:
+      type: object
+      properties:
+        action:
+          type: string
+          description: The action to perform
+          enum:
+            - play
+            - pause
+            - stop
+            - next
+            - previous
+            - shuffle_on
+            - shuffle_off
+            - volume_up
+            - volume_down
+            - volume_set
+            - mute
+            - unmute
+        search_query:
+          type: string
+          description: >-
+            The name of what to play (artist, album, track, playlist, or radio station).
+            For tracks use "Artist - Track Name" format.
+            For albums use "Artist - Album Name" if ambiguous.
+            Leave empty for pause/stop/next/previous/volume actions.
+        media_type:
+          type: string
+          description: The type of media to play. Will be auto-detected if omitted.
+          enum:
+            - artist
+            - album
+            - track
+            - playlist
+            - radio
+        target_player:
+          type: string
+          description: >-
+            The media player entity to play on.
+            Use the default speaker from room context if not specified by user.
+        radio_mode:
+          type: boolean
+          description: Enable radio mode to auto-fill queue with similar tracks.
+        artist_filter:
+          type: string
+          description: Filter by artist name when searching for tracks or albums.
+        album_filter:
+          type: string
+          description: Filter by album name when searching for tracks.
+        enqueue:
+          type: string
+          description: How to handle the queue when adding new media.
+          enum:
+            - replace
+            - add
+            - next
+            - play
+        volume_level:
+          type: number
+          description: >-
+            Volume level from 0 to 100. Only used with "volume_set" action.
+      required:
+        - action
+  function:
+    type: script
+    sequence:
+      - service: script.music_control_ma
+        data:
+          action: "{{ action }}"
+          search_query: "{{ search_query }}"
+          media_type: "{{ media_type }}"
+          target_player: "{{ target_player }}"
+          radio_mode: "{{ radio_mode }}"
+          artist_filter: "{{ artist_filter }}"
+          album_filter: "{{ album_filter }}"
+          enqueue: "{{ enqueue }}"
+          volume_level: "{{ volume_level }}"
+
+- spec:
+    name: get_weather
+    description: Get current weather and warnings for home location
+    parameters:
+      type: object
+      properties: {}
+  function:
+    type: template
+    value_template: >
+      {% set w = states.weather.your_weather_entity %}
+      {% set warn = states.sensor.your_warning_sensor %}
+      Weather station: {{ w.attributes.station_name }}.
+      Current conditions: {{ w.state }}.
+      Temperature: {{ w.attributes.temperature }}°C.
+      Humidity: {{ w.attributes.humidity }}%.
+      Wind: {{ w.attributes.wind_speed }} km/h from {{ w.attributes.wind_bearing }}°.
+      Pressure: {{ w.attributes.pressure }} hPa.
+      Visibility: {{ w.attributes.visibility }} km.
+      UV Index: {{ w.attributes.uv_index }}.
+
+      --- Weather Warnings ---
+      Region: {{ warn.attributes.region_name }}.
+      Current warning level: {{ warn.state }}.
+      Active warnings: {{ warn.attributes.warning_count }}.
+      {% if warn.attributes.warning_count | int > 0 %}
+      {% for i in range(1, warn.attributes.warning_count | int + 1) %}
+      Warning {{ i }}: {{ warn.attributes['warning_' ~ i ~ '_headline'] }}
+      Description: {{ warn.attributes['warning_' ~ i ~ '_description'] }}
+      {% endfor %}
+      {% else %}
+      No active warnings.
+      {% endif %}
+
+- spec:
+    name: get_weather_worldwide
+    description: >-
+      Get current weather for any location worldwide. Use this when the user asks
+      about weather in a specific city or location other than home.
+    parameters:
+      type: object
+      properties:
+        location:
+          type: string
+          description: The city or location name (e.g., "Paris", "New York", "Tokyo")
+      required:
+        - location
+  function:
+    type: script
+    sequence:
+      - service: script.get_weather_worldwide
+        data:
+          location: "{{ location }}"
+        response_variable: weather_result
+      - variables:
+          _function_result: "{{ weather_result._function_result }}"
+
+- spec:
+    name: get_current_time
+    description: Get the current local date and time
+    parameters:
+      type: object
+      properties: {}
+  function:
+    type: template
+    value_template: >
+      Date: {{ now().strftime('%A, %d %B %Y') }}.
+      Time: {{ now().strftime('%H:%M:%S') }}.
+      Week: {{ now().isocalendar()[1] }}.
+      Day of year: {{ now().strftime('%j') }}.
+      Timezone: {{ now().tzinfo }}.

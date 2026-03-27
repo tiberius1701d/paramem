@@ -107,6 +107,12 @@ def _get_quantization_config(model_config: ModelConfig) -> Optional[BitsAndBytes
     if model_config.cpu_offload:
         extra_kwargs["llm_int8_enable_fp32_cpu_offload"] = True
 
+    if model_config.quantization == "int8":
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+            **extra_kwargs,
+        )
+
     if model_config.quantization == "nf4":
         return BitsAndBytesConfig(
             load_in_4bit=True,

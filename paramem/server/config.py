@@ -1,5 +1,8 @@
 """Server configuration — loads server.yaml into typed dataclasses."""
 
+import logging
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,6 +14,36 @@ from paramem.utils.config import (
     ModelConfig,
     TrainingConfig,
 )
+
+logger = logging.getLogger(__name__)
+
+# Pattern for ${VAR_NAME} env var references in YAML values
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+
+def _interpolate_env_vars(value):
+    """Recursively replace ${VAR_NAME} with os.environ values.
+
+    Warns if a secret-like field contains a literal value that looks like
+    an API key (long alphanumeric string) instead of an env var reference.
+    """
+    if isinstance(value, str):
+
+        def _replace(match):
+            var_name = match.group(1)
+            env_val = os.environ.get(var_name)
+            if env_val is None:
+                logger.warning("Env var %s not set, using empty string", var_name)
+                return ""
+            return env_val
+
+        return _ENV_VAR_PATTERN.sub(_replace, value)
+    if isinstance(value, dict):
+        return {k: _interpolate_env_vars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate_env_vars(item) for item in value]
+    return value
+
 
 # Duplicated from experiments/utils/test_harness.py to avoid modifying that file
 # while benchmarks are running. TODO: refactor into shared paramem.models.registry
@@ -59,6 +92,7 @@ VALIDATED_TRAINING_CONFIG = TrainingConfig(
 class ServerNetConfig:
     host: str = "0.0.0.0"
     port: int = 8420
+    reclaim_interval_minutes: int = 10  # auto-reclaim GPU check interval
 
 
 @dataclass
@@ -84,11 +118,53 @@ class PathsConfig:
 
 
 @dataclass
-class CloudConfig:
+class GeneralAgentConfig:
+    """Configuration for the cloud/general agent."""
+
     enabled: bool = False
-    endpoint: str = ""
+    provider: str = "openai"  # openai, anthropic, google, groq
     model: str = ""
     api_key: str = field(default="", repr=False)
+    endpoint: str = ""  # optional custom endpoint (for Groq, ollama, etc.)
+
+
+# Deprecated alias — use GeneralAgentConfig via config.general_agent
+CloudConfig = GeneralAgentConfig
+
+
+@dataclass
+class HAToolsConfig:
+    """Configuration for HA-proxied tool execution."""
+
+    url: str = ""
+    token: str = field(default="", repr=False)
+    auto_discover: bool = False
+    allowlist: list[str] = field(default_factory=list)
+    sensitive_override: bool = False
+
+
+@dataclass
+class ToolsConfig:
+    """Tool use configuration."""
+
+    ha: HAToolsConfig = field(default_factory=HAToolsConfig)
+    cloud_native: list[str] = field(default_factory=list)
+    max_tool_rounds: int = 5
+    tool_timeout_seconds: float = 3.0
+    total_timeout_seconds: float = 8.0
+    definitions: str = "tools.yaml"
+
+
+@dataclass
+class SanitizationConfig:
+    """PII sanitization for cloud-bound queries."""
+
+    mode: str = "block"  # off, warn, block
+
+    def __post_init__(self):
+        valid = {"off", "warn", "block"}
+        if self.mode not in valid:
+            raise ValueError(f"Invalid sanitization mode '{self.mode}'. Must be one of: {valid}")
 
 
 @dataclass
@@ -149,8 +225,16 @@ class ServerConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
-    cloud: CloudConfig = field(default_factory=CloudConfig)
+    general_agent: GeneralAgentConfig = field(default_factory=GeneralAgentConfig)
+    ha_agent_id: str = "conversation.groq"  # HA conversation agent for escalation
+    tools: ToolsConfig = field(default_factory=ToolsConfig)
+    sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
+
+    @property
+    def cloud(self) -> GeneralAgentConfig:
+        """Deprecated alias for general_agent. Use general_agent instead."""
+        return self.general_agent
 
     # Derived path accessors for backward compatibility
     @property
@@ -235,13 +319,20 @@ class ServerConfig:
 
 
 def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig:
-    """Load server configuration from YAML file."""
+    """Load server configuration from YAML file.
+
+    Supports ${VAR_NAME} env var interpolation in all string values.
+    Accepts both new 'agents:' key and deprecated 'cloud:' key.
+    """
     path = Path(path)
     if not path.exists():
         return ServerConfig()
 
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
+
+    # Interpolate env vars in all string values
+    raw = _interpolate_env_vars(raw)
 
     config = ServerConfig()
     config.server = ServerNetConfig(**raw.get("server", {}))
@@ -255,6 +346,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             data=Path(paths_raw.get("data", config.paths.data)),
             sessions=Path(paths_raw.get("sessions", config.paths.sessions)),
             debug=Path(paths_raw.get("debug", config.paths.debug)),
+            prompts=Path(paths_raw.get("prompts", config.paths.prompts)),
         )
 
     # Adapters
@@ -278,7 +370,51 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     if consolidation_raw:
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
 
-    config.cloud = CloudConfig(**raw.get("cloud", {}))
+    # General agent — new 'agents.general' key, with deprecated 'cloud' fallback
+    agents_raw = raw.get("agents", {})
+    general_raw = agents_raw.get("general", {})
+    cloud_raw = raw.get("cloud", {})
+
+    config.ha_agent_id = agents_raw.get("ha_agent_id", "conversation.groq")
+
+    if general_raw:
+        config.general_agent = GeneralAgentConfig(**general_raw)
+    elif cloud_raw:
+        # Deprecated: map old cloud config to new general_agent
+        if cloud_raw.get("enabled") or cloud_raw.get("endpoint"):
+            logger.info("Migrating deprecated 'cloud:' config to 'agents.general:'")
+        config.general_agent = GeneralAgentConfig(
+            enabled=cloud_raw.get("enabled", False),
+            provider="openai",  # old config was OpenAI-only
+            model=cloud_raw.get("model", ""),
+            api_key=cloud_raw.get("api_key", ""),
+            endpoint=cloud_raw.get("endpoint", ""),
+        )
+
+    # Tools
+    tools_raw = raw.get("tools", {})
+    if tools_raw:
+        ha_raw = tools_raw.get("ha", {})
+        ha_config = HAToolsConfig(
+            url=ha_raw.get("url", ""),
+            token=ha_raw.get("token", ""),
+            auto_discover=ha_raw.get("auto_discover", False),
+            allowlist=ha_raw.get("allowlist", []),
+            sensitive_override=ha_raw.get("sensitive_override", False),
+        )
+        config.tools = ToolsConfig(
+            ha=ha_config,
+            cloud_native=tools_raw.get("cloud_native", []),
+            max_tool_rounds=tools_raw.get("max_tool_rounds", 5),
+            tool_timeout_seconds=tools_raw.get("tool_timeout_seconds", 3.0),
+            total_timeout_seconds=tools_raw.get("total_timeout_seconds", 8.0),
+            definitions=tools_raw.get("definitions", "tools.yaml"),
+        )
+
+    # Sanitization
+    sanitization_raw = raw.get("sanitization", {})
+    if sanitization_raw:
+        config.sanitization = SanitizationConfig(**sanitization_raw)
 
     voice_raw = raw.get("voice", {})
     if voice_raw:

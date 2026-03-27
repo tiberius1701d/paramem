@@ -93,8 +93,13 @@ def train_adapter(
     eval_dataset=None,
     run_name: Optional[str] = None,
     callbacks_extra: Optional[list] = None,
+    active_adapters: Optional[list[str]] = None,
 ) -> dict:
     """Train a LoRA adapter on the given dataset.
+
+    If active_adapters is provided, all listed adapters are set active in the
+    forward pass (for chained/compositional training). Only adapter_name
+    receives gradients — caller must freeze others via set_requires_grad.
 
     Returns training metrics dict.
     """
@@ -103,7 +108,26 @@ def train_adapter(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model.set_adapter(adapter_name)
+    if active_adapters is not None:
+        # Activate all adapters in forward pass, frozen by default
+        model.base_model.set_adapter(active_adapters, inference_mode=True)
+        # Unfreeze only the adapter being trained
+        model.set_requires_grad(adapter_name, requires_grad=True)
+        # Verify gradients are live — silent failure here would invalidate results
+        trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+        if not trainable:
+            raise RuntimeError(
+                f"No trainable parameters after activating {active_adapters} "
+                f"and unfreezing '{adapter_name}'"
+            )
+        logger.info(
+            "Compose training: %d adapters active, %d trainable params in '%s'",
+            len(active_adapters),
+            sum(p.numel() for p in model.parameters() if p.requires_grad),
+            adapter_name,
+        )
+    else:
+        model.set_adapter(adapter_name)
 
     report_to = "none"
     if wandb_config and wandb_config.enabled:

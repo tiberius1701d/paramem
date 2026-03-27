@@ -4,7 +4,7 @@ import logging
 
 import httpx
 
-from paramem.server.config import CloudConfig
+from paramem.server.config import GeneralAgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -16,19 +16,23 @@ def detect_escalation(response: str) -> tuple[bool, str]:
 
     Returns (should_escalate, forwarded_query).
     The forwarded query is the text after the [ESCALATE] tag.
+    The tag may appear mid-response (e.g. "I don't know [ESCALATE] ...").
     """
-    stripped = response.strip()
-    if stripped.startswith(ESCALATE_TAG):
-        query = stripped[len(ESCALATE_TAG) :].strip()
+    idx = response.find(ESCALATE_TAG)
+    if idx >= 0:
+        query = response[idx + len(ESCALATE_TAG) :].strip().lstrip(":").strip()
         return True, query
     return False, ""
 
 
-def escalate_to_cloud(query: str, cloud_config: CloudConfig) -> str:
+def escalate_to_cloud(query: str, cloud_config: GeneralAgentConfig) -> str:
     """Forward a query to the cloud SOTA model.
 
     Only the query is sent — no conversation history, no personal context.
     The cloud response is returned verbatim.
+
+    This is the legacy OpenAI-compatible escalation path. Will be replaced
+    by the provider adapter pattern in F5.2a (cloud/base.py).
     """
     if not cloud_config.enabled or not cloud_config.endpoint:
         logger.warning("Cloud escalation requested but cloud is not configured")

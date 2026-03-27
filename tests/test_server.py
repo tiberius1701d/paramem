@@ -16,7 +16,10 @@ class TestConfig:
         assert config.model_name == "mistral"
         assert config.server.port == 8420
         assert config.adapter_dir == Path("data/ha/adapters")
-        assert config.cloud.enabled is False
+        assert config.general_agent.enabled is True
+        assert config.general_agent.provider == "groq"
+        # Deprecated alias still works
+        assert config.cloud.enabled is True
 
     def test_model_config_resolution(self):
         config = ServerConfig(model_name="mistral")
@@ -60,6 +63,68 @@ class TestConfig:
         assert config.model_name == "mistral"
         assert config.server.port == 8420
 
+    def test_env_var_interpolation(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEST_API_KEY", "sk-secret-123")
+        config_file = tmp_path / "server.yaml"
+        config_file.write_text(
+            "agents:\n"
+            "  general:\n"
+            "    enabled: true\n"
+            "    provider: groq\n"
+            "    model: llama-4-scout\n"
+            "    api_key: ${TEST_API_KEY}\n"
+        )
+        config = load_server_config(config_file)
+        assert config.general_agent.api_key == "sk-secret-123"
+        assert config.general_agent.provider == "groq"
+
+    def test_env_var_missing_uses_empty(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
+        config_file = tmp_path / "server.yaml"
+        config_file.write_text(
+            "agents:\n  general:\n    enabled: true\n    api_key: ${NONEXISTENT_VAR}\n"
+        )
+        config = load_server_config(config_file)
+        assert config.general_agent.api_key == ""
+
+    def test_deprecated_cloud_key_migration(self, tmp_path):
+        config_file = tmp_path / "server.yaml"
+        config_file.write_text(
+            "cloud:\n"
+            "  enabled: true\n"
+            "  endpoint: https://api.openai.com/v1/chat/completions\n"
+            "  model: gpt-4o\n"
+            "  api_key: sk-test\n"
+        )
+        config = load_server_config(config_file)
+        assert config.general_agent.enabled is True
+        assert config.general_agent.provider == "openai"
+        assert config.general_agent.model == "gpt-4o"
+        assert config.general_agent.api_key == "sk-test"
+        # Deprecated alias still works
+        assert config.cloud.enabled is True
+
+    def test_new_agents_key_takes_precedence(self, tmp_path):
+        config_file = tmp_path / "server.yaml"
+        config_file.write_text(
+            "agents:\n"
+            "  general:\n"
+            "    enabled: true\n"
+            "    provider: anthropic\n"
+            "    model: claude-sonnet\n"
+            "cloud:\n"
+            "  enabled: false\n"
+            "  model: gpt-4o\n"
+        )
+        config = load_server_config(config_file)
+        # New agents key wins over deprecated cloud key
+        assert config.general_agent.provider == "anthropic"
+        assert config.general_agent.model == "claude-sonnet"
+
+    def test_prompts_path_loaded(self):
+        config = load_server_config("configs/server.yaml")
+        assert config.paths.prompts == Path("configs/prompts")
+
 
 class TestEscalation:
     def test_no_escalation(self):
@@ -77,9 +142,11 @@ class TestEscalation:
         assert should is True
         assert query == "What is quantum computing?"
 
-    def test_escalation_mid_sentence_not_detected(self):
-        should, query = detect_escalation("The team decided to [ESCALATE] the issue to management.")
-        assert should is False
+    def test_escalation_mid_sentence_detected(self):
+        text = "I don't know the answer. [ESCALATE] What is the weather?"
+        should, query = detect_escalation(text)
+        assert should is True
+        assert query == "What is the weather?"
 
     def test_empty_response(self):
         should, query = detect_escalation("")

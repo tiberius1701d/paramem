@@ -244,8 +244,8 @@ class QueryRouter:
     def _get_connected_entities(self, entity: str) -> list[str]:
         """Find entities one hop away from the given entity via shared keys.
 
-        If entity "tobias" has keys where "pauline" is the other endpoint,
-        "pauline" is returned. This enables probing facts about connected
+        If entity "alex" has keys where "sam" is the other endpoint,
+        "sam" is returned. This enables probing facts about connected
         people (spouse, children, pets) when the speaker is the query subject.
         """
         connected = set()
