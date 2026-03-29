@@ -1104,7 +1104,7 @@ Other approaches from literature:
 ## Test 8: Large-Scale Incremental (500-Key Target)
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** IN PROGRESS — 37 cycles complete, 334/500 keys, 100% recall. Paused (2026-03-27).
+**Status:** IN PROGRESS — 40 cycles complete, 373/500 keys, 100% recall. Paused (2026-03-29).
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -1127,7 +1127,7 @@ indexed key training with full replay.
 - **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
 - **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
 
-### Results (2026-03-25, cycles 1-23 complete)
+### Results (2026-03-29, cycles 1-40 complete)
 
 | Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
 |-------|------|--------|------|------------------|------------|-------|
@@ -1163,13 +1163,17 @@ indexed key training with full replay.
 | 34 | 295 | 295/295 (100%) | 0.0001 | 21 | ~200 min | New character (Cai Xiuying) |
 | 35 | 324 | 324/324 (100%) | 0.0000 | 29 | ~223 min | |
 | 36 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 37 | 334 | 334/334 (100%) | — | 10 | ~231 min | Paused at 334 keys |
+| 37 | 334 | 334/334 (100%) | — | 10 | ~231 min | |
+| 38 | — | — | — | 0.0 | — | Skipped (no new triples) |
+| 39 | 347 | 347/347 (100%) | 0.154 | 13 | 306 min | New character (Ye Jie) |
+| 40 | 373 | 373/373 (100%) | 0.154 | 26 | 332 min | Best yield since cycle 35. Paused at 373 keys |
 
-**100% recall at every scale point from 21 to 334 keys.** No degradation. Seven
-characters processed (Deng Yu, Liang Xin, Xia Yu, Zhao Li, shili, Bao Jun
-completed; Cai Xiuying in progress, nearing exhaustion). Adapter size: 27 MB
-(fixed, independent of key count). Graph: 357 nodes, 334 edges.
-11 characters remaining, ~166 keys to target.
+**100% recall at every scale point from 21 to 373 keys.** No degradation. Eight
+characters processed (Deng Yu, Liang Xin, Xia Yu, Zhao Li, shili, Bao Jun,
+Cai Xiuying completed; Ye Jie in progress at session 12/25). Adapter size: 27 MB
+(fixed, independent of key count). Graph: 401 nodes, 373 edges.
+~127 keys to target. Epoch convergence pattern stable at 373 keys: 48% at epoch 15,
+95% at epoch 20, 100% at epoch 25.
 
 ### Extraction pipeline improvement (cycles 22-23)
 
@@ -1187,15 +1191,15 @@ The yield increase accelerates progress toward 500 keys. At the new rate (~20-30
 
 ### Key observations
 
-1. **Loss is flat at ~0.16** across all scales (21-274 keys), then drops sharply to near-zero at 295-324 keys. No upward trend — the adapter has capacity headroom.
+1. **Loss is flat at ~0.15-0.16** across all scales (21-373 keys). Brief near-zero dip at 295-324 keys normalized back to 0.154 at 347-373 keys. No upward trend — the adapter has capacity headroom.
 
-2. **Epoch convergence is stable.** Per-epoch probes (every 5 epochs) show recall reaching 95%+ by epoch 20 and 100% by epoch 25 at all tested scales, including 324 keys. 30 epochs provides adequate margin. The pattern is consistent: epoch 5 (~0%), epoch 10 (~5%), epoch 15 (~30%), epoch 20 (~95%), epoch 25 (100%).
+2. **Epoch convergence is stable.** Per-epoch probes (every 5 epochs) show recall reaching 95%+ by epoch 20 and 100% by epoch 25 at all tested scales, including 373 keys. 30 epochs provides adequate margin. The pattern at 373 keys: epoch 5 (1%), epoch 10 (7%), epoch 15 (48%), epoch 20 (95%), epoch 25 (100%). Mid-training recall (epoch 15) has increased from ~30% at 100 keys to ~48% at 373 keys — the model learns faster per-epoch as the adapter becomes more structured.
 
 3. **QA yield varies 0-6.8 per session.** Conversations are not uniformly information-dense. Yield is highest at character transitions (fresh entity graph) and lowest when a character's sessions are nearly exhausted (dedup filters most triples). The extraction pipeline fix (cycle 22+) significantly improved yield.
 
-4. **Cycle time scales linearly** — ~0.69 min/key at current scales. At 324 keys, cycle time is ~223 min (~3.7 hours). Projected: ~5.8 hours/cycle at 500 keys.
+4. **Cycle time scales linearly** — ~0.89 min/key at current scales. At 373 keys, cycle time is ~332 min (~5.5 hours). Projected: ~7.4 hours/cycle at 500 keys. Training dominates (~91% of cycle time at 373 keys).
 
-5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36)** skip training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Cai Xiuying is nearing exhaustion — 3 of the last 4 cycles were skipped.
+5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36, 38)** skip training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Cai Xiuying exhausted at cycle 37; Ye Jie started cycle 39 with strong yield (13+26 keys in 2 cycles).
 
 ### Cohort tracking
 
@@ -1311,17 +1315,17 @@ At 324 keys, 175 sessions processed, with new extraction pipeline:
 ## Test 9: Natural Recall Emergence
 
 **Script:** `experiments/test9_natural_recall.py`
-**Status:** COMPLETE — Mistral 7B, 2026-03-27 (4h 16m)
+**Status:** COMPLETE — Mistral 7B, 2026-03-27 + resumed 2026-03-29 (31 cycles, 5h 25m total)
 
 ### Objective
 
 Track how natural recall (without keyed retrieval prompts) emerges as
 adapter knowledge density grows. Uses Test 8's cycle checkpoints to
-measure recall across scale from 21 to 324 keys.
+measure recall across scale from 21 to 373 keys.
 
 ### Design
 
-Three probe passes per Test 8 cycle checkpoint (28 cycles, 21–324 keys):
+Three probe passes per Test 8 cycle checkpoint (31 cycles, 21–373 keys):
 
 | Pass | Probe style | Difficulty |
 |------|------------|------------|
@@ -1340,7 +1344,7 @@ One model load, adapter swapped per cycle. Incremental per-cycle results saved.
 `--resume` skips completed cycles and merges results. Re-runnable after
 Test 8 advances — picks up new cycle checkpoints automatically.
 
-### Results — Mistral 7B (28 cycles, 324 keys, 64 entities)
+### Results — Mistral 7B (31 cycles, 373 keys, 73 entities)
 
 | Cycle | Keys | Entities | Keyed | Direct | Overlap | Open Facts | Entity Hit | Time |
 |------:|-----:|---------:|------:|-------:|--------:|-----------:|-----------:|-----:|
@@ -1372,21 +1376,24 @@ Test 8 advances — picks up new cycle checkpoints automatically.
 | 31 | 274 | 56 | 100% | 100% | 0.993 | 33.9% | 53.6% | 16.4m |
 | 34 | 295 | 61 | 100% | 99.7% | 0.996 | 31.5% | 49.2% | 17.6m |
 | 35 | 324 | 64 | 100% | 100% | 0.997 | 33.6% | 51.6% | 19.8m |
+| 37 | 334 | 65 | 100% | 100% | 0.997 | 33.2% | 49.2% | 24.4m |
+| 39 | 347 | 67 | 100% | 99.7% | 0.992 | 35.7% | 50.7% | 21.7m |
+| 40 | 373 | 73 | 100% | 99.7% | 0.995 | 37.3% | 52.0% | 23.2m |
 
 ### Summary
 
-| Metric | Final (324 keys) | Range across cycles |
+| Metric | Final (373 keys) | Range across cycles |
 |--------|------------------|---------------------|
 | Keyed retrieval | **100%** | 100% every cycle |
-| Direct questions | **100%** | 95.2% – 100% |
-| Direct overlap | **0.997** | 0.954 – 0.998 |
-| Open-ended facts | **33.6%** | 13.6% – 37.3% |
-| Open-ended entity hit | **51.6%** | 35.7% – 71.4% |
+| Direct questions | **99.7%** | 95.2% – 100% |
+| Direct overlap | **0.995** | 0.954 – 0.998 |
+| Open-ended facts | **37.3%** | 13.6% – 37.3% |
+| Open-ended entity hit | **52.0%** | 35.7% – 71.4% |
 
 ### Analysis
 
-**Keyed retrieval is perfect at all scales.** 100% across 28 cycles from
-21 to 324 keys. The indexed key mechanism shows no degradation with scale.
+**Keyed retrieval is perfect at all scales.** 100% across 31 cycles from
+21 to 373 keys. The indexed key mechanism shows no degradation with scale.
 
 **Direct questions (natural language, no key cue) achieve 99–100%.** The
 model reliably retrieves parametrically stored facts when asked the training
@@ -1396,9 +1403,18 @@ prompt — natural language works.
 
 **Open-ended recall plateaus around 1/3 of facts.** The "What do you know
 about X?" probe style does not show an upward trend with scale. Fact recall
-fluctuates between 25–37% from 21 keys to 324 keys. Entity hit rate is
+fluctuates between 25–37% from 21 keys to 373 keys. Entity hit rate is
 similarly flat around 50% (half the entities produce at least one correct
-fact). Cycle 13 is an outlier at 13.6% — likely generation variance.
+fact).
+
+**Cycle 13 outlier (13.6%) is a scoring artifact, not a recall regression.**
+Compared to adjacent cycles (12: 30.5%, 14: 32.1%), cycle 13's adapter
+produces terser refusal responses ("I don't have specific knowledge about X")
+instead of verbose ones that leak training-format language ("Information
+about X is not available in this knowledge graph triple..."). The verbose
+format incidentally overlaps more content words with expected answers,
+inflating the overlap score. Keyed (100%) and direct (99.2%) recall are
+identical across cycles 12 and 13, confirming the knowledge is intact.
 
 **Interpretation:** The adapter encodes facts with high fidelity (100% keyed,
 99%+ direct), but maximally vague open-ended questions do not reliably trigger
@@ -1411,8 +1427,8 @@ candidate for live testing via the HA pipeline over time.
 
 ### Runtime
 
-- 28 cycles, 4h 16m total on RTX 5070 (8GB, QLoRA 4-bit)
-- Per-cycle time scales linearly: ~1.7m at 21 keys → ~19.8m at 324 keys
+- 31 cycles, ~5h 25m total on RTX 5070 (8GB, QLoRA 4-bit)
+- Per-cycle time scales linearly: ~1.7m at 21 keys → ~24.4m at 334 keys
 - Dominated by keyed retrieval pass at larger scales
 
 ---
@@ -1433,6 +1449,61 @@ WebSocket `conversation.process`. RTX 5070 on WSL2, HA on NAS (LAN).
 Architecture: ParaMem → HA WebSocket (conversation.process) → Groq API +
 tool execution (inside HA) → response. Single hop — no round-trips between
 ParaMem and HA for tool execution.
+
+---
+
+## Dual-Escalation Routing (2026-03-29)
+
+Tri-path routing via dual-graph matching. Zero LLM inference cost for the
+routing decision — pure substring + fuzzy matching against two entity graphs.
+
+### Architecture
+
+| Match source | Path | Service |
+|---|---|---|
+| PA knowledge graph | Local adapter probe + reasoning | Mistral 7B (local) |
+| HA entity graph | HA conversation agent | Groq + Llama 3.3 70B (via HA) |
+| Neither graph | SOTA cloud agent | Claude Sonnet (Anthropic API) |
+| Both graphs | PA first; [ESCALATE] → HA | Local → HA fallback |
+
+**HA entity graph:** Built from HA REST API at startup. 238 entities, 165 action
+verbs across 52 domains. Indexes friendly names and service verbs (turn_on →
+"turn on"). Refreshed after consolidation and via `POST /refresh-ha`.
+
+**Imperative detection:** HA entity match + action verb + non-interrogative →
+routes directly to HA, skipping local inference.
+
+**Area routing:** Handled by HA internally (voice satellite context). ParaMem
+does not replicate room resolution.
+
+### Fallback Chain
+
+Local mode: local adapter → HA/Groq → SOTA → local base model.
+Cloud-only mode: HA/Groq → SOTA → static error.
+Every path terminates gracefully. No dead ends.
+
+### SOTA Persona Continuity
+
+Sanitized conversation history (PII-blocked turns dropped) + speaker name
+passed to the SOTA model. System prompt instructs the model to derive persona,
+tone, and style from the conversation context. No personal facts leak to cloud.
+
+### Provider Support
+
+Core (httpx): OpenAI, Groq, Mistral, Ollama.
+Optional: Anthropic (`pip install paramem[anthropic]`), Google Gemini
+(`pip install paramem[google]`).
+
+### Integration Test Results (cloud-only mode, VPN to NAS)
+
+| Test | Path | Latency | Result |
+|---|---|---|---|
+| Time query | HA | 795ms | Real time from HA |
+| Weather query | HA | 1158ms | Real weather + warnings |
+| Deductive vs inductive | SOTA | 2526ms | Claude reasoning |
+| Math (120km/2h) | SOTA | 2478ms | Correct (60km/h) |
+| Turn on lights | HA fallback | 589ms | HA entity resolution |
+| HA graph refresh | /refresh-ha | — | 238 entities, 165 verbs |
 
 ---
 

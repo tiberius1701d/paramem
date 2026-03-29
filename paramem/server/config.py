@@ -226,6 +226,7 @@ class ServerConfig:
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
     general_agent: GeneralAgentConfig = field(default_factory=GeneralAgentConfig)
+    sota_agent: GeneralAgentConfig = field(default_factory=GeneralAgentConfig)
     ha_agent_id: str = "conversation.groq"  # HA conversation agent for escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
@@ -390,6 +391,11 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             api_key=cloud_raw.get("api_key", ""),
             endpoint=cloud_raw.get("endpoint", ""),
         )
+
+    # SOTA agent — high-capability model for reasoning queries
+    sota_raw = agents_raw.get("sota", {})
+    if sota_raw:
+        config.sota_agent = GeneralAgentConfig(**sota_raw)
 
     # Tools
     tools_raw = raw.get("tools", {})

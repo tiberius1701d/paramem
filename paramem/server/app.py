@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ from paramem.models.loader import load_adapter, load_base_model, unload_model
 from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import load_server_config
 from paramem.server.consolidation import run_consolidation
+from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.inference import ChatResult, handle_chat
 from paramem.server.router import QueryRouter
 from paramem.server.session_buffer import SessionBuffer
@@ -38,6 +40,16 @@ from paramem.server.tools.registry import ToolRegistry
 from paramem.utils.notify import SERVER_CLOUD_ONLY, SERVER_RECLAIMED, notify_server
 
 logger = logging.getLogger(__name__)
+
+# Resolve nvidia-smi at import time. On WSL2 it lives in /usr/lib/wsl/lib
+# which systemd may not have on PATH; on native Linux it's typically in
+# /usr/bin.  Falls back to bare name (will fail with FileNotFoundError,
+# caught by the caller).
+_NVIDIA_SMI = (
+    shutil.which("nvidia-smi")
+    or shutil.which("nvidia-smi", path="/usr/lib/wsl/lib:/usr/bin:/usr/local/bin")
+    or "nvidia-smi"
+)
 
 # Global state — single model, single adapter, single server
 _state = {
@@ -141,9 +153,6 @@ async def lifespan(app: FastAPI):
         config.session_dir,
         retain_sessions=config.consolidation.retain_sessions,
     )
-    _state["router"] = QueryRouter(
-        adapter_dir=config.adapter_dir,
-    )
 
     # Initialize cloud agent if configured
     _state["cloud_agent"] = get_cloud_agent(config.general_agent)
@@ -156,7 +165,19 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Cloud agent: not configured (local-only mode)")
 
-    # Initialize HA client and tool registry if configured
+    # Initialize SOTA agent if configured
+    _state["sota_agent"] = get_cloud_agent(config.sota_agent)
+    if _state["sota_agent"]:
+        logger.info(
+            "SOTA agent: %s (%s)",
+            config.sota_agent.provider,
+            config.sota_agent.model,
+        )
+    else:
+        logger.info("SOTA agent: not configured")
+
+    # Initialize HA client, tool registry, and HA entity graph
+    ha_graph = None
     tools_config = config.tools
     if tools_config.ha.url and tools_config.ha.token:
         ha_client = HAClient(
@@ -169,6 +190,10 @@ async def lifespan(app: FastAPI):
             logger.info("HA client: connected to %s", tools_config.ha.url)
             entity_count = ha_client.load_entity_map()
             logger.info("HA entity map: %d entities", entity_count)
+
+            # Build HA entity graph for dual-graph routing
+            ha_services = ha_client.get_services()
+            ha_graph = HAEntityGraph.build(ha_client._raw_states, ha_services)
         else:
             logger.warning("HA client: configured but unreachable at %s", tools_config.ha.url)
         _state["ha_client"] = ha_client
@@ -176,7 +201,7 @@ async def lifespan(app: FastAPI):
         # Load tool definitions
         registry = ToolRegistry()
         if tools_config.ha.auto_discover:
-            ha_services = ha_client.get_services()
+            ha_services = ha_client.get_services() if not ha_graph else ha_services
             if ha_services:
                 registry.load_from_ha(
                     ha_services,
@@ -188,6 +213,12 @@ async def lifespan(app: FastAPI):
         logger.info("Tool registry: %d tools loaded", len(registry.tools))
     else:
         logger.info("HA tools: not configured")
+
+    _state["ha_graph"] = ha_graph
+    _state["router"] = QueryRouter(
+        adapter_dir=config.adapter_dir,
+        ha_graph=ha_graph,
+    )
 
     # Start consolidation scheduler if configured
     if config.consolidation.schedule:
@@ -260,22 +291,20 @@ async def chat(request: ChatRequest):
                 speaker=speaker,
             )
 
-    # Cloud-only mode — forward to HA conversation agent
+    # Cloud-only mode — route via HA graph + SOTA, no local model
     if _state["mode"] == "cloud-only":
-        ha_client = _state.get("ha_client")
-        if ha_client is None:
-            return ChatResponse(
-                text="I'm running in limited mode right now. Please try again later.",
-                speaker=speaker,
-            )
-        response_text = ha_client.conversation_process(
-            request.text, agent_id=_state["config"].ha_agent_id
+        result = _cloud_only_route(
+            text=request.text,
+            speaker=speaker,
+            history=request.history,
+            config=_state["config"],
+            router=_state.get("router"),
+            ha_client=_state.get("ha_client"),
+            sota_agent=_state.get("sota_agent"),
         )
-        if response_text is None:
-            response_text = "I couldn't get an answer right now. Please try again."
         buffer.append(request.conversation_id, "user", request.text)
-        buffer.append(request.conversation_id, "assistant", response_text)
-        return ChatResponse(text=response_text, escalated=True, speaker=speaker)
+        buffer.append(request.conversation_id, "assistant", result.text)
+        return ChatResponse(text=result.text, escalated=True, speaker=speaker)
 
     # Local mode — normal inference with entity routing
     async with _mode_lock:
@@ -292,6 +321,7 @@ async def chat(request: ChatRequest):
                 config=_state["config"],
                 router=_state["router"],
                 cloud_agent=_state.get("cloud_agent"),
+                sota_agent=_state.get("sota_agent"),
                 ha_client=_state.get("ha_client"),
                 tool_registry=_state.get("tool_registry"),
             ),
@@ -353,6 +383,40 @@ async def status():
     )
 
 
+@app.post("/refresh-ha")
+async def refresh_ha():
+    """Rebuild the HA entity graph from the HA API.
+
+    Call after adding/removing devices, renaming entities, or
+    reorganizing areas in Home Assistant.
+    """
+    ha_client = _state.get("ha_client")
+    if ha_client is None:
+        return {"status": "not_configured"}
+
+    ha_client.load_entity_map()
+    ha_services = ha_client.get_services()
+    ha_graph = _state.get("ha_graph")
+    if ha_graph is not None:
+        ha_graph.refresh(ha_client._raw_states, ha_services)
+    else:
+        ha_graph = HAEntityGraph.build(ha_client._raw_states, ha_services)
+        _state["ha_graph"] = ha_graph
+        # Rebuild router with new graph
+        config = _state["config"]
+        _state["router"] = QueryRouter(
+            adapter_dir=config.adapter_dir,
+            ha_graph=ha_graph,
+        )
+
+    return {
+        "status": "refreshed",
+        "entities": ha_graph.entity_count,
+        "areas": ha_graph.area_count,
+        "verbs": ha_graph.verb_count,
+    }
+
+
 @app.post("/consolidate", response_model=ConsolidateResponse)
 async def consolidate():
     """Trigger consolidation manually."""
@@ -367,6 +431,48 @@ async def consolidate():
     future.add_done_callback(_consolidation_done_callback)
 
     return ConsolidateResponse(status="started")
+
+
+def _cloud_only_route(
+    text: str,
+    speaker: str | None,
+    history: list[dict] | None,
+    config,
+    router=None,
+    ha_client=None,
+    sota_agent=None,
+) -> ChatResult:
+    """Route queries when the local model is unavailable (cloud-only mode).
+
+    HA first (has tools for weather, time, devices), SOTA as fallback
+    for reasoning. Mutual fallback: if one fails, try the other.
+    """
+    from paramem.server.inference import _escalate_to_sota
+    from paramem.server.sanitizer import sanitize_for_cloud
+
+    # Cloud-only: no local model for PA probing.
+    # HA first (has tools for weather, time, devices), SOTA as fallback.
+
+    # Try HA conversation agent — it has tools and real-time data
+    if ha_client is not None:
+        response_text = ha_client.conversation_process(text, agent_id=config.ha_agent_id)
+        if response_text is not None:
+            return ChatResult(text=response_text, escalated=True)
+
+    # HA failed or unavailable → try SOTA for reasoning
+    if sota_agent is not None:
+        sanitized, _ = sanitize_for_cloud(text, mode=config.sanitization.mode)
+        if sanitized is not None:
+            result = _escalate_to_sota(
+                sanitized, sota_agent, config, speaker=speaker, history=history
+            )
+            if result.text:
+                return result
+
+    return ChatResult(
+        text="I'm running in limited mode right now. Please try again later.",
+        escalated=True,
+    )
 
 
 # --- Internal ---
@@ -395,6 +501,13 @@ def _run_consolidation_sync():
         _state["model"] = loop.model
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
     _state["router"].reload()
+    # Refresh HA entity graph if available
+    ha_graph = _state.get("ha_graph")
+    ha_client = _state.get("ha_client")
+    if ha_graph is not None and ha_client is not None:
+        ha_client.load_entity_map()
+        ha_services = ha_client.get_services()
+        ha_graph.refresh(ha_client._raw_states, ha_services)
     logger.info("Consolidation result: %s", result)
 
 
@@ -542,7 +655,7 @@ def _gpu_has_compute_processes() -> bool:
     """Check if any non-server process is using the GPU."""
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            [_NVIDIA_SMI, "--query-compute-apps=pid", "--format=csv,noheader"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -554,7 +667,11 @@ def _gpu_has_compute_processes() -> bool:
         return len(external_pids) > 0
     except (subprocess.TimeoutExpired, FileNotFoundError, ValueError) as e:
         # Fail safe: if we can't check, assume GPU is occupied
-        logger.warning("nvidia-smi unavailable (%s) — assuming GPU occupied", type(e).__name__)
+        logger.warning(
+            "nvidia-smi unavailable at %s (%s) — assuming GPU occupied",
+            _NVIDIA_SMI,
+            type(e).__name__,
+        )
         return True
 
 

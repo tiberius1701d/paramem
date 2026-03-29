@@ -200,11 +200,15 @@ class TestRegistry:
         )
         assert get_cloud_agent(config) is None
 
-    def test_anthropic_not_yet_implemented(self):
+    def test_anthropic_agent_created(self):
         config = GeneralAgentConfig(
             enabled=True, provider="anthropic", model="claude-sonnet", api_key="key"
         )
-        assert get_cloud_agent(config) is None
+        agent = get_cloud_agent(config)
+        assert agent is not None
+        from paramem.server.cloud.anthropic_adapter import AnthropicAgent
+
+        assert isinstance(agent, AnthropicAgent)
 
 
 class TestPrivacyRouting:
@@ -243,8 +247,9 @@ class TestPrivacyRouting:
                     ],
                     strategy="entity",
                     matched_entities=matched,
+                    match_source="pa",
                 )
-            return RoutingPlan(strategy="direct")
+            return RoutingPlan(strategy="direct", match_source="none")
 
         router.route = route
         return router

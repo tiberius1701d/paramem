@@ -39,6 +39,8 @@ class HAClient:
         )
         # friendly_name_lower → entity_id
         self._entity_map: dict[str, str] = {}
+        # Raw states list from last load_entity_map() call
+        self._raw_states: list[dict] = []
         # WebSocket URL derived from REST URL
         ws_scheme = "wss" if self._base_url.startswith("https") else "ws"
         rest_base = self._base_url.split("://", 1)[1]
@@ -121,6 +123,7 @@ class HAClient:
             logger.error("Failed to load HA entity states: %s", e)
             return 0
 
+        self._raw_states = states
         self._entity_map.clear()
         for state in states:
             entity_id = state.get("entity_id", "")

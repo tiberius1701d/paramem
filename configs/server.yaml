@@ -47,6 +47,12 @@ agents:
     model: llama-3.3-70b-versatile
     api_key: ${GROQ_API_KEY}   # env var only — never inline secrets
     endpoint: ""               # groq default endpoint used when empty
+  sota:
+    enabled: true
+    provider: anthropic
+    model: claude-sonnet-4-6
+    api_key: ${ANTHROPIC_API_KEY}
+    endpoint: ""
   ha_agent_id: conversation.groq  # HA conversation agent entity for escalation
 
 # Deprecated — use agents.general instead:
@@ -70,7 +76,7 @@ tools:
       - media_player.*
   definitions: configs/tools.yaml   # copy from tools.yaml.example and customize
   max_tool_rounds: 5
-  tool_timeout_seconds: 3.0
+  tool_timeout_seconds: 10.0
   total_timeout_seconds: 8.0
 
 sanitization:

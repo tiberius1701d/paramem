@@ -41,10 +41,20 @@ class OpenAICompatAgent(CloudAgent):
         system_prompt: str = "",
         tool_results: list[dict] | None = None,
         tools: list[dict] | None = None,
+        history: list[dict] | None = None,
     ) -> CloudResponse:
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+
+        # Include conversation history before the current query
+        if history:
+            for turn in history:
+                role = turn.get("role", "user")
+                text = turn.get("text", "")
+                if role in ("user", "assistant") and text:
+                    messages.append({"role": role, "content": text})
+
         messages.append({"role": "user", "content": query})
 
         # Insert tool results: user → assistant(tool_calls) → tool → ...

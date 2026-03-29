@@ -4,21 +4,30 @@ Routes queries to the right adapter(s) and identifies which indexed keys
 to probe, using the knowledge graph's entity-to-key mappings. This avoids
 probing all keys for every query at scale.
 
-Three routing strategies:
-  - direct: no entities found, answer from adapter weights (no probing)
-  - targeted_probe: entities found, probe specific keys per adapter
-  - temporal: time reference detected, probe keys by date range
+Dual-graph routing: queries are matched against both the PA knowledge graph
+(personal entities) and the HA entity graph (devices, areas, action verbs).
+The match_source field in RoutingPlan tells inference.py which path to take:
+  - "pa": personal knowledge → local adapter probe
+  - "ha": device/action → HA conversation agent
+  - "both": PA + HA overlap → PA first, HA on [ESCALATE]
+  - "none": no match → SOTA cloud agent
 
 The router is stateless per query — all state lives in the indexes built
-from keyed_pairs.json and the knowledge graph at startup/reload.
+from keyed_pairs.json, the knowledge graph, and the HA entity graph.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rapidfuzz import fuzz
+
+if TYPE_CHECKING:
+    from paramem.server.ha_graph import HAEntityGraph, HAMatchResult
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +52,39 @@ class RoutingPlan:
     steps: list[RoutingStep] = field(default_factory=list)
     strategy: str = "direct"
     matched_entities: list[str] = field(default_factory=list)
+    # Dual-graph routing: which graph(s) produced the match
+    match_source: str = "none"  # "pa", "ha", "both", "none"
+    # Action verb + HA entity detected (strong HA signal)
+    imperative: bool = False
+    # HA domains of matched entities/verbs
+    ha_domains: list[str] = field(default_factory=list)
+
+
+_INTERROGATIVE_PREFIXES = frozenset(
+    {
+        "what",
+        "how",
+        "why",
+        "when",
+        "where",
+        "who",
+        "is",
+        "are",
+        "does",
+        "do",
+        "can",
+        "could",
+        "would",
+        "will",
+        "which",
+    }
+)
+
+
+def _is_interrogative(text: str) -> bool:
+    """Check if the query is a question (not an imperative command)."""
+    first_word = text.strip().split()[0].lower().rstrip("'s") if text.strip() else ""
+    return first_word in _INTERROGATIVE_PREFIXES
 
 
 class QueryRouter:
@@ -50,15 +92,18 @@ class QueryRouter:
 
     Built from persisted keyed_pairs.json files (one per adapter) and
     the cumulative knowledge graph. Rebuilt after each consolidation.
+    Optionally includes an HA entity graph for dual-graph routing.
     """
 
     def __init__(
         self,
         adapter_dir: Path,
         graph_path: Path | None = None,
+        ha_graph: HAEntityGraph | None = None,
     ):
         self.adapter_dir = Path(adapter_dir)
         self.graph_path = Path(graph_path) if graph_path else None
+        self._ha_graph = ha_graph
 
         # adapter_name -> {entity_lower -> set[key]}
         self._entity_key_index: dict[str, dict[str, set[str]]] = {}
@@ -149,67 +194,101 @@ class QueryRouter:
         entity so that self-referential queries ("What is my name?")
         resolve to the speaker's keys.
 
+        Dual-graph routing: checks both PA knowledge graph and HA entity
+        graph. Sets match_source to indicate which graph(s) matched.
+
         Returns a RoutingPlan describing what to activate and probe.
         """
-        if not self._entity_key_index:
-            return RoutingPlan(strategy="direct")
+        # --- PA graph matching ---
+        pa_entities = []
+        if self._entity_key_index:
+            pa_entities = self._extract_entities(text)
 
-        entities = self._extract_entities(text)
+            # Inject speaker as implicit entity
+            if speaker:
+                speaker_lower = speaker.lower().strip()
+                if speaker_lower not in pa_entities and speaker_lower in self._all_entities:
+                    pa_entities.append(speaker_lower)
 
-        # Inject speaker as implicit entity
-        if speaker:
-            speaker_lower = speaker.lower().strip()
-            if speaker_lower not in entities and speaker_lower in self._all_entities:
-                entities.append(speaker_lower)
+            # One-hop expansion
+            if speaker:
+                connected = self._get_connected_entities(speaker.lower().strip())
+                for entity in connected:
+                    if entity not in pa_entities:
+                        pa_entities.append(entity)
 
-        if not entities:
-            return RoutingPlan(strategy="direct")
+            pa_entities.sort()
 
-        # One-hop expansion: entities connected to the speaker via keyed_pairs
-        # (e.g. speaker "Alex" has key Alex→Jordan, so also probe Jordan's keys)
-        if speaker:
-            connected = self._get_connected_entities(speaker.lower().strip())
-            for entity in connected:
-                if entity not in entities:
-                    entities.append(entity)
+        has_pa = bool(pa_entities) and bool(self._resolve_keys(pa_entities))
 
-        entities.sort()
+        # --- HA graph matching ---
+        ha_match: HAMatchResult | None = None
+        if self._ha_graph is not None:
+            ha_match = self._ha_graph.match(text)
+        has_ha = ha_match is not None and ha_match.has_entity_match
 
-        adapter_keys = self._resolve_keys(entities)
-        if not adapter_keys:
-            return RoutingPlan(
-                strategy="direct",
-                matched_entities=entities,
-            )
+        # --- Determine match_source ---
+        if has_pa and has_ha:
+            match_source = "both"
+        elif has_pa:
+            match_source = "pa"
+        elif has_ha:
+            match_source = "ha"
+        else:
+            match_source = "none"
 
-        # Build steps in memory hierarchy order:
-        # procedural (behavioral priming) → semantic (stable knowledge) → episodic (recent)
+        # --- Imperative detection ---
+        imperative = False
+        if has_ha and ha_match is not None:
+            has_verb = ha_match.has_verb_match
+            is_question = _is_interrogative(text)
+            imperative = has_verb and not is_question
+
+        # --- Build PA adapter steps (only if PA matched) ---
         steps = []
-        for adapter_name in ["procedural", "semantic", "episodic"]:
-            if adapter_name in adapter_keys:
-                keys = list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY]
-                steps.append(
-                    RoutingStep(
-                        adapter_name=adapter_name,
-                        keys_to_probe=keys,
+        if has_pa:
+            adapter_keys = self._resolve_keys(pa_entities)
+            for adapter_name in ["procedural", "semantic", "episodic"]:
+                if adapter_name in adapter_keys:
+                    keys = list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY]
+                    steps.append(
+                        RoutingStep(
+                            adapter_name=adapter_name,
+                            keys_to_probe=keys,
+                        )
                     )
-                )
 
-        # Include any other adapters (personas, etc.)
-        known = {"procedural", "semantic", "episodic"}
-        for adapter_name, keys in adapter_keys.items():
-            if adapter_name not in known:
-                steps.append(
-                    RoutingStep(
-                        adapter_name=adapter_name,
-                        keys_to_probe=list(keys)[:MAX_KEYS_PER_QUERY],
+            # Include any other adapters (personas, etc.)
+            known = {"procedural", "semantic", "episodic"}
+            for adapter_name, keys in adapter_keys.items():
+                if adapter_name not in known:
+                    steps.append(
+                        RoutingStep(
+                            adapter_name=adapter_name,
+                            keys_to_probe=list(keys)[:MAX_KEYS_PER_QUERY],
+                        )
                     )
-                )
+
+        strategy = "targeted_probe" if steps else "direct"
+
+        ha_domains = ha_match.domains if ha_match else []
+
+        if match_source != "none":
+            logger.info(
+                "Routed query: source=%s, pa_entities=%s, ha=%s, imperative=%s",
+                match_source,
+                pa_entities if has_pa else [],
+                ha_domains if has_ha else [],
+                imperative,
+            )
 
         return RoutingPlan(
             steps=steps,
-            strategy="targeted_probe",
-            matched_entities=entities,
+            strategy=strategy,
+            matched_entities=pa_entities,
+            match_source=match_source,
+            imperative=imperative,
+            ha_domains=ha_domains,
         )
 
     def _extract_entities(self, text: str) -> list[str]:

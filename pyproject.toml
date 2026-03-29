@@ -38,6 +38,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+anthropic = ["anthropic>=0.80"]
+google = ["google-genai>=1.0"]
+all-agents = ["anthropic>=0.80", "google-genai>=1.0"]
 dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.3"]
 
 [tool.setuptools.packages.find]

@@ -46,14 +46,17 @@ class CloudAgent(ABC):
         system_prompt: str = "",
         tool_results: list[dict] | None = None,
         tools: list[dict] | None = None,
+        history: list[dict] | None = None,
     ) -> CloudResponse:
         """Send a query to the cloud model.
 
         Args:
-            query: The user query (single turn, no history).
+            query: The user query.
             system_prompt: Optional system prompt.
             tool_results: Results from previous tool calls in the agentic loop.
             tools: Tool definitions in the standard internal format.
+            history: Optional conversation history as list of
+                {"role": "user"|"assistant", "text": "..."} dicts.
 
         Returns:
             CloudResponse with either final text or tool calls.

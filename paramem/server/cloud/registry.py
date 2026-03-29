@@ -8,11 +8,15 @@ from paramem.server.config import GeneralAgentConfig
 
 logger = logging.getLogger(__name__)
 
+ALL_PROVIDERS = sorted(COMPATIBLE_PROVIDERS | {"anthropic", "google"})
+
 
 def get_cloud_agent(config: GeneralAgentConfig) -> CloudAgent | None:
     """Create a cloud agent for the configured provider.
 
     Returns None if cloud is not enabled or not configured.
+    Optional providers (anthropic, google) require their SDK to be installed
+    via pip install paramem[anthropic] or paramem[google].
     """
     if not config.enabled:
         return None
@@ -28,16 +32,42 @@ def get_cloud_agent(config: GeneralAgentConfig) -> CloudAgent | None:
         return None
 
     if provider == "anthropic":
-        logger.warning("Anthropic adapter not yet implemented")
+        try:
+            from paramem.server.cloud.anthropic_adapter import AnthropicAgent
+        except ImportError:
+            logger.error(
+                "Anthropic provider requires the anthropic SDK. "
+                "Install with: pip install paramem[anthropic]"
+            )
+            return None
+
+        agent = AnthropicAgent(config)
+        if agent.is_available():
+            logger.info("Cloud agent: anthropic (%s)", config.model)
+            return agent
+        logger.warning("Anthropic agent configured but API key missing")
         return None
 
     if provider == "google":
-        logger.warning("Google adapter not yet implemented")
+        try:
+            from paramem.server.cloud.google_adapter import GoogleAgent
+        except ImportError:
+            logger.error(
+                "Google provider requires the google-genai SDK. "
+                "Install with: pip install paramem[google]"
+            )
+            return None
+
+        agent = GoogleAgent(config)
+        if agent.is_available():
+            logger.info("Cloud agent: google (%s)", config.model)
+            return agent
+        logger.warning("Google agent configured but API key missing")
         return None
 
     logger.warning(
         "Unknown cloud provider: '%s'. Available: %s",
         provider,
-        COMPATIBLE_PROVIDERS,
+        ALL_PROVIDERS,
     )
     return None
