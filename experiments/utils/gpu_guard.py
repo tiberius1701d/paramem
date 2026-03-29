@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -24,6 +25,15 @@ DEFAULT_SERVER_PORT = 8420
 VRAM_CLEAR_TIMEOUT = 30  # seconds to wait for VRAM to clear
 VRAM_POLL_INTERVAL = 2  # seconds between polls
 
+# Resolve nvidia-smi at import time. On WSL2 it lives in /usr/lib/wsl/lib
+# which systemd may not have on PATH; on native Linux it's typically in
+# /usr/bin.  Falls back to bare name (caught by the caller's exception handler).
+_NVIDIA_SMI = (
+    shutil.which("nvidia-smi")
+    or shutil.which("nvidia-smi", path="/usr/lib/wsl/lib:/usr/bin:/usr/local/bin")
+    or "nvidia-smi"
+)
+
 
 class GPUAcquireError(RuntimeError):
     """Raised when the GPU cannot be acquired."""
@@ -33,7 +43,7 @@ def _get_gpu_pids() -> list[int]:
     """Return PIDs of processes using the GPU for compute."""
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            [_NVIDIA_SMI, "--query-compute-apps=pid", "--format=csv,noheader"],
             capture_output=True,
             text=True,
             timeout=5,
