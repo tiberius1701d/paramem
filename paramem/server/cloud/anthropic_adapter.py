@@ -15,7 +15,7 @@ class AnthropicAgent(CloudAgent):
 
     def __init__(self, config: GeneralAgentConfig):
         super().__init__(config)
-        self._client = anthropic.Anthropic(api_key=config.api_key)
+        self._client = anthropic.Anthropic(api_key=config.api_key, timeout=30.0)
 
     def call(
         self,
@@ -42,6 +42,13 @@ class AnthropicAgent(CloudAgent):
             "messages": messages,
             "max_tokens": 1024,
         }
+
+        # Use caller-supplied tools if provided, otherwise enable web search
+        if tools:
+            kwargs["tools"] = self.format_tools(tools)
+        else:
+            kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+
         if system_prompt:
             kwargs["system"] = system_prompt
 

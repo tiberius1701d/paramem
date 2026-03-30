@@ -15,7 +15,10 @@ class GoogleAgent(CloudAgent):
 
     def __init__(self, config: GeneralAgentConfig):
         super().__init__(config)
-        self._client = genai.Client(api_key=config.api_key)
+        self._client = genai.Client(
+            api_key=config.api_key,
+            http_options=genai.types.HttpOptions(timeout=30_000),
+        )
 
     def call(
         self,
@@ -44,11 +47,15 @@ class GoogleAgent(CloudAgent):
 
         contents.append(query)
 
-        config = genai.types.GenerateContentConfig(
-            max_output_tokens=1024,
-        )
+        # Enable Google Search grounding by default; skip if caller provides tools
+        config_kwargs: dict = {"max_output_tokens": 1024}
+        if not tools:
+            search_tool = genai.types.Tool(google_search=genai.types.GoogleSearch())
+            config_kwargs["tools"] = [search_tool]
         if system_prompt:
-            config.system_instruction = system_prompt
+            config_kwargs["system_instruction"] = system_prompt
+
+        config = genai.types.GenerateContentConfig(**config_kwargs)
 
         try:
             response = self._client.models.generate_content(

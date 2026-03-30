@@ -227,6 +227,7 @@ class ServerConfig:
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
     general_agent: GeneralAgentConfig = field(default_factory=GeneralAgentConfig)
     sota_agent: GeneralAgentConfig = field(default_factory=GeneralAgentConfig)
+    sota_providers: dict[str, GeneralAgentConfig] = field(default_factory=dict)
     ha_agent_id: str = "conversation.groq"  # HA conversation agent for escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
@@ -396,6 +397,12 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     sota_raw = agents_raw.get("sota", {})
     if sota_raw:
         config.sota_agent = GeneralAgentConfig(**sota_raw)
+
+    # Additional SOTA providers for direct routing (sota:anthropic, sota:openai, etc.)
+    sota_providers_raw = agents_raw.get("sota_providers", {})
+    for name, provider_raw in sota_providers_raw.items():
+        if isinstance(provider_raw, dict):
+            config.sota_providers[name] = GeneralAgentConfig(**provider_raw)
 
     # Tools
     tools_raw = raw.get("tools", {})

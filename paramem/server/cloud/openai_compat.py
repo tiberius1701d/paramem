@@ -85,12 +85,21 @@ class OpenAICompatAgent(CloudAgent):
                     }
                 )
 
+        is_search_model = "search" in self.config.model
+
         payload: dict = {
             "model": self.config.model,
             "messages": messages,
-            "temperature": 0.7,
             "max_tokens": 1024,
         }
+
+        # Search models reject temperature; regular models use it
+        if not is_search_model:
+            payload["temperature"] = 0.7
+
+        # Enable web search for OpenAI search models (gpt-4o-search-preview, etc.)
+        if self.config.provider == "openai" and is_search_model:
+            payload["web_search_options"] = {}
 
         if tools:
             payload["tools"] = self.format_tools(tools)

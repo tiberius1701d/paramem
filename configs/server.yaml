@@ -53,6 +53,22 @@ agents:
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
     endpoint: ""
+  sota_providers:
+    anthropic:
+      enabled: true
+      provider: anthropic
+      model: claude-sonnet-4-6
+      api_key: ${ANTHROPIC_API_KEY}
+    openai:
+      enabled: true
+      provider: openai
+      model: gpt-4o-search-preview
+      api_key: ${OPENAI_API_KEY}
+    google:
+      enabled: true
+      provider: google
+      model: gemini-2.5-flash
+      api_key: ${GOOGLE_API_KEY}
   ha_agent_id: conversation.groq  # HA conversation agent entity for escalation
 
 # Deprecated — use agents.general instead:

@@ -32,7 +32,7 @@ from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import load_server_config
 from paramem.server.consolidation import run_consolidation
 from paramem.server.ha_graph import HAEntityGraph
-from paramem.server.inference import ChatResult, handle_chat
+from paramem.server.inference import ChatResult, _escalate_to_sota, handle_chat
 from paramem.server.router import QueryRouter
 from paramem.server.session_buffer import SessionBuffer
 from paramem.server.tools.ha_client import HAClient
@@ -81,6 +81,7 @@ class ChatRequest(BaseModel):
     conversation_id: str = "default"
     speaker: str | None = None
     history: list[dict] | None = None
+    route: str | None = None  # Force routing: "ha", "sota", or None (auto)
 
 
 class ChatResponse(BaseModel):
@@ -176,6 +177,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("SOTA agent: not configured")
 
+    # Register additional SOTA providers for direct routing (sota:anthropic, etc.)
+    _state["sota_providers"] = {}
+    for name, provider_config in config.sota_providers.items():
+        agent = get_cloud_agent(provider_config)
+        if agent:
+            _state["sota_providers"][name] = agent
+            logger.info("SOTA provider registered: %s (%s)", name, provider_config.model)
+    logger.info("SOTA providers available: %s", list(_state["sota_providers"].keys()))
+
     # Initialize HA client, tool registry, and HA entity graph
     ha_graph = None
     tools_config = config.tools
@@ -262,6 +272,57 @@ app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
 async def chat(request: ChatRequest):
     """Handle a conversation turn with speaker identification."""
     buffer = _state["session_buffer"]
+
+    # Forced routing — bypass normal routing for direct provider testing.
+    # Requires completed greeting flow (speaker identified) to prevent
+    # unauthenticated access to HA device control.
+    # Supports: "ha", "sota", "sota:anthropic", "sota:openai", "sota:google"
+    if request.route and request.route.startswith(("ha", "sota")):
+        state = buffer.get_session_state(request.conversation_id)
+        speaker = buffer.get_speaker(request.conversation_id)
+        if state in ("new", "greeting_sent"):
+            return ChatResponse(
+                text="Speaker identification required before forced routing.",
+                escalated=False,
+                speaker=speaker,
+            )
+        loop = asyncio.get_running_loop()
+
+        result = None
+        if request.route == "ha" and _state.get("ha_client") is not None:
+            response_text = await loop.run_in_executor(
+                None,
+                lambda: _state["ha_client"].conversation_process(
+                    request.text, agent_id=_state["config"].ha_agent_id
+                ),
+            )
+            if response_text is not None:
+                result = ChatResult(text=response_text, escalated=True)
+        elif request.route.startswith("sota"):
+            parts = request.route.split(":", 1)
+            agent = (
+                _state.get("sota_providers", {}).get(parts[1])
+                if len(parts) == 2
+                else _state.get("sota_agent")
+            )
+            if agent is not None:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: _escalate_to_sota(
+                        request.text,
+                        agent,
+                        _state["config"],
+                        speaker=speaker,
+                        history=request.history,
+                    ),
+                )
+        if result and result.text:
+            return ChatResponse(text=result.text, escalated=True, speaker=speaker)
+        return ChatResponse(
+            text=f"Route '{request.route}' unavailable.",
+            escalated=False,
+            speaker=speaker,
+        )
 
     # Ignore application-level user identity (e.g. HA user context).
     # Speaker must self-identify in the conversation via the greeting flow.
@@ -447,7 +508,6 @@ def _cloud_only_route(
     HA first (has tools for weather, time, devices), SOTA as fallback
     for reasoning. Mutual fallback: if one fails, try the other.
     """
-    from paramem.server.inference import _escalate_to_sota
     from paramem.server.sanitizer import sanitize_for_cloud
 
     # Cloud-only: no local model for PA probing.
