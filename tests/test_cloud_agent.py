@@ -201,14 +201,23 @@ class TestRegistry:
         assert get_cloud_agent(config) is None
 
     def test_anthropic_agent_created(self):
-        config = GeneralAgentConfig(
-            enabled=True, provider="anthropic", model="claude-sonnet", api_key="key"
-        )
-        agent = get_cloud_agent(config)
-        assert agent is not None
-        from paramem.server.cloud.anthropic_adapter import AnthropicAgent
+        mock_anthropic = MagicMock()
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            # Force reimport so the adapter picks up the mock
+            import sys
 
-        assert isinstance(agent, AnthropicAgent)
+            mod_name = "paramem.server.cloud.anthropic_adapter"
+            sys.modules.pop(mod_name, None)
+
+            config = GeneralAgentConfig(
+                enabled=True, provider="anthropic", model="claude-sonnet", api_key="key"
+            )
+            agent = get_cloud_agent(config)
+            assert agent is not None
+
+            from paramem.server.cloud.anthropic_adapter import AnthropicAgent
+
+            assert isinstance(agent, AnthropicAgent)
 
 
 class TestPrivacyRouting:
