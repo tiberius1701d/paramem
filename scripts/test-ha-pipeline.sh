@@ -8,7 +8,7 @@
 #   bash scripts/test-ha-pipeline.sh http://localhost:8420   # custom URL
 #   bash scripts/test-ha-pipeline.sh --verbose               # show full responses
 
-set -euo pipefail
+set -uo pipefail
 
 SERVER="${1:-http://localhost:8420}"
 VERBOSE=false
@@ -34,9 +34,12 @@ check() {
 
     local start_ms=$(($(date +%s%N) / 1000000))
 
+    local payload
+    payload=$(python3 -c "import json,sys; print(json.dumps({'text': sys.argv[1], 'conversation_id': sys.argv[2]}))" "$text" "$conv_id")
+
     response=$(curl -sf -X POST "$SERVER/chat" \
         -H "Content-Type: application/json" \
-        -d "{\"text\": \"$text\", \"conversation_id\": \"$conv_id\"}" 2>/dev/null) || {
+        -d "$payload" 2>/dev/null) || {
         echo "  FAIL  $label — server unreachable"
         echo "        curl failed. Is the server running? Check: curl $SERVER/status"
         FAIL=$((FAIL + 1))
@@ -75,9 +78,12 @@ check_escalated() {
 
     local start_ms=$(($(date +%s%N) / 1000000))
 
+    local payload
+    payload=$(python3 -c "import json,sys; print(json.dumps({'text': sys.argv[1], 'conversation_id': sys.argv[2]}))" "$text" "$conv_id")
+
     response=$(curl -sf -X POST "$SERVER/chat" \
         -H "Content-Type: application/json" \
-        -d "{\"text\": \"$text\", \"conversation_id\": \"$conv_id\"}" 2>/dev/null) || {
+        -d "$payload" 2>/dev/null) || {
         echo "  FAIL  $label — server unreachable"
         FAIL=$((FAIL + 1))
         return 1
@@ -120,6 +126,58 @@ skip() {
     SKIP=$((SKIP + 1))
 }
 
+# check_routed <label> <text> <route> <expect_pattern> [conversation_id]
+# Forces routing via the "route" parameter (ha, sota)
+check_routed() {
+    local label="$1"
+    local text="$2"
+    local route="$3"
+    local expect="$4"
+    local conv_id="${5:-integration-routed-$$}"
+
+    local start_ms=$(($(date +%s%N) / 1000000))
+
+    # Use python3 to build JSON payload safely (no shell interpolation issues)
+    local payload
+    payload=$(python3 -c "import json,sys; print(json.dumps({'text': sys.argv[1], 'conversation_id': sys.argv[2], 'route': sys.argv[3]}))" "$text" "$conv_id" "$route")
+
+    response=$(curl -sf -X POST "$SERVER/chat" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null) || {
+        echo "  FAIL  $label — server unreachable"
+        FAIL=$((FAIL + 1))
+        return 1
+    }
+
+    local end_ms=$(($(date +%s%N) / 1000000))
+    local elapsed=$(( end_ms - start_ms ))
+
+    reply=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('text',''))" 2>/dev/null)
+    escalated=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('escalated', False))" 2>/dev/null)
+
+    # Fail on error responses — "unavailable" or "couldn't" means the provider is down
+    if echo "$reply" | grep -qi "unavailable\|couldn't"; then
+        echo "  FAIL  $label (${elapsed}ms, route=$route) — provider error"
+        echo "        got: $reply"
+        FAIL=$((FAIL + 1))
+        return 1
+    fi
+
+    if echo "$reply" | grep -qi "$expect"; then
+        echo "  PASS  $label (${elapsed}ms, route=$route)"
+        log_verbose "response: $reply"
+        log_verbose "escalated: $escalated"
+        PASS=$((PASS + 1))
+        return 0
+    else
+        echo "  FAIL  $label (${elapsed}ms, route=$route)"
+        echo "        expected pattern: /$expect/"
+        echo "        got: $reply"
+        FAIL=$((FAIL + 1))
+        return 1
+    fi
+}
+
 echo "ParaMem HA Pipeline — Integration Test"
 echo "======================================="
 echo ""
@@ -154,35 +212,59 @@ check "greeting prompt" "Hello" "who are you\|who.*you" "$CONV_MAIN"
 check "speaker identification" "I am TestUser" "nice to meet\|TestUser" "$CONV_MAIN"
 
 # ========================================================================
-# 2. HA Path — queries that need tools/real-time data
+# 2. Real-time via HA agent (tools: SerpAPI, HA sensors)
 # ========================================================================
 echo ""
-echo "--- 2. HA Path (tools / real-time) ---"
-check_escalated "time query" "What time is it?" "True" "[0-9]" "$CONV_MAIN"
-check_escalated "weather query" "How is the weather?" "True" \
-    "temperature\|°C\|degrees\|weather\|cloudy\|clear\|rain\|wind" "$CONV_MAIN"
+echo "--- 2. Real-time via HA Agent ---"
+check_routed "HA: time query" "What's the current time in Germany?" "ha" \
+    "[0-9].*:[0-9]" "$CONV_MAIN"
+check_routed "HA: weather query" "What's the weather like in Berlin right now?" "ha" \
+    "temperature\|°C\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
 
 # ========================================================================
-# 3. SOTA Path — reasoning queries (no HA entity match)
+# 3. Real-time via SOTA agents (web search per provider)
 # ========================================================================
 echo ""
-echo "--- 3. SOTA Path (reasoning) ---"
-CONV_SOTA="integration-sota-$(date +%s)"
-# Fresh conversation to avoid speaker PA match interference
-check "sota greeting" "Hello" "who are you" "$CONV_SOTA"
-check "sota speaker" "I am TestUser" "nice to meet" "$CONV_SOTA"
-check_escalated "reasoning query" \
+echo "--- 3a. SOTA: Anthropic (Claude web search) ---"
+check_routed "Anthropic: time query" "What's the current time in Germany?" "sota:anthropic" \
+    "time\|clock\|[0-9].*:[0-9]\|CET\|CEST\|UTC" "$CONV_MAIN"
+check_routed "Anthropic: weather query" "What's the weather like in Berlin right now?" "sota:anthropic" \
+    "temperature\|°C\|°F\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
+
+echo ""
+echo "--- 3b. SOTA: OpenAI (web search preview) ---"
+check_routed "OpenAI: time query" "What's the current time in Germany?" "sota:openai" \
+    "time\|clock\|[0-9].*:[0-9]\|CET\|CEST\|UTC" "$CONV_MAIN"
+check_routed "OpenAI: weather query" "What's the weather like in Berlin right now?" "sota:openai" \
+    "temperature\|°C\|°F\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
+
+echo ""
+echo "--- 3c. SOTA: Google Gemini (search grounding) ---"
+check_routed "Gemini: time query" "What's the current time in Germany?" "sota:google" \
+    "time\|clock\|[0-9].*:[0-9]\|CET\|CEST\|UTC" "$CONV_MAIN"
+check_routed "Gemini: weather query" "What's the weather like in Berlin right now?" "sota:google" \
+    "temperature\|°C\|°F\|degrees\|weather\|cloudy\|clear\|rain\|wind\|sun" "$CONV_MAIN"
+
+# ========================================================================
+# 4. Auto-routing (normal flow: local model → escalation)
+# ========================================================================
+echo ""
+echo "--- 4. Auto-routing (real-time + reasoning) ---"
+check_escalated "auto: real-time escalation" \
+    "What's the current time in Germany?" "True" \
+    "time\|clock\|[0-9]\|CET\|CEST\|UTC" "$CONV_MAIN"
+check_escalated "auto: reasoning (no graph match)" \
     "Explain the difference between deductive and inductive reasoning" \
-    "True" "deduct\|induct\|reason\|logic\|premis\|conclusion\|general" "$CONV_SOTA"
-check_escalated "math reasoning" \
+    "True" "deduct\|induct\|reason\|logic\|premis\|conclusion\|general" "$CONV_MAIN"
+check_escalated "auto: math reasoning" \
     "If a train travels 120km in 2 hours, what is its average speed?" \
-    "True" "60" "$CONV_SOTA"
+    "True" "60" "$CONV_MAIN"
 
 # ========================================================================
-# 4. Memory Recall (local mode only, keys > 0)
+# 5. Memory Recall (local mode only, keys > 0)
 # ========================================================================
 echo ""
-echo "--- 4. Memory Recall ---"
+echo "--- 5. Memory Recall ---"
 if [ "$mode" = "local" ] && [ "$keys" -gt 0 ]; then
     check "memory probe" "What do you know about me?" "." "$CONV_MAIN"
 else
@@ -190,22 +272,19 @@ else
 fi
 
 # ========================================================================
-# 5. Fallback: SOTA → HA (SOTA fails for real-time queries)
+# 6. Imperative HA Command
 # ========================================================================
 echo ""
-echo "--- 5. Fallback Chains ---"
-
-# In cloud-only mode, HA is tried first, so this is the natural path.
-# In local mode, this tests the fallback from SOTA to HA via _escalate_to_ha_agent.
-check_escalated "real-time fallback to HA" \
+echo "--- 6. Imperative HA Command ---"
+check_escalated "imperative: turn on lights" \
     "Turn on the kitchen lights" \
     "True" "." "$CONV_MAIN"
 
 # ========================================================================
-# 6. /refresh-ha endpoint
+# 7. /refresh-ha endpoint
 # ========================================================================
 echo ""
-echo "--- 6. HA Graph Refresh ---"
+echo "--- 7. HA Graph Refresh ---"
 refresh=$(curl -sf -X POST "$SERVER/refresh-ha" 2>/dev/null) || {
     echo "  FAIL  /refresh-ha — endpoint unreachable"
     FAIL=$((FAIL + 1))
@@ -229,10 +308,10 @@ if [ -n "$refresh" ]; then
 fi
 
 # ========================================================================
-# 7. /status endpoint fields
+# 8. /status endpoint fields
 # ========================================================================
 echo ""
-echo "--- 7. Status Endpoint ---"
+echo "--- 8. Status Endpoint ---"
 status_ok=$(echo "$status" | python3 -c "
 import sys, json
 s = json.load(sys.stdin)

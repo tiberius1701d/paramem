@@ -1104,7 +1104,7 @@ Other approaches from literature:
 ## Test 8: Large-Scale Incremental (500-Key Target)
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** IN PROGRESS — 40 cycles complete, 373/500 keys, 100% recall. Paused (2026-03-29).
+**Status:** IN PROGRESS — 43 cycles complete, 420/500 keys, 100% recall (2026-03-30). ~80 keys remaining.
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -1127,7 +1127,7 @@ indexed key training with full replay.
 - **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
 - **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
 
-### Results (2026-03-29, cycles 1-40 complete)
+### Results (2026-03-30, cycles 1-43 complete)
 
 | Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
 |-------|------|--------|------|------------------|------------|-------|
@@ -1166,14 +1166,17 @@ indexed key training with full replay.
 | 37 | 334 | 334/334 (100%) | — | 10 | ~231 min | |
 | 38 | — | — | — | 0.0 | — | Skipped (no new triples) |
 | 39 | 347 | 347/347 (100%) | 0.154 | 13 | 306 min | New character (Ye Jie) |
-| 40 | 373 | 373/373 (100%) | 0.154 | 26 | 332 min | Best yield since cycle 35. Paused at 373 keys |
+| 40 | 373 | 373/373 (100%) | 0.154 | 26 | 332 min | Best yield since cycle 35 |
+| 41 | — | — | — | 0.0 | — | Skipped (no new triples) |
+| 42 | 408 | 408/408 (100%) | 0.154 | 35 | 402 min | New character (He Xiaohong), best single-cycle yield since cycle 23 |
+| 43 | 420 | 420/420 (100%) | 0.158 | 12 | 413 min | 9th character processing |
 
-**100% recall at every scale point from 21 to 373 keys.** No degradation. Eight
+**100% recall at every scale point from 21 to 420 keys.** No degradation. Nine
 characters processed (Deng Yu, Liang Xin, Xia Yu, Zhao Li, shili, Bao Jun,
-Cai Xiuying completed; Ye Jie in progress at session 12/25). Adapter size: 27 MB
-(fixed, independent of key count). Graph: 401 nodes, 373 edges.
-~127 keys to target. Epoch convergence pattern stable at 373 keys: 48% at epoch 15,
-95% at epoch 20, 100% at epoch 25.
+Cai Xiuying, Ye Jie completed; He Xiaohong in progress at session 2/25).
+Adapter size: 27 MB (fixed, independent of key count). Graph: 461 nodes, 420 edges.
+~80 keys to target. Epoch convergence pattern at 420 keys: 38% at epoch 15,
+94% at epoch 20, 100% at epoch 25.
 
 ### Extraction pipeline improvement (cycles 22-23)
 
@@ -1315,7 +1318,7 @@ At 324 keys, 175 sessions processed, with new extraction pipeline:
 ## Test 9: Natural Recall Emergence
 
 **Script:** `experiments/test9_natural_recall.py`
-**Status:** COMPLETE — Mistral 7B, 2026-03-27 + resumed 2026-03-29 (31 cycles, 5h 25m total)
+**Status:** COMPLETE — Mistral 7B, 2026-03-27 + resumed 2026-03-29/30 (33 cycles, 21→420 keys)
 
 ### Objective
 
@@ -1325,7 +1328,7 @@ measure recall across scale from 21 to 373 keys.
 
 ### Design
 
-Three probe passes per Test 8 cycle checkpoint (31 cycles, 21–373 keys):
+Three probe passes per Test 8 cycle checkpoint (33 cycles, 21–420 keys):
 
 | Pass | Probe style | Difficulty |
 |------|------------|------------|
@@ -1344,7 +1347,7 @@ One model load, adapter swapped per cycle. Incremental per-cycle results saved.
 `--resume` skips completed cycles and merges results. Re-runnable after
 Test 8 advances — picks up new cycle checkpoints automatically.
 
-### Results — Mistral 7B (31 cycles, 373 keys, 73 entities)
+### Results — Mistral 7B (33 cycles, 420 keys, 79 entities)
 
 | Cycle | Keys | Entities | Keyed | Direct | Overlap | Open Facts | Entity Hit | Time |
 |------:|-----:|---------:|------:|-------:|--------:|-----------:|-----------:|-----:|
@@ -1379,31 +1382,33 @@ Test 8 advances — picks up new cycle checkpoints automatically.
 | 37 | 334 | 65 | 100% | 100% | 0.997 | 33.2% | 49.2% | 24.4m |
 | 39 | 347 | 67 | 100% | 99.7% | 0.992 | 35.7% | 50.7% | 21.7m |
 | 40 | 373 | 73 | 100% | 99.7% | 0.995 | 37.3% | 52.0% | 23.2m |
+| 42 | 408 | 77 | 100% | 100% | 0.996 | 33.8% | 49.4% | 25.1m |
+| 43 | 420 | 79 | 100% | 100% | 0.997 | 35.2% | 51.9% | 26.0m |
 
 ### Summary
 
-| Metric | Final (373 keys) | Range across cycles |
+| Metric | Final (420 keys) | Range across cycles |
 |--------|------------------|---------------------|
 | Keyed retrieval | **100%** | 100% every cycle |
-| Direct questions | **99.7%** | 95.2% – 100% |
-| Direct overlap | **0.995** | 0.954 – 0.998 |
-| Open-ended facts | **37.3%** | 13.6% – 37.3% |
-| Open-ended entity hit | **52.0%** | 35.7% – 71.4% |
+| Direct questions | **100%** | 95.2% – 100% |
+| Direct overlap | **0.997** | 0.954 – 0.998 |
+| Open-ended facts | **35.2%** | 13.6% – 37.3% |
+| Open-ended entity hit | **51.9%** | 35.7% – 71.4% |
 
 ### Analysis
 
-**Keyed retrieval is perfect at all scales.** 100% across 31 cycles from
-21 to 373 keys. The indexed key mechanism shows no degradation with scale.
+**Keyed retrieval is perfect at all scales.** 100% across 33 cycles from
+21 to 420 keys. The indexed key mechanism shows no degradation with scale.
 
 **Direct questions (natural language, no key cue) achieve 99–100%.** The
 model reliably retrieves parametrically stored facts when asked the training
-question in natural form. Token overlap with expected answers averages 0.98+.
+question in natural form. Token overlap with expected answers averages 0.99+.
 This confirms that parametric recall is not limited to the keyed retrieval
 prompt — natural language works.
 
 **Open-ended recall plateaus around 1/3 of facts.** The "What do you know
 about X?" probe style does not show an upward trend with scale. Fact recall
-fluctuates between 25–37% from 21 keys to 373 keys. Entity hit rate is
+fluctuates between 25–37% from 21 keys to 420 keys. Entity hit rate is
 similarly flat around 50% (half the entities produce at least one correct
 fact).
 
@@ -1427,8 +1432,8 @@ candidate for live testing via the HA pipeline over time.
 
 ### Runtime
 
-- 31 cycles, ~5h 25m total on RTX 5070 (8GB, QLoRA 4-bit)
-- Per-cycle time scales linearly: ~1.7m at 21 keys → ~24.4m at 334 keys
+- 33 cycles, ~6h total on RTX 5070 (8GB, QLoRA 4-bit)
+- Per-cycle time scales linearly: ~1.7m at 21 keys → ~26m at 420 keys
 - Dominated by keyed retrieval pass at larger scales
 
 ---
@@ -1452,7 +1457,7 @@ ParaMem and HA for tool execution.
 
 ---
 
-## Dual-Escalation Routing (2026-03-29)
+## Dual-Escalation Routing (2026-03-30)
 
 Tri-path routing via dual-graph matching. Zero LLM inference cost for the
 routing decision — pure substring + fuzzy matching against two entity graphs.
@@ -1463,10 +1468,15 @@ routing decision — pure substring + fuzzy matching against two entity graphs.
 |---|---|---|
 | PA knowledge graph | Local adapter probe + reasoning | Mistral 7B (local) |
 | HA entity graph | HA conversation agent | Groq + Llama 3.3 70B (via HA) |
-| Neither graph | SOTA cloud agent | Claude Sonnet (Anthropic API) |
-| Both graphs | PA first; [ESCALATE] → HA | Local → HA fallback |
+| Neither graph | HA first (tools), SOTA fallback (reasoning) | HA → Cloud |
+| Both graphs | PA first; [ESCALATE] → HA → SOTA | Local → HA → Cloud |
 
-**HA entity graph:** Built from HA REST API at startup. 238 entities, 165 action
+All escalation paths follow the same invariant: **HA first** (has tools for
+real-time data), **SOTA fallback** (reasoning). This applies to Path 3 (no
+graph match), `[ESCALATE]` from local model, and `_probe_and_reason` fallback
+when keyed recall fails.
+
+**HA entity graph:** Built from HA REST API at startup. 238 entities, 164 action
 verbs across 52 domains. Indexes friendly names and service verbs (turn_on →
 "turn on"). Refreshed after consolidation and via `POST /refresh-ha`.
 
@@ -1482,28 +1492,63 @@ Local mode: local adapter → HA/Groq → SOTA → local base model.
 Cloud-only mode: HA/Groq → SOTA → static error.
 Every path terminates gracefully. No dead ends.
 
+### Forced Routing
+
+The `route` parameter on `/chat` allows direct provider testing: `"ha"`,
+`"sota"`, `"sota:anthropic"`, `"sota:openai"`, `"sota:google"`. Requires
+completed speaker identification (greeting flow) to prevent unauthenticated
+HA device control.
+
 ### SOTA Persona Continuity
 
 Sanitized conversation history (PII-blocked turns dropped) + speaker name
 passed to the SOTA model. System prompt instructs the model to derive persona,
 tone, and style from the conversation context. No personal facts leak to cloud.
 
-### Provider Support
+### Multi-Provider SOTA (2026-03-30)
 
-Core (httpx): OpenAI, Groq, Mistral, Ollama.
-Optional: Anthropic (`pip install paramem[anthropic]`), Google Gemini
-(`pip install paramem[google]`).
+Three SOTA providers with web search, configurable via `agents.sota_providers`
+in server.yaml. Web search is enabled by default but defers to caller-supplied
+tools when provided.
 
-### Integration Test Results (cloud-only mode, VPN to NAS)
-
-| Test | Path | Latency | Result |
+| Provider | Model | Web Search | Install |
 |---|---|---|---|
-| Time query | HA | 795ms | Real time from HA |
-| Weather query | HA | 1158ms | Real weather + warnings |
-| Deductive vs inductive | SOTA | 2526ms | Claude reasoning |
-| Math (120km/2h) | SOTA | 2478ms | Correct (60km/h) |
-| Turn on lights | HA fallback | 589ms | HA entity resolution |
-| HA graph refresh | /refresh-ha | — | 238 entities, 165 verbs |
+| Anthropic | Claude Sonnet 4.6 | `web_search_20250305` tool | `pip install paramem[anthropic]` |
+| OpenAI | gpt-4o-search-preview | `web_search_options` | core (httpx) |
+| Google Gemini | gemini-2.5-flash | Google Search grounding | `pip install paramem[google]` |
+
+Also available via core httpx adapter: Groq, Mistral, Ollama.
+
+**Graceful failure at every level:**
+- Missing SDK → logged with install instructions, provider not registered
+- Missing API key → logged, provider skipped
+- Connection/timeout errors → user-facing error message, fallback chain continues
+- Unknown provider → logged with available list
+
+**Known issue:** Gemini API times out (30s) when VPN is active. Works without VPN
+(1-2s latency). This is a VPN routing issue, not a code bug.
+
+### Integration Test Results (2026-03-30, local mode, VPN to NAS)
+
+15/17 passing. 2 failures: Gemini timeout (VPN routing issue).
+
+| Test | Path | Provider | Latency | Result |
+|---|---|---|---|---|
+| Time query | HA | Groq (via HA) | 635ms | PASS |
+| Weather query | HA | Groq (via HA) | 935ms | PASS |
+| Time query | SOTA | Anthropic | 12.2s | PASS |
+| Weather query | SOTA | Anthropic | 5.6s | PASS |
+| Time query | SOTA | OpenAI | 7.0s | PASS |
+| Weather query | SOTA | OpenAI | 9.4s | PASS |
+| Time query | SOTA | Gemini | 32.4s | FAIL (VPN timeout) |
+| Weather query | SOTA | Gemini | 32.4s | FAIL (VPN timeout) |
+| Real-time escalation | Auto | HA→Anthropic | 11.8s | PASS |
+| Reasoning | Auto | SOTA | 2.2s | PASS |
+| Math | Auto | SOTA | 2.7s | PASS |
+| Memory probe | Auto | Local | 2.7s | PASS |
+| Imperative HA | Auto | HA fallback | 2.6s | PASS |
+| HA graph refresh | /refresh-ha | — | — | PASS (238 entities) |
+| Status endpoint | /status | — | — | PASS |
 
 ---
 

@@ -326,7 +326,7 @@ class TestPrivacyRouting:
         assert "Berlin" in result.text
 
     def test_non_personal_query_goes_to_cloud(self):
-        """Query with no entity match should go directly to cloud."""
+        """Query with no entity match → HA first (None) → SOTA fallback."""
         from paramem.server.inference import handle_chat
 
         cloud_agent = self._make_mock_cloud_agent()
@@ -339,6 +339,11 @@ class TestPrivacyRouting:
         config = MagicMock()
         config.voice.load_prompt.return_value = "You are a helper."
         config.general_agent.enabled = True
+        config.sanitization.mode = "off"
+
+        # Mock HA client that returns None (simulates HA unavailable)
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = None
 
         with patch(
             "paramem.server.inference.detect_temporal_query",
@@ -353,10 +358,13 @@ class TestPrivacyRouting:
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
-                cloud_agent=cloud_agent,
+                ha_client=ha_client,
+                sota_agent=cloud_agent,
             )
 
-        # Cloud agent MUST have been called
+        # HA was attempted first and returned None
+        ha_client.conversation_process.assert_called_once()
+        # SOTA agent called as fallback
         cloud_agent.call.assert_called_once()
         assert result.escalated is True
         assert result.text == "cloud answer"
