@@ -1104,7 +1104,7 @@ Other approaches from literature:
 ## Test 8: Large-Scale Incremental (500-Key Target)
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** IN PROGRESS — 43 cycles complete, 420/500 keys, 100% recall (2026-03-30). ~80 keys remaining.
+**Status:** IN PROGRESS — 48 cycles complete, 489/500 keys, 100% recall (2026-04-01). Paused. 11 keys remaining.
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -1127,7 +1127,7 @@ indexed key training with full replay.
 - **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
 - **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
 
-### Results (2026-03-30, cycles 1-43 complete)
+### Results (2026-04-01, cycles 1-48 complete)
 
 | Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
 |-------|------|--------|------|------------------|------------|-------|
@@ -1170,13 +1170,18 @@ indexed key training with full replay.
 | 41 | — | — | — | 0.0 | — | Skipped (no new triples) |
 | 42 | 408 | 408/408 (100%) | 0.154 | 35 | 402 min | New character (He Xiaohong), best single-cycle yield since cycle 23 |
 | 43 | 420 | 420/420 (100%) | 0.158 | 12 | 413 min | 9th character processing |
+| 44 | 431 | 431/431 (100%) | 0.156 | 11 | — | |
+| 45 | 441 | 441/441 (100%) | 0.150 | 10 | — | |
+| 46 | 461 | 461/461 (100%) | 0.153 | 20 | — | |
+| 47 | — | — | — | 0.0 | — | Skipped (no new triples) |
+| 48 | 489 | 489/489 (100%) | 0.153 | 28 | — | 10th character (Ruan Wenting) |
 
-**100% recall at every scale point from 21 to 420 keys.** No degradation. Nine
+**100% recall at every scale point from 21 to 489 keys.** No degradation. Ten
 characters processed (Deng Yu, Liang Xin, Xia Yu, Zhao Li, shili, Bao Jun,
-Cai Xiuying, Ye Jie completed; He Xiaohong in progress at session 2/25).
-Adapter size: 27 MB (fixed, independent of key count). Graph: 461 nodes, 420 edges.
-~80 keys to target. Epoch convergence pattern at 420 keys: 38% at epoch 15,
-94% at epoch 20, 100% at epoch 25.
+Cai Xiuying, Ye Jie, He Xiaohong completed; Ruan Wenting in progress).
+Adapter size: 27 MB (fixed, independent of key count). Graph: 549 nodes, 489 edges.
+11 keys to target. Epoch convergence at 489 keys: 60% at epoch 15,
+99% at epoch 20, 100% at epoch 25.
 
 ### Extraction pipeline improvement (cycles 22-23)
 
@@ -1194,15 +1199,27 @@ The yield increase accelerates progress toward 500 keys. At the new rate (~20-30
 
 ### Key observations
 
-1. **Loss is flat at ~0.15-0.16** across all scales (21-373 keys). Brief near-zero dip at 295-324 keys normalized back to 0.154 at 347-373 keys. No upward trend — the adapter has capacity headroom.
+1. **Loss is flat at ~0.15-0.16** across all scales (21-489 keys). Brief near-zero dip at 295-324 keys normalized back to 0.150-0.153 at 441-489 keys. No upward trend — the adapter has capacity headroom.
 
-2. **Epoch convergence is stable.** Per-epoch probes (every 5 epochs) show recall reaching 95%+ by epoch 20 and 100% by epoch 25 at all tested scales, including 373 keys. 30 epochs provides adequate margin. The pattern at 373 keys: epoch 5 (1%), epoch 10 (7%), epoch 15 (48%), epoch 20 (95%), epoch 25 (100%). Mid-training recall (epoch 15) has increased from ~30% at 100 keys to ~48% at 373 keys — the model learns faster per-epoch as the adapter becomes more structured.
+2. **Epoch convergence is stable but borderline.** Most cycles (30/34) reach 100% at epoch 25. Four cycles needed the full 30 epochs (cycles 31, 34, 37, 45) — these are not correlated with scale but represent ~12% of training cycles hitting the budget ceiling with zero margin. Mid-training recall (E15) fluctuates between 8–74% with no monotonic trend. 30 epochs is sufficient but not conservative — if any cycle needs 31+, the current budget will fail. See "Key ID interleaving" below for the root cause.
 
 3. **QA yield varies 0-6.8 per session.** Conversations are not uniformly information-dense. Yield is highest at character transitions (fresh entity graph) and lowest when a character's sessions are nearly exhausted (dedup filters most triples). The extraction pipeline fix (cycle 22+) significantly improved yield.
 
-4. **Cycle time scales linearly** — ~0.89 min/key at current scales. At 373 keys, cycle time is ~332 min (~5.5 hours). Projected: ~7.4 hours/cycle at 500 keys. Training dominates (~91% of cycle time at 373 keys).
+4. **Cycle time scales linearly** — ~0.89 min/key at current scales. At 489 keys, cycle time is ~7.3 hours (projected from linear trend). Projected: ~7.4 hours/cycle at 500 keys. Training dominates (~91% of cycle time).
 
-5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36, 38)** skip training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Cai Xiuying exhausted at cycle 37; Ye Jie started cycle 39 with strong yield (13+26 keys in 2 cycles).
+5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36, 38, 41, 47)** skip training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Ruan Wenting (10th character) started cycle 48 with 28 new keys.
+
+### Key ID interleaving and epoch convergence
+
+**Finding:** The 4 cycles that needed 30 epochs (31, 34, 37, 45) all have a disproportionate number of new keys assigned to low key IDs — IDs that interleave with keys learned in much earlier cycles. 59% of new keys in borderline cycles had IDs below the 50th percentile of total keys, vs only 7% in clean (E25) cycles.
+
+**Mechanism:** The QA generator assigns key IDs sequentially per-entity, not globally. When a new character's entity (e.g. "Li Ming" in He Xiaohong's sessions) shares a name with an entity from an earlier character, the QA generator fills gaps in the existing ID range. This places new keys in ID-space neighborhoods where the adapter weights are already tightly optimized from 40+ cycles of full-replay training.
+
+**Example (cycle 45, 441 keys):** New keys graph58–60 were inserted between graph57 (cycle 43, "User curious about Fish Fillet") and graph61 (cycle 3, "Li Ming has a friend named Xiaoyu"). New keys graph95–101 were inserted between graph93–94 (cycle 31, Li Ming/Law Department) and graph102–103 (cycle 3, Cheng Ping/Media Company, Everything Is Good/Tsinghua). The adapter must carve out new distinctions in regions where weights have been reinforced for dozens of cycles.
+
+**Contrast (cycle 42, 408 keys, converged at E25):** 35 new keys were mostly assigned graph353–408 — a fresh, unoccupied range with no existing weight patterns to work around.
+
+**Implication:** Epoch budget pressure is driven by key ID distribution, not key count. A mitigation would be to assign globally sequential IDs rather than per-entity IDs, ensuring new keys always land in fresh ID-space. However, this is an observation from the current run — the 30-epoch budget has not failed yet.
 
 ### Cohort tracking
 
@@ -1307,11 +1324,11 @@ Parametric memory reduces the at-rest attack surface. Runtime exposure during re
 
 ### Estimated completion
 
-At 324 keys, 175 sessions processed, with new extraction pipeline:
-- ~6-7 more training cycles needed for 500 keys (at ~25-30 new keys/cycle)
-- Cycle time growing from ~223 min (324 keys) to ~345 min at 500 keys
-- Estimated: ~25-35 GPU hours remaining
-- 6 skipped cycles in recent runs suggest character exhaustion; character transitions produce yield bursts (21-29 new keys)
+At 441 keys, 225 sessions processed, with new extraction pipeline:
+- ~6 more training cycles needed for 500 keys (at ~10 new keys/cycle)
+- Cycle time growing — at 441 keys, each cycle is 7+ hours
+- Epoch convergence margin tightening: 30 epochs just sufficient at 441 keys
+- He Xiaohong still yielding; next character transition should produce a burst
 
 ---
 
