@@ -1104,7 +1104,7 @@ Other approaches from literature:
 ## Test 8: Large-Scale Incremental (500-Key Target)
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** IN PROGRESS — 48 cycles complete, 489/500 keys, 100% recall (2026-04-01). Paused. 11 keys remaining.
+**Status:** IN PROGRESS — 50 cycles running, **510 keys** at cycle 49 (500-key target passed), 100% recall (2026-04-02). Cycle 50 (528 keys) training now.
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -1127,7 +1127,7 @@ indexed key training with full replay.
 - **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
 - **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
 
-### Results (2026-04-01, cycles 1-48 complete)
+### Results (2026-04-02, cycles 1-49 complete, cycle 50 in progress)
 
 | Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
 |-------|------|--------|------|------------------|------------|-------|
@@ -1175,13 +1175,16 @@ indexed key training with full replay.
 | 46 | 461 | 461/461 (100%) | 0.153 | 20 | — | |
 | 47 | — | — | — | 0.0 | — | Skipped (no new triples) |
 | 48 | 489 | 489/489 (100%) | 0.153 | 28 | — | 10th character (Ruan Wenting) |
+| 49 | 510 | 510/510 (100%) | 0.152 | 21 | — | **500-key milestone passed** |
+| 50 | 528 | — | — | 18 | — | Training in progress |
 
-**100% recall at every scale point from 21 to 489 keys.** No degradation. Ten
-characters processed (Deng Yu, Liang Xin, Xia Yu, Zhao Li, shili, Bao Jun,
-Cai Xiuying, Ye Jie, He Xiaohong completed; Ruan Wenting in progress).
-Adapter size: 27 MB (fixed, independent of key count). Graph: 549 nodes, 489 edges.
-11 keys to target. Epoch convergence at 489 keys: 60% at epoch 15,
-99% at epoch 20, 100% at epoch 25.
+**500-key milestone passed at cycle 49 with 100% recall.** No degradation at any
+scale point from 21 to 510 keys. Ten characters processed (Deng Yu, Liang Xin,
+Xia Yu, Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong completed;
+Ruan Wenting in progress). Adapter size: 27 MB (fixed, independent of key count).
+Graph: 572 nodes, 510 edges. Loss stable at 0.152 — no upward trend through 5× the
+original 100-key validated scale. Epoch convergence at 510 keys: 50% at epoch 15,
+96% at epoch 20, 100% at epoch 25. Run continuing to find the ceiling.
 
 ### Extraction pipeline improvement (cycles 22-23)
 
@@ -1199,7 +1202,7 @@ The yield increase accelerates progress toward 500 keys. At the new rate (~20-30
 
 ### Key observations
 
-1. **Loss is flat at ~0.15-0.16** across all scales (21-489 keys). Brief near-zero dip at 295-324 keys normalized back to 0.150-0.153 at 441-489 keys. No upward trend — the adapter has capacity headroom.
+1. **Loss is flat at ~0.15-0.16** across all scales (21-510 keys). Brief near-zero dip at 295-324 keys normalized back to 0.150-0.152 at 441-510 keys. No upward trend at 5× the original 100-key scale — the adapter has capacity headroom.
 
 2. **Epoch convergence is stable but borderline.** Most cycles (30/34) reach 100% at epoch 25. Four cycles needed the full 30 epochs (cycles 31, 34, 37, 45) — these are not correlated with scale but represent ~12% of training cycles hitting the budget ceiling with zero margin. Mid-training recall (E15) fluctuates between 8–74% with no monotonic trend. 30 epochs is sufficient but not conservative — if any cycle needs 31+, the current budget will fail. See "Key ID interleaving" below for the root cause.
 
@@ -1322,13 +1325,13 @@ This is a novel framing: LoRA adapters as structured storage with explicit retri
 
 Parametric memory reduces the at-rest attack surface. Runtime exposure during reasoning is identical to RAG and inherent to any agent that processes private data. A tool-boundary architecture (PM server as a function call) limits exposure to query results, not the full knowledge base.
 
-### Estimated completion
+### Scaling status
 
-At 441 keys, 225 sessions processed, with new extraction pipeline:
-- ~6 more training cycles needed for 500 keys (at ~10 new keys/cycle)
-- Cycle time growing — at 441 keys, each cycle is 7+ hours
-- Epoch convergence margin tightening: 30 epochs just sufficient at 441 keys
-- He Xiaohong still yielding; next character transition should produce a burst
+500-key target reached at cycle 49 (2026-04-02). Run continuing past 500 to find the ceiling:
+- 510 keys confirmed at 100% recall, cycle 50 (528 keys) training now
+- Cycle time at 510 keys: ~8 hours. Each additional cycle adds ~20 keys
+- Loss and convergence show no degradation — no ceiling indicators yet
+- Ruan Wenting (10th character) still yielding; additional characters available in PerLTQA data
 
 ---
 
