@@ -1104,7 +1104,7 @@ Other approaches from literature:
 ## Test 8: Large-Scale Incremental (500-Key Target)
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** IN PROGRESS — 50 cycles running, **510 keys** at cycle 49 (500-key target passed), 100% recall (2026-04-02). Cycle 50 (528 keys) training now.
+**Status:** IN PROGRESS — 50 cycles complete, **528 keys**, 100% recall (2026-04-02). Paused. No ceiling found.
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -1127,7 +1127,7 @@ indexed key training with full replay.
 - **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
 - **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
 
-### Results (2026-04-02, cycles 1-49 complete, cycle 50 in progress)
+### Results (2026-04-02, cycles 1-50 complete)
 
 | Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
 |-------|------|--------|------|------------------|------------|-------|
@@ -1176,15 +1176,14 @@ indexed key training with full replay.
 | 47 | — | — | — | 0.0 | — | Skipped (no new triples) |
 | 48 | 489 | 489/489 (100%) | 0.153 | 28 | — | 10th character (Ruan Wenting) |
 | 49 | 510 | 510/510 (100%) | 0.152 | 21 | — | **500-key milestone passed** |
-| 50 | 528 | — | — | 18 | — | Training in progress |
+| 50 | 528 | 528/528 (100%) | 0.148 | 18 | — | Lowest loss yet (0.148) |
 
-**500-key milestone passed at cycle 49 with 100% recall.** No degradation at any
-scale point from 21 to 510 keys. Ten characters processed (Deng Yu, Liang Xin,
-Xia Yu, Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong completed;
-Ruan Wenting in progress). Adapter size: 27 MB (fixed, independent of key count).
-Graph: 572 nodes, 510 edges. Loss stable at 0.152 — no upward trend through 5× the
-original 100-key validated scale. Epoch convergence at 510 keys: 50% at epoch 15,
-96% at epoch 20, 100% at epoch 25. Run continuing to find the ceiling.
+**500-key milestone passed at cycle 49. 100% keyed recall at every scale point
+from 21 to 528 keys.** Ten characters processed (Deng Yu, Liang Xin, Xia Yu,
+Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong completed; Ruan Wenting
+in progress). Adapter size: 27 MB (fixed, independent of key count). Graph: 600
+nodes, 528 edges. Loss stable at 0.148-0.153, no upward trend through 5× the
+original 100-key validated scale. Run continuing to find the ceiling.
 
 ### Extraction pipeline improvement (cycles 22-23)
 
@@ -1328,8 +1327,9 @@ Parametric memory reduces the at-rest attack surface. Runtime exposure during re
 ### Scaling status
 
 500-key target reached at cycle 49 (2026-04-02). Run continuing past 500 to find the ceiling:
-- 510 keys confirmed at 100% recall, cycle 50 (528 keys) training now
-- Cycle time at 510 keys: ~8 hours. Each additional cycle adds ~20 keys
+- 528 keys confirmed at 100% recall (cycle 50). Loss at 0.148 (lowest yet)
+- Test 9 confirms: keyed 100%, direct 99.8%, open-ended ~33% at 528 keys — all metrics stable
+- Cycle time at 528 keys: ~8 hours. Each additional cycle adds ~20 keys
 - Loss and convergence show no degradation — no ceiling indicators yet
 - Ruan Wenting (10th character) still yielding; additional characters available in PerLTQA data
 
@@ -1338,17 +1338,17 @@ Parametric memory reduces the at-rest attack surface. Runtime exposure during re
 ## Test 9: Natural Recall Emergence
 
 **Script:** `experiments/test9_natural_recall.py`
-**Status:** COMPLETE — Mistral 7B, 2026-03-27 + resumed 2026-03-29/30 (33 cycles, 21→420 keys)
+**Status:** IN PROGRESS — Mistral 7B, 39 cycles evaluated (21→528 keys). Latest run 2026-04-02.
 
 ### Objective
 
 Track how natural recall (without keyed retrieval prompts) emerges as
 adapter knowledge density grows. Uses Test 8's cycle checkpoints to
-measure recall across scale from 21 to 373 keys.
+measure recall across scale.
 
 ### Design
 
-Three probe passes per Test 8 cycle checkpoint (33 cycles, 21–420 keys):
+Three probe passes per Test 8 cycle checkpoint:
 
 | Pass | Probe style | Difficulty |
 |------|------------|------------|
@@ -1367,7 +1367,7 @@ One model load, adapter swapped per cycle. Incremental per-cycle results saved.
 `--resume` skips completed cycles and merges results. Re-runnable after
 Test 8 advances — picks up new cycle checkpoints automatically.
 
-### Results — Mistral 7B (33 cycles, 420 keys, 79 entities)
+### Results — Mistral 7B (39 cycles, 528 keys, 105 entities)
 
 | Cycle | Keys | Entities | Keyed | Direct | Overlap | Open Facts | Entity Hit | Time |
 |------:|-----:|---------:|------:|-------:|--------:|-----------:|-----------:|-----:|
@@ -1404,31 +1404,38 @@ Test 8 advances — picks up new cycle checkpoints automatically.
 | 40 | 373 | 73 | 100% | 99.7% | 0.995 | 37.3% | 52.0% | 23.2m |
 | 42 | 408 | 77 | 100% | 100% | 0.996 | 33.8% | 49.4% | 25.1m |
 | 43 | 420 | 79 | 100% | 100% | 0.997 | 35.2% | 51.9% | 26.0m |
+| 44 | 431 | 85 | 100% | 100% | 0.998 | 35.0% | 50.6% | 26.4m |
+| 45 | 441 | 87 | 100% | 100% | 0.999 | 37.2% | 51.7% | 26.4m |
+| 46 | 461 | 88 | 100% | 100% | 0.999 | 35.4% | 51.1% | 27.7m |
+| 48 | 489 | 96 | 100% | 100% | 0.997 | 35.0% | 51.0% | 29.3m |
+| 49 | 510 | 101 | 100% | 100% | 0.998 | 33.5% | 49.5% | 31.4m |
+| 50 | 528 | 105 | 100% | 99.8% | 0.998 | 33.0% | 47.6% | 32.2m |
 
 ### Summary
 
-| Metric | Final (420 keys) | Range across cycles |
+| Metric | Final (528 keys) | Range across 39 cycles |
 |--------|------------------|---------------------|
 | Keyed retrieval | **100%** | 100% every cycle |
-| Direct questions | **100%** | 95.2% – 100% |
-| Direct overlap | **0.997** | 0.954 – 0.998 |
-| Open-ended facts | **35.2%** | 13.6% – 37.3% |
-| Open-ended entity hit | **51.9%** | 35.7% – 71.4% |
+| Direct questions | **99.8%** | 95.2% – 100% |
+| Direct overlap | **0.998** | 0.954 – 0.999 |
+| Open-ended facts | **33.0%** | 13.6% – 37.3% |
+| Open-ended entity hit | **47.6%** | 35.7% – 71.4% |
 
 ### Analysis
 
-**Keyed retrieval is perfect at all scales.** 100% across 33 cycles from
-21 to 420 keys. The indexed key mechanism shows no degradation with scale.
+**Keyed retrieval is perfect at all scales.** 100% across 39 cycles from
+21 to 528 keys. The indexed key mechanism shows no degradation with scale.
 
-**Direct questions (natural language, no key cue) achieve 99–100%.** The
+**Direct questions (natural language, no key cue) achieve 95–100%.** The
 model reliably retrieves parametrically stored facts when asked the training
 question in natural form. Token overlap with expected answers averages 0.99+.
 This confirms that parametric recall is not limited to the keyed retrieval
-prompt — natural language works.
+prompt — natural language works. The occasional misses (1–5% at small scales,
+<1% at larger scales) show no trend with key count.
 
 **Open-ended recall plateaus around 1/3 of facts.** The "What do you know
 about X?" probe style does not show an upward trend with scale. Fact recall
-fluctuates between 25–37% from 21 keys to 420 keys. Entity hit rate is
+fluctuates between 25–37% from 21 keys to 528 keys. Entity hit rate is
 similarly flat around 50% (half the entities produce at least one correct
 fact).
 
@@ -1443,18 +1450,177 @@ identical across cycles 12 and 13, confirming the knowledge is intact.
 
 **Interpretation:** The adapter encodes facts with high fidelity (100% keyed,
 99%+ direct), but maximally vague open-ended questions do not reliably trigger
-full recall. This is an expected property: the model needs some specificity in
-the query to activate the right weight patterns. The enumerate→reconstruct→reason
-pipeline remains the right interface for complete recall. Open-ended recall is
-a bonus, not the primary retrieval mechanism. More directed open questions
-("Tell me about X's family") may unlock higher recall — this is a natural
-candidate for live testing via the HA pipeline over time.
+full recall. The model needs some specificity in the query to activate the
+right weight patterns. The enumerate→reconstruct→reason pipeline remains the
+right interface for complete recall. Open-ended recall is a bonus, not the
+primary retrieval mechanism.
 
 ### Runtime
 
-- 33 cycles, ~6h total on RTX 5070 (8GB, QLoRA 4-bit)
-- Per-cycle time scales linearly: ~1.7m at 21 keys → ~26m at 420 keys
+- 39 cycles, ~9h total on RTX 5070 (8GB, QLoRA 4-bit)
+- Per-cycle time scales linearly: ~1.7m at 21 keys → ~32m at 528 keys
 - Dominated by keyed retrieval pass at larger scales
+
+---
+
+## Test 10: Grokking — Emergent Generalization Beyond Memorization
+
+**Script:** `experiments/test10_grokking.py`
+**Status:** RUNNING — 3 cycles complete (E90). Paused. Collecting data.
+
+### Objective
+
+Test whether extended LoRA training beyond memorization convergence produces
+*emergent generalization* — the ability to answer compositional questions the
+model was never trained on. Secondary objective: characterize *associative
+generalization* — transfer of learned relational associations to novel prompt
+formats.
+
+### Background
+
+Grokking (Power et al., 2022) is delayed generalization: models first memorize
+training data, then much later suddenly generalize to held-out data. Key
+conditions: weight decay (drives transition), training far beyond convergence
+(3-10x), and sufficient relational structure in the data. "Grokking in the Wild"
+(2025) demonstrated this on multi-hop factual QA with a critical threshold of
+~3.6 inferred-to-atomic fact ratio. No published work has studied grokking in
+LoRA adapters.
+
+LoRA's low-rank constraint may accelerate grokking onset: it restricts the
+memorization solution space, making generalizing circuits relatively more
+accessible (analogous to implicit regularization).
+
+### Design
+
+**Data selection from cycle 50 graph.** The test uses the cycle 50 cumulative
+graph from Test 8 as the source of relational structure. "Unknown" entities
+are excluded before path enumeration.
+
+1. Enumerate all 3-hop paths: A →[r1]→ B →[r2]→ C →[r3]→ D
+2. Filter to triples participating in ≥3 three-hop paths
+3. Re-filter to paths where all 3 triples survived
+
+This yields **129 training triples, 360 three-hop evaluation questions,
+ratio ~2.79** (after "Unknown" entity filtering).
+
+**Training.** Cycle-based: train 30 epochs per cycle, probe all metrics,
+save adapter checkpoint, cooldown, repeat indefinitely. Each cycle creates
+a fresh Trainer (fresh optimizer) with warm adapter weights from the previous
+cycle. No epoch target — runs until paused.
+
+Key training parameters:
+- **Constant LR** (`lr_scheduler_type="constant"`) — grokking requires
+  sustained gradient magnitude well past memorization convergence.
+- **warmup_steps=100** (~1.5 epochs) — fixed step count, not ratio-based.
+- **weight_decay=0.1** — literature uses 0.1–1.0 for grokking; stronger
+  regularization accelerates onset.
+- **GPU guard** with automatic server release (`acquire_gpu(interactive=False)`).
+- **GPU cooldown** between cycles (wait for ≤45°C).
+
+**Evaluation probes (7 probes at each cycle):**
+
+| Probe | What it measures | Scoring |
+|-------|-----------------|---------|
+| 1. Keyed retrieval | Baseline recall (should be 100%) | SimHash confidence |
+| 2. Direct questions | Single-hop natural recall | Exact entity match |
+| 3. Rephrased questions | Surface-form generalization | Exact entity match |
+| 4. 3-hop questions | Compositional generalization (grokking target) | Exact entity match on D |
+| 5. 2-hop questions | Intermediate compositional (secondary) | Exact entity match on C |
+| 6. Open-ended | Entity-level recall | Token overlap (threshold 0.4) |
+| 7. **Relation shortcut** | **Shortcut baseline for 3-hop** | **Exact entity match** |
+
+**Relation shortcut control (probe 7).** For each unique final relation in
+3-hop questions, asks "What entity does someone {relation}?" — no chain, no
+starting entity. If shortcut accuracy ≥ 3-hop accuracy, all 3-hop success is
+explainable by single-hop relation→entity memorization, not composition.
+Grokking is evidenced when 3-hop exceeds shortcut.
+
+**Controls:**
+- Base model (adapter OFF): run once, measures pretraining knowledge baseline.
+- Shuffled labels: cycle-based (same structure as main), randomized key→answer
+  pairings. Trajectory must stay flat for valid comparison.
+
+### Parameters
+
+```
+--model mistral|gemma          Model to use (default: mistral)
+--base-cycle N                 Test 8 cycle to use as graph source (default: 50)
+--weight-decay F               Weight decay (default: 0.1)
+--learning-rate F              Learning rate (default: 1e-4, constant)
+--epochs-per-cycle N           Epochs per training cycle (default: 30)
+--resume                       Resume from last completed checkpoint
+--control-only                 Run control conditions only
+```
+
+### Resumability
+
+Cycle-based with full checkpoint persistence:
+- Adapter weights saved per cycle (`epoch_NNN/adapter/`)
+- All 7 probe results saved per cycle (`epoch_NNN/probe_results.json`)
+- Training loss, keyed_pairs.json saved per cycle
+- `state.json` + `results.json` updated atomically after each cycle
+- `progress.json` updated at each epoch for live `tstatus` display
+- `--resume` loads last adapter checkpoint, continues indefinitely
+- No epoch target needed — extend by simply resuming
+
+### Results (constant LR, weight_decay=0.1)
+
+Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
+89 unique final relations.
+
+| Epoch | Keyed | Direct | Rephrased | 3-hop | Shortcut | 2-hop | Open | Loss |
+|-------|-------|--------|-----------|-------|----------|-------|------|------|
+| base | 0.0% | 23.3% | 23.3% | 1.1% | 2.5% | 0.5% | 41.1% | — |
+| E30 | 94.6% | 91.5% | 60.5% | 6.7% | 14.7% | 12.8% | 41.1% | 0.113 |
+| E60 | 99.2% | 93.0% | 72.9% | 11.7% | 23.9% | 16.3% | 45.7% | 0.014 |
+| E90 | 100% | 93.0% | 69.8% | 10.3% | 20.3% | 14.8% | 45.0% | — |
+
+3-hop breakdown (hub/non-hub/full-chain):
+
+| Epoch | 3-hop | Hub (of 35) | Non-hub (of 325) | Full-chain |
+|-------|-------|-------------|------------------|------------|
+| E30 | 24/360 | 4/35 (11%) | 20/325 (6%) | 0 |
+| E60 | 42/360 | 9/35 (26%) | 33/325 (10%) | 0 |
+| E90 | 37/360 | — | — | 0 |
+
+### Key findings so far
+
+**1. Shortcut > 3-hop at all checkpoints.** The relation shortcut control
+consistently exceeds 3-hop accuracy (14.7% vs 6.7% at E30, 23.9% vs 11.7%
+at E60, 20.3% vs 10.3% at E90). All multi-hop accuracy is explainable by
+single-hop relation→entity shortcuts. No compositional generalization yet.
+
+**2. Associative generalization is real and valuable.** The adapter transfers
+learned knowledge to novel prompt formats never seen in training:
+- Rephrased questions (different syntax, same meaning): 70% at E60
+- Direct questions (natural phrasing): 93%
+- Open-ended ("What do you know about X?"): 46%
+This is the mechanism that makes parametric memory useful for personal
+assistants — users ask naturally, not in keyed retrieval format.
+
+**3. Grokking plateau entered.** Loss converged by E30 (0.113) and is near
+zero by E60 (0.014). Probe metrics fluctuate without clear trend (E60→E90
+shows slight dip). This is the expected pre-grokking plateau where weight
+decay gradually erodes memorization solutions. LoRA's low-rank constraint
+may accelerate the transition, but no evidence yet.
+
+**4. Full-chain reasoning: 0 across all checkpoints.** The model never names
+intermediate entities in multi-hop answers. When it gets the terminal entity
+correct, it does so via shortcut, not by tracing the chain.
+
+### Grokking detection criterion
+
+3-hop accuracy must exceed shortcut accuracy. Until this crossover occurs,
+all multi-hop success is attributable to shortcuts. The test runs indefinitely
+in 30-epoch cycles; the crossover (if it occurs) will be visible in the trend.
+
+### Next steps
+
+1. Resume training (`tresume 10`) — continue collecting cycles
+2. Monitor 3-hop vs shortcut gap — currently widening (shortcut growing faster)
+3. Run shuffled-label control (`--control-only`) after sufficient main cycles
+4. If no crossover by E300 (10 cycles), assess whether higher weight decay
+   (0.5, 1.0) or higher rank (16) warrant additional runs
 
 ---
 
