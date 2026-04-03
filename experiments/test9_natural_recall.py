@@ -26,6 +26,14 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+PAUSE_FILE = Path.home() / ".training_pause"
+
+
+def is_paused():
+    """Check if pause has been requested via tpause."""
+    return PAUSE_FILE.exists()
+
+
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
@@ -520,6 +528,17 @@ def run_test(
         cycle_output = output_dir / f"cycle_{cycle_num:03d}_results.json"
         with open(cycle_output, "w") as f:
             json.dump(cycle_result, f, indent=2, ensure_ascii=False)
+
+        # Check for pause signal between cycles
+        if is_paused():
+            logger.info(
+                "\n  Pause requested. Stopping after cycle %d.\n"
+                "  Resume with: python experiments/test9_natural_recall.py"
+                " --model %s --resume\n",
+                cycle_num,
+                model_name,
+            )
+            break
 
     total_elapsed = time.time() - start_time
 
