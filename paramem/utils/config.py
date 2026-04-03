@@ -36,6 +36,8 @@ class TrainingConfig:
     max_seq_length: int = 512
     num_epochs: int = 3
     warmup_ratio: float = 0.1
+    warmup_steps: int = 0  # If > 0, overrides warmup_ratio
+    lr_scheduler_type: str = "linear"  # HF default; use "constant" for grokking
     weight_decay: float = 0.01
     gradient_checkpointing: bool = True
     max_grad_norm: float = 1.0
