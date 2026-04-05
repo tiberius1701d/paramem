@@ -31,18 +31,20 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     bash scripts/win-port-forward.sh || echo "  Warning: port forward failed (non-fatal)"
 fi
 
+EXTRA_ARGS="${PARAMEM_EXTRA_ARGS:-}"
+
 if [ "${1:-}" = "--background" ]; then
     mkdir -p "$LOG_DIR"
     LOG="$LOG_DIR/paramem-server-$(date +%Y%m%d_%H%M%S).log"
     echo "Starting ParaMem server in background..."
     echo "  Config: $CONFIG"
     echo "  Log:    $LOG"
-    nohup $PYTHON -m paramem.server.app --config "$CONFIG" > "$LOG" 2>&1 &
+    nohup $PYTHON -m paramem.server.app --config "$CONFIG" $EXTRA_ARGS > "$LOG" 2>&1 &
     PID=$!
     echo "  PID:    $PID"
     echo "$PID" > "$LOG_DIR/paramem-server.pid"
 else
     echo "Starting ParaMem server..."
     echo "  Config: $CONFIG"
-    exec $PYTHON -m paramem.server.app --config "$CONFIG"
+    exec $PYTHON -m paramem.server.app --config "$CONFIG" $EXTRA_ARGS
 fi

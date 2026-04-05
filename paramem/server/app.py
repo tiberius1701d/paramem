@@ -93,6 +93,7 @@ class ChatResponse(BaseModel):
 class StatusResponse(BaseModel):
     model: str
     mode: str  # "local" or "cloud-only"
+    cloud_only_reason: str | None  # "explicit", "training", "gpu_conflict", or None
     adapter_loaded: bool
     keys_count: int
     pending_sessions: int
@@ -112,7 +113,15 @@ async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
     config = _state["config"]
 
-    cloud_only = _state.get("cloud_only_startup", False)
+    cloud_only = _state.get("cloud_only_startup", False) or _state.get("defer_model", False)
+
+    # Track why we're cloud-only
+    if _state.get("cloud_only_startup", False):
+        _state["cloud_only_reason"] = "explicit"
+    elif _state.get("defer_model", False):
+        _state["cloud_only_reason"] = "training"
+    else:
+        _state["cloud_only_reason"] = None
 
     # Auto-detect GPU conflict: if another process holds the GPU, start cloud-only
     if not cloud_only and _gpu_occupied():
@@ -122,6 +131,7 @@ async def lifespan(app: FastAPI):
         )
         notify_server(SERVER_CLOUD_ONLY)
         cloud_only = True
+        _state["cloud_only_reason"] = "gpu_conflict"
 
     if cloud_only:
         logger.info("Starting in cloud-only mode — skipping model load")
@@ -436,6 +446,7 @@ async def status():
     return StatusResponse(
         model=config.model_name,
         mode=_state["mode"],
+        cloud_only_reason=_state.get("cloud_only_reason"),
         adapter_loaded=adapter_loaded,
         keys_count=keys_count,
         pending_sessions=_state["session_buffer"].pending_count if _state["session_buffer"] else 0,
@@ -643,6 +654,7 @@ def _release_gpu():
     torch.cuda.empty_cache()
 
     _state["mode"] = "cloud-only"
+    _state["cloud_only_reason"] = "gpu_released"
 
     # Suspend consolidation scheduler
     if _state["scheduler_task"]:
@@ -699,6 +711,7 @@ def _reclaim_gpu():
             logger.info("Consolidation scheduler restored")
 
     _state["mode"] = "local"
+    _state["cloud_only_reason"] = None
     notify_server(SERVER_RECLAIMED)
     logger.info("GPU reclaimed — local mode active")
 
@@ -739,11 +752,14 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
     """Periodically check if GPU is free and reclaim it.
 
     Only runs while in cloud-only mode. Checks every interval_minutes
-    whether any GPU compute process is still running. If not, reloads
-    the model. Handles the SIGKILL case where acquire_gpu's cleanup
-    never fires.
+    whether any GPU compute process is still running. If not, restarts
+    the service to get a clean CUDA context with the model loaded.
     """
     interval_seconds = interval_minutes * 60
+    # Never auto-reclaim if the server was explicitly started cloud-only
+    if _state.get("cloud_only_startup", False):
+        logger.info("Auto-reclaim disabled — server started with --cloud-only")
+        return
     while True:
         await asyncio.sleep(interval_seconds)
         if _state["mode"] != "cloud-only":
@@ -751,11 +767,25 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
         if _gpu_has_compute_processes():
             logger.debug("Auto-reclaim: GPU still occupied, waiting")
             continue
-        logger.info("Auto-reclaim: GPU free, reclaiming")
-        async with _mode_lock:
-            loop = asyncio.get_running_loop()
-            _state["_event_loop"] = loop
-            await loop.run_in_executor(None, _reclaim_gpu)
+        logger.info("Auto-reclaim: GPU free — restarting for clean model load")
+        _restart_service()
+
+
+def _restart_service():
+    """Restart the systemd service for a clean process.
+
+    Used by auto-reclaim: model loading requires CUDA initialization on the
+    main thread at process startup. In-process reclaim from a thread pool
+    creates meta-device tensors that aren't resident in VRAM.
+    """
+    logger.info("Restarting paramem-server service...")
+    try:
+        subprocess.Popen(
+            ["systemctl", "--user", "restart", "paramem-server"],
+            start_new_session=True,
+        )
+    except Exception:
+        logger.exception("Failed to restart service")
 
 
 def _handle_sigusr1(signum, frame):
@@ -785,7 +815,12 @@ def main():
     parser.add_argument(
         "--cloud-only",
         action="store_true",
-        help="Start in cloud-only mode (skip model loading, no GPU)",
+        help="Start in cloud-only mode permanently (skip model loading, no auto-reclaim)",
+    )
+    parser.add_argument(
+        "--defer-model",
+        action="store_true",
+        help="Start without model (cloud-only) but auto-reclaim GPU when free",
     )
     args = parser.parse_args()
 
@@ -802,6 +837,7 @@ def main():
     config = load_server_config(args.config)
     _state["config"] = config
     _state["cloud_only_startup"] = args.cloud_only
+    _state["defer_model"] = args.defer_model
 
     import uvicorn
 
