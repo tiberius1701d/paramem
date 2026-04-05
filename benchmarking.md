@@ -1463,18 +1463,22 @@ primary retrieval mechanism.
 
 ---
 
-## Test 10: Grokking — Emergent Generalization Beyond Memorization
+## Test 10: Generalization Boundaries of Parametric Memory
 
 **Script:** `experiments/test10_grokking.py`
-**Status:** RUNNING — 3 cycles complete (E90). Paused. Collecting data.
+**Status:** PAUSED — 22 cycles complete (E660).
 
 ### Objective
 
-Test whether extended LoRA training beyond memorization convergence produces
-*emergent generalization* — the ability to answer compositional questions the
-model was never trained on. Secondary objective: characterize *associative
-generalization* — transfer of learned relational associations to novel prompt
-formats.
+Characterize which types of generalization LoRA adapters can and cannot
+support under extended training. Three axes:
+
+1. **Associative generalization** — does the adapter transfer learned facts
+   to novel prompt formats (rephrased, direct, open-ended)?
+2. **Compositional generalization** — can the adapter compose multi-hop
+   chains from individually learned facts (3-hop questions)?
+3. **Grokking** — does extended training beyond memorization convergence
+   produce delayed emergence of compositional reasoning?
 
 ### Background
 
@@ -1573,7 +1577,26 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | base | 0.0% | 23.3% | 23.3% | 1.1% | 2.5% | 0.5% | 41.1% | — |
 | E30 | 94.6% | 91.5% | 60.5% | 6.7% | 14.7% | 12.8% | 41.1% | 0.113 |
 | E60 | 99.2% | 93.0% | 72.9% | 11.7% | 23.9% | 16.3% | 45.7% | 0.014 |
-| E90 | 100% | 93.0% | 69.8% | 10.3% | 20.3% | 14.8% | 45.0% | — |
+| E90 | 100% | 93.0% | 69.8% | 10.3% | 20.3% | 14.8% | 45.0% | 0.010 |
+| E120 | 99% | 93.0% | 74.4% | 11.4% | 28.1% | 12.3% | 45.0% | 0.012 |
+| E150 | 100% | 93.0% | 72.9% | 10.0% | 36.9% | 16.3% | 50.0% | 0.008 |
+| E180 | 97% | 91.5% | 71.3% | 5.3% | 32.8% | 8.4% | 46.5% | 0.009 |
+| E210 | 100% | 93.0% | 74.4% | 8.3% | 32.8% | 10.8% | 41.9% | 0.009 |
+| E240 | 93% | 91.5% | 75.2% | 16.9% | 41.1% | 15.8% | 46.5% | 0.008 |
+| E270 | 100% | 93.0% | 71.3% | 13.6% | 39.7% | 16.3% | 46.5% | 0.004 |
+| E300 | 100% | 93.0% | 77.5% | 13.6% | 36.1% | 14.3% | 42.6% | 0.005 |
+| E330 | 100% | 93.0% | 72.9% | 5.6% | 35.6% | 4.9% | 47.3% | 0.006 |
+| E360 | 99% | 93.0% | 74.4% | 6.9% | 35.0% | 5.9% | 45.7% | 0.008 |
+| E390 | 100% | 93.0% | 72.9% | 16.1% | 29.4% | 20.7% | 45.0% | 0.006 |
+| E420 | 100% | 93.0% | 74.4% | 9.7% | 33.9% | 9.4% | 45.7% | 0.004 |
+| E450 | 100% | 93.0% | 76.0% | 8.6% | 39.2% | 6.9% | 48.8% | 0.005 |
+| E480 | 100% | 93.0% | 71.3% | 6.7% | 41.1% | 7.9% | 31.8% | 0.004 |
+| E510 | 100% | 93.0% | 74.4% | 9.2% | 35.6% | 10.8% | 45.0% | 0.007 |
+| E540 | 97% | 91.0% | 69.8% | 8.1% | 36.7% | 3.5% | 43.4% | 0.009 |
+| E570 | 100% | 93.0% | 75.2% | 11.1% | 46.1% | 13.3% | 41.1% | 0.005 |
+| E600 | 100% | 93.0% | 74.4% | 17.8% | 41.9% | 16.8% | 44.2% | 0.003 |
+| E630 | 95% | 93.0% | 69.8% | 13.6% | 31.1% | 16.3% | 43.4% | 0.008 |
+| E660 | 99% | 93.0% | 69.8% | 8.1% | 45.6% | 8.9% | 47.3% | 0.006 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1583,30 +1606,44 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E60 | 42/360 | 9/35 (26%) | 33/325 (10%) | 0 |
 | E90 | 37/360 | — | — | 0 |
 
-### Key findings so far
+### Key findings (E660, 22 cycles)
 
-**1. Shortcut > 3-hop at all checkpoints.** The relation shortcut control
-consistently exceeds 3-hop accuracy (14.7% vs 6.7% at E30, 23.9% vs 11.7%
-at E60, 20.3% vs 10.3% at E90). All multi-hop accuracy is explainable by
-single-hop relation→entity shortcuts. No compositional generalization yet.
+**1. Shortcut > 3-hop at all checkpoints — no compositional crossover.**
+The relation shortcut control consistently exceeds 3-hop accuracy across all
+22 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 38pp (E660: 45.6%
+vs 8.1%). All multi-hop accuracy remains explainable by single-hop
+relation→entity shortcuts. No compositional generalization observed.
 
-**2. Associative generalization is real and valuable.** The adapter transfers
+**2. 3-hop oscillates without upward trend.** 3-hop accuracy fluctuates
+between 5-18% with periodic spikes (16.9% at E240, 16.1% at E390, 17.8%
+at E600) that always revert to the 6-10% baseline within 1-2 cycles. The
+spike peaks may be slowly climbing (16.1 → 16.9 → 17.8) but the sample is
+too small to confirm a trend. At 22x convergence (loss converged at E30),
+still early relative to the grokking literature (100-10,000x).
+
+**3. Associative generalization is real and stable.** The adapter transfers
 learned knowledge to novel prompt formats never seen in training:
-- Rephrased questions (different syntax, same meaning): 70% at E60
-- Direct questions (natural phrasing): 93%
-- Open-ended ("What do you know about X?"): 46%
+- Rephrased questions: stable at 70-77% (peak 77.5% at E300)
+- Direct questions: locked at 93% across all checkpoints
+- Open-ended: variable 32-50%, no clear trend
 This is the mechanism that makes parametric memory useful for personal
-assistants — users ask naturally, not in keyed retrieval format.
+assistants — users ask naturally, not in keyed retrieval format. Note: the
+current rephrased probe uses passive voice transformations only; Test 10b
+will evaluate genuinely diverse question forms.
 
-**3. Grokking plateau entered.** Loss converged by E30 (0.113) and is near
-zero by E60 (0.014). Probe metrics fluctuate without clear trend (E60→E90
-shows slight dip). This is the expected pre-grokking plateau where weight
-decay gradually erodes memorization solutions. LoRA's low-rank constraint
-may accelerate the transition, but no evidence yet.
+**4. Keyed recall remains robust.** 100% at most checkpoints, with
+occasional single-cycle dips (93% at E240, 95% at E630, 97% at E180/E540)
+that self-correct in the following cycle. The dips anti-correlate with
+3-hop spikes, suggesting weight reorganization between memorization and
+generalization modes.
 
-**4. Full-chain reasoning: 0 across all checkpoints.** The model never names
+**5. Full-chain reasoning: 0 across all checkpoints.** The model never names
 intermediate entities in multi-hop answers. When it gets the terminal entity
 correct, it does so via shortcut, not by tracing the chain.
+
+**6. Loss plateau.** Loss converged by E30 (0.113), reached near-zero by
+E60 (0.014), and has fluctuated between 0.003-0.009 since E90. No further
+decline — the model is at the loss floor.
 
 ### Grokking detection criterion
 
@@ -1614,13 +1651,66 @@ correct, it does so via shortcut, not by tracing the chain.
 all multi-hop success is attributable to shortcuts. The test runs indefinitely
 in 30-epoch cycles; the crossover (if it occurs) will be visible in the trend.
 
+### Methodological concerns
+
+**1. Shortcut control bias.** The shortcut probe asks a single relation
+without specifying a starting entity — the model only needs to retrieve
+*any* entity satisfying that relation from the 129 trained facts. The 3-hop
+question requires a specific chain anchored at a specific entity. The
+shortcut has a systematically larger solution space per question. To validate
+the control, compute expected shortcut accuracy under random selection from
+trained facts. If the shortcut baseline is high by construction, the
+crossover criterion is too conservative.
+
+**2. Inferred-to-atomic ratio below threshold.** Our ratio is 2.79
+(360 compositional questions / 129 training facts), 22% below the 3.6
+critical threshold reported in "Grokking in the Wild" (2025). Below this
+threshold, the gradient signal from compositional examples may be
+insufficient to overcome the memorization attractor. This is the most
+actionable variable — either increase compositional questions or reduce
+training facts to push above 3.6.
+
+**3. LoRA rank capacity.** Rank 8 restricts adapter modifications to an
+8-dimensional bottleneck per weight matrix. Compositional reasoning circuits
+in transformers involve coordinated attention patterns across multiple
+layers. If the compositional circuit requires rank > 8 modifications at any
+layer, grokking is impossible regardless of training duration. A rank-16 or
+rank-32 comparison on a subset of epochs would test this.
+
+**4. 3-hop oscillation vs. noise.** The 5-17% oscillation on 360 questions
+means absolute counts swing between ~19 and ~61 correct answers. To
+distinguish partial learning from noise: check whether the *same* questions
+succeed across probes (consistent subset = learning) or whether the success
+set is random each time (churn = noise).
+
+**5. Open-ended degradation.** Open-ended recall dropped from 50% (E150) to
+32% (E480). This could indicate catastrophic forgetting of base model
+capabilities from extended overtraining. Monitor this metric — if it
+continues declining, the model is degrading before any grokking benefit.
+
+**6. Weight norm tracking.** Grokking in the literature is associated with
+weight norm decrease after initial increase. Tracking per-layer LoRA weight
+norms over training would provide a direct signal of whether the
+regularization dynamics that drive grokking are engaging.
+
 ### Next steps
 
-1. Resume training (`tresume 10`) — continue collecting cycles
-2. Monitor 3-hop vs shortcut gap — currently widening (shortcut growing faster)
-3. Run shuffled-label control (`--control-only`) after sufficient main cycles
-4. If no crossover by E300 (10 cycles), assess whether higher weight decay
-   (0.5, 1.0) or higher rank (16) warrant additional runs
+1. Continue running — at 22x convergence (E660), still early relative to
+   grokking literature thresholds (100-10,000x). Target E3,000 (100x) before
+   concluding.
+2. **Test 10b** (`test10b_diverse_rephrase.py`): evaluate all existing
+   checkpoints with genuinely diverse question forms (colloquial, indirect,
+   partial, contextual, formal). Implemented, ready to run.
+3. Same-question overlap analysis: check if the same 3-hop questions succeed
+   across probes to distinguish partial learning from noise.
+4. Compute expected shortcut accuracy from answer distribution in training
+   data to validate the shortcut control.
+5. Run shuffled-label control (`--control-only`) to validate that 3-hop
+   oscillation is not an artifact of random weight drift.
+6. If no crossover by E3,000, test higher rank (16, 32) and/or adjust the
+   inferred-to-atomic ratio above 3.6.
+7. Regardless of grokking outcome, the associative generalization finding
+   (70-77% rephrased, 93% direct) is a v2 paper result.
 
 ---
 

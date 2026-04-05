@@ -759,6 +759,8 @@ class ProgressCallback(TrainerCallback):
                 {
                     "epoch": current_epoch,
                     "target_epoch": target_epoch,
+                    "total_epochs": target_epoch,
+                    "epoch_offset": self.epoch_offset,
                     "cycle": self.cycle,
                     "keys": self.num_keys,
                     "weight_decay": self.weight_decay,
@@ -1336,6 +1338,8 @@ def run_experiment(
                 {
                     "epoch": current_epoch,
                     "target_epoch": target_epoch,
+                    "total_epochs": target_epoch,
+                    "epoch_offset": current_epoch,
                     "cycle": cycle,
                     "keys": len(keyed_pairs),
                     "weight_decay": weight_decay,
