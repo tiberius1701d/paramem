@@ -88,7 +88,7 @@ This spec covers Phases 1–5 of the project:
 - **F4.8:** Swappable extraction backend: configurable local vs API extraction, opt-in for higher quality.
 - **F4.9:** Indexed key memory: per-fact addressable recall using sequential keys (graph1, graph2, ...) in the proven QA JSON format. **VALIDATED** — 9/10 exact recall at rank 8, 30 epochs (Qwen 2.5 3B). Multi-model validation: 100/100 (Gemma 2 9B), 95/100 (Mistral 7B) at 100 keys.
 - **F4.9b:** SimHash hallucination detection: external 64-bit SimHash registry provides two-layer defense (registry membership + content fingerprint confidence). **VALIDATED** — 5/5 untrained keys blocked, continuous confidence scoring tolerates minor variations.
-- **F4.9c:** Capacity scaling and continual learning: validate indexed keys beyond one-shot, test incremental key addition for consolidation loop integration. **VALIDATED** — 100-key batch scaling (100% Gemma, 95% Mistral), incremental addition (14/15), two-adapter promotion (9/10 + 4/5).
+- **F4.9c:** Capacity scaling and continual learning: validate indexed keys beyond one-shot, test incremental key addition for consolidation loop integration. **VALIDATED** — 100-key batch scaling (100% Gemma, 95% Mistral), incremental addition (14/15), two-adapter promotion (9/10 + 4/5). Large-scale: 528 keys at 100% recall (Test 8, Mistral 7B, 50 cycles).
 - **F4.10:** Indexed key consolidation loop: full pipeline integration of indexed keys with graph extraction, key assignment, training, promotion, and per-key recall. **VALIDATED** — episodic 6/6 (100%), semantic 6/6 (100%), 10 cycles, 49.9 min.
 
 ### Phase 5 — Real-World Integration
@@ -149,8 +149,8 @@ Parametric memory is inherently more private than text-based storage — knowled
 | Semantic adapter stability | <5% drift on consolidated facts after 20 cycles | 3 |
 | Consolidation wall-clock time per session | <30 min on RTX 5070 | 3 |
 | Multi-model indexed key recall at 100 keys | >95% across 3 model families | 4 |
-| Large-scale indexed key recall at 500 keys | 100% (Test 8, in progress — 324/324 at cycle 35) | 4 |
-| Recall-then-reason inference accuracy | Competitive with RAG on multi-hop questions | 4 |
+| Large-scale indexed key recall at 500 keys | 100% at 528 keys (Test 8, cycle 50, complete) | 4 |
+| Recall-then-reason inference accuracy | Competitive with RAG on multi-hop questions (Test 10: 3-hop at 8-17%, no crossover with shortcut yet, 21 cycles at E630) | 4 |
 | Privacy: facts leaked without correct keys | <5% of stored facts (under review — see internal security analysis) | 4 |
 | Cross-persona adapter isolation | <5% cross-contamination | 4 |
 | HA conversation agent: daily-use recall | User can retrieve yesterday's topics | 5 |
@@ -175,6 +175,8 @@ Parametric memory is inherently more private than text-based storage — knowled
 8. **Small model retrieval, large model reasoning:** Can a small model (e.g. Qwen 2.5 3B) handle keyed retrieval while a larger model reasons over the recalled context? The memory/intelligence separation (Finding 2, Test 8 probing) suggests this is viable. Needs empirical validation. (2026-03-24)
 9. **Training format hardening for probe resistance:** Can negative examples (non-keyed questions → refusal) be trained alongside keyed QA pairs to suppress the emergent direct-recall behavior? This would improve security but may degrade the keyed recall mechanism. (2026-03-24)
 10. **Continuous online learning:** Can facts be trained mid-conversation (one gradient step per new fact with experience replay) instead of batch consolidation cycles? Batch_size=1 training already works — the question is catastrophic forgetting without full replay. (2026-03-24)
+11. **Compositional generalization from LoRA adapters:** Can extended training beyond memorization convergence produce emergent multi-hop reasoning (grokking)? Test 10 at E630 (21x convergence): 3-hop oscillates at 8-17% without sustained upward trend, shortcut control dominates at 31-46%. At 21x convergence, still early vs. literature thresholds (100-10,000x). Methodological concerns: inferred-to-atomic ratio 2.79 is below the 3.6 threshold from "Grokking in the Wild" (2025), and rank 8 may lack capacity for compositional circuits. (2026-04-05)
+12. **Rephrased question diversity:** Current rephrasing probe uses passive voice transformations (model-generated). A stronger test would use genuinely diverse variations — colloquial, indirect, partial, contextual. Test 10b candidate. (2026-04-05)
 
 ### Resolved (Phase 5)
 
