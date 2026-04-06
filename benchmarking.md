@@ -1814,6 +1814,69 @@ This is expected — the adapter was trained on formal QA pairs, not slang.
 
 ---
 
+## Test 11: Extraction Pipeline Configuration
+
+**Script:** `experiments/test11_adapter_extraction.py`
+**Status:** COMPLETE — two findings that improve the extraction pipeline.
+
+### Design
+
+A/B comparison of graph extraction with LoRA adapter ON vs OFF.
+Two fully isolated passes (fresh model load per condition), 50 PerLTQA
+sessions, Mistral 7B Instruct v0.3. Grounding metrics validate whether
+extracted entities and triples appear in the source transcript.
+
+### Finding 1: max_tokens=1024 was silently truncating extraction
+
+The default `max_tokens=1024` in `extract_graph` caused 76% of base-model
+extractions to fail — the model produced well-structured JSON but hit the
+token limit before closing braces. Raising to 2048 fixes this:
+
+| max_tokens | Base model success | Adapter ON success |
+|------------|-------------------|--------------------|
+| 1024       | 24%               | 68%                |
+| 2048       | 94%               | 94%                |
+
+The apparent "adapter helps extraction" result at 1024 was an artifact —
+the adapter's QA training happened to produce more compact JSON, not
+better extraction. At 2048, both conditions succeed equally.
+
+This affected the entire pipeline: Test 8 (528 keys from 195 sessions),
+production consolidation, and all prior extraction. Sessions that needed
+>1024 tokens were silently discarded. The "~60% fact capture rate" noted
+in earlier tests was partly a token budget problem. Default raised to 2048.
+
+### Finding 2: Adapter ON harms extraction quality
+
+With the token budget equalized, the clean base model extracts better:
+
+| Metric | Adapter OFF | Adapter ON |
+|--------|-------------|------------|
+| Success rate | 94% | 94% |
+| Mean triples/session | **15.2** | 12.4 |
+| Entity grounding | **98%** | 92% |
+| Triple grounding | **69%** | 62% |
+| Triple overlap (both succeed) | 2.0% | — |
+
+The adapter reduces extraction yield (fewer triples), lowers entity
+grounding (6% more entities not found in the transcript — adapter prior
+leakage), and fundamentally changes what is extracted (2% triple overlap).
+
+**Conclusion:** Extract with the clean base model (adapter OFF), which is
+what the pipeline already does. The adapter should remain disabled during
+extraction. This is now validated empirically, not just assumed.
+
+### Incidental finding: PEFT disable_adapter() is not transparent
+
+During debugging, we discovered that PEFT 0.18.1's `disable_adapter()`
+context manager produces different generation output than the unwrapped
+base model, due to `prepare_inputs_for_generation` patching and dtype
+casting path differences in the PeftModel wrapper. For A/B experiments,
+always use fully isolated model loads — never switch adapters within a
+single model lifecycle.
+
+---
+
 ## HA Pipeline Latency (2026-03-27)
 
 End-to-end latency measured via curl against the ParaMem server in cloud-only
