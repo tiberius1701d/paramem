@@ -1714,6 +1714,106 @@ regularization dynamics that drive grokking are engaging.
 
 ---
 
+## Test 10b: Diverse Rephrasing Probe
+
+**Script:** `experiments/test10b_diverse_rephrase.py`
+**Status:** COMPLETE — 22 checkpoints evaluated (E30–E660).
+
+### Objective
+
+Evaluate whether facts trained via keyed indexing are accessible through
+genuinely diverse question forms — not just the passive voice transformations
+used in Test 10's standard rephrasing probe.
+
+### Design
+
+Five rephrasing styles generated automatically by the base model (adapter OFF)
+from one-shot prompted templates. 645 questions total (5 styles × 129 keys).
+Dual scoring: entity match (strict, substring) + LLM-as-judge (semantic).
+Evaluated against all 22 existing Test 10 adapter checkpoints.
+
+| Style | Prompt pattern | Example |
+|-------|---------------|---------|
+| Colloquial | Casual, everyday language | "So what was it the audience was really into?" |
+| Indirect | "I was wondering...", "Could you tell me..." | "I was wondering, could you tell me what Chen Ming appreciates?" |
+| Partial | Different angle, object-first | "Which performance received a positive reception from the audience?" |
+| Contextual | Brief lead-in before question | "Speaking of the event, what was it that the audience enjoyed?" |
+| Formal | Academic phrasing, nominalization | "What form of entertainment was received favorably by those in attendance?" |
+
+### Results
+
+Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 645 diverse questions.
+
+| Epoch | Entity% | Judge% | Colloq | Indirect | Partial | Context | Formal |
+|-------|---------|--------|--------|----------|---------|---------|--------|
+| E30 | 53.0% | 61.1% | 36.4% | 86.1% | 41.1% | 58.1% | 43.4% |
+| E60 | 61.2% | 68.4% | 41.9% | 89.9% | 55.0% | 66.7% | 52.7% |
+| E90 | 61.1% | 69.2% | 41.9% | 90.7% | 51.2% | 68.2% | 53.5% |
+| E120 | 66.4% | 72.7% | 50.4% | 90.7% | 59.7% | 71.3% | 59.7% |
+| E150 | 63.4% | 70.9% | 44.2% | 90.7% | 58.9% | 69.8% | 53.5% |
+| E180 | 61.6% | 67.8% | 45.0% | 88.4% | 52.7% | 66.7% | 55.0% |
+| E210 | 66.8% | 71.9% | 46.5% | 89.9% | 63.6% | 72.1% | 62.0% |
+| E240 | 63.7% | 69.0% | 48.8% | 86.8% | 60.5% | 65.9% | 56.6% |
+| E270 | 62.2% | 69.9% | 41.9% | 91.5% | 55.0% | 62.0% | 60.5% |
+| E300 | 62.5% | 68.8% | 45.0% | 90.7% | 55.8% | 65.1% | 55.8% |
+| E330 | 65.3% | 71.9% | 45.0% | 90.7% | 59.7% | 69.0% | 62.0% |
+| E360 | 63.9% | 69.2% | 44.2% | 89.9% | 60.5% | 65.9% | 58.9% |
+| E390 | 64.8% | 70.4% | 41.9% | 91.5% | 59.7% | 71.3% | 59.7% |
+| E420 | 62.9% | 69.2% | 41.9% | 89.9% | 58.9% | 68.2% | 55.8% |
+| E450 | 62.8% | 69.0% | 43.4% | 89.9% | 56.6% | 65.9% | 58.1% |
+| E480 | 62.3% | 68.4% | 40.3% | 89.9% | 55.8% | 69.0% | 56.6% |
+| E510 | 67.6% | 71.3% | 49.6% | 88.4% | 65.9% | 72.1% | 62.0% |
+| E540 | 61.9% | 65.3% | 45.0% | 86.1% | 55.8% | 67.4% | 55.0% |
+| E570 | 66.0% | 71.3% | 48.8% | 89.9% | 60.5% | 67.4% | 63.6% |
+| E600 | 62.9% | 67.6% | 45.0% | 89.1% | 58.1% | 70.5% | 51.9% |
+| E630 | 62.0% | 66.4% | 50.4% | 89.9% | 53.5% | 62.8% | 53.5% |
+| E660 | 62.0% | 65.0% | 45.7% | 91.5% | 55.0% | 65.9% | 51.9% |
+
+### Aggregated per-style summary
+
+| Style | Mean | Range | Character |
+|-------|------|-------|-----------|
+| **Indirect** | **89.8%** | 86–92% | Natural conversational queries |
+| Contextual | 67.2% | 58–72% | Topical lead-in |
+| Partial | 56.5% | 41–66% | Different angle |
+| Formal | 56.1% | 44–63% | Academic phrasing |
+| Colloquial | 44.6% | 36–50% | Casual/slang |
+| Overall entity | 63.1% | 53–68% | All styles combined |
+| Overall judge | 69.0% | 61–73% | Semantic correctness |
+
+### Key findings
+
+**1. Indirect recall at 90% is the headline result.** "I was wondering,
+could you tell me..." and "Do you happen to know..." are natural
+conversational query styles. The adapter answers these at 90%+ accuracy
+purely from parametric memory, with no retrieval system. This is the
+style most likely used in real assistant interactions.
+
+**2. Keyed indexing is training scaffolding, not an inference requirement.**
+Facts trained via "Recall the QA pair stored under key 'graphN'" format
+are accessible through natural language at 90%+ (indirect), 93% (direct),
+and 70-77% (passive rephrasing). The key format forces precise encoding;
+the knowledge generalizes beyond it.
+
+**3. No training duration effect.** Results are stable from E60 onwards.
+The generalization is established early and preserved through extended
+training. Extended training does not improve or degrade diverse recall.
+
+**4. Style hierarchy is stable across all checkpoints:**
+indirect >> contextual > partial ≈ formal >> colloquial. This ranking
+never changes, suggesting each style tests a distinct generalization axis.
+
+**5. Judge adds ~6pp over entity match consistently.** The model conveys
+the correct fact in ~6% of cases where it doesn't use the exact entity
+string. Both metrics are valuable: entity match for comparability with
+Test 10, judge for real-world accuracy assessment.
+
+**6. Colloquial is the hardest style (45%).** Casual language
+("So what's Chen Ming into?") differs most from the training format.
+This is expected — the adapter was trained on formal QA pairs, not slang.
+
+---
+
 ## HA Pipeline Latency (2026-03-27)
 
 End-to-end latency measured via curl against the ParaMem server in cloud-only
