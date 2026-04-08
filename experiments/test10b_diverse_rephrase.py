@@ -466,6 +466,10 @@ def run_test10b(
     resume: bool = False,
 ):
     """Main orchestration."""
+    # Clear pause file on resume (shared with Test 10)
+    if PAUSE_FILE.exists():
+        PAUSE_FILE.unlink()
+
     # Input: Test 10 run directory (adapters + keyed_pairs)
     test10_dir = find_test10_run_dir(model_name, run_dir_override)
     logger.info("Test 10 input dir: %s", test10_dir)
@@ -515,11 +519,16 @@ def run_test10b(
         logger.warning("No checkpoints found in %s", test10_dir)
         return
 
+    # Count already-evaluated checkpoints (for resume)
+    already_done = sum(
+        1 for cp_dir in checkpoints if (output_dir / cp_dir.name / RESULTS_FILENAME).exists()
+    )
+
     # Write state for tstatus discovery
     state = {
         "test10_input": str(test10_dir),
         "total_checkpoints": len(checkpoints),
-        "completed_checkpoints": 0,
+        "completed_checkpoints": already_done,
         "model": model_name,
     }
     save_json_atomic(state, output_dir / "state.json")

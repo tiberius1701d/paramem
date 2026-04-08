@@ -15,7 +15,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import intent
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DEFAULT_TIMEOUT, DOMAIN
+from .const import DEFAULT_FALLBACK_AGENT, DEFAULT_TIMEOUT, DOMAIN
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ class ParaMemConversationEntity(ConversationEntity):
             result = await self.hass.services.async_call(
                 "conversation",
                 "process",
-                {"text": user_input.text},
+                {"text": user_input.text, "agent_id": DEFAULT_FALLBACK_AGENT},
                 blocking=True,
                 return_response=True,
             )

@@ -1473,7 +1473,7 @@ primary retrieval mechanism.
 ## Test 10: Generalization Boundaries of Parametric Memory
 
 **Script:** `experiments/test10_grokking.py`
-**Status:** PAUSED — 22 cycles complete (E660).
+**Status:** PAUSED — 24 cycles complete (E720).
 
 ### Objective
 
@@ -1604,6 +1604,8 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E600 | 100% | 93.0% | 74.4% | 17.8% | 41.9% | 16.8% | 44.2% | 0.003 |
 | E630 | 95% | 93.0% | 69.8% | 13.6% | 31.1% | 16.3% | 43.4% | 0.008 |
 | E660 | 99% | 93.0% | 69.8% | 8.1% | 45.6% | 8.9% | 47.3% | 0.006 |
+| E690 | 100% | 93.0% | 72.1% | 10.8% | 41.1% | 10.3% | 45.0% | 0.004 |
+| E720 | 97% | 92.2% | 72.9% | 10.8% | 48.6% | 12.3% | 41.1% | 0.009 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1612,20 +1614,22 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E30 | 24/360 | 4/35 (11%) | 20/325 (6%) | 0 |
 | E60 | 42/360 | 9/35 (26%) | 33/325 (10%) | 0 |
 | E90 | 37/360 | — | — | 0 |
+| E690 | 39/360 | 8/35 (23%) | 31/325 (10%) | 0 |
+| E720 | 39/360 | 9/35 (26%) | 30/325 (9%) | 0 |
 
-### Key findings (E660, 22 cycles)
+### Key findings (E720, 24 cycles)
 
 **1. Shortcut > 3-hop at all checkpoints — no compositional crossover.**
 The relation shortcut control consistently exceeds 3-hop accuracy across all
-22 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 38pp (E660: 45.6%
-vs 8.1%). All multi-hop accuracy remains explainable by single-hop
+24 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 38pp (E720: 48.6%
+vs 10.8%). All multi-hop accuracy remains explainable by single-hop
 relation→entity shortcuts. No compositional generalization observed.
 
 **2. 3-hop oscillates without upward trend.** 3-hop accuracy fluctuates
 between 5-18% with periodic spikes (16.9% at E240, 16.1% at E390, 17.8%
 at E600) that always revert to the 6-10% baseline within 1-2 cycles. The
 spike peaks may be slowly climbing (16.1 → 16.9 → 17.8) but the sample is
-too small to confirm a trend. At 22x convergence (loss converged at E30),
+too small to confirm a trend. At 24x convergence (loss converged at E30),
 still early relative to the grokking literature (100-10,000x).
 
 **3. Associative generalization is real and stable.** The adapter transfers
@@ -1639,7 +1643,7 @@ current rephrased probe uses passive voice transformations only; Test 10b
 will evaluate genuinely diverse question forms.
 
 **4. Keyed recall remains robust.** 100% at most checkpoints, with
-occasional single-cycle dips (93% at E240, 95% at E630, 97% at E180/E540)
+occasional single-cycle dips (93% at E240, 95% at E630, 97% at E180/E540/E720)
 that self-correct in the following cycle. The dips anti-correlate with
 3-hop spikes, suggesting weight reorganization between memorization and
 generalization modes.
@@ -1702,12 +1706,10 @@ regularization dynamics that drive grokking are engaging.
 
 ### Next steps
 
-1. Continue running — at 22x convergence (E660), still early relative to
+1. Continue running — at 24x convergence (E720), still early relative to
    grokking literature thresholds (100-10,000x). Target E3,000 (100x) before
    concluding.
-2. **Test 10b** (`test10b_diverse_rephrase.py`): evaluate all existing
-   checkpoints with genuinely diverse question forms (colloquial, indirect,
-   partial, contextual, formal). Implemented, ready to run.
+2. ~~**Test 10b**: evaluate diverse question forms~~ — COMPLETE (see below).
 3. Same-question overlap analysis: check if the same 3-hop questions succeed
    across probes to distinguish partial learning from noise.
 4. Compute expected shortcut accuracy from answer distribution in training
@@ -1724,7 +1726,7 @@ regularization dynamics that drive grokking are engaging.
 ## Test 10b: Diverse Rephrasing Probe
 
 **Script:** `experiments/test10b_diverse_rephrase.py`
-**Status:** COMPLETE — 22 checkpoints evaluated (E30–E660).
+**Status:** COMPLETE — 24 checkpoints evaluated (E30–E720).
 
 ### Objective
 
@@ -1775,18 +1777,20 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 645 diverse questions.
 | E600 | 62.9% | 67.6% | 45.0% | 89.1% | 58.1% | 70.5% | 51.9% |
 | E630 | 62.0% | 66.4% | 50.4% | 89.9% | 53.5% | 62.8% | 53.5% |
 | E660 | 62.0% | 65.0% | 45.7% | 91.5% | 55.0% | 65.9% | 51.9% |
+| E690 | 62.8% | 67.9% | 46.5% | 89.1% | 57.4% | 69.8% | 51.2% |
+| E720 | 61.2% | 66.2% | 43.4% | 86.8% | 55.0% | 66.7% | 54.3% |
 
 ### Aggregated per-style summary
 
 | Style | Mean | Range | Character |
 |-------|------|-------|-----------|
-| **Indirect** | **89.8%** | 86–92% | Natural conversational queries |
-| Contextual | 67.2% | 58–72% | Topical lead-in |
+| **Indirect** | **89.7%** | 86–92% | Natural conversational queries |
+| Contextual | 67.3% | 58–72% | Topical lead-in |
 | Partial | 56.5% | 41–66% | Different angle |
-| Formal | 56.1% | 44–63% | Academic phrasing |
-| Colloquial | 44.6% | 36–50% | Casual/slang |
-| Overall entity | 63.1% | 53–68% | All styles combined |
-| Overall judge | 69.0% | 61–73% | Semantic correctness |
+| Formal | 56.0% | 44–64% | Academic phrasing |
+| Colloquial | 44.7% | 36–50% | Casual/slang |
+| Overall entity | 63.0% | 53–68% | All styles combined |
+| Overall judge | 68.9% | 61–73% | Semantic correctness |
 
 ### Key findings
 
@@ -2342,14 +2346,22 @@ Same speaker (Tobias), pyannote 512-dim embeddings:
 
 - Daily greeting on first interaction per speaker (configurable interval, default 24h)
 - Time-of-day aware: "Good morning/afternoon/evening, {name}"
-- Injected via system prompt — the model produces the greeting naturally
+- App-layer prepend to spoken response — not in the training transcript (prevents greeting patterns leaking into adapter weights)
+- Greeting timestamps persisted in SpeakerStore (keyed by speaker_id, UTC). Survives server restarts.
 - Only for confirmed speakers (high-confidence match). Unknown speakers get no greeting.
+
+### Privacy Mode
+
+- `debug: false` in server.yaml: transcripts live only in RAM. After consolidation, knowledge is in the adapter weights — no textual traces remain on disk.
+- `debug: true` (default): transcripts written to JSONL files for inspection, archived after consolidation.
+- Encrypted session snapshots on graceful shutdown (SIGUSR1, SIGTERM): Fernet-encrypted snapshot saved to disk, restored on startup, deleted immediately after restore. Unconsolidated conversations survive controlled restarts. Uncontrolled kills (SIGKILL, power loss) lose unconsolidated data — acceptable.
+- Snapshot key configured via `${PARAMEM_SNAPSHOT_KEY}` env var. No key = snapshots disabled.
 
 ### Resilience
 
 - Speaker resolution failure → proceeds as anonymous (no 500 error)
 - Enrollment failure → logged, query continues normally
-- HA custom component: ParaMem server error → falls back to HA conversation agent (Groq)
+- HA custom component: ParaMem server error → falls back to HA conversation agent (explicit `conversation.groq` agent_id to prevent recursive fallback)
 - HA agent also fails → generic error message. No dead ends.
 
 ### Infrastructure Notes
