@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import uuid
 from contextlib import asynccontextmanager
@@ -177,7 +178,10 @@ async def lifespan(app: FastAPI):
     _state["session_buffer"] = SessionBuffer(
         config.session_dir,
         retain_sessions=config.consolidation.retain_sessions,
+        debug=config.debug,
+        snapshot_key=config.snapshot_key,
     )
+    _state["session_buffer"].load_snapshot()
 
     # Initialize speaker store (voice-based identification)
     if config.speaker.enabled:
@@ -342,8 +346,19 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Consolidation scheduled at: %s", config.consolidation.schedule)
 
-    # GPU lifecycle is service-level (stop/restart), not signal-based.
-    # SIGUSR1's default action (terminate) is acceptable — systemd restarts.
+    # Graceful shutdown: save encrypted session snapshot before exit.
+    # SIGUSR1 (GPU release for training) and SIGTERM (systemd stop) both
+    # trigger a snapshot so unconsolidated conversations survive restarts.
+    def _graceful_exit(signum, _frame):
+        sig_name = signal.Signals(signum).name
+        logger.info("Received %s — saving session snapshot before exit", sig_name)
+        buffer = _state.get("session_buffer")
+        if buffer:
+            buffer.save_snapshot()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGUSR1, _graceful_exit)
+    signal.signal(signal.SIGTERM, _graceful_exit)
 
     _state["mode"] = "cloud-only" if cloud_only else "local"
 
@@ -504,6 +519,15 @@ async def chat(request: ChatRequest):
     except Exception:
         logger.exception("Speaker enrollment failed — continuing without enrollment")
 
+    # Check greeting before routing (applies to all paths)
+    greeting_prefix = None
+    greeting_interval = _state["config"].voice.greeting_interval_hours
+    if speaker and speaker_id and store and greeting_interval > 0:
+        greeting = store.should_greet(speaker_id, greeting_interval)
+        if greeting:
+            greeting_prefix = f"{greeting}, {speaker}. "
+            store.confirm_greeting(speaker_id)
+
     # Cloud-only mode — route via HA graph + SOTA, no local model
     if _state["mode"] == "cloud-only":
         result = _cloud_only_route(
@@ -523,7 +547,8 @@ async def chat(request: ChatRequest):
         )
         cloud_text = result.text
         buffer.append(request.conversation_id, "assistant", cloud_text)
-        return ChatResponse(text=cloud_text, escalated=True, speaker=speaker, follow_up=follow_up)
+        spoken_text = f"{greeting_prefix}{cloud_text}" if greeting_prefix else cloud_text
+        return ChatResponse(text=spoken_text, escalated=True, speaker=speaker, follow_up=follow_up)
 
     # Local mode — normal inference with entity routing
     # GPU lock prevents concurrent access with STT transcription
@@ -550,16 +575,6 @@ async def chat(request: ChatRequest):
             ),
         )
 
-    # Prepend greeting to response if this is the first interaction today
-    from paramem.server.inference import _confirm_greeting, _should_greet
-
-    greeting_interval = _state["config"].voice.greeting_interval_hours
-    if speaker and greeting_interval > 0:
-        greeting = _should_greet(speaker, greeting_interval)
-        if greeting:
-            result.text = f"{greeting}, {speaker}. {result.text}"
-            _confirm_greeting(speaker)
-
     buffer.append(
         request.conversation_id,
         "user",
@@ -569,8 +584,9 @@ async def chat(request: ChatRequest):
     response_text = result.text
     buffer.append(request.conversation_id, "assistant", response_text)
 
+    spoken_text = f"{greeting_prefix}{response_text}" if greeting_prefix else response_text
     return ChatResponse(
-        text=response_text,
+        text=spoken_text,
         escalated=result.escalated,
         speaker=speaker,
         follow_up=follow_up,

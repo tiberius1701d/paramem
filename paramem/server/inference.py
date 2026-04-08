@@ -16,7 +16,6 @@ probe → reason flow.
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from paramem.evaluation.recall import generate_answer
 from paramem.models.loader import adapt_messages
@@ -32,35 +31,6 @@ from paramem.server.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_TURNS = 10
-
-# Track greeting timestamps per speaker — resets on server restart (intentional)
-_last_greeted: dict[str, datetime] = {}
-
-
-def _should_greet(speaker: str, interval_hours: int) -> str | None:
-    """Return a time-appropriate greeting if the interval has elapsed.
-
-    Returns None if disabled (interval_hours=0) or greeted recently.
-    Does NOT commit the timestamp — caller must call _confirm_greeting()
-    after the greeting is confirmed delivered (not escalated).
-    """
-    if interval_hours <= 0:
-        return None
-    now = datetime.now()
-    last = _last_greeted.get(speaker)
-    if last and (now - last).total_seconds() < interval_hours * 3600:
-        return None
-    hour = now.hour
-    if hour < 12:
-        return "Good morning"
-    if hour < 18:
-        return "Good afternoon"
-    return "Good evening"
-
-
-def _confirm_greeting(speaker: str) -> None:
-    """Mark the speaker as greeted. Call after greeting is delivered."""
-    _last_greeted[speaker] = datetime.now()
 
 
 def _personalize_prompt(base_prompt: str, speaker: str | None) -> str:

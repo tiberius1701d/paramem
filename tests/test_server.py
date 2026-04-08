@@ -189,7 +189,12 @@ class TestSessionBuffer:
         assert len(pending) == 1
         assert pending[0]["session_id"] == "conv2"
 
-        # Archived file should exist
+    def test_mark_consolidated_debug_archives(self, tmp_path):
+        buffer = SessionBuffer(tmp_path / "sessions", debug=True)
+        buffer.append("conv1", "user", "Hello")
+
+        buffer.mark_consolidated(["conv1"])
+
         assert (tmp_path / "sessions" / "archive" / "conv1.jsonl").exists()
 
     def test_pending_count(self, tmp_path):
@@ -204,7 +209,7 @@ class TestSessionBuffer:
         assert buffer.get_pending() == []
 
     def test_turn_timestamps(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", debug=True)
         buffer.append("conv1", "user", "Hello")
 
         path = tmp_path / "sessions" / "conv1.jsonl"
@@ -214,8 +219,16 @@ class TestSessionBuffer:
         assert entry["role"] == "user"
         assert entry["text"] == "Hello"
 
+    def test_no_disk_writes_without_debug(self, tmp_path):
+        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer.append("conv1", "user", "Hello")
+
+        assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
+        assert buffer.pending_count == 1
+        assert len(buffer.get_pending()) == 1
+
     def test_retain_sessions_false_deletes(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions", retain_sessions=False)
+        buffer = SessionBuffer(tmp_path / "sessions", retain_sessions=False, debug=True)
         buffer.append("conv1", "user", "Hello")
         assert (tmp_path / "sessions" / "conv1.jsonl").exists()
 
@@ -226,7 +239,7 @@ class TestSessionBuffer:
         assert buffer.pending_count == 0
 
     def test_retain_sessions_true_archives(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions", retain_sessions=True)
+        buffer = SessionBuffer(tmp_path / "sessions", retain_sessions=True, debug=True)
         buffer.append("conv1", "user", "Hello")
 
         buffer.mark_consolidated(["conv1"])
@@ -253,6 +266,68 @@ class TestSessionBuffer:
         pending = buffer.get_pending()
         assert "Alex: I live in Amsterdam" in pending[0]["transcript"]
         assert pending[0]["speaker_id"] == "spk_abc"
+
+    def test_snapshot_save_and_restore(self, tmp_path):
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+
+        # Populate buffer and save snapshot
+        buf1 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        buf1.set_speaker("conv1", "spk_abc", "Alex")
+        buf1.append("conv1", "user", "I live in Amsterdam")
+        buf1.append("conv1", "assistant", "That's nice!")
+        assert buf1.save_snapshot()
+        assert (tmp_path / "sessions" / "session_snapshot.enc").exists()
+
+        # Restore into a fresh buffer
+        buf2 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        assert buf2.load_snapshot()
+        assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
+
+        pending = buf2.get_pending()
+        assert len(pending) == 1
+        assert "Alex: I live in Amsterdam" in pending[0]["transcript"]
+        assert pending[0]["speaker_id"] == "spk_abc"
+        assert buf2.get_speaker("conv1") == "Alex"
+
+    def test_snapshot_wrong_key_discards(self, tmp_path):
+        from cryptography.fernet import Fernet
+
+        key1 = Fernet.generate_key().decode()
+        key2 = Fernet.generate_key().decode()
+
+        buf1 = SessionBuffer(tmp_path / "sessions", snapshot_key=key1)
+        buf1.append("conv1", "user", "Secret data")
+        buf1.save_snapshot()
+
+        buf2 = SessionBuffer(tmp_path / "sessions", snapshot_key=key2)
+        assert not buf2.load_snapshot()  # decryption fails, file deleted
+        assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
+        assert buf2.pending_count == 0
+
+    def test_snapshot_deleted_on_restore(self, tmp_path):
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+
+        buf1 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        buf1.append("conv1", "user", "Hello")
+        buf1.save_snapshot()
+        assert (tmp_path / "sessions" / "session_snapshot.enc").exists()
+
+        buf2 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        buf2.load_snapshot()
+        assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
+
+    def test_snapshot_empty_buffer_no_file(self, tmp_path):
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+
+        buffer = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        assert buffer.save_snapshot()
+        assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
 
 class TestKeyMetadata:

@@ -19,6 +19,7 @@ import math
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ class SpeakerStore:
         self.redundancy_threshold = redundancy_threshold
         self._profiles: dict[str, dict] = {}  # speaker_id → {name, embeddings}
         self._centroids: dict[str, list[float]] = {}  # cached centroids per profile
+        self._last_greeted: dict[str, str] = {}  # speaker_id → ISO timestamp
         self._lock = threading.Lock()  # guards profile mutations and saves
         self._dirty = False  # deferred save flag for enrichment batching
         self._load()
@@ -114,6 +116,8 @@ class SpeakerStore:
             return
 
         version = data.get("version", 1)
+
+        self._last_greeted = data.get("last_greeted", {})
 
         if version >= _PROFILE_VERSION:
             self._profiles = data.get("speakers", {})
@@ -167,6 +171,34 @@ class SpeakerStore:
         else:
             self._centroids.pop(speaker_id, None)
 
+    def should_greet(self, speaker_id: str, interval_hours: int) -> str | None:
+        """Return a time-appropriate greeting if the interval has elapsed.
+
+        Returns None if disabled (interval_hours=0) or greeted recently.
+        Does NOT commit — caller must call confirm_greeting() after delivery.
+        """
+        if interval_hours <= 0:
+            return None
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            last_str = self._last_greeted.get(speaker_id)
+        if last_str:
+            last = datetime.fromisoformat(last_str)
+            if (now - last).total_seconds() < interval_hours * 3600:
+                return None
+        hour = datetime.now().hour  # local time for greeting text
+        if hour < 12:
+            return "Good morning"
+        if hour < 18:
+            return "Good afternoon"
+        return "Good evening"
+
+    def confirm_greeting(self, speaker_id: str) -> None:
+        """Mark the speaker as greeted and persist to disk."""
+        with self._lock:
+            self._last_greeted[speaker_id] = datetime.now(timezone.utc).isoformat()
+            self._save()
+
     def flush(self) -> None:
         """Write deferred enrichment changes to disk. Call periodically."""
         with self._lock:
@@ -181,7 +213,11 @@ class SpeakerStore:
         try:
             with open(tmp, "w") as f:
                 json.dump(
-                    {"speakers": self._profiles, "version": _PROFILE_VERSION},
+                    {
+                        "speakers": self._profiles,
+                        "last_greeted": self._last_greeted,
+                        "version": _PROFILE_VERSION,
+                    },
                     f,
                     indent=2,
                 )
