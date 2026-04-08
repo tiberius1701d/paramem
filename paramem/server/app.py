@@ -355,7 +355,12 @@ async def lifespan(app: FastAPI):
         buffer = _state.get("session_buffer")
         if buffer:
             buffer.save_snapshot()
-        raise SystemExit(0)
+        if signum == signal.SIGUSR1:
+            # GPU release: exit non-zero so systemd restarts (Restart=on-failure)
+            os._exit(1)
+        else:
+            # SIGTERM: intentional stop, don't restart
+            raise SystemExit(0)
 
     signal.signal(signal.SIGUSR1, _graceful_exit)
     signal.signal(signal.SIGTERM, _graceful_exit)
