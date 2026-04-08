@@ -90,16 +90,16 @@ class ParaMemConversationEntity(ConversationEntity):
                     resp.raise_for_status()
                     data = await resp.json()
                     response_text = data.get("text", "")
-        except aiohttp.ClientError as err:
-            logger.error("ParaMem server error: %s", err)
-            response_text = "Sorry, I couldn't reach my memory server."
-        except TimeoutError:
-            logger.error(
-                "ParaMem server timed out after %ds", self._timeout
-            )
-            response_text = (
-                "Sorry, my memory server took too long to respond."
-            )
+                    follow_up = data.get("follow_up")
+        except (aiohttp.ClientError, TimeoutError) as err:
+            logger.warning("ParaMem server unavailable (%s), falling back to HA agent", err)
+            response_text = await self._fallback_to_ha(user_input)
+            follow_up = None
+
+        # Append follow-up as a separate sentence if present
+        # (e.g. speaker introduction question)
+        if follow_up:
+            response_text = f"{response_text} ... {follow_up}"
 
         # Record assistant response in chat log
         chat_log.async_add_assistant_content_without_tools(
@@ -110,15 +110,41 @@ class ParaMemConversationEntity(ConversationEntity):
         )
 
         # Build HA IntentResponse
-        response = intent.IntentResponse(
-            language=user_input.language
-        )
+        response = intent.IntentResponse(language=user_input.language)
         response.async_set_speech(response_text)
 
         return ConversationResult(
             response=response,
             conversation_id=chat_log.conversation_id,
         )
+
+    async def _fallback_to_ha(self, user_input: ConversationInput) -> str:
+        """Fall back to HA's default conversation agent when ParaMem is unavailable."""
+        try:
+            result = await self.hass.services.async_call(
+                "conversation",
+                "process",
+                {"text": user_input.text},
+                blocking=True,
+                return_response=True,
+            )
+            if result and "response" in result:
+                resp = result["response"]
+                # HA conversation responses have speech in response.speech.plain.speech
+                # but may also be directly in response.speech as a string
+                speech = resp.get("speech", {})
+                if isinstance(speech, str):
+                    return speech
+                plain = speech.get("plain", {})
+                if isinstance(plain, str):
+                    return plain
+                text = plain.get("speech", "")
+                if text:
+                    return text
+            logger.warning("HA fallback returned unexpected format: %s", result)
+        except Exception:
+            logger.exception("HA conversation fallback also failed")
+        return "I'm having trouble connecting to my services right now."
 
 
 def _extract_history(chat_log: ChatLog) -> list[dict]:
