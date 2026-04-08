@@ -357,26 +357,47 @@ def probe_open_ended(
 
 
 def _find_resume_dir(model_name: str) -> Path | None:
-    """Find the most recent Test 9 output directory for resuming."""
+    """Find the Test 9 output directory with the most completed cycles.
+
+    Results may be spread across multiple timestamped dirs (from separate
+    resume runs). Pick the one with the most results so new cycles land
+    alongside the majority.
+    """
     model_dir = OUTPUT_BASE / model_name
     if not model_dir.exists():
         return None
     run_dirs = sorted(model_dir.iterdir())
-    return run_dirs[-1] if run_dirs else None
+    if not run_dirs:
+        return None
+    best_dir = None
+    best_count = -1
+    for d in run_dirs:
+        count = len(list(d.glob("cycle_*_results.json")))
+        if count > best_count:
+            best_count = count
+            best_dir = d
+    return best_dir
 
 
 def _load_completed_cycles(output_dir: Path) -> dict[int, dict]:
-    """Load already-completed cycle results from an output directory."""
+    """Load completed cycle results from ALL run dirs under this model.
+
+    Merges results across timestamped dirs so resume sees everything,
+    regardless of which dir results landed in.
+    """
     completed = {}
-    for result_file in output_dir.glob("cycle_*_results.json"):
-        try:
-            with open(result_file) as f:
-                data = json.load(f)
-            cycle_num = data.get("cycle")
-            if cycle_num is not None:
-                completed[cycle_num] = data
-        except (json.JSONDecodeError, KeyError):
-            continue
+    # Scan all sibling run dirs, not just output_dir
+    model_dir = output_dir.parent
+    for run_dir in model_dir.iterdir():
+        for result_file in run_dir.glob("cycle_*_results.json"):
+            try:
+                with open(result_file) as f:
+                    data = json.load(f)
+                cycle_num = data.get("cycle")
+                if cycle_num is not None:
+                    completed[cycle_num] = data
+            except (json.JSONDecodeError, KeyError):
+                continue
     return completed
 
 

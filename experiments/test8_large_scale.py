@@ -1178,6 +1178,10 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
         print("  Cooling down...")
         wait_for_cooldown(45)
 
+    # Clean up pause file — run is finished regardless of how the loop exited
+    if PAUSE_FILE.exists():
+        PAUSE_FILE.unlink()
+
     # Final summary
     if all_cycle_results:
         final = all_cycle_results[-1]

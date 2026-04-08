@@ -1588,5 +1588,5 @@ def main():
 if __name__ == "__main__":
     from experiments.utils.gpu_guard import acquire_gpu
 
-    with acquire_gpu(interactive=False):
+    with acquire_gpu():
         main()
