@@ -71,6 +71,13 @@ MODEL_REGISTRY = {
         trust_remote_code=True,
         cpu_offload=False,
     ),
+    "gemma4": ModelConfig(
+        model_id="google/gemma-4-E4B-it",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        trust_remote_code=True,
+        cpu_offload=False,
+    ),
 }
 
 # Validated training parameters from test campaign (Tests 1-8).
@@ -171,6 +178,7 @@ class SanitizationConfig:
 class VoiceConfig:
     prompt_file: str = "configs/prompts/ha_voice.txt"
     system_prompt: str = ""
+    greeting_interval_hours: int = 24  # hours between greetings per speaker (0 = disabled)
 
     def load_prompt(self) -> str:
         """Load system prompt from file, falling back to inline default."""
@@ -190,8 +198,39 @@ class VoiceConfig:
 class ConsolidationScheduleConfig:
     schedule: str = "02:00"
     promotion_threshold: int = 3
-    max_active_keys: int = 50
     retain_sessions: bool = True
+    extraction_max_tokens: int = 2048  # max output tokens for graph extraction
+
+
+@dataclass
+class SpeakerConfig:
+    """Voice-based speaker identification settings."""
+
+    enabled: bool = False
+    high_confidence_threshold: float = 0.60
+    low_confidence_threshold: float = 0.45
+    store_path: str = ""  # empty = default (data/ha/speaker_profiles.json)
+    enrollment_prompt: str = "By the way, I don't think we've met yet. Please introduce yourself."
+    enrollment_idle_timeout: int = 120  # seconds of /chat silence before LLM name extraction
+    enrollment_reprompt_interval: int = 600  # seconds between re-prompting unknown speakers
+    enrollment_check_interval: int = 15  # seconds between idle-loop checks
+    min_embedding_words: int = 5  # discard embeddings from shorter transcripts (noisy)
+    max_embeddings_per_profile: int = 50  # cap on stored embeddings per speaker
+    redundancy_threshold: float = 0.95  # skip add_embedding if similarity to centroid exceeds this
+    grouping_threshold_factor: float = 0.6  # unknown grouping = low_threshold * this factor
+
+
+@dataclass
+class STTConfig:
+    """Local speech-to-text via Faster Whisper."""
+
+    enabled: bool = False
+    model: str = "small"  # tiny, base, small, medium, large-v3, distil-large-v3
+    cpu_fallback_model: str = "distil-small.en"  # smaller model for CPU when GPU unavailable
+    device: str = "cuda"  # cuda, cpu, auto
+    compute_type: str = "int8"  # int8, float16, float32
+    port: int = 10300  # Wyoming STT listener port
+    language: str = "en"  # default language, "auto" for detection
 
 
 @dataclass
@@ -232,6 +271,8 @@ class ServerConfig:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
+    speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
+    stt: STTConfig = field(default_factory=STTConfig)
 
     @property
     def cloud(self) -> GeneralAgentConfig:
@@ -313,7 +354,6 @@ class ServerConfig:
         """Build ConsolidationConfig for ConsolidationLoop."""
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
-            max_active_keys=self.consolidation.max_active_keys,
             indexed_key_replay_enabled=True,
             reconstruction_interval=5,
             decay_window=10,
@@ -341,7 +381,9 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     config.model_name = raw.get("model", config.model_name)
     config.debug = raw.get("debug", config.debug)
 
-    # Paths
+    # Paths — resolve relative paths against config file directory so they
+    # work regardless of the process's working directory at runtime.
+    config_dir = Path(path).resolve().parent.parent  # configs/ → project root
     paths_raw = raw.get("paths", {})
     if paths_raw:
         config.paths = PathsConfig(
@@ -350,6 +392,11 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             debug=Path(paths_raw.get("debug", config.paths.debug)),
             prompts=Path(paths_raw.get("prompts", config.paths.prompts)),
         )
+    # Make relative paths absolute (anchored to project root)
+    for path_field in ("data", "sessions", "debug", "prompts"):
+        p = getattr(config.paths, path_field)
+        if not p.is_absolute():
+            setattr(config.paths, path_field, config_dir / p)
 
     # Adapters
     adapters_raw = raw.get("adapters", {})
@@ -432,5 +479,13 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     voice_raw = raw.get("voice", {})
     if voice_raw:
         config.voice = VoiceConfig(**voice_raw)
+
+    speaker_raw = raw.get("speaker", {})
+    if speaker_raw:
+        config.speaker = SpeakerConfig(**speaker_raw)
+
+    stt_raw = raw.get("stt", {})
+    if stt_raw:
+        config.stt = STTConfig(**stt_raw)
 
     return config

@@ -3,26 +3,24 @@
 Usage:
     python -m paramem.server.app --config configs/server.yaml
 
-GPU lifecycle:
-    SIGUSR1 → release GPU (switch to cloud-only mode)
-    Auto-reclaim timer reloads model when GPU is free
+GPU lifecycle (service-level):
+    Stop service to free GPU, restart to reclaim.
+    --defer-model: start without GPU model, auto-reclaim when GPU is free.
+    --cloud-only: permanent cloud-only mode, no auto-reclaim.
 """
 
 import argparse
 import asyncio
-import gc
 import json
 import logging
 import os
-import re
 import shutil
-import signal
 import subprocess
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -37,7 +35,7 @@ from paramem.server.router import QueryRouter
 from paramem.server.session_buffer import SessionBuffer
 from paramem.server.tools.ha_client import HAClient
 from paramem.server.tools.registry import ToolRegistry
-from paramem.utils.notify import SERVER_CLOUD_ONLY, SERVER_RECLAIMED, notify_server
+from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +65,21 @@ _state = {
     "scheduler_task": None,
     "reclaim_task": None,
     "mode": "local",  # "local" or "cloud-only"
+    "cloud_only_reason": None,  # "explicit", "training", "gpu_conflict", or None
+    "speaker_store": None,
+    "stt": None,
+    "wyoming_server": None,
+    "last_chat_time": None,
+    "enrollment_task": None,
+    "pending_enrollments": set(),
+    # Unknown speaker groups: temp_id → {embeddings, conversations, first_seen}
+    # Thread safety: both the chat handler and enrollment loop run on the asyncio
+    # event loop (cooperative scheduling). Mutations are synchronous within each
+    # handler, so no interleaving within a single dict operation. Safe without locks.
+    "unknown_speakers": {},
+    # Global cooldown: first prompt waits for the full interval after startup
+    "last_enrollment_prompt": datetime.now(timezone.utc),
 }
-
-# Lock to prevent concurrent model access during mode transitions
-_mode_lock = asyncio.Lock()
 
 
 # --- Request/Response schemas ---
@@ -80,6 +89,7 @@ class ChatRequest(BaseModel):
     text: str
     conversation_id: str = "default"
     speaker: str | None = None
+    speaker_embedding: list[float] | None = None  # Voice embedding from STT
     history: list[dict] | None = None
     route: str | None = None  # Force routing: "ha", "sota", or None (auto)
 
@@ -88,6 +98,7 @@ class ChatResponse(BaseModel):
     text: str
     escalated: bool = False
     speaker: str | None = None
+    follow_up: str | None = None  # Server-initiated follow-up (e.g. introduction)
 
 
 class StatusResponse(BaseModel):
@@ -99,6 +110,9 @@ class StatusResponse(BaseModel):
     pending_sessions: int
     consolidating: bool
     last_consolidation: str | None
+    speaker_profiles: int = 0
+    stt_loaded: bool = False
+    stt_model: str | None = None
 
 
 class ConsolidateResponse(BaseModel):
@@ -164,6 +178,87 @@ async def lifespan(app: FastAPI):
         config.session_dir,
         retain_sessions=config.consolidation.retain_sessions,
     )
+
+    # Initialize speaker store (voice-based identification)
+    if config.speaker.enabled:
+        from paramem.server.speaker import SpeakerStore
+
+        speaker_path = (
+            Path(config.speaker.store_path)
+            if config.speaker.store_path
+            else config.paths.data / "speaker_profiles.json"
+        )
+        _state["speaker_store"] = SpeakerStore(
+            speaker_path,
+            high_threshold=config.speaker.high_confidence_threshold,
+            low_threshold=config.speaker.low_confidence_threshold,
+            max_embeddings=config.speaker.max_embeddings_per_profile,
+            redundancy_threshold=config.speaker.redundancy_threshold,
+        )
+        logger.info("Speaker store: %d profiles", _state["speaker_store"].profile_count)
+
+        # Preload speaker embedding model (CPU, ~17 MB)
+        from paramem.server.speaker_embedding import load_embedding_model
+
+        if load_embedding_model():
+            logger.info("Speaker embedding model ready")
+        else:
+            logger.warning("Speaker embedding unavailable — install paramem[speaker]")
+    else:
+        _state["speaker_store"] = None
+        logger.info("Speaker identification disabled")
+
+    # Initialize local STT (Faster Whisper) if configured
+    # In cloud-only mode, force CPU to avoid GPU contention with training
+    _state["stt"] = None
+    _state["wyoming_server"] = None
+    if config.stt.enabled:
+        from paramem.server.stt import WhisperSTT
+
+        if cloud_only and config.stt.device != "cpu":
+            stt_device = "cpu"
+            stt_model = config.stt.cpu_fallback_model
+            stt_compute = "int8"
+            logger.info(
+                "Cloud-only mode — Whisper on CPU (%s instead of %s)",
+                stt_model,
+                config.stt.model,
+            )
+        else:
+            stt_device = config.stt.device
+            stt_model = config.stt.model
+            stt_compute = config.stt.compute_type
+
+        stt = WhisperSTT(
+            model_name=stt_model,
+            device=stt_device,
+            compute_type=stt_compute,
+            language=config.stt.language,
+        )
+        if stt.load():
+            _state["stt"] = stt
+            logger.info("Local STT: Whisper %s on %s", stt_model, stt_device)
+
+            # Start Wyoming STT server
+            from paramem.server.wyoming_handler import start_wyoming_server
+
+            def _on_stt_embedding(embedding):
+                """Store latest speaker embedding from Wyoming STT."""
+                if embedding:
+                    _state["latest_embedding"] = embedding
+
+            _state["wyoming_server"] = await start_wyoming_server(
+                host=config.server.host,
+                port=config.stt.port,
+                stt=stt,
+                speaker_store=_state.get("speaker_store"),
+                embedding_callback=_on_stt_embedding,
+            )
+            logger.info("Wyoming STT server listening on port %d", config.stt.port)
+        else:
+            logger.warning("Local STT disabled — model failed to load")
+    else:
+        logger.info("Local STT: disabled")
 
     # Initialize cloud agent if configured
     _state["cloud_agent"] = get_cloud_agent(config.general_agent)
@@ -247,24 +342,42 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Consolidation scheduled at: %s", config.consolidation.schedule)
 
-    # Register SIGUSR1 handler for GPU release
-    signal.signal(signal.SIGUSR1, _handle_sigusr1)
-    logger.info("SIGUSR1 handler registered (send to release GPU)")
-
-    # Start auto-reclaim timer
-    reclaim_interval = getattr(config.server, "reclaim_interval_minutes", 10)
-    _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
+    # GPU lifecycle is service-level (stop/restart), not signal-based.
+    # SIGUSR1's default action (terminate) is acceptable — systemd restarts.
 
     _state["mode"] = "cloud-only" if cloud_only else "local"
+
+    # Auto-reclaim: only when started without the model (--defer-model).
+    # In local mode we already have the GPU — nothing to reclaim.
+    if cloud_only and not _state.get("cloud_only_startup", False):
+        reclaim_interval = config.server.reclaim_interval_minutes
+        _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
+    # Deferred enrollment: start idle loop (all state lives in RAM)
+    if not cloud_only and config.speaker.enabled:
+        idle_timeout = config.speaker.enrollment_idle_timeout
+        _state["enrollment_task"] = asyncio.create_task(_enrollment_idle_loop(idle_timeout))
+
     logger.info("ParaMem server ready — mode: %s, model: %s", _state["mode"], config.model_name)
 
     yield
 
-    # Shutdown
+    # Shutdown — flush deferred speaker profile writes
+    store = _state.get("speaker_store")
+    if store:
+        store.flush()
+
     if _state["scheduler_task"]:
         _state["scheduler_task"].cancel()
     if _state["reclaim_task"]:
         _state["reclaim_task"].cancel()
+    if _state.get("enrollment_task"):
+        _state["enrollment_task"].cancel()
+    wyoming_server = _state.get("wyoming_server")
+    if wyoming_server is not None:
+        wyoming_server.stop()
+    stt = _state.get("stt")
+    if stt is not None:
+        stt.unload()
     if _state.get("ha_client"):
         _state["ha_client"].close()
     if _state["model"]:
@@ -281,21 +394,13 @@ app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Handle a conversation turn with speaker identification."""
+    _state["last_chat_time"] = datetime.now(timezone.utc)
     buffer = _state["session_buffer"]
 
     # Forced routing — bypass normal routing for direct provider testing.
-    # Requires completed greeting flow (speaker identified) to prevent
-    # unauthenticated access to HA device control.
     # Supports: "ha", "sota", "sota:anthropic", "sota:openai", "sota:google"
     if request.route and request.route.startswith(("ha", "sota")):
-        state = buffer.get_session_state(request.conversation_id)
-        speaker = buffer.get_speaker(request.conversation_id)
-        if state in ("new", "greeting_sent"):
-            return ChatResponse(
-                text="Speaker identification required before forced routing.",
-                escalated=False,
-                speaker=speaker,
-            )
+        _speaker_id, speaker = _resolve_speaker(request, buffer, _state.get("speaker_store"))
         loop = asyncio.get_running_loop()
 
         result = None
@@ -334,33 +439,70 @@ async def chat(request: ChatRequest):
             speaker=speaker,
         )
 
-    # Ignore application-level user identity (e.g. HA user context).
-    # Speaker must self-identify in the conversation via the greeting flow.
+    # Pick up speaker embedding from latest STT if not in request
+    has_latest = "latest_embedding" in _state
+    if not request.speaker_embedding and has_latest:
+        request.speaker_embedding = _state.pop("latest_embedding")
+        logger.info("Picked up STT embedding (%d dims)", len(request.speaker_embedding))
+    elif not request.speaker_embedding:
+        logger.info("No speaker embedding available")
 
-    # Speaker identification flow
-    state = buffer.get_session_state(request.conversation_id)
-    speaker = buffer.get_speaker(request.conversation_id)
+    # Discard embeddings from short utterances — pyannote needs enough voice
+    # data for a stable print. Short commands produce noisy, unreliable embeddings.
+    min_words = _state["config"].speaker.min_embedding_words
+    word_count = len(request.text.split()) if request.text else 0
+    if request.speaker_embedding and word_count < min_words:
+        logger.info(
+            "Embedding discarded: transcript too short (%d words < %d minimum)",
+            word_count,
+            min_words,
+        )
+        request.speaker_embedding = None
 
-    if state == "new":
-        buffer.set_state(request.conversation_id, "greeting_sent")
-        greeting = "Hi, I'm your home assistant. Who are you?"
-        return ChatResponse(text=greeting, speaker=speaker)
+    # Speaker resolution: embedding → session history → anonymous.
+    # Never let speaker ID failure kill the request — proceed as anonymous.
+    try:
+        speaker_id, speaker = _resolve_speaker(request, buffer, _state.get("speaker_store"))
+    except Exception:
+        logger.exception("Speaker resolution failed — proceeding as anonymous")
+        speaker_id, speaker = None, None
+    follow_up = None
+    store = _state.get("speaker_store")
 
-    if state == "greeting_sent":
-        extracted_name = _extract_speaker_name(request.text)
-        if extracted_name:
-            buffer.set_speaker(request.conversation_id, extracted_name)
-            speaker = extracted_name
-            welcome = f"Nice to meet you, {extracted_name}. I'll memorize everything we discuss."
-            buffer.append(request.conversation_id, "user", request.text)
-            buffer.append(request.conversation_id, "assistant", welcome)
-            return ChatResponse(text=welcome, speaker=speaker)
-        else:
-            # Could not extract name — ask again
-            return ChatResponse(
-                text="I didn't catch your name. Could you tell me who you are?",
-                speaker=speaker,
-            )
+    # Deferred enrollment: unknown voice → group by embedding silently.
+    # Prompt only after global cooldown elapses — never on first encounter.
+    # Enrollment failure must never block the query.
+    try:
+        if speaker_id is None and request.speaker_embedding and store:
+            conv_id = request.conversation_id
+            now = datetime.now(timezone.utc)
+            unknown_group_id = _match_unknown_speaker(request.speaker_embedding)
+
+            if unknown_group_id:
+                group = _state["unknown_speakers"][unknown_group_id]
+                group["conversations"].add(conv_id)
+                group["embeddings"].append(request.speaker_embedding)
+                _state["pending_enrollments"].add(conv_id)
+                logger.info("Unknown speaker — grouped into %s", unknown_group_id)
+            else:
+                unknown_group_id = uuid.uuid4().hex[:8]
+                _state["unknown_speakers"][unknown_group_id] = {
+                    "embeddings": [request.speaker_embedding],
+                    "conversations": {conv_id},
+                    "first_seen": now,
+                }
+                _state["pending_enrollments"].add(conv_id)
+                logger.info("Unknown speaker — new group %s", unknown_group_id)
+
+            # Global enrollment prompt cooldown
+            reprompt_interval = _state["config"].speaker.enrollment_reprompt_interval
+            last_prompt = _state["last_enrollment_prompt"]
+            if (now - last_prompt).total_seconds() >= reprompt_interval:
+                follow_up = _state["config"].speaker.enrollment_prompt
+                _state["last_enrollment_prompt"] = now
+                logger.info("Enrollment prompt sent (cooldown %ds)", reprompt_interval)
+    except Exception:
+        logger.exception("Speaker enrollment failed — continuing without enrollment")
 
     # Cloud-only mode — route via HA graph + SOTA, no local model
     if _state["mode"] == "cloud-only":
@@ -373,12 +515,21 @@ async def chat(request: ChatRequest):
             ha_client=_state.get("ha_client"),
             sota_agent=_state.get("sota_agent"),
         )
-        buffer.append(request.conversation_id, "user", request.text)
-        buffer.append(request.conversation_id, "assistant", result.text)
-        return ChatResponse(text=result.text, escalated=True, speaker=speaker)
+        buffer.append(
+            request.conversation_id,
+            "user",
+            request.text,
+            embedding=request.speaker_embedding,
+        )
+        cloud_text = result.text
+        buffer.append(request.conversation_id, "assistant", cloud_text)
+        return ChatResponse(text=cloud_text, escalated=True, speaker=speaker, follow_up=follow_up)
 
     # Local mode — normal inference with entity routing
-    async with _mode_lock:
+    # GPU lock prevents concurrent access with STT transcription
+    from paramem.server.wyoming_handler import gpu_inference_lock
+
+    async with gpu_inference_lock:
         loop = asyncio.get_running_loop()
         result: ChatResult = await loop.run_in_executor(
             None,
@@ -386,6 +537,7 @@ async def chat(request: ChatRequest):
                 text=request.text,
                 conversation_id=request.conversation_id,
                 speaker=speaker,
+                speaker_id=speaker_id,
                 history=request.history,
                 model=_state["model"],
                 tokenizer=_state["tokenizer"],
@@ -398,33 +550,83 @@ async def chat(request: ChatRequest):
             ),
         )
 
-    buffer.append(request.conversation_id, "user", request.text)
-    buffer.append(request.conversation_id, "assistant", result.text)
+    # Prepend greeting to response if this is the first interaction today
+    from paramem.server.inference import _confirm_greeting, _should_greet
 
-    return ChatResponse(text=result.text, escalated=result.escalated, speaker=speaker)
+    greeting_interval = _state["config"].voice.greeting_interval_hours
+    if speaker and greeting_interval > 0:
+        greeting = _should_greet(speaker, greeting_interval)
+        if greeting:
+            result.text = f"{greeting}, {speaker}. {result.text}"
+            _confirm_greeting(speaker)
+
+    buffer.append(
+        request.conversation_id,
+        "user",
+        request.text,
+        embedding=request.speaker_embedding,
+    )
+    response_text = result.text
+    buffer.append(request.conversation_id, "assistant", response_text)
+
+    return ChatResponse(
+        text=response_text,
+        escalated=result.escalated,
+        speaker=speaker,
+        follow_up=follow_up,
+    )
 
 
-def _extract_speaker_name(text: str) -> str | None:
-    """Extract a speaker name from a self-introduction response.
+def _match_unknown_speaker(embedding: list[float]) -> str | None:
+    """Match an embedding against unknown speaker groups.
 
-    Handles common patterns: "I'm Alex", "My name is Alex",
-    "Alex", "It's Alex", "This is Alex", "Call me Alex".
+    Uses a lenient threshold (low_confidence * 0.6 ≈ 0.27) because we're
+    grouping noisy unknowns, not confirming identity. Compares against each
+    group's centroid (improves as more embeddings accumulate).
     """
+    from paramem.server.speaker import compute_centroid, cosine_similarity
 
-    text = text.strip().rstrip(".")
+    cfg = _state["config"].speaker
+    threshold = cfg.low_confidence_threshold * cfg.grouping_threshold_factor
+    best_id = None
+    best_score = 0.0
+    for group_id, group in _state["unknown_speakers"].items():
+        centroid = compute_centroid(group["embeddings"])
+        if not centroid:
+            continue
+        score = cosine_similarity(embedding, centroid)
+        if score >= threshold and score > best_score:
+            best_score = score
+            best_id = group_id
+    return best_id
 
-    patterns = [
-        r"(?:I'm|I am|my name is|it's|this is|call me|they call me)\s+(\w+)",
-        r"^(\w+)$",  # bare name
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            name = match.group(1)
-            # Filter out non-name words
-            if name.lower() not in ("hi", "hello", "hey", "yes", "no", "the", "a"):
-                return name.capitalize()
-    return None
+
+def _resolve_speaker(request: ChatRequest, buffer, speaker_store) -> tuple[str | None, str | None]:
+    """Resolve speaker identity from multiple sources.
+
+    Returns (speaker_id, speaker_name) tuple.
+
+    Priority:
+    1. Voice embedding match (via SpeakerStore, high confidence only)
+    2. Session history (previously identified in this conversation)
+    3. Anonymous (None, None)
+    """
+    # 1. Voice embedding match
+    if request.speaker_embedding and speaker_store:
+        match = speaker_store.match(request.speaker_embedding)
+        if match.speaker_id and not match.tentative:
+            buffer.set_speaker(request.conversation_id, match.speaker_id, match.name)
+            # Enrich profile with this embedding (strengthens cross-device centroid)
+            speaker_store.add_embedding(match.speaker_id, request.speaker_embedding)
+            return match.speaker_id, match.name
+
+    # 2. Previously identified in session
+    existing_id = buffer.get_speaker_id(request.conversation_id)
+    existing_name = buffer.get_speaker(request.conversation_id)
+    if existing_id:
+        return existing_id, existing_name
+
+    return None, None
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -452,6 +654,11 @@ async def status():
         pending_sessions=_state["session_buffer"].pending_count if _state["session_buffer"] else 0,
         consolidating=_state["consolidating"],
         last_consolidation=_state["last_consolidation"],
+        speaker_profiles=_state["speaker_store"].profile_count
+        if _state.get("speaker_store")
+        else 0,
+        stt_loaded=_state.get("stt") is not None and _state["stt"].is_loaded,
+        stt_model=_state["stt"].model_name if _state.get("stt") else None,
     )
 
 
@@ -526,20 +733,26 @@ def _cloud_only_route(
 
     # Try HA conversation agent — it has tools and real-time data
     if ha_client is not None:
+        logger.info("Cloud-only route: trying HA agent for: %s", text[:100])
         response_text = ha_client.conversation_process(text, agent_id=config.ha_agent_id)
         if response_text is not None:
+            logger.info("Cloud-only route: HA agent responded")
             return ChatResult(text=response_text, escalated=True)
+        logger.info("Cloud-only route: HA agent failed, trying SOTA")
 
     # HA failed or unavailable → try SOTA for reasoning
     if sota_agent is not None:
         sanitized, _ = sanitize_for_cloud(text, mode=config.sanitization.mode)
         if sanitized is not None:
+            logger.info("Cloud-only route: escalating to SOTA")
             result = _escalate_to_sota(
                 sanitized, sota_agent, config, speaker=speaker, history=history
             )
             if result.text:
+                logger.info("Cloud-only route: SOTA responded")
                 return result
 
+    logger.warning("Cloud-only route: all services failed")
     return ChatResult(
         text="I'm running in limited mode right now. Please try again later.",
         escalated=True,
@@ -622,98 +835,185 @@ async def _consolidation_scheduler(schedule: str):
         await asyncio.sleep(30)
 
 
-# --- GPU lifecycle ---
+# --- Deferred speaker enrollment ---
+#
+# When an unknown speaker talks, their voice embedding is stored alongside
+# each transcript turn. After an idle timeout (no /chat requests), the local
+# model extracts the speaker's self-introduced name from the transcript.
+# This replaces fragile regex-based name extraction with LLM reasoning.
+#
 
 
-def _release_gpu():
-    """Unload model from VRAM, switch to cloud-only mode.
+def _extract_name_via_llm(
+    turns: list[dict],
+    model,
+    tokenizer,
+) -> str | None:
+    """Use the local LLM to extract a speaker's self-introduced name from transcript.
 
-    Called from SIGUSR1 handler. Blocks until model is fully unloaded.
+    The LLM reasons about context to distinguish the speaker's own name
+    from other names mentioned in conversation. Returns the name or None.
     """
-    if _state["mode"] == "cloud-only":
-        logger.info("Already in cloud-only mode")
-        return
+    from paramem.evaluation.recall import generate_answer
 
-    if _state["consolidating"]:
-        logger.warning("Cannot release GPU — consolidation in progress")
-        return
+    lines = []
+    for turn in turns:
+        role = turn.get("role", "unknown")
+        text = turn.get("text", "")
+        lines.append(f"{role}: {text}")
+    transcript_text = "\n".join(lines)
 
-    logger.info("Releasing GPU — switching to cloud-only mode")
+    system_msg = (
+        "You extract speaker names from conversation transcripts. "
+        "Return ONLY the first name the speaker claims as their own identity, "
+        "or NONE if they did not introduce themselves. "
+        "Do NOT extract names of other people mentioned in conversation."
+    )
+    user_msg = (
+        "Extract the speaker's self-introduced name from this transcript.\n\n"
+        "Examples:\n"
+        'Transcript: "user: My name is Alex. What time is it?"\n'
+        "Answer: Alex\n\n"
+        'Transcript: "user: Tell me about John Smith\'s schedule"\n'
+        "Answer: NONE\n\n"
+        'Transcript: "user: Stop playing music"\n'
+        "Answer: NONE\n\n"
+        f"Transcript:\n{transcript_text}\n\n"
+        "Answer:"
+    )
 
-    # Unload model and free VRAM
-    model = _state["model"]
-    tokenizer = _state["tokenizer"]
-    _state["model"] = None
-    _state["tokenizer"] = None
-    _state["consolidation_loop"] = None
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    if model is not None:
-        unload_model(model, tokenizer)
-    del model, tokenizer
-    gc.collect()
-    torch.cuda.empty_cache()
+    result = generate_answer(model, tokenizer, prompt, max_new_tokens=64, temperature=0.0)
+    result = result.strip().strip('"').strip("'").strip(".")
 
-    _state["mode"] = "cloud-only"
-    _state["cloud_only_reason"] = "gpu_released"
+    if not result or result.upper() == "NONE" or len(result) > 30:
+        return None
 
-    # Suspend consolidation scheduler
-    if _state["scheduler_task"]:
-        _state["scheduler_task"].cancel()
-        _state["scheduler_task"] = None
-        logger.info("Consolidation scheduler suspended")
+    words = result.split()
+    if len(words) > 3 or len(words) == 0:
+        return None
 
-    notify_server(SERVER_CLOUD_ONLY)
-    logger.info("GPU released — cloud-only mode active")
+    return result
 
 
-def _reclaim_gpu():
-    """Reload model and adapters, switch back to local mode.
+async def _enrollment_idle_loop(idle_timeout_seconds: int):
+    """Background task: extract speaker names via LLM after idle timeout.
 
-    Called by the auto-reclaim timer when the GPU is free.
+    Only runs when mode == 'local' (GPU available). Check interval configurable.
+    Aborts the current batch if a new /chat request arrives.
+    On cancellation (shutdown), flushes any pending speaker profile writes.
     """
-    if _state["mode"] == "local":
-        logger.info("Already in local mode")
-        return
+    check_interval = _state["config"].speaker.enrollment_check_interval
 
-    config = _state["config"]
-    logger.info("Reclaiming GPU — loading model: %s", config.model_name)
+    try:
+        await _enrollment_idle_loop_inner(idle_timeout_seconds, check_interval)
+    except asyncio.CancelledError:
+        store = _state.get("speaker_store")
+        if store:
+            store.flush()
+        raise
 
-    model, tokenizer = load_base_model(config.model_config)
 
-    for adapter_name, adapter_cfg in (
-        ("episodic", config.adapters.episodic),
-        ("semantic", config.adapters.semantic),
-        ("procedural", config.adapters.procedural),
-    ):
-        if not adapter_cfg.enabled:
+async def _enrollment_idle_loop_inner(idle_timeout_seconds: int, check_interval: int):
+    """Inner loop — separated so the outer wrapper can catch CancelledError."""
+    while True:
+        await asyncio.sleep(check_interval)
+
+        if _state["mode"] != "local":
             continue
-        adapter_path = config.adapter_dir / adapter_name
-        if adapter_path.exists():
-            logger.info("Loading adapter: %s from %s", adapter_name, adapter_path)
-            model = load_adapter(model, str(config.adapter_dir), adapter_name)
+        if not _state.get("pending_enrollments"):
+            continue
+        last_chat = _state.get("last_chat_time")
+        if not last_chat:
+            continue
+        elapsed = (datetime.now(timezone.utc) - last_chat).total_seconds()
+        if elapsed < idle_timeout_seconds:
+            continue
 
-    _state["model"] = model
-    _state["tokenizer"] = tokenizer
-    _state["router"].reload()
+        buffer = _state["session_buffer"]
+        store = _state.get("speaker_store")
+        model = _state.get("model")
+        tokenizer = _state.get("tokenizer")
 
-    # Restore consolidation scheduler — event_loop is passed from the async caller
-    # because _reclaim_gpu runs in a thread pool via run_in_executor
-    if config.consolidation.schedule and not _state["scheduler_task"]:
-        event_loop = _state.get("_event_loop")
-        if event_loop:
-            event_loop.call_soon_threadsafe(
-                lambda: _state.update(
-                    scheduler_task=event_loop.create_task(
-                        _consolidation_scheduler(config.consolidation.schedule)
-                    )
+        if not store or not model or not tokenizer:
+            continue
+
+        from paramem.server.wyoming_handler import gpu_inference_lock
+
+        # Process each unknown speaker group
+        group_ids = list(_state["unknown_speakers"].keys())
+        for group_id in group_ids:
+            # Abort if new activity arrived
+            new_last = _state.get("last_chat_time")
+            if new_last and new_last != last_chat:
+                logger.info("Enrollment deferred: new /chat activity detected")
+                break
+
+            group = _state["unknown_speakers"].get(group_id)
+            if not group:
+                continue
+
+            # Collect all turns across this group's conversations
+            all_turns = []
+            for conv_id in group["conversations"]:
+                all_turns.extend(buffer.get_session_turns(conv_id))
+
+            if not all_turns:
+                _state["pending_enrollments"] -= group["conversations"]
+                del _state["unknown_speakers"][group_id]
+                continue
+
+            async with gpu_inference_lock:
+                loop = asyncio.get_running_loop()
+                extracted = await loop.run_in_executor(
+                    None,
+                    lambda t=all_turns: _extract_name_via_llm(t, model, tokenizer),
                 )
-            )
-            logger.info("Consolidation scheduler restored")
 
-    _state["mode"] = "local"
-    _state["cloud_only_reason"] = None
-    notify_server(SERVER_RECLAIMED)
-    logger.info("GPU reclaimed — local mode active")
+            if extracted:
+                from paramem.server.speaker import compute_centroid
+
+                ref_embedding = compute_centroid(group["embeddings"])
+                new_id = store.enroll(extracted, ref_embedding)
+                if new_id:
+                    # Attribute all grouped conversations
+                    for conv_id in group["conversations"]:
+                        buffer.set_speaker(conv_id, new_id, extracted)
+                    claimed = buffer.claim_sessions_for_speaker(new_id, extracted, store)
+                    logger.info(
+                        "Deferred enrollment: %s (id=%s, group %s), claimed %d sessions",
+                        extracted,
+                        new_id,
+                        group_id,
+                        claimed,
+                    )
+                else:
+                    logger.info(
+                        "Deferred enrollment skipped for group %s (voice already enrolled)",
+                        group_id,
+                    )
+            else:
+                logger.info("No self-introduction found in group %s", group_id)
+
+            _state["pending_enrollments"] -= group["conversations"]
+            del _state["unknown_speakers"][group_id]
+
+
+# --- GPU lifecycle ---
+#
+# GPU management is service-level: stop the service to free GPU,
+# restart to reclaim. No in-process GPU release/reclaim — process
+# exit is the only way to fully free the CUDA context.
+#
+# Flow:
+#   tresume: stop service → start with --defer-model → launch training
+#   Training finishes: auto-reclaim detects GPU free → restart service
+#   Fresh lifespan loads both LLM + STT on startup
 
 
 def _gpu_occupied() -> bool:
@@ -751,19 +1051,14 @@ def _gpu_has_compute_processes() -> bool:
 async def _auto_reclaim_loop(interval_minutes: int = 10):
     """Periodically check if GPU is free and reclaim it.
 
-    Only runs while in cloud-only mode. Checks every interval_minutes
-    whether any GPU compute process is still running. If not, restarts
-    the service to get a clean CUDA context with the model loaded.
+    Only started when the server is in cloud-only/defer mode (no model loaded).
+    Checks every interval_minutes whether any GPU compute process is still
+    running. If not, restarts the service to get a clean CUDA context with
+    the model loaded.
     """
     interval_seconds = interval_minutes * 60
-    # Never auto-reclaim if the server was explicitly started cloud-only
-    if _state.get("cloud_only_startup", False):
-        logger.info("Auto-reclaim disabled — server started with --cloud-only")
-        return
     while True:
         await asyncio.sleep(interval_seconds)
-        if _state["mode"] != "cloud-only":
-            continue
         if _gpu_has_compute_processes():
             logger.debug("Auto-reclaim: GPU still occupied, waiting")
             continue
@@ -786,19 +1081,6 @@ def _restart_service():
         )
     except Exception:
         logger.exception("Failed to restart service")
-
-
-def _handle_sigusr1(signum, frame):
-    """Signal handler for SIGUSR1 — schedule GPU release on the event loop."""
-    loop = asyncio.get_event_loop()
-    loop.call_soon_threadsafe(asyncio.ensure_future, _async_release_gpu())
-
-
-async def _async_release_gpu():
-    """Async wrapper for GPU release — acquires lock first."""
-    async with _mode_lock:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _release_gpu)
 
 
 # --- Entry point ---
@@ -846,6 +1128,7 @@ def main():
         host=config.server.host,
         port=config.server.port,
         log_level="info",
+        log_config=None,
     )
 
 

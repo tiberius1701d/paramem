@@ -46,6 +46,7 @@ def create_consolidation_loop(
         output_dir=config.adapter_dir,
         graph_path=None,
         extraction_temperature=0.0,
+        extraction_max_tokens=config.consolidation.extraction_max_tokens,
         save_cycle_snapshots=config.debug,
         snapshot_dir=config.debug_dir if config.debug else None,
         persist_graph=False,
@@ -99,10 +100,25 @@ def run_consolidation(
     for session in pending:
         session_id = session["session_id"]
         transcript = session["transcript"]
+        session_speaker_id = session.get("speaker_id")
+
+        # Skip anonymous sessions — no speaker, no key ownership
+        if not session_speaker_id:
+            logger.warning("Skipping session %s: no speaker_id", session_id)
+            session_ids.append(session_id)  # still archive it
+            continue
+
+        # Snapshot keys before cycle to identify new ones by set diff
+        keys_before = set(loop.indexed_key_qa.keys())
         session_ids.append(session_id)
 
         result = loop.run_cycle(transcript, session_id)
         cycle_results.append(result)
+
+        # Tag newly created keys with speaker_id
+        new_keys = set(loop.indexed_key_qa.keys()) - keys_before
+        for key in new_keys:
+            loop.indexed_key_qa[key]["speaker_id"] = session_speaker_id
 
         # Update per-key session counts using this session's entities
         _increment_key_sessions(loop, session_id)
@@ -278,7 +294,7 @@ def _write_keyed_pairs(
                 "question": qa["question"],
                 "answer": qa["answer"],
             }
-            for meta_key in ("source_subject", "source_object", "source_predicate"):
+            for meta_key in ("source_subject", "source_object", "source_predicate", "speaker_id"):
                 if meta_key in qa:
                     entry[meta_key] = qa[meta_key]
             pairs.append(entry)

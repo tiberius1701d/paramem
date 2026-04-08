@@ -16,6 +16,7 @@ probe → reason flow.
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from paramem.evaluation.recall import generate_answer
 from paramem.models.loader import adapt_messages
@@ -31,6 +32,46 @@ from paramem.server.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_TURNS = 10
+
+# Track greeting timestamps per speaker — resets on server restart (intentional)
+_last_greeted: dict[str, datetime] = {}
+
+
+def _should_greet(speaker: str, interval_hours: int) -> str | None:
+    """Return a time-appropriate greeting if the interval has elapsed.
+
+    Returns None if disabled (interval_hours=0) or greeted recently.
+    Does NOT commit the timestamp — caller must call _confirm_greeting()
+    after the greeting is confirmed delivered (not escalated).
+    """
+    if interval_hours <= 0:
+        return None
+    now = datetime.now()
+    last = _last_greeted.get(speaker)
+    if last and (now - last).total_seconds() < interval_hours * 3600:
+        return None
+    hour = now.hour
+    if hour < 12:
+        return "Good morning"
+    if hour < 18:
+        return "Good afternoon"
+    return "Good evening"
+
+
+def _confirm_greeting(speaker: str) -> None:
+    """Mark the speaker as greeted. Call after greeting is delivered."""
+    _last_greeted[speaker] = datetime.now()
+
+
+def _personalize_prompt(base_prompt: str, speaker: str | None) -> str:
+    """Inject speaker name into the system prompt.
+
+    Greeting is handled at the app layer (prepended to response text)
+    so it works across all paths including escalation.
+    """
+    if not speaker:
+        return base_prompt
+    return f"You are speaking with {speaker}. " + base_prompt
 
 
 @dataclass
@@ -53,6 +94,7 @@ def handle_chat(
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     tool_registry: ToolRegistry | None = None,
+    speaker_id: str | None = None,
 ) -> ChatResult:
     """Process a chat message via tri-path routing.
 
@@ -73,12 +115,20 @@ def handle_chat(
     # Build a routing plan
     plan = None
 
+    # Speaker's allowed key set (for scoping temporal and entity queries)
+    allowed_keys = None
+    if speaker_id and router is not None:
+        allowed_keys = router._speaker_key_index.get(speaker_id, set())
+
     # Path 1: Temporal query — filter keys by date range
     date_range = detect_temporal_query(text)
     if date_range:
         start_date, end_date = date_range
         logger.info("Temporal query detected: %s to %s", start_date, end_date)
         temporal_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
+        # Scope temporal keys to the identified speaker
+        if allowed_keys is not None:
+            temporal_keys = [k for k in temporal_keys if k in allowed_keys]
         if temporal_keys:
             plan = RoutingPlan(
                 steps=[
@@ -94,7 +144,7 @@ def handle_chat(
 
     # Path 2: Dual-graph entity routing
     if plan is None and router is not None:
-        plan = router.route(text, speaker=speaker)
+        plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
 
     # Shared kwargs for _escalate_to_ha_agent calls
     ha_kwargs = dict(
@@ -424,7 +474,8 @@ def _probe_and_reason(
     layered_context = "\n\n".join(context_sections)
     augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
-    messages = _build_messages(augmented_text, history, config.voice.load_prompt(), tokenizer)
+    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker)
+    messages = _build_messages(augmented_text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     if isinstance(model, PeftModel):
@@ -464,7 +515,8 @@ def _base_model_answer(
     """Answer from base model without context — escalation candidate."""
     from peft import PeftModel
 
-    messages = _build_messages(text, history, config.voice.load_prompt(), tokenizer)
+    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker)
+    messages = _build_messages(text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     if isinstance(model, PeftModel):

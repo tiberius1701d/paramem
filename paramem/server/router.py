@@ -107,6 +107,8 @@ class QueryRouter:
 
         # adapter_name -> {entity_lower -> set[key]}
         self._entity_key_index: dict[str, dict[str, set[str]]] = {}
+        # speaker_id -> set[key] (for speaker-scoped filtering)
+        self._speaker_key_index: dict[str, set[str]] = {}
         # All known entity names (lowercase) for fast matching
         self._all_entities: set[str] = set()
         # Ordered list for fuzzy matching
@@ -117,6 +119,7 @@ class QueryRouter:
     def reload(self) -> None:
         """Rebuild indexes from disk. Call after consolidation."""
         self._entity_key_index.clear()
+        self._speaker_key_index.clear()
         self._all_entities.clear()
 
         # Scan adapter directories for keyed_pairs.json
@@ -159,6 +162,9 @@ class QueryRouter:
         index = self._entity_key_index.setdefault(adapter_name, {})
         for kp in pairs:
             key = kp.get("key", "")
+            speaker_id = kp.get("speaker_id")
+            if speaker_id:
+                self._speaker_key_index.setdefault(speaker_id, set()).add(key)
             for field_name in ("source_subject", "source_object"):
                 entity = kp.get(field_name, "")
                 if entity and len(entity) > 1:
@@ -187,21 +193,29 @@ class QueryRouter:
         except Exception as e:
             logger.warning("Failed to load graph entities: %s", e)
 
-    def route(self, text: str, speaker: str | None = None) -> RoutingPlan:
+    def route(
+        self,
+        text: str,
+        speaker: str | None = None,
+        speaker_id: str | None = None,
+    ) -> RoutingPlan:
         """Route a query to the appropriate adapter(s) and keys.
 
         If speaker is provided, it is always injected as an implicit
         entity so that self-referential queries ("What is my name?")
         resolve to the speaker's keys.
 
-        Dual-graph routing: checks both PA knowledge graph and HA entity
-        graph. Sets match_source to indicate which graph(s) matched.
+        speaker_id scopes key access: only keys tagged with this speaker_id
+        are returned. If speaker_id is None, no personal keys are served.
 
         Returns a RoutingPlan describing what to activate and probe.
         """
+        # Speaker's allowed key set (empty if anonymous)
+        allowed_keys = self._speaker_key_index.get(speaker_id, set()) if speaker_id else set()
+
         # --- PA graph matching ---
         pa_entities = []
-        if self._entity_key_index:
+        if self._entity_key_index and allowed_keys:
             pa_entities = self._extract_entities(text)
 
             # Inject speaker as implicit entity
@@ -210,16 +224,16 @@ class QueryRouter:
                 if speaker_lower not in pa_entities and speaker_lower in self._all_entities:
                     pa_entities.append(speaker_lower)
 
-            # One-hop expansion
+            # One-hop expansion scoped to speaker's keys
             if speaker:
-                connected = self._get_connected_entities(speaker.lower().strip())
+                connected = self._get_connected_entities(speaker.lower().strip(), allowed_keys)
                 for entity in connected:
                     if entity not in pa_entities:
                         pa_entities.append(entity)
 
             pa_entities.sort()
 
-        has_pa = bool(pa_entities) and bool(self._resolve_keys(pa_entities))
+        has_pa = bool(pa_entities) and bool(self._resolve_keys(pa_entities, allowed_keys))
 
         # --- HA graph matching ---
         ha_match: HAMatchResult | None = None
@@ -247,7 +261,7 @@ class QueryRouter:
         # --- Build PA adapter steps (only if PA matched) ---
         steps = []
         if has_pa:
-            adapter_keys = self._resolve_keys(pa_entities)
+            adapter_keys = self._resolve_keys(pa_entities, allowed_keys)
             for adapter_name in ["procedural", "semantic", "episodic"]:
                 if adapter_name in adapter_keys:
                     keys = list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY]
@@ -320,29 +334,42 @@ class QueryRouter:
 
         return sorted(matched)
 
-    def _get_connected_entities(self, entity: str) -> list[str]:
+    def _get_connected_entities(
+        self, entity: str, allowed_keys: set[str] | None = None
+    ) -> list[str]:
         """Find entities one hop away from the given entity via shared keys.
 
         If entity "alex" has keys where "sam" is the other endpoint,
-        "sam" is returned. This enables probing facts about connected
-        people (spouse, children, pets) when the speaker is the query subject.
+        "sam" is returned. Only traverses keys in allowed_keys if provided.
         """
         connected = set()
         for index in self._entity_key_index.values():
             keys = index.get(entity, set())
-            # Find all other entities that share these keys
+            if allowed_keys is not None:
+                keys = keys & allowed_keys
             for other_entity, other_keys in index.items():
-                if other_entity != entity and keys & other_keys:
-                    connected.add(other_entity)
+                if other_entity != entity:
+                    shared = keys & other_keys
+                    if allowed_keys is not None:
+                        shared = shared & allowed_keys
+                    if shared:
+                        connected.add(other_entity)
         return sorted(connected)
 
-    def _resolve_keys(self, entities: list[str]) -> dict[str, set[str]]:
-        """Map entities to keys, grouped by adapter."""
+    def _resolve_keys(
+        self, entities: list[str], allowed_keys: set[str] | None = None
+    ) -> dict[str, set[str]]:
+        """Map entities to keys, grouped by adapter.
+
+        If allowed_keys is provided, only returns keys in the allowed set.
+        """
         result: dict[str, set[str]] = {}
 
         for entity in entities:
             for adapter_name, index in self._entity_key_index.items():
                 keys = index.get(entity, set())
+                if allowed_keys is not None:
+                    keys = keys & allowed_keys
                 if keys:
                     result.setdefault(adapter_name, set()).update(keys)
 

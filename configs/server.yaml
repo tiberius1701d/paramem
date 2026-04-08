@@ -34,8 +34,8 @@ adapters:
 consolidation:
   schedule: "02:00"            # daily at this hour (empty string = manual only)
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
-  max_active_keys: 50          # cap episodic keys (evict oldest beyond this)
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
+  extraction_max_tokens: 2048  # max output tokens for graph extraction (was 1024)
 
 # --- Agents ---
 # Two-agent design: memory (local) + general (cloud).
@@ -69,7 +69,7 @@ agents:
       provider: google
       model: gemini-2.5-flash
       api_key: ${GOOGLE_API_KEY}
-  ha_agent_id: conversation.groq  # HA conversation agent entity for escalation
+  ha_agent_id: conversation.groq  # HA conversation agent (Groq for fast inference)
 
 # Deprecated — use agents.general instead:
 # cloud:
@@ -93,10 +93,34 @@ tools:
   definitions: configs/tools.yaml   # copy from tools.yaml.example and customize
   max_tool_rounds: 5
   tool_timeout_seconds: 10.0
-  total_timeout_seconds: 8.0
+  total_timeout_seconds: 30.0
 
 sanitization:
   mode: block           # off, warn, block — controls PII detection for cloud queries
 
 voice:
   prompt_file: configs/prompts/ha_voice.txt
+  greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)
+
+speaker:
+  enabled: true   # voice-based speaker identification via pyannote
+  high_confidence_threshold: 0.60  # confirmed match (cross-device centroid)
+  low_confidence_threshold: 0.45   # tentative match, no interruption
+  enrollment_prompt: "By the way, I don't think we've met yet. Please introduce yourself."
+  enrollment_idle_timeout: 120     # seconds of /chat silence before LLM name extraction
+  enrollment_reprompt_interval: 600  # seconds between re-prompting unknown speakers
+  enrollment_check_interval: 15      # seconds between idle-loop checks
+  min_embedding_words: 5             # discard embeddings from shorter transcripts (noisy)
+  max_embeddings_per_profile: 50     # cap on stored embeddings per speaker
+  redundancy_threshold: 0.95         # skip enrichment if similarity to centroid exceeds this
+  grouping_threshold_factor: 0.6     # unknown grouping = low_threshold * this factor
+  # store_path: ""                 # default: data/ha/speaker_profiles.json
+
+stt:
+  enabled: true              # local Whisper STT via Wyoming protocol
+  model: distil-large-v3     # GPU model: distil-large-v3, large-v3, etc.
+  cpu_fallback_model: distil-small.en  # CPU model for cloud-only mode (RTF 0.44x)
+  device: cuda               # cuda, cpu, auto
+  compute_type: int8         # int8, float16, float32
+  port: 10300                # Wyoming STT listener port
+  language: en               # language code or "auto"
