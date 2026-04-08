@@ -261,6 +261,7 @@ class ServerConfig:
     server: ServerNetConfig = field(default_factory=ServerNetConfig)
     model_name: str = "mistral"
     debug: bool = True
+    snapshot_key: str = ""  # Fernet key for encrypted session snapshots; auto-generated if empty
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
@@ -380,6 +381,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     config.server = ServerNetConfig(**raw.get("server", {}))
     config.model_name = raw.get("model", config.model_name)
     config.debug = raw.get("debug", config.debug)
+    config.snapshot_key = raw.get("snapshot_key", config.snapshot_key)
 
     # Paths — resolve relative paths against config file directory so they
     # work regardless of the process's working directory at runtime.
