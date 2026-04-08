@@ -308,14 +308,50 @@ if [ -n "$refresh" ]; then
 fi
 
 # ========================================================================
-# 8. /status endpoint fields
+# 8. Speaker Identification
 # ========================================================================
 echo ""
-echo "--- 8. Status Endpoint ---"
+echo "--- 8. Speaker Identification ---"
+
+speaker_count=$(echo "$status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('speaker_profiles',0))" 2>/dev/null)
+
+if [ "$speaker_count" -gt 0 ]; then
+    # Test: short transcript → embedding discarded (word count filter)
+    short_result=$(curl -sf -X POST "$SERVER/chat" \
+        -H "Content-Type: application/json" \
+        -d '{"text": "Play music", "conversation_id": "speaker-test-short-'$$'", "speaker_embedding": [0.1, 0.2]}' 2>/dev/null)
+    if [ -n "$short_result" ]; then
+        short_speaker=$(echo "$short_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('speaker','') or 'none')" 2>/dev/null)
+        if [ "$short_speaker" = "none" ] || [ "$short_speaker" = "None" ]; then
+            echo "  PASS  short transcript: embedding discarded (speaker=none)"
+            PASS=$((PASS + 1))
+        else
+            echo "  FAIL  short transcript: expected no speaker, got '$short_speaker'"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "  FAIL  short transcript test — server error"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Test: /status reports speaker profiles
+    if [ "$speaker_count" -gt 0 ]; then
+        echo "  PASS  /status reports $speaker_count speaker profile(s)"
+        PASS=$((PASS + 1))
+    fi
+else
+    skip "speaker identification" "no speaker profiles enrolled"
+fi
+
+# ========================================================================
+# 9. Status Endpoint Fields
+# ========================================================================
+echo ""
+echo "--- 9. Status Endpoint ---"
 status_ok=$(echo "$status" | python3 -c "
 import sys, json
 s = json.load(sys.stdin)
-required = ['model', 'mode', 'adapter_loaded', 'keys_count', 'pending_sessions', 'consolidating']
+required = ['model', 'mode', 'adapter_loaded', 'keys_count', 'pending_sessions', 'consolidating', 'speaker_profiles', 'stt_loaded']
 missing = [k for k in required if k not in s]
 print('ok' if not missing else 'missing: ' + ', '.join(missing))
 " 2>/dev/null)

@@ -16,6 +16,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 
 from paramem.utils.notify import ML_FINISHED, ML_PAUSED, ML_RESUMED, ML_STARTED, notify_ml
@@ -261,11 +262,11 @@ class _GPUGuard:
             for info in process_info:
                 print(f"    {info}")
 
-            if self._interactive:
+            if self._interactive and sys.stdin.isatty():
                 answer = input("  Kill these processes? [Y/n] ").strip().lower()
                 if answer not in ("", "y", "yes"):
                     raise GPUAcquireError("User declined — GPU not acquired")
-            else:
+            elif not self._interactive:
                 raise GPUAcquireError("GPU occupied by unknown processes (non-interactive mode)")
 
             for pid in unknown_pids:
@@ -285,7 +286,7 @@ class _GPUGuard:
                 notify_ml(ML_STARTED)
                 return self
 
-            if self._interactive:
+            if self._interactive and sys.stdin.isatty():
                 print(
                     f"\n  ParaMem server (PID {server_pid}) is using the GPU."
                     "\n  It will switch to cloud-only mode during this workload."
@@ -293,6 +294,8 @@ class _GPUGuard:
                 answer = input("  Continue? [Y/n] ").strip().lower()
                 if answer not in ("", "y", "yes"):
                     raise GPUAcquireError("User declined GPU acquisition")
+            elif self._interactive:
+                print(f"  ParaMem server (PID {server_pid}) on GPU — proceeding (no TTY).")
 
             print("  Sending SIGUSR1 to release GPU...")
             _send_release_signal(server_pid)

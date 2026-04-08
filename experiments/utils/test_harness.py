@@ -64,6 +64,13 @@ BENCHMARK_MODELS = {
         trust_remote_code=True,
         cpu_offload=False,
     ),
+    "gemma4": ModelConfig(
+        model_id="google/gemma-4-E4B-it",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        trust_remote_code=True,
+        cpu_offload=False,
+    ),
 }
 
 

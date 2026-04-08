@@ -15,18 +15,21 @@ import sys
 import threading
 
 
-def forward(src, dst):
+def forward(src, dst, shutdown_event):
     try:
         while True:
-            data = src.recv(4096)
+            data = src.recv(65536)
             if not data:
                 break
             dst.sendall(data)
     except OSError:
         pass
     finally:
-        src.close()
-        dst.close()
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        shutdown_event.set()
 
 
 def handle(client, target_host, target_port):
@@ -38,8 +41,16 @@ def handle(client, target_host, target_port):
         client.close()
         return
 
-    threading.Thread(target=forward, args=(client, target), daemon=True).start()
-    threading.Thread(target=forward, args=(target, client), daemon=True).start()
+    done_a = threading.Event()
+    done_b = threading.Event()
+    threading.Thread(target=forward, args=(client, target, done_a), daemon=True).start()
+    threading.Thread(target=forward, args=(target, client, done_b), daemon=True).start()
+
+    # Wait for both directions to finish before closing sockets
+    done_a.wait()
+    done_b.wait()
+    client.close()
+    target.close()
 
 
 def main():

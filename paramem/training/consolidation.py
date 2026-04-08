@@ -90,6 +90,7 @@ class ConsolidationLoop:
         output_dir: str | Path = "outputs/phase3",
         graph_path: Optional[str | Path] = None,
         extraction_temperature: float = 0.0,
+        extraction_max_tokens: int = 2048,
         distillation_config=None,
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
@@ -116,6 +117,7 @@ class ConsolidationLoop:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.extraction_temperature = extraction_temperature
+        self.extraction_max_tokens = extraction_max_tokens
 
         # Distillation pipeline (optional, for instruct-class model)
         self.distillation_pipeline = None
@@ -251,6 +253,7 @@ class ConsolidationLoop:
                         session_transcript,
                         session_id,
                         temperature=self.extraction_temperature,
+                        max_tokens=self.extraction_max_tokens,
                         prompts_dir=self.prompts_dir,
                     )
             else:
@@ -260,6 +263,7 @@ class ConsolidationLoop:
                     session_transcript,
                     session_id,
                     temperature=self.extraction_temperature,
+                    max_tokens=self.extraction_max_tokens,
                     prompts_dir=self.prompts_dir,
                 )
 
@@ -518,20 +522,6 @@ class ConsolidationLoop:
             # Move SimHash entry to semantic
             if key in self.episodic_simhash:
                 self.semantic_simhash[key] = self.episodic_simhash.pop(key)
-
-        # Cap at max_active_keys (evict oldest if over)
-        if len(episodic_keyed) > self.config.max_active_keys:
-            evicted = episodic_keyed[: len(episodic_keyed) - self.config.max_active_keys]
-            episodic_keyed = episodic_keyed[len(evicted) :]
-            for kp in evicted:
-                self.indexed_key_registry.remove(kp["key"])
-                self.indexed_key_qa.pop(kp["key"], None)
-                self.episodic_simhash.pop(kp["key"], None)
-            logger.info(
-                "Evicted %d oldest keys (capacity cap %d)",
-                len(evicted),
-                self.config.max_active_keys,
-            )
 
         if not episodic_keyed:
             return None

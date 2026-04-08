@@ -289,6 +289,7 @@ def assign_keys(qa_pairs: list[dict], start_index: int = 1) -> list[dict]:
             "source_object",
             "first_seen_cycle",
             "source_character",
+            "speaker_id",
         ):
             if extra_key in qa:
                 entry[extra_key] = qa[extra_key]
