@@ -241,7 +241,7 @@ class TestPrivacyRouting:
         router = MagicMock()
         known = {e.lower() for e in (known_entities or [])}
 
-        def route(text, speaker=None):
+        def route(text, speaker=None, speaker_id=None):
             text_lower = text.lower()
             matched = [e for e in known if e in text_lower]
             if speaker and speaker.lower() in known:

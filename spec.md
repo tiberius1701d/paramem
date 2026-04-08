@@ -131,6 +131,52 @@ Parametric memory is inherently more private than text-based storage — knowled
 - **F5.4d:** Adapter weight encryption: explore encrypting the LoRA adapter files at rest. Standard approach — decrypt into memory at load time, never write plaintext to disk.
 - **F5.4e:** Extraction resistance validation: extend Test 5 (privacy preservation) to adversarial settings — prompt injection, fine-tuning attacks, weight inspection. Goal is to *measure* what an attacker with access to the adapter file can recover, not to guarantee resistance. This is characterization, not hardening.
 
+#### F5.5 Voice-Based Speaker Identification (implemented 2026-04-08)
+
+Automatic speaker identification via voice embeddings, integrated into the
+HA voice pipeline. Multi-embedding profiles with L2-normalized centroid
+matching for cross-device robustness.
+
+- **F5.5a:** Wyoming STT wrapper: intercepts audio between voice satellite
+  and STT engine. Pyannote speaker embedding model (4.3M params, CPU,
+  <1s inference) computes 512-dim embedding per utterance alongside Whisper.
+- **F5.5b:** Speaker enrollment via deferred LLM extraction: unknown voices
+  grouped silently by embedding similarity. After a global cooldown (default
+  600s), the system prompts for introduction. Name extraction runs via the
+  local LLM during idle periods (2 min timeout). Enrollment uses the
+  centroid of all accumulated group embeddings.
+- **F5.5c:** Multi-embedding store (v3): each profile holds up to 50
+  embeddings from different utterances and devices. Matching compares
+  against the L2-normalized centroid. Confirmed matches auto-enrich the
+  profile, building cross-device robustness over time. Thread-safe with
+  deferred disk writes flushed on shutdown.
+- **F5.5d:** Confidence-based routing: high-confidence match (>=0.60) →
+  attach speaker silently + enrich centroid. Tentative match (0.45-0.60) →
+  attach tentatively, no interruption. No match (<0.45) → anonymous.
+  All thresholds configurable in server.yaml.
+- **F5.5e:** Embedding quality filter: utterances shorter than 5 words have
+  embeddings discarded (pyannote needs ~3s of voice for stable prints).
+  Prevents noisy short-command embeddings from polluting profiles.
+- **F5.5f:** Cloud-only mode: skip speaker identification. Route all
+  queries to HA/SOTA escalation. Speaker ID only matters when the local
+  model needs to scope facts by speaker.
+- **F5.5g:** Personalized greeting: on first interaction per speaker per
+  interval (default 24h, configurable), the system prompt instructs the
+  model to greet naturally ("Good morning, Tobias"). Time-of-day aware.
+  Disabled for unknown speakers.
+- **F5.5h:** Resilience: speaker resolution and enrollment failures are
+  caught and logged — the query proceeds as anonymous. HA custom component
+  falls back to the HA conversation agent (Groq) on server error/timeout.
+
+Measured cross-device scores (pyannote/embedding, 512-dim):
+- Same speaker, same device (ESP32 S3 Box 3): 0.15-0.57 per utterance
+- Same speaker, cross-device (ReSpeaker Lite vs S3 Box 3): 0.38-0.52
+- After centroid enrollment (2-3 embeddings): 0.54-0.67
+- ReSpeaker Lite produces more consistent embeddings than S3 Box 3
+
+Dependency: pyannote-audio (open source, MIT). Runs on CPU — no GPU
+contention with the local model.
+
 ## Out of Scope (Phase 5)
 
 - Cloud deployment and multi-user support

@@ -1104,7 +1104,7 @@ Other approaches from literature:
 ## Test 8: Large-Scale Incremental (500-Key Target)
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** IN PROGRESS — 50 cycles complete, **528 keys**, 100% recall (2026-04-02). Paused. No ceiling found.
+**Status:** IN PROGRESS — 56 cycles complete, **536 keys**, 100% recall (2026-04-08). Running. No ceiling found.
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -1127,7 +1127,7 @@ indexed key training with full replay.
 - **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
 - **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
 
-### Results (2026-04-02, cycles 1-50 complete)
+### Results (2026-04-08, cycles 1-56 complete)
 
 | Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
 |-------|------|--------|------|------------------|------------|-------|
@@ -1177,12 +1177,17 @@ indexed key training with full replay.
 | 48 | 489 | 489/489 (100%) | 0.153 | 28 | — | 10th character (Ruan Wenting) |
 | 49 | 510 | 510/510 (100%) | 0.152 | 21 | — | **500-key milestone passed** |
 | 50 | 528 | 528/528 (100%) | 0.148 | 18 | — | Lowest loss yet (0.148) |
+| 51 | — | — | — | 0.0 | — | Skipped (no new triples) |
+| 52 | — | — | — | 0.0 | — | Skipped (no new triples) |
+| 53 | 536 | 536/536 (100%) | — | 8 | — | 11th character (Zou Min) |
+| 54 | — | — | — | 0.0 | — | Skipped (no new triples) |
+| 55 | — | — | — | 0.0 | — | Skipped (no new triples) |
 
 **500-key milestone passed at cycle 49. 100% keyed recall at every scale point
-from 21 to 528 keys.** Ten characters processed (Deng Yu, Liang Xin, Xia Yu,
-Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong completed; Ruan Wenting
-in progress). Adapter size: 27 MB (fixed, independent of key count). Graph: 600
-nodes, 528 edges. Loss stable at 0.148-0.153, no upward trend through 5× the
+from 21 to 536 keys.** Eleven characters processed (Deng Yu, Liang Xin, Xia Yu,
+Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong, Ruan Wenting completed; Zou Min
+in progress). Adapter size: 27 MB (fixed, independent of key count). Graph: 607
+nodes, 536 edges. Loss stable at 0.148-0.153, no upward trend through 5× the
 original 100-key validated scale. Run continuing to find the ceiling.
 
 ### Extraction pipeline improvement (cycles 22-23)
@@ -1326,19 +1331,19 @@ Parametric memory reduces the at-rest attack surface. Runtime exposure during re
 
 ### Scaling status
 
-500-key target reached at cycle 49 (2026-04-02). Run continuing past 500 to find the ceiling:
-- 528 keys confirmed at 100% recall (cycle 50). Loss at 0.148 (lowest yet)
-- Test 9 confirms: keyed 100%, direct 99.8%, open-ended ~33% at 528 keys — all metrics stable
-- Cycle time at 528 keys: ~8 hours. Each additional cycle adds ~20 keys
-- Loss and convergence show no degradation — no ceiling indicators yet
-- Ruan Wenting (10th character) still yielding; additional characters available in PerLTQA data
+500-key target reached at cycle 49 (2026-04-02). Run paused at cycle 56 with 550 keys:
+- **550 keys at 100% recall** (cycle 56, 280 sessions, 11 characters, 623 graph nodes)
+- Final training loss: 0.156, QA yield: 2.8/session
+- Test 9 confirms at 550 keys: keyed 100%, direct 99.6%, open-ended 32.2% — all metrics stable
+- Zero degradation from 21 to 550 keys — no ceiling indicators yet
+- Additional characters available in PerLTQA data for further scaling
 
 ---
 
 ## Test 9: Natural Recall Emergence
 
 **Script:** `experiments/test9_natural_recall.py`
-**Status:** IN PROGRESS — Mistral 7B, 39 cycles evaluated (21→528 keys). Latest run 2026-04-02.
+**Status:** COMPLETE — Mistral 7B, 41 cycles evaluated (21→550 keys). Latest run 2026-04-08.
 
 ### Objective
 
@@ -1367,7 +1372,7 @@ One model load, adapter swapped per cycle. Incremental per-cycle results saved.
 `--resume` skips completed cycles and merges results. Re-runnable after
 Test 8 advances — picks up new cycle checkpoints automatically.
 
-### Results — Mistral 7B (39 cycles, 528 keys, 105 entities)
+### Results — Mistral 7B (41 cycles, 550 keys, 107 entities)
 
 | Cycle | Keys | Entities | Keyed | Direct | Overlap | Open Facts | Entity Hit | Time |
 |------:|-----:|---------:|------:|-------:|--------:|-----------:|-----------:|-----:|
@@ -1410,21 +1415,23 @@ Test 8 advances — picks up new cycle checkpoints automatically.
 | 48 | 489 | 96 | 100% | 100% | 0.997 | 35.0% | 51.0% | 29.3m |
 | 49 | 510 | 101 | 100% | 100% | 0.998 | 33.5% | 49.5% | 31.4m |
 | 50 | 528 | 105 | 100% | 99.8% | 0.998 | 33.0% | 47.6% | 32.2m |
+| 53 | 536 | 106 | 100% | 100% | 0.998 | 33.0% | 47.2% | 30.9m |
+| 56 | 550 | 107 | 100% | 99.6% | 0.995 | 32.2% | 47.7% | 33.7m |
 
 ### Summary
 
-| Metric | Final (528 keys) | Range across 39 cycles |
+| Metric | Final (550 keys) | Range across 41 cycles |
 |--------|------------------|---------------------|
 | Keyed retrieval | **100%** | 100% every cycle |
-| Direct questions | **99.8%** | 95.2% – 100% |
-| Direct overlap | **0.998** | 0.954 – 0.999 |
-| Open-ended facts | **33.0%** | 13.6% – 37.3% |
-| Open-ended entity hit | **47.6%** | 35.7% – 71.4% |
+| Direct questions | **99.6%** | 95.2% – 100% |
+| Direct overlap | **0.995** | 0.954 – 0.998 |
+| Open-ended facts | **32.2%** | 13.6% – 37.3% |
+| Open-ended entity hit | **47.7%** | 35.7% – 71.4% |
 
 ### Analysis
 
-**Keyed retrieval is perfect at all scales.** 100% across 39 cycles from
-21 to 528 keys. The indexed key mechanism shows no degradation with scale.
+**Keyed retrieval is perfect at all scales.** 100% across 41 cycles from
+21 to 550 keys. The indexed key mechanism shows no degradation with scale.
 
 **Direct questions (natural language, no key cue) achieve 95–100%.** The
 model reliably retrieves parametrically stored facts when asked the training
@@ -1435,8 +1442,8 @@ prompt — natural language works. The occasional misses (1–5% at small scales
 
 **Open-ended recall plateaus around 1/3 of facts.** The "What do you know
 about X?" probe style does not show an upward trend with scale. Fact recall
-fluctuates between 25–37% from 21 keys to 528 keys. Entity hit rate is
-similarly flat around 50% (half the entities produce at least one correct
+fluctuates between 25–37% from 21 keys to 550 keys. Entity hit rate is
+similarly flat around 48% (half the entities produce at least one correct
 fact).
 
 **Cycle 13 outlier (13.6%) is a scoring artifact, not a recall regression.**
@@ -2278,3 +2285,89 @@ First live deployment of ParaMem as a Home Assistant conversation agent.
 ### Key observation
 
 Personal knowledge recalled from adapter weights makes the agent feel genuinely personal — it knows where you live, what you do, who your family is — without any documents stored on disk. This validates the core thesis: parametric memory as a practical alternative to RAG for personal agents.
+
+---
+
+## F5.5 Speaker Identification (2026-04-08)
+
+Voice-based multi-user speaker identification via pyannote embeddings, integrated into the Wyoming STT pipeline.
+
+### Architecture
+
+- **Embedding model:** pyannote/embedding (4.3M params, 512-dim, CPU inference <1s)
+- **Profile format (v3):** multi-embedding — each speaker stores up to 50 embeddings from different utterances and devices. Matching uses L2-normalized centroid.
+- **Enrollment:** deferred LLM extraction. Unknown voices grouped silently by embedding similarity. After a global cooldown (600s), the system prompts for introduction. Name extracted from conversation context via local LLM during idle periods.
+- **Enrichment:** confirmed matches auto-add the new embedding to the profile. The centroid naturally becomes cross-device as the speaker uses different satellites.
+
+### Voice Satellites
+
+| Device | Location | Mic Type | Embedding Quality |
+|--------|----------|----------|------------------|
+| ReSpeaker Lite | Living room | Dedicated dual-mic array, hardware beamforming | More consistent (purpose-built for voice) |
+| ESP32 S3 Box 3 | Office | ES7210 ADC + built-in MEMS mic | Noisier (general-purpose dev kit) |
+
+### Measured Embedding Scores (cosine similarity)
+
+Same speaker (Tobias), pyannote 512-dim embeddings:
+
+| Condition | Score Range | Notes |
+|-----------|------------|-------|
+| Office mic → office mic (different utterances) | 0.15–0.57 | High variance from short commands + MEMS mic noise |
+| Cross-device (ReSpeaker → S3 Box) | 0.38–0.52 | Channel mismatch dominates |
+| After centroid enrollment (2-3 embeddings) | 0.54–0.67 | Centroid averaging recovers signal |
+| Centroid match from office (3 embeddings) | 0.54–0.64 | Within high-confidence threshold |
+| Centroid match from living room (3 embeddings) | 0.67 | Better mic produces better scores |
+
+### Thresholds (configured in server.yaml)
+
+| Threshold | Value | Purpose |
+|-----------|-------|---------|
+| High confidence | 0.60 | Confirmed match — attach speaker, enrich centroid |
+| Low confidence | 0.45 | Tentative match — attach without interruption |
+| Redundancy | 0.95 | Skip add_embedding if too similar to centroid |
+| Grouping factor | 0.6 × low = 0.27 | Group unknown voices (lenient for noisy embeddings) |
+| Min embedding words | 5 | Discard embeddings from shorter transcripts |
+
+### Key Findings
+
+1. **Single-utterance embeddings are unreliable.** Pyannote needs ~3s of voice for stable prints. Short commands ("Play music", 1.5s after VAD) produce scores that vary 0.15–0.57 for the same speaker on the same device.
+
+2. **Cross-device enrollment requires centroid averaging.** A single enrollment embedding from one mic doesn't transfer to a different mic (0.38–0.52). The L2-normalized centroid from multiple devices recovers matching quality (0.54–0.67).
+
+3. **ReSpeaker > S3 Box for voice capture.** Dedicated voice hardware with hardware beamforming produces more consistent embeddings than a general-purpose ESP32 dev kit.
+
+4. **The system improves with use.** Each confirmed match enriches the centroid. After a few conversations from each room, cross-device matching converges above the high-confidence threshold.
+
+### Personalization
+
+- Daily greeting on first interaction per speaker (configurable interval, default 24h)
+- Time-of-day aware: "Good morning/afternoon/evening, {name}"
+- Injected via system prompt — the model produces the greeting naturally
+- Only for confirmed speakers (high-confidence match). Unknown speakers get no greeting.
+
+### Resilience
+
+- Speaker resolution failure → proceeds as anonymous (no 500 error)
+- Enrollment failure → logged, query continues normally
+- HA custom component: ParaMem server error → falls back to HA conversation agent (Groq)
+- HA agent also fails → generic error message. No dead ends.
+
+### Infrastructure Notes
+
+- Sonos TTS forwarding via HA automation (`esphome.tts_uri` event → `media_player.play_media` with `announce: true`)
+- Music Assistant entity sync can break silently — MA container restart fixes it
+- Wyoming STT on port 10300, REST API on port 8420
+- Speaker profiles persisted as JSON, deferred disk writes flushed on shutdown
+
+### Planned: Continuous Background Training
+
+Current consolidation runs as a batch job (daily at 02:00). An alternative architecture would train continuously in the background, interruptible on user activity:
+
+- HuggingFace Trainer supports checkpoint save/resume (optimizer state + LR scheduler + adapter weights)
+- `TrainerCallback.on_step_end` can check a pause flag and halt training mid-step
+- With QLoRA, no model unload needed — the base model stays in VRAM. Training and inference differ only in adapter mode (`model.train()` vs `model.eval()`) and optimizer state (~few MB for rank-8 LoRA)
+- On user activity: save checkpoint → switch to eval mode → serve inference → resume training
+- The mode switch is milliseconds, not seconds — no VRAM reallocation
+- Periodic snapshots as safe rollback points; discard partial epoch on interruption
+
+This would reduce the fact-encoding latency from "next morning" to minutes after conversation, approaching real-time incremental learning. The building blocks (Trainer checkpoints, GPU inference lock, adapter switching) already exist in the codebase.

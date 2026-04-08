@@ -15,7 +15,7 @@ class TestConfig:
         config = load_server_config("configs/server.yaml")
         assert config.model_name == "mistral"
         assert config.server.port == 8420
-        assert config.adapter_dir == Path("data/ha/adapters")
+        assert config.adapter_dir == Path("data/ha/adapters").resolve()
         assert config.general_agent.enabled is True
         assert config.general_agent.provider == "groq"
         # Deprecated alias still works
@@ -123,7 +123,7 @@ class TestConfig:
 
     def test_prompts_path_loaded(self):
         config = load_server_config("configs/server.yaml")
-        assert config.paths.prompts == Path("configs/prompts")
+        assert config.paths.prompts == Path("configs/prompts").resolve()
 
 
 class TestEscalation:
@@ -238,18 +238,21 @@ class TestSessionBuffer:
         buffer = SessionBuffer(tmp_path / "sessions")
         assert buffer.get_session_state("conv1") == "new"
         assert buffer.get_speaker("conv1") is None
+        assert buffer.get_speaker_id("conv1") is None
 
-        buffer.set_speaker("conv1", "Alex")
+        buffer.set_speaker("conv1", "spk_abc", "Alex")
         assert buffer.get_speaker("conv1") == "Alex"
+        assert buffer.get_speaker_id("conv1") == "spk_abc"
         assert buffer.get_session_state("conv1") == "identified"
 
     def test_speaker_in_transcript(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions")
-        buffer.set_speaker("conv1", "Alex")
+        buffer.set_speaker("conv1", "spk_abc", "Alex")
         buffer.append("conv1", "user", "I live in Amsterdam")
 
         pending = buffer.get_pending()
         assert "Alex: I live in Amsterdam" in pending[0]["transcript"]
+        assert pending[0]["speaker_id"] == "spk_abc"
 
 
 class TestKeyMetadata:

@@ -261,10 +261,12 @@ tools:
 ### Architecture
 
 ```
-Voice/Text → HA → ParaMem Server
-  ├─ Speaker identified? → greeting flow
+Voice Satellite → Wyoming STT (Whisper + pyannote) → HA → ParaMem /chat
+  ├─ Speaker match (centroid) → attach identity
   ├─ Entity match in knowledge graph? → adapter recall → reason → respond
-  └─ No match → HA conversation.process (WebSocket) → response
+  ├─ HA entity match? → HA conversation agent (tools, device control)
+  └─ Neither → SOTA cloud agent (reasoning, search)
+Response → HA TTS → Sonos (announce)
 ```
 
 ParaMem owns memory (speaker identification, entity routing, adapter recall, consolidation). Home Assistant owns everything else (device control, search, weather, music, prompt engineering, model selection). Non-memory queries are forwarded to HA's configured conversation agent, which handles tool execution, entity resolution, and room-aware context internally.
@@ -318,6 +320,16 @@ A custom conversation agent for Home Assistant is included in `custom_components
 - ParaMem handles memory-related queries locally (parametric recall from adapter weights)
 - Non-memory queries are forwarded back to HA's configured conversation agent via WebSocket (`conversation.process`), which handles device control, search, weather, and other tools with full room awareness
 - The HA conversation agent's prompt, model, and tools are configured entirely on the HA side — no duplication in ParaMem
+
+### Voice Pipeline
+
+ParaMem includes a local voice pipeline for privacy-first operation:
+
+- **Local STT:** Whisper distil-large-v3 on GPU via Wyoming protocol (port 10300). CPU fallback: distil-small.en.
+- **Speaker identification:** Pyannote 512-dim voice embeddings. Multi-embedding profiles with L2-normalized centroid matching for cross-device robustness. Auto-enrichment on confirmed matches.
+- **TTS to Sonos:** ESPHome voice satellites fire `esphome.tts_uri` events, HA automation routes to room-appropriate Sonos speaker via `media_player.play_media` with `announce: true`.
+
+Tested voice satellites: ReSpeaker Lite (living room), ESP32 S3 Box 3 (office).
 
 ## Data
 
