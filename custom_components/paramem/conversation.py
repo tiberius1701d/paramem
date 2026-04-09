@@ -96,18 +96,17 @@ class ParaMemConversationEntity(ConversationEntity):
             response_text = await self._fallback_to_ha(user_input)
             follow_up = None
 
-        # Append follow-up as a separate sentence if present
-        # (e.g. speaker introduction question)
-        if follow_up:
-            response_text = f"{response_text} ... {follow_up}"
-
-        # Record assistant response in chat log
+        # Record assistant response in chat log (without follow-up prompt)
         chat_log.async_add_assistant_content_without_tools(
             AssistantContent(
                 agent_id=user_input.agent_id,
                 content=response_text,
             )
         )
+
+        # Append follow-up after recording — spoken by TTS but not in history
+        if follow_up:
+            response_text = f"{response_text} ... {follow_up}"
 
         # Build HA IntentResponse
         response = intent.IntentResponse(language=user_input.language)
