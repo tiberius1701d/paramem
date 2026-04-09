@@ -171,27 +171,50 @@ class SpeakerStore:
         else:
             self._centroids.pop(speaker_id, None)
 
-    def should_greet(self, speaker_id: str, interval_hours: int) -> str | None:
-        """Return a time-appropriate greeting if the interval has elapsed.
+    @staticmethod
+    def _time_period(hour: int) -> str:
+        """Return the current time-of-day period."""
+        if hour < 12:
+            return "morning"
+        if hour < 18:
+            return "afternoon"
+        return "evening"
 
-        Returns None if disabled (interval_hours=0) or greeted recently.
+    @staticmethod
+    def _greeting_text(period: str) -> str:
+        greetings = {
+            "morning": "Good morning",
+            "afternoon": "Good afternoon",
+            "evening": "Good evening",
+        }
+        return greetings[period]
+
+    def should_greet(self, speaker_id: str, interval_hours: int) -> str | None:
+        """Return a time-appropriate greeting if the interval has elapsed
+        or the time-of-day period changed since last greeting.
+
+        Greets when either condition is met:
+        a) More than interval_hours since last greeting, OR
+        b) The time-of-day period (morning/afternoon/evening) changed.
+
+        Returns None if disabled (interval_hours=0) or greeted in this period.
         Does NOT commit — caller must call confirm_greeting() after delivery.
         """
         if interval_hours <= 0:
             return None
         now = datetime.now(timezone.utc)
+        hour = datetime.now().hour  # local time for period check
+        current_period = self._time_period(hour)
         with self._lock:
             last_str = self._last_greeted.get(speaker_id)
         if last_str:
             last = datetime.fromisoformat(last_str)
-            if (now - last).total_seconds() < interval_hours * 3600:
+            last_local_hour = last.astimezone().hour
+            last_period = self._time_period(last_local_hour)
+            hours_elapsed = (now - last).total_seconds() / 3600
+            if current_period == last_period and hours_elapsed < interval_hours:
                 return None
-        hour = datetime.now().hour  # local time for greeting text
-        if hour < 12:
-            return "Good morning"
-        if hour < 18:
-            return "Good afternoon"
-        return "Good evening"
+        return self._greeting_text(current_period)
 
     def confirm_greeting(self, speaker_id: str) -> None:
         """Mark the speaker as greeted and persist to disk."""
@@ -244,7 +267,7 @@ class SpeakerStore:
             if not centroid:
                 continue
             score = cosine_similarity(embedding, centroid)
-            logger.debug(
+            logger.info(
                 "Speaker match: %s score=%.4f (%d embeddings, thresholds: high=%.2f, low=%.2f)",
                 profile.get("name", speaker_id),
                 score,
