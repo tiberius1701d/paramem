@@ -1473,7 +1473,7 @@ primary retrieval mechanism.
 ## Test 10: Generalization Boundaries of Parametric Memory
 
 **Script:** `experiments/test10_grokking.py`
-**Status:** PAUSED — 24 cycles complete (E720).
+**Status:** RUNNING — 29 cycles complete (E870). Target E3,000.
 
 ### Objective
 
@@ -1606,6 +1606,11 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E660 | 99% | 93.0% | 69.8% | 8.1% | 45.6% | 8.9% | 47.3% | 0.006 |
 | E690 | 100% | 93.0% | 72.1% | 10.8% | 41.1% | 10.3% | 45.0% | 0.004 |
 | E720 | 97% | 92.2% | 72.9% | 10.8% | 48.6% | 12.3% | 41.1% | 0.009 |
+| E750 | 100% | 93.0% | 73.6% | 6.1% | 43.3% | 11.3% | 45.7% | 0.003 |
+| E780 | 100% | 93.0% | 72.9% | 14.7% | 49.2% | 11.8% | 49.6% | 0.004 |
+| E810 | 100% | 93.0% | 70.5% | 7.5% | 48.6% | 4.9% | 48.1% | 0.002 |
+| E840 | 100% | 93.0% | 77.5% | 7.2% | 45.0% | 10.8% | 42.6% | 0.002 |
+| E870 | 100% | 93.0% | 72.1% | 10.6% | 51.4% | 10.8% | 44.2% | 0.003 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1616,20 +1621,26 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E90 | 37/360 | — | — | 0 |
 | E690 | 39/360 | 8/35 (23%) | 31/325 (10%) | 0 |
 | E720 | 39/360 | 9/35 (26%) | 30/325 (9%) | 0 |
+| E750 | 22/360 | 5/35 (14%) | 17/325 (5%) | 0 |
+| E780 | 53/360 | 11/35 (31%) | 42/325 (13%) | 0 |
+| E810 | 27/360 | 7/35 (20%) | 20/325 (6%) | 0 |
+| E840 | 26/360 | 4/35 (11%) | 22/325 (7%) | 0 |
+| E870 | 38/360 | 4/35 (11%) | 34/325 (10%) | 0 |
 
-### Key findings (E720, 24 cycles)
+### Key findings (E870, 29 cycles)
 
 **1. Shortcut > 3-hop at all checkpoints — no compositional crossover.**
 The relation shortcut control consistently exceeds 3-hop accuracy across all
-24 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 38pp (E720: 48.6%
-vs 10.8%). All multi-hop accuracy remains explainable by single-hop
+29 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 41pp (E870: 51.4%
+vs 10.6%). Shortcut is the only metric still climbing (15%→51%), while 3-hop
+is flat. All multi-hop accuracy remains explainable by single-hop
 relation→entity shortcuts. No compositional generalization observed.
 
 **2. 3-hop oscillates without upward trend.** 3-hop accuracy fluctuates
 between 5-18% with periodic spikes (16.9% at E240, 16.1% at E390, 17.8%
 at E600) that always revert to the 6-10% baseline within 1-2 cycles. The
-spike peaks may be slowly climbing (16.1 → 16.9 → 17.8) but the sample is
-too small to confirm a trend. At 24x convergence (loss converged at E30),
+E750-E870 extension confirms the pattern: 6.1%, 14.7%, 7.5%, 7.2%, 10.6%.
+No upward drift. At 29x convergence (loss converged at E30),
 still early relative to the grokking literature (100-10,000x).
 
 **3. Associative generalization is real and stable.** The adapter transfers
@@ -1644,17 +1655,18 @@ will evaluate genuinely diverse question forms.
 
 **4. Keyed recall remains robust.** 100% at most checkpoints, with
 occasional single-cycle dips (93% at E240, 95% at E630, 97% at E180/E540/E720)
-that self-correct in the following cycle. The dips anti-correlate with
-3-hop spikes, suggesting weight reorganization between memorization and
-generalization modes.
+that self-correct in the following cycle. E750-E870: solid 100% across all
+5 new cycles — no dips. The earlier dips anti-correlated with 3-hop spikes,
+suggesting weight reorganization between memorization and generalization modes.
 
 **5. Full-chain reasoning: 0 across all checkpoints.** The model never names
 intermediate entities in multi-hop answers. When it gets the terminal entity
 correct, it does so via shortcut, not by tracing the chain.
 
-**6. Loss plateau.** Loss converged by E30 (0.113), reached near-zero by
-E60 (0.014), and has fluctuated between 0.003-0.009 since E90. No further
-decline — the model is at the loss floor.
+**6. Loss still declining.** Loss converged by E30 (0.113), reached near-zero by
+E60 (0.014). E90-E720 fluctuated 0.003-0.009. E750-E870 shows the lowest
+values yet (0.003, 0.004, 0.002, 0.002, 0.003), suggesting continued
+memorization refinement even without generalization improvement.
 
 ### Grokking detection criterion
 
@@ -1694,10 +1706,10 @@ distinguish partial learning from noise: check whether the *same* questions
 succeed across probes (consistent subset = learning) or whether the success
 set is random each time (churn = noise).
 
-**5. Open-ended degradation.** Open-ended recall dropped from 50% (E150) to
-32% (E480). This could indicate catastrophic forgetting of base model
-capabilities from extended overtraining. Monitor this metric — if it
-continues declining, the model is degrading before any grokking benefit.
+**5. Open-ended stable, not degrading.** Open-ended recall varies 32-50%
+with no sustained trend. The E480 dip (32%) was an outlier — subsequent
+checkpoints recovered to 41-50%. No evidence of catastrophic forgetting
+from extended overtraining through E870.
 
 **6. Weight norm tracking.** Grokking in the literature is associated with
 weight norm decrease after initial increase. Tracking per-layer LoRA weight
@@ -1706,7 +1718,7 @@ regularization dynamics that drive grokking are engaging.
 
 ### Next steps
 
-1. Continue running — at 24x convergence (E720), still early relative to
+1. Continue running — at 29x convergence (E870), still early relative to
    grokking literature thresholds (100-10,000x). Target E3,000 (100x) before
    concluding.
 2. ~~**Test 10b**: evaluate diverse question forms~~ — COMPLETE (see below).
