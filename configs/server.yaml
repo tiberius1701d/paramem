@@ -107,7 +107,7 @@ speaker:
   enabled: true   # voice-based speaker identification via pyannote
   high_confidence_threshold: 0.60  # confirmed match (cross-device centroid)
   low_confidence_threshold: 0.45   # tentative match, no interruption
-  enrollment_prompt: "By the way, I don't think we've met yet. Please introduce yourself."
+  enrollment_prompt: "By the way, I don't think we've met yet. Please introduce yourself with your next request."
   enrollment_idle_timeout: 120     # seconds of /chat silence before LLM name extraction
   enrollment_reprompt_interval: 600  # seconds between re-prompting unknown speakers
   enrollment_check_interval: 15      # seconds between idle-loop checks
