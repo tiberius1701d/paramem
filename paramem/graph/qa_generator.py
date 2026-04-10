@@ -9,6 +9,40 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Supplementary predicate set for procedural filtering.
+# Primary gate is relation_type == "preference"; this catches cases where
+# the extractor used a preference predicate but tagged the relation as factual.
+_PROCEDURAL_PREDICATES = frozenset(
+    {
+        "prefers",
+        "likes",
+        "dislikes",
+        "has_hobby",
+        "drinks",
+        "eats",
+        "watches",
+        "listens_to",
+        "avoids",
+        "favorite",
+    }
+)
+
+
+def filter_procedural_relations(relations: list[dict]) -> list[dict]:
+    """Filter relations that represent behavioral preferences or habits.
+
+    Primary gate: relation_type == "preference" (catches model-coined predicates).
+    Secondary: predicate in supplementary set (catches mis-tagged preferences).
+    """
+    result = []
+    for rel in relations:
+        if rel.get("relation_type") == "preference":
+            result.append(rel)
+        elif rel.get("predicate", "").lower() in _PROCEDURAL_PREDICATES:
+            result.append(rel)
+    return result
+
+
 # Few-shot examples covering diverse predicate types.
 # These teach the model the expected output format and conciseness.
 # Includes verbose/narrative objects to demonstrate extracting current state.
@@ -210,6 +244,12 @@ def generate_qa_from_relations(
             qa_pairs.extend(_template_fallback(subject, predicate, obj))
 
     logger.info("Generated %d QA pairs from %d relations", len(qa_pairs), len(relations))
+    for qa in qa_pairs:
+        logger.debug(
+            "  QA: Q=%s | A=%s",
+            qa.get("question", "")[:80],
+            qa.get("answer", "")[:80],
+        )
     return qa_pairs
 
 

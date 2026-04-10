@@ -1,10 +1,29 @@
-Extract all entities and relations from this conversation transcript.
+Extract PERSONAL FACTS about the speaker from this conversation transcript.
+
+Only extract facts that would still be true tomorrow — identity, relationships,
+location, preferences, work, education.
 
 Rules:
-- Entity types: person, place, organization, concept, preference, event
+- INTENT MATTERS: Only extract from statements the speaker makes about themselves.
+  Questions out of curiosity are NOT facts. "What's the weather in Bahamas?" does
+  not mean the speaker lives in or plans to travel to the Bahamas. "What's the
+  nearest airport?" is a question, not a statement about location.
+- USE THE ASSISTANT'S RESPONSE to correct entity names. If the speaker says
+  "Frankford" but the assistant responds with "Frankfurt", use "Frankfurt" — the
+  assistant has access to correct spellings.
+- PLAUSIBILITY: If an extracted name sounds acoustically wrong in context
+  (e.g. "Mute Supermix" in a music context — likely "YouTube Supermix"), discard
+  it rather than store a wrong fact.
+- The subject of every relation must be a NAMED person, never "User" or "Assistant"
+- Discard extractions where the object is a placeholder ("Unknown", "None"),
+  a system identifier (containing dots like "media_player.sonos_office"), or
+  not a meaningful personal fact
+- Consider the full conversation holistically — cross-reference user statements
+  with assistant responses for the most accurate entity names
+- Entity types: person, place, organization, concept, preference
 - Relation types: factual, temporal, preference, social
-- Use the EXACT names from the transcript — never substitute or rename entities
-- Include attributes like age, role, date where mentioned
+- Tag preferences correctly: if the speaker uses or prefers something (music
+  service, food, hobby), set relation_type to "preference", not "factual"
 - predicate: snake_case verb phrase — consistent, reusable across sessions
 - confidence: 1.0 for explicit facts, 0.7 for implied/inferred
 - Resolve implied relationships from possessives and kinship terms:
@@ -12,26 +31,34 @@ Rules:
   "my brother/sister X" = sibling_of, "my/our dog/cat X" = has_pet
 
 Predicate examples (use these exact forms when they apply):
-- Family/social: married_to (wife/husband), parent_of (son/daughter), child_of, sibling_of (brother/sister), has_pet (dog/cat/pet)
-- Location: lives_in, lives_with, born_in
+- Family/social: married_to, parent_of, child_of, sibling_of, has_pet
+- Location: lives_in, lives_near, born_in
 - Work/education: works_at, studies_at, manages
-- Personal: prefers, knows, has_hobby
-- Actions: attended, visited, bought, read, fixed, cooked, watched
+- Preferences/habits: prefers, likes, dislikes, drinks, eats, listens_to, uses, avoids
 - If none fit, create a new snake_case predicate (e.g. "competed_in")
 
-Example — given transcript "Yuki: I live in Osaka with my wife Hana and our dog Kiko":
-{{"entities": [{{"name": "Yuki", "entity_type": "person", "attributes": {{}}}},
- {{"name": "Hana", "entity_type": "person", "attributes": {{}}}},
- {{"name": "Kiko", "entity_type": "concept", "attributes": {{"species": "dog"}}}},
- {{"name": "Osaka", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "Yuki", "predicate": "lives_in", "object": "Osaka", "relation_type": "factual", "confidence": 1.0}},
- {{"subject": "Yuki", "predicate": "married_to", "object": "Hana", "relation_type": "social", "confidence": 1.0}},
- {{"subject": "Yuki", "predicate": "has_pet", "object": "Kiko", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Yuki lives in Osaka, is married to Hana, and has a dog named Kiko."}}
+POSITIVE example — transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
+{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Frankfurt", "entity_type": "place", "attributes": {{}}}}],
+ "relations": [{{"subject": "Speaker", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
+ "summary": "Speaker's sister lives in Frankfurt (name corrected from assistant response)."}}
 
-Extract ALL entities and relations from the transcript, even if there are more than shown in the example.
+POSITIVE example — transcript: "[user] I enjoy reading science fiction."
+{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Science Fiction", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [{{"subject": "Speaker", "predicate": "likes", "object": "Science Fiction", "relation_type": "preference", "confidence": 1.0}}],
+ "summary": "Speaker enjoys reading science fiction."}}
+
+NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."
+Extract: NONE — asking about weather in a location is curiosity, not a personal fact about where the speaker lives.
+
+NEGATIVE example — transcript: "[user] Play some music. [assistant] Playing on media_player.living_room."
+Extract: NONE — device commands are not personal facts. Do not extract system entity IDs.
+
+NEGATIVE example — transcript: "[user] What time is it? [assistant] 14:23."
+Extract: NONE — no personal facts.
 
 Transcript:
 {transcript}
 
-Extract all entities and relations as JSON.
+Extract personal facts as JSON. If no personal facts are present, return {{"entities": [], "relations": [], "summary": "No personal facts found."}}.
