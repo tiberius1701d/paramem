@@ -58,6 +58,15 @@ def create_consolidation_loop(
     if metadata:
         loop.seed_key_metadata(metadata)
 
+    # Seed procedural QA from keyed_pairs.json (for contradiction index)
+    proc_kp_path = config.adapter_dir / "procedural" / "keyed_pairs.json"
+    if proc_kp_path.exists():
+        import json
+
+        with open(proc_kp_path) as f:
+            proc_pairs = json.load(f)
+        loop.seed_procedural_qa(proc_pairs)
+
     return loop
 
 
@@ -67,13 +76,14 @@ def run_consolidation(
     config: ServerConfig,
     session_buffer: SessionBuffer,
     loop: ConsolidationLoop | None = None,
+    ha_context: dict | None = None,
 ) -> dict:
     """Run consolidation on all pending sessions.
 
-    Each pending session becomes one cycle. After all cycles:
-    - Update per-key session counts for promotion tracking
-    - Promote keys that reach the threshold to semantic
-    - Save key_metadata.json, registry, and keyed_pairs
+    Batch mode: extract all sessions first, then train once.
+    - Phase 1: Extract graphs and generate QA for each session
+    - Phase 2: Train all adapters once on the accumulated QA
+    - Phase 3: Save artifacts and mark sessions consolidated
 
     Returns a result dict including the loop instance for reuse.
     """
@@ -94,47 +104,109 @@ def run_consolidation(
     if loop is None:
         loop = create_consolidation_loop(model, tokenizer, config)
 
-    # Run one cycle per pending session, tracking per-session entities
-    cycle_results = []
+    # --- Phase 1: Extract all sessions ---
+    all_episodic_qa = []
+    all_procedural_rels = []
     session_ids = []
+    speaker_ids = []  # track per-session speakers for key tagging
+    total_relations = 0
+
     for session in pending:
         session_id = session["session_id"]
         transcript = session["transcript"]
         session_speaker_id = session.get("speaker_id")
 
+        session_ids.append(session_id)
+
         # Skip anonymous sessions — no speaker, no key ownership
         if not session_speaker_id:
             logger.warning("Skipping session %s: no speaker_id", session_id)
-            session_ids.append(session_id)  # still archive it
             continue
 
-        # Snapshot keys before cycle to identify new ones by set diff
-        keys_before = set(loop.indexed_key_qa.keys())
-        session_ids.append(session_id)
+        episodic_qa, procedural_rels = loop.extract_session(
+            transcript,
+            session_id,
+            speaker_id=session_speaker_id,
+            ha_context=ha_context,
+            stt_correction=config.consolidation.extraction_stt_correction,
+            ha_validation=config.consolidation.extraction_ha_validation,
+            noise_filter=config.consolidation.extraction_noise_filter,
+            noise_filter_model=config.consolidation.extraction_noise_filter_model,
+        )
 
-        result = loop.run_cycle(transcript, session_id)
-        cycle_results.append(result)
-
-        # Tag newly created keys with speaker_id
-        new_keys = set(loop.indexed_key_qa.keys()) - keys_before
-        for key in new_keys:
-            loop.indexed_key_qa[key]["speaker_id"] = session_speaker_id
-
-        # Update per-key session counts using this session's entities
+        # Increment key session counts while last_seen is still correct
         _increment_key_sessions(loop, session_id)
 
+        # Tag QA pairs with speaker — assign_keys preserves speaker_id
+        for qa in episodic_qa:
+            qa["speaker_id"] = session_speaker_id
+        for rel in procedural_rels:
+            rel["speaker_id"] = session_speaker_id
+
+        all_episodic_qa.extend(episodic_qa)
+        all_procedural_rels.extend(procedural_rels)
+        total_relations += len(episodic_qa) + len(procedural_rels)
+        speaker_ids.append(session_speaker_id)
+
         logger.info(
-            "Cycle %d (session=%s): %d relations, loss=%.4f",
-            result.cycle_index,
+            "Extracted session %s: %d episodic, %d procedural relations",
             session_id,
-            result.relations_extracted,
-            result.episodic_train_loss or 0.0,
+            len(episodic_qa),
+            len(procedural_rels),
         )
+
+        # Check shutdown flag between sessions
+        if loop.shutdown_requested:
+            logger.info("Shutdown requested — stopping extraction after %s", session_id)
+            break
+
+    if not all_episodic_qa and not all_procedural_rels:
+        logger.info("No QA pairs extracted — skipping training")
+        session_buffer.mark_consolidated(session_ids)
+        return {
+            "status": "no_facts",
+            "sessions": len(session_ids),
+            "loop": loop,
+        }
+
+    # --- Simulate mode: extract only, skip training ---
+    simulate = config.consolidation.mode == "simulate"
+    if simulate:
+        if config.debug:
+            _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
+        session_buffer.mark_consolidated(session_ids)
+        elapsed = time.time() - start_time
+        summary = {
+            "status": "simulated",
+            "sessions": len(session_ids),
+            "total_relations": total_relations,
+            "episodic_qa": len(all_episodic_qa),
+            "procedural_rels": len(all_procedural_rels),
+            "elapsed_seconds": round(elapsed, 1),
+            "loop": loop,
+        }
+        logger.info("Simulation complete: %s", {k: v for k, v in summary.items() if k != "loop"})
+        return summary
+
+    # --- Phase 2: Train once ---
+    logger.info(
+        "Training on %d episodic + %d procedural QA pairs",
+        len(all_episodic_qa),
+        len(all_procedural_rels),
+    )
+
+    # Fallback speaker_id for procedural contradiction scoping.
+    # Each QA pair already has its own speaker_id (tagged during extraction).
+    # This fallback is only used when a relation lacks a speaker_id.
+    primary_speaker = speaker_ids[-1] if speaker_ids else ""
+    train_result = loop.train_adapters(
+        all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
+    )
 
     # Key-level promotion: promote keys that reached the threshold
     newly_promoted = _promote_mature_keys(loop, config)
 
-    # Save all server artifacts
+    # --- Phase 3: Save ---
     _save_keyed_pairs_for_router(loop, config)
     _save_registry(loop, config)
     _save_key_metadata(loop, config)
@@ -142,17 +214,16 @@ def run_consolidation(
     session_buffer.mark_consolidated(session_ids)
 
     elapsed = time.time() - start_time
-    last = cycle_results[-1] if cycle_results else None
 
     summary = {
         "status": "complete",
         "sessions": len(session_ids),
-        "cycles": len(cycle_results),
-        "total_relations": sum(r.relations_extracted for r in cycle_results),
+        "total_relations": total_relations,
         "newly_promoted": len(newly_promoted),
         "episodic_keys": len(loop.episodic_simhash),
         "semantic_keys": len(loop.semantic_simhash),
-        "train_loss": last.episodic_train_loss if last else None,
+        "procedural_keys": len(loop.procedural_simhash),
+        "train_loss": train_result.get("episodic_train_loss"),
         "elapsed_seconds": round(elapsed, 1),
         "loop": loop,
     }
@@ -190,6 +261,38 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
         obj = qa.get("source_object", "").lower()
         if subject in session_entities or obj in session_entities:
             loop.key_sessions[key] = loop.key_sessions.get(key, 0) + 1
+
+
+def _save_simulation_results(
+    episodic_qa: list[dict],
+    procedural_rels: list[dict],
+    loop: ConsolidationLoop,
+    config: ServerConfig,
+) -> None:
+    """Save extraction results to debug dir without training.
+
+    Writes timestamped graph snapshot and QA pairs for review.
+    """
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sim_dir = config.debug_dir / f"sim_{timestamp}"
+    sim_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save cumulative graph
+    loop.merger.save_graph(sim_dir / "graph.json")
+
+    # Save QA pairs
+    _atomic_json_write(episodic_qa, sim_dir / "episodic_qa.json")
+    if procedural_rels:
+        _atomic_json_write(procedural_rels, sim_dir / "procedural_rels.json")
+
+    logger.info(
+        "Simulation saved to %s: %d episodic QA, %d procedural rels",
+        sim_dir,
+        len(episodic_qa),
+        len(procedural_rels),
+    )
 
 
 def _promote_mature_keys(loop: ConsolidationLoop, config: ServerConfig) -> list[str]:
@@ -254,6 +357,8 @@ def _save_registry(loop: ConsolidationLoop, config: ServerConfig) -> None:
         combined[key] = {"simhash": simhash, "adapter": "episodic"}
     for key, simhash in loop.semantic_simhash.items():
         combined[key] = {"simhash": simhash, "adapter": "semantic"}
+    for key, simhash in loop.procedural_simhash.items():
+        combined[key] = {"simhash": simhash, "adapter": "procedural"}
     _atomic_json_write(combined, config.registry_path)
 
 
@@ -276,6 +381,16 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
             loop.indexed_key_qa,
             loop.semantic_simhash,
             sem_dir / "keyed_pairs.json",
+        )
+
+    # Procedural keyed_pairs in the procedural adapter directory
+    if loop.procedural_simhash:
+        proc_dir = config.adapter_dir / "procedural"
+        proc_dir.mkdir(parents=True, exist_ok=True)
+        _write_keyed_pairs(
+            loop.indexed_key_qa,
+            loop.procedural_simhash,
+            proc_dir / "keyed_pairs.json",
         )
 
 

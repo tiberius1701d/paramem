@@ -81,6 +81,26 @@ class LossEarlyStoppingCallback(TrainerCallback):
             self._below_count = 0
 
 
+class GracefulShutdownCallback(TrainerCallback):
+    """Stop training cleanly when a shutdown flag is set.
+
+    Checks the flag at each epoch boundary. When set, the trainer
+    finishes the current step, saves state, and exits the training loop.
+    """
+
+    def __init__(self, shutdown_flag: callable):
+        """Args: shutdown_flag — callable returning True when shutdown requested."""
+        self._should_stop = shutdown_flag
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if self._should_stop():
+            logger.info(
+                "Graceful shutdown requested — stopping after epoch %d",
+                int(state.epoch),
+            )
+            control.should_training_stop = True
+
+
 def train_adapter(
     model: PeftModel,
     tokenizer: PreTrainedTokenizer,

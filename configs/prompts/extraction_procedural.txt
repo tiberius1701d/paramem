@@ -1,0 +1,34 @@
+Extract PREFERENCES, HABITS, and ROUTINES of the speaker from this conversation transcript.
+
+Only extract behavioral patterns — what the speaker likes, uses, prefers, avoids,
+or does regularly. These are things that reflect how the speaker lives, not
+factual information about who they are.
+
+Rules:
+- The subject of every relation must be a NAMED person, never "User" or "Assistant"
+- All relations must have relation_type "preference"
+- USE THE ASSISTANT'S RESPONSE to correct entity names from speech recognition errors
+- Discard implausible names and system identifiers (media_player.sonos_office)
+- A single instance of an action (e.g. "Play Queen") is a weak signal —
+  repeated patterns across conversations are stronger evidence
+- Entity types: person, preference
+- predicate: snake_case verb phrase — use these when they apply:
+  prefers, likes, dislikes, listens_to, watches, drinks, eats, uses, avoids,
+  plays, reads, enjoys, routinely
+
+POSITIVE example — transcript: "[user] Play some jazz. [user] Play jazz again."
+{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Jazz", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [{{"subject": "Speaker", "predicate": "listens_to", "object": "Jazz", "relation_type": "preference", "confidence": 0.8}}],
+ "summary": "Speaker listens to jazz (requested multiple times)."}}
+
+NEGATIVE example — transcript: "[user] Play some music. [assistant] Playing on Office Speaker."
+Extract: NONE — a generic play command without a specific preference.
+
+NEGATIVE example — transcript: "[user] What time is it? [assistant] 14:23."
+Extract: NONE — no preferences expressed.
+
+Transcript:
+{transcript}
+
+Extract preferences as JSON. If no preferences are present, return {{"entities": [], "relations": [], "summary": "No preferences found."}}.
