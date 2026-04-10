@@ -1,18 +1,29 @@
-"""Wyoming protocol handler for STT with speaker embedding.
+"""Wyoming protocol handlers for STT and TTS.
 
-Receives audio from HA voice satellites via the Wyoming protocol,
-transcribes using local Whisper, computes speaker embeddings,
-and returns the transcript.
+STT: Receives audio from HA voice satellites, transcribes via Whisper,
+computes speaker embeddings, detects language.
+
+TTS: Receives text from HA, synthesizes speech via Piper or MMS-TTS
+in the detected language, returns audio.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from wyoming.asr import Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event, async_write_event
-from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
+from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
+from wyoming.tts import Synthesize
+
+from paramem.server.config import ISO_LANGUAGE_NAMES
+
+if TYPE_CHECKING:
+    from paramem.server.tts import TTSManager
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +47,14 @@ class SpeakerSTTHandler(AsyncEventHandler):
         speaker_store=None,
         chat_callback=None,
         embedding_callback=None,
+        language_callback=None,
     ):
         super().__init__(reader, writer)
         self._stt = stt
         self._speaker_store = speaker_store
         self._chat_callback = chat_callback
         self._embedding_callback = embedding_callback
+        self._language_callback = language_callback
         self._audio_buffer = bytearray()
         self._sample_rate = 16000
         self._sample_width = 2
@@ -109,11 +122,21 @@ class SpeakerSTTHandler(AsyncEventHandler):
         # Transcribe with GPU lock to prevent concurrent GPU access with LLM
         loop = asyncio.get_running_loop()
         async with gpu_inference_lock:
-            text = await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None, self._stt.transcribe, audio_bytes, self._sample_rate
             )
 
-        logger.info("Transcript: '%s'", text[:100] if text else "(empty)")
+        text = result.text
+        logger.info(
+            "Transcript: '%s' (lang=%s, prob=%.2f)",
+            text[:100] if text else "(empty)",
+            result.language,
+            result.language_probability,
+        )
+
+        # Propagate detected language to server state
+        if self._language_callback and text:
+            self._language_callback(result.language, result.language_probability)
 
         # Compute speaker embedding on CPU (no GPU lock needed)
         embedding = None
@@ -148,7 +171,7 @@ class SpeakerSTTHandler(AsyncEventHandler):
         languages = (
             [self._stt.language]
             if self._stt.language != "auto"
-            else ["en", "de", "fr", "es", "it", "pt", "nl", "ja", "zh"]
+            else list(ISO_LANGUAGE_NAMES.keys())
         )
         info = Info(
             asr=[
@@ -187,6 +210,7 @@ async def start_wyoming_server(
     speaker_store=None,
     chat_callback=None,
     embedding_callback=None,
+    language_callback=None,
 ) -> AsyncServer:
     """Start the Wyoming STT server (non-blocking).
 
@@ -195,12 +219,175 @@ async def start_wyoming_server(
 
     def handler_factory(reader, writer):
         return SpeakerSTTHandler(
-            reader, writer, stt, speaker_store, chat_callback, embedding_callback
+            reader,
+            writer,
+            stt,
+            speaker_store,
+            chat_callback,
+            embedding_callback,
+            language_callback,
         )
 
     server = AsyncServer.from_uri(f"tcp://{host}:{port}")
 
     logger.info("Wyoming STT server starting on %s:%d", host, port)
+    await server.start(handler_factory)
+
+    return server
+
+
+# ---------------------------------------------------------------------------
+# TTS handler
+# ---------------------------------------------------------------------------
+
+
+class TTSHandler(AsyncEventHandler):
+    """Handles a single Wyoming TTS connection.
+
+    Receives a Synthesize event with text, synthesizes audio in the
+    detected language, and returns audio chunks.
+    """
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        tts_manager: TTSManager,
+        language_resolver=None,
+        audio_chunk_bytes: int = 4096,
+    ):
+        super().__init__(reader, writer)
+        self._tts = tts_manager
+        self._language_resolver = language_resolver
+        self._audio_chunk_bytes = audio_chunk_bytes
+
+    async def handle_event(self, event: Event) -> bool:
+        """Process a Wyoming protocol event."""
+        if Describe.is_type(event.type):
+            await self._send_info()
+            return True
+
+        if Synthesize.is_type(event.type):
+            synthesize = Synthesize.from_event(event)
+            await self._synthesize(synthesize)
+            return False  # Connection complete
+
+        return True
+
+    async def _synthesize(self, request: Synthesize) -> None:
+        """Synthesize text and send audio back."""
+        text = request.text
+        if not text:
+            logger.warning("Empty TTS request")
+            return
+
+        # Resolve language: voice hint → resolver callback → default
+        language = None
+        if request.voice and request.voice.language:
+            language = request.voice.language
+        elif self._language_resolver:
+            language = self._language_resolver()
+
+        logger.info(
+            "TTS request: '%s' (lang=%s)",
+            text[:80],
+            language or "default",
+        )
+
+        loop = asyncio.get_running_loop()
+
+        # Acquire GPU lock only if THIS language's engine is on GPU
+        try:
+            if self._tts.needs_gpu(language):
+                async with gpu_inference_lock:
+                    pcm_data, sample_rate = await loop.run_in_executor(
+                        None, self._tts.synthesize, text, language
+                    )
+            else:
+                pcm_data, sample_rate = await loop.run_in_executor(
+                    None, self._tts.synthesize, text, language
+                )
+        except Exception:
+            logger.exception("TTS synthesis failed for lang=%s", language)
+            return
+
+        # Send audio back via Wyoming protocol
+        await async_write_event(
+            AudioStart(rate=sample_rate, width=2, channels=1).event(),
+            self.writer,
+        )
+
+        # Send in chunks (4096 bytes ~ 128ms at 16kHz)
+        chunk_size = self._audio_chunk_bytes
+        for i in range(0, len(pcm_data), chunk_size):
+            await async_write_event(
+                AudioChunk(
+                    audio=pcm_data[i : i + chunk_size],
+                    rate=sample_rate,
+                    width=2,
+                    channels=1,
+                ).event(),
+                self.writer,
+            )
+
+        await async_write_event(AudioStop().event(), self.writer)
+        logger.debug("TTS complete: %d bytes audio", len(pcm_data))
+
+    async def _send_info(self) -> None:
+        """Respond to Describe event with TTS service info."""
+        voices = [
+            TtsVoice(
+                name=f"paramem-{lang}",
+                description=f"ParaMem TTS ({lang})",
+                attribution=Attribution(
+                    name="ParaMem",
+                    url="https://github.com/tiberius1701d/paramem",
+                ),
+                installed=True,
+                version="1.0.0",
+                languages=[lang],
+            )
+            for lang in self._tts.available_languages
+        ]
+        info = Info(
+            tts=[
+                TtsProgram(
+                    name="paramem-tts",
+                    description="ParaMem multilingual TTS",
+                    attribution=Attribution(
+                        name="ParaMem",
+                        url="https://github.com/tiberius1701d/paramem",
+                    ),
+                    installed=True,
+                    version="1.0.0",
+                    voices=voices,
+                )
+            ],
+        )
+        await async_write_event(info.event(), self.writer)
+
+
+async def start_wyoming_tts_server(
+    host: str,
+    port: int,
+    tts_manager: TTSManager,
+    language_resolver=None,
+    audio_chunk_bytes: int = 4096,
+) -> AsyncServer:
+    """Start the Wyoming TTS server (non-blocking).
+
+    Args:
+        tts_manager: Loaded TTSManager with voice engines.
+        language_resolver: Callable returning the detected language code.
+        audio_chunk_bytes: Bytes per Wyoming audio chunk sent to satellite.
+    """
+
+    def handler_factory(reader, writer):
+        return TTSHandler(reader, writer, tts_manager, language_resolver, audio_chunk_bytes)
+
+    server = AsyncServer.from_uri(f"tcp://{host}:{port}")
+
+    logger.info("Wyoming TTS server starting on %s:%d", host, port)
     await server.start(handler_factory)
 
     return server

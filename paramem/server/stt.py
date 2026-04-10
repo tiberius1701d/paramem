@@ -5,10 +5,22 @@ VRAM check at startup ensures both models fit.
 """
 
 import logging
+from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TranscriptionResult:
+    """Result from Whisper transcription including language detection."""
+
+    text: str
+    language: str  # ISO 639-1 code (e.g. "en", "de", "fr")
+    language_probability: float  # 0.0–1.0 confidence
+
 
 # Approximate VRAM usage in MB per model size (INT8 quantization).
 # float16 uses roughly 2x these values.
@@ -43,11 +55,21 @@ VRAM_HEADROOM_MB = 200  # GPU inference lock prevents concurrent usage
 class WhisperSTT:
     """Local Whisper STT with VRAM-aware loading."""
 
-    def __init__(self, model_name: str, device: str, compute_type: str, language: str):
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        compute_type: str,
+        language: str,
+        beam_size: int = 5,
+        vad_filter: bool = True,
+    ):
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
         self.language = language
+        self.beam_size = beam_size
+        self.vad_filter = vad_filter
         self._model = None
 
     def check_vram(self) -> bool:
@@ -131,13 +153,11 @@ class WhisperSTT:
         logger.info("Whisper %s loaded on %s", self.model_name, device)
         return True
 
-    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> str:
-        """Transcribe raw PCM audio (int16, mono) to text."""
+    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> TranscriptionResult:
+        """Transcribe raw PCM audio (int16, mono) to text with language detection."""
         if self._model is None:
             logger.error("Whisper model not loaded")
-            return ""
-
-        import numpy as np
+            return TranscriptionResult(text="", language="en", language_probability=0.0)
 
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -147,13 +167,13 @@ class WhisperSTT:
                 len(audio_np),
                 len(audio_np) / sample_rate,
             )
-            return ""
+            return TranscriptionResult(text="", language="en", language_probability=0.0)
 
         segments, info = self._model.transcribe(
             audio_np,
             language=self.language if self.language != "auto" else None,
-            beam_size=5,
-            vad_filter=True,
+            beam_size=self.beam_size,
+            vad_filter=self.vad_filter,
         )
 
         text = " ".join(segment.text.strip() for segment in segments)
@@ -164,7 +184,11 @@ class WhisperSTT:
             info.language,
             info.language_probability,
         )
-        return text.strip()
+        return TranscriptionResult(
+            text=text.strip(),
+            language=info.language,
+            language_probability=info.language_probability,
+        )
 
     def unload(self) -> None:
         """Free the Whisper model from memory."""
