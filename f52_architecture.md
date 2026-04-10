@@ -5,7 +5,7 @@
 | Component | Choice | Reasoning |
 |-----------|--------|-----------|
 | **Cloud adapters** | httpx (async) | Already in use by HF; async matches FastAPI server |
-| **HA communication** | HA REST API + `return_response: true` | Simpler than WebSocket; script return values supported since HA 2024.1 |
+| **HA communication** | WebSocket (`conversation.process`) primary; REST API fallback | Primary path is single-hop via HA conversation agent; REST retained for direct tool execution |
 | **HA auth** | Long-lived access token | Standard HA mechanism; no expiry; env var only (never inline config) |
 | **Tool definitions** | JSON Schema (internal) | All providers use JSON Schema for parameters; adapters translate structure only |
 | **Config format** | YAML (server.yaml extension) | Consistent with existing config; env var interpolation for secrets |
@@ -17,8 +17,8 @@
 
 | Option | Pros | Cons | Decision |
 |--------|------|------|----------|
-| REST API with `return_response` | Simple HTTP, synchronous, script return values | Requires HA 2024.1+ | **Chosen** — simplest, sufficient |
-| WebSocket API | Most capable, streaming | Connection management overhead, complex | Skip — overkill for occasional tool calls |
+| WebSocket API (`conversation.process`) | Single hop, HA handles tools/prompts/entity resolution | Connection management | **Chosen** — primary escalation path (5.2e rearchitecture) |
+| REST API with `return_response` | Simple HTTP, synchronous, script return values | Requires HA 2024.1+ | **Retained** — fallback and direct tool execution |
 | Webhooks | No auth needed, event-driven | No return values, fire-and-forget only | Skip — cannot return tool results |
 | Conversation API (`/api/conversation/process`) | Built-in NLU | Redundant — we already have a model reasoning | Skip — wrong abstraction level |
 
@@ -223,9 +223,9 @@ minimum version.
 
 ### AD-F52-10: Config Migration
 
-The existing `CloudConfig` dataclass is replaced by the new `agents.general`
-structure. For backward compatibility, the config loader accepts the
-deprecated `cloud:` key and maps it to `agents.general`.
+The `CloudConfig` dataclass has been replaced by `GeneralAgentConfig` in the
+`agents.general` structure. For backward compatibility, the config loader
+accepts the deprecated `cloud:` key and maps it to `agents.general`.
 
 Env var interpolation (`${VAR_NAME}`) is added to the config loader.
 Secrets (API keys, HA tokens) must use env vars — the loader warns if

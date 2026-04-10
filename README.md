@@ -1,5 +1,7 @@
 # ParaMem
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19502523.svg)](https://doi.org/10.5281/zenodo.19502523)
+
 **Indexed key retrieval for continual learning in personal LLM agents.**
 
 Knowledge lives in LoRA adapter weights, not in files.
@@ -43,31 +45,37 @@ All experiments run on a single RTX 5070 (8GB VRAM) using QLoRA 4-bit quantizati
                ┌──────────────────────────┐
                │        Base Model        │
                │    QLoRA 4-bit frozen    │
-               └─────┬────────────┬───────┘
-                     │            │
-            ┌────────┴───┐  ┌─────┴────────┐
-            │  Episodic  │  │   Semantic   │
-            │  Adapter   │  │   Adapter    │
-            │  (rank 8)  │  │   (rank 24)  │
-            └─────┬──────┘  └──────┬───────┘
-                  │                │
-                  └───────┬────────┘
-                          │
-            ┌─────────────┴───────────────┐
-            │     Consolidation Loop      │
-            │                             │
-            │  extract → merge → score →  │
-            │  assign keys → train →      │
-            │  promote → decay            │
-            └──────────────┬──────────────┘
-                           │
-                  ┌────────┴──────────┐
-                  │ Knowledge Graph   │
-                  │ (transient layer) │
-                  └───────────────────┘
+               └──┬──────────┬─────────┬──┘
+                  │          │         │
+          ┌───────┴──┐ ┌────┴─────┐ ┌─┴──────────┐
+          │ Episodic │ │ Semantic │ │ Procedural │
+          │ Adapter  │ │ Adapter  │ │  Adapter   │
+          │ (rank 8) │ │(rank 24) │ │ (rank 12)  │
+          └───┬──────┘ └────┬─────┘ └──┬─────────┘
+              │             │          │
+              └──────┬──────┘──────────┘
+                     │
+       ┌─────────────┴───────────────┐
+       │     Consolidation Loop      │
+       │                             │
+       │  extract → merge → score →  │
+       │  assign keys → train →      │
+       │  promote → decay            │
+       └──────────────┬──────────────┘
+                      │
+             ┌────────┴──────────┐
+             │ Knowledge Graph   │
+             │ (transient layer) │
+             └───────────────────┘
 ```
 
-**Episodic adapter** holds recent facts with indexed keys for per-fact retrieval. **Semantic adapter** holds promoted, well-reinforced knowledge. The knowledge graph is a transient processing layer — like the visual cortex, it structures input but doesn't store long-term memory. The adapters are the memory.
+**Episodic adapter** holds recent facts with indexed keys for per-fact retrieval. **Semantic adapter** holds promoted, well-reinforced knowledge. **Procedural adapter** captures behavioral patterns and preferences (targets MLP layers in addition to attention). The knowledge graph is a transient processing layer — like the visual cortex, it structures input but doesn't store long-term memory. The adapters are the memory.
+
+Extraction uses a **multi-pass pipeline**: LLM-based graph extraction, STT correction (Levenshtein matching against assistant response tokens), HA context validation (location facts checked against Home Assistant zones/areas), and an optional SOTA noise filter (anonymize locally, filter via cloud, de-anonymize). All filters are configurable in `server.yaml` under `consolidation:` with graceful fallback.
+
+**Background training** runs on a configurable interval (default: every 2 hours). The `BackgroundTrainer` pauses at step boundaries for inference requests and switches the model between eval/train mode automatically. A **simulation mode** (`consolidation.mode: simulate`) runs extraction only, saving results to a debug directory without training.
+
+**Speaker identification** uses pyannote 512-dim voice embeddings with multi-embedding centroid matching and auto-enrichment on confirmed matches.
 
 ## Quick Start
 

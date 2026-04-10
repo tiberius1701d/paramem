@@ -61,9 +61,9 @@ PEFT supports loading multiple named LoRA adapters on a single base model and sw
 
 ```
 Base Model (frozen, 4-bit quantized)
-  ├── adapter: "episodic"  (rank 8, lr 1e-4)
-  ├── adapter: "semantic"  (rank 24, lr 1e-5)
-  └── adapter: "procedural" (rank 12, lr 5e-5)  [future]
+  ├── adapter: "episodic"    (rank 8, lr 1e-4)   — recent facts, high churn
+  ├── adapter: "semantic"    (rank 24, lr 1e-5)  — consolidated knowledge, stable
+  └── adapter: "procedural"  (rank 12, lr 5e-5)  — preferences and behavioral patterns
 ```
 
 During inference, adapters can be switched or merged with configurable weights. During training, each adapter is optimized independently with its own objective.
@@ -161,9 +161,9 @@ Key insight: reconstruction does not need to be perfect. Facts that matter get r
 
 This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs) which contradicted the core architectural invariant: knowledge lives in weights, not in files.
 
-### AD-11: Procedural Adapter Targets MLP Layers (Phase 4)
+### AD-11: Procedural Adapter Targets MLP Layers (Phase 4, implemented F5.6)
 
-The procedural adapter (rank 12) targets both attention layers (q/k/v/o_proj) and MLP layers (gate/up/down_proj). This differs from episodic/semantic adapters which target attention only. Rationale: behavioral patterns (style, formatting) are more closely tied to the model's feed-forward computations than to attention patterns. Already configured in default.yaml.
+The procedural adapter (rank 12) targets both attention layers (q/k/v/o_proj) and MLP layers (gate/up/down_proj). This differs from episodic/semantic adapters which target attention only. Rationale: behavioral patterns (style, formatting) are more closely tied to the model's feed-forward computations than to attention patterns. Configured in default.yaml. Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
 
 ### AD-12: Swappable Extraction Backend (Phase 4)
 
@@ -204,6 +204,39 @@ Key design decisions:
 - **SimHash registry per adapter:** Each adapter (episodic, semantic) maintains its own SimHash registry. Keys promoted from episodic to semantic are registered in the semantic registry and removed from episodic.
 
 Validated: 10-cycle smoke test, episodic 6/6 (100%), semantic 6/6 (100%), 49.9 min total.
+
+### AD-16: Multi-Pass Extraction Pipeline (Phase 5)
+
+Graph extraction runs through multiple configurable passes to improve quality:
+
+1. **LLM extraction:** Mistral generates factual triples (`extraction.txt` prompt) and preference triples (`extraction_procedural.txt` prompt)
+2. **STT correction:** Levenshtein matching of entity names against assistant response tokens, correcting speech-to-text errors
+3. **HA context validation:** Location facts checked against Home Assistant `/api/config` (home location, zones, areas)
+4. **SOTA noise filter:** Anonymize entities via local model, send to Claude for noise filtering, de-anonymize results
+
+All filters are configurable in `server.yaml` under `consolidation:` with graceful fallback — each pass is optional and fails open.
+
+### AD-17: Background Training with Inference Pause (Phase 5)
+
+Consolidation supports two code paths:
+
+- **Blocking:** `run_consolidation` — extracts all sessions then trains. Used for manual `POST /consolidate`.
+- **Background:** `_extract_and_start_training` spawns a `BackgroundTrainer` that runs on a configurable interval (`training_interval_hours`, default 2h). The trainer pauses at step boundaries when inference requests arrive (`pause()`/`resume()`), switching the model between eval and train mode. `GracefulShutdownCallback` stops training at epoch boundaries on shutdown, and `rollback_preparation()` reverts on failure.
+
+Batch consolidation processes sessions as: `extract_session()` for all pending sessions, then `train_adapters()` once.
+
+A **simulation mode** (`consolidation.mode: simulate`) runs extraction only, saving results to a debug directory without training — useful for tuning extraction quality.
+
+### AD-18: Dual-Engine Multilingual TTS (Phase 5, F5.7)
+
+Local text-to-speech via two engines behind a common `TTSEngine` ABC:
+
+- **Piper** (ONNX runtime): fast, high-quality voices for well-supported languages (en, de, fr, es). Sub-second synthesis on GPU.
+- **MMS-TTS** (HuggingFace VitsModel): broader language coverage (e.g. Tagalog) where Piper has no voice model.
+
+`TTSManager` routes synthesis requests by language code to the configured engine/voice from `server.yaml`. GPU primary with CPU fallback. Exposed as a Wyoming protocol server (port 10301) so HA voice satellites can use it directly.
+
+Language detection flows from Whisper STT → `TranscriptionResult.language` → `/chat` handler → inference paths. `_language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency.
 
 ## Known Constraints and Risks
 

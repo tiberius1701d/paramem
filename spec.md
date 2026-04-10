@@ -162,7 +162,7 @@ matching for cross-device robustness.
   model needs to scope facts by speaker.
 - **F5.5g:** Personalized greeting: on first interaction per speaker per
   interval (default 24h, configurable), the system prompt instructs the
-  model to greet naturally ("Good morning, Tobias"). Time-of-day aware.
+  model to greet naturally ("Good morning, Alex"). Time-of-day aware.
   Disabled for unknown speakers.
 - **F5.5h:** Resilience: speaker resolution and enrollment failures are
   caught and logged — the query proceeds as anonymous. HA custom component
@@ -176,6 +176,57 @@ Measured cross-device scores (pyannote/embedding, 512-dim):
 
 Dependency: pyannote-audio (open source, MIT). Runs on CPU — no GPU
 contention with the local model.
+
+#### F5.6 Procedural Adapter — User Preferences & Habits
+
+Extracts behavioral preferences and habits from conversations and trains them
+into a dedicated procedural LoRA adapter. Uses the same indexed key mechanism
+as episodic/semantic but with a separate key namespace (`proc1`, `proc2`, ...).
+
+- **F5.6a:** Preference filter: during consolidation, filter already-extracted
+  graph relations by `relation_type == "preference"`. No second LLM pass —
+  zero additional extraction latency. Preferences route to the procedural
+  adapter; factual relations continue to episodic as before.
+- **F5.6b:** Contradiction handling: when a new preference shares the same
+  `(speaker_id, subject, predicate)` as an existing procedural key, the old
+  key is retired (removed from SimHash registry) and replaced. Preferences
+  overwrite, not accumulate.
+- **F5.6c:** No promotion: procedural keys stay in the procedural adapter
+  permanently. They do not participate in the episodic→semantic promotion flow.
+- **F5.6d:** Speaker-scoped: procedural keys are tagged with `speaker_id`,
+  enabling per-user preferences. Different speakers' preferences never collide.
+- **F5.6e:** Adapter reconstruction: procedural keys are reconstructed from
+  adapter weights each cycle, same as episodic and semantic. Knowledge
+  lives in the weights — no separate QA storage.
+- **F5.6f:** Inference integration: procedural facts appear as "Behavioral
+  preferences" in the layered context. Assembly order: procedural (preferences)
+  → episodic (recent) → semantic (consolidated). Training order is different:
+  episodic → semantic → procedural (by importance).
+  Already supported by the existing inference pipeline (LAYER_LABELS).
+
+#### F5.7 Multilingual TTS — Language-Aware Speech Synthesis
+
+Dual-engine local TTS integrated via Wyoming protocol, with language detection
+from Whisper propagated through the full inference pipeline.
+
+- **F5.7a:** Engine abstraction: `TTSEngine` ABC with `PiperTTSEngine` (ONNX,
+  fast, high quality) and `MMSTTSEngine` (HuggingFace, broader language
+  coverage). Both support GPU and CPU execution.
+- **F5.7b:** `TTSManager` loads per-language voice configs from `server.yaml`.
+  GPU primary, CPU fallback. Lazy loading — voices loaded on first use.
+- **F5.7c:** Language detection: Whisper `info.language` propagated via
+  `TranscriptionResult` dataclass through Wyoming STT callback → `/chat`
+  endpoint → all inference paths (local, HA, SOTA, escalation).
+- **F5.7d:** Language-consistent inference: `_language_instruction()` helper
+  appends "Respond in {language}" to the system prompt when non-English
+  input is detected. Applied across all inference paths.
+- **F5.7e:** Speaker language binding: `preferred_language` stored in
+  SpeakerStore (v4 schema). Updated at runtime from high-confidence Whisper
+  detections (above `language_confidence_threshold`).
+- **F5.7f:** Wyoming TTS server on port 10301. `TTSHandler` receives
+  `Synthesize` events, routes to the correct engine by language code.
+- **F5.7g:** Voice config: Piper for en/de/fr/es, MMS-TTS for tl (Tagalog).
+  Per-voice device override possible.
 
 ## Out of Scope (Phase 5)
 

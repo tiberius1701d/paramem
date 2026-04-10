@@ -1473,7 +1473,7 @@ primary retrieval mechanism.
 ## Test 10: Generalization Boundaries of Parametric Memory
 
 **Script:** `experiments/test10_grokking.py`
-**Status:** RUNNING — 29 cycles complete (E870). Target E3,000.
+**Status:** RUNNING — 35 cycles complete (E1050). Target E3,000.
 
 ### Objective
 
@@ -1611,6 +1611,12 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E810 | 100% | 93.0% | 70.5% | 7.5% | 48.6% | 4.9% | 48.1% | 0.002 |
 | E840 | 100% | 93.0% | 77.5% | 7.2% | 45.0% | 10.8% | 42.6% | 0.002 |
 | E870 | 100% | 93.0% | 72.1% | 10.6% | 51.4% | 10.8% | 44.2% | 0.003 |
+| E900 | 100% | 93.0% | 67.4% | 15.0% | 45.3% | 13.8% | 45.7% | 0.002 |
+| E930 | 100% | 93.0% | 68.2% | 11.1% | 44.7% | 11.3% | 43.4% | 0.003 |
+| E960 | 100% | 93.0% | 72.9% | 10.6% | 45.6% | 12.3% | 44.2% | 0.004 |
+| E990 | 99% | 93.0% | 76.0% | 8.9% | 39.7% | 13.8% | 42.6% | 0.008 |
+| E1020 | 100% | 93.0% | 74.4% | 8.6% | 42.2% | 11.3% | 45.0% | 0.002 |
+| E1050 | 100% | 93.0% | 67.4% | 8.9% | 39.4% | 11.8% | 46.5% | 0.003 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1626,22 +1632,28 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E810 | 27/360 | 7/35 (20%) | 20/325 (6%) | 0 |
 | E840 | 26/360 | 4/35 (11%) | 22/325 (7%) | 0 |
 | E870 | 38/360 | 4/35 (11%) | 34/325 (10%) | 0 |
+| E900 | 54/360 | 8/35 (23%) | 46/325 (14%) | 0 |
+| E930 | 40/360 | 9/35 (26%) | 31/325 (10%) | 0 |
+| E960 | 38/360 | 9/35 (26%) | 29/325 (9%) | 0 |
+| E990 | 32/360 | 9/35 (26%) | 23/325 (7%) | 0 |
+| E1020 | 31/360 | 7/35 (20%) | 24/325 (7%) | 0 |
+| E1050 | 32/360 | 6/35 (17%) | 26/325 (8%) | 0 |
 
-### Key findings (E870, 29 cycles)
+### Key findings (E1050, 35 cycles)
 
 **1. Shortcut > 3-hop at all checkpoints — no compositional crossover.**
 The relation shortcut control consistently exceeds 3-hop accuracy across all
-29 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 41pp (E870: 51.4%
-vs 10.6%). Shortcut is the only metric still climbing (15%→51%), while 3-hop
-is flat. All multi-hop accuracy remains explainable by single-hop
+35 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 41pp (E870: 51.4%
+vs 10.6%). Shortcut peaked at 51.4% (E870) and has since declined to 39.4%
+(E1050), while 3-hop remains flat. All multi-hop accuracy remains explainable by single-hop
 relation→entity shortcuts. No compositional generalization observed.
 
 **2. 3-hop oscillates without upward trend.** 3-hop accuracy fluctuates
 between 5-18% with periodic spikes (16.9% at E240, 16.1% at E390, 17.8%
 at E600) that always revert to the 6-10% baseline within 1-2 cycles. The
-E750-E870 extension confirms the pattern: 6.1%, 14.7%, 7.5%, 7.2%, 10.6%.
-No upward drift. At 29x convergence (loss converged at E30),
-still early relative to the grokking literature (100-10,000x).
+E900-E1050 extension shows a slight downward drift: 15.0%, 11.1%, 10.6%,
+8.9%, 8.6%, 8.9%. No grokking signal. At 35x convergence (loss converged
+at E30), approaching the lower end of grokking literature thresholds.
 
 **3. Associative generalization is real and stable.** The adapter transfers
 learned knowledge to novel prompt formats never seen in training:
@@ -1663,10 +1675,10 @@ suggesting weight reorganization between memorization and generalization modes.
 intermediate entities in multi-hop answers. When it gets the terminal entity
 correct, it does so via shortcut, not by tracing the chain.
 
-**6. Loss still declining.** Loss converged by E30 (0.113), reached near-zero by
-E60 (0.014). E90-E720 fluctuated 0.003-0.009. E750-E870 shows the lowest
-values yet (0.003, 0.004, 0.002, 0.002, 0.003), suggesting continued
-memorization refinement even without generalization improvement.
+**6. Loss at floor.** Loss converged by E30 (0.113), reached near-zero by
+E60 (0.014). E90-E720 fluctuated 0.003-0.009. E750-E1050 stabilized at
+0.002-0.004 with occasional spikes (0.008 at E990). No further decline —
+the model is at the loss floor.
 
 ### Grokking detection criterion
 
@@ -1718,9 +1730,10 @@ regularization dynamics that drive grokking are engaging.
 
 ### Next steps
 
-1. Continue running — at 29x convergence (E870), still early relative to
+1. Continue running — at 35x convergence (E1050), approaching the lower end of
    grokking literature thresholds (100-10,000x). Target E3,000 (100x) before
-   concluding.
+   concluding. Shortcut decline and 3-hop stagnation suggest grokking may not
+   occur at rank 8.
 2. ~~**Test 10b**: evaluate diverse question forms~~ — COMPLETE (see below).
 3. Same-question overlap analysis: check if the same 3-hop questions succeed
    across probes to distinguish partial learning from noise.
@@ -2324,7 +2337,7 @@ Voice-based multi-user speaker identification via pyannote embeddings, integrate
 
 ### Measured Embedding Scores (cosine similarity)
 
-Same speaker (Tobias), pyannote 512-dim embeddings:
+Same speaker, pyannote 512-dim embeddings:
 
 | Condition | Score Range | Notes |
 |-----------|------------|-------|

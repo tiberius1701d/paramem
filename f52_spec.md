@@ -52,9 +52,9 @@ Query arrives
   → Graph entity check (in-RAM, milliseconds)
   → Entity match found?
     ├─ YES → memory agent (local Mistral, adapter active)
-    └─ NO  → cloud agent configured?
-              ├─ YES → general agent (cloud)
-              └─ NO  → memory agent fallback
+    └─ NO  → HA conversation agent (WebSocket, primary)
+              ├─ HA available → response via conversation.process
+              └─ HA unavailable → SOTA cloud fallback (Anthropic/OpenAI/Google)
 ```
 
 When no entity match is found and a cloud agent is configured, the query goes
@@ -68,11 +68,11 @@ where both models run for a single query.
 
 ### FR-2: Provider Abstraction
 
-A `CloudAgent` base class with provider-specific adapters:
+A `CloudAgent` base class with provider-specific adapters (all implemented):
 
-- **OpenAI-compatible** (OpenAI, Groq, Mistral API, local ollama)
-- **Anthropic** (Claude)
-- **Google** (Gemini)
+- **OpenAI-compatible** (OpenAI, Groq, Mistral API, local ollama) — `openai_compat.py`
+- **Anthropic** (Claude) — `anthropic.py` (optional dependency: `pip install paramem[anthropic]`)
+- **Google** (Gemini) — `google.py` (optional dependency: `pip install paramem[google]`)
 
 Each adapter handles:
 - Authentication
@@ -196,9 +196,9 @@ tools:
 interpolation (`${VAR_NAME}` → `os.environ["VAR_NAME"]`). The existing
 loader does plain `yaml.safe_load` — this needs extending.
 
-**Migration:** The existing `CloudConfig` dataclass (`config.py:87`) must be
-migrated to the new `agents.general` structure. The `cloud:` key in existing
-configs is accepted as a deprecated alias during the transition.
+**Migration:** The `CloudConfig` dataclass has been replaced by `GeneralAgentConfig`
+in the `agents.general` structure. The `cloud:` key in existing configs is
+accepted as a deprecated alias during the transition.
 
 ### FR-8: Graceful Degradation
 
@@ -227,7 +227,7 @@ The server adapts to what is configured:
 - **Cloud model training or fine-tuning** — cloud models are used as-is
 - **HA custom component changes** — the HA component stays a thin REST client
 - **Streaming responses** — buffered responses only
-- **Model-side routing** — the server decides routing, not the model (dual-escalation routing `[ESCALATE:HA]` vs `[ESCALATE:CLOUD]` is a future design topic)
+- **Model-side routing** — the server decides routing, not the model. Primary escalation is via HA WebSocket (`conversation.process`), with SOTA cloud providers (Anthropic, OpenAI, Google) as fallback
 
 ## Open Questions
 
@@ -293,7 +293,9 @@ even in allowlist. Enforced in both auto-discovery and tools.yaml paths.
 - ✅ Tool response truncation (2000 chars, `json.dumps`)
 - ✅ `dict()` copy before mutation in `call_service`
 - ✅ 16 unit tests (registry, HA client, executor, config)
-- ⬜ Anthropic + Google adapters (deferred — OpenAI-compat covers Groq)
+- ✅ Anthropic adapter (`paramem/server/cloud/anthropic.py`)
+- ✅ Google adapter (`paramem/server/cloud/google.py`)
+- ✅ OpenAI adapter (`paramem/server/cloud/openai_compat.py`) — covers OpenAI, Groq, ollama
 - ⬜ HA version check (deferred)
 
 ### Phase 5.2c: PII Sanitization — COMPLETE
