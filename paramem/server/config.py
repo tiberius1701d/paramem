@@ -100,6 +100,7 @@ class ServerNetConfig:
     host: str = "0.0.0.0"
     port: int = 8420
     reclaim_interval_minutes: int = 10  # auto-reclaim GPU check interval
+    vram_safety_margin_mb: int = 200  # free VRAM to keep after loading all GPU components
 
 
 @dataclass
@@ -135,10 +136,6 @@ class GeneralAgentConfig:
     endpoint: str = ""  # optional custom endpoint (for Groq, ollama, etc.)
 
 
-# Deprecated alias — use GeneralAgentConfig via config.general_agent
-CloudConfig = GeneralAgentConfig
-
-
 @dataclass
 class HAToolsConfig:
     """Configuration for HA-proxied tool execution."""
@@ -148,6 +145,7 @@ class HAToolsConfig:
     auto_discover: bool = False
     allowlist: list[str] = field(default_factory=list)
     sensitive_override: bool = False
+    supported_languages: list[str] = field(default_factory=list)  # HA conversation agent langs
 
 
 @dataclass
@@ -197,9 +195,18 @@ class VoiceConfig:
 @dataclass
 class ConsolidationScheduleConfig:
     schedule: str = "02:00"
+    mode: str = "train"  # "train" = full pipeline, "simulate" = extract only
     promotion_threshold: int = 3
     retain_sessions: bool = True
+    indexed_key_replay: bool = True  # indexed key training mechanism
+    reconstruction_interval: int = 5  # run fidelity checks every N cycles
+    decay_window: int = 10  # cycles before unreinforced keys decay
     extraction_max_tokens: int = 2048  # max output tokens for graph extraction
+    extraction_stt_correction: bool = True  # correct STT errors from assistant responses
+    extraction_ha_validation: bool = True  # validate locations against HA home context
+    extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)
+    extraction_noise_filter_model: str = "claude-sonnet-4-6"  # model for noise filtering
+    training_interval_hours: int = 2  # background training interval (0 = disabled)
 
 
 @dataclass
@@ -230,7 +237,59 @@ class STTConfig:
     device: str = "cuda"  # cuda, cpu, auto
     compute_type: str = "int8"  # int8, float16, float32
     port: int = 10300  # Wyoming STT listener port
-    language: str = "en"  # default language, "auto" for detection
+    language: str = "auto"  # "auto" for multilingual detection, or fixed code
+    beam_size: int = 5  # Whisper beam search width (higher = better quality, slower)
+    vad_filter: bool = True  # voice activity detection (trims silence, may clip short commands)
+
+
+@dataclass
+class TTSVoiceConfig:
+    """Configuration for a single TTS voice."""
+
+    engine: str = "piper"  # "piper" or "mms"
+    model: str = ""  # Piper model name or HuggingFace model ID
+    device: str = ""  # "" = inherit from TTSConfig.device
+    language_name: str = ""  # display name for LLM prompt (e.g. "German"); "" = auto from ISO
+
+
+# Standard ISO 639-1 language names — fallback when language_name is not set in config.
+ISO_LANGUAGE_NAMES: dict[str, str] = {
+    "de": "German",
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "it": "Italian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "nl": "Dutch",
+    "pt": "Portuguese",
+    "tl": "Tagalog",
+    "zh": "Chinese",
+}
+
+
+@dataclass
+class TTSConfig:
+    """Local text-to-speech via Wyoming protocol."""
+
+    enabled: bool = True
+    port: int = 10301  # Wyoming TTS listener port
+    device: str = "cuda"  # default device for all voices; per-voice override possible
+    default_language: str = "en"
+    language_confidence_threshold: float = 0.8  # minimum Whisper probability to trust detection
+    model_dir: str = ""  # directory for TTS model files; "" = paths.data / "tts"
+    audio_chunk_bytes: int = 4096  # bytes per Wyoming audio chunk (tradeoff: latency vs overhead)
+    voices: dict[str, TTSVoiceConfig] = field(default_factory=dict)
+
+    def language_name(self, code: str) -> str:
+        """Resolve display name for a language code.
+
+        Priority: voice config language_name > ISO standard > raw code.
+        """
+        voice = self.voices.get(code)
+        if voice and voice.language_name:
+            return voice.language_name
+        return ISO_LANGUAGE_NAMES.get(code, code)
 
 
 @dataclass
@@ -274,6 +333,7 @@ class ServerConfig:
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
+    tts: TTSConfig = field(default_factory=TTSConfig)
 
     @property
     def cloud(self) -> GeneralAgentConfig:
@@ -355,9 +415,9 @@ class ServerConfig:
         """Build ConsolidationConfig for ConsolidationLoop."""
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
-            indexed_key_replay_enabled=True,
-            reconstruction_interval=5,
-            decay_window=10,
+            indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
+            reconstruction_interval=self.consolidation.reconstruction_interval,
+            decay_window=self.consolidation.decay_window,
         )
 
 
@@ -463,6 +523,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             auto_discover=ha_raw.get("auto_discover", False),
             allowlist=ha_raw.get("allowlist", []),
             sensitive_override=ha_raw.get("sensitive_override", False),
+            supported_languages=ha_raw.get("supported_languages", []),
         )
         config.tools = ToolsConfig(
             ha=ha_config,
@@ -489,5 +550,13 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     stt_raw = raw.get("stt", {})
     if stt_raw:
         config.stt = STTConfig(**stt_raw)
+
+    tts_raw = raw.get("tts", {})
+    if tts_raw:
+        voices_raw = tts_raw.pop("voices", {})
+        config.tts = TTSConfig(**tts_raw)
+        for lang_code, voice_data in voices_raw.items():
+            if isinstance(voice_data, dict):
+                config.tts.voices[lang_code] = TTSVoiceConfig(**voice_data)
 
     return config

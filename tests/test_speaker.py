@@ -185,8 +185,8 @@ def test_enroll_same_name_different_voice(tmp_path, sample_embedding, different_
     """Two different voices can share the same display name."""
     # Use strict thresholds so test embeddings aren't rejected as same voice
     store = SpeakerStore(tmp_path / "profiles.json", high_threshold=0.90, low_threshold=0.70)
-    id1 = store.enroll("Tobias", sample_embedding)
-    id2 = store.enroll("Tobias", different_embedding)
+    id1 = store.enroll("Alex", sample_embedding)
+    id2 = store.enroll("Alex", different_embedding)
     assert id1 is not None
     assert id2 is not None
     assert id1 != id2
@@ -194,11 +194,11 @@ def test_enroll_same_name_different_voice(tmp_path, sample_embedding, different_
 
     result1 = store.match(sample_embedding)
     assert result1.speaker_id == id1
-    assert result1.name == "Tobias"
+    assert result1.name == "Alex"
 
     result2 = store.match(different_embedding)
     assert result2.speaker_id == id2
-    assert result2.name == "Tobias"
+    assert result2.name == "Alex"
 
 
 def test_remove_profile(store, sample_embedding):
@@ -239,9 +239,9 @@ def test_speaker_names(store, sample_embedding, different_embedding):
 
 def test_speaker_names_deduplication(store, sample_embedding, different_embedding):
     """speaker_names returns unique names even with multiple profiles sharing a name."""
-    store.enroll("Tobias", sample_embedding)
-    store.enroll("Tobias", different_embedding)
-    assert store.speaker_names == ["Tobias"]
+    store.enroll("Alex", sample_embedding)
+    store.enroll("Alex", different_embedding)
+    assert store.speaker_names == ["Alex"]
 
 
 def test_get_name(store, sample_embedding):
@@ -280,7 +280,7 @@ def test_file_created_on_first_enroll(tmp_path, sample_embedding):
     store.enroll("Alice", sample_embedding)
     assert path.exists()
     data = json.loads(path.read_text())
-    assert data["version"] == 3
+    assert data["version"] == 4
     assert len(data["speakers"]) == 1
     profile = list(data["speakers"].values())[0]
     assert "embeddings" in profile
@@ -302,7 +302,7 @@ def test_legacy_v1_migration(tmp_path, sample_embedding):
     assert len(result.speaker_id) == 8
 
     data = json.loads(path.read_text())
-    assert data["version"] == 3
+    assert data["version"] == 4
     assert all("name" in v and "embeddings" in v for v in data["speakers"].values())
 
 
@@ -323,7 +323,7 @@ def test_legacy_v2_migration(tmp_path, sample_embedding):
     assert result.speaker_id == "abc12345"
 
     data = json.loads(path.read_text())
-    assert data["version"] == 3
+    assert data["version"] == 4
     profile = data["speakers"]["abc12345"]
     assert "embeddings" in profile
     assert "embedding" not in profile
@@ -398,3 +398,61 @@ def test_centroid_improves_with_samples(store):
     result_centroid = store_single.match(test_mid)
 
     assert result_centroid.confidence >= result_single.confidence
+
+
+# --- Greeting logic ---
+
+
+class TestTimePeriod:
+    def test_morning(self):
+        assert SpeakerStore._time_period(6) == "morning"
+        assert SpeakerStore._time_period(0) == "morning"
+        assert SpeakerStore._time_period(11) == "morning"
+
+    def test_afternoon(self):
+        assert SpeakerStore._time_period(12) == "afternoon"
+        assert SpeakerStore._time_period(15) == "afternoon"
+        assert SpeakerStore._time_period(17) == "afternoon"
+
+    def test_evening(self):
+        assert SpeakerStore._time_period(18) == "evening"
+        assert SpeakerStore._time_period(21) == "evening"
+        assert SpeakerStore._time_period(23) == "evening"
+
+
+class TestGreetingText:
+    def test_morning_text(self):
+        assert SpeakerStore._greeting_text("morning") == "Good morning"
+
+    def test_afternoon_text(self):
+        assert SpeakerStore._greeting_text("afternoon") == "Good afternoon"
+
+    def test_evening_text(self):
+        assert SpeakerStore._greeting_text("evening") == "Good evening"
+
+
+class TestShouldGreet:
+    def test_disabled_when_interval_zero(self, tmp_path):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        assert store.should_greet("speaker1", interval_hours=0) is None
+
+    def test_first_greeting(self, tmp_path):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        result = store.should_greet("speaker1", interval_hours=24)
+        assert result is not None
+        assert "Good" in result
+
+    def test_no_repeat_within_period(self, tmp_path):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        result1 = store.should_greet("speaker1", interval_hours=24)
+        assert result1 is not None
+        store.confirm_greeting("speaker1")
+        result2 = store.should_greet("speaker1", interval_hours=24)
+        assert result2 is None
+
+    def test_different_speakers_independent(self, tmp_path):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        store.should_greet("speaker1", interval_hours=24)
+        store.confirm_greeting("speaker1")
+        result = store.should_greet("speaker2", interval_hours=24)
+        assert result is not None

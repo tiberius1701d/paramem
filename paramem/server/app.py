@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from paramem.models.loader import load_adapter, load_base_model, unload_model
 from paramem.server.cloud import get_cloud_agent
-from paramem.server.config import load_server_config
+from paramem.server.config import TTSConfig, load_server_config
 from paramem.server.consolidation import run_consolidation
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.inference import ChatResult, _escalate_to_sota, handle_chat
@@ -64,12 +64,18 @@ _state = {
     "consolidating": False,
     "last_consolidation": None,
     "scheduler_task": None,
+    "training_scheduler_task": None,
+    "background_trainer": None,
     "reclaim_task": None,
     "mode": "local",  # "local" or "cloud-only"
     "cloud_only_reason": None,  # "explicit", "training", "gpu_conflict", or None
     "speaker_store": None,
     "stt": None,
     "wyoming_server": None,
+    "tts_manager": None,
+    "wyoming_tts_server": None,
+    "latest_embedding": None,
+    "latest_language_detection": None,  # {language: str, probability: float}
     "last_chat_time": None,
     "enrollment_task": None,
     "pending_enrollments": set(),
@@ -238,6 +244,8 @@ async def lifespan(app: FastAPI):
             device=stt_device,
             compute_type=stt_compute,
             language=config.stt.language,
+            beam_size=config.stt.beam_size,
+            vad_filter=config.stt.vad_filter,
         )
         if stt.load():
             _state["stt"] = stt
@@ -251,18 +259,90 @@ async def lifespan(app: FastAPI):
                 if embedding:
                     _state["latest_embedding"] = embedding
 
+            def _on_stt_language(language: str, probability: float):
+                """Store latest detected language from Wyoming STT.
+
+                Written as single dict to avoid race between language and probability.
+                Read by both /chat endpoint and TTS language resolver.
+                """
+                _state["latest_language_detection"] = {
+                    "language": language,
+                    "probability": probability,
+                }
+
             _state["wyoming_server"] = await start_wyoming_server(
                 host=config.server.host,
                 port=config.stt.port,
                 stt=stt,
                 speaker_store=_state.get("speaker_store"),
                 embedding_callback=_on_stt_embedding,
+                language_callback=_on_stt_language,
             )
             logger.info("Wyoming STT server listening on port %d", config.stt.port)
         else:
             logger.warning("Local STT disabled — model failed to load")
     else:
         logger.info("Local STT: disabled")
+
+    # Initialize local TTS if configured
+    if config.tts.enabled:
+        from paramem.server.tts import TTSManager
+
+        tts_config = config.tts
+        if cloud_only and tts_config.device != "cpu":
+            logger.info("Cloud-only mode — forcing TTS to CPU")
+            # Override device to CPU so engines don't attempt GPU loading
+            tts_config = TTSConfig(
+                enabled=tts_config.enabled,
+                port=tts_config.port,
+                device="cpu",
+                default_language=tts_config.default_language,
+                language_confidence_threshold=tts_config.language_confidence_threshold,
+                model_dir=tts_config.model_dir,
+                audio_chunk_bytes=tts_config.audio_chunk_bytes,
+                voices=tts_config.voices,
+            )
+
+        tts_manager = TTSManager(
+            tts_config,
+            vram_safety_margin_mb=config.server.vram_safety_margin_mb,
+        )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, tts_manager.load_all)
+
+        if tts_manager.is_loaded:
+            _state["tts_manager"] = tts_manager
+            logger.info("Local TTS: %s", ", ".join(tts_manager.available_languages))
+
+            from paramem.server.wyoming_handler import start_wyoming_tts_server
+
+            lang_conf_threshold = config.tts.language_confidence_threshold
+
+            def _resolve_language():
+                """Return the most recently detected language if confidence is sufficient.
+
+                Consumes (pops) the detection so stale values don't persist
+                across requests.
+                """
+                detection = _state.pop("latest_language_detection", None)
+                if not detection:
+                    return None
+                if detection["probability"] >= lang_conf_threshold:
+                    return detection["language"]
+                return None
+
+            _state["wyoming_tts_server"] = await start_wyoming_tts_server(
+                host=config.server.host,
+                port=config.tts.port,
+                tts_manager=tts_manager,
+                language_resolver=_resolve_language,
+                audio_chunk_bytes=config.tts.audio_chunk_bytes,
+            )
+            logger.info("Wyoming TTS server listening on port %d", config.tts.port)
+        else:
+            logger.warning("Local TTS disabled — no voices loaded")
+    else:
+        logger.info("Local TTS: disabled")
 
     # Initialize cloud agent if configured
     _state["cloud_agent"] = get_cloud_agent(config.general_agent)
@@ -346,12 +426,29 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Consolidation scheduled at: %s", config.consolidation.schedule)
 
+    # Start background training scheduler if configured
+    training_interval = config.consolidation.training_interval_hours
+    if training_interval > 0 and not cloud_only:
+        _state["training_scheduler_task"] = asyncio.create_task(
+            _training_scheduler(training_interval)
+        )
+        logger.info("Background training scheduled every %dh", training_interval)
+
     # Graceful shutdown: save encrypted session snapshot before exit.
     # SIGUSR1 (GPU release for training) and SIGTERM (systemd stop) both
     # trigger a snapshot so unconsolidated conversations survive restarts.
     def _graceful_exit(signum, _frame):
         sig_name = signal.Signals(signum).name
         logger.info("Received %s — saving session snapshot before exit", sig_name)
+        # Signal training to stop at the next epoch boundary
+        consolidation_loop = _state.get("consolidation_loop")
+        if consolidation_loop is not None:
+            consolidation_loop.shutdown_requested = True
+            logger.info("Shutdown flag set — training will stop after current epoch")
+        bg_trainer = _state.get("background_trainer")
+        if bg_trainer is not None and bg_trainer.is_training:
+            bg_trainer.stop(timeout=30)
+            logger.info("Background trainer stopped")
         buffer = _state.get("session_buffer")
         if buffer:
             buffer.save_snapshot()
@@ -366,6 +463,7 @@ async def lifespan(app: FastAPI):
     signal.signal(signal.SIGTERM, _graceful_exit)
 
     _state["mode"] = "cloud-only" if cloud_only else "local"
+    _state["event_loop"] = asyncio.get_running_loop()
 
     # Auto-reclaim: only when started without the model (--defer-model).
     # In local mode we already have the GPU — nothing to reclaim.
@@ -388,6 +486,8 @@ async def lifespan(app: FastAPI):
 
     if _state["scheduler_task"]:
         _state["scheduler_task"].cancel()
+    if _state.get("training_scheduler_task"):
+        _state["training_scheduler_task"].cancel()
     if _state["reclaim_task"]:
         _state["reclaim_task"].cancel()
     if _state.get("enrollment_task"):
@@ -395,9 +495,15 @@ async def lifespan(app: FastAPI):
     wyoming_server = _state.get("wyoming_server")
     if wyoming_server is not None:
         wyoming_server.stop()
+    wyoming_tts = _state.get("wyoming_tts_server")
+    if wyoming_tts is not None:
+        wyoming_tts.stop()
     stt = _state.get("stt")
     if stt is not None:
         stt.unload()
+    tts_manager = _state.get("tts_manager")
+    if tts_manager is not None:
+        tts_manager.unload_all()
     if _state.get("ha_client"):
         _state["ha_client"].close()
     if _state["model"]:
@@ -460,12 +566,23 @@ async def chat(request: ChatRequest):
         )
 
     # Pick up speaker embedding from latest STT if not in request
-    has_latest = "latest_embedding" in _state
-    if not request.speaker_embedding and has_latest:
-        request.speaker_embedding = _state.pop("latest_embedding")
+    latest_embedding = _state.get("latest_embedding")
+    if not request.speaker_embedding and latest_embedding is not None:
+        request.speaker_embedding = latest_embedding
+        _state["latest_embedding"] = None
         logger.info("Picked up STT embedding (%d dims)", len(request.speaker_embedding))
     elif not request.speaker_embedding:
         logger.info("No speaker embedding available")
+
+    # Pick up detected language from latest STT.
+    # Not cleared here — TTS resolver reads it independently during synthesis
+    # (which runs after /chat returns). Cleared after TTS consumes it via
+    # the Wyoming handler's on_synthesize callback.
+    lang_detection = _state.get("latest_language_detection")
+    detected_language = lang_detection["language"] if lang_detection else None
+    detected_language_prob = lang_detection["probability"] if lang_detection else 0.0
+    if detected_language:
+        logger.info("Detected language: %s (prob=%.2f)", detected_language, detected_language_prob)
 
     # Discard embeddings from short utterances — pyannote needs enough voice
     # data for a stable print. Short commands produce noisy, unreliable embeddings.
@@ -524,6 +641,30 @@ async def chat(request: ChatRequest):
     except Exception:
         logger.exception("Speaker enrollment failed — continuing without enrollment")
 
+    # Update speaker language preference from STT detection
+    tts_config = _state["config"].tts
+    if speaker_id and store and detected_language and detected_language_prob > 0:
+        store.update_language(
+            speaker_id,
+            detected_language,
+            detected_language_prob,
+            threshold=tts_config.language_confidence_threshold,
+        )
+
+    # Resolve effective language for this request:
+    # 1. High-confidence Whisper detection
+    # 2. Speaker's stored preference
+    # 3. Config default (English)
+    lang_threshold = tts_config.language_confidence_threshold
+    if detected_language and detected_language_prob >= lang_threshold:
+        effective_language = detected_language
+    elif speaker_id and store:
+        effective_language = store.get_preferred_language(speaker_id)
+    else:
+        effective_language = None
+    # Replace detected_language with the resolved effective language
+    detected_language = effective_language
+
     # Check greeting before routing (applies to all paths)
     greeting_prefix = None
     greeting_interval = _state["config"].voice.greeting_interval_hours
@@ -543,6 +684,7 @@ async def chat(request: ChatRequest):
             router=_state.get("router"),
             ha_client=_state.get("ha_client"),
             sota_agent=_state.get("sota_agent"),
+            language=detected_language,
         )
         buffer.append(
             request.conversation_id,
@@ -556,7 +698,18 @@ async def chat(request: ChatRequest):
         return ChatResponse(text=spoken_text, escalated=True, speaker=speaker, follow_up=follow_up)
 
     # Local mode — normal inference with entity routing
-    # GPU lock prevents concurrent access with STT transcription
+    # Pause background training if active, then acquire GPU lock
+    bg_trainer = _state.get("background_trainer")
+    training_paused = False
+    training_stopped = False
+    if bg_trainer is not None and bg_trainer.is_training:
+        if bg_trainer.pause():
+            training_paused = True
+        else:
+            logger.warning("Could not pause training — stopping trainer before inference")
+            bg_trainer.stop(timeout=30)
+            training_stopped = True
+
     from paramem.server.wyoming_handler import gpu_inference_lock
 
     async with gpu_inference_lock:
@@ -577,6 +730,7 @@ async def chat(request: ChatRequest):
                 sota_agent=_state.get("sota_agent"),
                 ha_client=_state.get("ha_client"),
                 tool_registry=_state.get("tool_registry"),
+                language=detected_language,
             ),
         )
 
@@ -588,6 +742,14 @@ async def chat(request: ChatRequest):
     )
     response_text = result.text
     buffer.append(request.conversation_id, "assistant", response_text)
+
+    # Resume training after inference — only if we paused (not stopped)
+    if training_paused and bg_trainer is not None:
+        bg_trainer.resume()
+    elif training_stopped:
+        logger.warning(
+            "Training was stopped for inference — will restart on next scheduled training interval"
+        )
 
     spoken_text = f"{greeting_prefix}{response_text}" if greeting_prefix else response_text
     return ChatResponse(
@@ -741,6 +903,7 @@ def _cloud_only_route(
     router=None,
     ha_client=None,
     sota_agent=None,
+    language: str | None = None,
 ) -> ChatResult:
     """Route queries when the local model is unavailable (cloud-only mode).
 
@@ -753,9 +916,16 @@ def _cloud_only_route(
     # HA first (has tools for weather, time, devices), SOTA as fallback.
 
     # Try HA conversation agent — it has tools and real-time data
+    # Language passed via HA's native conversation API parameter
     if ha_client is not None:
-        logger.info("Cloud-only route: trying HA agent for: %s", text[:100])
-        response_text = ha_client.conversation_process(text, agent_id=config.ha_agent_id)
+        logger.debug("Cloud-only route: trying HA agent for: %s", text[:100])
+        ha_languages = config.tools.ha.supported_languages
+        response_text = ha_client.conversation_process(
+            text,
+            agent_id=config.ha_agent_id,
+            language=language,
+            supported_languages=ha_languages,
+        )
         if response_text is not None:
             logger.info("Cloud-only route: HA agent responded")
             return ChatResult(text=response_text, escalated=True)
@@ -767,7 +937,12 @@ def _cloud_only_route(
         if sanitized is not None:
             logger.info("Cloud-only route: escalating to SOTA")
             result = _escalate_to_sota(
-                sanitized, sota_agent, config, speaker=speaker, history=history
+                sanitized,
+                sota_agent,
+                config,
+                speaker=speaker,
+                history=history,
+                language=language,
             )
             if result.text:
                 logger.info("Cloud-only route: SOTA responded")
@@ -790,12 +965,19 @@ def _run_consolidation_sync():
     the executor, and cleared by _consolidation_done_callback after
     completion. This eliminates the race window.
     """
+    # Read HA home context for location validation
+    ha_context = None
+    ha_client = _state.get("ha_client")
+    if ha_client is not None:
+        ha_context = ha_client.get_home_context()
+
     result = run_consolidation(
         model=_state["model"],
         tokenizer=_state["tokenizer"],
         config=_state["config"],
         session_buffer=_state["session_buffer"],
         loop=_state["consolidation_loop"],
+        ha_context=ha_context,
     )
     # Store loop for reuse across runs (preserves graph, registries, cycle count)
     if "loop" in result:
@@ -854,6 +1036,267 @@ async def _consolidation_scheduler(schedule: str):
             triggered_today = False
 
         await asyncio.sleep(30)
+
+
+# --- Background training scheduler ---
+
+
+async def _training_scheduler(interval_hours: int):
+    """Extract pending sessions and start background training.
+
+    Every N hours:
+    1. Extract all pending sessions (blocking — needs model for LLM extraction)
+    2. Prepare training data (key assignment, reconstruction)
+    3. Start BackgroundTrainer (non-blocking — trains in daemon thread)
+
+    Skips if no pending sessions, already consolidating/training, or cloud-only.
+    """
+    interval_seconds = interval_hours * 3600
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+
+        if _state["consolidating"]:
+            logger.info("Training scheduler: consolidation already running, skipping")
+            continue
+        if _state["mode"] != "local":
+            continue
+        bg = _state.get("background_trainer")
+        if bg is not None and bg.is_training:
+            logger.info("Training scheduler: background training active, skipping")
+            continue
+
+        pending = _state["session_buffer"].get_pending()
+        if not pending:
+            logger.info("Training scheduler: no pending sessions, skipping")
+            continue
+
+        has_speaker = any(s.get("speaker_id") for s in pending)
+        if not has_speaker:
+            logger.info("Training scheduler: no sessions with speaker_id, skipping")
+            continue
+
+        logger.info(
+            "Training scheduler: %d pending sessions, starting extract + train",
+            len(pending),
+        )
+        _state["consolidating"] = True
+
+        # Fire-and-forget — extraction runs in executor, training in daemon thread
+        event_loop = asyncio.get_running_loop()
+        future = event_loop.run_in_executor(None, _extract_and_start_training)
+        future.add_done_callback(_training_scheduler_done_callback)
+
+
+def _training_scheduler_done_callback(future):
+    """Called when extraction phase completes (training continues in background)."""
+    exc = future.exception()
+    if exc:
+        logger.exception("Training scheduler extraction failed: %s", exc)
+        _state["consolidating"] = False
+
+
+def _extract_and_start_training():
+    """Extract sessions, prepare training data, start background trainer.
+
+    Runs in executor thread. Extraction is blocking (LLM inference).
+    Training starts in a background daemon thread and returns immediately.
+    """
+    from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
+    from paramem.server.consolidation import (
+        _increment_key_sessions,
+        _promote_mature_keys,
+        _save_key_metadata,
+        _save_keyed_pairs_for_router,
+        _save_registry,
+        _save_simulation_results,
+        create_consolidation_loop,
+    )
+
+    config = _state["config"]
+    session_buffer = _state["session_buffer"]
+
+    # Create or reuse consolidation loop
+    loop = _state.get("consolidation_loop")
+    if loop is None:
+        loop = create_consolidation_loop(_state["model"], _state["tokenizer"], config)
+        _state["consolidation_loop"] = loop
+        _state["model"] = loop.model
+
+    # Read HA home context for location validation
+    ha_context = None
+    ha_client = _state.get("ha_client")
+    if ha_client is not None:
+        ha_context = ha_client.get_home_context()
+
+    # --- Phase 1: Extract all sessions ---
+    pending = session_buffer.get_pending()
+    all_episodic_qa = []
+    all_procedural_rels = []
+    session_ids = []
+    speaker_ids = []
+
+    for session in pending:
+        session_id = session["session_id"]
+        transcript = session["transcript"]
+        session_speaker_id = session.get("speaker_id")
+        session_ids.append(session_id)
+
+        if not session_speaker_id:
+            continue
+
+        if loop.shutdown_requested:
+            logger.info("Shutdown — stopping extraction early")
+            break
+
+        episodic_qa, procedural_rels = loop.extract_session(
+            transcript,
+            session_id,
+            speaker_id=session_speaker_id,
+            ha_context=ha_context,
+            stt_correction=config.consolidation.extraction_stt_correction,
+            ha_validation=config.consolidation.extraction_ha_validation,
+            noise_filter=config.consolidation.extraction_noise_filter,
+            noise_filter_model=config.consolidation.extraction_noise_filter_model,
+        )
+        _increment_key_sessions(loop, session_id)
+
+        for qa in episodic_qa:
+            qa["speaker_id"] = session_speaker_id
+        for rel in procedural_rels:
+            rel["speaker_id"] = session_speaker_id
+
+        all_episodic_qa.extend(episodic_qa)
+        all_procedural_rels.extend(procedural_rels)
+        speaker_ids.append(session_speaker_id)
+
+    if not all_episodic_qa and not all_procedural_rels:
+        logger.info("No QA pairs extracted — skipping")
+        session_buffer.mark_consolidated(session_ids)
+        _state["consolidating"] = False
+        return
+
+    # --- Simulate mode: save results, skip training ---
+    if config.consolidation.mode == "simulate":
+        if config.debug:
+            _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
+        session_buffer.mark_consolidated(session_ids)
+        _state["consolidating"] = False
+        logger.info(
+            "Simulation complete: %d episodic QA, %d procedural rels",
+            len(all_episodic_qa),
+            len(all_procedural_rels),
+        )
+        return
+
+    # --- Phase 2: Prepare training data (key assignment, reconstruction) ---
+    if not loop.config.indexed_key_replay_enabled:
+        logger.warning("Indexed key replay disabled — skipping training")
+        session_buffer.mark_consolidated(session_ids)
+        _state["consolidating"] = False
+        return
+
+    primary_speaker = speaker_ids[-1] if speaker_ids else ""
+    jobs_data = loop.prepare_training_data(
+        all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
+    )
+
+    if not jobs_data:
+        logger.info("No training jobs prepared — skipping")
+        session_buffer.mark_consolidated(session_ids)
+        _state["consolidating"] = False
+        return
+
+    # Build TrainingJob objects
+    adapter_configs = {
+        "episodic": config.episodic_adapter_config,
+        "semantic": config.semantic_adapter_config,
+        "procedural": config.procedural_adapter_config,
+    }
+    training_jobs = [
+        TrainingJob(
+            keyed_pairs=keyed_pairs,
+            adapter_name=adapter_name,
+            adapter_config=adapter_configs[adapter_name],
+        )
+        for adapter_name, keyed_pairs in jobs_data
+    ]
+
+    # --- Phase 3: Start background training ---
+    def _on_training_complete():
+        """Called from training thread when all jobs finish.
+
+        Disk I/O is safe from any thread. SimHash updates and state
+        mutations are posted to the event loop via call_soon_threadsafe
+        to avoid race conditions with inference reads.
+        """
+        # Disk I/O — safe from any thread
+        loop.finalize_training()
+        _promote_mature_keys(loop, config)
+        _save_keyed_pairs_for_router(loop, config)
+        _save_registry(loop, config)
+        _save_key_metadata(loop, config)
+        session_buffer.mark_consolidated(session_ids)
+
+        # SimHash updates + state mutations + router reload — all on event loop
+        aio_loop = _state.get("event_loop")
+        if aio_loop is not None and aio_loop.is_running():
+            aio_loop.call_soon_threadsafe(_finalize_background_training, loop, jobs_data)
+        else:
+            _finalize_background_training(loop, jobs_data)
+
+    # Build TrainingJob objects and start background trainer
+    bt = BackgroundTrainer(
+        model=_state["model"],
+        tokenizer=_state["tokenizer"],
+        training_config=config.training_config,
+        output_dir=config.adapter_dir,
+    )
+
+    def _on_training_error():
+        loop.rollback_preparation()
+        _state["consolidating"] = False
+        logger.error("Background training failed — state rolled back")
+
+    _state["background_trainer"] = bt
+    bt.start_jobs(
+        training_jobs,
+        on_complete=_on_training_complete,
+        on_error=_on_training_error,
+    )
+    logger.info(
+        "Extraction done — %d training jobs started in background",
+        len(training_jobs),
+    )
+
+
+def _finalize_background_training(loop, jobs_data=None):
+    """Update shared server state after background training.
+
+    Must run on the event loop thread to avoid racing with /chat.
+    SimHash updates happen here (not in the training thread) for thread safety.
+    """
+    from paramem.training.indexed_memory import build_registry
+
+    # Update SimHash registries on the event loop thread
+    if jobs_data is not None:
+        for adapter_name, keyed_pairs in jobs_data:
+            new_registry = build_registry(keyed_pairs)
+            if adapter_name == "episodic":
+                loop.episodic_simhash.update(new_registry)
+            elif adapter_name == "semantic":
+                loop.semantic_simhash.update(new_registry)
+            elif adapter_name == "procedural":
+                loop.procedural_simhash.update(new_registry)
+
+    loop.model.eval()
+    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    _state["router"].reload()
+    _state["consolidating"] = False
+    total_keys = (
+        len(loop.episodic_simhash) + len(loop.semantic_simhash) + len(loop.procedural_simhash)
+    )
+    logger.info("Background training complete — %d keys saved", total_keys)
 
 
 # --- Deferred speaker enrollment ---

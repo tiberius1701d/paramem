@@ -4,7 +4,10 @@ These tests use the template fallback (no model/tokenizer provided).
 LLM-based generation is validated by GPU experiments.
 """
 
-from paramem.graph.qa_generator import generate_qa_from_relations
+from paramem.graph.qa_generator import (
+    filter_procedural_relations,
+    generate_qa_from_relations,
+)
 
 
 class TestTemplateGeneration:
@@ -144,3 +147,95 @@ class TestTemplateGeneration:
             assert len(qa) == 1, f"Expected 1 QA for '{pred}', got {len(qa)}"
             assert qa[0]["question"], f"Empty question for predicate '{pred}'"
             assert qa[0]["answer"], f"Empty answer for predicate '{pred}'"
+
+
+class TestFilterProceduralRelations:
+    def test_preference_relation_type(self):
+        rels = [
+            {
+                "subject": "Alex",
+                "predicate": "enjoys",
+                "object": "jazz",
+                "relation_type": "preference",
+            },
+        ]
+        result = filter_procedural_relations(rels)
+        assert len(result) == 1
+
+    def test_factual_relation_excluded(self):
+        rels = [
+            {
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "relation_type": "factual",
+            },
+        ]
+        result = filter_procedural_relations(rels)
+        assert len(result) == 0
+
+    def test_predicate_whitelist_fallback(self):
+        rels = [
+            {
+                "subject": "Alex",
+                "predicate": "likes",
+                "object": "coffee",
+                "relation_type": "factual",
+            },
+        ]
+        result = filter_procedural_relations(rels)
+        assert len(result) == 1
+
+    def test_mixed_relations(self):
+        rels = [
+            {
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "relation_type": "factual",
+            },
+            {
+                "subject": "Alex",
+                "predicate": "prefers",
+                "object": "jazz",
+                "relation_type": "preference",
+            },
+            {
+                "subject": "Alex",
+                "predicate": "works_at",
+                "object": "SAP",
+                "relation_type": "factual",
+            },
+            {
+                "subject": "Alex",
+                "predicate": "drinks",
+                "object": "coffee",
+                "relation_type": "factual",
+            },
+        ]
+        result = filter_procedural_relations(rels)
+        assert len(result) == 2
+        predicates = {r["predicate"] for r in result}
+        assert predicates == {"prefers", "drinks"}
+
+    def test_empty_input(self):
+        assert filter_procedural_relations([]) == []
+
+    def test_novel_preference_predicate(self):
+        rels = [
+            {
+                "subject": "Alex",
+                "predicate": "enjoys_cooking",
+                "object": "Italian",
+                "relation_type": "preference",
+            },
+        ]
+        result = filter_procedural_relations(rels)
+        assert len(result) == 1
+
+    def test_missing_relation_type(self):
+        rels = [
+            {"subject": "Alex", "predicate": "likes", "object": "jazz"},
+        ]
+        result = filter_procedural_relations(rels)
+        assert len(result) == 1

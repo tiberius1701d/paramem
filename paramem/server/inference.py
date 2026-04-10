@@ -33,15 +33,44 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_TURNS = 10
 
 
-def _personalize_prompt(base_prompt: str, speaker: str | None) -> str:
-    """Inject speaker name into the system prompt.
+def _language_instruction(language: str | None, config: ServerConfig | None = None) -> str:
+    """Return a language instruction string, or empty for English/unknown.
+
+    Derives the display name from TTS config (voice language_name field),
+    falling back to ISO 639 standard names.
+    """
+    if not language or language == "en":
+        return ""
+    if config is not None:
+        name = config.tts.language_name(language)
+    else:
+        from paramem.server.config import ISO_LANGUAGE_NAMES
+
+        name = ISO_LANGUAGE_NAMES.get(language, language)
+    return f"Respond in {name}."
+
+
+def _personalize_prompt(
+    base_prompt: str,
+    speaker: str | None,
+    language: str | None = None,
+    config: ServerConfig | None = None,
+) -> str:
+    """Inject speaker name and language instruction into the system prompt.
 
     Greeting is handled at the app layer (prepended to response text)
     so it works across all paths including escalation.
     """
-    if not speaker:
-        return base_prompt
-    return f"You are speaking with {speaker}. " + base_prompt
+    parts = []
+    if speaker:
+        parts.append(f"You are speaking with {speaker}.")
+    lang_instr = _language_instruction(language, config)
+    if lang_instr:
+        parts.append(lang_instr)
+    prefix = " ".join(parts)
+    if prefix:
+        return prefix + " " + base_prompt
+    return base_prompt
 
 
 @dataclass
@@ -65,6 +94,7 @@ def handle_chat(
     ha_client: HAClient | None = None,
     tool_registry: ToolRegistry | None = None,
     speaker_id: str | None = None,
+    language: str | None = None,
 ) -> ChatResult:
     """Process a chat message via tri-path routing.
 
@@ -121,6 +151,7 @@ def handle_chat(
         sota_agent=sota_agent,
         speaker=speaker,
         history=history,
+        language=language,
     )
 
     # Path 2a: Imperative + HA entity → HA agent directly (action command)
@@ -150,6 +181,7 @@ def handle_chat(
             ha_client,
             tool_registry,
             speaker=speaker,
+            language=language,
         )
 
     # Path 2c: HA-only match (non-imperative) → HA agent
@@ -179,7 +211,12 @@ def handle_chat(
         if sota_agent is not None:
             logger.info("HA failed, routing to SOTA agent")
             return _escalate_to_sota(
-                sanitized, sota_agent, config, speaker=speaker, history=history
+                sanitized,
+                sota_agent,
+                config,
+                speaker=speaker,
+                history=history,
+                language=language,
             )
     else:
         logger.info("Sanitizer blocked query: %s", findings)
@@ -196,6 +233,7 @@ def handle_chat(
         ha_client=ha_client,
         tool_registry=tool_registry,
         speaker=speaker,
+        language=language,
     )
 
 
@@ -208,6 +246,7 @@ def _escalate_to_ha_agent(
     sota_agent: CloudAgent | None = None,
     speaker: str | None = None,
     history: list[dict] | None = None,
+    language: str | None = None,
 ) -> ChatResult | None:
     """Escalate to HA conversation agent, then SOTA fallback.
 
@@ -215,15 +254,29 @@ def _escalate_to_ha_agent(
     through to the local base model.
     """
     # Primary: HA conversation agent (Groq via HA, has tools + system prompt)
+    # Language passed via HA's native conversation API parameter
+    ha_languages = config.tools.ha.supported_languages if config else []
     if ha_client is not None:
-        response = ha_client.conversation_process(text, agent_id=config.ha_agent_id)
+        response = ha_client.conversation_process(
+            text,
+            agent_id=config.ha_agent_id,
+            language=language,
+            supported_languages=ha_languages,
+        )
         if response is not None:
             return ChatResult(text=response, escalated=True)
         logger.warning("HA conversation.process failed, trying SOTA")
 
     # Fallback: SOTA agent
     if sota_agent is not None:
-        return _escalate_to_sota(text, sota_agent, config, speaker=speaker, history=history)
+        return _escalate_to_sota(
+            text,
+            sota_agent,
+            config,
+            speaker=speaker,
+            history=history,
+            language=language,
+        )
 
     # All cloud services down — return None so caller can use local model
     logger.warning("All cloud services failed")
@@ -268,6 +321,7 @@ def _escalate_to_sota(
     config: ServerConfig,
     speaker: str | None = None,
     history: list[dict] | None = None,
+    language: str | None = None,
 ) -> ChatResult:
     """Route to SOTA cloud model for reasoning-heavy queries.
 
@@ -278,10 +332,16 @@ def _escalate_to_sota(
     """
     sanitized_history = _sanitize_history(history, mode=config.sanitization.mode)
 
-    # Build system prompt with speaker name if available
+    # Build system prompt with speaker name and language instruction
     prompt = SOTA_PROMPT
+    parts = []
     if speaker:
-        prompt = f"You are speaking with {speaker}. " + prompt
+        parts.append(f"You are speaking with {speaker}.")
+    lang_instr = _language_instruction(language, config)
+    if lang_instr:
+        parts.append(lang_instr)
+    if parts:
+        prompt = " ".join(parts) + " " + prompt
 
     logger.info(
         "SOTA escalation (%d history turns): %s",
@@ -334,6 +394,7 @@ def _probe_and_reason(
     ha_client: HAClient | None = None,
     tool_registry: ToolRegistry | None = None,
     speaker: str | None = None,
+    language: str | None = None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -405,6 +466,7 @@ def _probe_and_reason(
                 sota_agent=sota_agent,
                 speaker=speaker,
                 history=history,
+                language=language,
             )
             # HA first (has tools for real-time data), SOTA fallback
             result = _escalate_to_ha_agent(
@@ -415,7 +477,12 @@ def _probe_and_reason(
             # HA chain failed — SOTA for reasoning
             if sota_agent is not None:
                 return _escalate_to_sota(
-                    sanitized, sota_agent, config, speaker=speaker, history=history
+                    sanitized,
+                    sota_agent,
+                    config,
+                    speaker=speaker,
+                    history=history,
+                    language=language,
                 )
         return _base_model_answer(
             text,
@@ -428,14 +495,17 @@ def _probe_and_reason(
             ha_client=ha_client,
             tool_registry=tool_registry,
             speaker=speaker,
+            language=language,
         )
 
     total_facts = sum(len(f) for f in layers.values())
     logger.info("Total recalled: %d facts from %d layers", total_facts, len(layers))
 
-    # Assemble layered context in hierarchy order
+    # Assemble layered context in hierarchy order: procedural → episodic → semantic.
+    # Later sections sit closer to the query in the context window, giving them
+    # higher recency bias. Semantic (consolidated knowledge) goes last.
     context_sections = []
-    for adapter_name in ["procedural", "semantic", "episodic"]:
+    for adapter_name in ["procedural", "episodic", "semantic"]:
         if adapter_name in layers:
             label = LAYER_LABELS.get(adapter_name, adapter_name)
             facts_text = "\n".join(layers[adapter_name])
@@ -444,7 +514,7 @@ def _probe_and_reason(
     layered_context = "\n\n".join(context_sections)
     augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
-    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker)
+    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
     messages = _build_messages(augmented_text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -467,6 +537,7 @@ def _probe_and_reason(
         tool_registry=tool_registry,
         speaker=speaker,
         history=history,
+        language=language,
     )
 
 
@@ -481,11 +552,12 @@ def _base_model_answer(
     ha_client: HAClient | None = None,
     tool_registry: ToolRegistry | None = None,
     speaker: str | None = None,
+    language: str | None = None,
 ) -> ChatResult:
     """Answer from base model without context — escalation candidate."""
     from peft import PeftModel
 
-    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker)
+    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
     messages = _build_messages(text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -506,6 +578,7 @@ def _base_model_answer(
         tool_registry=tool_registry,
         speaker=speaker,
         history=history,
+        language=language,
     )
 
 
@@ -520,6 +593,7 @@ def _maybe_escalate(
     tool_registry: ToolRegistry | None = None,
     speaker: str | None = None,
     history: list[dict] | None = None,
+    language: str | None = None,
 ) -> ChatResult:
     """Check for [ESCALATE] tag and route to HA first, then SOTA.
 
@@ -538,6 +612,7 @@ def _maybe_escalate(
                 sota_agent=sota_agent,
                 speaker=speaker,
                 history=history,
+                language=language,
             )
             # Always try HA first — it has tools for real-time data.
             logger.info("[ESCALATE] → HA (source=%s): %s", match_source, sanitized[:100])
@@ -552,7 +627,12 @@ def _maybe_escalate(
                     "[ESCALATE] → SOTA fallback (source=%s): %s", match_source, sanitized[:100]
                 )
                 return _escalate_to_sota(
-                    sanitized, sota_agent, config, speaker=speaker, history=history
+                    sanitized,
+                    sota_agent,
+                    config,
+                    speaker=speaker,
+                    history=history,
+                    language=language,
                 )
 
     if should_escalate:

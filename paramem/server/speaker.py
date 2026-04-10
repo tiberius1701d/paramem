@@ -7,7 +7,7 @@ Profiles stored as JSON with UUID-based speaker IDs. Each profile holds
 multiple embeddings (from different utterances and devices). Matching
 uses the L2-normalized centroid for robustness.
 
-{"speakers": {"a1b2c3d4": {"name": "Tobias", "embeddings": [[0.1, ...], ...]}}, "version": 3}
+{"speakers": {"a1b2c3d4": {"name": "Alex", "embeddings": [[0.1, ...], ...]}}, "version": 3}
 
 Embedding computation happens externally (Wyoming STT wrapper) —
 this module only stores and matches pre-computed embeddings.
@@ -24,7 +24,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_PROFILE_VERSION = 3
+_PROFILE_VERSION = 4
 
 
 @dataclass
@@ -121,8 +121,16 @@ class SpeakerStore:
 
         if version >= _PROFILE_VERSION:
             self._profiles = data.get("speakers", {})
+        elif version == 3:
+            # v3 → v4: add preferred_language field
+            self._profiles = data.get("speakers", {})
+            for profile in self._profiles.values():
+                profile.setdefault("preferred_language", "")
+            if self._profiles:
+                logger.info("Migrated %d v3 profiles to v4 (language)", len(self._profiles))
+                self._save()
         elif version == 2:
-            # v2 → v3: single "embedding" → list "embeddings"
+            # v2 → v4: single "embedding" → list "embeddings" + preferred_language
             legacy = data.get("speakers", {})
             self._profiles = {}
             for speaker_id, profile in legacy.items():
@@ -130,12 +138,13 @@ class SpeakerStore:
                 self._profiles[speaker_id] = {
                     "name": profile["name"],
                     "embeddings": [emb] if emb else [],
+                    "preferred_language": "",
                 }
             if self._profiles:
-                logger.info("Migrated %d v2 profiles to v3 (multi-embedding)", len(self._profiles))
+                logger.info("Migrated %d v2 profiles to v4", len(self._profiles))
                 self._save()
         else:
-            # v1: {"speakers": {"Alice": [0.1, ...]}}
+            # v1 → v4: name-keyed → UUID-keyed + multi-embedding + preferred_language
             legacy = data.get("speakers", {})
             self._profiles = {}
             for name, embedding in legacy.items():
@@ -143,9 +152,10 @@ class SpeakerStore:
                 self._profiles[speaker_id] = {
                     "name": name,
                     "embeddings": [embedding] if embedding else [],
+                    "preferred_language": "",
                 }
             if self._profiles:
-                logger.info("Migrated %d v1 profiles to v3", len(self._profiles))
+                logger.info("Migrated %d v1 profiles to v4", len(self._profiles))
                 self._save()
 
         logger.info("Loaded %d speaker profiles", len(self._profiles))
@@ -370,7 +380,11 @@ class SpeakerStore:
             # Final collision guard (astronomically unlikely)
             while speaker_id in self._profiles:
                 speaker_id = uuid.uuid4().hex
-            self._profiles[speaker_id] = {"name": display_name, "embeddings": [embedding]}
+            self._profiles[speaker_id] = {
+                "name": display_name,
+                "embeddings": [embedding],
+                "preferred_language": "",
+            }
             self._invalidate_centroid(speaker_id)
             self._save()
         logger.info(
@@ -397,6 +411,42 @@ class SpeakerStore:
         """Get the display name for a speaker ID."""
         profile = self._profiles.get(speaker_id)
         return profile["name"] if profile else None
+
+    def get_preferred_language(self, speaker_id: str) -> str | None:
+        """Get the preferred language for a speaker, or None if not set."""
+        profile = self._profiles.get(speaker_id)
+        if profile is None:
+            return None
+        lang = profile.get("preferred_language", "")
+        return lang if lang else None
+
+    def update_language(
+        self, speaker_id: str, language: str, probability: float, threshold: float = 0.8
+    ) -> None:
+        """Update speaker's preferred language based on detected language.
+
+        Only updates when detection confidence exceeds threshold. Uses
+        simple majority: if the new language matches current preference,
+        keep it. If different and high confidence, switch.
+        """
+        if probability < threshold:
+            return
+        with self._lock:
+            profile = self._profiles.get(speaker_id)
+            if profile is None:
+                return
+            current = profile.get("preferred_language", "")
+            if current == language:
+                return
+            profile["preferred_language"] = language
+            self._dirty = True
+        logger.info(
+            "Speaker %s language updated: %s → %s (prob=%.2f)",
+            speaker_id,
+            current or "(none)",
+            language,
+            probability,
+        )
 
     @property
     def profile_count(self) -> int:

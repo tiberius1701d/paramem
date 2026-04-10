@@ -271,13 +271,22 @@ class HAClient:
         text: str,
         agent_id: str = "conversation.groq",
         timeout: float | None = None,
+        language: str | None = None,
+        supported_languages: list[str] | None = None,
     ) -> str | None:
         """Forward a query to an HA conversation agent.
 
         Calls conversation.process via WebSocket, which runs the full
         agent pipeline (system prompt, tools, entity resolution) inside
         HA. Returns the speech response text, or None on failure.
+
+        If language is provided but not in supported_languages, it is
+        omitted so HA uses its configured default.
         """
+        # Only pass language if HA's agent supports it
+        if language and supported_languages and language not in supported_languages:
+            logger.info("Language '%s' not in HA supported languages, using HA default", language)
+            language = None
         import websockets.sync.client as ws_sync
 
         ws_timeout = timeout or max(self._timeout, 30.0)
@@ -303,6 +312,7 @@ class HAClient:
                             "service_data": {
                                 "agent_id": agent_id,
                                 "text": text,
+                                **({"language": language} if language else {}),
                             },
                             "return_response": True,
                         }
@@ -340,6 +350,61 @@ class HAClient:
         except (httpx.HTTPError, httpx.RequestError) as e:
             logger.error("HA services query failed: %s", e)
             return None
+
+    def get_home_context(self) -> dict:
+        """Get HA home configuration for extraction validation.
+
+        Returns location name, timezone, coordinates, area names, and
+        zone entities (home, work, etc.). Used as ground truth to validate
+        extracted location facts.
+        """
+        context = {
+            "location_name": "",
+            "timezone": "",
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "areas": [],
+            "zones": [],
+        }
+
+        # HA config — home location, timezone
+        try:
+            resp = self._get_client().get("/api/config")
+            resp.raise_for_status()
+            config = resp.json()
+            context["location_name"] = config.get("location_name", "")
+            context["timezone"] = config.get("time_zone", "")
+            context["latitude"] = config.get("latitude", 0.0)
+            context["longitude"] = config.get("longitude", 0.0)
+        except (httpx.HTTPError, httpx.RequestError) as e:
+            logger.warning("Failed to read HA config: %s", e)
+
+        # Zone entities (home, work, school, etc.)
+        if self._raw_states:
+            for state in self._raw_states:
+                entity_id = state.get("entity_id", "")
+                if entity_id.startswith("zone."):
+                    name = state.get("attributes", {}).get("friendly_name", "")
+                    if name:
+                        context["zones"].append(name)
+
+        # Area names from entity graph
+        if self._raw_states:
+            areas = set()
+            for state in self._raw_states:
+                area = state.get("attributes", {}).get("area_id", "")
+                if area:
+                    areas.add(area.replace("_", " ").title())
+            context["areas"] = sorted(areas)
+
+        logger.info(
+            "HA home context: location=%s, timezone=%s, %d zones, %d areas",
+            context["location_name"],
+            context["timezone"],
+            len(context["zones"]),
+            len(context["areas"]),
+        )
+        return context
 
     def close(self):
         """Close the pooled connection."""

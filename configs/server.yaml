@@ -2,6 +2,7 @@ server:
   host: "0.0.0.0"
   port: 8420
   reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
+  vram_safety_margin_mb: 200   # free VRAM to keep after loading all GPU components
 
 model: mistral  # mistral | gemma | qwen3b
 
@@ -27,16 +28,25 @@ adapters:
     alpha: 16
     learning_rate: 1.0e-5
   procedural:
-    enabled: false      # future — behavioral patterns, routines, preferences
+    enabled: true       # behavioral patterns, routines, preferences (F5.6)
     rank: 8
     alpha: 16
     learning_rate: 5.0e-5
 
 consolidation:
   schedule: "02:00"            # daily at this hour (empty string = manual only)
+  mode: simulate               # "train" = full pipeline, "simulate" = extract only (saves graphs + QA to debug dir)
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
-  extraction_max_tokens: 2048  # max output tokens for graph extraction (was 1024)
+  indexed_key_replay: true     # indexed key training mechanism
+  reconstruction_interval: 5   # run fidelity checks every N cycles
+  decay_window: 10             # cycles before unreinforced keys decay
+  extraction_max_tokens: 2048  # max output tokens for graph extraction
+  extraction_stt_correction: true  # correct STT errors from assistant responses
+  extraction_ha_validation: true  # validate locations against HA home context
+  extraction_noise_filter: anthropic  # SOTA provider for noise filtering ("" = disabled)
+  extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
+  training_interval_hours: 2   # background training interval (0 = disabled)
 
 # --- Agents ---
 # Two-agent design: memory (local) + general (cloud).
@@ -85,6 +95,7 @@ tools:
     url: ${HA_URL}                # e.g. http://homeassistant.local:8123
     token: ${HA_TOKEN}
     auto_discover: true
+    supported_languages: [en, de, fr, es]  # languages HA conversation agent accepts
     allowlist:
       - light.*
       - switch.*
@@ -124,4 +135,31 @@ stt:
   device: cuda               # cuda, cpu, auto
   compute_type: int8         # int8, float16, float32
   port: 10300                # Wyoming STT listener port
-  language: en               # language code or "auto"
+  language: auto             # "auto" for multilingual detection, or fixed code (e.g. "en")
+  beam_size: 5               # Whisper beam search width (higher = better, slower)
+  vad_filter: true           # voice activity detection (trims silence)
+
+tts:
+  enabled: true              # local TTS via Wyoming protocol
+  port: 10301                # Wyoming TTS listener port
+  device: cuda               # default device; per-voice override possible
+  default_language: en
+  language_confidence_threshold: 0.8  # Whisper detection probability to trust
+  # model_dir: ""            # TTS model storage; default: data/ha/tts
+  voices:
+    en:
+      engine: piper
+      model: en_US-lessac-high
+    de:
+      engine: piper
+      model: de_DE-thorsten-high
+    fr:
+      engine: piper
+      model: fr_FR-siwis-medium
+    es:
+      engine: piper
+      model: es_ES-davefx-medium
+    tl:
+      engine: mms
+      model: facebook/mms-tts-tgl
+      # device: cpu            # per-voice override (default: inherit from tts.device)
