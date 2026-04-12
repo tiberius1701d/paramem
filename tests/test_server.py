@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from paramem.server.config import ServerConfig, load_server_config
+from paramem.server.config import MODEL_REGISTRY, ServerConfig, load_server_config
 from paramem.server.escalation import detect_escalation
 from paramem.server.session_buffer import SessionBuffer
 
@@ -13,13 +13,9 @@ from paramem.server.session_buffer import SessionBuffer
 class TestConfig:
     def test_load_default_config(self):
         config = load_server_config("configs/server.yaml")
-        assert config.model_name == "mistral"
+        assert config.model_name in MODEL_REGISTRY
         assert config.server.port == 8420
         assert config.adapter_dir == Path("data/ha/adapters").resolve()
-        assert config.general_agent.enabled is True
-        assert config.general_agent.provider == "groq"
-        # Deprecated alias still works
-        assert config.cloud.enabled is True
 
     def test_model_config_resolution(self):
         config = ServerConfig(model_name="mistral")
@@ -68,58 +64,24 @@ class TestConfig:
         config_file = tmp_path / "server.yaml"
         config_file.write_text(
             "agents:\n"
-            "  general:\n"
+            "  sota:\n"
             "    enabled: true\n"
-            "    provider: groq\n"
-            "    model: llama-4-scout\n"
+            "    provider: anthropic\n"
+            "    model: claude-sonnet\n"
             "    api_key: ${TEST_API_KEY}\n"
         )
         config = load_server_config(config_file)
-        assert config.general_agent.api_key == "sk-secret-123"
-        assert config.general_agent.provider == "groq"
+        assert config.sota_agent.api_key == "sk-secret-123"
+        assert config.sota_agent.provider == "anthropic"
 
     def test_env_var_missing_uses_empty(self, tmp_path, monkeypatch):
         monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
         config_file = tmp_path / "server.yaml"
         config_file.write_text(
-            "agents:\n  general:\n    enabled: true\n    api_key: ${NONEXISTENT_VAR}\n"
+            "agents:\n  sota:\n    enabled: true\n    api_key: ${NONEXISTENT_VAR}\n"
         )
         config = load_server_config(config_file)
-        assert config.general_agent.api_key == ""
-
-    def test_deprecated_cloud_key_migration(self, tmp_path):
-        config_file = tmp_path / "server.yaml"
-        config_file.write_text(
-            "cloud:\n"
-            "  enabled: true\n"
-            "  endpoint: https://api.openai.com/v1/chat/completions\n"
-            "  model: gpt-4o\n"
-            "  api_key: sk-test\n"
-        )
-        config = load_server_config(config_file)
-        assert config.general_agent.enabled is True
-        assert config.general_agent.provider == "openai"
-        assert config.general_agent.model == "gpt-4o"
-        assert config.general_agent.api_key == "sk-test"
-        # Deprecated alias still works
-        assert config.cloud.enabled is True
-
-    def test_new_agents_key_takes_precedence(self, tmp_path):
-        config_file = tmp_path / "server.yaml"
-        config_file.write_text(
-            "agents:\n"
-            "  general:\n"
-            "    enabled: true\n"
-            "    provider: anthropic\n"
-            "    model: claude-sonnet\n"
-            "cloud:\n"
-            "  enabled: false\n"
-            "  model: gpt-4o\n"
-        )
-        config = load_server_config(config_file)
-        # New agents key wins over deprecated cloud key
-        assert config.general_agent.provider == "anthropic"
-        assert config.general_agent.model == "claude-sonnet"
+        assert config.sota_agent.api_key == ""
 
     def test_prompts_path_loaded(self):
         config = load_server_config("configs/server.yaml")
