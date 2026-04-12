@@ -601,7 +601,8 @@ class TestMultiJobSequencing:
             lambda *a, **k: [{"input_ids": [0], "labels": [0]}],
         )
 
-        # Replace Trainer class entirely so no real training happens
+        # Replace Trainer and TrainingArguments — TrainingArguments validates bf16/GPU
+        # at construction time, which fails on CPU-only CI runners.
         class FakeTrainer:
             def __init__(self, **kwargs):
                 pass
@@ -610,6 +611,10 @@ class TestMultiJobSequencing:
                 calls.append(("train",))
 
         monkeypatch.setattr("paramem.server.background_trainer.Trainer", FakeTrainer)
+        monkeypatch.setattr(
+            "paramem.server.background_trainer.TrainingArguments",
+            lambda **kwargs: MagicMock(),
+        )
 
         model = MagicMock()
         model.peft_config = {"episodic": MagicMock(), "in_training": MagicMock()}

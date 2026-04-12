@@ -552,6 +552,7 @@ def test_speaker_language_same_no_op(tmp_path):
 
 def test_tts_handler_construction():
     """TTSHandler accepts all parameters without error."""
+    pytest.importorskip("wyoming")
     from paramem.server.wyoming_handler import TTSHandler
 
     mock_tts = MagicMock()
@@ -570,6 +571,7 @@ def test_tts_handler_construction():
 
 def test_tts_handler_default_chunk_size():
     """TTSHandler defaults to 4096 byte chunks."""
+    pytest.importorskip("wyoming")
     from paramem.server.wyoming_handler import TTSHandler
 
     handler = TTSHandler(
