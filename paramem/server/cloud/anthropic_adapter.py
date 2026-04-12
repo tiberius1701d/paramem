@@ -5,7 +5,7 @@ import logging
 import anthropic
 
 from paramem.server.cloud.base import CloudAgent, CloudResponse
-from paramem.server.config import GeneralAgentConfig
+from paramem.server.config import CloudAgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class AnthropicAgent(CloudAgent):
     """Adapter for Anthropic's Messages API via the official SDK."""
 
-    def __init__(self, config: GeneralAgentConfig):
+    def __init__(self, config: CloudAgentConfig):
         super().__init__(config)
         self._client = anthropic.Anthropic(api_key=config.api_key, timeout=30.0)
 

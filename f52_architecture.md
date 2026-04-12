@@ -223,9 +223,9 @@ minimum version.
 
 ### AD-F52-10: Config Migration
 
-The `CloudConfig` dataclass has been replaced by `GeneralAgentConfig` in the
-`agents.general` structure. For backward compatibility, the config loader
-accepts the deprecated `cloud:` key and maps it to `agents.general`.
+The `CloudConfig` dataclass has been replaced by `CloudAgentConfig` in the
+`agents.sota` structure. For backward compatibility, the config loader
+accepts the deprecated `cloud:` key and maps it to `agents.sota`.
 
 Env var interpolation (`${VAR_NAME}`) is added to the config loader.
 Secrets (API keys, HA tokens) must use env vars — the loader warns if
@@ -264,6 +264,6 @@ may not provide sufficient reasoning quality.
 | HA `return_response` version requirement | Won't work on old HA installs | Document HA 2024.1+ requirement; detect and warn at startup |
 | Large tool responses | Cloud model context window overflow | Truncate/summarize before feeding back to cloud model |
 | Auto-discovery exposes sensitive HA services | Cloud model told about alarm codes, locks, etc. | Default-deny: no allowlist = no tools. Sensitive domains blocked even if listed. |
-| Config migration | Breaking change for existing `cloud:` config key | Deprecated alias maps `cloud:` → `agents.general` during transition |
+| Config migration | Breaking change for existing `cloud:` config key | Deprecated alias maps `cloud:` → `agents.sota` during transition |
 | Double inference | Mistral + cloud both run for non-personal queries | Mitigated: cloud-only mode routes directly to HA agent. Local mode uses direct routing (no entity match → HA agent, no local inference). |
 | Env var interpolation missing | API keys stored as literal `${VAR}` strings | Implement interpolation in config loader before 5.2a ships |

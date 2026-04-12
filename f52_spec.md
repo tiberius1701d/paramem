@@ -196,8 +196,8 @@ tools:
 interpolation (`${VAR_NAME}` → `os.environ["VAR_NAME"]`). The existing
 loader does plain `yaml.safe_load` — this needs extending.
 
-**Migration:** The `CloudConfig` dataclass has been replaced by `GeneralAgentConfig`
-in the `agents.general` structure. The `cloud:` key in existing configs is
+**Migration:** The `CloudConfig` dataclass has been replaced by `CloudAgentConfig`
+in the `agents.sota` structure. The `cloud:` key in existing configs is
 accepted as a deprecated alias during the transition.
 
 ### FR-8: Graceful Degradation
@@ -275,7 +275,7 @@ even in allowlist. Enforced in both auto-discovery and tools.yaml paths.
 ### Phase 5.2a: Provider Abstraction — COMPLETE
 
 - ✅ `CloudAgent` base class + OpenAI-compatible adapter (Groq, ollama)
-- ✅ Config schema: `agents.general` with deprecated `cloud:` alias
+- ✅ Config schema: `agents.sota` (`CloudAgentConfig`) with deprecated `cloud:` alias
 - ✅ Env var interpolation (`${VAR}`) in config loader
 - ✅ Provider dispatch via `get_cloud_agent()` registry
 - ✅ Direct cloud routing for no-entity-match (no double inference)

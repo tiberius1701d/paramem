@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from paramem.server.config import GeneralAgentConfig
+from paramem.server.config import CloudAgentConfig
 
 
 @dataclass
@@ -36,7 +36,7 @@ class CloudAgent(ABC):
     tool calls that need execution.
     """
 
-    def __init__(self, config: GeneralAgentConfig):
+    def __init__(self, config: CloudAgentConfig):
         self.config = config
 
     @abstractmethod

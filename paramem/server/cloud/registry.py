@@ -4,14 +4,14 @@ import logging
 
 from paramem.server.cloud.base import CloudAgent
 from paramem.server.cloud.openai_compat import COMPATIBLE_PROVIDERS, OpenAICompatAgent
-from paramem.server.config import GeneralAgentConfig
+from paramem.server.config import CloudAgentConfig
 
 logger = logging.getLogger(__name__)
 
 ALL_PROVIDERS = sorted(COMPATIBLE_PROVIDERS | {"anthropic", "google"})
 
 
-def get_cloud_agent(config: GeneralAgentConfig) -> CloudAgent | None:
+def get_cloud_agent(config: CloudAgentConfig) -> CloudAgent | None:
     """Create a cloud agent for the configured provider.
 
     Returns None if cloud is not enabled or not configured.

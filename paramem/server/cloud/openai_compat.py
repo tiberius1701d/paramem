@@ -10,7 +10,7 @@ import logging
 import httpx
 
 from paramem.server.cloud.base import CloudAgent, CloudResponse, ToolCall
-from paramem.server.config import GeneralAgentConfig
+from paramem.server.config import CloudAgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ COMPATIBLE_PROVIDERS = {"openai", "groq", "mistral", "ollama"}
 class OpenAICompatAgent(CloudAgent):
     """Adapter for OpenAI-compatible chat completions API."""
 
-    def __init__(self, config: GeneralAgentConfig):
+    def __init__(self, config: CloudAgentConfig):
         super().__init__(config)
         self._endpoint = config.endpoint or _DEFAULT_ENDPOINTS.get(config.provider, "")
         if not self._endpoint:

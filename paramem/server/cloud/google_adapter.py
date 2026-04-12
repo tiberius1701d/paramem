@@ -5,7 +5,7 @@ import logging
 from google import genai
 
 from paramem.server.cloud.base import CloudAgent, CloudResponse
-from paramem.server.config import GeneralAgentConfig
+from paramem.server.config import CloudAgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class GoogleAgent(CloudAgent):
     """Adapter for Google's Gemini API via the official SDK."""
 
-    def __init__(self, config: GeneralAgentConfig):
+    def __init__(self, config: CloudAgentConfig):
         super().__init__(config)
         self._client = genai.Client(
             api_key=config.api_key,

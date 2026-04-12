@@ -72,7 +72,7 @@ MODEL_REGISTRY = {
         cpu_offload=False,
     ),
     "gemma4": ModelConfig(
-        model_id="google/gemma-4-E4B-it",
+        model_id="principled-intelligence/gemma-4-E4B-it-text-only",
         quantization="nf4",
         compute_dtype="bfloat16",
         trust_remote_code=True,
@@ -126,8 +126,8 @@ class PathsConfig:
 
 
 @dataclass
-class GeneralAgentConfig:
-    """Configuration for the cloud/general agent."""
+class CloudAgentConfig:
+    """Configuration for a cloud (SOTA) agent."""
 
     enabled: bool = False
     provider: str = "openai"  # openai, anthropic, google, groq
@@ -153,11 +153,7 @@ class ToolsConfig:
     """Tool use configuration."""
 
     ha: HAToolsConfig = field(default_factory=HAToolsConfig)
-    cloud_native: list[str] = field(default_factory=list)
-    max_tool_rounds: int = 5
     tool_timeout_seconds: float = 3.0
-    total_timeout_seconds: float = 8.0
-    definitions: str = "tools.yaml"
 
 
 @dataclass
@@ -207,6 +203,8 @@ class ConsolidationScheduleConfig:
     extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)
     extraction_noise_filter_model: str = "claude-sonnet-4-6"  # model for noise filtering
     training_interval_hours: int = 2  # background training interval (0 = disabled)
+    training_temp_limit: int = 0  # GPU temp ceiling for background training (0 = disabled)
+    training_temp_check_interval: int = 5  # check temp every N training steps
 
 
 @dataclass
@@ -324,9 +322,8 @@ class ServerConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
-    general_agent: GeneralAgentConfig = field(default_factory=GeneralAgentConfig)
-    sota_agent: GeneralAgentConfig = field(default_factory=GeneralAgentConfig)
-    sota_providers: dict[str, GeneralAgentConfig] = field(default_factory=dict)
+    sota_agent: CloudAgentConfig = field(default_factory=CloudAgentConfig)
+    sota_providers: dict[str, CloudAgentConfig] = field(default_factory=dict)
     ha_agent_id: str = "conversation.groq"  # HA conversation agent for escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
@@ -334,11 +331,6 @@ class ServerConfig:
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
-
-    @property
-    def cloud(self) -> GeneralAgentConfig:
-        """Deprecated alias for general_agent. Use general_agent instead."""
-        return self.general_agent
 
     # Derived path accessors for backward compatibility
     @property
@@ -481,37 +473,19 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     if consolidation_raw:
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
 
-    # General agent — new 'agents.general' key, with deprecated 'cloud' fallback
     agents_raw = raw.get("agents", {})
-    general_raw = agents_raw.get("general", {})
-    cloud_raw = raw.get("cloud", {})
-
     config.ha_agent_id = agents_raw.get("ha_agent_id", "conversation.groq")
-
-    if general_raw:
-        config.general_agent = GeneralAgentConfig(**general_raw)
-    elif cloud_raw:
-        # Deprecated: map old cloud config to new general_agent
-        if cloud_raw.get("enabled") or cloud_raw.get("endpoint"):
-            logger.info("Migrating deprecated 'cloud:' config to 'agents.general:'")
-        config.general_agent = GeneralAgentConfig(
-            enabled=cloud_raw.get("enabled", False),
-            provider="openai",  # old config was OpenAI-only
-            model=cloud_raw.get("model", ""),
-            api_key=cloud_raw.get("api_key", ""),
-            endpoint=cloud_raw.get("endpoint", ""),
-        )
 
     # SOTA agent — high-capability model for reasoning queries
     sota_raw = agents_raw.get("sota", {})
     if sota_raw:
-        config.sota_agent = GeneralAgentConfig(**sota_raw)
+        config.sota_agent = CloudAgentConfig(**sota_raw)
 
     # Additional SOTA providers for direct routing (sota:anthropic, sota:openai, etc.)
     sota_providers_raw = agents_raw.get("sota_providers", {})
     for name, provider_raw in sota_providers_raw.items():
         if isinstance(provider_raw, dict):
-            config.sota_providers[name] = GeneralAgentConfig(**provider_raw)
+            config.sota_providers[name] = CloudAgentConfig(**provider_raw)
 
     # Tools
     tools_raw = raw.get("tools", {})
@@ -527,11 +501,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
         )
         config.tools = ToolsConfig(
             ha=ha_config,
-            cloud_native=tools_raw.get("cloud_native", []),
-            max_tool_rounds=tools_raw.get("max_tool_rounds", 5),
             tool_timeout_seconds=tools_raw.get("tool_timeout_seconds", 3.0),
-            total_timeout_seconds=tools_raw.get("total_timeout_seconds", 8.0),
-            definitions=tools_raw.get("definitions", "tools.yaml"),
         )
 
     # Sanitization
