@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
-"""Compare extraction quality: Mistral vs Claude — same pipeline, validation ON.
+"""Compare extraction quality: Claude vs Mistral vs Gemma 4 — same pipeline.
 
-Both models go through the same code path:
+All models go through the same code path:
 1. Same extraction prompt
 2. Same JSON parsing
 3. Same normalization
 4. Same STT correction
-5. Same validation pass
+
+Each model pass saves results immediately. Re-running skips completed passes.
 
 Usage:
+    # Stop the server first (frees GPU VRAM)
+    systemctl --user stop paramem-server
+
     export $(grep -v '^#' .env | xargs)
     python scripts/compare_extraction.py
+
+    # Re-run only missing passes (e.g. after a crash):
+    python scripts/compare_extraction.py
+
+    # Force re-run a specific model:
+    python scripts/compare_extraction.py --rerun gemma4
 """
 
+import argparse
+import gc
 import json
 import logging
 import os
@@ -30,9 +42,7 @@ from paramem.graph.extractor import (
 )
 from paramem.graph.schema import SessionGraph
 
-# Enable DEBUG logging to see raw validation output
-logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
-# Quiet noisy loggers
+logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
 for name in ("httpx", "anthropic", "urllib3", "transformers", "accelerate", "bitsandbytes"):
     logging.getLogger(name).setLevel(logging.WARNING)
 
@@ -40,30 +50,33 @@ logger = logging.getLogger(__name__)
 
 PROMPT_DIR = Path("configs/prompts")
 SESSION_DIR = Path("data/ha/sessions")
-OUTPUT_DIR = Path("data/ha/debug")
+OUTPUT_DIR = Path("data/ha/debug/extraction_comparison")
 
 
-def load_transcripts(session_dir: Path) -> list[dict]:
-    """Load all transcripts from session JSONL files."""
+def load_transcripts() -> list[dict]:
+    """Load all transcripts from session JSONL files (pending + archived)."""
     transcripts = []
-    for f in sorted(session_dir.glob("*.jsonl")):
-        lines = f.read_text().strip().split("\n")
-        turns = [json.loads(line) for line in lines]
-        text_parts = []
-        for turn in turns:
-            role = turn.get("role", "user")
-            text = turn.get("text", "")
-            text_parts.append(f"[{role}] {text}")
-        transcript = "\n".join(text_parts)
-        if len(transcript) > 50:
-            transcripts.append({"session_id": f.stem, "transcript": transcript})
+    for search_dir in [SESSION_DIR, SESSION_DIR / "archive"]:
+        if not search_dir.exists():
+            continue
+        for f in sorted(search_dir.glob("*.jsonl")):
+            if f.stem == "test-lang":
+                continue
+            lines = f.read_text().strip().split("\n")
+            turns = [json.loads(line) for line in lines]
+            text_parts = []
+            for turn in turns:
+                role = turn.get("role", "user")
+                text = turn.get("text", "")
+                text_parts.append(f"[{role}] {text}")
+            transcript = "\n".join(text_parts)
+            if len(transcript) > 50:
+                transcripts.append({"session_id": f.stem, "transcript": transcript})
     return transcripts
 
 
-def run_extraction(
-    raw_output: str, transcript: str, session_id: str, model=None, tokenizer=None, validate=True
-) -> SessionGraph:
-    """Shared extraction pipeline: parse → normalize → STT correct → validate."""
+def run_extraction(raw_output: str, transcript: str, session_id: str) -> SessionGraph:
+    """Shared extraction pipeline: parse -> normalize -> STT correct."""
     try:
         json_str = _extract_json_block(raw_output)
         data = json.loads(json_str)
@@ -81,12 +94,7 @@ def run_extraction(
     if not graph.relations:
         return graph
 
-    # STT correction
     graph = _correct_entity_names(graph, transcript)
-
-    # Validation is now handled by the SOTA noise filter in extract_graph().
-    # This comparison script only runs extraction + STT correction.
-
     return graph
 
 
@@ -105,8 +113,8 @@ def generate_with_claude(transcript: str) -> str:
     return "".join(b.text for b in response.content if hasattr(b, "text"))
 
 
-def generate_with_mistral(transcript: str, model, tokenizer) -> str:
-    """Get raw extraction output from Mistral."""
+def generate_with_local(transcript: str, model, tokenizer) -> str:
+    """Get raw extraction output from a local model."""
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
@@ -159,7 +167,6 @@ def validate_with_claude(graph: SessionGraph, transcript: str) -> SessionGraph:
         messages=[{"role": "user", "content": prompt}],
     )
     raw = "".join(b.text for b in response.content if hasattr(b, "text"))
-    logger.debug("Claude validation raw: %s", raw[:500])
 
     try:
         json_str = _extract_json_block(raw)
@@ -170,10 +177,8 @@ def validate_with_claude(graph: SessionGraph, transcript: str) -> SessionGraph:
                     validated = validated[key]
                     break
         if not isinstance(validated, list):
-            logger.warning("Claude validation returned non-list, keeping original")
             return graph
     except (json.JSONDecodeError, ValueError):
-        logger.warning("Claude validation parse failed, keeping original")
         return graph
 
     if not validated:
@@ -208,8 +213,19 @@ def validate_with_claude(graph: SessionGraph, transcript: str) -> SessionGraph:
     return graph
 
 
-def print_relations(label: str, graph: SessionGraph):
-    """Print relations for one model."""
+def serialize_relations(graph: SessionGraph) -> list[dict]:
+    return [
+        {
+            "subject": r.subject,
+            "predicate": r.predicate,
+            "object": r.object,
+            "relation_type": r.relation_type,
+        }
+        for r in graph.relations
+    ]
+
+
+def print_relations(graph: SessionGraph):
     if graph.relations:
         for r in graph.relations:
             print(
@@ -220,157 +236,176 @@ def print_relations(label: str, graph: SessionGraph):
         print("    (none)")
 
 
+def save_pass(model_name: str, results: dict):
+    """Save a single model pass to disk immediately."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / f"{model_name}.json"
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"  [{model_name}] Results saved to {path}")
+
+
+def load_pass(model_name: str) -> dict | None:
+    """Load a previously completed model pass."""
+    path = OUTPUT_DIR / f"{model_name}.json"
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+
+def unload_model(model, tokenizer):
+    """Free GPU memory after a model pass."""
+    import torch
+
+    if hasattr(model, "cpu"):
+        model.cpu()
+    del tokenizer
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+
+# --- Model passes ---
+
+
+def run_claude_pass(transcripts: list[dict]) -> dict:
+    """Run Claude extraction on all sessions."""
+    results = {}
+    for i, t in enumerate(transcripts):
+        sid = t["session_id"]
+        preview = t["transcript"].split("\n")[0][:80]
+        print(f"  [claude] Session {i + 1}/{len(transcripts)}: {sid[:20]}")
+        print(f"    {preview}")
+
+        raw = generate_with_claude(t["transcript"])
+        graph = run_extraction(raw, t["transcript"], sid)
+        print(f"    -> {len(graph.relations)} relations (raw)")
+        print_relations(graph)
+
+        validated = graph
+        if graph.relations:
+            validated = validate_with_claude(graph, t["transcript"])
+            print(f"    -> {len(validated.relations)} relations (validated)")
+
+        results[sid] = {
+            "raw_output": raw,
+            "relations_raw": serialize_relations(graph),
+            "relations_validated": serialize_relations(validated),
+        }
+
+    return results
+
+
+def run_local_pass(model_name: str, transcripts: list[dict]) -> dict:
+    """Load a local model, extract all sessions, save, unload."""
+    from paramem.models.loader import load_base_model
+    from paramem.server.config import MODEL_REGISTRY
+
+    model_config = MODEL_REGISTRY[model_name]
+    print(f"  Loading {model_name}...")
+    model, tokenizer = load_base_model(model_config)
+    print(f"  {model_name} loaded\n")
+
+    results = {}
+    for i, t in enumerate(transcripts):
+        sid = t["session_id"]
+        preview = t["transcript"].split("\n")[0][:80]
+        print(f"  [{model_name}] Session {i + 1}/{len(transcripts)}: {sid[:20]}")
+        print(f"    {preview}")
+
+        raw = generate_with_local(t["transcript"], model, tokenizer)
+        graph = run_extraction(raw, t["transcript"], sid)
+        print(f"    -> {len(graph.relations)} relations")
+        print_relations(graph)
+
+        results[sid] = {
+            "raw_output": raw,
+            "relations": serialize_relations(graph),
+        }
+
+    print(f"\n  Unloading {model_name}...")
+    unload_model(model, tokenizer)
+    print(f"  {model_name} unloaded")
+
+    return results
+
+
+def print_summary(transcripts, claude, mistral, gemma4):
+    """Print comparison summary table."""
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print(f"{'Session':<25} {'C_raw':>6} {'C_val':>6} {'M_raw':>6} {'G4_raw':>7}")
+    print("-" * 80)
+    for t in transcripts:
+        sid = t["session_id"][:22]
+        cr = len(claude.get(t["session_id"], {}).get("relations_raw", []))
+        cv = len(claude.get(t["session_id"], {}).get("relations_validated", []))
+        mr = len(mistral.get(t["session_id"], {}).get("relations", []))
+        gr = len(gemma4.get(t["session_id"], {}).get("relations", []))
+        print(f"  {sid:<25} {cr:>4}   {cv:>4}   {mr:>4}   {gr:>5}")
+    tcr = sum(len(v.get("relations_raw", [])) for v in claude.values())
+    tcv = sum(len(v.get("relations_validated", [])) for v in claude.values())
+    tmr = sum(len(v.get("relations", [])) for v in mistral.values())
+    tgr = sum(len(v.get("relations", [])) for v in gemma4.values())
+    print("-" * 80)
+    print(f"  {'TOTAL':<25} {tcr:>4}   {tcv:>4}   {tmr:>4}   {tgr:>5}")
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Compare extraction quality across models")
+    parser.add_argument("--rerun", help="Force re-run a specific model pass", default=None)
+    args = parser.parse_args()
+
     if "ANTHROPIC_API_KEY" not in os.environ:
         print("ERROR: ANTHROPIC_API_KEY not set")
         sys.exit(1)
 
-    transcripts = load_transcripts(SESSION_DIR)
-    if not transcripts:
-        transcripts = load_transcripts(SESSION_DIR / "archive")
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+
+    transcripts = load_transcripts()
     print(f"Processing {len(transcripts)} sessions\n")
     if not transcripts:
         print("No sessions found")
         sys.exit(0)
 
-    # Load Mistral
-    print("Loading Mistral model...")
-    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
-    from paramem.models.loader import load_base_model
-    from paramem.utils.config import load_config
+    # --- Pass 1: Claude (API) ---
+    claude = load_pass("claude") if args.rerun != "claude" else None
+    if claude is not None:
+        print("PASS 1: Claude — loaded from previous run")
+    else:
+        print("=" * 70)
+        print("PASS 1: Claude (API)")
+        print("=" * 70)
+        claude = run_claude_pass(transcripts)
+        save_pass("claude", claude)
 
-    config = load_config()
-    model, tokenizer = load_base_model(config.model)
-    print("Model loaded\n")
+    # --- Pass 2: Mistral (GPU) ---
+    mistral = load_pass("mistral") if args.rerun != "mistral" else None
+    if mistral is not None:
+        print("PASS 2: Mistral — loaded from previous run")
+    else:
+        print("\n" + "=" * 70)
+        print("PASS 2: Mistral (GPU)")
+        print("=" * 70)
+        mistral = run_local_pass("mistral", transcripts)
+        save_pass("mistral", mistral)
 
-    results = []
-    for i, t in enumerate(transcripts):
-        sid = t["session_id"][:20]
-        preview = t["transcript"].split("\n")[0][:80]
-        print(f"{'=' * 70}")
-        print(f"Session {i + 1}/{len(transcripts)}: {sid}")
-        print(f"  {preview}")
-        print()
+    # --- Pass 3: Gemma 4 (GPU) ---
+    gemma4 = load_pass("gemma4") if args.rerun != "gemma4" else None
+    if gemma4 is not None:
+        print("PASS 3: Gemma 4 — loaded from previous run")
+    else:
+        print("\n" + "=" * 70)
+        print("PASS 3: Gemma 4 (GPU)")
+        print("=" * 70)
+        gemma4 = run_local_pass("gemma4", transcripts)
+        save_pass("gemma4", gemma4)
 
-        # --- Claude: extract → normalize → STT correct → validate (via Claude) ---
-        print("  CLAUDE (extraction):")
-        claude_raw = generate_with_claude(t["transcript"])
-        claude_graph_raw = run_extraction(
-            claude_raw,
-            t["transcript"],
-            t["session_id"],
-            model=None,
-            tokenizer=None,
-            validate=False,
-        )
-        print_relations("Claude (pre-validation)", claude_graph_raw)
-
-        print("  CLAUDE (after validation):")
-        claude_graph = run_extraction(
-            claude_raw,
-            t["transcript"],
-            t["session_id"],
-            model=None,
-            tokenizer=None,
-            validate=False,
-        )
-        if claude_graph.relations:
-            claude_graph = validate_with_claude(claude_graph, t["transcript"])
-        print_relations("Claude (validated)", claude_graph)
-
-        # --- Mistral: extract → normalize → STT correct → validate (via Mistral) ---
-        print("  MISTRAL (extraction):")
-        mistral_raw = generate_with_mistral(t["transcript"], model, tokenizer)
-        mistral_graph_raw = run_extraction(
-            mistral_raw,
-            t["transcript"],
-            t["session_id"],
-            model=None,
-            tokenizer=None,
-            validate=False,
-        )
-        print_relations("Mistral (pre-validation)", mistral_graph_raw)
-
-        print("  MISTRAL (after validation):")
-        mistral_graph = run_extraction(
-            mistral_raw,
-            t["transcript"],
-            t["session_id"],
-            model=model,
-            tokenizer=tokenizer,
-            validate=True,
-        )
-        print_relations("Mistral (validated)", mistral_graph)
-
-        results.append(
-            {
-                "session_id": t["session_id"],
-                "transcript_preview": t["transcript"][:300],
-                "claude_raw": [
-                    {
-                        "subject": r.subject,
-                        "predicate": r.predicate,
-                        "object": r.object,
-                        "relation_type": r.relation_type,
-                    }
-                    for r in claude_graph_raw.relations
-                ],
-                "claude_validated": [
-                    {
-                        "subject": r.subject,
-                        "predicate": r.predicate,
-                        "object": r.object,
-                        "relation_type": r.relation_type,
-                    }
-                    for r in claude_graph.relations
-                ],
-                "mistral_raw": [
-                    {
-                        "subject": r.subject,
-                        "predicate": r.predicate,
-                        "object": r.object,
-                        "relation_type": r.relation_type,
-                    }
-                    for r in mistral_graph_raw.relations
-                ],
-                "mistral_validated": [
-                    {
-                        "subject": r.subject,
-                        "predicate": r.predicate,
-                        "object": r.object,
-                        "relation_type": r.relation_type,
-                    }
-                    for r in mistral_graph.relations
-                ],
-            }
-        )
-        print()
-
-    # Save
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / "extraction_comparison.json"
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    # Summary
-    print("=" * 75)
-    print("SUMMARY")
-    print(f"{'Session':<25} {'C_raw':>6} {'C_val':>6} {'M_raw':>6} {'M_val':>6}")
-    print("-" * 75)
-    for r in results:
-        sid = r["session_id"][:22]
-        cr = len(r["claude_raw"])
-        cv = len(r["claude_validated"])
-        mr = len(r["mistral_raw"])
-        mv = len(r["mistral_validated"])
-        print(f"  {sid:<25} {cr:>4}   {cv:>4}   {mr:>4}   {mv:>4}")
-    tcr = sum(len(r["claude_raw"]) for r in results)
-    tcv = sum(len(r["claude_validated"]) for r in results)
-    tmr = sum(len(r["mistral_raw"]) for r in results)
-    tmv = sum(len(r["mistral_validated"]) for r in results)
-    print("-" * 75)
-    print(f"  {'TOTAL':<25} {tcr:>4}   {tcv:>4}   {tmr:>4}   {tmv:>4}")
-    print(f"\nResults saved to {out_path}")
+    print_summary(transcripts, claude, mistral, gemma4)
 
 
 if __name__ == "__main__":

@@ -1617,6 +1617,14 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E990 | 99% | 93.0% | 76.0% | 8.9% | 39.7% | 13.8% | 42.6% | 0.008 |
 | E1020 | 100% | 93.0% | 74.4% | 8.6% | 42.2% | 11.3% | 45.0% | 0.002 |
 | E1050 | 100% | 93.0% | 67.4% | 8.9% | 39.4% | 11.8% | 46.5% | 0.003 |
+| E1080 | 100% | 93.0% | 69.0% | 6.7% | 46.9% | 7.4% | 44.2% | 0.003 |
+| E1110 | 100% | 93.0% | 64.3% | 3.3% | 42.8% | 6.9% | 46.5% | 0.002 |
+| E1140 | 100% | 93.0% | 69.0% | 10.6% | 43.3% | 6.9% | 38.8% | 0.004 |
+| E1170 | 100% | 93.0% | 73.6% | 9.7% | 34.4% | 8.4% | 45.0% | 0.005 |
+| E1200 | 100% | 93.0% | 70.5% | 7.8% | 36.7% | 4.9% | 48.1% | 0.003 |
+| E1230 | 100% | 93.0% | 74.4% | 8.9% | 41.1% | 10.8% | 36.4% | 0.004 |
+| E1260 | 100% | 93.0% | 72.1% | 10.3% | 48.3% | 8.4% | 43.4% | 0.004 |
+| E1290 | 100% | 93.0% | 76.7% | 12.5% | 44.4% | 10.3% | 43.4% | 0.005 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1638,47 +1646,58 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E990 | 32/360 | 9/35 (26%) | 23/325 (7%) | 0 |
 | E1020 | 31/360 | 7/35 (20%) | 24/325 (7%) | 0 |
 | E1050 | 32/360 | 6/35 (17%) | 26/325 (8%) | 0 |
+| E1080 | 24/360 | 5/35 (14%) | 19/325 (5%) | 0 |
+| E1110 | 12/360 | 2/35 (5%) | 10/325 (3%) | 0 |
+| E1140 | 38/360 | 2/35 (5%) | 36/325 (11%) | 0 |
+| E1170 | 35/360 | 6/35 (17%) | 29/325 (8%) | 0 |
+| E1200 | 28/360 | 9/35 (25%) | 19/325 (5%) | 0 |
+| E1230 | 32/360 | 8/35 (22%) | 24/325 (7%) | 0 |
+| E1260 | 37/360 | 4/35 (11%) | 33/325 (10%) | 0 |
+| E1290 | 45/360 | 11/35 (31%) | 34/325 (10%) | 0 |
 
-### Key findings (E1050, 35 cycles)
+### Key findings (E1290, 43 cycles) — PAUSED 2026-04-12
 
 **1. Shortcut > 3-hop at all checkpoints — no compositional crossover.**
 The relation shortcut control consistently exceeds 3-hop accuracy across all
-35 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 41pp (E870: 51.4%
-vs 10.6%). Shortcut peaked at 51.4% (E870) and has since declined to 39.4%
-(E1050), while 3-hop remains flat. All multi-hop accuracy remains explainable by single-hop
+43 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 41pp (E870: 51.4%
+vs 10.6%). Shortcut oscillates in the 34-48% band (E1290: 44.4%), 3-hop stays
+3-17% (E1290: 12.5%). All multi-hop accuracy remains explainable by single-hop
 relation→entity shortcuts. No compositional generalization observed.
 
 **2. 3-hop oscillates without upward trend.** 3-hop accuracy fluctuates
-between 5-18% with periodic spikes (16.9% at E240, 16.1% at E390, 17.8%
-at E600) that always revert to the 6-10% baseline within 1-2 cycles. The
-E900-E1050 extension shows a slight downward drift: 15.0%, 11.1%, 10.6%,
-8.9%, 8.6%, 8.9%. No grokking signal. At 35x convergence (loss converged
-at E30), approaching the lower end of grokking literature thresholds.
+between 3-18% with periodic spikes (16.9% at E240, 16.1% at E390, 17.8% at
+E600, 14.7% at E780) that always revert to the 6-10% baseline within 1-2
+cycles. The E900-E1290 extension continues the pattern without any emerging
+trend: 15.0%, 11.1%, 10.6%, 8.9%, 8.6%, 8.9%, 6.7%, 3.3%, 10.6%, 9.7%, 7.8%,
+8.9%, 10.3%, 12.5%. No grokking signal at 43x convergence (E1290), still
+within lower end of grokking literature thresholds (100-10,000x).
 
-**3. Associative generalization is real and stable.** The adapter transfers
-learned knowledge to novel prompt formats never seen in training:
-- Rephrased questions: stable at 70-77% (peak 77.5% at E300)
-- Direct questions: locked at 93% across all checkpoints
+**3. Associative generalization is real and stable — but has plateaued.**
+The adapter transfers learned knowledge to novel prompt formats never seen
+in training:
+- Rephrased questions: plateau at ~73% (range 64-78%, first-10-cycles avg
+  73.6%, last-10-cycles avg 71.2% — no upward trend across 40 cycles)
+- Direct questions: locked at 93% across all 43 checkpoints
 - Open-ended: variable 32-50%, no clear trend
 This is the mechanism that makes parametric memory useful for personal
 assistants — users ask naturally, not in keyed retrieval format. Note: the
 current rephrased probe uses passive voice transformations only; Test 10b
-will evaluate genuinely diverse question forms.
+evaluated genuinely diverse question forms (see below).
 
-**4. Keyed recall remains robust.** 100% at most checkpoints, with
-occasional single-cycle dips (93% at E240, 95% at E630, 97% at E180/E540/E720)
-that self-correct in the following cycle. E750-E870: solid 100% across all
-5 new cycles — no dips. The earlier dips anti-correlated with 3-hop spikes,
-suggesting weight reorganization between memorization and generalization modes.
+**4. Keyed recall remains robust.** 100% at most checkpoints (43/43 cycles
+include 100% keyed recall at E1080-E1290). Earlier dips (93% at E240, 95%
+at E630, 97% at E180/E540/E720/E720) anti-correlated with 3-hop spikes,
+suggesting weight reorganization between memorization and generalization
+modes. No dips in the E1080-E1290 extension.
 
-**5. Full-chain reasoning: 0 across all checkpoints.** The model never names
-intermediate entities in multi-hop answers. When it gets the terminal entity
-correct, it does so via shortcut, not by tracing the chain.
+**5. Full-chain reasoning: 0 across all 43 checkpoints.** The model never
+names intermediate entities in multi-hop answers. When it gets the terminal
+entity correct, it does so via shortcut, not by tracing the chain.
 
 **6. Loss at floor.** Loss converged by E30 (0.113), reached near-zero by
-E60 (0.014). E90-E720 fluctuated 0.003-0.009. E750-E1050 stabilized at
-0.002-0.004 with occasional spikes (0.008 at E990). No further decline —
-the model is at the loss floor.
+E60 (0.014). E90-E720 fluctuated 0.003-0.009. E750-E1290 stabilized at
+0.002-0.005 with occasional spikes. No further decline — the model is at
+the loss floor.
 
 ### Grokking detection criterion
 

@@ -6,7 +6,7 @@
 
 Knowledge lives in LoRA adapter weights, not in files.
 
-## The Idea
+## Motivation
 
 Personal AI agents need persistent memory. Current approaches — RAG, text-based memory, conversation logs — store and retrieve text, but the model itself learns nothing. Every session starts from the same frozen weights.
 
@@ -155,7 +155,7 @@ experiments/          # Validated experiment scripts
 ├── test1-7_*.py      # Extended evaluation suite (see below)
 └── ...
 examples/             # Self-contained example scripts
-tests/                # Unit tests (243 tests)
+tests/                # Unit and integration tests
 data/synthetic/       # Synthetic personas, sessions, inference facts
 archive/              # Failed approaches (part of the research story)
 ```

@@ -39,6 +39,7 @@ data/external/
 # Internal development context (not for public repo)
 CLAUDE.md
 STATE.md
+STAGING_ADAPTER_PLAN.md
 ha_assist_pipeline.md
 paper/ROADMAP_v2.md
 gpu_debugging.md
@@ -82,3 +83,4 @@ ha_jarvis_prompt.txt
 ha_jarvis_tools.yaml
 ha_music_control_script.yaml
 ha_get_weather_worldwide.yaml
+ha_automations/

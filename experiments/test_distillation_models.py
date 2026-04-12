@@ -171,7 +171,7 @@ def load_model_4bit(model_id):
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map={"": 0},
         trust_remote_code=True,
     )
     return model, tokenizer

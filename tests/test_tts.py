@@ -829,7 +829,6 @@ def test_escalation_language_filtering_integration():
     result = _escalate_to_ha_agent(
         text="Kumusta ang panahon?",
         ha_client=mock_ha,
-        cloud_agent=None,
         config=config,
         language="tl",
     )
@@ -855,17 +854,16 @@ def test_escalation_supported_language_preserved():
 
     def capture_call(text, agent_id=None, language=None, supported_languages=None):
         captured["language"] = language
-        return "Antwort auf Deutsch"
+        return "What's the weather?"
 
     mock_ha.conversation_process = capture_call
 
     result = _escalate_to_ha_agent(
-        text="Wie ist das Wetter?",
+        text="What's the weather?",
         ha_client=mock_ha,
-        cloud_agent=None,
         config=config,
-        language="de",
+        language="en",
     )
 
-    assert captured["language"] == "de"
-    assert result.text == "Antwort auf Deutsch"
+    assert captured["language"] == "en"
+    assert result.text == "What's the weather?"
