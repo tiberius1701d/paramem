@@ -35,7 +35,6 @@ from paramem.server.inference import ChatResult, _escalate_to_sota, handle_chat
 from paramem.server.router import QueryRouter
 from paramem.server.session_buffer import SessionBuffer
 from paramem.server.tools.ha_client import HAClient
-from paramem.server.tools.registry import ToolRegistry
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
 logger = logging.getLogger(__name__)
@@ -57,9 +56,9 @@ _state = {
     "config": None,
     "session_buffer": None,
     "router": None,
-    "cloud_agent": None,
+    "sota_agent": None,
+    "sota_providers": {},
     "ha_client": None,
-    "tool_registry": None,
     "consolidation_loop": None,
     "consolidating": False,
     "last_consolidation": None,
@@ -69,6 +68,10 @@ _state = {
     "reclaim_task": None,
     "mode": "local",  # "local" or "cloud-only"
     "cloud_only_reason": None,  # "explicit", "training", "gpu_conflict", or None
+    "cloud_only_startup": False,  # set by --cloud-only CLI flag before app start
+    "defer_model": False,  # set by --defer-model CLI flag before app start
+    "ha_graph": None,  # HAEntityGraph built from HA states/services at startup
+    "event_loop": None,  # asyncio event loop reference for cross-thread scheduling
     "speaker_store": None,
     "stt": None,
     "wyoming_server": None,
@@ -344,17 +347,6 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Local TTS: disabled")
 
-    # Initialize cloud agent if configured
-    _state["cloud_agent"] = get_cloud_agent(config.general_agent)
-    if _state["cloud_agent"]:
-        logger.info(
-            "Cloud agent: %s (%s)",
-            config.general_agent.provider,
-            config.general_agent.model,
-        )
-    else:
-        logger.info("Cloud agent: not configured (local-only mode)")
-
     # Initialize SOTA agent if configured
     _state["sota_agent"] = get_cloud_agent(config.sota_agent)
     if _state["sota_agent"]:
@@ -397,19 +389,6 @@ async def lifespan(app: FastAPI):
             logger.warning("HA client: configured but unreachable at %s", tools_config.ha.url)
         _state["ha_client"] = ha_client
 
-        # Load tool definitions
-        registry = ToolRegistry()
-        if tools_config.ha.auto_discover:
-            ha_services = ha_client.get_services() if not ha_graph else ha_services
-            if ha_services:
-                registry.load_from_ha(
-                    ha_services,
-                    allowlist=tools_config.ha.allowlist,
-                    sensitive_override=tools_config.ha.sensitive_override,
-                )
-        registry.load_from_yaml(tools_config.definitions)
-        _state["tool_registry"] = registry
-        logger.info("Tool registry: %d tools loaded", len(registry.tools))
     else:
         logger.info("HA tools: not configured")
 
@@ -710,9 +689,9 @@ async def chat(request: ChatRequest):
             bg_trainer.stop(timeout=30)
             training_stopped = True
 
-    from paramem.server.wyoming_handler import gpu_inference_lock
+    from paramem.server.gpu_lock import gpu_lock
 
-    async with gpu_inference_lock:
+    async with gpu_lock():
         loop = asyncio.get_running_loop()
         result: ChatResult = await loop.run_in_executor(
             None,
@@ -726,10 +705,8 @@ async def chat(request: ChatRequest):
                 tokenizer=_state["tokenizer"],
                 config=_state["config"],
                 router=_state["router"],
-                cloud_agent=_state.get("cloud_agent"),
                 sota_agent=_state.get("sota_agent"),
                 ha_client=_state.get("ha_client"),
-                tool_registry=_state.get("tool_registry"),
                 language=detected_language,
             ),
         )
@@ -887,6 +864,10 @@ async def consolidate():
     if _state["consolidating"]:
         return ConsolidateResponse(status="already_running")
 
+    bg_trainer = _state.get("background_trainer")
+    if bg_trainer is not None and bg_trainer.is_training:
+        return ConsolidateResponse(status="training_active")
+
     _state["consolidating"] = True
     loop = asyncio.get_running_loop()
     future = loop.run_in_executor(None, _run_consolidation_sync)
@@ -963,8 +944,17 @@ def _run_consolidation_sync():
 
     The consolidating flag is set by the caller before submitting to
     the executor, and cleared by _consolidation_done_callback after
-    completion. This eliminates the race window.
+    completion. Holds the GPU lock for the entire consolidation to
+    prevent concurrent CUDA access from STT/TTS/inference.
     """
+    from paramem.server.gpu_lock import gpu_lock_sync
+
+    with gpu_lock_sync():
+        _run_consolidation_inner()
+
+
+def _run_consolidation_inner():
+    """Consolidation logic — must be called with GPU lock held."""
     # Read HA home context for location validation
     ha_context = None
     ha_client = _state.get("ha_client")
@@ -1099,8 +1089,9 @@ def _training_scheduler_done_callback(future):
 def _extract_and_start_training():
     """Extract sessions, prepare training data, start background trainer.
 
-    Runs in executor thread. Extraction is blocking (LLM inference).
-    Training starts in a background daemon thread and returns immediately.
+    Runs in executor thread. Extraction holds the GPU lock (LLM inference).
+    Training runs in a background thread and acquires/releases the GPU lock
+    per training step via the BackgroundTrainer pause/resume mechanism.
     """
     from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
     from paramem.server.consolidation import (
@@ -1129,46 +1120,49 @@ def _extract_and_start_training():
     if ha_client is not None:
         ha_context = ha_client.get_home_context()
 
-    # --- Phase 1: Extract all sessions ---
+    # --- Phase 1: Extract all sessions (holds GPU lock) ---
+    from paramem.server.gpu_lock import gpu_lock_sync
+
     pending = session_buffer.get_pending()
     all_episodic_qa = []
     all_procedural_rels = []
     session_ids = []
     speaker_ids = []
 
-    for session in pending:
-        session_id = session["session_id"]
-        transcript = session["transcript"]
-        session_speaker_id = session.get("speaker_id")
-        session_ids.append(session_id)
+    with gpu_lock_sync():
+        for session in pending:
+            session_id = session["session_id"]
+            transcript = session["transcript"]
+            session_speaker_id = session.get("speaker_id")
+            session_ids.append(session_id)
 
-        if not session_speaker_id:
-            continue
+            if not session_speaker_id:
+                continue
 
-        if loop.shutdown_requested:
-            logger.info("Shutdown — stopping extraction early")
-            break
+            if loop.shutdown_requested:
+                logger.info("Shutdown — stopping extraction early")
+                break
 
-        episodic_qa, procedural_rels = loop.extract_session(
-            transcript,
-            session_id,
-            speaker_id=session_speaker_id,
-            ha_context=ha_context,
-            stt_correction=config.consolidation.extraction_stt_correction,
-            ha_validation=config.consolidation.extraction_ha_validation,
-            noise_filter=config.consolidation.extraction_noise_filter,
-            noise_filter_model=config.consolidation.extraction_noise_filter_model,
-        )
-        _increment_key_sessions(loop, session_id)
+            episodic_qa, procedural_rels = loop.extract_session(
+                transcript,
+                session_id,
+                speaker_id=session_speaker_id,
+                ha_context=ha_context,
+                stt_correction=config.consolidation.extraction_stt_correction,
+                ha_validation=config.consolidation.extraction_ha_validation,
+                noise_filter=config.consolidation.extraction_noise_filter,
+                noise_filter_model=config.consolidation.extraction_noise_filter_model,
+            )
+            _increment_key_sessions(loop, session_id)
 
-        for qa in episodic_qa:
-            qa["speaker_id"] = session_speaker_id
-        for rel in procedural_rels:
-            rel["speaker_id"] = session_speaker_id
+            for qa in episodic_qa:
+                qa["speaker_id"] = session_speaker_id
+            for rel in procedural_rels:
+                rel["speaker_id"] = session_speaker_id
 
-        all_episodic_qa.extend(episodic_qa)
-        all_procedural_rels.extend(procedural_rels)
-        speaker_ids.append(session_speaker_id)
+            all_episodic_qa.extend(episodic_qa)
+            all_procedural_rels.extend(procedural_rels)
+            speaker_ids.append(session_speaker_id)
 
     if not all_episodic_qa and not all_procedural_rels:
         logger.info("No QA pairs extracted — skipping")
@@ -1251,6 +1245,8 @@ def _extract_and_start_training():
         tokenizer=_state["tokenizer"],
         training_config=config.training_config,
         output_dir=config.adapter_dir,
+        temp_limit=config.consolidation.training_temp_limit,
+        temp_check_interval=config.consolidation.training_temp_check_interval,
     )
 
     def _on_training_error():
@@ -1407,7 +1403,7 @@ async def _enrollment_idle_loop_inner(idle_timeout_seconds: int, check_interval:
         if not store or not model or not tokenizer:
             continue
 
-        from paramem.server.wyoming_handler import gpu_inference_lock
+        from paramem.server.gpu_lock import gpu_lock
 
         # Process each unknown speaker group
         group_ids = list(_state["unknown_speakers"].keys())
@@ -1432,7 +1428,7 @@ async def _enrollment_idle_loop_inner(idle_timeout_seconds: int, check_interval:
                 del _state["unknown_speakers"][group_id]
                 continue
 
-            async with gpu_inference_lock:
+            async with gpu_lock():
                 loop = asyncio.get_running_loop()
                 extracted = await loop.run_in_executor(
                     None,
@@ -1584,6 +1580,25 @@ def main():
     _state["config"] = config
     _state["cloud_only_startup"] = args.cloud_only
     _state["defer_model"] = args.defer_model
+
+    # Clear stale systemd env var so it can't resurface on next restart.
+    # tresume sets PARAMEM_EXTRA_ARGS=--defer-model; tpause normally clears
+    # it, but if a training run was paused without tpause (e.g. killed),
+    # the var persists and every restart silently starts cloud-only. When
+    # this process starts WITHOUT --defer-model, treat it as authoritative
+    # and clear the var so the intent is consistent with future restarts.
+    if not args.defer_model and not args.cloud_only:
+        import subprocess
+
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "unset-environment", "PARAMEM_EXTRA_ARGS"],
+                check=False,
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
 
     import uvicorn
 

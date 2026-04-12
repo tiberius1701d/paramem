@@ -12,6 +12,12 @@ The match_source field in RoutingPlan tells inference.py which path to take:
   - "both": PA + HA overlap → PA first, HA on [ESCALATE]
   - "none": no match → SOTA cloud agent
 
+Imperative fallback: when match_source would be "none" and the query is an
+imperative command (not a question), it is promoted to "ha" so the HA
+conversation agent can attempt to resolve it. Commands like "play music" or
+"set a timer" name no specific entity but are almost certainly device actions.
+Interrogatives ("What is X?") stay on the "none" → SOTA path.
+
 The router is stateless per query — all state lives in the indexes built
 from keyed_pairs.json, the knowledge graph, and the HA entity graph.
 """
@@ -83,7 +89,10 @@ _INTERROGATIVE_PREFIXES = frozenset(
 
 def _is_interrogative(text: str) -> bool:
     """Check if the query is a question (not an imperative command)."""
-    first_word = text.strip().split()[0].lower().rstrip("'s") if text.strip() else ""
+    first_word = text.strip().split()[0].lower() if text.strip() else ""
+    # Handle possessives: "who's" → "who", "what's" → "what"
+    if first_word.endswith("'s"):
+        first_word = first_word[:-2]
     return first_word in _INTERROGATIVE_PREFIXES
 
 
@@ -257,6 +266,17 @@ class QueryRouter:
             has_verb = ha_match.has_verb_match
             is_question = _is_interrogative(text)
             imperative = has_verb and not is_question
+
+        # --- Imperative fallback: no graph match but clearly a command ---
+        # Imperatives with no entity match (e.g. "play music", "set a timer") are
+        # almost certainly device commands. Route them to HA so its conversation
+        # agent can resolve the intent — it's better equipped than the routing
+        # layer to handle commands that don't name a specific entity.
+        # Interrogatives stay on the SOTA path (knowledge/reasoning questions).
+        if match_source == "none" and self._ha_graph is not None and not _is_interrogative(text):
+            match_source = "ha"
+            imperative = True
+            logger.info("Imperative fallback: no entity match, routing to HA agent")
 
         # --- Build PA adapter steps (only if PA matched) ---
         steps = []

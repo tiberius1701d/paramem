@@ -47,6 +47,35 @@ from paramem.utils.config import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_staging_compat(*adapter_configs) -> None:
+    """Ensure all production adapter configs are weight-shape compatible with staging.
+
+    The `in_training` staging slot uses episodic_config as template. The
+    fingerprint captures ONLY the fields that determine LoRA tensor shapes:
+    rank (A/B matrix inner dim), target_modules (which layers get adapted),
+    and bias setting (whether bias tensors exist). alpha and dropout affect
+    training behavior but not tensor shapes, so they may differ across
+    adapters. A fingerprint mismatch means copy_adapter_weights would fail
+    at the parameter-set-equality check — we fail faster here.
+    """
+    reference = None
+    for cfg in adapter_configs:
+        if cfg is None:
+            continue
+        fingerprint = (
+            getattr(cfg, "rank", None),
+            tuple(sorted(getattr(cfg, "target_modules", []) or [])),
+            getattr(cfg, "bias", None),
+        )
+        if reference is None:
+            reference = fingerprint
+        elif fingerprint != reference:
+            raise ValueError(
+                f"Adapter configs incompatible for staging: {reference} vs {fingerprint}. "
+                "All production adapters must share rank, target_modules, and bias."
+            )
+
+
 @dataclass
 class CycleResult:
     """Results from a single consolidation cycle."""
@@ -1586,9 +1615,13 @@ class ConsolidationLoop:
     def _ensure_adapters(self):
         """Create adapters that don't exist yet.
 
-        Episodic is always created. Semantic is created if promotion
-        is enabled. Procedural is created if its config was provided.
+        Production adapters (episodic, semantic, procedural) are created
+        based on configuration. A reusable `in_training` staging adapter is
+        also created — background training uses it so that inference during
+        pauses falls back to the last-known-good production adapter weights.
         """
+        import shutil
+
         from paramem.models.loader import create_adapter
 
         has_peft = hasattr(self.model, "peft_config")
@@ -1601,6 +1634,24 @@ class ConsolidationLoop:
         if self.procedural_config is not None and "procedural" not in self.model.peft_config:
             logger.info("Creating procedural adapter")
             self.model = create_adapter(self.model, self.procedural_config, "procedural")
+
+        # Staging adapter for on-the-fly training. Uses episodic config as
+        # the template. All production adapters MUST share the same rank,
+        # target_modules, and bias settings (the fields that determine LoRA
+        # tensor shapes). alpha and dropout may differ per adapter since
+        # they affect training behavior, not tensor shapes.
+        _validate_staging_compat(self.episodic_config, self.semantic_config, self.procedural_config)
+        if "in_training" not in self.model.peft_config:
+            logger.info("Creating in_training staging adapter")
+            self.model = create_adapter(self.model, self.episodic_config, "in_training")
+
+        # Clean stale staging checkpoints on disk — in_training is never
+        # authoritative on disk; only production adapters are.
+        stale_dir = Path(self.output_dir) / "in_training"
+        if stale_dir.exists():
+            logger.info("Cleaning stale in_training checkpoints at %s", stale_dir)
+            shutil.rmtree(stale_dir)
+
         return self.model
 
     def _disable_gradient_checkpointing(self) -> None:

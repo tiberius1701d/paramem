@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 from paramem.server.cloud.base import CloudAgent, CloudResponse, ToolCall
 from paramem.server.cloud.openai_compat import OpenAICompatAgent
 from paramem.server.cloud.registry import get_cloud_agent
-from paramem.server.config import GeneralAgentConfig
+from paramem.server.config import CloudAgentConfig
 
 
 class TestCloudResponse:
@@ -29,7 +29,7 @@ class TestOpenAICompatAdapter:
             "endpoint": "https://api.openai.com/v1/chat/completions",
         }
         defaults.update(kwargs)
-        return GeneralAgentConfig(**defaults)
+        return CloudAgentConfig(**defaults)
 
     def test_format_tools(self):
         agent = OpenAICompatAgent(self._make_config())
@@ -173,31 +173,29 @@ class TestOpenAICompatAdapter:
 
 class TestRegistry:
     def test_disabled_returns_none(self):
-        config = GeneralAgentConfig(enabled=False)
+        config = CloudAgentConfig(enabled=False)
         assert get_cloud_agent(config) is None
 
     def test_openai_with_key(self):
-        config = GeneralAgentConfig(
+        config = CloudAgentConfig(
             enabled=True, provider="openai", model="gpt-4o", api_key="sk-test"
         )
         agent = get_cloud_agent(config)
         assert isinstance(agent, OpenAICompatAgent)
 
     def test_groq_with_key(self):
-        config = GeneralAgentConfig(
+        config = CloudAgentConfig(
             enabled=True, provider="groq", model="llama-4-scout", api_key="gsk-test"
         )
         agent = get_cloud_agent(config)
         assert isinstance(agent, OpenAICompatAgent)
 
     def test_missing_key_returns_none(self):
-        config = GeneralAgentConfig(enabled=True, provider="openai", model="gpt-4o", api_key="")
+        config = CloudAgentConfig(enabled=True, provider="openai", model="gpt-4o", api_key="")
         assert get_cloud_agent(config) is None
 
     def test_unknown_provider_returns_none(self):
-        config = GeneralAgentConfig(
-            enabled=True, provider="unknown_ai", model="test", api_key="key"
-        )
+        config = CloudAgentConfig(enabled=True, provider="unknown_ai", model="test", api_key="key")
         assert get_cloud_agent(config) is None
 
     def test_anthropic_agent_created(self):
@@ -209,7 +207,7 @@ class TestRegistry:
             mod_name = "paramem.server.cloud.anthropic_adapter"
             sys.modules.pop(mod_name, None)
 
-            config = GeneralAgentConfig(
+            config = CloudAgentConfig(
                 enabled=True, provider="anthropic", model="claude-sonnet", api_key="key"
             )
             agent = get_cloud_agent(config)
@@ -263,6 +261,44 @@ class TestPrivacyRouting:
         router.route = route
         return router
 
+    def _make_ha_only_router(self, imperative=False):
+        """Create a mock router returning an HA-only match (no PA steps)."""
+        from paramem.server.router import RoutingPlan
+
+        router = MagicMock()
+
+        def route(text, speaker=None, speaker_id=None):
+            return RoutingPlan(
+                steps=[],
+                strategy="entity",
+                matched_entities=["lights"],
+                match_source="ha",
+                imperative=imperative,
+                ha_domains=["light"],
+            )
+
+        router.route = route
+        return router
+
+    def _make_both_match_router(self):
+        """Create a router returning a 'both' match (PA steps + HA entity)."""
+        from paramem.server.router import RoutingPlan, RoutingStep
+
+        router = MagicMock()
+
+        def route(text, speaker=None, speaker_id=None):
+            return RoutingPlan(
+                steps=[RoutingStep(adapter_name="episodic", keys_to_probe=["graph1"])],
+                strategy="entity",
+                matched_entities=["lights", "alex"],
+                match_source="both",
+                imperative=True,
+                ha_domains=["light"],
+            )
+
+        router.route = route
+        return router
+
     def test_personal_query_never_reaches_cloud(self):
         """Query mentioning a known entity must NOT call cloud agent."""
         from paramem.server.inference import handle_chat
@@ -281,8 +317,6 @@ class TestPrivacyRouting:
         config.registry_path = MagicMock()
         config.registry_path.exists.return_value = False
         config.voice.load_prompt.return_value = "You are a helper."
-        config.general_agent.enabled = True
-
         with (
             patch(
                 "paramem.training.indexed_memory.probe_key",
@@ -318,7 +352,6 @@ class TestPrivacyRouting:
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
-                cloud_agent=cloud_agent,
             )
 
         # Cloud agent must NOT have been called
@@ -338,7 +371,6 @@ class TestPrivacyRouting:
 
         config = MagicMock()
         config.voice.load_prompt.return_value = "You are a helper."
-        config.general_agent.enabled = True
         config.sanitization.mode = "off"
 
         # Mock HA client that returns None (simulates HA unavailable)
@@ -381,7 +413,6 @@ class TestPrivacyRouting:
 
         config = MagicMock()
         config.registry_path = MagicMock()
-        config.general_agent.enabled = False
         config.voice.load_prompt.return_value = "You are a helper."
 
         with (
@@ -416,7 +447,134 @@ class TestPrivacyRouting:
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
-                cloud_agent=None,
             )
 
+        assert result.escalated is False
+
+    def test_imperative_ha_command_sota_fallback(self):
+        """Path 2a (match_source=ha): HA fails → SOTA fallback."""
+        from paramem.server.inference import handle_chat
+
+        cloud_agent = self._make_mock_cloud_agent()
+        router = self._make_ha_only_router(imperative=True)
+
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        tokenizer = MagicMock()
+
+        config = MagicMock()
+        config.sanitization.mode = "off"
+        config.voice.load_prompt.return_value = "You are a helper."
+
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = None  # HA fails
+
+        with patch("paramem.server.inference.detect_temporal_query", return_value=None):
+            result = handle_chat(
+                text="Turn on the lights",
+                conversation_id="test",
+                speaker=None,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                router=router,
+                ha_client=ha_client,
+                sota_agent=cloud_agent,
+            )
+
+        ha_client.conversation_process.assert_called_once()
+        cloud_agent.call.assert_called_once()
+        assert result.escalated is True
+        assert result.text == "cloud answer"
+
+    def test_ha_nonimperative_match_sota_fallback(self):
+        """Path 2c (non-imperative HA match): HA fails → SOTA fallback."""
+        from paramem.server.inference import handle_chat
+
+        cloud_agent = self._make_mock_cloud_agent()
+        router = self._make_ha_only_router(imperative=False)
+
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        tokenizer = MagicMock()
+
+        config = MagicMock()
+        config.sanitization.mode = "off"
+        config.voice.load_prompt.return_value = "You are a helper."
+
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = None  # HA fails
+
+        with patch("paramem.server.inference.detect_temporal_query", return_value=None):
+            result = handle_chat(
+                text="Is the light on?",
+                conversation_id="test",
+                speaker=None,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                router=router,
+                ha_client=ha_client,
+                sota_agent=cloud_agent,
+            )
+
+        ha_client.conversation_process.assert_called_once()
+        cloud_agent.call.assert_called_once()
+        assert result.escalated is True
+        assert result.text == "cloud answer"
+
+    def test_imperative_both_match_ha_fails_routes_to_pa(self):
+        """B1 fix: match_source=both + imperative: HA fails → PA probe, NOT SOTA."""
+        from paramem.server.inference import handle_chat
+
+        cloud_agent = self._make_mock_cloud_agent()
+        router = self._make_both_match_router()
+
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        model.peft_config = {"episodic": MagicMock()}
+        tokenizer = MagicMock()
+
+        config = MagicMock()
+        config.registry_path = MagicMock()
+        config.registry_path.exists.return_value = False
+        config.sanitization.mode = "off"
+        config.voice.load_prompt.return_value = "You are a helper."
+
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = None  # HA fails
+
+        with (
+            patch("paramem.server.inference.detect_temporal_query", return_value=None),
+            patch(
+                "paramem.training.indexed_memory.probe_key",
+                return_value={"answer": "Alex prefers dim lights"},
+            ),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.server.inference.generate_answer",
+                return_value="Noted: Alex prefers dim lights.",
+            ),
+            patch("paramem.server.inference.detect_escalation", return_value=(False, "")),
+            patch("paramem.server.inference.adapt_messages", side_effect=lambda msgs, tok: msgs),
+            patch.object(tokenizer, "apply_chat_template", return_value="prompt"),
+        ):
+            result = handle_chat(
+                text="Turn on the lights for Alex",
+                conversation_id="test",
+                speaker=None,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                router=router,
+                ha_client=ha_client,
+                sota_agent=cloud_agent,
+            )
+
+        # HA tried once (path 2a), SOTA must NOT be called (match_source=both → path 2b)
+        ha_client.conversation_process.assert_called_once()
+        cloud_agent.call.assert_not_called()
         assert result.escalated is False

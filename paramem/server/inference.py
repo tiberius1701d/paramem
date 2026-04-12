@@ -11,6 +11,9 @@ directly to HA, skipping local inference.
 
 Temporal queries filter keys by date range first, then follow the same
 probe → reason flow.
+
+Fallback chain at every escalation point: HA → SOTA → local base model.
+_escalate_to_ha_agent is HA-only; callers own the SOTA fallback.
 """
 
 import json
@@ -26,7 +29,6 @@ from paramem.server.router import RoutingPlan, RoutingStep
 from paramem.server.sanitizer import sanitize_for_cloud
 from paramem.server.temporal import detect_temporal_query, filter_registry_by_date
 from paramem.server.tools.ha_client import HAClient
-from paramem.server.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +91,8 @@ def handle_chat(
     tokenizer,
     config: ServerConfig,
     router=None,
-    cloud_agent: CloudAgent | None = None,
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
-    tool_registry: ToolRegistry | None = None,
     speaker_id: str | None = None,
     language: str | None = None,
 ) -> ChatResult:
@@ -105,17 +105,10 @@ def handle_chat(
     4. HA match (non-imperative) → HA agent (device query)
     5. No match → HA first (tools, real-time data), SOTA fallback (reasoning)
     6. All cloud failed → local base model
-
-    The speaker entity is always injected into routing so that personal
-    queries ("What is my name?") resolve to the speaker's keys even
-    when no explicit entity appears in the query text.
     """
     model.gradient_checkpointing_disable()
 
-    # Build a routing plan
     plan = None
-
-    # Speaker's allowed key set (for scoping temporal and entity queries)
     allowed_keys = None
     if speaker_id and router is not None:
         allowed_keys = router._speaker_key_index.get(speaker_id, set())
@@ -126,17 +119,11 @@ def handle_chat(
         start_date, end_date = date_range
         logger.info("Temporal query detected: %s to %s", start_date, end_date)
         temporal_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
-        # Scope temporal keys to the identified speaker
         if allowed_keys is not None:
             temporal_keys = [k for k in temporal_keys if k in allowed_keys]
         if temporal_keys:
             plan = RoutingPlan(
-                steps=[
-                    RoutingStep(
-                        adapter_name="episodic",
-                        keys_to_probe=temporal_keys,
-                    )
-                ],
+                steps=[RoutingStep(adapter_name="episodic", keys_to_probe=temporal_keys)],
                 strategy="temporal",
                 match_source="pa",
             )
@@ -146,26 +133,28 @@ def handle_chat(
     if plan is None and router is not None:
         plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
 
-    # Shared kwargs for _escalate_to_ha_agent calls
-    ha_kwargs = dict(
-        sota_agent=sota_agent,
-        speaker=speaker,
-        history=history,
-        language=language,
-    )
+    # Pre-compute sanitization once for all cloud escalation paths
+    sanitized_text, sanitization_findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
 
     # Path 2a: Imperative + HA entity → HA agent directly (action command)
     if plan and plan.imperative and plan.match_source in ("ha", "both"):
         logger.info("Imperative HA command: domains=%s", plan.ha_domains)
-        sanitized, findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
-        if sanitized is not None:
-            result = _escalate_to_ha_agent(
-                sanitized, ha_client, cloud_agent, config, tool_registry, **ha_kwargs
-            )
+        if sanitized_text is not None:
+            result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
             if result is not None:
                 return result
+            # Only fall to SOTA when there is no PA match to probe in path 2b
+            if sota_agent is not None and plan.match_source == "ha":
+                return _escalate_to_sota(
+                    sanitized_text,
+                    sota_agent,
+                    config,
+                    speaker=speaker,
+                    history=history,
+                    language=language,
+                )
         else:
-            logger.info("Sanitizer blocked imperative HA command: %s", findings)
+            logger.info("Sanitizer blocked imperative HA command: %s", sanitization_findings)
 
     # Path 2b: PA match → probe adapters and reason locally
     if plan and plan.steps and plan.match_source in ("pa", "both"):
@@ -176,10 +165,8 @@ def handle_chat(
             model,
             tokenizer,
             config,
-            cloud_agent,
-            sota_agent,
-            ha_client,
-            tool_registry,
+            sota_agent=sota_agent,
+            ha_client=ha_client,
             speaker=speaker,
             language=language,
         )
@@ -187,31 +174,32 @@ def handle_chat(
     # Path 2c: HA-only match (non-imperative) → HA agent
     if plan and plan.match_source == "ha":
         logger.info("HA entity query (non-imperative): domains=%s", plan.ha_domains)
-        sanitized, findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
-        if sanitized is not None:
-            result = _escalate_to_ha_agent(
-                sanitized, ha_client, cloud_agent, config, tool_registry, **ha_kwargs
-            )
+        if sanitized_text is not None:
+            result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
             if result is not None:
                 return result
+            if sota_agent is not None:
+                return _escalate_to_sota(
+                    sanitized_text,
+                    sota_agent,
+                    config,
+                    speaker=speaker,
+                    history=history,
+                    language=language,
+                )
         else:
-            logger.info("Sanitizer blocked HA query: %s", findings)
+            logger.info("Sanitizer blocked HA query: %s", sanitization_findings)
 
-    # Path 3: No match in either graph → HA first (tools), SOTA fallback (reasoning)
-    sanitized, findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
-    if sanitized is not None:
-        # HA has tools for real-time data (weather, time, device status)
+    # Path 3: No match → HA first (has tools for real-time data), SOTA fallback
+    if sanitized_text is not None:
         logger.info("No graph match, trying HA agent (tools)")
-        result = _escalate_to_ha_agent(
-            sanitized, ha_client, cloud_agent, config, tool_registry, **ha_kwargs
-        )
+        result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
         if result is not None:
             return result
-        # HA chain failed — SOTA for reasoning
         if sota_agent is not None:
             logger.info("HA failed, routing to SOTA agent")
             return _escalate_to_sota(
-                sanitized,
+                sanitized_text,
                 sota_agent,
                 config,
                 speaker=speaker,
@@ -219,7 +207,7 @@ def handle_chat(
                 language=language,
             )
     else:
-        logger.info("Sanitizer blocked query: %s", findings)
+        logger.info("Sanitizer blocked query: %s", sanitization_findings)
 
     # All cloud services failed — local base model as last resort
     return _base_model_answer(
@@ -228,10 +216,8 @@ def handle_chat(
         model,
         tokenizer,
         config,
-        cloud_agent=cloud_agent,
         sota_agent=sota_agent,
         ha_client=ha_client,
-        tool_registry=tool_registry,
         speaker=speaker,
         language=language,
     )
@@ -240,53 +226,29 @@ def handle_chat(
 def _escalate_to_ha_agent(
     text: str,
     ha_client: HAClient | None,
-    cloud_agent: CloudAgent | None,
     config: ServerConfig,
-    tool_registry: ToolRegistry | None = None,
-    sota_agent: CloudAgent | None = None,
-    speaker: str | None = None,
-    history: list[dict] | None = None,
     language: str | None = None,
 ) -> ChatResult | None:
-    """Escalate to HA conversation agent, then SOTA fallback.
+    """Forward to the HA conversation agent.
 
-    Returns None if all cloud services fail, so the caller can fall
-    through to the local base model.
+    Returns None if HA is unavailable or the request fails. Callers own
+    the SOTA fallback — this function is HA-only.
     """
-    # Primary: HA conversation agent (Groq via HA, has tools + system prompt)
-    # Language passed via HA's native conversation API parameter
+    if ha_client is None:
+        logger.debug("HA escalation skipped — ha_client not configured")
+        return None
     ha_languages = config.tools.ha.supported_languages if config else []
-    if ha_client is not None:
-        response = ha_client.conversation_process(
-            text,
-            agent_id=config.ha_agent_id,
-            language=language,
-            supported_languages=ha_languages,
-        )
-        if response is not None:
-            return ChatResult(text=response, escalated=True)
-        logger.warning("HA conversation.process failed, trying SOTA")
-
-    # Fallback: SOTA agent
-    if sota_agent is not None:
-        return _escalate_to_sota(
-            text,
-            sota_agent,
-            config,
-            speaker=speaker,
-            history=history,
-            language=language,
-        )
-
-    # All cloud services down — return None so caller can use local model
-    logger.warning("All cloud services failed")
+    response = ha_client.conversation_process(
+        text,
+        agent_id=config.ha_agent_id,
+        language=language,
+        supported_languages=ha_languages,
+    )
+    if response is not None:
+        return ChatResult(text=response, escalated=True)
+    logger.warning("HA conversation.process failed")
     return None
 
-
-CLOUD_DIRECT_PROMPT = (
-    "You are a helpful personal assistant. Be concise. "
-    "Answer in 1-2 spoken sentences. Do not use markdown, lists, or structured formatting. "
-)
 
 SOTA_PROMPT = (
     "You are continuing a conversation as a personal assistant. "
@@ -332,7 +294,6 @@ def _escalate_to_sota(
     """
     sanitized_history = _sanitize_history(history, mode=config.sanitization.mode)
 
-    # Build system prompt with speaker name and language instruction
     prompt = SOTA_PROMPT
     parts = []
     if speaker:
@@ -358,30 +319,6 @@ def _escalate_to_sota(
     return ChatResult(text="I couldn't get an answer right now.", escalated=True)
 
 
-def _cloud_agent_answer(
-    cloud_agent: CloudAgent,
-    text: str,
-    config: ServerConfig,
-    tool_registry: ToolRegistry | None = None,
-) -> ChatResult:
-    """Direct cloud agent call — fallback when HA is unavailable.
-
-    Simple query-response without HA tools or prompt context.
-    """
-    response = cloud_agent.call(
-        query=text,
-        system_prompt=CLOUD_DIRECT_PROMPT,
-    )
-
-    if response.text:
-        return ChatResult(text=response.text, escalated=True)
-
-    return ChatResult(
-        text="I'm sorry, I couldn't get an answer right now.",
-        escalated=True,
-    )
-
-
 def _probe_and_reason(
     text: str,
     plan: RoutingPlan,
@@ -389,24 +326,14 @@ def _probe_and_reason(
     model,
     tokenizer,
     config: ServerConfig,
-    cloud_agent: CloudAgent | None = None,
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
-    tool_registry: ToolRegistry | None = None,
     speaker: str | None = None,
     language: str | None = None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
-    Replicates the intended adapter switching architecture into the
-    context window. Each adapter's recalled facts become a named section,
-    preserving the query order:
-
-        [Procedural]  — behavioral preferences, response style
-        [Semantic]    — consolidated stable knowledge
-        [Episodic]    — recent conversational knowledge
-
-    For each adapter:
+    For each adapter (procedural → semantic → episodic):
       1. Switch to it
       2. Probe its keys
       3. Collect recalled facts into that layer's section
@@ -419,22 +346,18 @@ def _probe_and_reason(
     from paramem.models.loader import switch_adapter
     from paramem.training.indexed_memory import probe_key
 
-    # Load registry for SimHash verification
     registry = _load_simhash_registry(config.registry_path)
 
-    # Section labels for the layered context — maps adapter name to its role
     LAYER_LABELS = {
         "procedural": "Behavioral preferences",
         "semantic": "Consolidated knowledge",
         "episodic": "Recent knowledge",
     }
 
-    # Probe each adapter's keys sequentially, collecting per-layer facts
     layers: dict[str, list[str]] = {}
     successful_keys = []
 
     for step in plan.steps:
-        # Switch to the target adapter if it exists on the model
         if hasattr(model, "peft_config") and step.adapter_name in model.peft_config:
             switch_adapter(model, step.adapter_name)
         elif step.adapter_name != "episodic":
@@ -459,22 +382,16 @@ def _probe_and_reason(
         )
 
     if not layers:
-        logger.info("All probed keys failed, falling back (match_source=%s)", plan.match_source)
-        sanitized, findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
+        logger.info(
+            "All %d probed key(s) failed, escalating via HA → SOTA (source=%s)",
+            sum(len(s.keys_to_probe) for s in plan.steps),
+            plan.match_source,
+        )
+        sanitized, _ = sanitize_for_cloud(text, mode=config.sanitization.mode)
         if sanitized is not None:
-            ha_kwargs = dict(
-                sota_agent=sota_agent,
-                speaker=speaker,
-                history=history,
-                language=language,
-            )
-            # HA first (has tools for real-time data), SOTA fallback
-            result = _escalate_to_ha_agent(
-                sanitized, ha_client, cloud_agent, config, tool_registry, **ha_kwargs
-            )
+            result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
             if result is not None:
                 return result
-            # HA chain failed — SOTA for reasoning
             if sota_agent is not None:
                 return _escalate_to_sota(
                     sanitized,
@@ -490,10 +407,8 @@ def _probe_and_reason(
             model,
             tokenizer,
             config,
-            cloud_agent=cloud_agent,
             sota_agent=sota_agent,
             ha_client=ha_client,
-            tool_registry=tool_registry,
             speaker=speaker,
             language=language,
         )
@@ -501,9 +416,8 @@ def _probe_and_reason(
     total_facts = sum(len(f) for f in layers.values())
     logger.info("Total recalled: %d facts from %d layers", total_facts, len(layers))
 
-    # Assemble layered context in hierarchy order: procedural → episodic → semantic.
-    # Later sections sit closer to the query in the context window, giving them
-    # higher recency bias. Semantic (consolidated knowledge) goes last.
+    # Assemble layered context: procedural → episodic → semantic.
+    # Later sections sit closer to the query, giving them higher recency bias.
     context_sections = []
     for adapter_name in ["procedural", "episodic", "semantic"]:
         if adapter_name in layers:
@@ -531,10 +445,8 @@ def _probe_and_reason(
         config,
         match_source=plan.match_source,
         probed_keys=successful_keys,
-        cloud_agent=cloud_agent,
         sota_agent=sota_agent,
         ha_client=ha_client,
-        tool_registry=tool_registry,
         speaker=speaker,
         history=history,
         language=language,
@@ -547,10 +459,8 @@ def _base_model_answer(
     model,
     tokenizer,
     config: ServerConfig,
-    cloud_agent: CloudAgent | None = None,
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
-    tool_registry: ToolRegistry | None = None,
     speaker: str | None = None,
     language: str | None = None,
 ) -> ChatResult:
@@ -572,10 +482,8 @@ def _base_model_answer(
     return _maybe_escalate(
         response,
         config,
-        cloud_agent=cloud_agent,
         sota_agent=sota_agent,
         ha_client=ha_client,
-        tool_registry=tool_registry,
         speaker=speaker,
         history=history,
         language=language,
@@ -587,60 +495,44 @@ def _maybe_escalate(
     config: ServerConfig,
     match_source: str = "none",
     probed_keys: list[str] | None = None,
-    cloud_agent: CloudAgent | None = None,
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
-    tool_registry: ToolRegistry | None = None,
     speaker: str | None = None,
     history: list[dict] | None = None,
     language: str | None = None,
 ) -> ChatResult:
-    """Check for [ESCALATE] tag and route to HA first, then SOTA.
+    """Check for [ESCALATE] tag and route HA → SOTA.
 
-    HA agent has tools (SerpAPI, device control, real-time data) so it
-    gets first shot at any escalation. SOTA is the fallback for queries
-    that don't need tools (pure reasoning).
+    HA agent has tools (search, device control, real-time data) so it
+    gets first shot. SOTA handles queries that need pure reasoning.
+    When all escalation paths fail, the pre-escalation portion of the
+    local response is returned (text before the [ESCALATE] marker).
     """
     should_escalate, forwarded_query = detect_escalation(response)
 
-    if should_escalate:
-        sanitized, _ = sanitize_for_cloud(forwarded_query, mode=config.sanitization.mode)
-        if sanitized is None:
-            should_escalate = False
-        else:
-            ha_kwargs = dict(
-                sota_agent=sota_agent,
+    if not should_escalate:
+        return ChatResult(text=response, probed_keys=probed_keys or [])
+
+    sanitized, _ = sanitize_for_cloud(forwarded_query, mode=config.sanitization.mode)
+    if sanitized is not None:
+        logger.info("[ESCALATE] → HA (source=%s): %s", match_source, sanitized[:100])
+        result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
+        if result is not None:
+            return result
+        if sota_agent is not None:
+            logger.info("[ESCALATE] → SOTA fallback (source=%s): %s", match_source, sanitized[:100])
+            return _escalate_to_sota(
+                sanitized,
+                sota_agent,
+                config,
                 speaker=speaker,
                 history=history,
                 language=language,
             )
-            # Always try HA first — it has tools for real-time data.
-            logger.info("[ESCALATE] → HA (source=%s): %s", match_source, sanitized[:100])
-            result = _escalate_to_ha_agent(
-                sanitized, ha_client, cloud_agent, config, tool_registry, **ha_kwargs
-            )
-            if result is not None:
-                return result
-            # HA chain failed — fall back to SOTA for reasoning.
-            if sota_agent is not None:
-                logger.info(
-                    "[ESCALATE] → SOTA fallback (source=%s): %s", match_source, sanitized[:100]
-                )
-                return _escalate_to_sota(
-                    sanitized,
-                    sota_agent,
-                    config,
-                    speaker=speaker,
-                    history=history,
-                    language=language,
-                )
 
-    if should_escalate:
-        response = response.replace("[ESCALATE]", "").strip()
-        if not response:
-            response = "I'm not sure about that."
-
-    return ChatResult(text=response, probed_keys=probed_keys or [])
+    # All escalation paths exhausted — return pre-escalation text from local model
+    local_text = response.split("[ESCALATE]")[0].strip()
+    return ChatResult(text=local_text or "I'm not sure about that.", probed_keys=probed_keys or [])
 
 
 def _load_simhash_registry(registry_path) -> dict:
@@ -661,14 +553,11 @@ def _build_messages(
     system_prompt: str,
     tokenizer,
 ) -> list[dict]:
-    """Build chat messages from user text, history, and system prompt.
+    """Build chat messages enforcing strict user/assistant alternation.
 
-    Enforces strict user/assistant alternation required by Mistral and
-    other chat templates. Consecutive same-role messages are merged.
+    Mistral requires: system → user → assistant → user → ...
+    HA may send non-alternating history, so we enforce the pattern here.
     """
-    # Build alternating user/assistant pairs from history.
-    # Mistral requires: system → user → assistant → user → ...
-    # HA may send non-alternating history, so we enforce the pattern.
     pairs = []
     if history:
         for turn in history[-MAX_HISTORY_TURNS:]:
@@ -677,7 +566,6 @@ def _build_messages(
             if role in ("user", "assistant") and content:
                 pairs.append({"role": role, "content": content})
 
-    # Merge consecutive same-role messages
     merged = []
     for msg in pairs:
         if merged and merged[-1]["role"] == msg["role"]:
@@ -685,13 +573,11 @@ def _build_messages(
         else:
             merged.append(msg)
 
-    # Strip leading assistant messages (must start with user after system)
     while merged and merged[0]["role"] == "assistant":
         merged.pop(0)
 
     messages = [{"role": "system", "content": system_prompt}] + merged
 
-    # Ensure the final message is a user turn with the current text
     if messages[-1]["role"] == "user":
         messages[-1]["content"] += "\n" + text
     else:

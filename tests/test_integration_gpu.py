@@ -68,8 +68,12 @@ class TestRollbackPreparation:
         from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
         model = MagicMock()
-        # Pretend adapters already exist to skip _ensure_adapters
-        model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
+        # Pretend all adapters (including staging) already exist to skip _ensure_adapters
+        model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "in_training": MagicMock(),
+        }
         loop = ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
@@ -245,19 +249,47 @@ class TestGetHomeContext:
 
 
 class TestTrainingSchedulerBehavior:
-    def test_consolidating_flag_cleared_on_no_sessions(self):
-        """Verify consolidating is cleared when no sessions found."""
+    @pytest.fixture(autouse=True)
+    def _reset_state(self):
+        """Snapshot _state before each test and restore after."""
         from paramem.server.app import _state
 
-        # Mock minimal state
-        _state["consolidating"] = False
-        _state["mode"] = "local"
-        buffer = MagicMock()
-        buffer.get_pending.return_value = []
-        _state["session_buffer"] = buffer
+        saved = _state.get("consolidating")
+        yield
+        _state["consolidating"] = saved if saved is not None else False
 
-        # The scheduler would skip — verify behavior
-        assert not _state["consolidating"]
+    def test_consolidation_done_callback_clears_flag(self):
+        """_consolidation_done_callback must reset _state['consolidating'] to False."""
+        from paramem.server.app import _consolidation_done_callback, _state
+
+        future = MagicMock()
+        future.exception.return_value = None
+
+        _state["consolidating"] = True
+        _consolidation_done_callback(future)
+        assert _state["consolidating"] is False
+
+    def test_consolidation_done_callback_on_exception(self):
+        """_consolidation_done_callback still clears the flag when the future raised."""
+        from paramem.server.app import _consolidation_done_callback, _state
+
+        future = MagicMock()
+        future.exception.return_value = RuntimeError("simulated")
+
+        _state["consolidating"] = True
+        _consolidation_done_callback(future)
+        assert _state["consolidating"] is False
+
+    def test_training_scheduler_done_callback_on_exception(self):
+        """_training_scheduler_done_callback clears the flag if extraction failed."""
+        from paramem.server.app import _state, _training_scheduler_done_callback
+
+        future = MagicMock()
+        future.exception.return_value = RuntimeError("extraction failed")
+
+        _state["consolidating"] = True
+        _training_scheduler_done_callback(future)
+        assert _state["consolidating"] is False
 
 
 # --- 7. BackgroundTrainer._train_adapter ---
@@ -276,6 +308,8 @@ class TestBackgroundTrainerTraining:
         # Create adapter if not exists
         if not hasattr(model, "peft_config") or "episodic" not in model.peft_config:
             model = create_adapter(model, AdapterConfig(), "episodic")
+        if "in_training" not in model.peft_config:
+            model = create_adapter(model, AdapterConfig(), "in_training")
 
         qa = [
             {"question": "Where does Alex live?", "answer": "Alex lives in Millfield."},
@@ -344,6 +378,168 @@ class TestBackgroundTrainerTraining:
 
         bt.stop(timeout=30)
         assert not bt.is_training
+
+
+# --- 7b. Staging adapter flow ---
+
+
+@pytest.fixture(scope="class")
+def staging_model(model_and_tokenizer):
+    """PeftModel with episodic + in_training adapters, wrapped once per class.
+
+    Using class scope avoids cross-test pollution of the module-level model
+    fixture (which other tests may leave in an unexpected state).
+    """
+    from peft import PeftModel
+
+    from paramem.models.loader import create_adapter
+    from paramem.utils.config import AdapterConfig
+
+    model, tokenizer = model_and_tokenizer
+    cfg = AdapterConfig()
+
+    # Wrap if not already a PeftModel
+    if not isinstance(model, PeftModel):
+        model = create_adapter(model, cfg, "episodic")
+
+    if "episodic" not in model.peft_config:
+        model = create_adapter(model, cfg, "episodic")
+    if "in_training" not in model.peft_config:
+        model = create_adapter(model, cfg, "in_training")
+
+    return model, tokenizer
+
+
+class TestStagingAdapterGPU:
+    """End-to-end staging flow with real model and adapters."""
+
+    def test_copy_adapter_weights_round_trip(self, staging_model):
+        """copy_adapter_weights on real LoRA adapters preserves tensor values."""
+        import torch
+
+        from paramem.models.loader import copy_adapter_weights
+
+        model, _ = staging_model
+
+        # Perturb in_training so it differs from episodic
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if ".in_training.weight" in name and p.requires_grad:
+                    p.data.fill_(0.5)
+
+        # Copy episodic → in_training
+        copy_adapter_weights(model, src="episodic", dst="in_training")
+
+        # Every in_training tensor now equals its episodic counterpart
+        params = dict(model.named_parameters())
+        for name, p in params.items():
+            if ".episodic.weight" in name:
+                staging_name = name.replace(".episodic.weight", ".in_training.weight")
+                assert staging_name in params
+                assert torch.equal(p.data, params[staging_name].data)
+
+    def test_staging_flow_inference_gets_production_weights(self, staging_model, tmp_path):
+        """
+        During a pause mid-training, inference must see the committed
+        production weights, NOT the in_training mid-cycle state.
+        """
+        import torch
+
+        from paramem.models.loader import switch_adapter
+        from paramem.server.background_trainer import BackgroundTrainer
+        from paramem.utils.config import TrainingConfig
+
+        model, tokenizer = staging_model
+
+        # Stamp episodic with a known signature. PEFT only marks the ACTIVE
+        # adapter's tensors as requires_grad=True, so we don't filter on it.
+        signature = 0.1234
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if ".episodic.weight" in name:
+                    p.data.fill_(signature)
+
+        # Stamp in_training with a different signature (simulating mid-training)
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if ".in_training.weight" in name:
+                    p.data.fill_(0.9999)
+
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            training_config=TrainingConfig(num_epochs=1),
+            output_dir=tmp_path,
+        )
+        bt._is_training = True
+        bt._current_adapter = "episodic"
+        bt._training_paused.set()
+
+        # Simulate mid-training state: in_training is active
+        switch_adapter(model, "in_training")
+        assert model.active_adapter == "in_training"
+
+        # Pause for inference
+        assert bt.pause(timeout=1.0) is True
+
+        # During pause, active adapter must be episodic (production)
+        assert model.active_adapter == "episodic"
+        # And its weights must still be the signature value (not clobbered)
+        checked = False
+        for name, p in model.named_parameters():
+            if ".episodic.weight" in name:
+                assert torch.all(p.data == signature), (
+                    f"Production episodic weights were modified during pause ({name})"
+                )
+                checked = True
+                break
+        assert checked, "No episodic weights found to verify"
+
+        bt.resume()
+
+    def test_commit_staging_to_production_on_gpu(self, staging_model, tmp_path):
+        """Commit copies staging → production and saves atomically to disk."""
+        import torch
+
+        from paramem.server.background_trainer import BackgroundTrainer
+        from paramem.utils.config import TrainingConfig
+
+        model, tokenizer = staging_model
+
+        # Stamp in_training
+        target_value = 0.7777
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if ".in_training.weight" in name:
+                    p.data.fill_(target_value)
+
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            training_config=TrainingConfig(num_epochs=1),
+            output_dir=tmp_path,
+        )
+        bt._commit_staging_to_production("episodic")
+
+        # Episodic in-memory now matches in_training
+        checked = False
+        for name, p in model.named_parameters():
+            if ".episodic.weight" in name:
+                assert torch.all(p.data == target_value), (
+                    f"Commit did not copy staging weights to production ({name})"
+                )
+                checked = True
+                break
+        assert checked
+
+        # Disk artifact written atomically (PEFT may save as .safetensors or .bin)
+        target_dir = tmp_path / "episodic"
+        assert target_dir.exists()
+        weight_files = list(target_dir.glob("adapter_model.*"))
+        assert weight_files, f"No adapter weight file in {target_dir}"
+        # No leftover tmp/old dirs
+        assert not list(tmp_path.glob("episodic.tmp.*"))
+        assert not (tmp_path / "episodic.old").exists()
 
 
 # --- 8. Batch consolidation end-to-end ---

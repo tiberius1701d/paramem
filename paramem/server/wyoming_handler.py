@@ -27,9 +27,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Shared GPU lock — prevents concurrent Whisper and LLM inference.
-# Imported and used by app.py for LLM inference as well.
-gpu_inference_lock = asyncio.Lock()
+# GPU lock — thread-safe, protects against concurrent CUDA access
+from paramem.server.gpu_lock import gpu_lock as _gpu_lock  # noqa: E402
 
 
 class SpeakerSTTHandler(AsyncEventHandler):
@@ -119,9 +118,9 @@ class SpeakerSTTHandler(AsyncEventHandler):
                 self._channels,
             )
 
-        # Transcribe with GPU lock to prevent concurrent GPU access with LLM
+        # Transcribe with GPU lock to prevent concurrent GPU access with LLM/training
         loop = asyncio.get_running_loop()
-        async with gpu_inference_lock:
+        async with _gpu_lock():
             result = await loop.run_in_executor(
                 None, self._stt.transcribe, audio_bytes, self._sample_rate
             )
@@ -299,7 +298,7 @@ class TTSHandler(AsyncEventHandler):
         # Acquire GPU lock only if THIS language's engine is on GPU
         try:
             if self._tts.needs_gpu(language):
-                async with gpu_inference_lock:
+                async with _gpu_lock():
                     pcm_data, sample_rate = await loop.run_in_executor(
                         None, self._tts.synthesize, text, language
                     )

@@ -4,7 +4,7 @@ server:
   reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
   vram_safety_margin_mb: 200   # free VRAM to keep after loading all GPU components
 
-model: mistral  # mistral | gemma | qwen3b
+model: mistral  # mistral | gemma | qwen3b | gemma4
 
 debug: true  # cycle snapshots, verbose logging
 snapshot_key: "${PARAMEM_SNAPSHOT_KEY}"  # Fernet key for encrypted session snapshots
@@ -47,17 +47,16 @@ consolidation:
   extraction_noise_filter: anthropic  # SOTA provider for noise filtering ("" = disabled)
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
   training_interval_hours: 2   # background training interval (0 = disabled)
+  # Thermal throttle: keeps the machine silent during background training.
+  # Training pauses when GPU temp exceeds the limit and resumes when it cools.
+  # Set to 0 to disable. Adjust to match your fan ramp-up threshold.
+  training_temp_limit: 55      # GPU temp ceiling in °C (0 = disabled)
+  training_temp_check_interval: 5  # check GPU temp every N training steps
 
 # --- Agents ---
-# Two-agent design: memory (local) + general (cloud).
-# Memory agent is always the local model above. General agent is optional.
+# PA (local model) handles personal knowledge. HA agent handles tool use.
+# SOTA is the fallback for general reasoning when HA cannot answer.
 agents:
-  general:
-    enabled: true
-    provider: groq
-    model: llama-3.3-70b-versatile
-    api_key: ${GROQ_API_KEY}   # env var only — never inline secrets
-    endpoint: ""               # groq default endpoint used when empty
   sota:
     enabled: true
     provider: anthropic
@@ -82,13 +81,6 @@ agents:
       api_key: ${GOOGLE_API_KEY}
   ha_agent_id: conversation.groq  # HA conversation agent (Groq for fast inference)
 
-# Deprecated — use agents.general instead:
-# cloud:
-#   enabled: false
-#   endpoint: ""
-#   model: ""
-#   api_key: ""
-
 # --- Tools ---
 tools:
   ha:
@@ -102,10 +94,7 @@ tools:
       - script.*
       - climate.*
       - media_player.*
-  definitions: configs/tools.yaml   # copy from tools.yaml.example and customize
-  max_tool_rounds: 5
   tool_timeout_seconds: 10.0
-  total_timeout_seconds: 30.0
 
 sanitization:
   mode: block           # off, warn, block — controls PII detection for cloud queries

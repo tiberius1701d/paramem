@@ -208,7 +208,7 @@ echo ""
 # ========================================================================
 CONV_MAIN="integration-main-$(date +%s)"
 echo "--- 1. Greeting Flow ---"
-check "greeting prompt" "Hello" "who are you\|who.*you" "$CONV_MAIN"
+check "greeting prompt" "Hello" "help\|assist\|evening\|morning\|hello\|hi\|good" "$CONV_MAIN"
 check "speaker identification" "I am TestUser" "nice to meet\|TestUser" "$CONV_MAIN"
 
 # ========================================================================

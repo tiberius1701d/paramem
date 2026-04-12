@@ -133,6 +133,40 @@ def _get_quantization_config(model_config: ModelConfig) -> Optional[BitsAndBytes
     raise ValueError(f"Unknown quantization type: {model_config.quantization}")
 
 
+def _verify_device_placement(model: PreTrainedModel, model_config: ModelConfig) -> None:
+    """Verify model is on the expected device after loading.
+
+    When cpu_offload=False, ALL parameters must be on GPU.
+    When cpu_offload=True, a mix of GPU and CPU is expected.
+    Raises RuntimeError if placement violates the configuration.
+    """
+    devices = {str(p.device) for p in model.parameters()}
+    param_count = sum(p.numel() for p in model.parameters())
+
+    if model_config.cpu_offload:
+        logger.info(
+            "Model loaded: %s (%.1fM params, quantization=%s, devices=%s, cpu_offload=True)",
+            model_config.model_id,
+            param_count / 1e6,
+            model_config.quantization,
+            devices,
+        )
+    else:
+        cpu_params = sum(p.numel() for p in model.parameters() if "cpu" in str(p.device))
+        if cpu_params > 0:
+            raise RuntimeError(
+                f"Model {model_config.model_id} has {cpu_params / 1e6:.1f}M params on CPU "
+                f"but cpu_offload=False. This means the model does not fit in GPU VRAM. "
+                f"Either free GPU memory, enable cpu_offload, or use a smaller model."
+            )
+        logger.info(
+            "Model loaded: %s (%.1fM params, quantization=%s, device=cuda, cpu_offload=False)",
+            model_config.model_id,
+            param_count / 1e6,
+            model_config.quantization,
+        )
+
+
 def _apply_wsl2_async_load_workaround() -> None:
     """Disable Transformers' threaded weight loading if requested via env var.
 
@@ -163,15 +197,21 @@ def load_base_model(
 
     quantization_config = _get_quantization_config(model_config)
 
-    load_kwargs = {
-        "device_map": "auto",
-        "trust_remote_code": model_config.trust_remote_code,
-    }
-
     if model_config.cpu_offload:
-        load_kwargs["max_memory"] = {
-            0: model_config.max_memory_gpu,
-            "cpu": model_config.max_memory_cpu,
+        # Intentional partial offload (e.g. Gemma 2 9B on 8GB GPU)
+        load_kwargs = {
+            "device_map": "auto",
+            "max_memory": {
+                0: model_config.max_memory_gpu,
+                "cpu": model_config.max_memory_cpu,
+            },
+            "trust_remote_code": model_config.trust_remote_code,
+        }
+    else:
+        # Force all layers to GPU — fail loudly if it doesn't fit
+        load_kwargs = {
+            "device_map": {"": 0},
+            "trust_remote_code": model_config.trust_remote_code,
         }
 
     if quantization_config is not None:
@@ -193,13 +233,7 @@ def load_base_model(
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = model.config.eos_token_id
 
-    logger.info(
-        "Model loaded: %s (%.1fM params, quantization=%s, cpu_offload=%s)",
-        model_config.model_id,
-        sum(p.numel() for p in model.parameters()) / 1e6,
-        model_config.quantization,
-        model_config.cpu_offload,
-    )
+    _verify_device_placement(model, model_config)
 
     return model, tokenizer
 
@@ -230,18 +264,20 @@ def load_distillation_model(
     else:
         quantization_config = None
 
-    load_kwargs = {}
     if config.cpu_offload:
-        load_kwargs["max_memory"] = {
-            0: config.max_memory_gpu,
-            "cpu": config.max_memory_cpu,
+        load_kwargs_full = {
+            "device_map": "auto",
+            "max_memory": {
+                0: config.max_memory_gpu,
+                "cpu": config.max_memory_cpu,
+            },
+            "trust_remote_code": config.trust_remote_code,
         }
-
-    load_kwargs_full = {
-        "device_map": "auto",
-        "trust_remote_code": config.trust_remote_code,
-        **load_kwargs,
-    }
+    else:
+        load_kwargs_full = {
+            "device_map": {"": 0},
+            "trust_remote_code": config.trust_remote_code,
+        }
     if quantization_config is not None:
         # Compute dtype is already in the BnB config — don't pass torch_dtype
         # (redundant, and triggers Transformers 5.x deprecation + CUDA race)
@@ -370,6 +406,118 @@ def save_adapter(model: PeftModel, path: str | Path, adapter_name: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(path), selected_adapters=[adapter_name])
     logger.info("Adapter '%s' saved to %s", adapter_name, path)
+
+
+def atomic_save_adapter(model: PeftModel, target_dir: str | Path, adapter_name: str) -> None:
+    """Save adapter atomically: write to temp dir, fsync, rename.
+
+    The final `target_dir` contains the adapter files directly
+    (`adapter_config.json`, `adapter_model.safetensors`). PEFT's
+    `save_pretrained` nests files in a subdirectory named after the
+    adapter; this function flattens the result so `target_dir` matches
+    the convention used by `load_adapter` / `PeftModel.from_pretrained`.
+
+    Guarantees that either the new adapter or the old one is on disk —
+    never a torn state.
+    """
+    import os
+    import shutil
+
+    target_dir = Path(target_dir)
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = target_dir.parent / f"{target_dir.name}.tmp.{os.getpid()}"
+    backup_dir = target_dir.parent / f"{target_dir.name}.old"
+
+    # Clean up leftovers from prior crashes
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+
+    staging_dir.mkdir(parents=True)
+    # PEFT writes into staging_dir/{adapter_name}/adapter_*.*
+    model.save_pretrained(str(staging_dir), selected_adapters=[adapter_name])
+
+    nested = staging_dir / adapter_name
+    if not nested.exists():
+        # Some PEFT versions write directly to staging_dir when only one
+        # adapter is selected. Fall back to staging_dir itself.
+        nested = staging_dir
+
+    # fsync the nested directory to ensure metadata hits disk
+    try:
+        fd = os.open(str(nested), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # fsync on directory not supported on all filesystems; continue
+        pass
+
+    # Swap: existing → backup, nested → target, clean up
+    if target_dir.exists():
+        target_dir.rename(backup_dir)
+    nested.rename(target_dir)
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+    logger.info("Adapter '%s' atomically saved to %s", adapter_name, target_dir)
+
+
+def copy_adapter_weights(model: PeftModel, src: str, dst: str) -> None:
+    """Copy LoRA adapter weights (weight + bias) from src to dst in-memory.
+
+    Uses named_parameters suffix matching to find adapter-keyed tensors.
+    Preserves device placement — each parameter is copied in-place on its
+    existing device. No disk I/O.
+
+    Handles both `.{name}.weight` and `.{name}.bias` suffixes so configs
+    with `bias="lora_only"` or `bias="all"` are covered. Asserts that the
+    set of source and destination parameter keys match exactly — a mismatch
+    means src and dst adapters have different target_modules or configs
+    and the copy would be silently incomplete.
+    """
+    if src not in model.peft_config:
+        raise ValueError(f"Source adapter '{src}' not found")
+    if dst not in model.peft_config:
+        raise ValueError(f"Destination adapter '{dst}' not found")
+
+    def _index(adapter: str) -> dict:
+        out = {}
+        for name, p in model.named_parameters():
+            for suffix in (f".{adapter}.weight", f".{adapter}.bias"):
+                if name.endswith(suffix):
+                    # key: (base path without adapter name, suffix type)
+                    base = name[: -len(suffix)]
+                    out[(base, suffix[-len(".weight") :] if "weight" in suffix else ".bias")] = p
+                    break
+        return out
+
+    src_index = _index(src)
+    dst_index = _index(dst)
+
+    if not src_index or not dst_index:
+        raise RuntimeError(
+            f"No adapter-keyed parameters found for src='{src}' (count={len(src_index)}) "
+            f"or dst='{dst}' (count={len(dst_index)})"
+        )
+
+    if set(src_index.keys()) != set(dst_index.keys()):
+        missing_in_dst = set(src_index.keys()) - set(dst_index.keys())
+        missing_in_src = set(dst_index.keys()) - set(src_index.keys())
+        raise RuntimeError(
+            f"Adapter parameter sets differ between '{src}' and '{dst}' — cannot copy. "
+            f"Missing in dst: {len(missing_in_dst)}. Missing in src: {len(missing_in_src)}. "
+            f"Adapters likely have different target_modules or bias configs."
+        )
+
+    with torch.no_grad():
+        for key, src_p in src_index.items():
+            dst_index[key].data.copy_(src_p.data)
+
+    logger.debug("Copied %d tensors from adapter '%s' to '%s'", len(src_index), src, dst)
 
 
 def get_adapter_info(model: PeftModel) -> dict:
