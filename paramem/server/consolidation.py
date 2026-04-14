@@ -77,6 +77,7 @@ def run_consolidation(
     session_buffer: SessionBuffer,
     loop: ConsolidationLoop | None = None,
     ha_context: dict | None = None,
+    speaker_store=None,
 ) -> dict:
     """Run consolidation on all pending sessions.
 
@@ -123,15 +124,23 @@ def run_consolidation(
             logger.warning("Skipping session %s: no speaker_id", session_id)
             continue
 
+        speaker_name = None
+        if speaker_store is not None:
+            try:
+                speaker_name = speaker_store.get_name(session_speaker_id)
+            except Exception as e:
+                logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
         episodic_qa, procedural_rels = loop.extract_session(
             transcript,
             session_id,
             speaker_id=session_speaker_id,
+            speaker_name=speaker_name,
             ha_context=ha_context,
             stt_correction=config.consolidation.extraction_stt_correction,
             ha_validation=config.consolidation.extraction_ha_validation,
             noise_filter=config.consolidation.extraction_noise_filter,
             noise_filter_model=config.consolidation.extraction_noise_filter_model,
+            noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
         )
 
         # Increment key session counts while last_seen is still correct

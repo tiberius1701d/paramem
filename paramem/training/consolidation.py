@@ -284,11 +284,13 @@ class ConsolidationLoop:
         session_transcript: str,
         session_id: str,
         speaker_id: str = "",
+        speaker_name: str | None = None,
         ha_context: dict | None = None,
         stt_correction: bool = True,
         ha_validation: bool = True,
         noise_filter: str = "",
         noise_filter_model: str = "claude-sonnet-4-6",
+        noise_filter_endpoint: str | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """Extract and generate QA pairs from a session without training.
 
@@ -300,7 +302,9 @@ class ConsolidationLoop:
         # --- EXTRACT ---
         if self.distillation_pipeline:
             self.distillation_pipeline.load()
-            session_graph = self.distillation_pipeline.extract_graph(session_transcript, session_id)
+            session_graph = self.distillation_pipeline.extract_graph(
+                session_transcript, session_id, speaker_name=speaker_name
+            )
         else:
             self._disable_gradient_checkpointing()
             from peft import PeftModel as _PeftModel
@@ -314,6 +318,8 @@ class ConsolidationLoop:
                 ha_validation=ha_validation,
                 noise_filter=noise_filter,
                 noise_filter_model=noise_filter_model,
+                noise_filter_endpoint=noise_filter_endpoint,
+                speaker_name=speaker_name,
             )
             if isinstance(self.model, _PeftModel):
                 with self.model.disable_adapter():
@@ -730,6 +736,7 @@ class ConsolidationLoop:
         session_transcript: str,
         session_id: str,
         speaker_id: str = "",
+        speaker_name: str | None = None,
     ) -> CycleResult:
         """Run one consolidation cycle for a new session.
 
@@ -760,6 +767,7 @@ class ConsolidationLoop:
             session_graph = self.distillation_pipeline.extract_graph(
                 session_transcript,
                 session_id,
+                speaker_name=speaker_name,
             )
         else:
             # Disable adapters for extraction (use base model reasoning)
@@ -776,6 +784,7 @@ class ConsolidationLoop:
                         temperature=self.extraction_temperature,
                         max_tokens=self.extraction_max_tokens,
                         prompts_dir=self.prompts_dir,
+                        speaker_name=speaker_name,
                     )
             else:
                 session_graph = extract_graph(
@@ -786,6 +795,7 @@ class ConsolidationLoop:
                     temperature=self.extraction_temperature,
                     max_tokens=self.extraction_max_tokens,
                     prompts_dir=self.prompts_dir,
+                    speaker_name=speaker_name,
                 )
 
         result.entities_extracted = len(session_graph.entities)

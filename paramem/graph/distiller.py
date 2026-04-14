@@ -266,8 +266,13 @@ class DistillationPipeline:
             repetition_penalty=self.config.repetition_penalty,
         )
 
-    def extract_graph(self, transcript: str, session_id: str):
-        """Use distillation model for graph extraction."""
+    def extract_graph(self, transcript: str, session_id: str, speaker_name: str | None = None):
+        """Use distillation model for graph extraction.
+
+        `speaker_name`: known speaker identity (voice enrollment, metadata,
+        etc.). When provided, injected into the extraction prompt so the
+        model uses the real name as subject instead of a generic placeholder.
+        """
         if not self.is_loaded():
             self.load()
         from paramem.graph.extractor import extract_graph
@@ -278,4 +283,5 @@ class DistillationPipeline:
             transcript,
             session_id,
             temperature=self.config.temperature,
+            speaker_name=speaker_name,
         )

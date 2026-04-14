@@ -231,7 +231,10 @@ def load_base_model(
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = model.config.eos_token_id
+        # Llama 3.1 declares multiple EOS tokens (turn-end markers); take the
+        # first since pad_token_id must be a single int.
+        eos = model.config.eos_token_id
+        model.config.pad_token_id = eos[0] if isinstance(eos, list) else eos
 
     _verify_device_placement(model, model_config)
 
@@ -297,7 +300,10 @@ def load_distillation_model(
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = model.config.eos_token_id
+        # Llama 3.1 declares multiple EOS tokens (turn-end markers); take the
+        # first since pad_token_id must be a single int.
+        eos = model.config.eos_token_id
+        model.config.pad_token_id = eos[0] if isinstance(eos, list) else eos
 
     logger.info(
         "Distillation model loaded: %s (%.1fM params, quantization=%s)",

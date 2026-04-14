@@ -398,6 +398,17 @@ async def lifespan(app: FastAPI):
         ha_graph=ha_graph,
     )
 
+    # Global observed-language tracker — records STT-detected languages with
+    # high confidence, publishes to HA as input_text.voice_observed_languages
+    # so the conversation agent can use it as context when interpreting
+    # (potentially mangled) transcripts from CPU fallback STT.
+    from paramem.server.language_tracker import LanguageTracker
+
+    _state["language_tracker"] = LanguageTracker(
+        store_path=config.paths.data / "observed_languages.json",
+        ha_client=_state.get("ha_client"),
+    )
+
     # Start consolidation scheduler if configured
     if config.consolidation.schedule:
         _state["scheduler_task"] = asyncio.create_task(
@@ -562,6 +573,9 @@ async def chat(request: ChatRequest):
     detected_language_prob = lang_detection["probability"] if lang_detection else 0.0
     if detected_language:
         logger.info("Detected language: %s (prob=%.2f)", detected_language, detected_language_prob)
+        tracker = _state.get("language_tracker")
+        if tracker is not None:
+            tracker.record(detected_language, detected_language_prob)
 
     # Discard embeddings from short utterances — pyannote needs enough voice
     # data for a stable print. Short commands produce noisy, unreliable embeddings.
