@@ -56,7 +56,7 @@ run_test() {
     fi
 
     # Dynamic GPU cooldown — returns instantly if already cool
-    wait_for_cooldown 45
+    wait_for_cooldown
 
     # Per-test disk check
     USED_GB=$(df / --output=used -BG | tail -1 | tr -d ' G')

@@ -84,3 +84,6 @@ ha_jarvis_tools.yaml
 ha_music_control_script.yaml
 ha_get_weather_worldwide.yaml
 ha_automations/
+
+# Claude Code local settings
+.claude/
