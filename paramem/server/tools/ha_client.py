@@ -110,6 +110,24 @@ class HAClient:
             logger.error("HA connection error: %s", e)
             return None
 
+    def set_state(self, entity_id: str, state: str) -> bool:
+        """POST a state to HA via /api/states/<entity_id>.
+
+        Used for publishing ParaMem context (e.g. observed languages) so HA's
+        conversation-agent prompt template can read it via `states('<entity_id>')`.
+        Returns True on success, False on network/HTTP error (non-fatal).
+        """
+        try:
+            resp = self._get_client().post(
+                f"/api/states/{entity_id}",
+                json={"state": state},
+            )
+            resp.raise_for_status()
+            return True
+        except (httpx.HTTPError, httpx.RequestError) as e:
+            logger.warning("HA set_state %s failed: %s", entity_id, e)
+            return False
+
     def load_entity_map(self) -> int:
         """Fetch all HA entity states and build friendly_name → entity_id map.
 

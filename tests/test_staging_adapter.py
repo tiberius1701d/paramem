@@ -496,6 +496,9 @@ class TestMultiJobSequencing:
             committed_to.append(job.adapter_name)
 
         bt._train_adapter = fake_train
+        # Stub thermal cooldown — it reads real GPU temp and sleeps, so the
+        # test would stall on a warm GPU. Not the subject under test.
+        bt._cooldown_between_jobs = lambda: None
         bt._is_training = True
 
         jobs = [
