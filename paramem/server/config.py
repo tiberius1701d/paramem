@@ -71,6 +71,27 @@ MODEL_REGISTRY = {
         trust_remote_code=True,
         cpu_offload=False,
     ),
+    "qwen": ModelConfig(
+        model_id="Qwen/Qwen2.5-7B-Instruct",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        trust_remote_code=True,
+        cpu_offload=False,
+    ),
+    "ministral": ModelConfig(
+        model_id="mistralai/Ministral-8B-Instruct-2410",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        trust_remote_code=True,
+        cpu_offload=False,
+    ),
+    "llama": ModelConfig(
+        model_id="meta-llama/Llama-3.1-8B-Instruct",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        trust_remote_code=True,
+        cpu_offload=False,
+    ),
     "gemma4": ModelConfig(
         model_id="principled-intelligence/gemma-4-E4B-it-text-only",
         quantization="nf4",
@@ -202,6 +223,7 @@ class ConsolidationScheduleConfig:
     extraction_ha_validation: bool = True  # validate locations against HA home context
     extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)
     extraction_noise_filter_model: str = "claude-sonnet-4-6"  # model for noise filtering
+    extraction_noise_filter_endpoint: str = ""  # custom endpoint for OpenAI-compatible providers
     training_interval_hours: int = 2  # background training interval (0 = disabled)
     training_temp_limit: int = 0  # GPU temp ceiling for background training (0 = disabled)
     training_temp_check_interval: int = 5  # check temp every N training steps
@@ -290,12 +312,29 @@ class TTSConfig:
         return ISO_LANGUAGE_NAMES.get(code, code)
 
 
+_ATTENTION_TARGETS = ["q_proj", "v_proj", "k_proj", "o_proj"]
+_ATTENTION_PLUS_MLP_TARGETS = [
+    "q_proj",
+    "v_proj",
+    "k_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+
 @dataclass
 class ServerAdapterConfig:
     enabled: bool = True
     rank: int = 8
     alpha: int = 16
     learning_rate: float = 1e-4
+    # Default: attention-only. Episodic + semantic adapters route via attention
+    # (indexed-key retrieval is routing, not representation). Procedural
+    # overrides to include MLP layers for representational imprinting of
+    # persistent preferences/habits — see `ServerAdaptersConfig.procedural`.
+    target_modules: list[str] = field(default_factory=lambda: list(_ATTENTION_TARGETS))
 
 
 @dataclass
@@ -308,7 +347,14 @@ class ServerAdaptersConfig:
     )
     procedural: ServerAdapterConfig = field(
         default_factory=lambda: ServerAdapterConfig(
-            enabled=False, rank=8, alpha=16, learning_rate=5e-5
+            enabled=False,
+            rank=8,
+            alpha=16,
+            learning_rate=5e-5,
+            # MLP targeting: behavioral patterns (style, formatting, prefs) live
+            # in the model's feed-forward layers; attention-only would limit
+            # procedural learning to routing, not representational change.
+            target_modules=list(_ATTENTION_PLUS_MLP_TARGETS),
         )
     )
 
@@ -366,12 +412,16 @@ class ServerConfig:
         return MODEL_REGISTRY[self.model_name]
 
     def _make_adapter_config(self, sac: ServerAdapterConfig) -> AdapterConfig:
-        """Build an AdapterConfig with validated defaults (dropout=0.0)."""
+        """Build an AdapterConfig with validated defaults (dropout=0.0).
+
+        Per-adapter `target_modules` are honoured — procedural targets MLP in
+        addition to attention, episodic/semantic target attention only.
+        """
         return AdapterConfig(
             rank=sac.rank,
             alpha=sac.alpha,
             learning_rate=sac.learning_rate,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            target_modules=list(sac.target_modules),
             dropout=0.0,
         )
 

@@ -69,9 +69,9 @@ All experiments run on a single RTX 5070 (8GB VRAM) using QLoRA 4-bit quantizati
              └───────────────────┘
 ```
 
-**Episodic adapter** holds recent facts with indexed keys for per-fact retrieval. **Semantic adapter** holds promoted, well-reinforced knowledge. **Procedural adapter** captures behavioral patterns and preferences (targets MLP layers in addition to attention). The knowledge graph is a transient processing layer — like the visual cortex, it structures input but doesn't store long-term memory. The adapters are the memory.
+**Episodic adapter** holds recent facts with indexed keys for per-fact retrieval. **Semantic adapter** holds promoted, well-reinforced knowledge. **Procedural adapter** captures behavioral patterns and preferences (targets MLP layers in addition to attention for representational imprinting of persistent habits). Episodic + semantic target attention only — indexed-key retrieval is a routing problem. The knowledge graph is a transient processing layer — like the visual cortex, it structures input but doesn't store long-term memory. The adapters are the memory.
 
-Extraction uses a **multi-pass pipeline**: LLM-based graph extraction, STT correction (Levenshtein matching against assistant response tokens), HA context validation (location facts checked against Home Assistant zones/areas), and an optional SOTA noise filter (anonymize locally, filter via cloud, de-anonymize). All filters are configurable in `server.yaml` under `consolidation:` with graceful fallback.
+Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/extractor.py`): local LLM extraction with speaker-name injection → anonymization (real → placeholder mapping) → leak guard + repair → SOTA enrichment with brace-binding protocol (cloud sees only placeholders, new entities must round-trip via `{Prefix_N}` tokens grounded in the transcript) → de-anonymization with residual-placeholder sweep → plausibility filter → transcript-grounding gate (drops SOTA world-knowledge inferences). A fallback path runs local plausibility + grounding on raw extraction if the primary chain empties out. All stages fall forward and are configurable under `consolidation:` in `server.yaml`.
 
 **Background training** runs on a configurable interval (default: every 2 hours). The `BackgroundTrainer` pauses at step boundaries for inference requests and switches the model between eval/train mode automatically. A **simulation mode** (`consolidation.mode: simulate`) runs extraction only, saving results to a debug directory without training.
 
@@ -228,7 +228,7 @@ server:
   port: 8420
   reclaim_interval_minutes: 10
 
-model: mistral          # mistral | gemma | qwen3b
+model: mistral          # mistral | gemma | qwen3b | qwen | ministral | llama | gemma4
 
 paths:
   data: data/ha
@@ -245,25 +245,26 @@ consolidation:
   schedule: "02:00"     # daily at 2am (empty = manual only)
 
 agents:
-  general:
+  sota:                 # SOTA cloud fallback for reasoning queries
     enabled: true
-    provider: groq
-    model: llama-3.3-70b-versatile
-    api_key: ${GROQ_API_KEY}
-  ha_agent_id: conversation.groq  # HA conversation agent for escalation
+    provider: anthropic
+    model: claude-sonnet-4-6
+    api_key: ${ANTHROPIC_API_KEY}
+  ha_agent_id: conversation.groq  # HA conversation agent for tool execution
 
 tools:
   ha:
-    url: http://your-ha-instance:8123
+    url: ${HA_URL}
     token: ${HA_TOKEN}
     auto_discover: true
+    supported_languages: [en, de, fr, es]
     allowlist:
       - light.*
       - switch.*
       - script.*
       - climate.*
       - media_player.*
-  definitions: configs/tools.yaml
+  tool_timeout_seconds: 10        # allows for VPN latency
 ```
 
 ### Architecture

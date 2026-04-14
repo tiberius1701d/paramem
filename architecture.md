@@ -161,9 +161,17 @@ Key insight: reconstruction does not need to be perfect. Facts that matter get r
 
 This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs) which contradicted the core architectural invariant: knowledge lives in weights, not in files.
 
-### AD-11: Procedural Adapter Targets MLP Layers (Phase 4, implemented F5.6)
+### AD-11: Procedural Adapter Targets MLP Layers (Phase 4, live in server deployment)
 
-The procedural adapter (rank 12) targets both attention layers (q/k/v/o_proj) and MLP layers (gate/up/down_proj). This differs from episodic/semantic adapters which target attention only. Rationale: behavioral patterns (style, formatting) are more closely tied to the model's feed-forward computations than to attention patterns. Configured in default.yaml. Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
+The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP layers (`gate/up/down_proj`). Episodic and semantic adapters target attention only.
+
+**Rationale.** Attention-only tunes *routing* — which context to attend to at inference time. This is what indexed-key retrieval needs: when the prompt contains `key graphN`, route to the stored QA. Facts stored this way are retrievable but the model's *representation* of them is unchanged. MLP targeting tunes *representation* — the persistent transformation applied to each token's hidden state. The interpretability literature locates factual associations and stylistic patterns predominantly in MLP feed-forward layers. Preferences and habits are persistent behavioral shifts, not keyed lookups, so they need MLP imprinting to take.
+
+**Implementation.** `paramem/server/config.py::ServerAdapterConfig` carries a `target_modules` field per adapter. `_make_adapter_config` honours it — no more hardcoded list. `ServerAdaptersConfig` defaults procedural to `["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]` (attention + MLP). Overridable in `server.yaml`.
+
+**Cost.** Procedural-only: ~3× more trainable params (~8 M → ~25 M at rank 8), ~30 MB → ~95 MB adapter file on disk, ~300–600 MB extra VRAM during training. Fits within the 8 GB budget alongside Mistral 7B NF4 + STT/TTS. Episodic and semantic unchanged.
+
+Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
 
 ### AD-12: Swappable Extraction Backend (Phase 4)
 
@@ -205,16 +213,22 @@ Key design decisions:
 
 Validated: 10-cycle smoke test, episodic 6/6 (100%), semantic 6/6 (100%), 49.9 min total.
 
-### AD-16: Multi-Pass Extraction Pipeline (Phase 5)
+### AD-16: Multi-Stage Privacy-Aware Extraction Pipeline (Phase 5)
 
-Graph extraction runs through multiple configurable passes to improve quality:
+Graph extraction is a staged chain built around a cloud-boundary privacy envelope.
+The local model owns everything that touches real user data; the SOTA cloud model
+sees only anonymized placeholders. Every stage falls forward — a failure at stage
+N keeps the predecessor's output and continues.
 
-1. **LLM extraction:** Mistral generates factual triples (`extraction.txt` prompt) and preference triples (`extraction_procedural.txt` prompt)
-2. **STT correction:** Levenshtein matching of entity names against assistant response tokens, correcting speech-to-text errors
-3. **HA context validation:** Location facts checked against Home Assistant `/api/config` (home location, zones, areas)
-4. **SOTA noise filter:** Anonymize entities via local model, send to Claude for noise filtering, de-anonymize results
+1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. Speaker-name injection pins the real speaker as canonical subject.
+2. **Anonymize** (`configs/prompts/anonymization.txt`): local model produces `{real → placeholder}` mapping + anonymized transcript.
+3. **Leak guard + repair** (`verify_anonymization_completeness`, `_repair_anonymization_leaks`): PII-scoped check with optional spaCy NER cross-check; missed names extend the mapping, hallucinated names drop referencing triples.
+4. **SOTA enrichment with brace-binding protocol** (`configs/prompts/sota_enrichment.txt`, `_extract_sota_bindings`): SOTA may introduce new entities as braced `{Prefix_N}` tokens that must appear in both facts and the updated transcript. Token-level diff recovers real-span ↔ placeholder bindings.
+5. **De-anonymize + residual sweep** (`_strip_residual_placeholders`): reverse-map all known placeholders; drop any fact still containing a placeholder-shaped token.
+6. **Plausibility** (`configs/prompts/sota_plausibility.txt` or `_local_plausibility_filter`): drops self-loops, tautologies, role leaks, conversation events.
+7. **Transcript-grounding gate** (`_drop_ungrounded_facts`): every surviving fact's subject and object must either be a known real-name or have every significant token appear in the original transcript. Drops SOTA world-knowledge inferences.
 
-All filters are configurable in `server.yaml` under `consolidation:` with graceful fallback — each pass is optional and fails open.
+A **fallback path** (`_fallback_plausibility_on_raw`) runs local plausibility + grounding on the raw extraction when the primary chain empties out. Per-stage diagnostics (`SessionGraph.diagnostics`) record raw outputs, transcript round-trip, and dropped facts for audit.
 
 ### AD-17: Background Training with Inference Pause (Phase 5)
 
