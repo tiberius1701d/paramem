@@ -1,5 +1,13 @@
 # F5.2 Spec: Cloud Escalation and Tool Use
 
+> **Status (2026-04):** Sections FR-3 through FR-6 describe the original
+> ParaMem-side tool executor and `tools.yaml` manual config. That path was
+> removed in phase 5.2e — HA's conversation agent is now the single tool
+> execution channel. The implemented routing is the dual-graph tri-path router
+> in `paramem/server/router.py` (see `ha_assist_pipeline.md` for the live
+> design). Config schema was renamed `agents.general` → `agents.sota`
+> (`CloudAgentConfig`). The sections below are retained for historical context.
+
 ## Problem Statement
 
 The ParaMem server currently runs Mistral 7B locally for all queries. This means:
@@ -152,45 +160,47 @@ Two sources for tool definitions, merged at startup:
 - Sensitive domains (`alarm_control_panel`, `lock`, `person`, `device_tracker`)
   are excluded even if listed in the allowlist — require explicit override
 
-**Manual configuration:**
-- `tools.yaml` for tools not discoverable from HA (cloud-native tools,
-  custom tool definitions, overrides)
-- Supports the same schema as HA conversation agent tool specs
-
-Auto-discovered tools can be overridden or disabled in `tools.yaml`.
+**Superseded:** The earlier `tools.yaml` manual configuration path has been
+removed. HA's conversation agent is now the single tool-execution path, so tool
+definitions and entity resolution live entirely on the HA side. ParaMem no
+longer maintains a tool registry or manual override file.
 
 ### FR-7: Configuration
 
 ```yaml
+# Current schema (see configs/server.yaml for the canonical example).
 agents:
-  memory:
-    provider: local
-    model: mistral-7b
-  general:
-    provider: groq            # openai, anthropic, google, groq, ...
-    model: llama-4-scout
-    api_key: ${GROQ_API_KEY}  # env var reference (required for secrets)
-    endpoint: ""              # optional custom endpoint
+  sota:
+    enabled: true
+    provider: anthropic         # openai | anthropic | google
+    model: claude-sonnet-4-6
+    api_key: ${ANTHROPIC_API_KEY}
+    endpoint: ""                # optional custom endpoint
+  sota_providers:               # registry of alternates for direct routing
+    anthropic: {...}
+    openai: {...}
+    google: {...}
+  ha_agent_id: conversation.groq  # HA conversation agent for tool use
 
 tools:
   ha:
-    url: http://localhost:8123
-    token: ${HA_TOKEN}        # env var only — never inline
+    url: ${HA_URL}
+    token: ${HA_TOKEN}          # env var only — never inline
     auto_discover: true
-    allowlist:                # default-deny: omit = no tools exposed
-      - script.music_control_ma
-      - script.perform_tavily_search
-      - script.perform_google_search
-      - script.get_weather_worldwide
+    supported_languages: [en, de, fr, es]
+    allowlist:
       - light.*
+      - switch.*
+      - script.*
+      - climate.*
       - media_player.*
-  cloud_native: []            # tools handled by cloud model directly
-  max_tool_rounds: 5
-  tool_timeout_seconds: 3     # per-tool execution timeout
-  total_timeout_seconds: 8    # total agentic loop timeout
-
-  definitions: tools.yaml     # additional/override tool definitions
+  tool_timeout_seconds: 10      # HA call timeout (VPN latency budget)
 ```
+
+**Note:** The earlier `tools.yaml` / `tool_registry` / `tool_executor` /
+`cloud_native` scheme has been removed. Tool execution is HA-only — the HA
+conversation agent owns all tool definitions and entity resolution. ParaMem
+does not maintain a separate tool registry.
 
 **Config loader requirement:** `load_server_config` must implement env var
 interpolation (`${VAR_NAME}` → `os.environ["VAR_NAME"]`). The existing

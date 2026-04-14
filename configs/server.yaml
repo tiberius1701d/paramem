@@ -120,7 +120,7 @@ speaker:
 stt:
   enabled: true              # local Whisper STT via Wyoming protocol
   model: distil-large-v3     # GPU model: distil-large-v3, large-v3, etc.
-  cpu_fallback_model: distil-small.en  # CPU model for cloud-only mode (RTF 0.44x)
+  cpu_fallback_model: small  # multilingual CPU model for cloud-only mode (distil-* variants are English-only)
   device: cuda               # cuda, cpu, auto
   compute_type: int8         # int8, float16, float32
   port: 10300                # Wyoming STT listener port

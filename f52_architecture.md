@@ -1,5 +1,11 @@
 # F5.2 Architecture: Cloud Escalation and Tool Use
 
+> **Status (2026-04):** The `paramem/server/tools/` subpackage (tool registry,
+> executor, agentic loop) referenced in AD-F52-5 has been removed. Tool
+> execution runs exclusively through HA's conversation agent via WebSocket
+> (`conversation.process`). `CloudConfig` → `CloudAgentConfig`, `agents.general`
+> → `agents.sota`. See `ha_assist_pipeline.md` for the live architecture.
+
 ## Chosen Tech Stack
 
 | Component | Choice | Reasoning |

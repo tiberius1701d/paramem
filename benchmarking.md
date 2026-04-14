@@ -1625,6 +1625,10 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E1230 | 100% | 93.0% | 74.4% | 8.9% | 41.1% | 10.8% | 36.4% | 0.004 |
 | E1260 | 100% | 93.0% | 72.1% | 10.3% | 48.3% | 8.4% | 43.4% | 0.004 |
 | E1290 | 100% | 93.0% | 76.7% | 12.5% | 44.4% | 10.3% | 43.4% | 0.005 |
+| E1320 | 100% | 93.0% | 71.3% | 11.1% | 47.8% |  5.4% | 46.5% | 0.005 |
+| E1350 | 100% | 93.0% | 69.0% |  9.4% | 40.6% |  5.4% | 44.2% | 0.005 |
+| E1380 | 100% | 93.0% | 68.2% |  9.4% | 35.8% |  7.9% | 45.0% | 0.002 |
+| E1410 | 100% | 93.0% | 69.8% |  6.9% | 41.9% | 11.3% | 46.5% | 0.006 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1654,8 +1658,22 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E1230 | 32/360 | 8/35 (22%) | 24/325 (7%) | 0 |
 | E1260 | 37/360 | 4/35 (11%) | 33/325 (10%) | 0 |
 | E1290 | 45/360 | 11/35 (31%) | 34/325 (10%) | 0 |
+| E1320 | 40/360 |  3/35 (9%)  | 37/325 (11%) | 0 |
+| E1350 | 34/360 |  1/35 (3%)  | 33/325 (10%) | 0 |
+| E1380 | 34/360 |  5/35 (14%) | 29/325 (9%)  | 0 |
+| E1410 | 25/360 |  5/35 (14%) | 20/325 (6%)  | 0 |
 
-### Key findings (E1290, 43 cycles) — PAUSED 2026-04-12
+### Key findings (E1410, 47 cycles) — PAUSED 2026-04-14
+
+Resume E1290→E1410 (4 additional cycles) reinforces the pattern: no grokking
+signal. Rephrased dropped slightly from 76.7% → 69.8%, 3-hop ended at its
+lowest recorded value (6.9%), full-chain count remains 0 across all 47 cycles.
+Keyed/direct fully stable at 100%/93%. Shortcut oscillates 36-48%. The earlier
+finding stands: shortcut consistently exceeds 3-hop, no compositional
+crossover emerging. Run paused at E1410 — extending further is unlikely to
+produce a phase transition.
+
+### Prior findings (E1290, 43 cycles) — superseded by E1410
 
 **1. Shortcut > 3-hop at all checkpoints — no compositional crossover.**
 The relation shortcut control consistently exceeds 3-hop accuracy across all
@@ -1929,6 +1947,78 @@ base model, due to `prepare_inputs_for_generation` patching and dtype
 casting path differences in the PeftModel wrapper. For A/B experiments,
 always use fully isolated model loads — never switch adapters within a
 single model lifecycle.
+
+---
+
+## 6-Model Extraction Comparison (2026-04-14)
+
+**Script:** `scripts/compare_extraction.py`
+**Session set:** `data/ha/debug/extraction_eval_perltqa_top5` — 5 curated
+PerLTQA sessions (Bao Jun quantum, Cai Xiuying finance, Ruan Wenting sports,
+Ye Jie cultural psychology, Ye Jie community fitness).
+**Models (extractors + own anonymizers):** Claude (cloud), Mistral 7B,
+Ministral 8B, Llama 3.1 8B, Qwen 2.5 7B, Gemma 4 E4B. Validator (SOTA
+enricher + plausibility judge): Claude.
+**Full privacy-aware pipeline active:** extract → anonymize → leak guard +
+repair → SOTA enrichment with brace-binding protocol → de-anonymize +
+residual sweep → plausibility filter → transcript-grounding gate → fallback
+on all-dropped.
+
+### Final totals
+
+| Model | Extracted | Final | Stage failures | Notes |
+|-------|-----------|-------|----------------|-------|
+| Claude | 14 | **42** | 0 | Cloud extractor; best enrichment. Binding recovery captured 6 + 4 + 2 new entities across sessions. |
+| Mistral 7B | 21 | **45** | 0 | Best total. Multi-subject enrichment from "we/our" pronouns legitimately expanded single-subject raw facts. |
+| Ministral 8B | 6 | **7** | 0 | Sparse extractor; clean output. |
+| Llama 3.1 8B | 17 | **9** | anon=3 | Can't emit valid anonymization JSON on 3/5 sessions; fallback path runs local plausibility on raw extraction. |
+| Qwen 2.5 7B | 25 | **20** | 0 | Grounding gate correctly dropped 7 `Speaker` placeholder triples (local-extractor hallucination of first-person speaker). |
+| Gemma 4 E4B | 13 | **22** | plaus=1 | Residual-leak path dropped zero referencing triples after repair → new fact-level filter kept the session alive (previously whole-session drop). One plausibility call hit a transient Anthropic `APIConnectionError` — pipeline fell through cleanly. |
+| **Totals** | **96** | **145** | — | — |
+
+### Pipeline-stage observations
+
+- **Grounding gate activity:** 14 triples dropped across models as
+  ungrounded inferences (Qwen Speaker ×7, Mistral attribute-label
+  summarizations ×5, Ministral ×1, Llama ×1). No world-knowledge leaks
+  surfaced from these PerLTQA sessions (no CIA-from-Langley-style triggers),
+  but the gate is live and catches the class.
+- **SOTA bindings captured** across the sweep: 14+ via transcript-diff
+  protocol (`{Event_1}`/`{Topic_1}` style reifications grounded back to real
+  spans like "community fitness event" / "benefits of regular exercise").
+- **Fallback-path triggers:** Llama 3×, Gemma 4 1× residual-leak. All
+  sessions produced final output (no zero-fact sessions when extraction
+  had content).
+- **Round-trip diagnostics** (`transcripts.{original, anonymized,
+  sota_updated, recovered, length_ratio}`) captured for every session;
+  enables per-model drift inspection.
+
+### Regressions caught during iteration
+
+Two pipeline bugs were found via this sweep and fixed mid-iteration:
+
+1. **Enrichment prompt contract drift.** An edit to the enrichment prompt
+   told SOTA to brace ALL placeholders (existing + new). Claude complied;
+   the binding-diff then recorded junk self-referential entries
+   (`Person_2 → Person_2`) that corrupted the reverse mapping. Fix: prompt
+   reverted to "leave existing bare placeholders as-is, only brace new
+   entities" + defensive guard in `_extract_sota_bindings` to reject
+   placeholder-shaped spans.
+2. **Fallback-path known_names included hallucinations.** The
+   `_fallback_plausibility_on_raw` gate used `extracted.entities` as
+   trusted names, which included Qwen's hallucinated `Speaker`. Fix:
+   `known_names=set()` in fallback — every entity must be transcript-
+   grounded.
+
+### Infrastructure lessons
+
+- Anthropic API transients: `APIConnectionError` with underlying
+  `ConnectError: Network is unreachable` is a WSL2 virtual-adapter blip,
+  not an Anthropic server issue. The pipeline fail-forward handles it
+  cleanly (affected stage drops to the predecessor's output). Error
+  logging was upgraded to surface `e.__cause__` so future incidents
+  diagnose at a glance rather than showing the SDK's generic "Connection
+  error." string.
 
 ---
 
