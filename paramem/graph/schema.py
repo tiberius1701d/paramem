@@ -38,3 +38,14 @@ class SessionGraph(BaseModel):
     entities: list[Entity] = Field(default_factory=list)
     relations: list[Relation] = Field(default_factory=list)
     summary: str = Field(default="", description="One-line session summary")
+    diagnostics: dict = Field(
+        default_factory=dict,
+        description=(
+            "Pipeline audit trail — populated by extractor passes. Keys include: "
+            "sota_raw_response, residual_dropped_facts, sota_updated_transcript. "
+            "Only read by consolidation when dumping debug artefacts; never "
+            "serialized to the cumulative graph.json or adapter weights. Always "
+            "populated — callers who need to discard it should `model_copy` with "
+            "`diagnostics={}` before persisting."
+        ),
+    )

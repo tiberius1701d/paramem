@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,8 +14,27 @@ _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "configs" 
 
 _DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Output valid JSON only."
 
+
+def build_speaker_context(speaker_name: str | None) -> str:
+    """Single source of truth for the extraction-prompt speaker directive.
+
+    Empty string when the speaker cannot be identified, leaving the generic
+    "Speaker" fallback in the prompt examples. When known, pins the real
+    name as the canonical subject across every extracted fact.
+    """
+    if not speaker_name:
+        return ""
+    # Leading + trailing newlines form a visually-separated block in the prompt;
+    # when speaker is unknown, the slot collapses to empty and no blank remains.
+    return (
+        f"\nThe current speaker is {speaker_name}. Use the exact string "
+        f"'{speaker_name}' as the subject of every fact about the speaker; "
+        f"do NOT use 'Speaker', 'User', 'I', or any other placeholder.\n"
+    )
+
+
 _DEFAULT_EXTRACTION_PROMPT = """\
-Extract all entities and relations from this conversation transcript.
+Extract all entities and relations from this conversation transcript.{speaker_context}
 
 Rules:
 - Entity types: person, place, organization, concept, preference, event
@@ -164,6 +184,8 @@ def extract_graph(
     ha_validation: bool = True,
     noise_filter: str = "",
     noise_filter_model: str = "claude-sonnet-4-6",
+    noise_filter_endpoint: str | None = None,
+    speaker_name: str | None = None,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -185,7 +207,7 @@ def extract_graph(
         noise_filter: SOTA provider for noise filtering ("" = disabled).
     """
     raw_output = _generate_extraction(
-        model, tokenizer, transcript, temperature, max_tokens, prompts_dir
+        model, tokenizer, transcript, temperature, max_tokens, prompts_dir, speaker_name
     )
     logger.debug("Raw extraction output: %s", raw_output[:500])
 
@@ -212,15 +234,16 @@ def extract_graph(
     if ha_validation and ha_context:
         graph = _validate_with_ha_context(graph, ha_context)
 
-    # Pass 4: SOTA noise filter (anonymize → cloud filter → de-anonymize)
+    # Pass 4: SOTA pipeline (anonymize → enrich → plausibility filter → de-anonymize)
     if validate and noise_filter and graph.relations:
-        graph = _sota_noise_filter(
+        graph = _sota_pipeline(
             graph,
             transcript,
             model,
             tokenizer,
             provider=noise_filter,
             filter_model=noise_filter_model,
+            endpoint=noise_filter_endpoint,
         )
 
     return graph
@@ -233,15 +256,26 @@ def _generate_extraction(
     temperature: float,
     max_tokens: int,
     prompts_dir: str | Path | None = None,
+    speaker_name: str | None = None,
 ) -> str:
-    """Generate graph extraction output from the model. Called once."""
+    """Generate graph extraction output from the model. Called once.
+
+    When `speaker_name` is provided (e.g. from voice enrollment in production,
+    or from session metadata in the test harness), inject it into the prompt
+    so the model uses the real name as subject instead of guessing or emitting
+    a placeholder like "Speaker".
+    """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
     system, prompt = load_extraction_prompts(prompts_dir)
+    speaker_context = build_speaker_context(speaker_name)
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": prompt.format(transcript=transcript)},
+        {
+            "role": "user",
+            "content": prompt.format(transcript=transcript, speaker_context=speaker_context),
+        },
     ]
     formatted = tokenizer.apply_chat_template(
         adapt_messages(messages, tokenizer), tokenize=False, add_generation_prompt=True
@@ -566,23 +600,57 @@ def _validate_with_ha_context(graph: SessionGraph, ha_context: dict) -> SessionG
 
 
 _DEFAULT_ANONYMIZATION_PROMPT = """\
-Anonymize the following extracted personal facts by replacing all identifying \
-information with category-prefixed placeholders.
+Anonymize the following extracted personal facts AND the conversation transcript \
+by replacing all identifying information with category-prefixed placeholders.
 
-Replace person names with Person_1, cities with City_1, etc.
+Replace:
+- Person names → Person_1, Person_2, ...
+- City/town names → City_1, City_2, ...
+- Country names → Country_1, Country_2, ...
+- Organization names → Org_1, Org_2, ...
+- Other identifying things (apps, products, brands) → Thing_1, Thing_2, ...
+
+Use the SAME placeholder for the SAME entity across facts and transcript. \
+The mapping you return MUST contain every real name that appears in either input \
+so the reverse mapping is total. If an entity appears in the transcript but not \
+in any fact, still include it in the mapping (e.g. "my wife" mentioned but no \
+fact yet — emit Person_2 in the mapping).
+
 Keep predicates, relation_type, and confidence unchanged.
 
-Facts: {facts_json}
+Facts to anonymize:
+{facts_json}
 
-Return JSON: {{"anonymized": [...], "mapping": {{"Person_1": "name", ...}}}}
+Transcript to anonymize:
+{transcript}
+
+Return JSON in this exact format:
+{{"anonymized_facts": [...], "anonymized_transcript": "...", \
+"mapping": {{"original_name": "Person_1", ...}}}}
+
+The mapping MUST use real names as keys and placeholders as values — \
+the local de-anonymization step reverses this to recover real names.
 """
 
-_DEFAULT_NOISE_FILTER_PROMPT = """\
-Review these extracted personal facts from a voice assistant conversation.
+# Two-stage SOTA pipeline: enrichment first, then plausibility filtering.
+# Each stage has a single responsibility and a separate prompt — combining
+# them in one call (the previous "noise_filter" prompt) led to the LLM
+# expanding scope at the same time as filtering, producing inflated counts
+# and self-referential schema artifacts.
+
+_DEFAULT_ENRICHMENT_PROMPT = """\
+Review these extracted personal facts (anonymized — placeholders like Person_1).
 
 1. Resolve coreference ("my wife" → married_to relation).
 2. Split compound facts into individual relations.
-3. Remove noise: casual questions, device identifiers, implausible entities.
+3. Canonicalize symmetric predicates: emit only ONE direction. For predicates \
+   like friend_of, married_to, sibling_of, colleague_of, neighbor_of, knows, \
+   workout_partner_of, met_with — if both (A, p, B) and (B, p, A) are present, \
+   drop the one where subject > object lexicographically. Asymmetric predicates \
+   (parent_of/child_of, manages/reports_to) keep both directions if both stated.
+
+You may ADD new facts that follow directly from the resolved coreference.
+Do NOT drop facts for other reasons — a separate plausibility filter handles removal.
 
 Conversation transcript (anonymized):
 {transcript}
@@ -590,58 +658,173 @@ Conversation transcript (anonymized):
 Extracted facts (anonymized):
 {facts_json}
 
-Return ONLY a JSON array of enriched facts. Each fact: subject, predicate, object, \
-relation_type, confidence. If none survive, return [].
+Return ONLY a JSON array of facts. Each fact: subject, predicate, object, \
+relation_type, confidence. If none, return [].
+"""
+
+_DEFAULT_PLAUSIBILITY_PROMPT = """\
+You are reviewing enriched personal facts from a voice assistant conversation. \
+Inputs may be anonymized (placeholders like Person_1) or real-named — apply \
+the same rules either way.
+
+Your task is to KEEP valid facts and DROP invalid ones. Do NOT add new facts. \
+Do NOT modify the subject, predicate, object, relation_type, or confidence of \
+facts you keep.
+
+DROP a fact if any of these hold (apply checks in order):
+
+1. Self-loop (lexical, no exceptions): `subject` and `object` are the same \
+string (case-insensitive), regardless of predicate. Includes has_name, is, \
+equals, same_as, named, identity-style predicates. Apply this check FIRST.
+2. Cross-loop / name-swap: both A has_name B AND B has_name A (or any \
+combination of has_name, named, is, equals that asserts A ≡ B) — DROP both.
+3. Tautology: predicate is a synonym of the object value (has_colleague → \
+"Colleagues", has_role → "role", has_name → "name").
+4. Role leak: subject or object is a dialogue role ("Assistant", "User", \
+"Speaker", "the bot", "the model"). Person_1/City_1/Org_1/Thing_1 are entity \
+placeholders, NOT role leaks.
+5. Placeholder leak in real-name input: drop any fact whose subject or object \
+matches the regex ^(Person|City|Country|Org|Thing)_\\d+$ — de-anonymization \
+missed an entity.
+6. Placeholder object: object is "Unknown", "None", "Various", "Something", \
+"N/A", or empty.
+7. System identifier: contains dots like "media_player.sonos_office".
+8. Casual-query inference: asking ≠ stating.
+9. Conversation event: predicates like "discussed_topic", "asked_about", \
+"responded_to", "mentioned_in_conversation".
+
+Conversation transcript (anonymized):
+{transcript}
+
+Enriched facts (anonymized):
+{facts_json}
+
+Return ONLY a JSON array of the surviving facts, schema unchanged. If none, return [].
 """
 
 
-def _sota_noise_filter(
+def _sota_pipeline(
     graph: SessionGraph,
     transcript: str,
     model,
     tokenizer,
     provider: str = "anthropic",
     filter_model: str = "claude-sonnet-4-6",
+    endpoint: str | None = None,
+    ner_check: bool = False,
+    ner_model: str = "en_core_web_sm",
 ) -> SessionGraph:
-    """Enrich and filter extraction via local anonymization → SOTA cloud validation.
+    """Enrich extraction via local anonymization → SOTA enrichment → local de-anonymize.
 
-    Three-in-one SOTA pass:
-    1. Coreference resolution — "my wife" → married_to(speaker, wife_name)
-    2. Compound fact splitting — "grew up in A and studied in B" → two relations
-    3. Noise removal — device IDs, casual queries, implausible entities
+    Stages:
+    1. Local anonymize    → facts + transcript with placeholders (one total mapping)
+    2. SOTA enrichment    → coreference resolution + compound splitting + symmetric dedup
+    3. Local de-anonymize → restore real names
 
-    Pipeline: anonymize locally → SOTA enriches + filters → de-anonymize.
-    Falls back to unfiltered graph on any failure.
+    Plausibility filtering (drop self-loops, tautologies, placeholder leaks)
+    is a separate, composable step the caller can apply afterwards using any
+    model. See `_plausibility_filter_with_sota` (anonymized data, SOTA judge)
+    or `_local_plausibility_filter` (real-name data, local judge).
+
+    Falls back to the prior stage's output on any single-stage failure.
+    Endpoint is forwarded for self-hosted OpenAI-compatible providers.
     """
     import os
 
-    # Determine API key based on provider
-    key_env = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "google": "GOOGLE_API_KEY",
-    }
-    api_key = os.environ.get(key_env.get(provider, "ANTHROPIC_API_KEY"), "")
+    key_env_name = PROVIDER_KEY_ENV.get(provider)
+    if key_env_name is None:
+        logger.warning("Unsupported SOTA provider %r — skipping enrichment", provider)
+        return graph
+    api_key = os.environ.get(key_env_name, "")
+    # Collect ALL config gaps before returning so a single warning surfaces
+    # everything missing — avoids the "fix the key, then discover the endpoint
+    # was also missing on the next run" loop.
+    gaps = []
     if not api_key:
-        logger.info("No API key for %s — skipping SOTA enrichment", provider)
+        gaps.append(f"{key_env_name} env var")
+    if (
+        provider in OPENAI_COMPAT_PROVIDERS
+        and not endpoint
+        and not OPENAI_COMPAT_ENDPOINTS.get(provider)
+    ):
+        gaps.append(f"endpoint for provider {provider!r}")
+    if gaps:
+        logger.info("Skipping SOTA enrichment — missing config: %s", ", ".join(gaps))
         return graph
 
     original_count = len(graph.relations)
 
-    # Step 1: Anonymize facts and transcript via local model
-    anon_facts, mapping = _anonymize_with_local_model(graph, model, tokenizer)
+    # Step 1: Anonymize facts AND transcript via local model in one call —
+    # mapping is total over everything that will reach the SOTA stage.
+    anon_facts, mapping, anon_transcript = _anonymize_with_local_model(
+        graph, model, tokenizer, transcript=transcript
+    )
     if anon_facts is None:
         logger.warning("Anonymization failed — skipping SOTA enrichment")
         return graph
-
-    # Apply the same mapping to the transcript for conversation context
-    anon_transcript = _anonymize_transcript(transcript, mapping)
-
-    # Step 2: SOTA enrichment — coreference + splitting + noise filtering
-    enriched_anon = _filter_with_sota(anon_facts, api_key, provider, filter_model, anon_transcript)
-    if enriched_anon is None:
-        logger.warning("SOTA enrichment failed — keeping original")
+    if not anon_facts:
+        logger.info("Anonymization produced 0 facts — skipping SOTA pipeline")
+        graph.relations = []
+        graph.entities = []
         return graph
+    # Canonicalize mapping direction before any downstream use.
+    mapping, norm_stats = _normalize_anonymization_mapping(mapping)
+    if norm_stats["dropped"]:
+        graph.diagnostics["mapping_ambiguous_dropped"] = norm_stats["dropped"]
+    # Fall back to mechanical replacement if the model didn't return an
+    # anonymized transcript (older anonymization prompt or partial response).
+    if not anon_transcript:
+        anon_transcript = _anonymize_transcript(transcript, mapping)
+
+    # Forward-path privacy guard: verify no real name leaked past anonymization
+    # before sending anything to the cloud. On leak, attempt deterministic
+    # repair (extend mapping for missed names, drop triples for hallucinated
+    # ones). Only then fail-closed if residual leaks remain.
+    extra_pii = extract_pii_names_with_ner(transcript, ner_model) if ner_check else None
+    leaked = verify_anonymization_completeness(
+        graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
+    )
+    if leaked:
+        if _mapping_is_canonical(mapping):
+            logger.info("Repairing %d leaked name(s): %s", len(leaked), leaked[:5])
+            anon_facts, mapping, anon_transcript, repair_status = _repair_anonymization_leaks(
+                graph, mapping, anon_facts, anon_transcript, transcript, leaked
+            )
+            logger.info(
+                "Repair: missed_fixed=%d hallucinated_dropped=%d",
+                repair_status["missed_fixed"],
+                repair_status["hallucinated_dropped"],
+            )
+            leaked = verify_anonymization_completeness(
+                graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
+            )
+        if leaked:
+            # Residual leak after repair: the transcript still contains real
+            # names we cannot scrub (they're not in the mapping). Sending it to
+            # SOTA would violate the privacy guarantee, so skip SOTA entirely
+            # and return the original extraction unchanged. Callers can still
+            # run plausibility on this output downstream.
+            logger.warning(
+                "Residual leaks after repair (%s); skipping SOTA call to preserve privacy.",
+                leaked[:5],
+            )
+            return graph
+
+    # Step 2: SOTA enrichment — coreference + compound splitting + safe reification.
+    # Brace every known placeholder at the SOTA boundary so the enricher sees a
+    # consistent `{Prefix_N}` convention throughout its input. SOTA continues the
+    # pattern for any new placeholders it introduces; we diff updated transcript
+    # vs input to recover their bindings.
+    known_placeholders = set(mapping.values())
+    braced_transcript = _brace_placeholders_in_text(anon_transcript, known_placeholders)
+    braced_facts = _brace_placeholders_in_facts(anon_facts, known_placeholders)
+    enriched_anon, updated_anon_transcript, _sota_raw = _filter_with_sota(
+        braced_facts, api_key, provider, filter_model, braced_transcript, endpoint=endpoint
+    )
+    anon_transcript = braced_transcript  # bindings diff is against what we sent
+    if enriched_anon is None:
+        logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
+        enriched_anon = anon_facts
 
     if not enriched_anon:
         logger.info("SOTA enrichment removed all relations")
@@ -649,28 +832,86 @@ def _sota_noise_filter(
         graph.entities = []
         return graph
 
-    # Step 3: De-anonymize — reverse the mapping for all surviving/new relations
+    # Step 2b: recover bindings for SOTA-introduced placeholders via transcript diff.
+    # SOTA must insert braced tokens (e.g. `{Event_1}`) in the updated transcript at
+    # the position of the span they represent. Ungrounded placeholders (those in
+    # facts but not in the updated transcript) are caught by the residual sweep below.
+    if updated_anon_transcript:
+        bindings = _extract_sota_bindings(anon_transcript, updated_anon_transcript)
+        for real_span, placeholder in bindings.items():
+            mapping.setdefault(real_span, placeholder)
+        if bindings:
+            logger.info("SOTA introduced %d new binding(s) via transcript diff", len(bindings))
+    # Strip braces from subject/object fields so downstream lookups use bare tokens.
+    enriched_anon = _strip_placeholder_braces(enriched_anon)
+
+    # Step 3: De-anonymize — reverse the mapping for all surviving/new relations.
+    # Extended mapping from repair + SOTA bindings is already included in `mapping`.
     reverse_mapping = {v: k for k, v in mapping.items()}
     from paramem.graph.schema import Entity, Relation
 
-    kept_relations = []
+    deanon_facts = []
     for fact in enriched_anon:
         if not isinstance(fact, dict):
             continue
-        subj = reverse_mapping.get(fact.get("subject", ""), fact.get("subject", ""))
-        obj = reverse_mapping.get(fact.get("object", ""), fact.get("object", ""))
+        deanon_facts.append(
+            {
+                **fact,
+                "subject": reverse_mapping.get(fact.get("subject", ""), fact.get("subject", "")),
+                "object": reverse_mapping.get(fact.get("object", ""), fact.get("object", "")),
+            }
+        )
+
+    # Deterministic placeholder sweep — drop any fact where SOTA invented a
+    # placeholder or de-anon couldn't resolve one. Either case would ship a
+    # literal "Person_3" string into the adapter.
+    deanon_facts, dropped_facts = _strip_residual_placeholders(deanon_facts)
+    if dropped_facts:
+        graph.diagnostics["residual_dropped_facts"] = dropped_facts
+        logger.warning(
+            "Dropped %d fact(s) with residual placeholder strings post-de-anon.",
+            len(dropped_facts),
+        )
+
+    # Final privacy gate: every surviving fact's subject and object must be
+    # grounded in the original transcript OR be a known real-name placeholder
+    # from the mapping. Catches SOTA world-knowledge inferences (e.g. inferring
+    # "CIA" from a transcript that only mentions "Langley") — those entities
+    # are dropped because they never existed in the user's actual words.
+    known_real_names = set(mapping.keys())
+    deanon_facts, ungrounded = _drop_ungrounded_facts(deanon_facts, transcript, known_real_names)
+    if ungrounded:
+        graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
+        logger.warning(
+            "Dropped %d fact(s) with entities ungrounded in the transcript "
+            "(likely SOTA world-knowledge inference).",
+            len(ungrounded),
+        )
+
+    if _sota_raw:
+        graph.diagnostics["sota_raw_response"] = _sota_raw
+    if updated_anon_transcript:
+        graph.diagnostics["sota_updated_transcript"] = updated_anon_transcript
+
+    kept_relations = []
+    for fact in deanon_facts:
         try:
             kept_relations.append(
                 Relation(
-                    subject=subj,
+                    subject=fact.get("subject", ""),
                     predicate=fact.get("predicate", ""),
-                    object=obj,
+                    object=fact.get("object", ""),
                     relation_type=fact.get("relation_type", "factual"),
                     confidence=float(fact.get("confidence", 1.0)),
                 )
             )
         except Exception:
             continue
+
+    # Deterministic safety net for symmetric-predicate canonicalization.
+    # The enrichment prompt asks the LLM to drop the inverse direction; this
+    # guards against the LLM leaving both. Local-only, no extra API call.
+    kept_relations = _canonicalize_symmetric_predicates(kept_relations)
 
     # Rebuild entity list from surviving + new relations
     kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
@@ -699,25 +940,464 @@ def _sota_noise_filter(
     return graph
 
 
+_PLACEHOLDER_RE = re.compile(r"^(Person|City|Country|Org|Thing)_\d+$", re.IGNORECASE)
+
+_REPAIR_TYPE_TO_PREFIX = {"person": "Person", "place": "City"}
+
+
+def _repair_anonymization_leaks(
+    graph: SessionGraph,
+    mapping: dict,
+    anon_facts: list[dict],
+    anon_transcript: str,
+    original_transcript: str,
+    leaked: list[str],
+) -> tuple[list[dict], dict, str, dict]:
+    """Deterministic repair of anonymization leaks — no LLM call.
+
+    For each leaked name:
+    - If the name appears in the original transcript (whole-word, case-insensitive),
+      classify as "missed": extend mapping with the next free placeholder of the
+      right PII type (person→Person_N, place→City_N), rewrite anon_facts and
+      anon_transcript via the extended mapping.
+    - Otherwise classify as "hallucinated": drop every triple in anon_facts
+      whose subject or object matches the leaked name. Mapping is not extended.
+
+    Precondition: mapping must be in canonical {real: placeholder} direction.
+    Caller checks `_mapping_is_canonical(mapping)` and skips repair otherwise.
+
+    Returns: (repaired_facts, extended_mapping, repaired_transcript, repair_status)
+    where repair_status = {"missed_fixed", "hallucinated_dropped", "residual_dropped"}.
+    """
+    type_by_name = {e.name: e.entity_type for e in graph.entities}
+    status = {"missed_fixed": 0, "hallucinated_dropped": 0, "residual_dropped": 0}
+
+    new_mapping = dict(mapping)
+    facts = [dict(f) for f in anon_facts if isinstance(f, dict)]
+
+    # Compute next-index allocator per prefix from current mapping values.
+    def _next_index(prefix: str) -> int:
+        max_n = 0
+        for v in new_mapping.values():
+            if not isinstance(v, str):
+                continue
+            if v.startswith(f"{prefix}_"):
+                tail = v.split("_")[-1]
+                if tail.isdigit():
+                    max_n = max(max_n, int(tail))
+        return max_n + 1
+
+    hallucinated: set[str] = set()
+    for name in leaked:
+        if not name:
+            continue
+        in_transcript = bool(
+            re.search(rf"\b{re.escape(name)}\b", original_transcript or "", re.IGNORECASE)
+        )
+        if not in_transcript:
+            hallucinated.add(name)
+            continue
+        # Missed — allocate placeholder based on declared type.
+        etype = (type_by_name.get(name) or "person").lower()
+        prefix = _REPAIR_TYPE_TO_PREFIX.get(etype)
+        if prefix is None:
+            # Type out of PII scope; treat as hallucinated rather than fabricate.
+            hallucinated.add(name)
+            continue
+        placeholder = f"{prefix}_{_next_index(prefix)}"
+        new_mapping[name] = placeholder
+        status["missed_fixed"] += 1
+
+    # Drop hallucinated-referencing triples from anon_facts.
+    if hallucinated:
+        hallu_lc = {h.lower() for h in hallucinated}
+        kept = []
+        for f in facts:
+            s = str(f.get("subject", ""))
+            o = str(f.get("object", ""))
+            if s.lower() in hallu_lc or o.lower() in hallu_lc:
+                status["hallucinated_dropped"] += 1
+                continue
+            kept.append(f)
+        facts = kept
+
+    # Field-level rewrite of subject/object for missed names, then mechanical
+    # transcript re-anonymization with the extended mapping.
+    missed_names = {n for n in leaked if n not in hallucinated}
+    if missed_names:
+        for f in facts:
+            s = f.get("subject", "")
+            o = f.get("object", "")
+            if isinstance(s, str) and s in missed_names:
+                f["subject"] = new_mapping[s]
+            if isinstance(o, str) and o in missed_names:
+                f["object"] = new_mapping[o]
+        anon_transcript = _anonymize_transcript(original_transcript, new_mapping)
+
+    return facts, new_mapping, anon_transcript, status
+
+
+_PLACEHOLDER_TOKEN_RE = re.compile(r"\{(\w+_\d+)\}|\b([A-Z][A-Za-z]*_\d+)\b")
+
+
+def _normalize_for_grounding(text: str) -> str:
+    """Lowercase and underscore-to-space normalise for transcript comparisons."""
+    return (text or "").replace("_", " ").lower()
+
+
+def _entity_is_grounded(entity: str, transcript_norm: str, known_names: set[str]) -> bool:
+    """True iff every significant token in `entity` appears in the transcript.
+
+    An entity is "grounded" when:
+    - It is a known real-name from the anonymization mapping (mapping.keys()), OR
+    - Every significant token (>2 alphabetic chars) appears as a whole word in
+      the normalised transcript.
+
+    Entities that pass the first check are users/places explicitly mentioned
+    in the session (covered by the mapping). Entities that pass only the
+    second check are concepts grounded in the transcript content. Entities
+    that pass neither (e.g. `CIA` inferred from a transcript that only
+    mentions "Langley") are rejected — SOTA brought them in via world
+    knowledge, not the user's conversation.
+    """
+    if not entity:
+        return False
+    if entity in known_names:
+        return True
+    norm = _normalize_for_grounding(entity).strip()
+    if not norm:
+        return False
+    tokens = [t for t in re.findall(r"[a-z]+", norm) if len(t) > 2]
+    if not tokens:
+        # Too-short entity (e.g. initials, CJK short names like "Li Na").
+        # Whole-phrase word-boundary match prevents "Li" from matching
+        # inside "Libya".
+        return bool(re.search(rf"\b{re.escape(norm)}\b", transcript_norm))
+    # Strict "all significant tokens must appear" is intentional: partial
+    # matches would let SOTA world-knowledge inferences slip through (entity
+    # "Munich Airport" against transcript saying only "Munich"). We favour
+    # precision (drop plausibly-enriched entities) over recall.
+    return all(re.search(rf"\b{re.escape(t)}\b", transcript_norm) for t in tokens)
+
+
+def _drop_ungrounded_facts(
+    facts: list[dict], original_transcript: str, known_names: set[str]
+) -> tuple[list[dict], list[dict]]:
+    """Gate every fact's subject and object against transcript grounding.
+
+    Returns `(kept_facts, dropped_facts)`. Dropped facts had at least one
+    endpoint that was neither a known real-name nor grounded in the user's
+    transcript — they were SOTA's world-knowledge inferences, not facts
+    about the user's session. The kept facts are safe to persist.
+    """
+    transcript_norm = _normalize_for_grounding(original_transcript)
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        subj = str(f.get("subject", ""))
+        obj = str(f.get("object", ""))
+        if _entity_is_grounded(subj, transcript_norm, known_names) and _entity_is_grounded(
+            obj, transcript_norm, known_names
+        ):
+            kept.append(f)
+        else:
+            dropped.append(f)
+    return kept, dropped
+
+
+def _strip_residual_placeholders(
+    facts: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Drop facts whose subject or object contains a residual placeholder token.
+
+    Runs post de-anonymization. Catches anything shaped like a placeholder —
+    either braced `{Prefix_N}` or bare `Prefix_N` with capitalised prefix.
+    No prefix enumeration; the pattern is type-agnostic. Covers:
+    1. SOTA invented a placeholder that was never in the mapping.
+    2. De-anonymization couldn't reverse-map a placeholder (mapping gap).
+    3. Composite strings like `Person_2's Support` where the placeholder is
+       embedded in a longer phrase (substring search).
+
+    Returns `(kept_facts, dropped_facts)`. Each dropped fact is the exact
+    input object the caller can inspect for audit / diagnostics — no
+    `id()`-based reconstruction required.
+    """
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        s = str(f.get("subject", ""))
+        o = str(f.get("object", ""))
+        if _PLACEHOLDER_TOKEN_RE.search(s) or _PLACEHOLDER_TOKEN_RE.search(o):
+            dropped.append(f)
+            continue
+        kept.append(f)
+    return kept, dropped
+
+
+def _normalize_anonymization_mapping(mapping: dict) -> tuple[dict, dict]:
+    """Normalize mapping to canonical {real_name: placeholder} direction.
+
+    Per-entry classification — each (k, v) pair is placed in canonical form
+    based on which side matches the placeholder regex:
+    - key matches placeholder and value does not ⇒ invert this pair.
+    - value matches placeholder and key does not ⇒ keep as-is.
+    - both or neither match ⇒ ambiguous; drop (logging).
+
+    Returns `(canonical_mapping, stats)` where stats has `{inverted, dropped}`
+    counts — surfaces the mapping-quality signal to callers so they can
+    persist it in diagnostics (ambiguous-drop can otherwise silently void
+    real entities).
+    """
+    if not mapping:
+        return mapping, {"inverted": 0, "dropped": 0}
+    out: dict = {}
+    inverted = 0
+    dropped = 0
+    for k, v in mapping.items():
+        k_match = bool(_PLACEHOLDER_RE.match(str(k)))
+        v_match = bool(_PLACEHOLDER_RE.match(str(v)))
+        if k_match and not v_match:
+            out[v] = k
+            inverted += 1
+        elif v_match and not k_match:
+            out[k] = v
+        else:
+            # Both sides match (e.g. {"Person_1": "City_1"}) or neither does —
+            # we cannot tell which side is real. Dropping the pair is safer
+            # than keeping it: retaining would corrupt reverse-lookup
+            # (placeholder → placeholder) and silently drop facts via the
+            # residual sweep with no explicit error.
+            dropped += 1
+    if inverted:
+        logger.info(
+            "Anonymization mapping: inverted %d/%d pairs to canonical "
+            "{real: placeholder} direction",
+            inverted,
+            len(mapping),
+        )
+    if dropped:
+        logger.warning(
+            "Anonymization mapping: dropped %d/%d ambiguous pairs (both or "
+            "neither side matches placeholder pattern); affected entities will "
+            "not de-anonymize and their triples will be swept.",
+            dropped,
+            len(mapping),
+        )
+    return out, {"inverted": inverted, "dropped": dropped}
+
+
+def _mapping_is_canonical(mapping: dict) -> bool:
+    """True iff mapping is {real_name: placeholder} with all values matching."""
+    if not mapping:
+        return True
+    return all(_PLACEHOLDER_RE.match(str(v)) for v in mapping.values()) and not any(
+        _PLACEHOLDER_RE.match(str(k)) for k in mapping.keys()
+    )
+
+
+# spaCy PII-type → our internal PII bucket.
+# PERSON → person, GPE/LOC → place. Other spaCy labels (ORG, DATE, etc.)
+# we treat as non-PII, consistent with the extraction prompt's type policy.
+_SPACY_PII_LABELS = {"PERSON": "person", "GPE": "place", "LOC": "place"}
+
+# Cached per-(lang) spaCy pipelines so we don't reload on every call.
+_SPACY_MODELS: dict[str, object] = {}
+
+# Cleanup patterns for noisy NER spans: dialogue-format transcripts often
+# cause spaCy to extend PERSON spans into the following response token.
+# E.g. "Li Ming: True" or "Li Yu: Indeed" — the person is "Li Ming", the
+# rest is dialogue cruft that would inflate false "missing mapping" flags.
+_NER_DIALOGUE_TAIL_RE = re.compile(r":\s*\w+.*$")
+_NER_POSSESSIVE_RE = re.compile(r"['\u2019]s?$")
+
+
+def _clean_ner_span(text: str) -> str:
+    """Normalize a raw spaCy NER span — strip dialogue tails, possessives."""
+    cleaned = text.strip()
+    cleaned = _NER_DIALOGUE_TAIL_RE.sub("", cleaned)
+    cleaned = _NER_POSSESSIVE_RE.sub("", cleaned)
+    cleaned = cleaned.rstrip(":,.;!? ")
+    return cleaned.strip()
+
+
+def extract_pii_names_with_ner(transcript: str, spacy_model: str = "en_core_web_sm") -> set[str]:
+    """Independent PII detection via spaCy NER (optional defense-in-depth).
+
+    Returns a set of names classified as PII (person or place) by spaCy.
+    Empty set on failure (spaCy not installed, model missing, etc.) — the
+    caller uses this as a supplement to the extractor's own type tags, not
+    a replacement. Caller decides whether to require NER success.
+    """
+    if not transcript:
+        return set()
+    try:
+        import spacy
+    except ImportError:
+        logger.info("spaCy not installed — NER cross-check disabled")
+        return set()
+    nlp = _SPACY_MODELS.get(spacy_model)
+    if nlp is None:
+        try:
+            nlp = spacy.load(spacy_model)
+            _SPACY_MODELS[spacy_model] = nlp
+        except Exception as e:
+            logger.warning("spaCy model %r not loadable — NER disabled: %s", spacy_model, e)
+            return set()
+    try:
+        doc = nlp(transcript)
+    except Exception as e:
+        logger.warning("spaCy NER call failed — NER disabled: %s", e)
+        return set()
+    names = set()
+    for ent in doc.ents:
+        if ent.label_ not in _SPACY_PII_LABELS:
+            continue
+        cleaned = _clean_ner_span(ent.text)
+        if cleaned:
+            names.add(cleaned)
+    return names
+
+
+def verify_anonymization_completeness(
+    graph: SessionGraph,
+    mapping: dict,
+    anon_facts: list[dict],
+    anon_transcript: str,
+    extra_pii_names: set[str] | None = None,
+) -> list[str]:
+    """Forward-path privacy guard — scope: KNOWN entities + optional NER.
+
+    Returns a list of real names that the anonymizer failed to handle properly.
+    Empty list == safe. Non-empty list means callers MUST abort the SOTA call.
+
+    Detects two failure modes:
+    1. **Leak**: a real name still appears in anon_transcript or anon_facts
+       (anonymizer didn't replace it). Privacy violation.
+    2. **Missing mapping**: a real name has been replaced in the output but is
+       NOT present in mapping.values(). De-anonymization will fail silently
+       and produce placeholder strings in the final graph. Correctness gap.
+
+    Scope is limited to PII-sensitive entity types (person, place). Concepts,
+    preferences, organizations, and events are treated as non-PII and may
+    legitimately appear verbatim in the anonymized output. A substring check
+    on PII names still catches compound cases like "Li Na's Support" where
+    a person name is embedded in a concept-type phrase.
+
+    `extra_pii_names`: names contributed by an independent NER pass (see
+    `extract_pii_names_with_ner`). Supplements the extractor's type tags —
+    catches PII the extractor mislabeled or missed. Off by default (callers
+    opt in at the pipeline level).
+    """
+    pii_types = {"person", "place"}
+    type_by_name = {e.name: e.entity_type for e in graph.entities}
+    real_names = {e.name for e in graph.entities if e.name and e.entity_type in pii_types}
+    # Defensive: pick up PII names from relation participants too.
+    for r in graph.relations:
+        for n in (r.subject, r.object):
+            if n and type_by_name.get(n) in pii_types:
+                real_names.add(n)
+    # Add externally-sourced PII names (e.g. NER cross-check).
+    if extra_pii_names:
+        real_names |= {n for n in extra_pii_names if n}
+
+    # Case-insensitive set of all mapped strings for coverage check.
+    # Mapping direction is technically {real_name: placeholder}, but models
+    # frequently emit {placeholder: real_name} instead (the old prompt
+    # wording taught this direction). De-anonymization may be misaligned
+    # but that's a separate bug; for the privacy guard we just need to know
+    # whether the real name is *somewhere* in the mapping. Bidirectional
+    # check: if the name appears in either keys or values, it's accounted for.
+    mapped_tokens_lc = {str(k).lower() for k in mapping.keys() if k}
+    mapped_tokens_lc |= {str(v).lower() for v in mapping.values() if v}
+
+    problems: list[str] = []
+    for name in real_names:
+        # Case 1: Leak — real name still appears in anon outputs.
+        # Word-boundary, case-insensitive match against the transcript.
+        leaked_in_transcript = anon_transcript and re.search(
+            rf"\b{re.escape(name)}\b", anon_transcript, re.IGNORECASE
+        )
+        if leaked_in_transcript:
+            problems.append(name)
+            continue
+        name_lc = name.lower()
+        leaked_in_facts = False
+        for fact in anon_facts:
+            if not isinstance(fact, dict):
+                continue
+            subj = str(fact.get("subject", "")).lower()
+            obj = str(fact.get("object", "")).lower()
+            if name_lc in subj or name_lc in obj:
+                leaked_in_facts = True
+                break
+        if leaked_in_facts:
+            problems.append(name)
+            continue
+        # Case 2: Missing mapping — real name absent from output AND absent
+        # from mapping. De-anonymization cannot recover it.
+        if name_lc not in mapped_tokens_lc:
+            problems.append(name)
+    return problems
+
+
 def _anonymize_transcript(transcript: str, mapping: dict) -> str:
     """Apply entity name → placeholder mapping to a transcript.
 
     Replaces all mapped entity names with their anonymized placeholders
     so SOTA can see the conversation context without identifying info.
     Longer names are replaced first to avoid partial matches.
+
+    Defensive: local models occasionally emit `null` placeholders; we skip
+    those entries rather than crashing on `str.replace(x, None)`.
     """
     result = transcript
     for original, placeholder in sorted(mapping.items(), key=lambda kv: -len(kv[0])):
-        result = result.replace(original, placeholder)
+        if not isinstance(original, str) or not isinstance(placeholder, str):
+            logger.warning("Skipping invalid anonymization entry: %r → %r", original, placeholder)
+            continue
+        if not original:
+            continue
+        # Word-boundary anchored replacement — prevents "Li" from eating the
+        # "Li" prefix of "Li Ming" or the "Li" substring of "Beijing".
+        result = re.sub(rf"\b{re.escape(original)}\b", placeholder, result)
     return result
 
 
-def _anonymize_with_local_model(
-    graph: SessionGraph, model, tokenizer
-) -> tuple[list[dict] | None, dict]:
-    """Anonymize extracted facts using the local model.
+_DEFAULT_ANONYMIZER_MAX_TOKENS = 2048
+_DEFAULT_ANONYMIZER_TEMPERATURE = 0.0
 
-    Returns (anonymized_facts, mapping) or (None, {}) on failure.
+
+def load_anonymization_prompt() -> str:
+    """Single source of truth for the anonymization prompt.
+
+    Both the local-model and cloud-extractor anonymization paths read through
+    this helper so a `configs/prompts/anonymization.txt` override applies to
+    both — no silent divergence.
+    """
+    return _load_prompt("anonymization.txt", _DEFAULT_ANONYMIZATION_PROMPT)
+
+
+def _anonymize_with_local_model(
+    graph: SessionGraph,
+    model,
+    tokenizer,
+    transcript: str = "",
+    max_tokens: int = _DEFAULT_ANONYMIZER_MAX_TOKENS,
+    temperature: float = _DEFAULT_ANONYMIZER_TEMPERATURE,
+) -> tuple[list[dict] | None, dict, str]:
+    """Anonymize extracted facts AND transcript using the local model.
+
+    Returns (anonymized_facts, mapping, anonymized_transcript) on success or
+    (None, {}, "") on failure. The mapping is total over both inputs by
+    contract — every real name appearing in either facts or transcript MUST
+    be a value in the mapping, so the reverse mapping is total too.
+
+    Backward-compat: if `transcript` is empty, an empty anonymized transcript
+    is returned. Existing callers (older tests) still work.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -733,8 +1413,11 @@ def _anonymize_with_local_model(
         for r in graph.relations
     ]
 
-    anon_prompt = _load_prompt("anonymization.txt", _DEFAULT_ANONYMIZATION_PROMPT)
-    prompt = anon_prompt.format(facts_json=json.dumps(facts, indent=2))
+    anon_prompt = load_anonymization_prompt()
+    prompt = anon_prompt.format(
+        facts_json=json.dumps(facts, indent=2),
+        transcript=transcript or "(no transcript provided)",
+    )
     messages = [
         {"role": "system", "content": "You anonymize data. Output valid JSON only."},
         {"role": "user", "content": prompt},
@@ -745,19 +1428,374 @@ def _anonymize_with_local_model(
         add_generation_prompt=True,
     )
 
-    raw = generate_answer(model, tokenizer, formatted, max_new_tokens=2048, temperature=0.0)
+    raw = generate_answer(
+        model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
+    )
     logger.debug("Anonymization raw: %s", raw[:500])
 
     try:
         json_str = _extract_json_block(raw)
         data = json.loads(json_str)
-        if isinstance(data, dict) and "anonymized" in data and "mapping" in data:
-            return data["anonymized"], data["mapping"]
+        if isinstance(data, dict) and "mapping" in data:
+            normalized, _ = _normalize_anonymization_mapping(data["mapping"])
+            # New schema: anonymized_facts + anonymized_transcript
+            if "anonymized_facts" in data:
+                return (
+                    data["anonymized_facts"],
+                    normalized,
+                    data.get("anonymized_transcript", ""),
+                )
+            # Backward-compat: old schema with "anonymized" key (facts only)
+            if "anonymized" in data:
+                return data["anonymized"], normalized, ""
         logger.warning("Anonymization returned unexpected format")
-        return None, {}
+        return None, {}, ""
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Anonymization parse failed: %s", e)
-        return None, {}
+        return None, {}, ""
+
+
+# Public provider metadata — single source of truth, reused by callers
+# (compare_extraction.py and the production server) so they can dispatch
+# by provider consistently with this module.
+OPENAI_COMPAT_ENDPOINTS = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "groq": "https://api.groq.com/openai/v1/chat/completions",
+    "mistral": "https://api.mistral.ai/v1/chat/completions",
+}
+OPENAI_COMPAT_PROVIDERS = set(OPENAI_COMPAT_ENDPOINTS) | {"ollama"}
+
+# Env var holding the API key for each supported provider. Extended whenever
+# a new provider is added to _filter_with_sota.
+PROVIDER_KEY_ENV = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "ollama": "OLLAMA_API_KEY",
+}
+
+# Symmetric predicates — relations that hold equally in both directions.
+# The enrichment prompt instructs the LLM to canonicalize these (emit one
+# direction only, lex-ordered subject < object). This set is the deterministic
+# post-processing safety net: if the LLM left both directions, drop the one
+# with subject > object. Kept in sync with the list in sota_enrichment.txt.
+SYMMETRIC_PREDICATES = frozenset(
+    {
+        "friend_of",
+        "friends_with",
+        "married_to",
+        "spouse_of",
+        "sibling_of",
+        "brother_of",
+        "sister_of",
+        "cousin_of",
+        "colleague_of",
+        "coworker_of",
+        "neighbor_of",
+        "partner_of",
+        "related_to",
+        "workout_partner_of",
+        "study_partner_of",
+        "met_with",
+        "talked_to",
+        "knows",
+        "agrees_with",
+        "disagrees_with",
+        "attended_with",
+        "attends_gym_with",
+        "shares_interest_with",
+    }
+)
+
+
+def _canonicalize_symmetric_predicates(relations: list) -> list:
+    """Drop redundant inverse triples for symmetric predicates.
+
+    Deterministic safety net for the LLM-driven canonicalization in the
+    enrichment prompt. For each (subject, predicate, object) where
+    `predicate ∈ SYMMETRIC_PREDICATES` and the inverse triple is also
+    present, keep only the one with subject ≤ object lexicographically.
+    """
+    if not relations:
+        return relations
+
+    # Build index of (subject, predicate, object) tuples for O(1) inverse lookup.
+    seen = {(r.subject, r.predicate, r.object) for r in relations}
+    kept = []
+    for r in relations:
+        if r.predicate in SYMMETRIC_PREDICATES and r.subject > r.object:
+            inverse = (r.object, r.predicate, r.subject)
+            if inverse in seen:
+                # Inverse will be (or has been) kept; drop this one.
+                logger.debug(
+                    "Symmetric dedup: dropped %s --[%s]--> %s (inverse kept)",
+                    r.subject,
+                    r.predicate,
+                    r.object,
+                )
+                continue
+        kept.append(r)
+    return kept
+
+
+_SOTA_ENRICHMENT_SYSTEM_PROMPT = (
+    "You are a knowledge graph enrichment assistant. "
+    "Resolve coreference and split compound facts. Do NOT remove facts — a "
+    "separate plausibility filter handles removal. Output valid JSON only."
+)
+_SOTA_PLAUSIBILITY_SYSTEM_PROMPT = (
+    "You are a knowledge graph plausibility filter. "
+    "Drop invalid facts only. Do NOT add or modify facts. Output valid JSON only."
+)
+# Backward-compatible alias for any external caller of the old name.
+_SOTA_SYSTEM_PROMPT = _SOTA_ENRICHMENT_SYSTEM_PROMPT
+
+
+_DEFAULT_FILTER_MAX_TOKENS = 2048
+# Validator temperature: deterministic by default. Threaded all the way to the
+# provider call so Anthropic and OpenAI-compatible filters match exactly.
+_DEFAULT_FILTER_TEMPERATURE = 0.0
+
+
+def _filter_anthropic(
+    prompt: str,
+    api_key: str,
+    filter_model: str,
+    system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+) -> str | None:
+    try:
+        import anthropic
+    except ImportError:
+        logger.warning("anthropic SDK not installed — skipping SOTA filter")
+        return None
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
+        response = client.messages.create(
+            model=filter_model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "".join(b.text for b in response.content if hasattr(b, "text"))
+    except Exception as e:
+        cause = e.__cause__ or e.__context__
+        detail = f"{type(e).__name__}: {e}"
+        if cause:
+            detail += f" (caused by {type(cause).__name__}: {cause})"
+        logger.warning("Anthropic API call failed — %s", detail)
+        return None
+
+
+def _filter_openai_compat(
+    prompt: str,
+    api_key: str,
+    filter_model: str,
+    provider: str,
+    endpoint: str | None = None,
+    system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+) -> str | None:
+    try:
+        import httpx
+    except ImportError:
+        logger.warning("httpx not installed — skipping SOTA filter")
+        return None
+
+    url = endpoint or OPENAI_COMPAT_ENDPOINTS.get(provider)
+    if not url:
+        logger.warning("No endpoint for OpenAI-compatible provider '%s'", provider)
+        return None
+    payload = {
+        "model": filter_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except (httpx.HTTPError, httpx.RequestError, KeyError, IndexError) as e:
+        logger.warning("%s API call failed: %s", provider, e)
+        return None
+
+
+def _sota_call(
+    prompt: str,
+    api_key: str,
+    provider: str,
+    filter_model: str,
+    endpoint: str | None,
+    max_tokens: int,
+    temperature: float,
+    system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
+) -> str | None:
+    """Generic SOTA dispatch (anthropic native or any OpenAI-compatible host)."""
+    if provider == "anthropic":
+        return _filter_anthropic(
+            prompt,
+            api_key,
+            filter_model,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+    if provider in OPENAI_COMPAT_PROVIDERS:
+        return _filter_openai_compat(
+            prompt,
+            api_key,
+            filter_model,
+            provider,
+            endpoint,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+    logger.warning("Unsupported SOTA provider '%s'", provider)
+    return None
+
+
+def _parse_facts_response(raw: str | None, strict_array: bool = False) -> list[dict] | None:
+    """Parse a SOTA response into a list of fact dicts. Returns None on failure.
+
+    `strict_array=True` rejects dict-wrapped responses — used by the
+    plausibility filter, whose contract requires a bare JSON array. The
+    enrichment stage is more permissive (tries common dict keys before failing).
+    """
+    if raw is None:
+        return None
+    logger.debug("SOTA response raw: %s", raw[:500])
+    try:
+        json_str = _extract_json_block(raw)
+        validated = json.loads(json_str)
+        if isinstance(validated, list):
+            return validated
+        if not strict_array and isinstance(validated, dict):
+            for key in ("relations", "filtered", "facts", "results"):
+                if key in validated and isinstance(validated[key], list):
+                    return validated[key]
+        logger.warning("SOTA response unexpected format: %s", type(validated).__name__)
+        return None
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning("SOTA response parse failed: %s", e)
+        return None
+
+
+_BRACED_PLACEHOLDER_RE = re.compile(r"\{(\w+_\d+)\}")
+# Match a bare placeholder token not already wrapped in braces (defensive: lets
+# _brace_placeholders_in_text be idempotent even on accidentally-pre-braced input).
+_BARE_PLACEHOLDER_RE = re.compile(r"(?<!\{)\b(\w+_\d+)\b(?!\})")
+
+
+def _brace_placeholders_in_text(text: str, placeholders: set[str]) -> str:
+    """Wrap each occurrence of known placeholder tokens in braces.
+
+    Applied at the SOTA boundary so the enricher sees a consistent
+    `{Prefix_N}` convention for every placeholder — both ours and any it
+    introduces. Bare tokens not in `placeholders` are left untouched (real
+    entity names with incidental digits like `user_42`).
+    """
+    if not text or not placeholders:
+        return text
+
+    def _wrap(m: re.Match) -> str:
+        return f"{{{m.group(1)}}}" if m.group(1) in placeholders else m.group(0)
+
+    return _BARE_PLACEHOLDER_RE.sub(_wrap, text)
+
+
+def _brace_placeholders_in_facts(facts: list[dict], placeholders: set[str]) -> list[dict]:
+    """Wrap subject/object placeholder tokens in braces (SOTA-facing form)."""
+    out = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        copy = dict(f)
+        for key in ("subject", "object"):
+            val = str(copy.get(key, ""))
+            if val in placeholders:
+                copy[key] = f"{{{val}}}"
+        out.append(copy)
+    return out
+
+
+def _extract_sota_bindings(old_transcript: str, new_transcript: str) -> dict[str, str]:
+    """Recover SOTA-introduced placeholder bindings via token-level span diff.
+
+    SOTA returns an updated transcript where newly-introduced entities are
+    marked as braced placeholders (`{Event_1}`) replacing the real span they
+    represent. This function aligns the two transcripts token-by-token and
+    reconstructs `{real_span: placeholder}` bindings for each replacement
+    whose new side is a single braced token.
+
+    Returns bindings with real spans stripped of trailing punctuation.
+    """
+    import difflib
+
+    old_toks = old_transcript.split()
+    new_toks = new_transcript.split()
+    matcher = difflib.SequenceMatcher(a=old_toks, b=new_toks)
+    bindings: dict[str, str] = {}
+    brace_token_re = re.compile(r"^\{(\w+_\d+)\}([.,;:!?)\]]*)$")
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "replace":
+            continue
+        if j2 - j1 != 1:
+            continue
+        m = brace_token_re.match(new_toks[j1])
+        if not m:
+            continue
+        placeholder = m.group(1)
+        span = " ".join(old_toks[i1:i2]).rstrip(".,;:!?'\")]")
+        # Defensive: skip placeholder→placeholder bindings. SOTA may brace a
+        # pre-existing bare placeholder (e.g. `Person_2` → `{Person_2}`) as
+        # "normalisation". The diff would record `span=Person_2` → placeholder
+        # `Person_2`. Adding that to the mapping (as `mapping["Person_2"] =
+        # "Person_2"`) would corrupt the reverse lookup — a later pair like
+        # `{Li Ming: Person_2}` gets overwritten, breaking de-anonymization.
+        # Reject both braced spans and bare-placeholder spans.
+        if (
+            brace_token_re.match(span)
+            or not span
+            or _PLACEHOLDER_RE.match(span)
+            or span == placeholder
+        ):
+            continue
+        if placeholder not in bindings.values():
+            bindings[span] = placeholder
+    return bindings
+
+
+def _strip_placeholder_braces(facts: list[dict]) -> list[dict]:
+    """Remove enclosing braces from placeholder references anywhere in subject/object.
+
+    Handles both exact-match (`{Event_1}` → `Event_1`) and inline occurrences
+    (`attended {Event_1}` → `attended Event_1`). Downstream de-anonymization
+    looks up bare placeholder tokens in the reverse mapping.
+    """
+    inline_brace_re = re.compile(r"\{(\w+_\d+)\}")
+    out: list[dict] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        copy = dict(f)
+        for key in ("subject", "object"):
+            val = str(copy.get(key, ""))
+            copy[key] = inline_brace_re.sub(r"\1", val)
+        out.append(copy)
+    return out
 
 
 def _filter_with_sota(
@@ -766,54 +1804,118 @@ def _filter_with_sota(
     provider: str = "anthropic",
     filter_model: str = "claude-sonnet-4-6",
     anon_transcript: str | None = None,
-) -> list[dict] | None:
-    """Send anonymized facts + transcript to SOTA for enrichment and filtering."""
-    if provider != "anthropic":
-        logger.warning(
-            "SOTA noise filter only supports 'anthropic' provider, got '%s' — "
-            "set consolidation.extraction_noise_filter to 'anthropic' or '' to disable",
-            provider,
-        )
-        return None
+    endpoint: str | None = None,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+) -> tuple[list[dict] | None, str | None, str | None]:
+    """SOTA enrichment pass — coreference + compound splitting + safe reification.
 
-    try:
-        import anthropic
-    except ImportError:
-        logger.warning("anthropic SDK not installed — skipping SOTA filter")
-        return None
+    Returns `(facts, updated_transcript, raw_response)`. The raw response
+    string is surfaced so callers can persist it for diagnostics — crucial
+    when binding recovery fails and we need to see what SOTA actually emitted.
 
-    filter_prompt = _load_prompt("noise_filter.txt", _DEFAULT_NOISE_FILTER_PROMPT)
-    prompt = filter_prompt.format(
+    Legacy responses (bare JSON array, no transcript) are accepted — in that
+    case `updated_transcript` is None and callers must fall back to the
+    registry-based drop filter for any unresolved placeholders.
+    """
+    enrichment_prompt = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
+    prompt = enrichment_prompt.format(
         facts_json=json.dumps(anon_facts, indent=2),
         transcript=anon_transcript or "(not available)",
     )
-
+    raw = _sota_call(
+        prompt,
+        api_key,
+        provider,
+        filter_model,
+        endpoint,
+        max_tokens,
+        temperature,
+        system_prompt=_SOTA_ENRICHMENT_SYSTEM_PROMPT,
+    )
+    if raw is None:
+        return None, None, None
+    # Preferred schema: {"facts": [...], "updated_transcript": "..."}
     try:
-        client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
-        response = client.messages.create(
-            model=filter_model,
-            max_tokens=2048,
-            system="You are a knowledge graph enrichment assistant. Output valid JSON only.",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = "".join(b.text for b in response.content if hasattr(b, "text"))
-    except Exception as e:
-        logger.warning("SOTA API call failed: %s", e)
-        return None
+        parsed = json.loads(_extract_json_block(raw))
+        if isinstance(parsed, dict) and isinstance(parsed.get("facts"), list):
+            return parsed["facts"], parsed.get("updated_transcript"), raw
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Legacy: bare array. No transcript, no reification recovery.
+    return _parse_facts_response(raw), None, raw
 
-    logger.debug("SOTA filter raw: %s", raw[:500])
 
-    try:
-        json_str = _extract_json_block(raw)
-        validated = json.loads(json_str)
-        if isinstance(validated, dict):
-            for key in ("relations", "filtered", "facts", "results"):
-                if key in validated and isinstance(validated[key], list):
-                    return validated[key]
-        if isinstance(validated, list):
-            return validated
-        logger.warning("SOTA filter returned unexpected format: %s", type(validated).__name__)
-        return None
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.warning("SOTA filter parse failed: %s", e)
-        return None
+def _plausibility_filter_with_sota(
+    enriched_anon_facts: list[dict],
+    api_key: str,
+    provider: str = "anthropic",
+    filter_model: str = "claude-sonnet-4-6",
+    anon_transcript: str | None = None,
+    endpoint: str | None = None,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+) -> tuple[list[dict] | None, str | None]:
+    """SOTA plausibility filter — drops invalid relations only.
+
+    No additions, no modifications. See sota_plausibility.txt for the
+    drop criteria (self-loops, tautologies, role leaks, etc.).
+
+    Returns `(facts, raw_response)`. Raw response is preserved so callers
+    can inspect the judge's verdict when questioning drop decisions.
+    """
+    plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+    prompt = plaus_prompt.format(
+        facts_json=json.dumps(enriched_anon_facts, indent=2),
+        transcript=anon_transcript or "(not available)",
+    )
+    raw = _sota_call(
+        prompt,
+        api_key,
+        provider,
+        filter_model,
+        endpoint,
+        max_tokens,
+        temperature,
+        system_prompt=_SOTA_PLAUSIBILITY_SYSTEM_PROMPT,
+    )
+    return _parse_facts_response(raw, strict_array=True), raw
+
+
+def _local_plausibility_filter(
+    facts: list[dict],
+    transcript: str,
+    model,
+    tokenizer,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+) -> list[dict] | None:
+    """Local-model plausibility filter — drops invalid relations only.
+
+    Same prompt as the SOTA plausibility filter, executed by a local model.
+    Caller decides what data to pass: anonymized facts (placeholder strings)
+    or de-anonymized facts (real names). The prompt is stage-agnostic.
+
+    Returns the filtered list or None on parse failure (caller falls back).
+    """
+    from paramem.evaluation.recall import generate_answer
+    from paramem.models.loader import adapt_messages
+
+    plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+    prompt = plaus_prompt.format(
+        facts_json=json.dumps(facts, indent=2),
+        transcript=transcript or "(not available)",
+    )
+    messages = [
+        {"role": "system", "content": _SOTA_PLAUSIBILITY_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    formatted = tokenizer.apply_chat_template(
+        adapt_messages(messages, tokenizer),
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    raw = generate_answer(
+        model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
+    )
+    return _parse_facts_response(raw, strict_array=True)

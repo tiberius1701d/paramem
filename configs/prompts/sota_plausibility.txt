@@ -1,0 +1,31 @@
+You are reviewing enriched personal facts from a voice assistant conversation. Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.
+
+Your task is to KEEP valid facts and DROP invalid ones. Do NOT add new facts. Do NOT modify the subject, predicate, object, relation_type, or confidence of facts you keep.
+
+DROP a fact if any of these hold (apply checks in order):
+
+1. **Self-loop (lexical, no exceptions)** — `subject` and `object` are the same string (case-insensitive), regardless of predicate. This includes `has_name`, `is`, `equals`, `same_as`, `named`, identity-style predicates. Apply this check FIRST, before reading the predicate. Example: a fact with subject "Person_1" and object "Person_1" → DROP. There is no valid case where an entity stands in a relation to itself via these predicates.
+
+2. **Cross-loop / name-swap** — both `subject has_name object` and `object has_name subject` are present (or any combination of `has_name`, `named`, `is`, `equals` that asserts `Person_1 ≡ Person_2`). DROP both — anonymization placeholders cannot be each other's names.
+
+3. **Tautology** — predicate is a synonym of the object value (Person_1 → has_colleague → "Colleagues_in_Org_1", Person_1 → has_role → "role", Person_1 → has_name → "name").
+
+4. **Role leak** — subject or object is a dialogue role rather than an entity ("Assistant", "User", "Speaker", "the bot", "the model"). Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are real entity placeholders, NOT role leaks.
+
+5. **Placeholder leak in real-name input** — when input is real-named, drop any fact whose subject or object is still a literal placeholder string (matches `^(Person|City|Country|Org|Thing)_\d+$`). It means de-anonymization missed an entity.
+
+6. **Placeholder object** — object is a generic non-entity value: "Unknown", "None", "Various", "Something", "N/A", or an empty string.
+
+7. **System identifier** — subject or object contains dots characteristic of system entity IDs (e.g. "media_player.sonos_office", "sensor.temperature_kitchen").
+
+8. **Casual-query inference** — fact is inferred from a question rather than a statement. Asking about weather in a city does NOT imply living there. Asking about a band does NOT imply a preference.
+
+9. **Conversation event** — fact describes the conversation itself rather than a personal fact: predicates like "discussed_topic", "asked_about", "responded_to", "mentioned_in_conversation".
+
+Conversation transcript:
+{transcript}
+
+Enriched facts:
+{facts_json}
+
+Return ONLY a JSON array of the surviving facts, with each fact's original schema unchanged. If no facts survive, return [].

@@ -1,0 +1,64 @@
+You are reviewing extracted personal facts from a voice assistant conversation. The facts and transcript have been anonymized — entities appear as placeholder tokens like `Person_1`, `City_1`, `Thing_1` (bare, no braces). LEAVE existing bare placeholders as-is in your output — do NOT re-brace them. Braced form (`{{Event_1}}`) is reserved ONLY for NEW entities you introduce.
+
+Your task is twofold:
+
+## 1. Coreference Resolution
+Resolve pronouns and implicit references by examining the conversation context:
+- "my wife" → add married_to(Person_1, Person_2) if the wife's placeholder is identifiable from context
+- "we went there last summer" → add visited(Person_1, Location_1, "last summer") with subjects resolved
+- "I" / "me" / "my" always refers to the speaker (Person_1 unless context indicates otherwise)
+- "our kids" → add has_children(Person_1, ...) if not already captured
+- Possessive relationships: "my sister's husband" → chain the relations
+
+## 2. Compound Fact Splitting
+Split multi-fact statements into individual relations:
+- "grew up in City_1 and studied in City_2" → grew_up_in(Person_1, City_1) + studied_in(Person_1, City_2)
+- "likes hiking and cooking" → likes(Person_1, hiking) + likes(Person_1, cooking)
+
+## 3. Symmetric Predicate Canonicalization
+For predicates that are inherently symmetric (the relation holds equally in both directions), emit ONLY ONE direction. If both `(A, p, B)` and `(B, p, A)` are present in the input, drop the one where the subject is lexicographically greater than the object. The remaining triple represents both directions.
+
+Symmetric predicates (and obvious synonyms):
+- friend_of, friends_with
+- married_to, spouse_of
+- sibling_of, brother_of, sister_of, cousin_of (when reciprocal)
+- colleague_of, coworker_of
+- neighbor_of, partner_of, related_to
+- workout_partner_of, study_partner_of
+- met_with, talked_to (only if context confirms reciprocity)
+- knows (only if reciprocal in context)
+- agrees_with, disagrees_with, attended_with, attends_gym_with, shares_interest_with
+
+Asymmetric predicates that look symmetric but are NOT — keep both if both are stated:
+- parent_of / child_of (different predicates)
+- manages / reports_to
+- taught / studied_under
+- likes / liked_by
+
+For each fact: KEEP, MODIFY (resolve coreference / split / canonicalize symmetric), or you may ADD new facts discovered through coreference resolution that the extractor missed. Do NOT drop facts for any other reason — a separate plausibility filter handles removal.
+
+## 4. Introducing New Entities (STRICT CONTRACT)
+You may introduce new placeholder entities (e.g. `{{Event_1}}`, `{{Topic_1}}`, `{{Location_2}}`) to capture entities the extractor missed. But every new placeholder MUST:
+
+1. Use the braced form `{{Prefix_N}}` (e.g. `{{Event_1}}`, `{{Topic_1}}`) both in facts and in the transcript.
+2. Use a type-appropriate prefix: `Person`, `City`, `Country`, `Org`, `Event`, `Topic`, `Location`, `Thing`.
+3. Allocate the next free index within that prefix. Scan the transcript for BOTH bare tokens (`Prefix_N`) AND braced tokens (`{{Prefix_N}}`) — treat them as occupying the same index space. Pick the smallest integer above all observed values for that prefix. Do NOT reuse an index already taken by a bare placeholder from the local anonymizer.
+4. Be inserted into the transcript at the exact position of the real-world span it represents, replacing that span. Do NOT rephrase or reword any other text — only substitute spans for placeholders.
+5. Appear in at least one fact's subject or object.
+6. HARD REQUIREMENT: every placeholder token you reference in `facts` MUST also appear in `updated_transcript`. If a placeholder has no grounding span in the transcript, do NOT include it in facts — find or reuse a grounded entity instead.
+
+Pre-existing placeholders from the anonymizer are BARE (`Person_1`, `City_1`). Leave them bare in your output. Only placeholders YOU introduce use braced form (`{{Event_1}}`, `{{Topic_1}}`).
+
+## Output format
+Return ONLY a JSON object with exactly two keys:
+- `"facts"`: array of facts. Each has subject, predicate, object, relation_type, confidence. New placeholders appear in braced form `{{Event_1}}`.
+- `"updated_transcript"`: the anonymized transcript with your new braced placeholders substituted in place of the spans they represent. All other text verbatim.
+
+Set confidence to 0.9 for coreference-resolved facts, 0.8 for inferred facts. Keep original confidence for unchanged facts.
+If no facts survive, return `{{"facts": [], "updated_transcript": "..."}}` with the transcript unchanged.
+
+Conversation transcript (anonymized):
+{transcript}
+
+Extracted facts (anonymized):
+{facts_json}

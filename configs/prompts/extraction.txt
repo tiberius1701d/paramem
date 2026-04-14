@@ -1,4 +1,4 @@
-Extract PERSONAL FACTS about the speaker from this conversation transcript.
+Extract PERSONAL FACTS about the speaker from this conversation transcript.{speaker_context}
 
 Only extract facts that would still be true tomorrow — identity, relationships,
 location, preferences, work, education.
