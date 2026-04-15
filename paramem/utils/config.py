@@ -92,22 +92,6 @@ class ConsolidationConfig:
 
 
 @dataclass
-class DistillationConfig:
-    enabled: bool = False
-    model_id: str = "google/gemma-2-9b-it"
-    quantization: str = "nf4"
-    compute_dtype: str = "bfloat16"
-    trust_remote_code: bool = True
-    max_memory_gpu: str = "7GiB"
-    max_memory_cpu: str = "20GiB"
-    cpu_offload: bool = True
-    default_subject_name: str = "the user"
-    temperature: float = 0.2
-    max_new_tokens: int = 2048
-    repetition_penalty: float = 1.1
-
-
-@dataclass
 class WandbConfig:
     project: str = "paramem"
     entity: str = ""
@@ -130,7 +114,6 @@ class ParaMemConfig:
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
     consolidation: ConsolidationConfig = field(default_factory=ConsolidationConfig)
-    distillation: DistillationConfig = field(default_factory=DistillationConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
 
@@ -173,11 +156,6 @@ def load_config(
     replay = _build_dataclass(ReplayConfig, replay_raw)
     replay.topics = [_build_dataclass(TopicConfig, t) for t in topics_raw]
 
-    distillation = _build_dataclass(
-        DistillationConfig,
-        raw.get("distillation", {}),
-    )
-
     return ParaMemConfig(
         model=model,
         adapters=adapters,
@@ -185,7 +163,6 @@ def load_config(
         replay=replay,
         graph=graph,
         consolidation=consolidation,
-        distillation=distillation,
         wandb=wandb_cfg,
         paths=paths,
     )

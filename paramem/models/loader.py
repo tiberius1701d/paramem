@@ -24,7 +24,7 @@ from transformers import (
     PreTrainedTokenizer,
 )
 
-from paramem.utils.config import AdapterConfig, DistillationConfig, ModelConfig
+from paramem.utils.config import AdapterConfig, ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -237,80 +237,6 @@ def load_base_model(
         model.config.pad_token_id = eos[0] if isinstance(eos, list) else eos
 
     _verify_device_placement(model, model_config)
-
-    return model, tokenizer
-
-
-def load_distillation_model(
-    config: DistillationConfig,
-) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
-    """Load a distillation model (instruct-class) for QA generation.
-
-    Supports CPU offload and memory caps for larger models like Gemma 2 9B.
-    """
-    logger.info("Loading distillation model: %s", config.model_id)
-
-    compute_dtype = getattr(torch, config.compute_dtype)
-
-    bnb_kwargs = {}
-    if config.cpu_offload:
-        bnb_kwargs["llm_int8_enable_fp32_cpu_offload"] = True
-
-    if config.quantization == "nf4":
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=compute_dtype,
-            bnb_4bit_use_double_quant=True,
-            **bnb_kwargs,
-        )
-    else:
-        quantization_config = None
-
-    if config.cpu_offload:
-        load_kwargs_full = {
-            "device_map": "auto",
-            "max_memory": {
-                0: config.max_memory_gpu,
-                "cpu": config.max_memory_cpu,
-            },
-            "trust_remote_code": config.trust_remote_code,
-        }
-    else:
-        load_kwargs_full = {
-            "device_map": {"": 0},
-            "trust_remote_code": config.trust_remote_code,
-        }
-    if quantization_config is not None:
-        # Compute dtype is already in the BnB config — don't pass torch_dtype
-        # (redundant, and triggers Transformers 5.x deprecation + CUDA race)
-        load_kwargs_full["quantization_config"] = quantization_config
-    else:
-        load_kwargs_full["torch_dtype"] = compute_dtype
-
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_id,
-        **load_kwargs_full,
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model_id,
-        trust_remote_code=config.trust_remote_code,
-    )
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        # Llama 3.1 declares multiple EOS tokens (turn-end markers); take the
-        # first since pad_token_id must be a single int.
-        eos = model.config.eos_token_id
-        model.config.pad_token_id = eos[0] if isinstance(eos, list) else eos
-
-    logger.info(
-        "Distillation model loaded: %s (%.1fM params, quantization=%s)",
-        config.model_id,
-        sum(p.numel() for p in model.parameters()) / 1e6,
-        config.quantization,
-    )
 
     return model, tokenizer
 

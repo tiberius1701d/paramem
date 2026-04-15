@@ -81,20 +81,6 @@ consolidation:
   entity_retirement_cycles: 5    # more lenient than key replay (NL reconstruction is noisier)
   entity_profile_variants: 2     # question variants per entity profile
 
-distillation:
-  enabled: false
-  model_id: "google/gemma-2-9b-it"
-  quantization: "nf4"
-  compute_dtype: "bfloat16"
-  trust_remote_code: true
-  max_memory_gpu: "7GiB"
-  max_memory_cpu: "20GiB"
-  cpu_offload: true
-  default_subject_name: "the user"
-  temperature: 0.2
-  max_new_tokens: 2048
-  repetition_penalty: 1.1
-
 wandb:
   project: "paramem"
   entity: ""  # Set via WANDB_ENTITY env var or override in your config

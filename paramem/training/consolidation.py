@@ -124,7 +124,6 @@ class ConsolidationLoop:
         graph_path: Optional[str | Path] = None,
         extraction_temperature: float = 0.0,
         extraction_max_tokens: int = 2048,
-        distillation_config=None,
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
         persist_graph: bool = True,
@@ -153,13 +152,6 @@ class ConsolidationLoop:
 
         self.extraction_temperature = extraction_temperature
         self.extraction_max_tokens = extraction_max_tokens
-
-        # Distillation pipeline (optional, for instruct-class model)
-        self.distillation_pipeline = None
-        if distillation_config and distillation_config.enabled:
-            from paramem.graph.distiller import DistillationPipeline
-
-            self.distillation_pipeline = DistillationPipeline(distillation_config)
 
         # Graph state
         self.merger = GraphMerger()
@@ -305,42 +297,28 @@ class ConsolidationLoop:
         logger.info("=== Extraction (session=%s) ===", session_id)
 
         # --- EXTRACT ---
-        if self.distillation_pipeline:
-            self.distillation_pipeline.load()
-            session_graph = self.distillation_pipeline.extract_graph(
-                session_transcript, session_id, speaker_name=speaker_name
-            )
-        else:
-            self._disable_gradient_checkpointing()
-            from peft import PeftModel as _PeftModel
+        self._disable_gradient_checkpointing()
+        from peft import PeftModel as _PeftModel
 
-            extraction_kwargs = dict(
-                temperature=self.extraction_temperature,
-                max_tokens=self.extraction_max_tokens,
-                prompts_dir=self.prompts_dir,
-                ha_context=ha_context,
-                stt_correction=stt_correction,
-                ha_validation=ha_validation,
-                noise_filter=noise_filter,
-                noise_filter_model=noise_filter_model,
-                noise_filter_endpoint=noise_filter_endpoint,
-                speaker_name=speaker_name,
-                ner_check=ner_check,
-                ner_model=ner_model,
-                plausibility_judge=plausibility_judge,
-                plausibility_stage=plausibility_stage,
-                verify_anonymization=verify_anonymization,
-            )
-            if isinstance(self.model, _PeftModel):
-                with self.model.disable_adapter():
-                    session_graph = extract_graph(
-                        self.model,
-                        self.tokenizer,
-                        session_transcript,
-                        session_id,
-                        **extraction_kwargs,
-                    )
-            else:
+        extraction_kwargs = dict(
+            temperature=self.extraction_temperature,
+            max_tokens=self.extraction_max_tokens,
+            prompts_dir=self.prompts_dir,
+            ha_context=ha_context,
+            stt_correction=stt_correction,
+            ha_validation=ha_validation,
+            noise_filter=noise_filter,
+            noise_filter_model=noise_filter_model,
+            noise_filter_endpoint=noise_filter_endpoint,
+            speaker_name=speaker_name,
+            ner_check=ner_check,
+            ner_model=ner_model,
+            plausibility_judge=plausibility_judge,
+            plausibility_stage=plausibility_stage,
+            verify_anonymization=verify_anonymization,
+        )
+        if isinstance(self.model, _PeftModel):
+            with self.model.disable_adapter():
                 session_graph = extract_graph(
                     self.model,
                     self.tokenizer,
@@ -348,6 +326,14 @@ class ConsolidationLoop:
                     session_id,
                     **extraction_kwargs,
                 )
+        else:
+            session_graph = extract_graph(
+                self.model,
+                self.tokenizer,
+                session_transcript,
+                session_id,
+                **extraction_kwargs,
+            )
 
         logger.info(
             "Extracted %d entities, %d relations",
@@ -374,19 +360,9 @@ class ConsolidationLoop:
             for r in session_graph.relations
         ]
 
-        qa_model = self.model
-        qa_tokenizer = self.tokenizer
-        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
-            qa_model = self.distillation_pipeline.model
-            qa_tokenizer = self.distillation_pipeline.tokenizer
-
         episodic_qa = generate_qa_from_relations(
-            session_relations, model=qa_model, tokenizer=qa_tokenizer
+            session_relations, model=self.model, tokenizer=self.tokenizer
         )
-
-        # Unload distillation model to free VRAM
-        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
-            self.distillation_pipeline.unload()
 
         # --- PROCEDURAL: separate extraction pass ---
         procedural_rels = []
@@ -634,14 +610,8 @@ class ConsolidationLoop:
         logger.info("Found %d procedural relations", len(procedural_relations))
 
         # Generate QA pairs
-        qa_model = self.model
-        qa_tokenizer = self.tokenizer
-        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
-            qa_model = self.distillation_pipeline.model
-            qa_tokenizer = self.distillation_pipeline.tokenizer
-
         new_qa = generate_qa_from_relations(
-            procedural_relations, model=qa_model, tokenizer=qa_tokenizer
+            procedural_relations, model=self.model, tokenizer=self.tokenizer
         )
         if not new_qa:
             return []
@@ -772,31 +742,12 @@ class ConsolidationLoop:
         )
 
         # --- 1. EXTRACT ---
-        if self.distillation_pipeline:
-            self.distillation_pipeline.load()
-            session_graph = self.distillation_pipeline.extract_graph(
-                session_transcript,
-                session_id,
-                speaker_name=speaker_name,
-            )
-        else:
-            # Disable adapters for extraction (use base model reasoning)
-            self._disable_gradient_checkpointing()
-            from peft import PeftModel as _PeftModel
+        # Disable adapters for extraction (use base model reasoning)
+        self._disable_gradient_checkpointing()
+        from peft import PeftModel as _PeftModel
 
-            if isinstance(self.model, _PeftModel):
-                with self.model.disable_adapter():
-                    session_graph = extract_graph(
-                        self.model,
-                        self.tokenizer,
-                        session_transcript,
-                        session_id,
-                        temperature=self.extraction_temperature,
-                        max_tokens=self.extraction_max_tokens,
-                        prompts_dir=self.prompts_dir,
-                        speaker_name=speaker_name,
-                    )
-            else:
+        if isinstance(self.model, _PeftModel):
+            with self.model.disable_adapter():
                 session_graph = extract_graph(
                     self.model,
                     self.tokenizer,
@@ -807,6 +758,17 @@ class ConsolidationLoop:
                     prompts_dir=self.prompts_dir,
                     speaker_name=speaker_name,
                 )
+        else:
+            session_graph = extract_graph(
+                self.model,
+                self.tokenizer,
+                session_transcript,
+                session_id,
+                temperature=self.extraction_temperature,
+                max_tokens=self.extraction_max_tokens,
+                prompts_dir=self.prompts_dir,
+                speaker_name=speaker_name,
+            )
 
         result.entities_extracted = len(session_graph.entities)
         result.relations_extracted = len(session_graph.relations)
@@ -845,12 +807,6 @@ class ConsolidationLoop:
             }
             for r in session_graph.relations
         ]
-        qa_model = self.model
-        qa_tokenizer = self.tokenizer
-        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
-            qa_model = self.distillation_pipeline.model
-            qa_tokenizer = self.distillation_pipeline.tokenizer
-
         # When procedural adapter is enabled, exclude preference relations
         # from episodic — they route to procedural instead
         procedural_rels = []
@@ -863,8 +819,8 @@ class ConsolidationLoop:
 
         episodic_qa = generate_qa_from_relations(
             episodic_relations,
-            model=qa_model,
-            tokenizer=qa_tokenizer,
+            model=self.model,
+            tokenizer=self.tokenizer,
         )
 
         # Promotion: relations for promoted entities (cap to keep training bounded)
@@ -874,15 +830,11 @@ class ConsolidationLoop:
                 promote_relations = random.sample(promote_relations, 20)
             promote_qa = generate_qa_from_relations(
                 promote_relations,
-                model=qa_model,
-                tokenizer=qa_tokenizer,
+                model=self.model,
+                tokenizer=self.tokenizer,
             )
         else:
             promote_qa = []
-
-        # Unload distillation model before training to free VRAM
-        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
-            self.distillation_pipeline.unload()
 
         # --- 4b. INDEXED KEY REPLAY (F4.9c validated) ---
         if self.indexed_key_registry is not None:
@@ -1219,14 +1171,8 @@ class ConsolidationLoop:
         )
 
         # Generate QA pairs from preference relations
-        qa_model = self.model
-        qa_tokenizer = self.tokenizer
-        if self.distillation_pipeline and self.distillation_pipeline.is_loaded():
-            qa_model = self.distillation_pipeline.model
-            qa_tokenizer = self.distillation_pipeline.tokenizer
-
         new_qa = generate_qa_from_relations(
-            procedural_relations, model=qa_model, tokenizer=qa_tokenizer
+            procedural_relations, model=self.model, tokenizer=self.tokenizer
         )
         if not new_qa:
             return None
