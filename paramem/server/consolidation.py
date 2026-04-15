@@ -141,6 +141,11 @@ def run_consolidation(
             noise_filter=config.consolidation.extraction_noise_filter,
             noise_filter_model=config.consolidation.extraction_noise_filter_model,
             noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
+            ner_check=config.consolidation.extraction_ner_check,
+            ner_model=config.consolidation.extraction_ner_model,
+            plausibility_judge=config.consolidation.extraction_plausibility_judge,
+            plausibility_stage=config.consolidation.extraction_plausibility_stage,
+            verify_anonymization=config.consolidation.extraction_verify_anonymization,
         )
 
         # Increment key session counts while last_seen is still correct
@@ -178,11 +183,34 @@ def run_consolidation(
             "loop": loop,
         }
 
+    # --- Cross-session dedup on (subject, predicate, object) identity ---
+    # Applied before the simulate/train branch so both paths see the same
+    # post-dedup set. Duplicates arise when independent sessions extract the
+    # same triple (e.g. "Tobias listens_to Music" from two transcripts).
+    pre_ep, pre_pr = len(all_episodic_qa), len(all_procedural_rels)
+    all_episodic_qa = _dedup_episodic(all_episodic_qa)
+    all_procedural_rels = _dedup_procedural(all_procedural_rels)
+    if pre_ep != len(all_episodic_qa) or pre_pr != len(all_procedural_rels):
+        logger.info(
+            "Dedup: episodic %d→%d, procedural %d→%d",
+            pre_ep,
+            len(all_episodic_qa),
+            pre_pr,
+            len(all_procedural_rels),
+        )
+
     # --- Simulate mode: extract only, skip training ---
     simulate = config.consolidation.mode == "simulate"
     if simulate:
         if config.debug:
-            _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
+            try:
+                _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
+            except Exception:
+                logger.exception(
+                    "Simulation save failed — leaving %d sessions pending",
+                    len(session_ids),
+                )
+                raise
         session_buffer.mark_consolidated(session_ids)
         elapsed = time.time() - start_time
         summary = {
@@ -208,17 +236,24 @@ def run_consolidation(
     # Each QA pair already has its own speaker_id (tagged during extraction).
     # This fallback is only used when a relation lacks a speaker_id.
     primary_speaker = speaker_ids[-1] if speaker_ids else ""
-    train_result = loop.train_adapters(
-        all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
-    )
+    try:
+        train_result = loop.train_adapters(
+            all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
+        )
 
-    # Key-level promotion: promote keys that reached the threshold
-    newly_promoted = _promote_mature_keys(loop, config)
+        # Key-level promotion: promote keys that reached the threshold
+        newly_promoted = _promote_mature_keys(loop, config)
 
-    # --- Phase 3: Save ---
-    _save_keyed_pairs_for_router(loop, config)
-    _save_registry(loop, config)
-    _save_key_metadata(loop, config)
+        # --- Phase 3: Save ---
+        _save_keyed_pairs_for_router(loop, config)
+        _save_registry(loop, config)
+        _save_key_metadata(loop, config)
+    except Exception:
+        logger.exception(
+            "Consolidation failed during train/save — leaving %d sessions pending",
+            len(session_ids),
+        )
+        raise
 
     session_buffer.mark_consolidated(session_ids)
 
@@ -270,6 +305,43 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
         obj = qa.get("source_object", "").lower()
         if subject in session_entities or obj in session_entities:
             loop.key_sessions[key] = loop.key_sessions.get(key, 0) + 1
+
+
+def _dedup_episodic(qa_list: list[dict]) -> list[dict]:
+    """Deduplicate episodic QA by (source_subject, source_predicate, source_object).
+
+    Keeps the first occurrence. Case-insensitive on subject/object to collapse
+    minor casing drift across sessions. Entries missing any identity field fall
+    back to a per-object identity so they survive rather than collide.
+    """
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for qa in qa_list:
+        subj = (qa.get("source_subject") or "").strip().lower()
+        pred = (qa.get("source_predicate") or "").strip().lower()
+        obj = (qa.get("source_object") or "").strip().lower()
+        key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(qa))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(qa)
+    return out
+
+
+def _dedup_procedural(rels: list[dict]) -> list[dict]:
+    """Deduplicate procedural relations by (subject, predicate, object)."""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for rel in rels:
+        subj = (rel.get("subject") or "").strip().lower()
+        pred = (rel.get("predicate") or "").strip().lower()
+        obj = (rel.get("object") or "").strip().lower()
+        key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(rel))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rel)
+    return out
 
 
 def _save_simulation_results(

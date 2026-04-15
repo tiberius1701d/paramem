@@ -287,8 +287,15 @@ class TestSOTANoiseFilter:
         assert result is None
         assert anon_transcript == ""
 
-    def test_pipeline_anonymize_failure_returns_original(self):
-        """If anonymization fails, the original graph is returned unchanged."""
+    def test_pipeline_anonymize_failure_falls_back_to_raw_plausibility(self):
+        """If anonymization fails, the pipeline falls back to raw (local) plausibility (D8).
+
+        The old behavior was to return the original graph unchanged.
+        The new behavior runs _fallback_plausibility_on_raw so that tautologies,
+        role leaks, and other noise are still filtered even without SOTA.
+        The grounding gate inside the fallback may drop facts whose entities are
+        not grounded in the provided transcript — this is correct and expected.
+        """
         from paramem.graph.extractor import _sota_pipeline
 
         graph = _make_graph(
@@ -304,10 +311,18 @@ class TestSOTANoiseFilter:
                 "paramem.graph.extractor._anonymize_with_local_model",
                 return_value=(None, {}, ""),
             ),
+            # Pass model=None/tokenizer=None → _local_plausibility_filter skipped inside fallback
         ):
-            result = _sota_pipeline(graph, "transcript", None, None)
+            # Transcript "Alex lives in Millfield" grounds both entities.
+            result = _sota_pipeline(
+                graph, "Alex lives in Millfield", None, None, plausibility_judge="off"
+            )
+        # With plausibility_judge="off", fallback runs grounding + sweep only.
+        # Both entities ARE in the transcript → relation survives.
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
+        # Fallback path recorded in diagnostics.
+        assert result.diagnostics.get("fallback_path") == "anon_failed"
 
     def test_pipeline_enrichment_failure_keeps_anon_facts(self):
         """If enrichment fails, the anonymized facts pass through to de-anonymization."""
@@ -562,7 +577,14 @@ class TestSOTANoiseFilter:
         assert result.relations[0].object == "Millfield"
 
     def test_pipeline_drops_hallucinated_leak(self):
-        """A leaked name NOT in the transcript is classified hallucinated and dropped."""
+        """A leaked name NOT in the transcript is classified hallucinated and dropped (D1).
+
+        When "Ghost" is in anon_facts but not in the transcript, repair classifies it
+        as hallucinated and drops the referencing triple from anon_facts. After repair,
+        anon_facts is empty → the pipeline returns an empty graph (no triples survive,
+        SOTA is skipped). This is correct: a fact whose object is a hallucinated entity
+        should not reach the adapter.
+        """
         from paramem.graph.extractor import _sota_pipeline
 
         graph = _make_graph(
@@ -591,12 +613,11 @@ class TestSOTANoiseFilter:
         ):
             result = _sota_pipeline(graph, "Alex mentioned something.", None, None)
 
-        # The hallucinated triple is dropped from anon_facts; guard still flags
-        # the missing mapping, so SOTA is skipped. Graph is returned unchanged —
-        # callers run plausibility downstream to clean the hallucination.
-        assert filter_calls == []
-        assert len(result.relations) == 1
-        assert result.relations[0].object == "Ghost"
+        # The hallucinated triple is dropped during repair.
+        # After repair anon_facts is empty → grounding_gate="no_input", no facts survive.
+        assert filter_calls == [], "SOTA must not be called when anon_facts is empty after repair"
+        assert len(result.relations) == 0
+        assert result.diagnostics.get("grounding_gate") == "no_input"
 
     def test_pipeline_normalizes_mixed_direction_mapping_per_pair(self):
         """Mixed-direction mappings from the anonymizer are normalized per-pair.
@@ -931,3 +952,840 @@ class TestSimulationMode:
             saved = json.load(f)
         assert len(saved) == 1
         assert saved[0]["question"] == "Q"
+
+
+# ---------------------------------------------------------------------------
+# PR1 Alignment Tests — D1, D3, D4, D6, D7, D8, D9, D10, D13, D17, D18
+# ---------------------------------------------------------------------------
+
+
+class TestPlausibilityAnon:
+    """§7 test 1: _sota_pipeline with plausibility_stage="anon" (D3)."""
+
+    def test_anon_stage_plausibility_filters_subset(self):
+        """When plausibility_stage="anon" and a SOTA validator is configured, it runs
+        on the anonymized facts before de-anonymization and drops flagged entries."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [
+                ("Alex", "lives_in", "Millfield"),
+                ("Alex", "has_role", "Speaker"),  # role leak — should be dropped
+            ],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+                Entity(name="Speaker", entity_type="concept"),
+            ],
+        )
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
+            {"subject": "Person_1", "predicate": "has_role", "object": "Speaker"},
+        ]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_transcript = "Person_1 lives in City_1."
+
+        # Plausibility filter keeps only the lives_in fact
+        kept_anon = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, None),
+            ),
+            patch(
+                "paramem.graph.extractor._plausibility_filter_with_sota",
+                return_value=(kept_anon, "raw"),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                plausibility_judge="claude",
+                plausibility_stage="anon",
+            )
+
+        # Only the valid fact survives
+        assert len(result.relations) == 1
+        assert result.relations[0].predicate == "lives_in"
+        assert result.diagnostics.get("plausibility") == "anon"
+
+
+class TestPlausibilityDeanon:
+    """§7 test 2: _sota_pipeline with plausibility_stage="deanon" (D3)."""
+
+    def test_deanon_stage_plausibility_drops_tautology(self):
+        """Deanon-stage local plausibility receives real names and drops tautologies."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [
+                ("Alex", "lives_in", "Millfield"),
+                ("Alex", "has_name", "Alex"),  # tautology / self-loop
+            ],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
+            {"subject": "Person_1", "predicate": "has_name", "object": "Person_1"},
+        ]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_transcript = "Person_1 lives in City_1."
+
+        # Local plausibility drops the tautology, keeps lives_in
+        kept_deanon = [{"subject": "Alex", "predicate": "lives_in", "object": "Millfield"}]
+
+        local_plaus_calls = []
+
+        def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
+            local_plaus_calls.append((list(facts), transcript))
+            return kept_deanon
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, None),
+            ),
+            patch(
+                "paramem.graph.extractor._local_plausibility_filter",
+                side_effect=fake_local_plaus,
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                plausibility_judge="auto",
+                plausibility_stage="deanon",
+            )
+
+        # Plausibility ran and dropped the tautology
+        assert len(result.relations) == 1
+        assert result.relations[0].predicate == "lives_in"
+
+        # Verify the plausibility call received the ORIGINAL real-name transcript,
+        # NOT the anonymized transcript (privacy-critical per D1/D3 plan).
+        assert len(local_plaus_calls) == 1
+        _, transcript_arg = local_plaus_calls[0]
+        assert transcript_arg == "Alex lives in Millfield.", (
+            "Deanon-stage plausibility must receive original transcript, not anon_transcript"
+        )
+        assert result.diagnostics.get("plausibility") == "deanon"
+
+
+class TestResidualLeakDropsReferencingTriples:
+    """§7 test 3: D1 — residual leak drops referencing triples, non-referencing survive."""
+
+    def test_residual_leak_filters_fact_level(self):
+        """On residual leak after repair (canonical mapping), only leaked-name triples
+        are dropped. Non-referencing triples survive through the local path (SOTA skipped).
+
+        Setup: _repair_anonymization_leaks is mocked to return anon_facts that still
+        contain a leaked name in the object field, simulating a scenario where repair
+        cannot eliminate the leak. The second verify mock confirms the residual leak,
+        triggering fact-level filtering (_skip_sota=True).
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [
+                ("Alex", "lives_in", "Millfield"),
+                ("Alex", "friend_of", "Ghost"),  # referenced by the leak
+            ],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+                Entity(name="Ghost", entity_type="person"),
+            ],
+        )
+        # anon_facts still has Ghost (not anonymized in object position)
+        anon_facts_initial = [
+            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
+            {"subject": "Person_1", "predicate": "friend_of", "object": "Ghost"},
+        ]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_transcript = "Person_1 lives in City_1. Person_1 is friends with Ghost."
+        transcript = "Alex lives in Millfield. Alex is friends with Ghost."
+
+        sota_calls = []
+
+        def fake_sota(facts, *args, **kwargs):
+            sota_calls.append(list(facts))
+            return facts, None, None
+
+        # Mock repair to return anon_facts that STILL contain Ghost (residual leak)
+        def fake_repair(graph, mapping, anon_facts, anon_transcript, orig_transcript, leaked):
+            # Repair "runs" but Ghost remains in object position — residual leak
+            return (
+                anon_facts,
+                mapping,
+                anon_transcript,
+                {"missed_fixed": 0, "hallucinated_dropped": 0, "residual_dropped": 0},
+            )
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts_initial, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor._repair_anonymization_leaks",
+                side_effect=fake_repair,
+            ),
+            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+        ):
+            result = _sota_pipeline(
+                graph,
+                transcript,
+                None,
+                None,
+                plausibility_judge="off",
+            )
+
+        # SOTA must NOT be called (_skip_sota=True after residual leak)
+        assert sota_calls == [], "SOTA must be skipped on residual leak"
+        # The lives_in triple does NOT reference "Ghost" → survives
+        surviving_predicates = {r.predicate for r in result.relations}
+        assert "lives_in" in surviving_predicates
+        # The friend_of triple references "Ghost" (lowercase match) → dropped
+        assert "friend_of" not in surviving_predicates
+        # Diagnostics
+        assert "residual_leaked_triples_dropped" in result.diagnostics
+        assert result.diagnostics["residual_leaked_triples_dropped"] >= 1
+
+
+class TestAnonFailureFallback:
+    """§7 test 4: D8 — anon failure runs raw plausibility instead of returning original."""
+
+    def test_anon_failure_triggers_fallback(self):
+        """_sota_pipeline calls _fallback_plausibility_on_raw when anonymization fails."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+
+        fallback_calls = []
+
+        def fake_fallback(g, t, m, tok, reason):
+            fallback_calls.append(reason)
+            g.relations = []
+            g.entities = []
+            g.diagnostics["fallback_path"] = reason
+            return g
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(None, {}, ""),
+            ),
+            patch(
+                "paramem.graph.extractor._fallback_plausibility_on_raw",
+                side_effect=fake_fallback,
+            ),
+        ):
+            result = _sota_pipeline(graph, "transcript", None, None)
+
+        assert fallback_calls == ["anon_failed"], (
+            "fallback must be triggered with reason=anon_failed"
+        )
+        assert result.diagnostics.get("fallback_path") == "anon_failed"
+
+
+class TestAllDroppedSafetyNet:
+    """§7 test 5: D7 — all-dropped safety net triggers fallback."""
+
+    def test_all_dropped_triggers_fallback(self):
+        """When all relations are dropped by the grounding gate, _fallback_plausibility_on_raw runs.
+
+        The all-dropped safety net (D7) fires AFTER the full pipeline (deanon + grounding gate
+        + plausibility). If kept_relations is empty but original_count > 0, the pipeline
+        calls _fallback_plausibility_on_raw("all_dropped"). This happens when, e.g., the
+        grounding gate drops all SOTA-enriched entities as ungrounded world-knowledge inferences.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        # SOTA enrichment produces facts with no grounding in transcript ("Saturn", "Jupiter")
+        enriched_ungrounded = [
+            {"subject": "Saturn", "predicate": "orbits", "object": "Jupiter"},
+        ]
+
+        fallback_calls = []
+
+        def fake_fallback(g, t, m, tok, reason):
+            fallback_calls.append(reason)
+            g.diagnostics["fallback_path"] = reason
+            return g
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, "anon transcript"),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(enriched_ungrounded, None, None),
+            ),
+            patch(
+                "paramem.graph.extractor._fallback_plausibility_on_raw",
+                side_effect=fake_fallback,
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                # Short transcript — "Saturn" and "Jupiter" are not grounded here
+                "Alex lives in Millfield.",
+                None,
+                None,
+                plausibility_judge="off",
+            )
+
+        # Fallback must be called with reason="all_dropped"
+        assert "all_dropped" in fallback_calls, f"Expected all_dropped, got: {fallback_calls}"
+        assert result.diagnostics.get("fallback_path") == "all_dropped"
+
+
+class TestEntityTypePreservation:
+    """§7 test 6: D6 — entity types preserved, no "person" stampdown (regression)."""
+
+    def test_preserved_entity_types_pass_through(self):
+        """Entities pre-typed by _normalize_extraction keep their original types
+        after the pipeline even when mocked SOTA returns same facts."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [
+                ("Alex", "lives_in", "Frankfurt"),
+                ("Alex", "listens_to", "Music"),
+            ],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Frankfurt", entity_type="place"),
+                Entity(name="Music", entity_type="concept"),
+            ],
+        )
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
+            {"subject": "Person_1", "predicate": "listens_to", "object": "Thing_1"},
+        ]
+        mapping = {"Alex": "Person_1", "Frankfurt": "City_1", "Music": "Thing_1"}
+        anon_transcript = "Person_1 lives in City_1 and listens to Thing_1."
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, None),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex lives in Frankfurt and listens to Music.",
+                None,
+                None,
+                plausibility_judge="off",
+            )
+
+        entity_map = {e.name: e.entity_type for e in result.entities}
+        assert entity_map.get("Alex") == "person"
+        assert entity_map.get("Frankfurt") in ("place", "location")
+        assert entity_map.get("Music") == "concept", (
+            f"Music must be 'concept', not {entity_map.get('Music')!r}"
+        )
+
+    def test_sota_introduced_country_entity_typed_location(self):
+        """SOTA-introduced entity with Country_ placeholder is typed 'location', not 'person'."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "born_in", "Germany")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Germany", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "born_in", "object": "Country_1"}]
+        mapping = {"Alex": "Person_1", "Germany": "Country_1"}
+        anon_transcript = "Person_1 was born in Country_1."
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, None),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex was born in Germany.",
+                None,
+                None,
+                plausibility_judge="off",
+            )
+
+        entity_map = {e.name: e.entity_type for e in result.entities}
+        # Germany already existed in the graph as "place"; D6 preserves existing entity types.
+        # The Country_ → "location" mapping applies only to SOTA-*introduced* entities
+        # (names absent from the original graph). "place" and "location" both express
+        # geographic entities — accept both values.
+        assert entity_map.get("Germany") in ("place", "location"), (
+            f"Germany (Country_1) must be typed 'place' or 'location', "
+            f"not {entity_map.get('Germany')!r}"
+        )
+
+    def test_sota_introduced_entity_no_placeholder_typed_concept(self):
+        """SOTA-introduced entity with no placeholder (bare name) gets type 'concept', not 'person'.
+
+        D6 regression guard: entity with no reverse_mapping entry defaults to 'concept'.
+        China is NOT present in the original graph — only Alex is. SOTA enrichment
+        introduces China as a bare name (no anonymizer placeholder), so no
+        reverse_mapping entry exists. D6 ensures the fallback type is 'concept',
+        never 'person'.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        # Original graph has only Alex — no China entity
+        graph = _make_graph(
+            [("Alex", "has_plans", "Alex")],  # placeholder relation; SOTA will override
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+            ],
+        )
+        # Alex → Person_1 only; China is absent from the anonymization mapping
+        anon_facts = [{"subject": "Person_1", "predicate": "has_plans", "object": "Person_1"}]
+        mapping = {"Alex": "Person_1"}
+        anon_transcript = "Person_1 has plans."
+        # SOTA enrichment introduces China as a bare name with no placeholder equivalent
+        enriched_anon = [{"subject": "Person_1", "predicate": "visited", "object": "China"}]
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(enriched_anon, None, None),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex visited China.",
+                None,
+                None,
+                plausibility_judge="off",
+            )
+
+        entity_map = {e.name: e.entity_type for e in result.entities}
+        # China has no reverse_mapping entry → D6 safe fallback is "concept", not "person"
+        china_type = entity_map.get("China")
+        assert china_type == "concept", (
+            f"SOTA-introduced bare entity must be typed 'concept', not {china_type!r}"
+        )
+
+
+class TestFallbackPlausibilityOnRawHelper:
+    """§7 test 7: D10 — direct test of _fallback_plausibility_on_raw helper."""
+
+    def test_helper_removes_residual_placeholders(self):
+        """Helper drops facts containing residual placeholder tokens."""
+        from paramem.graph.extractor import _fallback_plausibility_on_raw
+
+        graph = _make_graph(
+            [
+                ("Alex", "lives_in", "City_1"),  # placeholder not resolved
+                ("Alex", "works_at", "Acme"),
+            ],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="City_1", entity_type="place"),
+                Entity(name="Acme", entity_type="organization"),
+            ],
+        )
+        result = _fallback_plausibility_on_raw(
+            graph,
+            "Alex works at Acme.",
+            None,
+            None,
+            reason="test_residual",
+        )
+        # City_1 is a placeholder token → the fact should be swept
+        surviving = {r.object for r in result.relations}
+        assert "City_1" not in surviving
+        assert result.diagnostics.get("fallback_path") == "test_residual"
+
+    def test_helper_records_fallback_path(self):
+        """Helper always records the reason in diagnostics."""
+        from paramem.graph.extractor import _fallback_plausibility_on_raw
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        result = _fallback_plausibility_on_raw(
+            graph, "Alex lives in Millfield.", None, None, reason="anon_failed"
+        )
+        assert result.diagnostics.get("fallback_path") == "anon_failed"
+
+
+class TestExtractGraphNewKwargs:
+    """§7 test 8: D4/D18 — new kwargs reach _sota_pipeline."""
+
+    def test_extract_graph_plumbs_ner_and_plausibility_kwargs(self):
+        """extract_graph forwards ner_check, ner_model, plausibility_judge,
+        plausibility_stage, verify_anonymization to _sota_pipeline."""
+        from paramem.graph.extractor import extract_graph
+
+        captured = {}
+
+        def fake_sota_pipeline(graph, transcript, model, tokenizer, **kwargs):
+            captured.update(kwargs)
+            return graph
+
+        graph_raw = json.dumps(
+            {
+                "entities": [{"name": "Alex", "entity_type": "person"}],
+                "relations": [],
+                "summary": "",
+            }
+        )
+
+        with (
+            patch(
+                "paramem.graph.extractor._generate_extraction",
+                return_value=graph_raw,
+            ),
+            patch(
+                "paramem.graph.extractor._sota_pipeline",
+                side_effect=fake_sota_pipeline,
+            ),
+        ):
+            # _sota_pipeline is only called when noise_filter is non-empty and
+            # there are relations — since our mock graph has no relations, we
+            # need to test the kwarg forwarding via a different approach.
+            pass
+
+        # Direct test: build a graph with relations and verify kwargs reach _sota_pipeline.
+        graph_with_rels = json.dumps(
+            {
+                "entities": [
+                    {"name": "Alex", "entity_type": "person"},
+                    {"name": "Millfield", "entity_type": "place"},
+                ],
+                "relations": [
+                    {
+                        "subject": "Alex",
+                        "predicate": "lives_in",
+                        "object": "Millfield",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    }
+                ],
+                "summary": "",
+            }
+        )
+        captured.clear()
+        with (
+            patch(
+                "paramem.graph.extractor._generate_extraction",
+                return_value=graph_with_rels,
+            ),
+            patch(
+                "paramem.graph.extractor._sota_pipeline",
+                side_effect=fake_sota_pipeline,
+            ),
+        ):
+            extract_graph(
+                None,
+                None,
+                "transcript",
+                "sess1",
+                noise_filter="anthropic",
+                ner_check=True,
+                ner_model="en_core_web_trf",
+                plausibility_judge="claude",
+                plausibility_stage="anon",
+                verify_anonymization=False,
+            )
+
+        assert captured.get("ner_check") is True
+        assert captured.get("ner_model") == "en_core_web_trf"
+        assert captured.get("plausibility_judge") == "claude"
+        assert captured.get("plausibility_stage") == "anon"
+        assert captured.get("verify_anonymization") is False
+
+    def test_extract_graph_default_temperature_zero(self):
+        """D14: extract_graph default temperature is 0.0 (was 0.3)."""
+        import inspect
+
+        from paramem.graph.extractor import extract_graph
+
+        sig = inspect.signature(extract_graph)
+        assert sig.parameters["temperature"].default == 0.0
+
+    def test_extract_graph_default_max_tokens_2048(self):
+        """D17: extract_graph default max_tokens is 2048 (was 1024)."""
+        import inspect
+
+        from paramem.graph.extractor import extract_graph
+
+        sig = inspect.signature(extract_graph)
+        assert sig.parameters["max_tokens"].default == 2048
+
+    def test_verify_anonymization_false_skips_guard(self):
+        """D18: verify_anonymization=False skips the forward-path privacy guard."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        # Mapping that would normally trigger a leak (Millfield not anonymized)
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Millfield"}]
+        mapping = {"Alex": "Person_1"}
+        anon_transcript = "Person_1 lives in Millfield."
+
+        verifier_calls = []
+
+        def fake_verify(*args, **kwargs):
+            verifier_calls.append(True)
+            return []  # report no leaks regardless
+
+        sota_calls = []
+
+        def fake_sota(facts, *args, **kwargs):
+            sota_calls.append(list(facts))
+            return facts, None, None
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor.verify_anonymization_completeness",
+                side_effect=fake_verify,
+            ),
+            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                verify_anonymization=False,
+                plausibility_judge="off",
+            )
+
+        # With verify_anonymization=False the guard function must not be called
+        assert verifier_calls == [], "verify_anonymization_completeness must be skipped when False"
+        # SOTA must have been called (no guard blocked it)
+        assert len(sota_calls) == 1
+
+
+class TestDiagnosticsKeys:
+    """§7 test 9: D13 — diagnostic keys populated after full pipeline run."""
+
+    def test_diagnostics_contains_plausibility_keys(self):
+        """After a deanon-stage plausibility run, diagnostics contains the expected keys."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_transcript = "Person_1 lives in City_1."
+
+        def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
+            return facts  # keep all
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, None),
+            ),
+            patch(
+                "paramem.graph.extractor._local_plausibility_filter",
+                side_effect=fake_local_plaus,
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                plausibility_judge="auto",
+                plausibility_stage="deanon",
+            )
+
+        assert "plausibility" in result.diagnostics, "diagnostics must contain 'plausibility'"
+        assert "plausibility_dropped" in result.diagnostics
+        assert "plausibility_judge_actual" in result.diagnostics
+        assert "anonymize" in result.diagnostics
+
+    def test_diagnostics_anonymize_key_populated_on_success(self):
+        """diagnostics['anonymize']='ok' when anonymization succeeds."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, "anon transcript"),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, None),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                plausibility_judge="off",
+            )
+
+        assert result.diagnostics.get("anonymize") == "ok"
+
+
+class TestConsolidationScheduleConfigPrivacyGuard:
+    """§7/§6 — privacy guard in ConsolidationScheduleConfig.__post_init__."""
+
+    def test_cloud_judge_plus_deanon_stage_raises(self):
+        """cloud provider + deanon stage must raise ValueError at construction."""
+        import pytest
+
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="Privacy violation"):
+            ConsolidationScheduleConfig(
+                extraction_plausibility_judge="anthropic",
+                extraction_plausibility_stage="deanon",
+            )
+
+    def test_cloud_judge_plus_anon_stage_ok(self):
+        """cloud provider + anon stage is safe and must not raise."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig(
+            extraction_plausibility_judge="claude",
+            extraction_plausibility_stage="anon",
+        )
+        assert cfg.extraction_plausibility_judge == "claude"
+        assert cfg.extraction_plausibility_stage == "anon"
+
+    def test_auto_judge_any_stage_ok(self):
+        """auto judge is always safe regardless of stage."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig(
+            extraction_plausibility_judge="auto",
+            extraction_plausibility_stage="deanon",
+        )
+        assert cfg.extraction_plausibility_judge == "auto"
+
+    def test_off_judge_any_stage_ok(self):
+        """off judge is always safe regardless of stage."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig(
+            extraction_plausibility_judge="off",
+            extraction_plausibility_stage="deanon",
+        )
+        assert cfg.extraction_plausibility_judge == "off"
+
+    def test_defaults_do_not_raise(self):
+        """Default config (auto/deanon) must not raise."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig()
+        assert cfg.extraction_plausibility_judge == "auto"
+        assert cfg.extraction_plausibility_stage == "deanon"
+
+    def test_minimal_yaml_loads_with_defaults(self, tmp_path):
+        """Back-compat: minimal yaml without new keys loads with all new defaults.
+
+        Pre-flight check #2 from alignment-plan-2026-04-15.md §12.
+        """
+        from paramem.server.config import load_server_config
+
+        minimal_yaml = tmp_path / "server.yaml"
+        minimal_yaml.write_text(
+            "model: mistral\nconsolidation:\n  schedule: every 2h\n  mode: simulate\n"
+        )
+        config = load_server_config(minimal_yaml)
+        # New fields must be present with defaults
+        assert config.consolidation.extraction_plausibility_judge == "auto"
+        assert config.consolidation.extraction_plausibility_stage == "deanon"
+        assert config.consolidation.extraction_verify_anonymization is True
+        assert config.consolidation.extraction_ner_check is False
+        assert config.consolidation.extraction_ner_model == "en_core_web_sm"

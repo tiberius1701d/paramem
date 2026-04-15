@@ -291,6 +291,11 @@ class ConsolidationLoop:
         noise_filter: str = "",
         noise_filter_model: str = "claude-sonnet-4-6",
         noise_filter_endpoint: str | None = None,
+        ner_check: bool = False,
+        ner_model: str = "en_core_web_sm",
+        plausibility_judge: str = "auto",
+        plausibility_stage: str = "deanon",
+        verify_anonymization: bool = True,
     ) -> tuple[list[dict], list[dict]]:
         """Extract and generate QA pairs from a session without training.
 
@@ -320,6 +325,11 @@ class ConsolidationLoop:
                 noise_filter_model=noise_filter_model,
                 noise_filter_endpoint=noise_filter_endpoint,
                 speaker_name=speaker_name,
+                ner_check=ner_check,
+                ner_model=ner_model,
+                plausibility_judge=plausibility_judge,
+                plausibility_stage=plausibility_stage,
+                verify_anonymization=verify_anonymization,
             )
             if isinstance(self.model, _PeftModel):
                 with self.model.disable_adapter():

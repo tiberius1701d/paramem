@@ -34,7 +34,7 @@ adapters:
     learning_rate: 5.0e-5
 
 consolidation:
-  schedule: "02:00"            # daily at this hour (empty string = manual only)
+  schedule: "every 2h"         # "HH:MM" (daily) or "every Nh"/"every Nm" (interval) or "" (manual only)
   mode: simulate               # "train" = full pipeline, "simulate" = extract only (saves graphs + QA to debug dir)
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
@@ -46,7 +46,29 @@ consolidation:
   extraction_ha_validation: true  # validate locations against HA home context
   extraction_noise_filter: anthropic  # SOTA provider for noise filtering ("" = disabled)
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
-  training_interval_hours: 2   # background training interval (0 = disabled)
+  # --- Extraction-pipeline stages (all configurable) ---
+  #
+  # Plausibility filter — final quality gate on extracted facts.
+  #
+  # Recommended default: local judge (`auto`) at the `deanon` stage.
+  #   * Zero cloud cost. Privacy-safe (real names stay local).
+  #   * Cross-family by construction (local model != cloud enricher).
+  #
+  # Alternative: SOTA judge at the `anon` stage (e.g. `claude`).
+  #   * Higher judgment quality. Paid.
+  #   * Runs on anonymized facts + anonymized transcript — cloud-safe.
+  #   * IMPORTANT: pick a family DIFFERENT from the enricher to avoid
+  #     same-family bias. Enricher=Claude -> judge with a non-Anthropic
+  #     provider (or stay local).
+  #
+  # `auto` => use the same local model that performed extraction.
+  # `off`  => disable plausibility entirely (not recommended).
+  extraction_plausibility_judge: auto
+  extraction_plausibility_stage: deanon         # "anon" | "deanon"
+
+  extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
+  extraction_ner_check: false                   # optional spaCy PII cross-check
+  extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
   # Thermal throttle: keeps the machine silent during background training.
   # Training pauses when GPU temp exceeds the limit and resumes when it cools.
   # Set to 0 to disable. Adjust to match your fan ramp-up threshold.

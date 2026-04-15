@@ -175,8 +175,8 @@ def extract_graph(
     tokenizer,
     transcript: str,
     session_id: str,
-    temperature: float = 0.3,
-    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
     prompts_dir: str | Path | None = None,
     validate: bool = True,
     ha_context: dict | None = None,
@@ -186,6 +186,11 @@ def extract_graph(
     noise_filter_model: str = "claude-sonnet-4-6",
     noise_filter_endpoint: str | None = None,
     speaker_name: str | None = None,
+    ner_check: bool = False,
+    ner_model: str = "en_core_web_sm",
+    plausibility_judge: str = "auto",
+    plausibility_stage: str = "deanon",
+    verify_anonymization: bool = True,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -193,18 +198,27 @@ def extract_graph(
     1. Extract candidate triples from transcript
     2. Correct STT entity names from assistant responses (configurable)
     3. Validate with HA context — location ground truth (configurable)
-    4. SOTA noise filter — anonymize → cloud filter → de-anonymize (configurable)
+    4. SOTA pipeline (anonymize → enrich → plausibility → de-anonymize, configurable)
 
     All filters fail gracefully — extraction result is preserved on any failure.
 
     Args:
+        temperature: Sampling temperature for extraction (default 0.0 for determinism).
+        max_tokens: Max output tokens for extraction (default 2048).
         prompts_dir: Optional override for prompt config directory.
-        validate: Run SOTA noise filter pass 4 (default True). Passes 2-3 have
+        validate: Run SOTA pipeline pass 4 (default True). Passes 2-3 have
             their own flags (stt_correction, ha_validation).
         ha_context: HA home config for location validation (from get_home_context).
         stt_correction: Correct entity names from assistant responses.
         ha_validation: Validate locations against HA home context.
         noise_filter: SOTA provider for noise filtering ("" = disabled).
+        ner_check: Enable spaCy NER cross-check for PII detection (default False).
+        ner_model: spaCy model for NER when ner_check=True.
+        plausibility_judge: Plausibility filter judge ("auto"=local, "off"=disabled,
+            or a SOTA provider name like "claude" for cloud judging at anon stage).
+        plausibility_stage: When to run plausibility ("deanon"=after de-anon,
+            "anon"=on anonymized data with SOTA judge).
+        verify_anonymization: Run forward-path privacy guard before SOTA (default True).
     """
     raw_output = _generate_extraction(
         model, tokenizer, transcript, temperature, max_tokens, prompts_dir, speaker_name
@@ -244,6 +258,11 @@ def extract_graph(
             provider=noise_filter,
             filter_model=noise_filter_model,
             endpoint=noise_filter_endpoint,
+            ner_check=ner_check,
+            ner_model=ner_model,
+            plausibility_judge=plausibility_judge,
+            plausibility_stage=plausibility_stage,
+            verify_anonymization=verify_anonymization,
         )
 
     return graph
@@ -703,6 +722,128 @@ Return ONLY a JSON array of the surviving facts, schema unchanged. If none, retu
 """
 
 
+# Registry of SOTA plausibility validators that see only anonymized data.
+# Keyed by the provider name callers pass as `plausibility_judge`.
+# "auto" and "off" are NOT in this registry — they are handled by the
+# deanon-stage (local judge) path; checking `judge in _PLAUSIBILITY_VALIDATORS`
+# before dispatching to the cloud prevents the "auto" crash on
+# `PROVIDER_KEY_ENV.get("auto")`.
+#
+# NOTE: This dict is duplicated from scripts/compare_extraction.py::VALIDATORS.
+# Both should stay in sync. TODO (PR2): move to a shared module to remove duplication.
+_PLAUSIBILITY_VALIDATORS: dict[str, dict] = {
+    "claude": {
+        "type": "cloud",
+        "provider": "anthropic",
+        "model_id": "claude-sonnet-4-6",
+        "key_env": "ANTHROPIC_API_KEY",
+    },
+}
+
+
+def _fallback_plausibility_on_raw(
+    graph: SessionGraph,
+    transcript: str,
+    model,
+    tokenizer,
+    reason: str,
+) -> SessionGraph:
+    """Fallback pipeline path: run local plausibility + grounding on raw (unanonymized) facts.
+
+    Used when anonymization fails entirely, when residual leaks after repair
+    render the mapping non-canonical (no safe SOTA path), or when the full
+    pipeline drops all relations.
+
+    Steps (ported from scripts/compare_extraction.py L722-795):
+    1. Serialize graph.relations to fact dicts.
+    2. Strip any residual placeholder tokens — records drops in diagnostics.
+    3. Drop ungrounded facts (empty known_names — no mapping available).
+    4. If non-empty, run local plausibility filter; keep raw on None return.
+    5. Rebuild Relations, canonicalize symmetric predicates, filter entities.
+    6. Record fallback_path in diagnostics.
+
+    Returns the modified graph in-place (graph.relations / graph.entities replaced).
+    """
+    from paramem.graph.schema import Relation
+
+    raw_facts = [
+        {
+            "subject": r.subject,
+            "predicate": r.predicate,
+            "object": r.object,
+            "relation_type": r.relation_type,
+            "confidence": r.confidence,
+        }
+        for r in graph.relations
+    ]
+
+    # Step 2: strip residual placeholders from raw facts (defensive)
+    raw_facts, res_dropped = _strip_residual_placeholders(raw_facts)
+    if res_dropped:
+        graph.diagnostics["residual_dropped_facts"] = res_dropped
+        logger.warning(
+            "_fallback_plausibility_on_raw: dropped %d fact(s) with residual placeholders",
+            len(res_dropped),
+        )
+
+    # Step 3: grounding gate with empty known_names (no mapping available)
+    raw_facts, ungrounded = _drop_ungrounded_facts(raw_facts, transcript, set())
+    if ungrounded:
+        graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
+        logger.warning(
+            "_fallback_plausibility_on_raw: dropped %d ungrounded fact(s)",
+            len(ungrounded),
+        )
+
+    # Step 4: local plausibility filter (uses real names)
+    if raw_facts and model is not None and tokenizer is not None:
+        filtered = _local_plausibility_filter(
+            raw_facts,
+            transcript,
+            model,
+            tokenizer,
+            max_tokens=_DEFAULT_FILTER_MAX_TOKENS,
+            temperature=_DEFAULT_FILTER_TEMPERATURE,
+        )
+        if filtered is not None:
+            pre = len(raw_facts)
+            raw_facts = filtered
+            dropped_count = pre - len(raw_facts)
+            if dropped_count:
+                graph.diagnostics["plausibility_dropped"] = dropped_count
+                graph.diagnostics["plausibility_judge_actual"] = "local_fallback"
+
+    # Step 5: rebuild Relations
+    kept_relations = []
+    for fact in raw_facts:
+        try:
+            kept_relations.append(
+                Relation(
+                    subject=fact.get("subject", ""),
+                    predicate=fact.get("predicate", ""),
+                    object=fact.get("object", ""),
+                    relation_type=fact.get("relation_type", "factual"),
+                    confidence=float(fact.get("confidence", 1.0)),
+                )
+            )
+        except Exception:
+            continue
+
+    kept_relations = _canonicalize_symmetric_predicates(kept_relations)
+    kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
+    graph.entities = [e for e in graph.entities if e.name in kept_names]
+    graph.relations = kept_relations
+
+    # Step 6: record fallback path
+    graph.diagnostics["fallback_path"] = reason
+    logger.info(
+        "_fallback_plausibility_on_raw: reason=%r, %d relation(s) surviving",
+        reason,
+        len(kept_relations),
+    )
+    return graph
+
+
 def _sota_pipeline(
     graph: SessionGraph,
     transcript: str,
@@ -713,21 +854,35 @@ def _sota_pipeline(
     endpoint: str | None = None,
     ner_check: bool = False,
     ner_model: str = "en_core_web_sm",
+    plausibility_judge: str = "auto",
+    plausibility_stage: str = "deanon",
+    verify_anonymization: bool = True,
 ) -> SessionGraph:
-    """Enrich extraction via local anonymization → SOTA enrichment → local de-anonymize.
+    """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
     Stages:
     1. Local anonymize    → facts + transcript with placeholders (one total mapping)
+    1d. Forward-path privacy guard (verify_anonymization=True): detect and repair leaks.
+        Residual leak after repair: fact-level filter + skip SOTA, OR fallback to raw
+        plausibility if mapping is non-canonical.
     2. SOTA enrichment    → coreference resolution + compound splitting + symmetric dedup
-    3. Local de-anonymize → restore real names
+    3a. Plausibility on anonymized data (plausibility_stage="anon", SOTA judge)
+    3b. De-anonymize + preserve pre-sweep snapshot
+    3c. Residual placeholder sweep
+    3d. Grounding gate
+    3e. Plausibility on de-anonymized data (plausibility_stage="deanon", local judge)
+    4. Build Relations + entity type rebuild + symmetric canonicalization
+    5. All-dropped safety net → fallback to raw plausibility
 
-    Plausibility filtering (drop self-loops, tautologies, placeholder leaks)
-    is a separate, composable step the caller can apply afterwards using any
-    model. See `_plausibility_filter_with_sota` (anonymized data, SOTA judge)
-    or `_local_plausibility_filter` (real-name data, local judge).
+    Falls back gracefully at every stage. Endpoint is forwarded for self-hosted
+    OpenAI-compatible providers.
 
-    Falls back to the prior stage's output on any single-stage failure.
-    Endpoint is forwarded for self-hosted OpenAI-compatible providers.
+    Plausibility judges:
+    - "auto"  → local model at deanon stage (zero cloud cost, privacy-safe)
+    - "off"   → disable plausibility entirely
+    - any SOTA provider name (e.g. "claude") → cloud judge at anon stage
+    - "anthropic", "openai", "google", etc. → cloud judge at anon stage
+      (must be combined with plausibility_stage="anon" to avoid PII exfiltration)
     """
     import os
 
@@ -760,10 +915,13 @@ def _sota_pipeline(
         graph, model, tokenizer, transcript=transcript
     )
     if anon_facts is None:
-        logger.warning("Anonymization failed — skipping SOTA enrichment")
-        return graph
+        logger.warning("Anonymization failed — falling back to raw plausibility")
+        graph.diagnostics["anonymize"] = "failed"
+        return _fallback_plausibility_on_raw(graph, transcript, model, tokenizer, "anon_failed")
     if not anon_facts:
         logger.info("Anonymization produced 0 facts — skipping SOTA pipeline")
+        graph.diagnostics["grounding_gate"] = "no_input"
+        graph.diagnostics["anonymize"] = "ok"
         graph.relations = []
         graph.entities = []
         return graph
@@ -779,73 +937,165 @@ def _sota_pipeline(
     # Forward-path privacy guard: verify no real name leaked past anonymization
     # before sending anything to the cloud. On leak, attempt deterministic
     # repair (extend mapping for missed names, drop triples for hallucinated
-    # ones). Only then fail-closed if residual leaks remain.
-    extra_pii = extract_pii_names_with_ner(transcript, ner_model) if ner_check else None
-    leaked = verify_anonymization_completeness(
-        graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
-    )
-    if leaked:
-        if _mapping_is_canonical(mapping):
-            logger.info("Repairing %d leaked name(s): %s", len(leaked), leaked[:5])
-            anon_facts, mapping, anon_transcript, repair_status = _repair_anonymization_leaks(
-                graph, mapping, anon_facts, anon_transcript, transcript, leaked
-            )
-            logger.info(
-                "Repair: missed_fixed=%d hallucinated_dropped=%d",
-                repair_status["missed_fixed"],
-                repair_status["hallucinated_dropped"],
-            )
-            leaked = verify_anonymization_completeness(
-                graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
-            )
+    # ones). If residual leaks remain after repair:
+    #   - mapping canonical → fact-level filter, skip SOTA, continue locally.
+    #   - mapping non-canonical → fallback to raw plausibility (cannot safely repair).
+    graph.diagnostics["anonymize"] = "ok"
+    _skip_sota = False
+    if verify_anonymization:
+        extra_pii = extract_pii_names_with_ner(transcript, ner_model) if ner_check else None
+        leaked = verify_anonymization_completeness(
+            graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
+        )
         if leaked:
-            # Residual leak after repair: the transcript still contains real
-            # names we cannot scrub (they're not in the mapping). Sending it to
-            # SOTA would violate the privacy guarantee, so skip SOTA entirely
-            # and return the original extraction unchanged. Callers can still
-            # run plausibility on this output downstream.
-            logger.warning(
-                "Residual leaks after repair (%s); skipping SOTA call to preserve privacy.",
-                leaked[:5],
-            )
-            return graph
+            if _mapping_is_canonical(mapping):
+                logger.info("Repairing %d leaked name(s): %s", len(leaked), leaked[:5])
+                anon_facts, mapping, anon_transcript, repair_status = _repair_anonymization_leaks(
+                    graph, mapping, anon_facts, anon_transcript, transcript, leaked
+                )
+                logger.info(
+                    "Repair: missed_fixed=%d hallucinated_dropped=%d",
+                    repair_status["missed_fixed"],
+                    repair_status["hallucinated_dropped"],
+                )
+                leaked = verify_anonymization_completeness(
+                    graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
+                )
+                if leaked:
+                    # Residual leak after repair with canonical mapping:
+                    # drop facts that reference leaked names, skip SOTA, continue locally.
+                    leaked_lc = {n.lower() for n in leaked}
+                    pre_filter = len(anon_facts)
+                    anon_facts = [
+                        f
+                        for f in anon_facts
+                        if not (
+                            str(f.get("subject", "")).lower() in leaked_lc
+                            or str(f.get("object", "")).lower() in leaked_lc
+                        )
+                    ]
+                    dropped_count = pre_filter - len(anon_facts)
+                    graph.diagnostics["residual_leaked_triples_dropped"] = dropped_count
+                    graph.diagnostics["residual_leaked"] = leaked[:10]
+                    graph.diagnostics["anonymize"] = "leaked_repaired"
+                    _skip_sota = True
+                    logger.warning(
+                        "Residual leaks after repair (%s); dropped %d triple(s) referencing "
+                        "leaked names, skipping SOTA.",
+                        leaked[:5],
+                        dropped_count,
+                    )
+            else:
+                # Non-canonical mapping — cannot safely repair. Fall back to raw plausibility.
+                logger.warning(
+                    "Residual leaks with non-canonical mapping (%s); falling back to raw "
+                    "plausibility.",
+                    leaked[:5],
+                )
+                graph.diagnostics["anonymize"] = "leaked_noncanonical"
+                return _fallback_plausibility_on_raw(
+                    graph, transcript, model, tokenizer, "anon_leaked_noncanonical"
+                )
 
     # Step 2: SOTA enrichment — coreference + compound splitting + safe reification.
-    # Brace every known placeholder at the SOTA boundary so the enricher sees a
-    # consistent `{Prefix_N}` convention throughout its input. SOTA continues the
-    # pattern for any new placeholders it introduces; we diff updated transcript
-    # vs input to recover their bindings.
-    known_placeholders = set(mapping.values())
-    braced_transcript = _brace_placeholders_in_text(anon_transcript, known_placeholders)
-    braced_facts = _brace_placeholders_in_facts(anon_facts, known_placeholders)
-    enriched_anon, updated_anon_transcript, _sota_raw = _filter_with_sota(
-        braced_facts, api_key, provider, filter_model, braced_transcript, endpoint=endpoint
-    )
-    anon_transcript = braced_transcript  # bindings diff is against what we sent
-    if enriched_anon is None:
-        logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
+    # Skipped when _skip_sota=True (residual leak after repair with canonical mapping).
+    updated_anon_transcript = None
+    _sota_raw = None
+    if _skip_sota:
+        # Skip SOTA — use filtered anon_facts as-is.
         enriched_anon = anon_facts
+        logger.info(
+            "Skipping SOTA enrichment (residual leak path); using %d fact(s)", len(anon_facts)
+        )
+    else:
+        # Brace every known placeholder at the SOTA boundary so the enricher sees a
+        # consistent `{Prefix_N}` convention throughout its input. SOTA continues the
+        # pattern for any new placeholders it introduces; we diff updated transcript
+        # vs input to recover their bindings.
+        known_placeholders = set(mapping.values())
+        braced_transcript = _brace_placeholders_in_text(anon_transcript, known_placeholders)
+        braced_facts = _brace_placeholders_in_facts(anon_facts, known_placeholders)
+        enriched_anon, updated_anon_transcript, _sota_raw = _filter_with_sota(
+            braced_facts, api_key, provider, filter_model, braced_transcript, endpoint=endpoint
+        )
+        anon_transcript = braced_transcript  # bindings diff is against what we sent
+        if enriched_anon is None:
+            logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
+            enriched_anon = anon_facts
 
+        if not enriched_anon:
+            logger.info("SOTA enrichment removed all relations")
+
+        # Step 2b: recover bindings for SOTA-introduced placeholders via transcript diff.
+        # SOTA must insert braced tokens (e.g. `{Event_1}`) in the updated transcript at
+        # the position of the span they represent. Ungrounded placeholders (those in
+        # facts but not in the updated transcript) are caught by the residual sweep below.
+        if updated_anon_transcript:
+            bindings = _extract_sota_bindings(anon_transcript, updated_anon_transcript)
+            for real_span, placeholder in bindings.items():
+                mapping.setdefault(real_span, placeholder)
+            if bindings:
+                logger.info("SOTA introduced %d new binding(s) via transcript diff", len(bindings))
+        # Strip braces from subject/object fields so downstream lookups use bare tokens.
+        enriched_anon = _strip_placeholder_braces(enriched_anon)
+
+    # Step 3a: Plausibility on anonymized data (SOTA judge, stage="anon").
+    # Only runs when: explicit SOTA provider, plausibility_stage=="anon", not _skip_sota,
+    # and enriched_anon is non-empty.
+    # Guard: use `plausibility_judge in _PLAUSIBILITY_VALIDATORS` (NOT != "off") —
+    # "auto" is not in the registry and would crash PROVIDER_KEY_ENV.get("auto").
+    if (
+        plausibility_stage == "anon"
+        and plausibility_judge in _PLAUSIBILITY_VALIDATORS
+        and not _skip_sota
+        and enriched_anon
+    ):
+        pv_info = _PLAUSIBILITY_VALIDATORS[plausibility_judge]
+        pv_key = os.environ.get(pv_info["key_env"], "")
+        if pv_key:
+            plaus_facts, plaus_raw = _plausibility_filter_with_sota(
+                enriched_anon,
+                pv_key,
+                provider=pv_info["provider"],
+                filter_model=pv_info["model_id"],
+                anon_transcript=anon_transcript,
+                endpoint=pv_info.get("endpoint"),
+                max_tokens=_DEFAULT_FILTER_MAX_TOKENS,
+                temperature=_DEFAULT_FILTER_TEMPERATURE,
+            )
+            if plaus_facts is not None:
+                pre_plaus = len(enriched_anon)
+                enriched_anon = plaus_facts
+                dropped_plaus = pre_plaus - len(enriched_anon)
+                graph.diagnostics["plausibility"] = "anon"
+                graph.diagnostics["plausibility_dropped"] = dropped_plaus
+                graph.diagnostics["plausibility_judge_actual"] = plausibility_judge
+                if plaus_raw:
+                    graph.diagnostics["sota_plausibility_raw_response"] = plaus_raw
+                logger.info(
+                    "Anon-stage plausibility (%s): %d → %d facts (%d dropped)",
+                    plausibility_judge,
+                    pre_plaus,
+                    len(enriched_anon),
+                    dropped_plaus,
+                )
+            else:
+                logger.warning("Anon-stage plausibility call failed — keeping enriched facts")
+        else:
+            logger.warning(
+                "Anon-stage plausibility: no API key for %r — skipping", plausibility_judge
+            )
+
+    # Empty-check guard (compare L1019-1028): if enriched_anon is empty after
+    # anon-stage plausibility (or was already empty), return early.
     if not enriched_anon:
-        logger.info("SOTA enrichment removed all relations")
+        logger.info("No facts remain after anon-stage plausibility — returning empty graph")
+        graph.diagnostics["grounding_gate"] = "no_input"
         graph.relations = []
         graph.entities = []
         return graph
 
-    # Step 2b: recover bindings for SOTA-introduced placeholders via transcript diff.
-    # SOTA must insert braced tokens (e.g. `{Event_1}`) in the updated transcript at
-    # the position of the span they represent. Ungrounded placeholders (those in
-    # facts but not in the updated transcript) are caught by the residual sweep below.
-    if updated_anon_transcript:
-        bindings = _extract_sota_bindings(anon_transcript, updated_anon_transcript)
-        for real_span, placeholder in bindings.items():
-            mapping.setdefault(real_span, placeholder)
-        if bindings:
-            logger.info("SOTA introduced %d new binding(s) via transcript diff", len(bindings))
-    # Strip braces from subject/object fields so downstream lookups use bare tokens.
-    enriched_anon = _strip_placeholder_braces(enriched_anon)
-
-    # Step 3: De-anonymize — reverse the mapping for all surviving/new relations.
+    # Step 3b: De-anonymize — reverse the mapping for all surviving/new relations.
     # Extended mapping from repair + SOTA bindings is already included in `mapping`.
     reverse_mapping = {v: k for k, v in mapping.items()}
     from paramem.graph.schema import Entity, Relation
@@ -862,7 +1112,7 @@ def _sota_pipeline(
             }
         )
 
-    # Deterministic placeholder sweep — drop any fact where SOTA invented a
+    # Step 3c: Deterministic placeholder sweep — drop any fact where SOTA invented a
     # placeholder or de-anon couldn't resolve one. Either case would ship a
     # literal "Person_3" string into the adapter.
     deanon_facts, dropped_facts = _strip_residual_placeholders(deanon_facts)
@@ -873,11 +1123,11 @@ def _sota_pipeline(
             len(dropped_facts),
         )
 
-    # Final privacy gate: every surviving fact's subject and object must be
-    # grounded in the original transcript OR be a known real-name placeholder
-    # from the mapping. Catches SOTA world-knowledge inferences (e.g. inferring
-    # "CIA" from a transcript that only mentions "Langley") — those entities
-    # are dropped because they never existed in the user's actual words.
+    # Step 3d: Grounding gate — every surviving fact's subject and object must be
+    # grounded in the original transcript OR be a known real-name from the mapping.
+    # Catches SOTA world-knowledge inferences (e.g. inferring "CIA" from a
+    # transcript that only mentions "Langley") — those entities are dropped because
+    # they never existed in the user's actual words.
     known_real_names = set(mapping.keys())
     deanon_facts, ungrounded = _drop_ungrounded_facts(deanon_facts, transcript, known_real_names)
     if ungrounded:
@@ -892,6 +1142,47 @@ def _sota_pipeline(
         graph.diagnostics["sota_raw_response"] = _sota_raw
     if updated_anon_transcript:
         graph.diagnostics["sota_updated_transcript"] = updated_anon_transcript
+
+    # Step 3e: Plausibility on de-anonymized data (local judge, stage="deanon").
+    # Runs when plausibility_judge != "off" AND plausibility_stage == "deanon"
+    # AND model/tokenizer are available (guard against tests that pass None).
+    # "auto" resolves to the local model. Receives the ORIGINAL real-name transcript
+    # (NOT anon_transcript) — privacy-critical when _skip_sota=True (leaked names
+    # may still be in anon_transcript but are safe in the real transcript).
+    if (
+        plausibility_stage == "deanon"
+        and plausibility_judge != "off"
+        and deanon_facts
+        and model is not None
+        and tokenizer is not None
+    ):
+        filtered_deanon = _local_plausibility_filter(
+            deanon_facts,
+            transcript,  # original real-name transcript — intentional, see docstring
+            model,
+            tokenizer,
+            max_tokens=_DEFAULT_FILTER_MAX_TOKENS,
+            temperature=_DEFAULT_FILTER_TEMPERATURE,
+        )
+        if filtered_deanon is not None:
+            pre_deanon = len(deanon_facts)
+            deanon_facts = filtered_deanon
+            dropped_deanon = pre_deanon - len(deanon_facts)
+            graph.diagnostics["plausibility"] = "deanon"
+            graph.diagnostics["plausibility_dropped"] = (
+                graph.diagnostics.get("plausibility_dropped", 0) + dropped_deanon
+            )
+            graph.diagnostics["plausibility_judge_actual"] = (
+                plausibility_judge if plausibility_judge != "auto" else "local"
+            )
+            logger.info(
+                "Deanon-stage plausibility (local): %d → %d facts (%d dropped)",
+                pre_deanon,
+                len(deanon_facts),
+                dropped_deanon,
+            )
+        else:
+            logger.warning("Deanon-stage plausibility call failed — keeping deanon facts")
 
     kept_relations = []
     for fact in deanon_facts:
@@ -908,24 +1199,49 @@ def _sota_pipeline(
         except Exception:
             continue
 
-    # Deterministic safety net for symmetric-predicate canonicalization.
+    # Step 4: Deterministic safety net for symmetric-predicate canonicalization.
     # The enrichment prompt asks the LLM to drop the inverse direction; this
     # guards against the LLM leaving both. Local-only, no extra API call.
     kept_relations = _canonicalize_symmetric_predicates(kept_relations)
 
-    # Rebuild entity list from surviving + new relations
+    # Step 5: All-dropped safety net — if every relation was dropped and the
+    # original extraction had facts, fall back to raw plausibility so the
+    # session does not yield zero facts due to anonymizer inconsistency.
+    if not kept_relations and original_count > 0:
+        logger.warning(
+            "All %d relation(s) dropped by pipeline — triggering all_dropped fallback",
+            original_count,
+        )
+        return _fallback_plausibility_on_raw(graph, transcript, model, tokenizer, "all_dropped")
+
+    # Rebuild entity list from surviving + new relations.
+    # Every relation endpoint must have a corresponding Entity record.
+    # D6: widened type_map covers all 5 anonymizer placeholder prefixes
+    # (Person_, City_, Country_, Org_, Thing_). Safe fallback is "concept",
+    # never "person" — that would stamp locations, media, and free-text
+    # entities as persons, as confirmed by sim_20260415_160543/graph.json.
     kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
     existing_names = {e.name for e in graph.entities}
     graph.entities = [e for e in graph.entities if e.name in kept_names]
-    # Add entities for newly resolved coreferences
     for name in kept_names - existing_names:
-        # Infer entity type from placeholder prefix (Person_, City_, Org_, etc.)
-        entity_type = "person"
+        # Infer entity type from anonymizer placeholder prefix when available.
+        # Anonymizer prefixes (configs/prompts/anonymization.txt):
+        #   Person_, City_, Country_, Org_, Thing_
+        # Safe fallback is "concept" (matches _normalize_extraction for unknown types).
+        # Never default to "person" — that stamps locations, media, devices, and
+        # free-text entities as persons.
+        entity_type = "concept"
         placeholder = reverse_mapping.get(name)
         if placeholder:
             prefix = placeholder.split("_")[0].lower()
-            type_map = {"person": "person", "city": "location", "org": "organization"}
-            entity_type = type_map.get(prefix, "person")
+            type_map = {
+                "person": "person",
+                "city": "location",
+                "country": "location",
+                "org": "organization",
+                "thing": "concept",
+            }
+            entity_type = type_map.get(prefix, "concept")
         graph.entities.append(Entity(name=name, entity_type=entity_type))
 
     graph.relations = kept_relations

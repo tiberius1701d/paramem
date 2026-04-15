@@ -211,7 +211,9 @@ class VoiceConfig:
 
 @dataclass
 class ConsolidationScheduleConfig:
-    schedule: str = "02:00"
+    schedule: str = (
+        "every 2h"  # "HH:MM" (daily) or "every Nh"/"every Nm" (interval) or "" (manual only)
+    )
     mode: str = "train"  # "train" = full pipeline, "simulate" = extract only
     promotion_threshold: int = 3
     retain_sessions: bool = True
@@ -224,9 +226,47 @@ class ConsolidationScheduleConfig:
     extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)
     extraction_noise_filter_model: str = "claude-sonnet-4-6"  # model for noise filtering
     extraction_noise_filter_endpoint: str = ""  # custom endpoint for OpenAI-compatible providers
-    training_interval_hours: int = 2  # background training interval (0 = disabled)
     training_temp_limit: int = 0  # GPU temp ceiling for background training (0 = disabled)
     training_temp_check_interval: int = 5  # check temp every N training steps
+    # --- Extraction-pipeline stages (all configurable) ---
+    #
+    # Plausibility filter: final quality gate on extracted facts.
+    #   "auto" → local judge at deanon stage (zero cloud cost, privacy-safe)
+    #   "off"  → disable plausibility entirely (not recommended)
+    #   SOTA provider name (e.g. "claude") → cloud judge at anon stage (paid,
+    #     runs on anonymized data only). IMPORTANT: use stage="anon" with any
+    #     cloud provider — stage="deanon" with a cloud provider sends real names
+    #     to the cloud and is rejected at server start.
+    extraction_plausibility_judge: str = "auto"
+    extraction_plausibility_stage: str = "deanon"  # "anon" | "deanon"
+    extraction_verify_anonymization: bool = True  # forward-path privacy guard
+    extraction_ner_check: bool = False  # optional spaCy PII cross-check
+    extraction_ner_model: str = "en_core_web_sm"  # spaCy model when ner_check=True
+
+    def __post_init__(self) -> None:
+        """Validate privacy-critical config combinations at construction time.
+
+        Raises ValueError if a cloud SOTA provider is configured as the
+        plausibility judge AND the stage is set to "deanon". That combination
+        would send real (de-anonymized) names to a cloud API, violating the
+        privacy guarantee. Yaml comments alone are insufficient enforcement.
+
+        Safe combinations:
+        - judge="auto"  + any stage  → local model, no cloud exposure
+        - judge="off"   + any stage  → plausibility disabled, no cloud exposure
+        - judge=<cloud> + stage="anon" → cloud judge on anonymized data only
+        """
+        judge = self.extraction_plausibility_judge
+        stage = self.extraction_plausibility_stage
+        # "auto" and "off" are always safe (local or disabled). Any other value
+        # is treated as a cloud provider name.
+        if judge not in ("auto", "off") and stage == "deanon":
+            raise ValueError(
+                f"Privacy violation: extraction_plausibility_judge={judge!r} + "
+                f"extraction_plausibility_stage='deanon' would send REAL NAMES to a "
+                f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
+                f"local judging."
+            )
 
 
 @dataclass
