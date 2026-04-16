@@ -44,7 +44,7 @@ def _make_graph_from_spec(
 
 # Simulated transcript representative of a home-assistant conversation
 _SMOKE_TRANSCRIPT = """\
-User: Good morning! I am calling from the office in Kelkheim/Taunus.
+User: Good morning! I am calling from the office in Portland.
 Assistant: Good morning! How can I help you today?
 User: Please turn on the Office Speaker and play HR3 from Royal Radio.
 Assistant: Playing HR3 on the Office Speaker.
@@ -63,15 +63,15 @@ class TestAlignmentSmoke:
         """Build a representative graph + anonymization mock return values."""
         graph = _make_graph_from_spec(
             relations=[
-                ("Tobias", "located_at", "Kelkheim/Taunus"),
-                ("Tobias", "has_role", "User"),  # role leak — should be dropped by plausibility
+                ("Alex", "located_at", "Portland"),
+                ("Alex", "has_role", "User"),  # role leak — should be dropped by plausibility
                 ("Office Speaker", "plays", "HR3"),
-                ("Tobias", "listens_to", "Music"),  # noise — plausibility should drop
-                ("Tobias", "requested", "Uptown Funk"),
+                ("Alex", "listens_to", "Music"),  # noise — plausibility should drop
+                ("Alex", "requested", "Uptown Funk"),
             ],
             entity_specs=[
-                ("Tobias", "person"),
-                ("Kelkheim/Taunus", "place"),
+                ("Alex", "person"),
+                ("Portland", "place"),
                 ("Office Speaker", "concept"),
                 ("HR3", "concept"),
                 ("Royal Radio", "organization"),
@@ -87,8 +87,8 @@ class TestAlignmentSmoke:
             {"subject": "Person_1", "predicate": "requested", "object": "Thing_4"},
         ]
         mapping = {
-            "Tobias": "Person_1",
-            "Kelkheim/Taunus": "City_1",
+            "Alex": "Person_1",
+            "Portland": "City_1",
             "Office Speaker": "Thing_1",
             "HR3": "Thing_2",
             "Music": "Thing_3",
@@ -136,11 +136,11 @@ class TestAlignmentSmoke:
 
         entity_map = {e.name: e.entity_type for e in result.entities}
 
-        # Tobias is the only actual person
+        # Alex is the only actual person
         for name, etype in entity_map.items():
-            if name == "Tobias":
-                assert etype == "person", f"Tobias must be 'person', got {etype!r}"
-            elif name in ("Kelkheim/Taunus",):
+            if name == "Alex":
+                assert etype == "person", f"Alex must be 'person', got {etype!r}"
+            elif name in ("Portland",):
                 assert etype in ("place", "location"), (
                     f"{name!r} must be place/location, got {etype!r}"
                 )

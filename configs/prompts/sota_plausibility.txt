@@ -21,12 +21,12 @@ Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, o
 ## Examples
 
 Input fact: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)
-Input fact: `{{"subject": "Tobias", "predicate": "lives_in", "object": "Kelkheim"}}` → KEEP
-Input fact: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Tobias"}}` → DROP (R3)
-Input fact: `{{"subject": "Tobias", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)
-Input fact: `{{"subject": "Tobias", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)
-Input fact: `{{"subject": "Tobias", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP
-Input fact: `{{"subject": "Tobias", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)
+Input fact: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP
+Input fact: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)
+Input fact: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)
+Input fact: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)
+Input fact: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP
+Input fact: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)
 
 ## Input
 

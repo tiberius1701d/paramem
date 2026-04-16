@@ -186,7 +186,7 @@ def run_consolidation(
     # --- Cross-session dedup on (subject, predicate, object) identity ---
     # Applied before the simulate/train branch so both paths see the same
     # post-dedup set. Duplicates arise when independent sessions extract the
-    # same triple (e.g. "Tobias listens_to Music" from two transcripts).
+    # same triple (e.g. "Alex listens_to Music" from two transcripts).
     pre_ep, pre_pr = len(all_episodic_qa), len(all_procedural_rels)
     all_episodic_qa = _dedup_episodic(all_episodic_qa)
     all_procedural_rels = _dedup_procedural(all_procedural_rels)
