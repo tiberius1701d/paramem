@@ -4,7 +4,7 @@
 #   - User, WorkingDirectory, ExecStart
 #
 # Install:
-#   sudo cp scripts/paramem-server.service /etc/systemd/system/
+#   sudo cp scripts/server/paramem-server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now paramem-server
 #

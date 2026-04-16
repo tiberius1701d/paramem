@@ -4,9 +4,9 @@
 # Requires: ParaMem server running, HA reachable, SOTA agent configured.
 #
 # Usage:
-#   bash scripts/test-ha-pipeline.sh                        # default
-#   bash scripts/test-ha-pipeline.sh http://localhost:8420   # custom URL
-#   bash scripts/test-ha-pipeline.sh --verbose               # show full responses
+#   bash scripts/dev/test-ha-pipeline.sh                        # default
+#   bash scripts/dev/test-ha-pipeline.sh http://localhost:8420   # custom URL
+#   bash scripts/dev/test-ha-pipeline.sh --verbose               # show full responses
 
 set -uo pipefail
 
@@ -192,7 +192,7 @@ status=$(curl -sf "$SERVER/status" 2>/dev/null) || {
     echo "  Troubleshooting:"
     echo "    1. Is the server running?  systemctl --user status paramem-server"
     echo "    2. Check logs:             journalctl --user -u paramem-server -n 20"
-    echo "    3. Start manually:         bash scripts/start-server.sh"
+    echo "    3. Start manually:         bash scripts/server/start-server.sh"
     exit 1
 }
 
@@ -376,7 +376,7 @@ if [ "$FAIL" -gt 0 ]; then
     echo ""
     echo "  Troubleshooting failed tests:"
     echo "    Server logs:  journalctl --user -u paramem-server -n 50"
-    echo "    Verbose mode: bash scripts/test-ha-pipeline.sh --verbose"
+    echo "    Verbose mode: bash scripts/dev/test-ha-pipeline.sh --verbose"
     echo "    HA status:    curl -s $SERVER/status | python3 -m json.tool"
     exit 1
 else

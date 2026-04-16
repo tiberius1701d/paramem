@@ -13,7 +13,7 @@ Architecture:
                     ParaMem /chat (with speaker_embedding)
 
 Usage:
-    python scripts/wyoming-speaker-wrapper.py \\
+    python scripts/server/wyoming-speaker-wrapper.py \\
         --upstream-host localhost --upstream-port 10300 \\
         --port 10301 \\
         --paramem-url http://localhost:8420

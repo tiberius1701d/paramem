@@ -11,7 +11,7 @@ Usage (stop the server first to free VRAM, then run in background)::
 
     systemctl --user stop paramem-server
     export $(grep -v '^#' .env | xargs)
-    python scripts/verify_pr1_extraction.py [--session-prefixes 01KNW,01KP0] \\
+    python scripts/dev/verify_pr1_extraction.py [--session-prefixes 01KNW,01KP0] \\
         [--limit 10] [--no-cloud-noise-filter]
 
 The script writes a timestamped sim_<ts>/ directory under data/ha/debug/ and

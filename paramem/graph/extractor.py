@@ -729,7 +729,7 @@ Return ONLY a JSON array of the surviving facts, schema unchanged. If none, retu
 # before dispatching to the cloud prevents the "auto" crash on
 # `PROVIDER_KEY_ENV.get("auto")`.
 #
-# NOTE: This dict is duplicated from scripts/compare_extraction.py::VALIDATORS.
+# NOTE: This dict is duplicated from scripts/dev/compare_extraction.py::VALIDATORS.
 # Both should stay in sync. TODO (PR2): move to a shared module to remove duplication.
 _PLAUSIBILITY_VALIDATORS: dict[str, dict] = {
     "claude": {
@@ -754,7 +754,7 @@ def _fallback_plausibility_on_raw(
     render the mapping non-canonical (no safe SOTA path), or when the full
     pipeline drops all relations.
 
-    Steps (ported from scripts/compare_extraction.py L722-795):
+    Steps (ported from scripts/dev/compare_extraction.py L722-795):
     1. Serialize graph.relations to fact dicts.
     2. Strip any residual placeholder tokens — records drops in diagnostics.
     3. Drop ungrounded facts (empty known_names — no mapping available).
@@ -1772,7 +1772,7 @@ def _anonymize_with_local_model(
 
 
 # Public provider metadata — single source of truth, reused by callers
-# (compare_extraction.py and the production server) so they can dispatch
+# (scripts/dev/compare_extraction.py and the production server) so they can dispatch
 # by provider consistently with this module.
 OPENAI_COMPAT_ENDPOINTS = {
     "openai": "https://api.openai.com/v1/chat/completions",

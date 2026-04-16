@@ -18,16 +18,16 @@ Usage:
     export $(grep -v '^#' .env | xargs)
 
     # Default: all sessions (data/ha/sessions/ + archive/)
-    python scripts/compare_extraction.py
+    python scripts/dev/compare_extraction.py
 
     # Curated evaluation set (folder of transcripts):
-    python scripts/compare_extraction.py --path data/ha/debug/eval_set_v1/
+    python scripts/dev/compare_extraction.py --path data/ha/debug/eval_set_v1/
 
     # Debug a single transcript:
-    python scripts/compare_extraction.py --path data/ha/sessions/01KN....jsonl
+    python scripts/dev/compare_extraction.py --path data/ha/sessions/01KN....jsonl
 
     # Force re-run a specific model:
-    python scripts/compare_extraction.py --rerun gemma4
+    python scripts/dev/compare_extraction.py --rerun gemma4
 """
 
 import argparse

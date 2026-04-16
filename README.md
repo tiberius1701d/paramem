@@ -84,6 +84,7 @@ Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/ext
 - Python 3.11+
 - GPU with 8GB+ VRAM (tested on RTX 5070)
 - CUDA toolkit
+- `~/.local/bin/gpu-cooldown.sh` — GPU thermal management script (machine infrastructure, shared across GPU projects; not included in this repo)
 
 ### Install
 
@@ -207,7 +208,7 @@ ParaMem includes a REST server for persistent deployment. The server keeps the m
 
 ```bash
 # Start the server
-bash scripts/start-server.sh
+bash scripts/server/start-server.sh
 
 # Or with systemd (recommended)
 systemctl --user enable --now paramem-server

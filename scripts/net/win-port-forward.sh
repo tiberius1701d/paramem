@@ -4,7 +4,7 @@
 # Single elevation prompt for all ports.
 #
 # Requires elevation (netsh portproxy needs admin). Run from WSL:
-#   bash scripts/win-port-forward.sh
+#   bash scripts/net/win-port-forward.sh
 
 set -euo pipefail
 

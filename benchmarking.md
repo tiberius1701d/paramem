@@ -1975,7 +1975,7 @@ single model lifecycle.
 
 ## 6-Model Extraction Comparison (2026-04-14)
 
-**Script:** `scripts/compare_extraction.py`
+**Script:** `scripts/dev/compare_extraction.py`
 **Session set:** `data/ha/debug/extraction_eval_perltqa_top5` — 5 curated
 PerLTQA sessions (Bao Jun quantum, Cai Xiuying finance, Ruan Wenting sports,
 Ye Jie cultural psychology, Ye Jie community fitness).

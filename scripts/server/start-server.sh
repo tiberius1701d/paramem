@@ -2,20 +2,20 @@
 # Start the ParaMem server.
 #
 # Usage:
-#   bash scripts/start-server.sh                    # foreground
-#   bash scripts/start-server.sh --background       # background with log
+#   bash scripts/server/start-server.sh                    # foreground
+#   bash scripts/server/start-server.sh --background       # background with log
 #
 # Environment:
 #   PARAMEM_PYTHON  — Python executable (default: python from PATH)
 #   PARAMEM_CONFIG  — Server config path (default: configs/server.yaml)
 #
 # For persistent deployment, install the systemd service instead:
-#   sudo cp scripts/paramem-server.service /etc/systemd/system/
+#   sudo cp scripts/server/paramem-server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now paramem-server
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 source .env 2>/dev/null || true
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -28,7 +28,7 @@ LOG_DIR=logs
 # Update Windows port proxy if running in WSL2
 if grep -qi microsoft /proc/version 2>/dev/null; then
     echo "Updating Windows port forward..."
-    bash scripts/win-port-forward.sh || echo "  Warning: port forward failed (non-fatal)"
+    bash scripts/net/win-port-forward.sh || echo "  Warning: port forward failed (non-fatal)"
 fi
 
 EXTRA_ARGS="${PARAMEM_EXTRA_ARGS:-}"
