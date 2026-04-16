@@ -14,6 +14,7 @@ expected; IDE autocomplete on ``entity.entity_type`` will degrade to
 from __future__ import annotations
 
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -66,6 +67,39 @@ _HARDCODED_FALLBACK: dict = {
     ],
     "procedural_entity_types": ["person", "preference"],
     "procedural_predicate_groups": ["Preferences/habits"],
+    "anonymizer": {
+        "prefixes": [
+            {
+                "prefix": "Person",
+                "entity_type": "person",
+                "description": "Person names",
+                "primary_for_type": True,
+            },
+            {
+                "prefix": "City",
+                "entity_type": "place",
+                "description": "City/town names",
+                "primary_for_type": True,
+            },
+            {
+                "prefix": "Country",
+                "entity_type": "place",
+                "description": "Country names",
+            },
+            {
+                "prefix": "Org",
+                "entity_type": "organization",
+                "description": "Organization names",
+                "primary_for_type": True,
+            },
+            {
+                "prefix": "Thing",
+                "entity_type": "concept",
+                "description": "Other identifying things (apps, products, brands)",
+                "primary_for_type": True,
+            },
+        ]
+    },
 }
 
 
@@ -89,6 +123,7 @@ def load_schema_config(path: str | None = None) -> dict:
             "relation_types",
             "fallback_relation_type",
             "preferred_predicates",
+            "anonymizer",
         }
     )
     target = Path(path) if path else _DEFAULT_SCHEMA_PATH
@@ -234,3 +269,95 @@ def format_predicate_examples(path: str | None = None, scope: str = "full") -> s
         groups = [g for g in groups if g["label"] in allowed]
     lines = [f"- {g['label']}: {', '.join(g['items'])}" for g in groups]
     return "\n".join(lines)
+
+
+def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
+    """Return ``{prefix_lower: entity_type}`` — reverse map for de-anonymization.
+
+    Keys are lowercased because ``anonymizer_placeholder_pattern`` is
+    case-insensitive and the SOTA path uses ``.split("_")[0].lower()``
+    before lookup.
+
+    Args:
+        path: Optional override path for the schema YAML.
+
+    Returns:
+        Mapping such as ``{"person": "person", "city": "place",
+        "country": "place", "org": "organization", "thing": "concept"}``.
+    """
+    cfg = load_schema_config(path)
+    return {
+        entry["prefix"].lower(): entry["entity_type"] for entry in cfg["anonymizer"]["prefixes"]
+    }
+
+
+def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
+    """Return ``{entity_type: prefix}`` for entries marked ``primary_for_type=True``.
+
+    Used by the repair path to pick a canonical placeholder when
+    re-anonymizing a leaked real name. Only types with a primary prefix
+    are eligible; others are treated as out-of-PII-scope.
+
+    Args:
+        path: Optional override path for the schema YAML.
+
+    Returns:
+        Mapping such as ``{"person": "Person", "place": "City",
+        "organization": "Org", "concept": "Thing"}``.
+    """
+    cfg = load_schema_config(path)
+    return {
+        entry["entity_type"]: entry["prefix"]
+        for entry in cfg["anonymizer"]["prefixes"]
+        if entry.get("primary_for_type", False)
+    }
+
+
+def format_replacement_rules(path: str | None = None) -> str:
+    """Return the bulleted Replace: block for the anonymization prompt.
+
+    One line per prefix:
+        ``- {description} → {Prefix}_1, {Prefix}_2, ...``
+
+    Args:
+        path: Optional override path for the schema YAML.
+
+    Returns:
+        Newline-joined bullet lines, one per configured prefix.
+    """
+    cfg = load_schema_config(path)
+    lines = []
+    for entry in cfg["anonymizer"]["prefixes"]:
+        prefix = entry["prefix"]
+        desc = entry["description"]
+        lines.append(f"- {desc} \u2192 {prefix}_1, {prefix}_2, ...")
+    return "\n".join(lines)
+
+
+def anonymizer_placeholder_pattern(path: str | None = None) -> "re.Pattern[str] | None":
+    """Return the compiled placeholder regex, or None when no prefixes are configured.
+
+    Built from the configured prefixes — e.g.
+    ``r"^(Person|City|Country|Org|Thing)_\\d+$"``.  Case-insensitive.
+
+    Callers treat ``None`` as "no vocabulary is configured" and branch to the
+    appropriate no-vocab behavior — they do not fall through to regex calls.
+
+    When prefixes are present the regex object is returned from Python's
+    internal ``re`` compile cache on repeated calls, so there is no
+    significant overhead from calling this function multiple times.
+
+    Args:
+        path: Optional override path for the schema YAML.
+
+    Returns:
+        A compiled ``re.Pattern`` matching ``<Prefix>_<digits>``
+        (case-insensitive) for all configured prefixes, or ``None`` when
+        the prefix list is empty.
+    """
+    prefixes = [
+        p["prefix"] for p in load_schema_config(path).get("anonymizer", {}).get("prefixes", [])
+    ]
+    if not prefixes:
+        return None
+    return re.compile(rf"^({'|'.join(prefixes)})_\d+$", re.IGNORECASE)

@@ -474,6 +474,66 @@ class TestSOTANoiseFilter:
         assert normalized == {}
         assert stats == {"inverted": 0, "dropped": 0}
 
+    def test_normalize_mapping_empty_vocab_drops_all(self, monkeypatch):
+        """With no anonymizer prefixes configured, all mapping pairs are dropped."""
+        from paramem.graph.extractor import _normalize_anonymization_mapping
+
+        monkeypatch.setattr("paramem.graph.extractor.anonymizer_placeholder_pattern", lambda: None)
+        result, stats = _normalize_anonymization_mapping({"Alex": "Person_1"})
+        assert result == {}
+        assert stats == {"inverted": 0, "dropped": 1}
+
+    def test_mapping_is_canonical_empty_vocab_empty_mapping(self, monkeypatch):
+        """Empty vocab + empty mapping → canonical (nothing to be wrong)."""
+        from paramem.graph.extractor import _mapping_is_canonical
+
+        monkeypatch.setattr("paramem.graph.extractor.anonymizer_placeholder_pattern", lambda: None)
+        assert _mapping_is_canonical({}) is True
+
+    def test_mapping_is_canonical_empty_vocab_nonempty_mapping(self, monkeypatch):
+        """Empty vocab + non-empty mapping → not canonical (no prefix vocabulary)."""
+        from paramem.graph.extractor import _mapping_is_canonical
+
+        monkeypatch.setattr("paramem.graph.extractor.anonymizer_placeholder_pattern", lambda: None)
+        assert _mapping_is_canonical({"Alex": "Person_1"}) is False
+
+    def test_repair_anonymization_leaks_organization_type(self):
+        """_repair_anonymization_leaks allocates Org_N placeholder for organization entities.
+
+        Pins the broadened repair scope: organization entities are now covered by
+        anonymizer_type_to_prefix() via configs/schema.yaml (Org is primary_for_type).
+        A previously person/place-only repair path would leave "Google" unreplaced.
+        """
+        from paramem.graph.extractor import _repair_anonymization_leaks
+
+        graph = _make_graph(
+            [("Alex", "works_at", "Google")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Google", entity_type="organization"),
+            ],
+        )
+        mapping = {"Alex": "Person_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Google"}]
+        anon_transcript = "Person_1 works at Google."
+        # "Google" is in the transcript → missed, not hallucinated.
+        leaked = ["Google"]
+        facts, new_mapping, _, status = _repair_anonymization_leaks(
+            graph, mapping, anon_facts, anon_transcript, "Alex works at Google.", leaked
+        )
+        assert status["missed_fixed"] == 1, (
+            "organization entity present in transcript must be classified as missed and fixed"
+        )
+        assert "Google" in new_mapping, "extended mapping must contain the real name"
+        org_placeholder = new_mapping["Google"]
+        assert org_placeholder.startswith("Org_"), (
+            f"organization entity must get an Org_N placeholder, got {org_placeholder!r}"
+        )
+        # The fact's object must be rewritten to the placeholder.
+        assert facts[0]["object"] == org_placeholder, (
+            f"anon_facts object must be rewritten to placeholder, got {facts[0]['object']!r}"
+        )
+
     def test_clean_ner_span_strips_dialogue_tail(self):
         """NER span cleanup removes 'Name: Response' dialogue artifacts."""
         from paramem.graph.extractor import _clean_ner_span

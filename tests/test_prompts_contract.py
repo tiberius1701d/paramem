@@ -14,17 +14,20 @@ from __future__ import annotations
 import re
 
 from paramem.graph.extractor import (
+    _DEFAULT_ANONYMIZATION_PROMPT,
     _DEFAULT_ENRICHMENT_PROMPT,
     _DEFAULT_EXTRACTION_PROMPT,
     _DEFAULT_PLAUSIBILITY_PROMPT,
     _DEFAULT_PROCEDURAL_PROMPT,
     _load_prompt,
     build_speaker_context,
+    load_anonymization_prompt,
 )
 from paramem.graph.schema_config import (
     format_entity_types,
     format_predicate_examples,
     format_relation_types,
+    format_replacement_rules,
 )
 
 
@@ -177,3 +180,56 @@ class TestProceduralPrompt:
         )
         assert "Alex" in rendered
         assert "'Alex'" in rendered
+
+
+class TestAnonymizationPrompt:
+    """Contract tests for the anonymization prompt — both default and file-based."""
+
+    def _render(self, tmpl: str) -> str:
+        """Render the anonymization prompt with all expected kwargs."""
+        return tmpl.format(
+            facts_json='[{"subject": "Person_1", "predicate": "lives_in", '
+            '"object": "City_1", "relation_type": "factual", "confidence": 0.9}]',
+            transcript="Person_1 lives in City_1.",
+            replacement_rules=format_replacement_rules(),
+        )
+
+    def test_default_renders_without_format_errors(self):
+        """_DEFAULT_ANONYMIZATION_PROMPT must render with all expected kwargs without KeyError."""
+        rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
+        assert "{facts_json}" not in rendered
+        assert "{transcript}" not in rendered
+        assert "{replacement_rules}" not in rendered
+
+    def test_file_based_renders_without_format_errors(self):
+        """File-based anonymization.txt must render with all expected kwargs without KeyError."""
+        tmpl = load_anonymization_prompt()
+        rendered = self._render(tmpl)
+        assert "{replacement_rules}" not in rendered
+
+    def test_replacement_rules_present_in_default(self):
+        """All five configured prefixes must appear in the rendered default prompt."""
+        rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
+        for prefix in ("Person", "City", "Country", "Org", "Thing"):
+            assert prefix in rendered, (
+                f"Prefix {prefix!r} missing from rendered _DEFAULT_ANONYMIZATION_PROMPT."
+            )
+
+    def test_replacement_rules_present_in_file_based(self):
+        """All five configured prefixes must appear in the rendered file-based prompt."""
+        tmpl = load_anonymization_prompt()
+        rendered = self._render(tmpl)
+        for prefix in ("Person", "City", "Country", "Org", "Thing"):
+            assert prefix in rendered, (
+                f"Prefix {prefix!r} missing from rendered file-based anonymization.txt."
+            )
+
+    def test_no_stray_unescaped_placeholders_in_default(self):
+        """After rendering, no stray {word} tokens should remain (only JSON literal braces)."""
+        import re
+
+        rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
+        # JSON literal braces are escaped as {{ }} in the template and appear as { } after render.
+        # A simple check: no single { immediately followed by a letter (unrendered placeholder).
+        stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
+        assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"

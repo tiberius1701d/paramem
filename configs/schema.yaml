@@ -29,3 +29,23 @@ preferred_predicates:
 # Narrow subset used by the procedural (preferences-only) extraction prompt.
 procedural_entity_types: [person, preference]
 procedural_predicate_groups: [Preferences/habits]
+
+# Anonymizer vocabulary — single source of truth for PII placeholder
+# prefixes shared by the anonymization prompt, the SOTA enrichment path,
+# and the de-anonymization/repair code.
+#
+# prefix           — the literal token ("Person", "City", etc.)
+# entity_type      — the graph type that this prefix represents. Must be one
+#                    of entity_types above. Multiple prefixes may map to the
+#                    same entity_type (City → place, Country → place).
+# description      — human-readable label rendered into anonymization.txt
+# primary_for_type — only one prefix per entity_type may set this.
+#                    Used by the repair path to pick a canonical prefix when
+#                    re-anonymizing a leaked real name.
+anonymizer:
+  prefixes:
+    - { prefix: Person,  entity_type: person,       description: "Person names",                                      primary_for_type: true }
+    - { prefix: City,    entity_type: place,         description: "City/town names",                                   primary_for_type: true }
+    - { prefix: Country, entity_type: place,         description: "Country names" }
+    - { prefix: Org,     entity_type: organization,  description: "Organization names",                                primary_for_type: true }
+    - { prefix: Thing,   entity_type: concept,       description: "Other identifying things (apps, products, brands)", primary_for_type: true }

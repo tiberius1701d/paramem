@@ -8,12 +8,16 @@ from pathlib import Path
 
 from paramem.graph.schema import SessionGraph
 from paramem.graph.schema_config import (
+    anonymizer_placeholder_pattern,
+    anonymizer_prefix_to_type,
+    anonymizer_type_to_prefix,
     entity_types,
     fallback_entity_type,
     fallback_relation_type,
     format_entity_types,
     format_predicate_examples,
     format_relation_types,
+    format_replacement_rules,
     relation_types,
 )
 
@@ -648,11 +652,7 @@ Anonymize the following extracted personal facts AND the conversation transcript
 by replacing all identifying information with category-prefixed placeholders.
 
 Replace:
-- Person names → Person_1, Person_2, ...
-- City/town names → City_1, City_2, ...
-- Country names → Country_1, Country_2, ...
-- Organization names → Org_1, Org_2, ...
-- Other identifying things (apps, products, brands) → Thing_1, Thing_2, ...
+{replacement_rules}
 
 Use the SAME placeholder for the SAME entity across facts and transcript. \
 The mapping you return MUST contain every real name that appears in either input \
@@ -1241,32 +1241,25 @@ def _sota_pipeline(
 
     # Rebuild entity list from surviving + new relations.
     # Every relation endpoint must have a corresponding Entity record.
-    # D6: widened type_map covers all 5 anonymizer placeholder prefixes
-    # (Person_, City_, Country_, Org_, Thing_). Safe fallback is "concept",
-    # never "person" — that would stamp locations, media, and free-text
-    # entities as persons, as confirmed by sim_20260415_160543/graph.json.
+    # Entity type inference uses anonymizer_prefix_to_type() from configs/schema.yaml.
+    # Safe fallback is "concept", never "person" — that would stamp locations,
+    # media, and free-text entities as persons, as confirmed by
+    # sim_20260415_160543/graph.json.
     kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
     existing_names = {e.name for e in graph.entities}
     graph.entities = [e for e in graph.entities if e.name in kept_names]
     for name in kept_names - existing_names:
         # Infer entity type from anonymizer placeholder prefix when available.
-        # Anonymizer prefixes (configs/prompts/anonymization.txt):
-        #   Person_, City_, Country_, Org_, Thing_
-        # Safe fallback is "concept" (matches _normalize_extraction for unknown types).
+        # Prefix-to-type mapping comes from anonymizer.prefixes in configs/schema.yaml
+        # (via anonymizer_prefix_to_type()). Safe fallback is "concept"
+        # (matches _normalize_extraction for unknown types).
         # Never default to "person" — that stamps locations, media, devices, and
         # free-text entities as persons.
         entity_type = "concept"
         placeholder = reverse_mapping.get(name)
         if placeholder:
             prefix = placeholder.split("_")[0].lower()
-            type_map = {
-                "person": "person",
-                "city": "location",
-                "country": "location",
-                "org": "organization",
-                "thing": "concept",
-            }
-            entity_type = type_map.get(prefix, "concept")
+            entity_type = anonymizer_prefix_to_type().get(prefix, "concept")
         graph.entities.append(Entity(name=name, entity_type=entity_type))
 
     graph.relations = kept_relations
@@ -1279,11 +1272,6 @@ def _sota_pipeline(
         added,
     )
     return graph
-
-
-_PLACEHOLDER_RE = re.compile(r"^(Person|City|Country|Org|Thing)_\d+$", re.IGNORECASE)
-
-_REPAIR_TYPE_TO_PREFIX = {"person": "Person", "place": "City"}
 
 
 def _repair_anonymization_leaks(
@@ -1340,9 +1328,13 @@ def _repair_anonymization_leaks(
             continue
         # Missed — allocate placeholder based on declared type.
         etype = (type_by_name.get(name) or "person").lower()
-        prefix = _REPAIR_TYPE_TO_PREFIX.get(etype)
+        prefix = anonymizer_type_to_prefix().get(etype)
         if prefix is None:
-            # Type out of PII scope; treat as hallucinated rather than fabricate.
+            # Missed — allocate placeholder based on declared type. Types with a
+            # primary_for_type prefix in configs/schema.yaml (person→Person, place→
+            # City, organization→Org, concept→Thing) get a fresh placeholder of
+            # that type. Types without a primary prefix (event, preference) are
+            # treated as hallucinated — there is no PII-scope anchor to bind to.
             hallucinated.add(name)
             continue
         placeholder = f"{prefix}_{_next_index(prefix)}"
@@ -1495,12 +1487,20 @@ def _normalize_anonymization_mapping(mapping: dict) -> tuple[dict, dict]:
     """
     if not mapping:
         return mapping, {"inverted": 0, "dropped": 0}
+    _pat = anonymizer_placeholder_pattern()
+    if _pat is None:
+        logger.warning(
+            "Anonymization mapping: no anonymizer prefixes configured; "
+            "dropping %d pairs — nothing can be canonicalized.",
+            len(mapping),
+        )
+        return {}, {"inverted": 0, "dropped": len(mapping)}
     out: dict = {}
     inverted = 0
     dropped = 0
     for k, v in mapping.items():
-        k_match = bool(_PLACEHOLDER_RE.match(str(k)))
-        v_match = bool(_PLACEHOLDER_RE.match(str(v)))
+        k_match = bool(_pat.match(str(k)))
+        v_match = bool(_pat.match(str(v)))
         if k_match and not v_match:
             out[v] = k
             inverted += 1
@@ -1532,11 +1532,21 @@ def _normalize_anonymization_mapping(mapping: dict) -> tuple[dict, dict]:
 
 
 def _mapping_is_canonical(mapping: dict) -> bool:
-    """True iff mapping is {real_name: placeholder} with all values matching."""
+    """True iff mapping is {real_name: placeholder} with all values matching.
+
+    When no anonymizer prefixes are configured (``anonymizer_placeholder_pattern``
+    returns ``None``), an empty mapping is considered canonical (no entries to
+    validate), and any non-empty mapping is non-canonical (no placeholder
+    vocabulary means no real-name→placeholder mapping can be valid).
+    """
     if not mapping:
         return True
-    return all(_PLACEHOLDER_RE.match(str(v)) for v in mapping.values()) and not any(
-        _PLACEHOLDER_RE.match(str(k)) for k in mapping.keys()
+    _pat = anonymizer_placeholder_pattern()
+    if _pat is None:
+        # No placeholder vocabulary — non-empty mapping cannot be canonical.
+        return not mapping
+    return all(_pat.match(str(v)) for v in mapping.values()) and not any(
+        _pat.match(str(k)) for k in mapping.keys()
     )
 
 
@@ -1758,6 +1768,7 @@ def _anonymize_with_local_model(
     prompt = anon_prompt.format(
         facts_json=json.dumps(facts, indent=2),
         transcript=transcript or "(no transcript provided)",
+        replacement_rules=format_replacement_rules(),
     )
     messages = [
         {"role": "system", "content": "You anonymize data. Output valid JSON only."},
@@ -2090,6 +2101,9 @@ def _extract_sota_bindings(old_transcript: str, new_transcript: str) -> dict[str
     matcher = difflib.SequenceMatcher(a=old_toks, b=new_toks)
     bindings: dict[str, str] = {}
     brace_token_re = re.compile(r"^\{(\w+_\d+)\}([.,;:!?)\]]*)$")
+    # Hoist pattern compile out of the loop — recompiling per iteration is wasteful
+    # and the None-vocab guard must be consistent across the entire diff pass.
+    _pat = anonymizer_placeholder_pattern()
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "replace":
             continue
@@ -2110,7 +2124,7 @@ def _extract_sota_bindings(old_transcript: str, new_transcript: str) -> dict[str
         if (
             brace_token_re.match(span)
             or not span
-            or _PLACEHOLDER_RE.match(span)
+            or (_pat is not None and _pat.match(span))
             or span == placeholder
         ):
             continue

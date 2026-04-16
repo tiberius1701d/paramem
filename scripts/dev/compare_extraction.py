@@ -428,9 +428,12 @@ def _anonymize_via_cloud(
         }
         for r in graph.relations
     ]
+    from paramem.graph.schema_config import format_replacement_rules
+
     prompt = load_anonymization_prompt().format(
         facts_json=json.dumps(facts, indent=2),
         transcript=transcript or "(no transcript provided)",
+        replacement_rules=format_replacement_rules(),
     )
     try:
         raw = _cloud_chat(
