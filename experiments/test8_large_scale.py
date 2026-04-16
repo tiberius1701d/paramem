@@ -482,14 +482,24 @@ class ScaleRecallCallback(TrainerCallback):
             return
         self._last_epoch = current_epoch
 
-        # Write progress file every epoch (cheap, enables ts monitoring)
+        # Write progress file every epoch (cheap, enables ts monitoring).
+        # Preserve cycle_started_at written at cycle start — tstatus uses it
+        # to compute elapsed/ETA. Per-epoch writes must not reset it.
         total_epochs = int(args.num_train_epochs)
+        progress_path = self.cycle_dir / "progress.json"
+        cycle_started_at = None
+        try:
+            existing = json.loads(progress_path.read_text())
+            cycle_started_at = existing.get("cycle_started_at")
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
         progress = {
             "epoch": current_epoch,
             "total_epochs": total_epochs,
             "keys": len(self.keyed_pairs),
+            "cycle_started_at": cycle_started_at or time.time(),
         }
-        with open(self.cycle_dir / "progress.json", "w") as f:
+        with open(progress_path, "w") as f:
             json.dump(progress, f)
 
         # Only probe at intervals (and always at the final epoch)
@@ -567,6 +577,12 @@ def train_cycle(model, tokenizer, qa_pairs, cycle_num, output_dir, num_epochs, r
     adapter_name = "episodic"
     cycle_dir = output_dir / f"cycle_{cycle_num:03d}"
     cycle_dir.mkdir(parents=True, exist_ok=True)
+
+    # Anchor tstatus ETA math: per-epoch callback preserves this timestamp so
+    # elapsed is measured from cycle start (not from dir mtime, which shifts
+    # every time a checkpoint subdir is created).
+    with open(cycle_dir / "progress.json", "w") as f:
+        json.dump({"cycle": cycle_num, "cycle_started_at": time.time()}, f)
 
     # Unwrap to base model
     if isinstance(model, _PeftModel):

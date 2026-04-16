@@ -754,7 +754,17 @@ class ProgressCallback(TrainerCallback):
             return
         self._last_epoch = current_epoch
         target_epoch = int(args.num_train_epochs) + self.epoch_offset
-        with open(self.output_dir / "progress.json", "w") as f:
+        progress_path = self.output_dir / "progress.json"
+        # Preserve cycle_started_at written by the cycle loop — per-epoch
+        # updates must not clobber it or ETA in tstatus will reset each epoch.
+        cycle_started_at = None
+        try:
+            existing = json.loads(progress_path.read_text())
+            if existing.get("cycle") == self.cycle:
+                cycle_started_at = existing.get("cycle_started_at")
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        with open(progress_path, "w") as f:
             json.dump(
                 {
                     "epoch": current_epoch,
@@ -762,6 +772,7 @@ class ProgressCallback(TrainerCallback):
                     "total_epochs": target_epoch,
                     "epoch_offset": self.epoch_offset,
                     "cycle": self.cycle,
+                    "cycle_started_at": cycle_started_at or time.time(),
                     "keys": self.num_keys,
                     "weight_decay": self.weight_decay,
                 },
@@ -1332,7 +1343,9 @@ def run_experiment(
             epochs_per_cycle,
         )
 
-        # Write progress for tstatus
+        # Write progress for tstatus. `cycle_started_at` anchors ETA math in
+        # tstatus — elapsed is measured from this timestamp, not from dir mtime
+        # (which jumps around as checkpoint subdirs are created).
         with open(output_dir / "progress.json", "w") as f:
             json.dump(
                 {
@@ -1341,6 +1354,7 @@ def run_experiment(
                     "total_epochs": target_epoch,
                     "epoch_offset": current_epoch,
                     "cycle": cycle,
+                    "cycle_started_at": time.time(),
                     "keys": len(keyed_pairs),
                     "weight_decay": weight_decay,
                 },

@@ -312,8 +312,24 @@ class _GPUGuard:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # Training actually stopped now — drop the defer-model flag before
+        # anything else so the next auto-reclaim tick (or any racing
+        # restart) loads the model in local mode. tpause only signals a
+        # cycle-boundary stop; the script keeps running until the cycle
+        # finishes, so the env var must not drop at tpause time — only
+        # here, when the test process is exiting. Crash-exit (SIGKILL)
+        # skips this hook, but auto-reclaim's GPU-free check combined with
+        # main()'s fallback in app.py handle that case independently.
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "unset-environment", "PARAMEM_EXTRA_ARGS"],
+                check=False,
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
         notify_ml(ML_FINISHED)
-        # Server auto-reclaims via timer — no action needed
         return False
 
 
