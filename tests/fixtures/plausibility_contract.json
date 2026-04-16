@@ -1,0 +1,29 @@
+{
+  "description": "Hand-curated labeled fixture for plausibility prompt LLM-compliance.",
+  "rationale": "Per feedback_prompt_contract_tests.md, mocked unit tests cannot catch LLM-compliance drift when the prompt is tuned. Each fact has a ground-truth label (keep/drop) derived lexically from the 6 DROP rules in configs/prompts/sota_plausibility.txt. The live local judge must match >= 90% of labels.",
+  "transcript": "User: Hi, I am Alex and I live in Portland. I just started a new job at Acme. Please turn on the office speaker and play Uptown Funk.\nAssistant: Playing Uptown Funk on the office speaker.\nUser: I also really love Bruno Mars.\nAssistant: Great taste.",
+  "facts": [
+    {"id": "keep_01", "subject": "Alex", "predicate": "lives_in",  "object": "Portland",    "relation_type": "factual", "confidence": 0.9, "expected": "keep", "rule": null,  "note": "plain KEEP — default disposition"},
+    {"id": "keep_02", "subject": "Alex", "predicate": "works_at",  "object": "Acme",        "relation_type": "factual", "confidence": 0.9, "expected": "keep", "rule": null,  "note": "plain KEEP — default disposition"},
+    {"id": "keep_03", "subject": "Alex", "predicate": "likes",     "object": "Bruno Mars",  "relation_type": "preference", "confidence": 0.9, "expected": "keep", "rule": null, "note": "plain KEEP — default disposition"},
+    {"id": "keep_04", "subject": "Alex", "predicate": "requested", "object": "Uptown Funk", "relation_type": "factual", "confidence": 0.8, "expected": "keep", "rule": null,  "note": "plain KEEP — default disposition"},
+
+    {"id": "drop_r1_01", "subject": "Alex",     "predicate": "has_name", "object": "Alex",     "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R1", "note": "self-loop exact match"},
+    {"id": "drop_r1_02", "subject": "Portland", "predicate": "is",       "object": "portland", "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R1", "note": "self-loop case-insensitive"},
+
+    {"id": "drop_r2_01", "subject": "Alex",   "predicate": "has_name", "object": "Alex K.", "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R2", "note": "name-swap pair half 1 — see drop_r2_02"},
+    {"id": "drop_r2_02", "subject": "Alex K.", "predicate": "has_name", "object": "Alex",   "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R2", "note": "name-swap pair half 2 — see drop_r2_01"},
+
+    {"id": "drop_r3_01", "subject": "Assistant", "predicate": "responded_to", "object": "Alex", "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R3", "note": "role leak subject=Assistant"},
+    {"id": "drop_r3_02", "subject": "Alex", "predicate": "asked", "object": "User", "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R3", "note": "role leak object=User"},
+
+    {"id": "drop_r4_01", "subject": "Alex", "predicate": "owns",     "object": "Person_4", "relation_type": "factual", "confidence": 0.8, "expected": "drop", "rule": "R4", "note": "unresolved placeholder in real-name input"},
+    {"id": "drop_r4_02", "subject": "City_2", "predicate": "has_population", "object": "500000", "relation_type": "factual", "confidence": 0.8, "expected": "drop", "rule": "R4", "note": "unresolved placeholder in real-name input"},
+
+    {"id": "drop_r5_01", "subject": "Alex", "predicate": "is_from", "object": "Unknown", "relation_type": "factual", "confidence": 0.7, "expected": "drop", "rule": "R5", "note": "sentinel object"},
+    {"id": "drop_r5_02", "subject": "Alex", "predicate": "owns",    "object": "",        "relation_type": "factual", "confidence": 0.7, "expected": "drop", "rule": "R5", "note": "empty object"},
+
+    {"id": "drop_r6_01", "subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office",   "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R6", "note": "system entity ID"},
+    {"id": "drop_r6_02", "subject": "sensor.temperature_kitchen", "predicate": "reads", "object": "21.5",     "relation_type": "factual", "confidence": 0.9, "expected": "drop", "rule": "R6", "note": "system entity ID in subject"}
+  ]
+}
