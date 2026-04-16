@@ -20,7 +20,8 @@ Rules:
   not a meaningful personal fact
 - Consider the full conversation holistically — cross-reference user statements
   with assistant responses for the most accurate entity names
-- Entity types: person, place, organization, concept, preference
+- Entity types: person, place, organization, event, preference, concept (fallback — see rule below)
+- IMPORTANT: Never label a named person, place, or organization as "concept". Use "concept" only for abstract things with no fit (e.g. a field of study like "quantum computing").
 - Relation types: factual, temporal, preference, social
 - Tag preferences correctly: if the speaker uses or prefers something (music
   service, food, hobby), set relation_type to "preference", not "factual"
@@ -48,6 +49,18 @@ POSITIVE example — transcript: "[user] I enjoy reading science fiction."
  {{"name": "Science Fiction", "entity_type": "preference", "attributes": {{}}}}],
  "relations": [{{"subject": "Speaker", "predicate": "likes", "object": "Science Fiction", "relation_type": "preference", "confidence": 1.0}}],
  "summary": "Speaker enjoys reading science fiction."}}
+
+POSITIVE example — transcript: "[user] I work at Siemens in the R&D group."
+{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Siemens", "entity_type": "organization", "attributes": {{}}}}],
+ "relations": [{{"subject": "Speaker", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Speaker works at Siemens in R&D."}}
+
+POSITIVE example — transcript: "[user] Our wedding anniversary is on June 14th."
+{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Wedding Anniversary", "entity_type": "event", "attributes": {{"date": "June 14"}}}}],
+ "relations": [{{"subject": "Speaker", "predicate": "celebrates", "object": "Wedding Anniversary", "relation_type": "temporal", "confidence": 1.0}}],
+ "summary": "Speaker's wedding anniversary is June 14."}}
 
 NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."
 Extract: NONE — asking about weather in a location is curiosity, not a personal fact about where the speaker lives.
