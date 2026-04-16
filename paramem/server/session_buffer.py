@@ -294,6 +294,58 @@ class SessionBuffer:
 
         return []
 
+    def get_summary(self) -> dict:
+        """Per-speaker pending-session attribution summary.
+
+        Returns:
+            {
+                "total": int,
+                "orphaned": int,                        # pending with no speaker_id
+                "oldest_age_seconds": int | None,       # age of oldest pending session
+                "per_speaker": {speaker_id: count},     # matched pending per speaker
+            }
+        """
+        from datetime import datetime, timezone
+
+        per_speaker: dict[str, int] = {}
+        orphaned = 0
+        total = 0
+        oldest_ts = None
+
+        for session in self.get_pending():
+            total += 1
+            sid = session.get("speaker_id")
+            if sid:
+                per_speaker[sid] = per_speaker.get(sid, 0) + 1
+            else:
+                orphaned += 1
+
+        # Oldest pending: first-turn timestamp across in-memory sessions
+        for turns in self._turns.values():
+            if not turns:
+                continue
+            try:
+                first_ts = datetime.fromisoformat(turns[0]["timestamp"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            # Coerce naive timestamps (legacy snapshots) to UTC so the
+            # subtraction below does not raise TypeError.
+            if first_ts.tzinfo is None:
+                first_ts = first_ts.replace(tzinfo=timezone.utc)
+            if oldest_ts is None or first_ts < oldest_ts:
+                oldest_ts = first_ts
+
+        oldest_age = None
+        if oldest_ts is not None:
+            oldest_age = int((datetime.now(timezone.utc) - oldest_ts).total_seconds())
+
+        return {
+            "total": total,
+            "orphaned": orphaned,
+            "oldest_age_seconds": oldest_age,
+            "per_speaker": per_speaker,
+        }
+
     @property
     def pending_count(self) -> int:
         count = len(self._turns)

@@ -116,6 +116,31 @@ def test_empty_store_no_match(store):
     assert result.confidence == 0.0
 
 
+def test_list_profiles_empty(store):
+    assert store.list_profiles() == []
+
+
+def test_list_profiles_after_enroll(store, sample_embedding, different_embedding):
+    alice_id = store.enroll("Alice", sample_embedding)
+    bob_id = store.enroll("Bob", different_embedding, method="manual")
+    profiles = {p["id"]: p for p in store.list_profiles()}
+    assert set(profiles.keys()) == {alice_id, bob_id}
+    assert profiles[alice_id]["name"] == "Alice"
+    assert profiles[alice_id]["embeddings"] == 1
+    assert profiles[alice_id]["enroll_method"] == "self_introduced"
+    assert profiles[bob_id]["embeddings"] == 1
+    assert profiles[bob_id]["enroll_method"] == "manual"
+
+
+def test_list_profiles_legacy_default_method(store, sample_embedding):
+    """Legacy profiles loaded without enroll_method report 'unknown'."""
+    sid = store.enroll("Alice", sample_embedding)
+    # Simulate a legacy profile missing the field
+    store._profiles[sid].pop("enroll_method", None)
+    profiles = store.list_profiles()
+    assert profiles[0]["enroll_method"] == "unknown"
+
+
 def test_enroll_and_exact_match(store, sample_embedding):
     speaker_id = store.enroll("Alice", sample_embedding)
     assert speaker_id is not None

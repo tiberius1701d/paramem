@@ -9,7 +9,7 @@ Tests cover:
 3. SOTA noise filter (anonymize → filter → de-anonymize)
 4. get_home_context
 5. _extract_and_start_training (mocked HA)
-6. _training_scheduler (async)
+6. _consolidation_scheduler (async)
 7. BackgroundTrainer._train_adapter
 8. Batch consolidation end-to-end
 """
@@ -281,16 +281,27 @@ class TestTrainingSchedulerBehavior:
         _consolidation_done_callback(future)
         assert _state["consolidating"] is False
 
-    def test_training_scheduler_done_callback_on_exception(self):
-        """_training_scheduler_done_callback clears the flag if extraction failed."""
-        from paramem.server.app import _state, _training_scheduler_done_callback
+    def test_scheduled_extract_done_callback_on_exception(self):
+        """_scheduled_extract_done_callback clears the flag if extraction failed."""
+        from paramem.server.app import _scheduled_extract_done_callback, _state
 
         future = MagicMock()
         future.exception.return_value = RuntimeError("extraction failed")
 
         _state["consolidating"] = True
-        _training_scheduler_done_callback(future)
+        _scheduled_extract_done_callback(future)
         assert _state["consolidating"] is False
+
+    def test_scheduled_extract_done_callback_on_success(self):
+        """On success, flag stays True — BG trainer will clear it on completion."""
+        from paramem.server.app import _scheduled_extract_done_callback, _state
+
+        future = MagicMock()
+        future.exception.return_value = None
+
+        _state["consolidating"] = True
+        _scheduled_extract_done_callback(future)
+        assert _state["consolidating"] is True
 
 
 # --- 7. BackgroundTrainer._train_adapter ---

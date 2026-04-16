@@ -158,6 +158,18 @@ class SpeakerStore:
                 logger.info("Migrated %d v1 profiles to v4", len(self._profiles))
                 self._save()
 
+        # Back-fill enroll_method for profiles written before that field existed.
+        # One-time migration, persisted on first load after the upgrade.
+        missing_method = [sid for sid, p in self._profiles.items() if "enroll_method" not in p]
+        if missing_method:
+            for sid in missing_method:
+                self._profiles[sid]["enroll_method"] = "unknown"
+            logger.info(
+                "Back-filled enroll_method='unknown' on %d legacy profiles",
+                len(missing_method),
+            )
+            self._save()
+
         logger.info("Loaded %d speaker profiles", len(self._profiles))
         self._rebuild_centroids()
 
@@ -344,12 +356,19 @@ class SpeakerStore:
         )
         return True
 
-    def enroll(self, name: str, embedding: list[float]) -> str | None:
+    def enroll(
+        self, name: str, embedding: list[float], method: str = "self_introduced"
+    ) -> str | None:
         """Register a new speaker profile.
 
         Rejects enrollment if the voice embedding already matches an
         existing profile at high confidence (prevents duplicate enrollment
         of the same voice under a different name).
+
+        `method` records how the speaker was enrolled — surfaced via pstatus
+        to distinguish self-introduction from voice-match recovery and manual
+        setup. Valid values: "self_introduced", "voice_matched", "manual",
+        "unknown" (migrated legacy profiles).
 
         Returns the new speaker_id on success, None on rejection.
         """
@@ -384,6 +403,7 @@ class SpeakerStore:
                 "name": display_name,
                 "embeddings": [embedding],
                 "preferred_language": "",
+                "enroll_method": method,
             }
             self._invalidate_centroid(speaker_id)
             self._save()
@@ -456,3 +476,22 @@ class SpeakerStore:
     def speaker_names(self) -> list[str]:
         """Unique display names across all profiles."""
         return list({p["name"] for p in self._profiles.values()})
+
+    def list_profiles(self) -> list[dict]:
+        """Return a lightweight snapshot of all enrolled speakers.
+
+        Each entry: {"id": str, "name": str, "embeddings": int,
+        "preferred_language": str}. Embedding vectors are not included —
+        only their count as a proxy for recognition events.
+        """
+        with self._lock:
+            return [
+                {
+                    "id": speaker_id,
+                    "name": profile.get("name", "?"),
+                    "embeddings": len(profile.get("embeddings", [])),
+                    "preferred_language": profile.get("preferred_language", ""),
+                    "enroll_method": profile.get("enroll_method", "unknown"),
+                }
+                for speaker_id, profile in self._profiles.items()
+            ]

@@ -242,7 +242,7 @@ adapters:
     alpha: 16
 
 consolidation:
-  schedule: "02:00"     # daily at 2am (empty = manual only)
+  schedule: "every 2h"  # "HH:MM" (daily) or "every Nh"/"every Nm" (interval); "" = manual only
 
 agents:
   sota:                 # SOTA cloud fallback for reasoning queries

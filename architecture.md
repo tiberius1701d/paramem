@@ -234,8 +234,8 @@ A **fallback path** (`_fallback_plausibility_on_raw`) runs local plausibility + 
 
 Consolidation supports two code paths:
 
-- **Blocking:** `run_consolidation` — extracts all sessions then trains. Used for manual `POST /consolidate`.
-- **Background:** `_extract_and_start_training` spawns a `BackgroundTrainer` that runs on a configurable interval (`training_interval_hours`, default 2h). The trainer pauses at step boundaries when inference requests arrive (`pause()`/`resume()`), switching the model between eval and train mode. `GracefulShutdownCallback` stops training at epoch boundaries on shutdown, and `rollback_preparation()` reverts on failure.
+- **Blocking:** `run_consolidation` — extracts all sessions then trains under a single GPU lock. Used for manual `POST /consolidate`.
+- **Scheduled (cooperative):** `_extract_and_start_training` spawns a `BackgroundTrainer` that releases the GPU lock per step so voice turns interleave. Driven by the single `_consolidation_scheduler`, configured via `consolidation.schedule` — accepts `"HH:MM"` (daily) or `"every Nh"`/`"every Nm"` (interval). `GracefulShutdownCallback` stops training at epoch boundaries on shutdown, and `rollback_preparation()` reverts on failure.
 
 Batch consolidation processes sessions as: `extract_session()` for all pending sessions, then `train_adapters()` once.
 

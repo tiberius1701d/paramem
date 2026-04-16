@@ -17,6 +17,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -62,8 +63,6 @@ _state = {
     "consolidation_loop": None,
     "consolidating": False,
     "last_consolidation": None,
-    "scheduler_task": None,
-    "training_scheduler_task": None,
     "background_trainer": None,
     "reclaim_task": None,
     "mode": "local",  # "local" or "cloud-only"
@@ -123,6 +122,17 @@ class StatusResponse(BaseModel):
     speaker_profiles: int = 0
     stt_loaded: bool = False
     stt_model: str | None = None
+    schedule: str = ""  # raw consolidation.schedule config value
+    mode_config: str = ""  # "train" or "simulate"
+    next_run_seconds: int | None = None  # seconds until next scheduled run
+    orphaned_pending: int = 0  # pending sessions without speaker_id
+    oldest_pending_seconds: int | None = None
+    speakers: list[dict] = []  # [{id, name, embeddings, pending, enroll_method}]
+    bg_trainer_active: bool = False
+    bg_trainer_adapter: str | None = None
+    last_consolidation_result: dict | None = None  # last completed run summary
+    pending_enrollments: int = 0  # unknown speakers awaiting name extraction
+    scheduler_started: bool = False  # True once scheduler first ticked
 
 
 class ConsolidateResponse(BaseModel):
@@ -409,20 +419,17 @@ async def lifespan(app: FastAPI):
         ha_client=_state.get("ha_client"),
     )
 
-    # Start consolidation scheduler if configured
-    if config.consolidation.schedule:
-        _state["scheduler_task"] = asyncio.create_task(
-            _consolidation_scheduler(config.consolidation.schedule)
-        )
-        logger.info("Consolidation scheduled at: %s", config.consolidation.schedule)
+    # Reconcile the systemd user timer with config.consolidation.schedule.
+    # The timer fires POST /scheduled-tick on its schedule regardless of mode;
+    # the tick handler defers when GPU is busy rather than skipping silently.
+    # Timer survives server restart (unlike the old in-process asyncio task).
+    from paramem.server import systemd_timer
 
-    # Start background training scheduler if configured
-    training_interval = config.consolidation.training_interval_hours
-    if training_interval > 0 and not cloud_only:
-        _state["training_scheduler_task"] = asyncio.create_task(
-            _training_scheduler(training_interval)
-        )
-        logger.info("Background training scheduled every %dh", training_interval)
+    try:
+        msg = systemd_timer.reconcile(config.consolidation.schedule)
+        logger.info("%s", msg)
+    except Exception:
+        logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
 
     # Graceful shutdown: save encrypted session snapshot before exit.
     # SIGUSR1 (GPU release for training) and SIGTERM (systemd stop) both
@@ -474,10 +481,6 @@ async def lifespan(app: FastAPI):
     if store:
         store.flush()
 
-    if _state["scheduler_task"]:
-        _state["scheduler_task"].cancel()
-    if _state.get("training_scheduler_task"):
-        _state["training_scheduler_task"].cancel()
     if _state["reclaim_task"]:
         _state["reclaim_task"].cancel()
     if _state.get("enrollment_task"):
@@ -819,20 +822,68 @@ async def status():
             registry = json.load(f)
         keys_count = len(registry)
 
+    # Session buffer summary (pending counts, orphan attribution, age)
+    buf = _state.get("session_buffer")
+    summary = (
+        buf.get_summary()
+        if buf
+        else {"total": 0, "orphaned": 0, "oldest_age_seconds": None, "per_speaker": {}}
+    )
+
+    # Per-speaker profile snapshot enriched with pending-session counts
+    store = _state.get("speaker_store")
+    speaker_rows: list[dict] = []
+    if store is not None:
+        per_speaker = summary["per_speaker"]
+        for prof in store.list_profiles():
+            prof["pending"] = per_speaker.get(prof["id"], 0)
+            speaker_rows.append(prof)
+
+    # Next scheduled run — sourced from the systemd user timer (wall-clock,
+    # survives server restart). See paramem/server/systemd_timer.py.
+    # Cached for 5s because /status is polled frequently (HA, pstatus) and
+    # `systemctl show` forks a subprocess on every call.
+    from paramem.server import systemd_timer
+
+    timer_state = systemd_timer.cached_timer_state(max_age_seconds=5)
+    next_run_seconds: int | None = None
+    scheduler_active = bool(timer_state.get("active", False))
+    next_us = timer_state.get("next_elapse_us") or ""
+    # systemd uses UINT64_MAX as the "no next elapse" sentinel. Treat any
+    # timestamp > 100 years from now (1e11 seconds) as "not scheduled".
+    if next_us.isdigit():
+        next_epoch = int(next_us) / 1_000_000
+        if next_epoch - time.time() < 3.15e9:  # < ~100 years ahead
+            next_run_seconds = max(0, int(next_epoch - time.time()))
+
+    # Background trainer
+    bt = _state.get("background_trainer")
+    bg_active = bool(bt and getattr(bt, "is_training", False))
+    bg_adapter = getattr(bt, "current_adapter_name", None) if bg_active else None
+
     return StatusResponse(
         model=config.model_name,
         mode=_state["mode"],
         cloud_only_reason=_state.get("cloud_only_reason"),
         adapter_loaded=adapter_loaded,
         keys_count=keys_count,
-        pending_sessions=_state["session_buffer"].pending_count if _state["session_buffer"] else 0,
+        pending_sessions=summary["total"],
         consolidating=_state["consolidating"],
         last_consolidation=_state["last_consolidation"],
-        speaker_profiles=_state["speaker_store"].profile_count
-        if _state.get("speaker_store")
-        else 0,
+        speaker_profiles=store.profile_count if store else 0,
         stt_loaded=_state.get("stt") is not None and _state["stt"].is_loaded,
         stt_model=_state["stt"].model_name if _state.get("stt") else None,
+        schedule=config.consolidation.schedule,
+        mode_config=config.consolidation.mode,
+        next_run_seconds=next_run_seconds,
+        orphaned_pending=summary["orphaned"],
+        oldest_pending_seconds=summary["oldest_age_seconds"],
+        speakers=speaker_rows,
+        bg_trainer_active=bg_active,
+        bg_trainer_adapter=bg_adapter,
+        last_consolidation_result=_state.get("last_consolidation_result"),
+        pending_enrollments=len(_state.get("pending_enrollments") or []),
+        scheduler_started=scheduler_active,
     )
 
 
@@ -868,6 +919,58 @@ async def refresh_ha():
         "areas": ha_graph.area_count,
         "verbs": ha_graph.verb_count,
     }
+
+
+@app.post("/debug/assign-orphans")
+async def debug_assign_orphans(speaker_id: str | None = None):
+    """Test-only: attribute all orphan sessions to a single speaker.
+
+    Requires debug mode. Uses the given speaker_id, or the first
+    enrolled profile if omitted. Mutates in-memory turns and, in
+    debug persistence mode, rewrites the jsonl files on disk.
+    """
+    config = _state["config"]
+    if not getattr(config, "debug", False):
+        return {"status": "forbidden_not_debug"}
+    store = _state.get("speaker_store")
+    buffer = _state.get("session_buffer")
+    if store is None or buffer is None:
+        return {"status": "not_ready"}
+    profiles = store.list_profiles()
+    if not profiles:
+        return {"status": "no_speakers_enrolled"}
+    target = next((p for p in profiles if p["id"] == speaker_id), profiles[0])
+    sid, sname = target["id"], target["name"]
+    claimed = 0
+    for conv_id, turns in buffer._turns.items():
+        if any(t.get("speaker_id") for t in turns):
+            continue
+        for turn in turns:
+            turn["speaker"] = sname
+            turn["speaker_id"] = sid
+        claimed += 1
+        if buffer.debug:
+            path = buffer.session_dir / f"{conv_id}.jsonl"
+            if path.exists():
+                with open(path, "w") as f:
+                    for turn in turns:
+                        f.write(json.dumps(turn) + "\n")
+    logger.info("debug/assign-orphans: %d sessions → speaker %s (%s)", claimed, sname, sid)
+    return {"status": "ok", "claimed": claimed, "speaker": sname, "speaker_id": sid}
+
+
+@app.post("/scheduled-tick", response_model=ConsolidateResponse)
+async def scheduled_tick():
+    """Systemd user-timer entrypoint (paramem-consolidate.timer).
+
+    Runs the cooperative extract + background-train path. If the GPU is
+    unavailable (cloud-only or bg training active), returns a 'deferred'
+    status — the timer will fire again on its next wall-clock tick.
+    """
+    _state["scheduler_last_tick_epoch"] = time.time()
+    status = _maybe_trigger_scheduled_consolidation()
+    _state["scheduler_last_tick_status"] = status
+    return ConsolidateResponse(status=status)
 
 
 @app.post("/consolidate", response_model=ConsolidateResponse)
@@ -991,6 +1094,7 @@ def _run_consolidation_inner():
         # in PeftModel with adapters during training
         _state["model"] = loop.model
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    _state["last_consolidation_result"] = {k: v for k, v in result.items() if k != "loop"}
     _state["router"].reload()
     # Refresh HA entity graph if available
     ha_graph = _state.get("ha_graph")
@@ -1010,93 +1114,103 @@ def _consolidation_done_callback(future):
         logger.exception("Consolidation failed: %s", exc)
 
 
-async def _consolidation_scheduler(schedule: str):
-    """Background task that triggers consolidation at the configured hour.
+def _maybe_trigger_scheduled_consolidation() -> str:
+    """Gate + dispatch the scheduled extract + BG-train run.
 
-    Schedule format: "HH:MM" (24-hour).
+    Returns a short status string. GPU-busy states return 'deferred_*' so the
+    caller can distinguish a missed-but-rescheduled tick from a true no-op.
+    The systemd timer will fire again on its next wall-clock tick and retry.
     """
-    try:
-        target_hour, target_minute = map(int, schedule.split(":"))
-    except ValueError:
-        logger.error("Invalid schedule format: %s (expected HH:MM)", schedule)
-        return
-
-    triggered_today = False
-
-    while True:
-        now = datetime.now()
-        current_hour = now.hour
-        current_minute = now.minute
-
-        if current_hour == target_hour and current_minute == target_minute:
-            if not triggered_today and not _state["consolidating"] and _state["mode"] == "local":
-                logger.info("Scheduled consolidation triggered at %s", schedule)
-                _state["consolidating"] = True
-                loop = asyncio.get_running_loop()
-                future = loop.run_in_executor(None, _run_consolidation_sync)
-                future.add_done_callback(_consolidation_done_callback)
-                triggered_today = True
-        else:
-            triggered_today = False
-
-        await asyncio.sleep(30)
-
-
-# --- Background training scheduler ---
-
-
-async def _training_scheduler(interval_hours: int):
-    """Extract pending sessions and start background training.
-
-    Every N hours:
-    1. Extract all pending sessions (blocking — needs model for LLM extraction)
-    2. Prepare training data (key assignment, reconstruction)
-    3. Start BackgroundTrainer (non-blocking — trains in daemon thread)
-
-    Skips if no pending sessions, already consolidating/training, or cloud-only.
-    """
-    interval_seconds = interval_hours * 3600
-
-    while True:
-        await asyncio.sleep(interval_seconds)
-
-        if _state["consolidating"]:
-            logger.info("Training scheduler: consolidation already running, skipping")
-            continue
-        if _state["mode"] != "local":
-            continue
-        bg = _state.get("background_trainer")
-        if bg is not None and bg.is_training:
-            logger.info("Training scheduler: background training active, skipping")
-            continue
-
-        pending = _state["session_buffer"].get_pending()
-        if not pending:
-            logger.info("Training scheduler: no pending sessions, skipping")
-            continue
-
-        has_speaker = any(s.get("speaker_id") for s in pending)
-        if not has_speaker:
-            logger.info("Training scheduler: no sessions with speaker_id, skipping")
-            continue
-
+    if _state["consolidating"]:
+        logger.info("Scheduler tick: consolidation already running — deferred")
+        return "deferred_already_running"
+    if _state["mode"] != "local":
         logger.info(
-            "Training scheduler: %d pending sessions, starting extract + train",
-            len(pending),
+            "Scheduler tick: mode=%s (reason=%s) — deferred, will retry on next tick",
+            _state["mode"],
+            _state.get("cloud_only_reason"),
         )
-        _state["consolidating"] = True
+        return "deferred_cloud_only"
+    bg = _state.get("background_trainer")
+    if bg is not None and bg.is_training:
+        logger.info("Scheduler tick: background training active — deferred")
+        return "deferred_bg_training"
 
-        # Fire-and-forget — extraction runs in executor, training in daemon thread
-        event_loop = asyncio.get_running_loop()
-        future = event_loop.run_in_executor(None, _extract_and_start_training)
-        future.add_done_callback(_training_scheduler_done_callback)
+    buffer = _state["session_buffer"]
+
+    # Retroactive voice-match claim: scan orphan sessions against every
+    # enrolled speaker. Attributes sessions whose embeddings match an
+    # existing profile at high confidence. Cheap — centroids are cached.
+    _retro_claim_orphan_sessions()
+
+    pending = buffer.get_pending()
+    if not pending:
+        logger.info("Scheduler tick: no pending sessions — noop")
+        return "noop_no_pending"
+    if not any(s.get("speaker_id") for s in pending):
+        logger.info("Scheduler tick: no sessions with speaker_id — noop")
+        return "noop_no_speaker"
+
+    logger.info("Scheduler tick: %d pending sessions, starting extract + train", len(pending))
+    _state["consolidating"] = True
+
+    event_loop = asyncio.get_running_loop()
+    future = event_loop.run_in_executor(None, _extract_and_start_training)
+    future.add_done_callback(_scheduled_extract_done_callback)
+    return "started"
 
 
-def _training_scheduler_done_callback(future):
-    """Called when extraction phase completes (training continues in background)."""
+def _retro_claim_orphan_sessions() -> int:
+    """Attribute orphaned pending sessions to existing speaker profiles via voice match.
+
+    Runs before each scheduled consolidation tick. For each enrolled speaker,
+    invokes `SessionBuffer.claim_sessions_for_speaker` which scans orphan
+    sessions for user turns whose stored embeddings match the speaker at
+    high confidence. Idempotent — already-claimed sessions are skipped.
+
+    Runs on the asyncio event loop thread (same thread as `_enrollment_idle_loop`),
+    so there is no lock contention over `SessionBuffer._turns` with the
+    enrollment path. `_extract_and_start_training` runs in an executor but is
+    dispatched only after this function returns.
+
+    A corrupt profile or session must not take down the entire tick —
+    each speaker is wrapped independently.
+
+    Returns the total number of sessions claimed across all speakers.
+    """
+    buffer = _state.get("session_buffer")
+    store = _state.get("speaker_store")
+    if buffer is None or store is None:
+        return 0
+
+    total = 0
+    for profile in store.list_profiles():
+        try:
+            claimed = buffer.claim_sessions_for_speaker(profile["id"], profile["name"], store)
+        except Exception:
+            logger.exception(
+                "Retro-claim failed for speaker %s (%s) — skipping",
+                profile.get("name", "?"),
+                profile.get("id", "?"),
+            )
+            continue
+        total += claimed
+    if total > 0:
+        logger.info("Retro-claim: attributed %d orphan sessions to known speakers", total)
+    else:
+        logger.debug("Retro-claim: no new orphan sessions matched known speakers")
+    return total
+
+
+def _scheduled_extract_done_callback(future):
+    """Clear the consolidating flag only if the extraction phase failed.
+
+    On success, _extract_and_start_training has handed off to the background
+    trainer and the flag will be cleared by _finalize_background_training.
+    """
     exc = future.exception()
     if exc:
-        logger.exception("Training scheduler extraction failed: %s", exc)
+        logger.exception("Scheduled extraction failed: %s", exc)
         _state["consolidating"] = False
 
 
@@ -1181,6 +1295,13 @@ def _extract_and_start_training():
     if not all_episodic_qa and not all_procedural_rels:
         logger.info("No QA pairs extracted — skipping")
         session_buffer.mark_consolidated(session_ids)
+        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+        _state["last_consolidation_result"] = {
+            "status": "no_facts",
+            "sessions": len(session_ids),
+            "episodic_qa": 0,
+            "procedural_rels": 0,
+        }
         _state["consolidating"] = False
         return
 
@@ -1189,6 +1310,13 @@ def _extract_and_start_training():
         if config.debug:
             _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
         session_buffer.mark_consolidated(session_ids)
+        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+        _state["last_consolidation_result"] = {
+            "status": "simulated",
+            "sessions": len(session_ids),
+            "episodic_qa": len(all_episodic_qa),
+            "procedural_rels": len(all_procedural_rels),
+        }
         _state["consolidating"] = False
         logger.info(
             "Simulation complete: %d episodic QA, %d procedural rels",
@@ -1302,10 +1430,15 @@ def _finalize_background_training(loop, jobs_data=None):
     loop.model.eval()
     _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
     _state["router"].reload()
-    _state["consolidating"] = False
     total_keys = (
         len(loop.episodic_simhash) + len(loop.semantic_simhash) + len(loop.procedural_simhash)
     )
+    _state["last_consolidation_result"] = {
+        "status": "trained",
+        "total_keys": total_keys,
+        "jobs": [job[0] for job in (jobs_data or [])],
+    }
+    _state["consolidating"] = False
     logger.info("Background training complete — %d keys saved", total_keys)
 
 

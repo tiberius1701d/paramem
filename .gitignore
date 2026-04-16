@@ -87,3 +87,7 @@ ha_automations/
 
 # Claude Code local settings
 .claude/
+
+# Session scratch pads (handovers, design plans, crash-safety notes)
+docs/handover-*.md
+docs/alignment-plan-*.md

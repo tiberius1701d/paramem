@@ -158,6 +158,11 @@ class BackgroundTrainer:
     def is_training(self) -> bool:
         return self._is_training
 
+    @property
+    def current_adapter_name(self) -> str:
+        """Name of the adapter currently being trained (empty if idle)."""
+        return self._current_adapter
+
     def start_jobs(
         self,
         jobs: list[TrainingJob],
