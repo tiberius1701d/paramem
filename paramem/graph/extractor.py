@@ -706,45 +706,69 @@ Return ONLY a JSON array of facts. Each fact: subject, predicate, object, \
 relation_type, confidence. If none, return [].
 """
 
-_DEFAULT_PLAUSIBILITY_PROMPT = """\
-You are reviewing enriched personal facts from a voice assistant conversation. \
-Inputs may be anonymized (placeholders like Person_1) or real-named — apply \
-the same rules either way.
-
-Your task is to KEEP valid facts and DROP invalid ones. Do NOT add new facts. \
-Do NOT modify the subject, predicate, object, relation_type, or confidence of \
-facts you keep.
-
-DROP a fact if any of these hold (apply checks in order):
-
-1. Self-loop (lexical, no exceptions): `subject` and `object` are the same \
-string (case-insensitive), regardless of predicate. Includes has_name, is, \
-equals, same_as, named, identity-style predicates. Apply this check FIRST.
-2. Cross-loop / name-swap: both A has_name B AND B has_name A (or any \
-combination of has_name, named, is, equals that asserts A ≡ B) — DROP both.
-3. Tautology: predicate is a synonym of the object value (has_colleague → \
-"Colleagues", has_role → "role", has_name → "name").
-4. Role leak: subject or object is a dialogue role ("Assistant", "User", \
-"Speaker", "the bot", "the model"). Person_1/City_1/Org_1/Thing_1 are entity \
-placeholders, NOT role leaks.
-5. Placeholder leak in real-name input: drop any fact whose subject or object \
-matches the regex ^(Person|City|Country|Org|Thing)_\\d+$ — de-anonymization \
-missed an entity.
-6. Placeholder object: object is "Unknown", "None", "Various", "Something", \
-"N/A", or empty.
-7. System identifier: contains dots like "media_player.sonos_office".
-8. Casual-query inference: asking ≠ stating.
-9. Conversation event: predicates like "discussed_topic", "asked_about", \
-"responded_to", "mentioned_in_conversation".
-
-Conversation transcript (anonymized):
-{transcript}
-
-Enriched facts (anonymized):
-{facts_json}
-
-Return ONLY a JSON array of the surviving facts, schema unchanged. If none, return [].
-"""
+# NOTE: keep this template byte-equivalent to ``configs/prompts/sota_plausibility.txt``.
+# ``tests/test_prompts_contract.py::test_inline_default_matches_file`` enforces parity.
+# The file uses long markdown paragraphs; we preserve them via implicit string
+# concatenation so Ruff E501 doesn't force line-wraps that alter the rendered text.
+# fmt: off
+_DEFAULT_PLAUSIBILITY_PROMPT = (
+    "You are filtering enriched personal facts from a voice assistant conversation. "  # noqa: E501
+    "Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.\n"  # noqa: E501
+    "\n"
+    "**Default: KEEP.** Silent data loss is worse than a noisy graph — the next session will correct noise, "  # noqa: E501
+    "but a dropped real fact is gone forever. Only drop a fact when one of the rules below matches unambiguously. "  # noqa: E501
+    "When uncertain, KEEP.\n"
+    "\n"
+    "Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, "  # noqa: E501
+    "or confidence of facts you keep.\n"
+    "\n"
+    "## DROP rules (each is a lexical pattern — no judgment calls)\n"
+    "\n"
+    "**R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), "  # noqa: E501
+    "regardless of predicate.\n"
+    "\n"
+    "**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are present "  # noqa: E501
+    "(also `named`, `is`, `equals`). Drop both.\n"
+    "\n"
+    "**R3. Role leak.** Subject or object is exactly one of: "
+    '"Assistant", "User", "Speaker", "the bot", "the model". '
+    'Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, '  # noqa: E501
+    "NOT role leaks.\n"
+    "\n"
+    "**R4. Unresolved placeholder in real-name input.** When the input is real-named "  # noqa: E501
+    "(no `Person_N` / `City_N` / `Country_N` / `Org_N` / `Thing_N` placeholders expected in the transcript), "  # noqa: E501
+    "drop any fact whose subject or object still matches "
+    r"`^(Person|City|Country|Org|Thing)_\d+$`."  # noqa: E501
+    "\n"
+    "\n"
+    "**R5. Empty / sentinel object.** Object is exactly one of: "
+    '"", "Unknown", "None", "Various", "Something", "N/A".\n'
+    "\n"
+    "**R6. System entity ID.** Subject or object contains a dot-separated HA-style identifier "  # noqa: E501
+    "(e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`).\n"
+    "\n"
+    "## Examples\n"
+    "\n"
+    'Input fact: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)\n'  # noqa: E501
+    'Input fact: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP\n'  # noqa: E501
+    'Input fact: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)\n'  # noqa: E501
+    'Input fact: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)\n'  # noqa: E501
+    'Input fact: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)\n'  # noqa: E501
+    'Input fact: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP\n'  # noqa: E501
+    'Input fact: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)\n'  # noqa: E501
+    "\n"
+    "## Input\n"
+    "\n"
+    "Conversation transcript:\n"
+    "{transcript}\n"
+    "\n"
+    "Enriched facts:\n"
+    "{facts_json}\n"
+    "\n"
+    "Return ONLY a JSON array of surviving facts, schema unchanged. "
+    "If all facts survive, return them all. If no facts survive, return [].\n"
+)
+# fmt: on
 
 
 # Registry of SOTA plausibility validators that see only anonymized data.

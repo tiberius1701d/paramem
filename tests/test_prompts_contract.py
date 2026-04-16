@@ -143,6 +143,18 @@ class TestPlausibilityPromptContract:
             "cannot be recovered from subsequent sessions."
         )
 
+    def test_inline_default_matches_file(self):
+        """The inline ``_DEFAULT_PLAUSIBILITY_PROMPT`` is only used when the
+        file is missing. If it drifts from the file, production behaviour
+        silently flips on any deployment that loses ``configs/prompts/``.
+        Render both with the same inputs and require byte equality.
+        """
+        from pathlib import Path
+
+        file_tmpl = Path("configs/prompts/sota_plausibility.txt").read_text()
+        args = {"transcript": "Person_1 said hi.", "facts_json": "[]"}
+        assert _DEFAULT_PLAUSIBILITY_PROMPT.format(**args) == file_tmpl.format(**args)
+
 
 class TestProceduralPrompt:
     def test_renders_with_speaker_context_empty(self):
