@@ -1,0 +1,78 @@
+[
+  {
+    "question_id": "test_pref_001",
+    "question_type": "single-session-preference",
+    "question": "What is Alex's favorite city?",
+    "answer": "Portland",
+    "question_date": "2023/04/10 (Mon) 23:07",
+    "haystack_dates": ["2023/03/15 (Wed) 10:00"],
+    "haystack_session_ids": ["answer_session_1"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I have been thinking about where to move next year.",
+          "has_answer": false
+        },
+        {
+          "role": "assistant",
+          "content": "That is a big decision. Do you have any cities in mind?",
+          "has_answer": false
+        },
+        {
+          "role": "user",
+          "content": "I really love the city in Oregon with the best food scene and outdoor activities.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "That city on the West Coast does sound like a great fit for someone who enjoys both.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["answer_session_1"]
+  },
+  {
+    "question_id": "test_multi_002",
+    "question_type": "multi-session",
+    "question": "How many cats does Jordan own?",
+    "answer": 3,
+    "question_date": "2023/05/20 (Sat) 18:30",
+    "haystack_dates": [
+      "2023/04/01 (Sat) 09:00",
+      "2023/04/08 (Sat) 11:00"
+    ],
+    "haystack_session_ids": [
+      "answer_session_A",
+      "distractor_session_B"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I adopted another feline last week so my household pet count went up by one.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Multiple cats! That must keep you busy.",
+          "has_answer": false
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I went to the farmer's market today and bought some tomatoes.",
+          "has_answer": false
+        },
+        {
+          "role": "assistant",
+          "content": "Sounds like a productive Saturday!",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["answer_session_A"]
+  }
+]

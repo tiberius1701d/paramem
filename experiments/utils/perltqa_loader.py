@@ -14,11 +14,18 @@ Two main use cases:
   2. load_character_eval_qa() — ground-truth QA pairs for evaluation
 
 Falls back to synthetic data if PerLTQA is not available locally.
+
+New class (additive only — all existing public names unchanged):
+  PerLTQALoader — DatasetLoader-compatible adapter for the probing harness.
 """
 
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    from experiments.utils.dataset_types import DatasetSession
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +241,92 @@ def load_fallback_qa(max_pairs: int = 100) -> list[dict]:
             break
 
     return qa_pairs
+
+
+class PerLTQALoader:
+    """DatasetLoader-compatible adapter for the PerLTQA dataset.
+
+    Wraps ``load_character_dialogues`` and yields ``DatasetSession`` objects
+    that conform to the common ``DatasetLoader`` protocol defined in
+    ``experiments.utils.dataset_types``.
+
+    Character selection:
+      - If ``character`` is provided to ``iter_sessions``, that character is
+        used directly.
+      - If ``character`` is None, the character with the most dialogues is
+        chosen deterministically (sorted by count desc, then name asc) and
+        the choice is logged at INFO level.
+
+    The loader does NOT load eval QA. Ground-truth QA is out of scope for
+    the extraction-health probe; the pipeline generates its own training QA
+    from dialogues via graph extraction.
+
+    Attributes:
+        name: Loader identifier for the dataset registry ("perltqa").
+    """
+
+    name: str = "perltqa"
+
+    def iter_sessions(
+        self,
+        limit: int | None = None,
+        character: str | None = None,
+        **kwargs,
+    ) -> "Iterator[DatasetSession]":
+        """Yield DatasetSession objects for a PerLTQA character.
+
+        Args:
+            limit: Maximum number of sessions to yield. None = all.
+            character: Character name (e.g. "Liang Xin"). If None, the
+                character with the most dialogues is chosen automatically.
+            **kwargs: Absorbed for protocol compatibility.
+
+        Yields:
+            DatasetSession with all five fields populated.
+
+        Raises:
+            RuntimeError: If PerLTQA is not available locally.
+        """
+        # Import here to avoid circular-import at module load time;
+        # dataset_types is only needed for the new class.
+        from experiments.utils.dataset_types import DatasetSession as _DS
+
+        if not is_available():
+            raise RuntimeError(
+                "PerLTQA dataset is not available locally. "
+                "Clone to data/external/PerLTQA/ and retry."
+            )
+
+        chosen_character = character
+        if chosen_character is None:
+            chars = list_characters()
+            if not chars:
+                logger.warning("PerLTQALoader: no characters found — yielding nothing")
+                return
+            # Sort: count desc, name asc for determinism.
+            chosen_character = sorted(
+                chars.items(),
+                key=lambda kv: (-kv[1]["dialogues"], kv[0]),
+            )[0][0]
+            logger.info(
+                "PerLTQALoader: no character specified — auto-selected %r (%d dialogues)",
+                chosen_character,
+                chars[chosen_character]["dialogues"],
+            )
+
+        sessions = load_character_dialogues(chosen_character, max_sessions=limit)
+        for session in sessions:
+            yield _DS(
+                session_id=session["session_id"],
+                transcript=session["transcript"],
+                speaker_id=f"perltqa:{chosen_character}",
+                speaker_name=chosen_character,
+                metadata={
+                    "timestamp": session.get("timestamp", ""),
+                    "character": chosen_character,
+                    "dataset": "perltqa",
+                },
+            )
 
 
 def load_qa(

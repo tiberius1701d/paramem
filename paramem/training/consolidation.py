@@ -156,6 +156,7 @@ class ConsolidationLoop:
         # Graph state
         self.merger = GraphMerger()
         self.scorer = PromotionScorer()
+        self.last_session_graph = None
         if graph_path:
             self.graph_path = Path(graph_path)
         elif self.persist_graph:
@@ -403,6 +404,7 @@ class ConsolidationLoop:
                 for r in proc_graph.relations
             ]
 
+        self.last_session_graph = session_graph
         return episodic_qa, procedural_rels
 
     def train_adapters(

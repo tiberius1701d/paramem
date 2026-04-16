@@ -1,0 +1,25 @@
+{
+  "Alex": {
+    "dialogues": {
+      "dlg001": {
+        "contents": {
+          "2023-01-10 09:00:00": [
+            "Alex: I love hiking in the mountains every weekend.",
+            "Jordan: That sounds wonderful! Which mountains do you prefer?",
+            "Alex: I usually go to the Blue Ridge Mountains. The trails are amazing."
+          ]
+        }
+      },
+      "dlg002": {
+        "contents": {
+          "2023-01-15 14:00:00": [
+            "Alex: My favorite food is definitely pizza, especially Neapolitan style.",
+            "Jordan: Have you tried the place on Main Street?",
+            "Alex: Yes! It is the best pizza in town."
+          ]
+        }
+      }
+    },
+    "events": {}
+  }
+}

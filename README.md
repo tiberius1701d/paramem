@@ -152,8 +152,9 @@ paramem/
 └── utils/            # Configuration (YAML-driven)
 configs/              # Default configuration
 experiments/          # Validated experiment scripts
-├── utils/            # Shared test harness + PerLTQA dataset loader
+├── utils/            # Shared test harness + PerLTQA / LongMemEval loaders
 ├── test1-7_*.py      # Extended evaluation suite (see below)
+├── dataset_probe.py  # Dataset-agnostic extraction-pipeline probe
 └── ...
 examples/             # Self-contained example scripts
 tests/                # Unit and integration tests
@@ -343,7 +344,7 @@ Tested voice satellites: ReSpeaker Lite (living room), ESP32 S3 Box 3 (office).
 
 ## Data
 
-Synthetic test data (`data/synthetic/`) is included in the repository. Two additional datasets are used:
+Synthetic test data (`data/synthetic/`) is included in the repository. Additional datasets used for benchmarking and probing:
 
 - **Synthetic sessions** (`data/synthetic/synthetic_sessions.json`) — 55 conversational sessions for the end-to-end consolidation loop (§5.5). Included in the repo.
 - **PerLTQA** — Public dataset with character profiles and dialogues, used by Tests 1-7 for realistic conversational data. Must be downloaded manually:
@@ -353,6 +354,17 @@ git clone https://github.com/Elvin-Yiming-Du/PerLTQA data/external/PerLTQA
 ```
 
 Tests fall back to synthetic data if PerLTQA is not available, but results may differ from the paper.
+
+- **LongMemEval** (ICLR 2025) — Long-horizon conversational QA benchmark (500 examples / 948 sessions in the oracle split). Used by `experiments/dataset_probe.py` to exercise the extraction pipeline on a second corpus. Fetched on first use from the `xiaowu0162/longmemeval-cleaned` HuggingFace dataset at a pinned revision and cached under `data/external/longmemeval/` (gitignored). No manual download step required.
+
+### Dataset probe
+
+`experiments/dataset_probe.py` runs any supported dataset through the full consolidation pipeline (extract → merge → QA → indexed-key train → recall smoke) and emits identically-shaped per-session diagnostics. Useful for comparing extraction quality across corpora and regression-testing the pipeline end-to-end. Resume-safe; outputs land in `outputs/dataset_probe/{dataset}/{model}/{timestamp}/`.
+
+```bash
+python experiments/dataset_probe.py --dataset perltqa --limit 20
+python experiments/dataset_probe.py --dataset longmemeval --limit 20
+```
 
 ## Extended Evaluation Suite
 
