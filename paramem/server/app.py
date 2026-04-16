@@ -1271,10 +1271,18 @@ def _extract_and_start_training():
                 logger.info("Shutdown — stopping extraction early")
                 break
 
+            speaker_name = None
+            if _state.get("speaker_store") is not None:
+                try:
+                    speaker_name = _state["speaker_store"].get_name(session_speaker_id)
+                except Exception as e:
+                    logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
+
             episodic_qa, procedural_rels = loop.extract_session(
                 transcript,
                 session_id,
                 speaker_id=session_speaker_id,
+                speaker_name=speaker_name,
                 ha_context=ha_context,
                 stt_correction=config.consolidation.extraction_stt_correction,
                 ha_validation=config.consolidation.extraction_ha_validation,

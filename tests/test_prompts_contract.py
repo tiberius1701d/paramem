@@ -17,6 +17,7 @@ from paramem.graph.extractor import (
     _DEFAULT_ENRICHMENT_PROMPT,
     _DEFAULT_EXTRACTION_PROMPT,
     _DEFAULT_PLAUSIBILITY_PROMPT,
+    _DEFAULT_PROCEDURAL_PROMPT,
     _load_prompt,
     build_speaker_context,
 )
@@ -138,3 +139,41 @@ class TestPlausibilityPromptContract:
             "Removing or inverting this causes silent data loss — dropped facts "
             "cannot be recovered from subsequent sessions."
         )
+
+
+class TestProceduralPrompt:
+    def test_renders_with_speaker_context_empty(self):
+        """Procedural prompt renders without errors when speaker is unknown.
+
+        Verifies that the {speaker_context} placeholder is present in the
+        file-based prompt and collapses cleanly to an empty string so no
+        dangling placeholder or extra blank lines remain.
+        """
+        tmpl = _load_prompt("extraction_procedural.txt", _DEFAULT_PROCEDURAL_PROMPT)
+        rendered = tmpl.format(
+            transcript="[user] Play some jazz.",
+            speaker_context=build_speaker_context(None),
+            entity_types=format_entity_types(scope="procedural"),
+            predicate_examples=format_predicate_examples(scope="procedural"),
+        )
+        assert "{transcript}" not in rendered
+        assert "{speaker_context}" not in rendered
+        # Empty speaker_context produces at most one blank-line gap, not three.
+        assert "\n\n\n\n" not in rendered
+
+    def test_renders_with_speaker_context_set(self):
+        """Procedural prompt injects real speaker name when provided.
+
+        Guards against the silent identity fragmentation bug where
+        procedural facts get subject "Speaker" while main-extraction
+        facts use the real name, creating two nodes for the same person.
+        """
+        tmpl = _load_prompt("extraction_procedural.txt", _DEFAULT_PROCEDURAL_PROMPT)
+        rendered = tmpl.format(
+            transcript="[user] Play some jazz.",
+            speaker_context=build_speaker_context("Alex"),
+            entity_types=format_entity_types(scope="procedural"),
+            predicate_examples=format_predicate_examples(scope="procedural"),
+        )
+        assert "Alex" in rendered
+        assert "'Alex'" in rendered

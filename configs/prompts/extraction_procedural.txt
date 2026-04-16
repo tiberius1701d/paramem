@@ -1,4 +1,4 @@
-Extract PREFERENCES, HABITS, and ROUTINES of the speaker from this conversation transcript.
+Extract PREFERENCES, HABITS, and ROUTINES of the speaker from this conversation transcript.{speaker_context}
 
 Only extract behavioral patterns — what the speaker likes, uses, prefers, avoids,
 or does regularly. These are things that reflect how the speaker lives, not

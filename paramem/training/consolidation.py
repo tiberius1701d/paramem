@@ -380,6 +380,7 @@ class ConsolidationLoop:
                         max_tokens=self.extraction_max_tokens,
                         prompts_dir=self.prompts_dir,
                         stt_correction=stt_correction,
+                        speaker_name=speaker_name,
                     )
             else:
                 proc_graph = extract_procedural_graph(
@@ -390,6 +391,7 @@ class ConsolidationLoop:
                     max_tokens=self.extraction_max_tokens,
                     prompts_dir=self.prompts_dir,
                     stt_correction=stt_correction,
+                    speaker_name=speaker_name,
                 )
             procedural_rels = [
                 {

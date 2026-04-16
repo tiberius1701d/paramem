@@ -89,6 +89,7 @@ class TestProceduralPromptRender:
         _, prompt = load_procedural_prompt()
         rendered = prompt.format(
             transcript="sample",
+            speaker_context="",
             entity_types=format_entity_types(scope="procedural"),
             predicate_examples=format_predicate_examples(scope="procedural"),
         )
@@ -98,6 +99,7 @@ class TestProceduralPromptRender:
         _, prompt = load_procedural_prompt()
         rendered = prompt.format(
             transcript="sample",
+            speaker_context="",
             entity_types=format_entity_types(scope="procedural"),
             predicate_examples=format_predicate_examples(scope="procedural"),
         )
@@ -108,6 +110,7 @@ class TestProceduralPromptRender:
         _, prompt = load_procedural_prompt()
         rendered = prompt.format(
             transcript="sample",
+            speaker_context="",
             entity_types=format_entity_types(scope="procedural"),
             predicate_examples=format_predicate_examples(scope="procedural"),
         )

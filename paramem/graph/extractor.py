@@ -86,7 +86,7 @@ def load_extraction_prompts(
 
 
 _DEFAULT_PROCEDURAL_PROMPT = """\
-Extract preferences, habits, and routines from this conversation.
+Extract preferences, habits, and routines from this conversation.{speaker_context}
 Only extract relation_type "preference". Return JSON.
 
 Transcript:
@@ -121,22 +121,32 @@ def extract_procedural_graph(
     max_tokens: int = 1024,
     prompts_dir: str | Path | None = None,
     stt_correction: bool = True,
+    speaker_name: str | None = None,
 ) -> SessionGraph:
     """Extract preferences/habits from a session transcript.
 
     Separate extraction pass with a dedicated prompt targeting
     behavioral patterns rather than factual knowledge.
+
+    Args:
+        speaker_name: Real name of the speaker (e.g. from voice enrollment).
+            When provided, injected into the prompt via ``build_speaker_context``
+            so the model uses the real name as the subject of every extracted
+            preference instead of the generic "Speaker" placeholder. Mirrors
+            the same parameter on ``extract_graph``.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
     system, prompt = load_procedural_prompt(prompts_dir)
+    speaker_context = build_speaker_context(speaker_name)
     messages = [
         {"role": "system", "content": system},
         {
             "role": "user",
             "content": prompt.format(
                 transcript=transcript,
+                speaker_context=speaker_context,
                 entity_types=format_entity_types(scope="procedural"),
                 predicate_examples=format_predicate_examples(scope="procedural"),
             ),
