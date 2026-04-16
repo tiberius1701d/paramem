@@ -99,13 +99,29 @@ class TestPlausibilityPromptContract:
         assert "{facts_json}" not in rendered
 
     def test_lists_drop_rules(self):
-        """Plausibility judge relies on numbered drop rules. Verify they exist."""
+        """Plausibility judge relies on six numbered drop rules (R1-R6). Verify they
+        all exist so a prompt edit that removes a rule is caught at unit-test time.
+        """
         tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
         required_rules = [
-            "self-loop",
-            "tautology",
-            "role leak",
-            "placeholder",
+            "self-loop",  # R1
+            "name-swap",  # R2
+            "role leak",  # R3
+            "placeholder",  # R4
+            "sentinel",  # R5
+            "system entity",  # R6
         ]
         for rule in required_rules:
             assert rule.lower() in tmpl.lower(), f"Plausibility prompt missing rule: {rule!r}"
+
+    def test_keep_default_disposition(self):
+        """The prompt uses a KEEP-by-default model. Regressing to DROP-by-default
+        silently discards valid facts — a data-loss bug that only surfaces
+        during a full extraction sweep. This assertion guards that semantic flip.
+        """
+        tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+        assert "default: keep" in tmpl.lower(), (
+            "Plausibility prompt must declare 'Default: KEEP' disposition. "
+            "Removing or inverting this causes silent data loss — dropped facts "
+            "cannot be recovered from subsequent sessions."
+        )
