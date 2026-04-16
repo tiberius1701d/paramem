@@ -1629,6 +1629,12 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E1350 | 100% | 93.0% | 69.0% |  9.4% | 40.6% |  5.4% | 44.2% | 0.005 |
 | E1380 | 100% | 93.0% | 68.2% |  9.4% | 35.8% |  7.9% | 45.0% | 0.002 |
 | E1410 | 100% | 93.0% | 69.8% |  6.9% | 41.9% | 11.3% | 46.5% | 0.006 |
+| E1440 | 100% | 93.0% | 73.6% |  9.2% | 51.9% |  6.9% | 41.9% | 0.002 |
+| E1470 | 100% | 93.0% | 67.4% |  5.3% | 41.4% |  6.4% | 42.6% | 0.007 |
+| E1500 | 100% | 93.0% | 73.6% |  6.9% | 45.6% |  4.9% | 40.3% | 0.003 |
+| E1530 | 100% | 93.0% | 73.6% |  8.3% | 49.2% |  8.9% | 28.7% | 0.005 |
+| E1560 | 100% | 93.0% | 76.0% |  8.1% | 46.4% | 10.8% | 38.8% | 0.006 |
+| E1590 | 100% | 93.0% | 76.0% |  7.2% | 49.7% |  8.9% | 43.4% | 0.005 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1662,16 +1668,33 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E1350 | 34/360 |  1/35 (3%)  | 33/325 (10%) | 0 |
 | E1380 | 34/360 |  5/35 (14%) | 29/325 (9%)  | 0 |
 | E1410 | 25/360 |  5/35 (14%) | 20/325 (6%)  | 0 |
+| E1440 | 33/360 |  8/35 (23%) | 25/325 (8%)  | 0 |
+| E1470 | 19/360 |  2/35 (6%)  | 17/325 (5%)  | 0 |
+| E1500 | 25/360 |  5/35 (14%) | 20/325 (6%)  | 0 |
+| E1530 | 30/360 |  7/35 (20%) | 23/325 (7%)  | 0 |
+| E1560 | 29/360 |  4/35 (11%) | 25/325 (8%)  | 0 |
+| E1590 | 26/360 |  6/35 (17%) | 20/325 (6%)  | 0 |
 
-### Key findings (E1410, 47 cycles) — PAUSED 2026-04-14
+### Key findings (E1590, 53 cycles) — 2026-04-16
+
+Resume E1410→E1590 (6 additional cycles, ~180 epochs overnight) reinforces
+the pattern: no grokking signal. Rephrased recovered into the 67-76% band
+(E1590: 76.0%), matching the long-run plateau. 3-hop stays in the 5-9% band
+with no upward trend (E1440-E1590: 9.2, 5.3, 6.9, 8.3, 8.1, 7.2%). Shortcut
+continues to oscillate 41-52% and remains strictly above 3-hop at every
+checkpoint. Full-chain count remains 0 across all 53 cycles. Keyed/direct
+fully stable at 100%/93%. The compositional crossover has not occurred at
+53x convergence; extending further is unlikely to produce a phase transition
+at rank 8.
+
+### Prior findings (E1410, 47 cycles) — superseded by E1590
 
 Resume E1290→E1410 (4 additional cycles) reinforces the pattern: no grokking
 signal. Rephrased dropped slightly from 76.7% → 69.8%, 3-hop ended at its
 lowest recorded value (6.9%), full-chain count remains 0 across all 47 cycles.
 Keyed/direct fully stable at 100%/93%. Shortcut oscillates 36-48%. The earlier
 finding stands: shortcut consistently exceeds 3-hop, no compositional
-crossover emerging. Run paused at E1410 — extending further is unlikely to
-produce a phase transition.
+crossover emerging.
 
 ### Prior findings (E1290, 43 cycles) — superseded by E1410
 
@@ -2507,7 +2530,7 @@ Same speaker, pyannote 512-dim embeddings:
 
 ### Planned: Continuous Background Training
 
-Current consolidation runs as a batch job (daily at 02:00). An alternative architecture would train continuously in the background, interruptible on user activity:
+Current consolidation runs on a configurable schedule (default `every 2h`; also accepts `HH:MM` for daily) via a cooperative `BackgroundTrainer` that releases the GPU lock per step. An alternative architecture would train continuously in the background, interruptible on user activity:
 
 - HuggingFace Trainer supports checkpoint save/resume (optimizer state + LR scheduler + adapter weights)
 - `TrainerCallback.on_step_end` can check a pause flag and halt training mid-step
