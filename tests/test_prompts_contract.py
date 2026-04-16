@@ -20,6 +20,11 @@ from paramem.graph.extractor import (
     _load_prompt,
     build_speaker_context,
 )
+from paramem.graph.schema_config import (
+    format_entity_types,
+    format_predicate_examples,
+    format_relation_types,
+)
 
 
 def _render(template: str, **values) -> str:
@@ -31,7 +36,11 @@ class TestExtractionPrompt:
     def test_renders_with_speaker_context_empty(self):
         tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
         rendered = tmpl.format(
-            transcript="[user] hello", speaker_context=build_speaker_context(None)
+            transcript="[user] hello",
+            speaker_context=build_speaker_context(None),
+            entity_types=format_entity_types(),
+            predicate_examples=format_predicate_examples(),
+            relation_types=format_relation_types(),
         )
         assert "{transcript}" not in rendered
         assert "{speaker_context}" not in rendered
@@ -41,7 +50,11 @@ class TestExtractionPrompt:
     def test_renders_with_speaker_context_set(self):
         tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
         rendered = tmpl.format(
-            transcript="[user] hello", speaker_context=build_speaker_context("Alex")
+            transcript="[user] hello",
+            speaker_context=build_speaker_context("Alex"),
+            entity_types=format_entity_types(),
+            predicate_examples=format_predicate_examples(),
+            relation_types=format_relation_types(),
         )
         assert "Alex" in rendered
         assert "'Alex'" in rendered

@@ -7,6 +7,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.graph.schema import SessionGraph
+from paramem.graph.schema_config import (
+    entity_types,
+    fallback_entity_type,
+    fallback_relation_type,
+    format_entity_types,
+    format_predicate_examples,
+    format_relation_types,
+    relation_types,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,24 +45,11 @@ def build_speaker_context(speaker_name: str | None) -> str:
 _DEFAULT_EXTRACTION_PROMPT = """\
 Extract all entities and relations from this conversation transcript.{speaker_context}
 
-Rules:
-- Entity types: person, place, organization, concept, preference, event
-- Relation types: factual, temporal, preference, social
-- Use the EXACT names from the transcript — never substitute or rename entities
-- Include attributes like age, role, date where mentioned
-- predicate: snake_case verb phrase — consistent, reusable across sessions
-- confidence: 1.0 for explicit facts, 0.7 for implied/inferred
-
-Predicate examples (use these exact forms when they apply):
-- married_to, parent_of, child_of, sibling_of, has_pet, lives_with
-- lives_in, works_at, studies_at, born_in, prefers, knows
-- manages, attended, visited, bought, read, fixed, cooked, watched
-- If none fit, create a new snake_case predicate (e.g. "competed_in")
+Extract as JSON with `entities` and `relations` arrays.
 
 Transcript:
 {transcript}
-
-Extract all entities and relations as JSON."""
+"""
 
 
 def _load_prompt(filename: str, default: str, prompts_dir: Path | None = None) -> str:
@@ -99,6 +95,12 @@ Transcript:
 Return JSON with entities, relations, summary.
 """
 
+# _DEFAULT_EXTRACTION_PROMPT and _DEFAULT_PROCEDURAL_PROMPT intentionally do
+# NOT include {entity_types} or {predicate_examples} placeholders — they are
+# self-contained fallbacks used only when the prompt files cannot be read.
+# The file-based prompts (extraction.txt, extraction_procedural.txt) carry
+# those placeholders and receive the formatted values via .format() kwargs.
+
 
 def load_procedural_prompt(
     prompts_dir: str | Path | None = None,
@@ -131,7 +133,14 @@ def extract_procedural_graph(
     system, prompt = load_procedural_prompt(prompts_dir)
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": prompt.format(transcript=transcript)},
+        {
+            "role": "user",
+            "content": prompt.format(
+                transcript=transcript,
+                entity_types=format_entity_types(scope="procedural"),
+                predicate_examples=format_predicate_examples(scope="procedural"),
+            ),
+        },
     ]
     formatted = tokenizer.apply_chat_template(
         adapt_messages(messages, tokenizer),
@@ -293,7 +302,13 @@ def _generate_extraction(
         {"role": "system", "content": system},
         {
             "role": "user",
-            "content": prompt.format(transcript=transcript, speaker_context=speaker_context),
+            "content": prompt.format(
+                transcript=transcript,
+                speaker_context=speaker_context,
+                entity_types=format_entity_types(),
+                predicate_examples=format_predicate_examples(),
+                relation_types=format_relation_types(),
+            ),
         },
     ]
     formatted = tokenizer.apply_chat_template(
@@ -374,9 +389,7 @@ def _extract_json_block(text: str) -> str:
     raise ValueError("Unbalanced braces in model output")
 
 
-# Field name mappings for normalization
-_ENTITY_TYPE_ALIASES = {"person", "place", "organization", "concept", "preference", "event"}
-_RELATION_TYPE_ALIASES = {"factual", "temporal", "preference", "social"}
+# Fallbacks resolved per-call via schema_config.
 
 
 def _normalize_extraction(data: dict) -> dict:
@@ -398,7 +411,8 @@ def _normalize_extraction(data: dict) -> dict:
             raw_type = ent.get("entity_type") or ent.get("type", "concept")
             if isinstance(raw_type, list):
                 raw_type = raw_type[0] if raw_type else "concept"
-            norm["entity_type"] = raw_type if raw_type in _ENTITY_TYPE_ALIASES else "concept"
+            fb_etype = fallback_entity_type()
+            norm["entity_type"] = raw_type if raw_type in set(entity_types()) else fb_etype
             raw_attrs = ent.get("attributes", {})
             if not isinstance(raw_attrs, dict):
                 raw_attrs = {}
@@ -459,7 +473,8 @@ def _normalize_extraction(data: dict) -> dict:
                 "confidence": max(0.0, min(1.0, raw_confidence)),
             }
             raw_type = rel.get("relation_type") or rel.get("type", "factual")
-            norm["relation_type"] = raw_type if raw_type in _RELATION_TYPE_ALIASES else "factual"
+            fb_rtype = fallback_relation_type()
+            norm["relation_type"] = raw_type if raw_type in set(relation_types()) else fb_rtype
             normalized_relations.append(norm)
         data["relations"] = normalized_relations
 

@@ -20,9 +20,9 @@ Rules:
   not a meaningful personal fact
 - Consider the full conversation holistically — cross-reference user statements
   with assistant responses for the most accurate entity names
-- Entity types: person, place, organization, event, preference, concept (fallback — see rule below)
+- Entity types: {entity_types}
 - IMPORTANT: Never label a named person, place, or organization as "concept". Use "concept" only for abstract things with no fit (e.g. a field of study like "quantum computing").
-- Relation types: factual, temporal, preference, social
+- Relation types: {relation_types}
 - Tag preferences correctly: if the speaker uses or prefers something (music
   service, food, hobby), set relation_type to "preference", not "factual"
 - predicate: snake_case verb phrase — consistent, reusable across sessions
@@ -32,10 +32,7 @@ Rules:
   "my brother/sister X" = sibling_of, "my/our dog/cat X" = has_pet
 
 Predicate examples (use these exact forms when they apply):
-- Family/social: married_to, parent_of, child_of, sibling_of, has_pet
-- Location: lives_in, lives_near, born_in
-- Work/education: works_at, studies_at, manages
-- Preferences/habits: prefers, likes, dislikes, drinks, eats, listens_to, uses, avoids
+{predicate_examples}
 - If none fit, create a new snake_case predicate (e.g. "competed_in")
 
 POSITIVE example — transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."

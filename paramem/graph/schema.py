@@ -4,14 +4,17 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from paramem.graph.schema_config import entity_types, relation_types
+
+_EntityType = Literal[entity_types()]  # type: ignore[valid-type]
+_RelationType = Literal[relation_types()]  # type: ignore[valid-type]
+
 
 class Entity(BaseModel):
     """A typed entity extracted from a session transcript."""
 
     name: str = Field(description="Canonical name of the entity")
-    entity_type: Literal["person", "place", "organization", "concept", "preference", "event"] = (
-        Field(description="Type of entity")
-    )
+    entity_type: _EntityType = Field(description="Type of entity")
     attributes: dict[str, str] = Field(
         default_factory=dict,
         description="Key-value attributes (e.g. age, role)",
@@ -24,9 +27,7 @@ class Relation(BaseModel):
     subject: str = Field(description="Source entity name")
     predicate: str = Field(description="Relation type (e.g. lives_in, works_at, prefers)")
     object: str = Field(description="Target entity name or literal value")
-    relation_type: Literal["factual", "temporal", "preference", "social"] = Field(
-        description="Category of relation"
-    )
+    relation_type: _RelationType = Field(description="Category of relation")
     confidence: float = Field(default=1.0, ge=0.0)
 
 

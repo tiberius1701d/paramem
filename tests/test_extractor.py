@@ -92,6 +92,21 @@ class TestNormalizeExtraction:
         result = _normalize_extraction(data)
         assert result["entities"][0]["entity_type"] == "concept"
 
+    def test_invalid_relation_type_defaults_to_factual(self):
+        data = {
+            "entities": [],
+            "relations": [
+                {
+                    "subject": "A",
+                    "predicate": "likes",
+                    "object": "B",
+                    "relation_type": "unknown_type",
+                }
+            ],
+        }
+        result = _normalize_extraction(data)
+        assert result["relations"][0]["relation_type"] == "factual"
+
     def test_captures_extra_fields_as_attributes(self):
         data = {
             "entities": [{"entity": "Alex", "type": "person", "age": "29"}],

@@ -26,9 +26,23 @@ class TestEntity:
             Entity(name="Alex", entity_type="invalid_type")
 
     def test_all_entity_types(self):
-        for etype in ["person", "place", "organization", "concept", "preference", "event"]:
+        from paramem.graph.schema_config import entity_types
+
+        for etype in entity_types():
             entity = Entity(name="test", entity_type=etype)
             assert entity.entity_type == etype
+
+    def test_all_relation_types(self):
+        from paramem.graph.schema_config import relation_types
+
+        for rtype in relation_types():
+            rel = Relation(
+                subject="A",
+                predicate="p",
+                object="B",
+                relation_type=rtype,
+            )
+            assert rel.relation_type == rtype
 
 
 class TestRelation:

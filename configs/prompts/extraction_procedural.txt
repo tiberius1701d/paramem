@@ -11,10 +11,9 @@ Rules:
 - Discard implausible names and system identifiers (media_player.sonos_office)
 - A single instance of an action (e.g. "Play Queen") is a weak signal —
   repeated patterns across conversations are stronger evidence
-- Entity types: person, preference
+- Entity types: {entity_types}
 - predicate: snake_case verb phrase — use these when they apply:
-  prefers, likes, dislikes, listens_to, watches, drinks, eats, uses, avoids,
-  plays, reads, enjoys, routinely
+{predicate_examples}
 
 POSITIVE example — transcript: "[user] Play some jazz. [user] Play jazz again."
 {{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},

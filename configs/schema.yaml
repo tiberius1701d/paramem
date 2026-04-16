@@ -1,0 +1,31 @@
+# Single source of truth for knowledge graph taxonomy.
+# Edit this file to evolve entity types, relation types, or preferred predicates.
+# Anchors document Schema.org/Wikidata lineage for future interop; unused at runtime today.
+
+entity_types:
+  person:        { anchor: "schema:Person" }
+  place:         { anchor: "schema:Place" }
+  organization:  { anchor: "schema:Organization" }
+  event:         { anchor: "schema:Event" }
+  preference:    { anchor: "internal" }
+  concept:       { anchor: "schema:Thing" }
+
+fallback_entity_type: concept
+
+relation_types: [factual, temporal, preference, social]
+fallback_relation_type: factual
+
+# Prompt hints, not validation. LLM may create new snake_case predicates if none fit.
+preferred_predicates:
+  - label: Family/social
+    items: [married_to, parent_of, child_of, sibling_of, has_pet]
+  - label: Location
+    items: [lives_in, lives_near, born_in]
+  - label: Work/education
+    items: [works_at, studies_at, manages]
+  - label: Preferences/habits
+    items: [prefers, likes, dislikes, drinks, eats, listens_to, uses, avoids]
+
+# Narrow subset used by the procedural (preferences-only) extraction prompt.
+procedural_entity_types: [person, preference]
+procedural_predicate_groups: [Preferences/habits]
