@@ -74,5 +74,183 @@
       ]
     ],
     "answer_session_ids": ["answer_session_A"]
+  },
+  {
+    "question_id": "test_pref_003",
+    "question_type": "single-session-preference",
+    "question": "What kind of music does Sam prefer?",
+    "answer": "jazz",
+    "question_date": "2023/06/05 (Mon) 14:00",
+    "haystack_dates": ["2023/05/28 (Sun) 16:30"],
+    "haystack_session_ids": ["session_pref_003"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I was at a live show last night and it reminded me why I love that improvisational style.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "That kind of music really does have a unique energy.",
+          "has_answer": false
+        },
+        {
+          "role": "user",
+          "content": "Exactly, the spontaneity is what draws me in every time.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_pref_003"]
+  },
+  {
+    "question_id": "test_user_004",
+    "question_type": "single-session-user",
+    "question": "What project is Pat currently working on?",
+    "answer": "a home garden",
+    "question_date": "2023/07/01 (Sat) 10:00",
+    "haystack_dates": ["2023/06/20 (Tue) 09:15"],
+    "haystack_session_ids": ["session_user_004"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I spent the whole weekend building raised beds in my yard.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Sounds like a great outdoor project.",
+          "has_answer": false
+        },
+        {
+          "role": "user",
+          "content": "Yes, I want to grow tomatoes and herbs this season.",
+          "has_answer": false
+        },
+        {
+          "role": "assistant",
+          "content": "Fresh herbs from your own garden make cooking so much better.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_user_004"]
+  },
+  {
+    "question_id": "test_user_005",
+    "question_type": "single-session-user",
+    "question": "What sport does Alex follow closely?",
+    "answer": "cycling",
+    "question_date": "2023/08/10 (Thu) 20:00",
+    "haystack_dates": ["2023/07/25 (Tue) 19:45"],
+    "haystack_session_ids": ["session_user_005"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I stayed up late watching the mountain stage race finish.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Those mountain finishes are always dramatic.",
+          "has_answer": false
+        },
+        {
+          "role": "user",
+          "content": "The climbers were incredible, the leader held on by just a few seconds.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_user_005"]
+  },
+  {
+    "question_id": "test_multi_006",
+    "question_type": "multi-session",
+    "question": "What programming language does Jordan prefer?",
+    "answer": "Python",
+    "question_date": "2023/09/01 (Fri) 12:00",
+    "haystack_dates": [
+      "2023/08/15 (Tue) 10:00"
+    ],
+    "haystack_session_ids": [
+      "session_multi_006"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I refactored the whole data pipeline using a scripting language known for readability.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "That sounds like a clean solution.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_multi_006"]
+  },
+  {
+    "question_id": "test_temporal_007",
+    "question_type": "temporal-reasoning",
+    "question": "When did Sam last mention traveling abroad?",
+    "answer": "March 2023",
+    "question_date": "2023/10/01 (Sun) 08:00",
+    "haystack_dates": ["2023/03/10 (Fri) 14:00"],
+    "haystack_session_ids": ["session_temporal_007"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I just got back from a trip overseas, the flights were exhausting.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Long flights can really wear you out. Did you enjoy the trip overall?",
+          "has_answer": false
+        },
+        {
+          "role": "user",
+          "content": "Yes, the sights were worth it.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_temporal_007"]
+  },
+  {
+    "question_id": "test_temporal_008",
+    "question_type": "temporal-reasoning",
+    "question": "In which month did Pat mention starting a new job?",
+    "answer": "February 2023",
+    "question_date": "2023/11/05 (Sun) 10:00",
+    "haystack_dates": ["2023/02/14 (Tue) 08:30"],
+    "haystack_session_ids": ["session_temporal_008"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "My first day at the new role is tomorrow, feeling nervous.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "First days are always a mix of nerves and excitement.",
+          "has_answer": false
+        },
+        {
+          "role": "user",
+          "content": "I hope the team is welcoming.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_temporal_008"]
   }
 ]

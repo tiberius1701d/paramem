@@ -10,6 +10,8 @@ Usage:
     python experiments/dataset_probe.py --dataset perltqa --no-sota --limit 5
     python experiments/dataset_probe.py --dataset perltqa --resume
     python experiments/dataset_probe.py --dataset longmemeval --model mistral --limit 5
+    python experiments/dataset_probe.py --dataset longmemeval \
+        --sample-strategy stratified --sample-size 100
 
 Sections of this file follow the plan at:
   .agent/plan-dataset-probe-2026-04-16.md
@@ -442,7 +444,8 @@ def parse_args() -> argparse.Namespace:
 
     Returns:
         Parsed Namespace with dataset, limit, resume, no_sota, model,
-        character (perltqa-only), and split (longmemeval-only).
+        character (perltqa-only), split, sample_strategy, sample_size, and
+        sample_seed (all three longmemeval-only).
     """
     parser = argparse.ArgumentParser(
         description="Dataset-agnostic ParaMem extraction-pipeline probe",
@@ -504,12 +507,49 @@ def parse_args() -> argparse.Namespace:
         help="LongMemEval split (longmemeval only). Default: longmemeval_oracle.",
     )
     parser.add_argument(
+        "--sample-strategy",
+        type=str,
+        default="none",
+        choices=["none", "stratified"],
+        dest="sample_strategy",
+        help=(
+            "Session sampling strategy (longmemeval only). "
+            "'none' yields all sessions in dataset order (default); "
+            "'stratified' draws a balanced sample across question_type buckets "
+            "— requires --sample-size."
+        ),
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        dest="sample_size",
+        help=(
+            "Total sessions to yield when --sample-strategy=stratified. "
+            "Required when --sample-strategy=stratified; ignored otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        dest="sample_seed",
+        help="Random seed for deterministic per-bucket shuffling (default: 42).",
+    )
+    parser.add_argument(
         "--num-epochs",
         type=int,
         default=20,
         help="Training epochs for indexed key training (default: 20).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.sample_strategy == "stratified" and args.sample_size is None:
+        parser.error("--sample-size is required when --sample-strategy=stratified")
+    if args.sample_size is not None and args.sample_strategy == "none":
+        parser.error("--sample-size has no effect without --sample-strategy=stratified")
+    if args.sample_strategy != "none" and args.dataset != "longmemeval":
+        parser.error("--sample-strategy only supported for --dataset=longmemeval")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +587,45 @@ def main() -> None:
                 state.get("dataset"),
             )
             sys.exit(1)
+        # Sampling-param validation only applies to LongMemEval runs.  Old
+        # PerLTQA runs do not have these keys in state.json, and that is fine.
+        if args.dataset == "longmemeval" and "sample_strategy" in state:
+            saved_strategy = state.get("sample_strategy", "none")
+            if saved_strategy != args.sample_strategy:
+                logger.error(
+                    "Resume conflict: run %s was started with --sample-strategy=%s, "
+                    "but you passed --sample-strategy=%s. Start a new run instead, or "
+                    "re-run with --sample-strategy=%s.",
+                    run_dir,
+                    saved_strategy,
+                    args.sample_strategy,
+                    saved_strategy,
+                )
+                sys.exit(1)
+            saved_size = state.get("sample_size")
+            if saved_size != args.sample_size:
+                logger.error(
+                    "Resume conflict: run %s was started with --sample-size=%s, "
+                    "but you passed --sample-size=%s. Start a new run instead, or "
+                    "re-run with --sample-size=%s.",
+                    run_dir,
+                    saved_size,
+                    args.sample_size,
+                    saved_size,
+                )
+                sys.exit(1)
+            saved_seed = state.get("sample_seed", 42)
+            if saved_seed != args.sample_seed:
+                logger.error(
+                    "Resume conflict: run %s was started with --sample-seed=%s, "
+                    "but you passed --sample-seed=%s. Start a new run instead, or "
+                    "re-run with --sample-seed=%s.",
+                    run_dir,
+                    saved_seed,
+                    args.sample_seed,
+                    saved_seed,
+                )
+                sys.exit(1)
         logger.info("Resuming run: %s", run_dir)
     else:
         run_dir = model_output_dir(base_dir=base_dir / args.dataset, model_name=args.model)
@@ -570,6 +649,11 @@ def main() -> None:
             "last_updated": datetime.utcnow().isoformat(),
             "args_snapshot": vars(args),
         }
+        # Sampling fields are only meaningful for LongMemEval runs.
+        if args.dataset == "longmemeval":
+            state["sample_strategy"] = args.sample_strategy
+            state["sample_size"] = args.sample_size
+            state["sample_seed"] = args.sample_seed
         _write_state(state, run_dir)
         logger.info("New run: %s", run_dir)
 
@@ -656,7 +740,12 @@ def main() -> None:
             loader = loader_cls()
             loader_kwargs = {"character": args.character}
         elif args.dataset == "longmemeval":
-            loader = loader_cls(split=args.split)
+            loader = loader_cls(
+                split=args.split,
+                sample_strategy=args.sample_strategy,
+                sample_size=args.sample_size,
+                sample_seed=args.sample_seed,
+            )
             loader_kwargs = {}
         else:
             loader = loader_cls()
@@ -859,6 +948,11 @@ def main() -> None:
             "args_snapshot": vars(args),
             "completed_at": datetime.utcnow().isoformat(),
         }
+        # Sampling fields are only meaningful for LongMemEval runs.
+        if args.dataset == "longmemeval":
+            summary["sample_strategy"] = args.sample_strategy
+            summary["sample_size"] = args.sample_size
+            summary["sample_seed"] = args.sample_seed
         _atomic_json_write(summary, run_dir / "summary.json")
         logger.info("Summary written to %s", run_dir / "summary.json")
 

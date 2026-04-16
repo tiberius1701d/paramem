@@ -1,0 +1,242 @@
+[
+  {
+    "question_id": "uneven_multi_001",
+    "question_type": "multi-session",
+    "question": "What hobby does Alex mention?",
+    "answer": "hiking",
+    "question_date": "2023/05/01 (Mon) 10:00",
+    "haystack_dates": ["2023/04/01 (Sat) 09:00"],
+    "haystack_session_ids": ["session_multi_001"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I went on a long trail walk this weekend.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Sounds like a great way to spend the day outdoors.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_multi_001"]
+  },
+  {
+    "question_id": "uneven_pref_001",
+    "question_type": "single-session-preference",
+    "question": "What beverage does Jordan prefer?",
+    "answer": "green tea",
+    "question_date": "2023/05/10 (Wed) 14:00",
+    "haystack_dates": ["2023/04/10 (Mon) 08:00"],
+    "haystack_session_ids": ["session_pref_001"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I start every morning with a warm herbal drink.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "A calming morning ritual sounds wonderful.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_pref_001"]
+  },
+  {
+    "question_id": "uneven_pref_002",
+    "question_type": "single-session-preference",
+    "question": "What genre does Sam enjoy reading?",
+    "answer": "science fiction",
+    "question_date": "2023/06/01 (Thu) 18:00",
+    "haystack_dates": ["2023/05/20 (Sat) 15:00"],
+    "haystack_session_ids": ["session_pref_002"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I just finished a novel about interstellar travel.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "That sounds like a gripping read.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_pref_002"]
+  },
+  {
+    "question_id": "uneven_pref_003",
+    "question_type": "single-session-preference",
+    "question": "What does Pat prefer for breakfast?",
+    "answer": "oatmeal",
+    "question_date": "2023/07/01 (Sat) 09:00",
+    "haystack_dates": ["2023/06/15 (Thu) 07:30"],
+    "haystack_session_ids": ["session_pref_003"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I had a warm bowl of porridge before heading to work.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "A hearty breakfast is a great way to start the day.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_pref_003"]
+  },
+  {
+    "question_id": "uneven_user_001",
+    "question_type": "single-session-user",
+    "question": "What instrument is Alex learning?",
+    "answer": "guitar",
+    "question_date": "2023/07/15 (Sat) 20:00",
+    "haystack_dates": ["2023/07/01 (Sat) 19:00"],
+    "haystack_session_ids": ["session_user_001"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I practiced chord transitions for an hour today.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Consistent practice is the key to improvement.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_user_001"]
+  },
+  {
+    "question_id": "uneven_user_002",
+    "question_type": "single-session-user",
+    "question": "What language is Jordan studying?",
+    "answer": "Spanish",
+    "question_date": "2023/08/01 (Tue) 12:00",
+    "haystack_dates": ["2023/07/20 (Thu) 10:00"],
+    "haystack_session_ids": ["session_user_002"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I completed lesson fifteen in my language app today.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Steady progress adds up quickly.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_user_002"]
+  },
+  {
+    "question_id": "uneven_user_003",
+    "question_type": "single-session-user",
+    "question": "What craft is Sam taking up?",
+    "answer": "pottery",
+    "question_date": "2023/09/01 (Fri) 17:00",
+    "haystack_dates": ["2023/08/15 (Tue) 14:00"],
+    "haystack_session_ids": ["session_user_003"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I signed up for a wheel-throwing class starting next week.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "That is a tactile and meditative craft to learn.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_user_003"]
+  },
+  {
+    "question_id": "uneven_temporal_001",
+    "question_type": "temporal-reasoning",
+    "question": "When did Pat mention finishing a marathon?",
+    "answer": "April 2023",
+    "question_date": "2023/10/01 (Sun) 08:00",
+    "haystack_dates": ["2023/04/05 (Wed) 18:00"],
+    "haystack_session_ids": ["session_temporal_001"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I crossed the finish line of the spring race yesterday.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Finishing a long-distance race is a real achievement.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_temporal_001"]
+  },
+  {
+    "question_id": "uneven_temporal_002",
+    "question_type": "temporal-reasoning",
+    "question": "In which month did Alex mention a promotion?",
+    "answer": "June 2023",
+    "question_date": "2023/11/01 (Wed) 10:00",
+    "haystack_dates": ["2023/06/10 (Sat) 11:00"],
+    "haystack_session_ids": ["session_temporal_002"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I got some exciting news at work today about moving up.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Congratulations, that is wonderful career progress.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_temporal_002"]
+  },
+  {
+    "question_id": "uneven_temporal_003",
+    "question_type": "temporal-reasoning",
+    "question": "When did Jordan mention buying a car?",
+    "answer": "August 2023",
+    "question_date": "2023/12/01 (Fri) 09:00",
+    "haystack_dates": ["2023/08/22 (Tue) 16:00"],
+    "haystack_session_ids": ["session_temporal_003"],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I picked up my new vehicle from the dealership this afternoon.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Exciting times, a new set of wheels opens up so many possibilities.",
+          "has_answer": false
+        }
+      ]
+    ],
+    "answer_session_ids": ["session_temporal_003"]
+  }
+]
