@@ -190,6 +190,8 @@ export HF_DEACTIVATE_ASYNC_LOAD=1
 
 This forces sequential weight loading. Models load slightly slower but reliably. The issue is specific to WSL2's DirectX Graphics (dxg) layer — native Linux is unaffected.
 
+**WSL2 Modern Standby (laptop GPUs):** Windows Modern Standby can power-cycle the GPU during idle periods, causing TDR BSOD (bugcheck 0x116) if a CUDA workload is active. The `acquire_gpu()` context manager in `experiments/utils/gpu_guard.py` prevents this by holding `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via a background PowerShell process for the duration of GPU workloads. This is automatic for all experiment scripts that use `acquire_gpu()`. A cooling pad is recommended for sustained workloads — the primary benefit is faster thermal recovery between runs rather than higher sustained clocks, as the TGP is the binding constraint under load.
+
 ## How It Works
 
 1. **Extract:** LLM-based graph extraction pulls entities and relations from session text (optionally using a dedicated distillation model for higher quality)
@@ -364,7 +366,16 @@ Tests fall back to synthetic data if PerLTQA is not available, but results may d
 ```bash
 python experiments/dataset_probe.py --dataset perltqa --limit 20
 python experiments/dataset_probe.py --dataset longmemeval --limit 20
+
+# Extraction-only diagnostics (skips adapter training + recall):
+python experiments/dataset_probe.py --dataset perltqa --no-train
+
+# Stratified LongMemEval sample (balanced across question types):
+python experiments/dataset_probe.py --dataset longmemeval \
+    --sample-strategy stratified --sample-size 100 --sample-seed 42
 ```
+
+See `benchmarking.md` → "Extraction Probe Sweep" for paired LME/PerLTQA results.
 
 ## Extended Evaluation Suite
 

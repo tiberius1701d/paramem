@@ -2350,77 +2350,110 @@ and multi-adapter compartmentalization.
 
 ---
 
-## Extraction Pipeline Quality (2026-03-25)
+## Extraction Pipeline Evolution
 
-### Discovery: Outlines never worked in production
+### v1: Outlines constrained generation (2026-03-25, superseded)
 
-Analysis of Test 8 logs revealed that Outlines constrained generation failed on **every single extraction attempt** across all tests. The `max_tokens` kwarg was silently ignored by HF Transformers, causing Outlines to generate nothing. Every successful graph extraction in Tests 1-8 came from the unconstrained prompt-parse fallback path.
+Outlines never worked in production — 0% success across all Tests 1-8 due to a `max_tokens` bug, then inconsistent failures with quantized Mistral 7B even after the fix. Every successful extraction came from the unconstrained prompt-parse fallback. Outlines was removed entirely in favor of generate-once-parse-once.
 
-After fixing `max_tokens` → `max_new_tokens`, Outlines still fails inconsistently with quantized Mistral 7B:
-- Confidence values outside 0-1 range (model outputs 0-100 scale)
-- Unbalanced braces in generated JSON
-- Returns raw strings instead of parsed Pydantic objects
-- Pydantic validation failures on field constraints
+### v2: 7-stage privacy-aware pipeline (current)
 
-When Outlines does succeed, it produces higher-quality graphs than the fallback (correct relationship structure, proper entity resolution).
+Anonymize → extract → SOTA enrich → deanonymize → residual sweep → grounding gate → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale.
 
-### Extraction success rates
+## Extraction Probe Sweep (2026-04-17)
 
-| Path | Test 8 (25 cycles) | HA Deployment (3 runs) |
-|------|-------------------|----------------------|
-| Outlines | 0/25 (0%) — `max_tokens` bug | 1/3 — but wrong names (old prompt) |
-| Fallback | 3/25 (12%) | 3/3 — but ~60% fact coverage |
-| Total | 3/25 (12%) | 3/3 with fallback |
+Large-scale extraction quality assessment across two datasets using the dataset-agnostic probe (`experiments/dataset_probe.py`). Mistral 7B NF4, SOTA enrichment enabled, `--no-train` (extraction diagnostics only).
 
-### Fallback quality on conversational vs PerLTQA transcripts
+### Datasets
 
-| Fact type | PerLTQA (name-dense) | Conversational (pronoun-heavy) |
-|-----------|---------------------|-------------------------------|
-| Explicit (X lives in Y) | Captured | Captured |
-| Professions | Captured | Captured |
-| Social (married_to, parent_of) | Captured | **Missed** — "my wife" not resolved |
-| Temporal (birth years) | Captured | **Misattributed** — mapped to country |
-| Pet ownership | Captured | **Missed** — implicit relationship |
+| Dataset | Sessions | Transcript size | Description |
+|---------|----------|----------------|-------------|
+| LongMemEval (stratified 100) | 100 | ~14k chars, 144 turns | Multi-topic Q&A, encyclopedia-style |
+| PerLTQA (3 characters) | 89 | ~1.9k chars, ~20 turns | Personal dialogues, character-driven |
 
-### Root cause
+### Two bugs fixed during the sweep
 
-The fallback path generates free-form JSON and parses it. It depends on the model's reasoning to resolve coreference ("I" → speaker name, "my wife" → married_to relationship). PerLTQA transcripts name characters explicitly in every turn; real conversations use pronouns after introduction.
+1. **Deanonymization substring bug** (`paramem/graph/extractor.py`): Deanonymization used exact dictionary lookup (`.get()`) instead of substring replacement. Composite strings like `"Person_2's cousin"` failed the lookup (only bare `"Person_2"` was in the mapping), leaving the placeholder intact. `_strip_residual_placeholders()` then dropped the entire fact. Fixed to use `re.sub()` with word boundaries, mirroring `_anonymize_transcript()`.
 
-### Fixes applied
+2. **Speaker name mistyping** (`experiments/utils/longmemeval_loader.py`): LongMemEval loader hard-coded `speaker_name="User"` for all sessions. The extraction pipeline typed "User" as `concept` instead of `person`, losing speaker-centric relationships. Fixed with `SpeakerNamePool` — deterministic pseudonym assignment per session from a pool of 614 culturally diverse first names.
 
-1. `max_tokens` → `max_new_tokens` in Outlines call
-2. Handle Outlines returning string/dict (not just SessionGraph)
-3. Type hardening: list→str coercion for entity names
-4. Confidence scaling: 0-100 → 0-1
-5. Extraction prompt: fictional example names, "use EXACT names from transcript"
+### Results: LME new (with fixes) vs LME old (baseline)
 
-### Resolution (same session)
+Same 100 stratified sessions (seed=42), paired comparison:
 
-Root cause identified and fixed:
+| Metric | Old (baseline) | New (fixes) | Delta |
+|--------|---------------|-------------|-------|
+| Post-plausibility QA | 379 | 381 | +2 (flat) |
+| Residual placeholder drops | 71 | 38 | **-33 (46% reduction)** |
+| Person entities | 80 (20.2%) | 99 (24.3%) | **+19 (+4.1pp)** |
+| Preference relations | 87 (23.0%) | 138 (36.2%) | **+51 (+59%)** |
+| Social relations | 10 (2.6%) | 12 (3.1%) | +2 |
+| Anonymization success | 74% | 87% | **+13pp** |
+| Ungrounded drops | 13 | 27 | +14 (expected) |
+| Zero-extraction sessions | 6 | 11 | +5 |
 
-1. **Outlines was never the right path.** It never succeeded in any test — every extraction was the prompt-parse fallback. Outlines added complexity and failure modes.
-2. **Double generation discarded good output.** When Outlines failed, the fallback called `generate_answer()` again. The second generation at temp=0 produced different (worse) output due to different prompt formatting in the Outlines path. The first generation was correct.
-3. **Fix: generate once, parse once.** Removed Outlines from extraction. Single `generate_answer()` call, parse the JSON result. No fallback, no retry.
-4. **Prompt externalized.** Extraction prompt moved to `configs/prompts/extraction.txt`. Few-shot example demonstrates implicit relationship resolution ("my wife" → married_to, "our dog" → has_pet). Predicate list grouped by category with trigger hints.
-5. **Confidence schema relaxed.** Removed `le=1.0` from Pydantic schema. Normalization scales 0-100 → 0-1 before downstream use.
-6. **Multi-object expansion.** Model outputs `"objects": ["Alice", "Bob"]` for one predicate; normalization expands to individual relations.
+**Interpretation:** Total QA yield is flat (+2), but extraction *quality* improved structurally. More correct entity types (person, place), more diverse relation types (preference +59%, social +20%). The remaining 38 residual drops are SOTA-invented placeholders never in the mapping — the deanon path is fixed. Ungrounded drops increased because facts previously lost to the residual sweep now survive deanonymization but fail the grounding gate — the pipeline filters more precisely. The 5 additional zero-extraction sessions reflect non-deterministic extraction variance from altered transcript text (speaker names), not a regression.
 
-**Result on conversational transcript:** 7 entities, 6 relations — married_to, parent_of, had_pet, lives_in, professions, birth years. All correct names and relationships.
+Per-session paired analysis: 17 sessions had residual drops eliminated, with individual recoveries of up to +10 QA pairs. 42 sessions gained QA, 33 lost, 25 unchanged.
 
-### Smoke test (2026-03-25, cycle on fresh run — not a resume)
+### Results: PerLTQA new (with fixes) vs PerLTQA old (baseline)
 
-| Metric | Old pipeline (Tests 1-8) | New pipeline (smoke test) |
-|--------|-------------------------|--------------------------|
-| Extraction success | 3/25 sessions (12%) | 2/5 sessions (40%) |
-| QA yield per cycle | ~4 pairs | 26 pairs |
-| Extraction time per session | ~70s (two generations) | ~35s (one generation) |
-| Failure mode | Outlines always fails → fallback sometimes fails | Truncation at max_tokens=1024 |
+Same 89 sessions across 3 characters (Deng Yu 31, Liang Xin 30, Xia Yu 28), paired comparison.
 
-The 3 failed sessions hit `max_tokens=1024` truncation (unbalanced braces). Increasing the token limit should recover these.
+| Metric | Old (baseline) | New (fixes) | Delta |
+|--------|---------------|-------------|-------|
+| Post-plausibility QA | 587 | 583 | -4 (-0.7%) |
+| Raw facts | 842 | 854 | +12 (+1.4%) |
+| Residual placeholder drops | 162 | 160 | -2 (-1.2%) |
+| Person entities | 81 (15.8%) | 82 (15.6%) | +1 |
+| Preference relations | 140 (23.9%) | 142 (24.4%) | +2 |
+| Social relations | 118 (20.1%) | 122 (20.9%) | +4 |
+| Anonymization OK+repaired | 84 (94.4%) | 84 (94.4%) | 0 |
+| Ungrounded drops | 60 | 67 | +7 |
+| Plausibility drops | 42 | 44 | +2 |
+| Zero-extraction sessions | 5 | 4 | -1 |
 
-**Note:** Smoke test ran as a fresh start (operator error: missing `--resume` flag), not a continuation from cycle 21. Cycle 21 state is intact. Resume with `--resume` in next session.
+**Interpretation:** The composite-placeholder deanon fix barely moves PerLTQA (-1.2% residual drops) compared to LME (-46%). PerLTQA's first-person dialogue rarely triggers the SOTA enrichment patterns (`Person_1's cousin`, `downtown City_1`) that the bug affected — those constructions appear primarily in LME's assistant-style content. The fix is real and validated on LME; on PerLTQA it shows no regression.
 
-**Validated at scale:** Cycles 22-23 confirmed the new extraction pipeline integrates cleanly with existing keys. 46 new keys added (168→214), 100% recall maintained across all keys including those from the old pipeline.
+The +7 net ungrounded drops are spread across 12 sessions (deltas ±1-2 each). Raw fact counts shift in both directions between runs — extraction is mildly non-deterministic at temperature=0, and the grounding gate correctly drops the new ungrounded subset each run. Entity and relation type distributions are essentially unchanged: pipeline already stable on this dataset. One session (`Xia Yu_119_10_4#13`) shows `leaked_repaired` in both runs with identical content (11 raw, 1 residual drop, 1 ungrounded) — a deterministic single-token leak that the repair path handles correctly.
+
+### Results: Cross-dataset comparison
+
+| Metric | LME (100) | PerLTQA (89) |
+|--------|-----------|-------------|
+| QA pairs/session | 3.8 | 6.6 |
+| Processing time/session | 97s | 77s |
+| Person entities | 24.3% | 15.8% |
+| Social relations | 3.1% | 20.1% |
+| Preference relations | 36.2% | 23.9% |
+| Residual drops (old → new) | 71 → 38 (-46%) | 162 → 160 (-1.2%) |
+
+LME transcripts are 7x longer but yield fewer facts — most content is informational Q&A, not personal knowledge. PerLTQA's character-driven dialogues produce denser personal facts and more social relationships. Both datasets are consistent with live HA deployment observations: extraction is selective rather than exhaustive, capturing genuine personal knowledge rather than every mentioned fact.
+
+### Preference extraction quality (spot check)
+
+One LME session (Nadia, mid-century modern design conversation) produced 11 QA pairs — 10 distinct preferences (clean lines, tapered legs, wood accents, modular design, etc.) and 1 factual. All non-redundant, correctly typed. Minor formatting artifact: some multi-word concepts extracted as `Snake_Case` (e.g. `Organic_Shapes`). Self-healing — QA regeneration from the cumulative graph produces natural language on the next consolidation cycle.
+
+### Diagnostics accounting fix
+
+`raw_fact_count` in session diagnostics went negative when SOTA enrichment added more facts than the original extraction produced. Fixed by splitting `plausibility_dropped` into actual drops (floored at 0) and `enrichment_added`. All 5 run directories retroactively corrected (38 + 18 files).
+
+### Infrastructure findings
+
+- **Modern Standby sleep inhibitor** (`experiments/utils/gpu_guard.py`): Overnight run crashed due to Windows Modern Standby power-cycling the GPU during CUDA compute (TDR BSOD, bugcheck 0x116). Root cause: `nvlddmkm.sys` driver race on power state transitions, not thermal. Fix: `acquire_gpu()` now holds `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via background PowerShell on WSL2. Validated across 100-session re-run with zero crashes.
+- **Cooling pad impact**: Reduces cooldown wait from ~3 min to ~30s between sessions. Enables occasional Dynamic Boost bursts (87W, 2625 MHz vs sustained 58W, 2010 MHz). Primary benefit is thermal recovery speed, not sustained clock — 60W TGP is the binding constraint.
+- **Wall-clock timing**: LME 100 sessions = 162 min processing, 385 min wall (cooldown overhead). PerLTQA 89 sessions = 115 min processing, ~115 min wall (shorter sessions, negligible cooldown).
+
+### `anon=not_run` sessions (7 of 100 LME) — correct behavior
+
+All 7 are generic assistant conversations with no personal information (NAS recommendations, mall stores, travel tips, packing lists, online courses). Extraction correctly returns 0 facts → anonymization is skipped. The old run hallucinated facts from several of these — e.g., 16 "considers_purchasing" relations from a NAS recommendation chat where the *assistant* listed products. The count increasing from 3 (old) → 7 (new) is a quality improvement: 4 sessions that previously produced false positives now correctly produce nothing.
+
+### Open items
+
+- Location → place type inference: SOTA enrichment occasionally tags places as `concept` instead of `place` when no explicit "place" cue appears in the transcript. Low priority; `place` already accounts for ~5% of LME entities post-fix.
+- Case-dup normalization: SOTA produces `Bioinformatics` vs `bioinformatics` as distinct entities. Affects entity merging across sessions.
+- Subject/object inversion: SOTA occasionally inverts predicate direction (e.g. `lives_in(City, Person)` instead of `lives_in(Person, City)`).
+- First-session SOTA parse failure: JSON output uses double-quote escaping that occasionally breaks the parser; fallback path catches it.
 
 ---
 

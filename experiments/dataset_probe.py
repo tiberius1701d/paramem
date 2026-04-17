@@ -50,6 +50,7 @@ from experiments.utils.dataset_types import DatasetSession  # noqa: E402
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.longmemeval_loader import LongMemEvalLoader  # noqa: E402
 from experiments.utils.perltqa_loader import PerLTQALoader  # noqa: E402
+from experiments.utils.speaker_names import SpeakerNamePool  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     model_output_dir,
@@ -258,6 +259,30 @@ def _validate_resume_accumulator(
     return all_episodic_qa, all_procedural_rels
 
 
+def _validate_no_train_resume(state: dict, no_train: bool) -> None:
+    """Validate that the --no-train flag matches the saved run state.
+
+    Old runs that predate this flag will not have a ``no_train`` key in
+    state.json; they are treated as ``False`` (normal training run), which
+    is backward-compatible with the pre-flag behavior.
+
+    Args:
+        state: Loaded state.json dict for the run being resumed.
+        no_train: Value of ``args.no_train`` for the current invocation.
+
+    Raises:
+        ValueError: When the saved ``no_train`` flag differs from the
+            current invocation's ``no_train`` value.
+    """
+    saved = state.get("no_train", False)
+    if saved != no_train:
+        raise ValueError(
+            f"Resume conflict: run was started with --no-train={saved}, "
+            f"but current invocation has --no-train={no_train}. "
+            f"Start a new run instead, or re-run with --no-train={saved}."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Per-session diagnostics
 # ---------------------------------------------------------------------------
@@ -310,17 +335,27 @@ def _build_session_diagnostics(
         except (TypeError, ValueError):
             return 0
 
+    # plausibility_dropped can be negative when SOTA enrichment adds more
+    # facts than plausibility removes.  Split into actual drops (≥0) and
+    # enrichment additions (≥0) so raw_fact_count stays sane.
+    plaus_raw = _as_count(diag.get("plausibility_dropped"))
     drops = {
         "residual_dropped_facts": _as_count(diag.get("residual_dropped_facts")),
         "ungrounded_dropped_facts": _as_count(diag.get("ungrounded_dropped_facts")),
-        "plausibility_dropped": _as_count(diag.get("plausibility_dropped")),
+        "plausibility_dropped": max(plaus_raw, 0),
         "mapping_ambiguous_dropped": _as_count(diag.get("mapping_ambiguous_dropped")),
         "residual_leaked_triples_dropped": _as_count(diag.get("residual_leaked_triples_dropped")),
     }
+    enrichment_added = max(-plaus_raw, 0)
 
-    # Compute raw_fact_count as sum of surviving relations + all drops.
+    # raw_fact_count: facts from the original extraction (before SOTA enrichment).
+    # post_plausibility_count: facts surviving all filtering (including enriched).
     post_plausibility_count = len(episodic_qa)
-    raw_fact_count = post_plausibility_count + sum(drops.values())
+    raw_fact_count = post_plausibility_count + sum(drops.values()) - enrichment_added
+    # When SOTA adds more than the original extraction produced, raw can go
+    # below zero arithmetically. Floor at 0 — the real pre-enrichment count
+    # is not tracked by the extractor, so this is the best reconstruction.
+    raw_fact_count = max(raw_fact_count, 0)
 
     # Entity and relation type distributions from the session graph.
     entity_type_dist: dict[str, int] = {}
@@ -542,6 +577,16 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Training epochs for indexed key training (default: 20).",
     )
+    parser.add_argument(
+        "--no-train",
+        action="store_true",
+        dest="no_train",
+        help=(
+            "Skip final adapter training + smoke-recall phase. "
+            "Use for pure extraction-diagnostics runs. "
+            "Saves GPU time when the goal is extraction quality, not adapter recall."
+        ),
+    )
     args = parser.parse_args()
     if args.sample_strategy == "stratified" and args.sample_size is None:
         parser.error("--sample-size is required when --sample-strategy=stratified")
@@ -626,6 +671,13 @@ def main() -> None:
                     saved_seed,
                 )
                 sys.exit(1)
+        # no_train validation: old runs without this key are treated as False,
+        # matching the original behavior (no error).
+        try:
+            _validate_no_train_resume(state, args.no_train)
+        except ValueError as exc:
+            logger.error("%s (run: %s)", exc, run_dir)
+            sys.exit(1)
         logger.info("Resuming run: %s", run_dir)
     else:
         run_dir = model_output_dir(base_dir=base_dir / args.dataset, model_name=args.model)
@@ -645,6 +697,7 @@ def main() -> None:
             "processed_session_ids": [],
             "completed": False,
             "training_started": False,
+            "no_train": args.no_train,
             "started_at": datetime.utcnow().isoformat(),
             "last_updated": datetime.utcnow().isoformat(),
             "args_snapshot": vars(args),
@@ -746,7 +799,8 @@ def main() -> None:
                 sample_size=args.sample_size,
                 sample_seed=args.sample_seed,
             )
-            loader_kwargs = {}
+            speaker_pool = SpeakerNamePool(seed=args.sample_seed)
+            loader_kwargs = {"speaker_name_pool": speaker_pool}
         else:
             loader = loader_cls()
             loader_kwargs = {}
@@ -886,7 +940,9 @@ def main() -> None:
         smoke_result: dict = {}
         train_result: dict = {}
 
-        if all_episodic_qa or all_procedural_rels:
+        if args.no_train:
+            logger.info("Training + smoke skipped (--no-train)")
+        elif all_episodic_qa or all_procedural_rels:
             state["training_started"] = True
             _write_state(state, run_dir)
 
@@ -945,6 +1001,7 @@ def main() -> None:
             "train_result": {k: v for k, v in train_result.items() if k != "loop"},
             "smoke_result": smoke_result,
             "processed_session_ids": processed_ids_final,
+            "no_train": args.no_train,
             "args_snapshot": vars(args),
             "completed_at": datetime.utcnow().isoformat(),
         }
@@ -955,6 +1012,12 @@ def main() -> None:
             summary["sample_seed"] = args.sample_seed
         _atomic_json_write(summary, run_dir / "summary.json")
         logger.info("Summary written to %s", run_dir / "summary.json")
+
+        # Persist speaker-name mapping for LongMemEval runs so downstream
+        # analysis can map speaker_id values back to their assigned pseudonyms.
+        if args.dataset == "longmemeval":
+            speaker_pool.save(run_dir / "speaker_names.json")
+            logger.info("Speaker-name mapping saved to %s", run_dir / "speaker_names.json")
 
         state["completed"] = True
         _write_state(state, run_dir)

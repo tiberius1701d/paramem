@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from experiments.dataset_probe import _find_resume_dir, _validate_resume_accumulator
+from experiments.dataset_probe import (
+    _find_resume_dir,
+    _validate_no_train_resume,
+    _validate_resume_accumulator,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -253,3 +257,51 @@ class TestValidateResumeAccumulator:
         assert all_episodic[1] == ep_a[0], (
             "Second QA pair must come from the second session in processed_ids"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for _validate_no_train_resume
+# ---------------------------------------------------------------------------
+
+
+class TestNoTrainResumeValidation:
+    """_validate_no_train_resume must catch --no-train mismatches on resume.
+
+    Old runs without the ``no_train`` key are treated as False (backward
+    compatible). Mismatches between the saved flag and the current invocation
+    must raise ValueError so the caller can log and exit 1.
+    """
+
+    def test_resume_mismatch_on_no_train_errors(self):
+        """Resuming a no_train=True run without --no-train raises ValueError.
+
+        If the saved state has ``no_train=True`` but the current invocation
+        passes ``no_train=False``, the validation must raise ValueError with
+        a message that mentions the conflict.
+        """
+        state_with_no_train = {
+            "dataset": "perltqa",
+            "completed": False,
+            "training_started": False,
+            "no_train": True,
+        }
+
+        with pytest.raises(ValueError, match="no-train"):
+            _validate_no_train_resume(state_with_no_train, no_train=False)
+
+    def test_resume_allows_missing_no_train_field(self):
+        """Old runs without no_train key resume fine when --no-train is absent.
+
+        A state.json that predates the --no-train flag has no ``no_train``
+        key. That absence must be treated as False, so resuming without
+        --no-train (also False) raises no error.
+        """
+        legacy_state = {
+            "dataset": "perltqa",
+            "completed": False,
+            "training_started": False,
+            # Intentionally omit "no_train" to simulate an old-format state.
+        }
+
+        # Must not raise.
+        _validate_no_train_resume(legacy_state, no_train=False)

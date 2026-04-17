@@ -12,6 +12,8 @@ Usage:
     # on exit: server auto-reclaims GPU via timer
 """
 
+import atexit
+import logging
 import os
 import shutil
 import signal
@@ -20,6 +22,8 @@ import sys
 import time
 
 from paramem.utils.notify import ML_FINISHED, ML_PAUSED, ML_RESUMED, ML_STARTED, notify_ml
+
+logger = logging.getLogger(__name__)
 
 # Default server port — read from config if available
 DEFAULT_SERVER_PORT = 8420
@@ -34,6 +38,131 @@ _NVIDIA_SMI = (
     or shutil.which("nvidia-smi", path="/usr/lib/wsl/lib:/usr/bin:/usr/local/bin")
     or "nvidia-smi"
 )
+
+
+def _is_wsl2() -> bool:
+    """Return True if running inside WSL2 (Windows Subsystem for Linux).
+
+    Detection is based on the kernel version string in ``/proc/version``,
+    which on WSL2 contains the substring ``microsoft`` (case-insensitive) or
+    ``WSL``.  On native Linux neither substring is present, so the function
+    returns False without any side effects.
+    """
+    try:
+        with open("/proc/version") as fh:
+            version_str = fh.read().lower()
+        return "microsoft" in version_str or "wsl" in version_str
+    except OSError:
+        return False
+
+
+class _SleepInhibitor:
+    """Prevent Windows Modern Standby from engaging during GPU workloads.
+
+    On WSL2, spawns a background ``powershell.exe`` child process that calls
+    ``SetThreadExecutionState`` with ``ES_CONTINUOUS | ES_SYSTEM_REQUIRED``
+    (``0x80000001``).  The child process blocks indefinitely so the execution
+    state remains set for its lifetime.  Killing the child releases the
+    inhibitor automatically — Windows resets the state when no thread holds it.
+
+    On native Linux the class is a complete no-op: ``start()`` returns
+    immediately and ``stop()`` is safe to call at any time.
+
+    The class is *not* thread-safe — callers must ensure that ``start`` and
+    ``stop`` are called from the same thread (or with external locking).
+    """
+
+    # Single-line PowerShell that sets the execution state and then sleeps
+    # until killed.  ES_CONTINUOUS (0x80000000) | ES_SYSTEM_REQUIRED (0x1).
+    _PS_CMD = (
+        # Set STA apartment state so Add-Type works reliably.
+        "[System.Threading.Thread]::CurrentThread"
+        ".SetApartmentState([System.Threading.ApartmentState]::STA); "
+        # P/Invoke shim for SetThreadExecutionState.
+        "Add-Type -MemberDefinition '"
+        '[DllImport("kernel32.dll")]'
+        " public static extern uint SetThreadExecutionState(uint esFlags);"
+        "' -Name 'Kernel32' -Namespace 'Win32' 2>$null; "
+        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED — prevent sleep while alive.
+        "[Win32.Kernel32]::SetThreadExecutionState(0x80000001) | Out-Null; "
+        "[System.Threading.Thread]::Sleep([System.Threading.Timeout]::Infinite)"
+    )
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._atexit_registered: bool = False
+
+    def start(self) -> None:
+        """Start the sleep inhibitor.
+
+        On WSL2, spawns a background ``powershell.exe`` process that holds
+        ``ES_CONTINUOUS | ES_SYSTEM_REQUIRED`` for its lifetime.  Calling
+        ``start()`` when already started is idempotent — the existing process
+        is reused and no second process is spawned.
+
+        On non-WSL2 systems the method returns immediately without any
+        side effects.
+        """
+        if self._proc is not None:
+            # Already running — idempotent.
+            return
+
+        if not _is_wsl2():
+            return
+
+        ps_exe = shutil.which("powershell.exe") or "powershell.exe"
+        try:
+            self._proc = subprocess.Popen(
+                [ps_exe, "-NoProfile", "-NonInteractive", "-Command", self._PS_CMD],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.debug("Sleep inhibitor started (PID %d)", self._proc.pid)
+        except (FileNotFoundError, OSError) as exc:
+            # powershell.exe unavailable — log and continue rather than
+            # blocking the GPU workload.
+            logger.warning("Sleep inhibitor unavailable: %s", exc)
+            self._proc = None
+            return
+
+        if not self._atexit_registered:
+            atexit.register(self.stop)
+            self._atexit_registered = True
+
+    def stop(self) -> None:
+        """Stop the sleep inhibitor and reap the child process.
+
+        Safe to call even if ``start()`` was never called or returned without
+        spawning a process.  After ``stop()`` returns the execution state
+        inhibitor is released (Windows resets it automatically when the child
+        exits).
+        """
+        proc = self._proc
+        if proc is None:
+            return
+
+        self._proc = None
+
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("Sleep inhibitor process did not exit within 5 s")
+        except (ChildProcessError, OSError):
+            pass
+
+        if self._atexit_registered:
+            try:
+                atexit.unregister(self.stop)
+            except Exception:
+                pass
+            self._atexit_registered = False
+
+        logger.debug("Sleep inhibitor stopped")
 
 
 class GPUAcquireError(RuntimeError):
@@ -228,6 +357,7 @@ class _GPUGuard:
         self._port = port
         self._interactive = interactive
         self._released_server = False
+        self._sleep_inhibitor = _SleepInhibitor()
 
     def __enter__(self):
         own_pid = os.getpid()
@@ -237,6 +367,7 @@ class _GPUGuard:
         if not external_pids:
             # GPU is free
             notify_ml(ML_STARTED)
+            self._sleep_inhibitor.start()
             return self
 
         # Classify GPU processes: server vs unknown
@@ -284,6 +415,7 @@ class _GPUGuard:
         if server_pid and server_pid in external_pids:
             if _server_is_cloud_only(self._port):
                 notify_ml(ML_STARTED)
+                self._sleep_inhibitor.start()
                 return self
 
             if self._interactive and sys.stdin.isatty():
@@ -309,9 +441,14 @@ class _GPUGuard:
             print("  GPU released by server.")
 
         notify_ml(ML_STARTED)
+        self._sleep_inhibitor.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # Stop sleep inhibitor first so Windows standby can resume as soon as
+        # the GPU workload is done, before any other cleanup.
+        self._sleep_inhibitor.stop()
+
         # Training actually stopped now — drop the defer-model flag before
         # anything else so the next auto-reclaim tick (or any racing
         # restart) loads the model in local mode. tpause only signals a

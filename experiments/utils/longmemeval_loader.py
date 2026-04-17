@@ -36,9 +36,12 @@ References:
 import logging
 import random
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from experiments.utils.dataset_types import DatasetSession
+
+if TYPE_CHECKING:
+    from experiments.utils.speaker_names import SpeakerNamePool
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,7 @@ class LongMemEvalLoader:
     def iter_sessions(
         self,
         limit: int | None = None,
+        speaker_name_pool: "SpeakerNamePool | None" = None,
         **kwargs,  # absorb dataset_probe kwargs (e.g. character — not used here)
     ) -> Iterator[DatasetSession]:
         """Yield DatasetSession objects from the LongMemEval dataset.
@@ -159,6 +163,11 @@ class LongMemEvalLoader:
             limit: Maximum number of sessions to yield. None = all. When
                 ``sample_strategy="stratified"``, acts as a secondary cap on
                 top of ``sample_size``.
+            speaker_name_pool: Optional :class:`~experiments.utils.speaker_names.SpeakerNamePool`
+                instance.  When provided, each session's ``speaker_name`` and
+                transcript user-turn prefixes are set to a unique pseudonym
+                drawn from the pool keyed by ``question_id``.  When ``None``
+                (default), all speakers are rendered as ``"User"``.
             **kwargs: Ignored; present so the loader satisfies the Protocol
                 without keyword mismatches from dataset_probe.py.
 
@@ -202,14 +211,15 @@ class LongMemEvalLoader:
             ds = _json.load(f)
 
         if self._sample_strategy == "stratified":
-            yield from self._iter_stratified(ds, limit)
+            yield from self._iter_stratified(ds, limit, speaker_name_pool)
         else:
-            yield from self._iter_all(ds, limit)
+            yield from self._iter_all(ds, limit, speaker_name_pool)
 
     def _iter_all(
         self,
         ds: list,
         limit: int | None,
+        speaker_name_pool: "SpeakerNamePool | None" = None,
     ) -> Iterator[DatasetSession]:
         """Yield all sessions in dataset-native order, capped by ``limit``.
 
@@ -219,6 +229,9 @@ class LongMemEvalLoader:
         Args:
             ds: Parsed dataset list (one dict per example).
             limit: Maximum number of sessions to yield. None = all.
+            speaker_name_pool: Optional name pool; when provided, user-turn
+                prefixes and ``speaker_name`` are set to a pseudonym from the
+                pool keyed by ``question_id``.
 
         Yields:
             DatasetSession with all five fields populated.
@@ -233,6 +246,10 @@ class LongMemEvalLoader:
             haystack_session_ids: list[str] = example["haystack_session_ids"]
             haystack_dates: list[str] = example["haystack_dates"]
             haystack_sessions: list[list] = example["haystack_sessions"]
+
+            speaker_name = (
+                speaker_name_pool.get(question_id) if speaker_name_pool is not None else "User"
+            )
 
             for i, (session_id_raw, session_date, turn_list) in enumerate(
                 zip(haystack_session_ids, haystack_dates, haystack_sessions)
@@ -250,6 +267,7 @@ class LongMemEvalLoader:
                     turn_list=turn_list,
                     session_index_in_example=i,
                     split=self._split,
+                    speaker_name=speaker_name,
                 )
                 yielded += 1
 
@@ -257,6 +275,7 @@ class LongMemEvalLoader:
         self,
         ds: list,
         limit: int | None,
+        speaker_name_pool: "SpeakerNamePool | None" = None,
     ) -> Iterator[DatasetSession]:
         """Yield a balanced stratified sample across ``question_type`` buckets.
 
@@ -274,6 +293,9 @@ class LongMemEvalLoader:
         Args:
             ds: Parsed dataset list (one dict per example).
             limit: Secondary cap applied after stratified selection.
+            speaker_name_pool: Optional name pool; when provided, user-turn
+                prefixes and ``speaker_name`` are set to a pseudonym from the
+                pool keyed by ``question_id``.
 
         Yields:
             DatasetSession with all five fields populated.
@@ -409,6 +431,9 @@ class LongMemEvalLoader:
                 session_date,
                 turn_list,
             ) = record
+            speaker_name = (
+                speaker_name_pool.get(question_id) if speaker_name_pool is not None else "User"
+            )
             yield _make_session(
                 question_id=question_id,
                 question_type=question_type,
@@ -419,6 +444,7 @@ class LongMemEvalLoader:
                 turn_list=turn_list,
                 session_index_in_example=session_idx,
                 split=self._split,
+                speaker_name=speaker_name,
             )
             yielded += 1
 
@@ -434,6 +460,7 @@ def _make_session(
     turn_list: list[dict],
     session_index_in_example: int,
     split: str,
+    speaker_name: str = "User",
 ) -> DatasetSession:
     """Build a DatasetSession from the raw per-session fields.
 
@@ -452,11 +479,15 @@ def _make_session(
             parent example's haystack (used for ``session_index_in_example``
             metadata and sort-key stability in stratified mode).
         split: The HF split name (e.g. ``"longmemeval_oracle"``).
+        speaker_name: Display name for the human speaker in the rendered
+            transcript.  Defaults to ``"User"``.  When a
+            :class:`~experiments.utils.speaker_names.SpeakerNamePool` is in
+            use, the caller supplies a pseudonym instead.
 
     Returns:
         Fully-populated DatasetSession.
     """
-    transcript = _build_transcript(turn_list)
+    transcript = _build_transcript(turn_list, speaker_name=speaker_name)
     session_id = f"longmemeval:{question_id}:{session_id_raw}"
     speaker_id = f"longmemeval:{question_id}"
 
@@ -477,27 +508,36 @@ def _make_session(
         session_id=session_id,
         transcript=transcript,
         speaker_id=speaker_id,
-        speaker_name="User",
+        speaker_name=speaker_name,
         metadata=metadata,
     )
 
 
-def _build_transcript(turn_list: list[dict]) -> str:
-    """Render a list of LongMemEval turns into a User/Assistant transcript.
+def _build_transcript(turn_list: list[dict], speaker_name: str = "User") -> str:
+    """Render a list of LongMemEval turns into a named-speaker/Assistant transcript.
 
     Each turn has ``role`` (``"user"`` or ``"assistant"``) and ``content``.
     The ``has_answer`` flag is conversation metadata and is not emitted.
 
+    User turns are prefixed with ``speaker_name`` (default ``"User"``).
+    Assistant turns are always prefixed with ``"Assistant"``.
+
     Args:
         turn_list: List of turn dicts from the haystack_sessions field.
+        speaker_name: Display name for the human speaker.  Defaults to
+            ``"User"`` so the output is unchanged when no pool is in use.
 
     Returns:
-        Newline-separated multi-turn string (``User: ...\\nAssistant: ...``).
+        Newline-separated multi-turn string
+        (e.g. ``"{speaker_name}: ...\\nAssistant: ...``).
     """
     lines = []
     for turn in turn_list:
         role: str = turn["role"]
         content: str = turn["content"]
-        prefix = role.capitalize()  # "user" -> "User", "assistant" -> "Assistant"
+        if role == "user":
+            prefix = speaker_name
+        else:
+            prefix = "Assistant"
         lines.append(f"{prefix}: {content}")
     return "\n".join(lines)

@@ -391,6 +391,53 @@ class TestSOTANoiseFilter:
             assert r.subject == "Alex"
             assert r.object == "Millfield"
 
+    def test_pipeline_deanonymizes_composite_placeholders(self):
+        """Composite strings like 'Person_1's family' get substring-replaced.
+
+        Uses a transcript where all composite entities are grounded so the
+        grounding gate doesn't interfere with testing the deanonymization fix.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        transcript = "Alex lives in downtown Millfield with Alex's family"
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        # SOTA produces composite strings with embedded placeholders
+        enriched_anon = anon_facts + [
+            {"subject": "Person_1's family", "predicate": "lives_in", "object": "City_1"},
+            {"subject": "Person_1", "predicate": "lives_in", "object": "downtown City_1"},
+        ]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(enriched_anon, None, None),
+            ),
+        ):
+            result = _sota_pipeline(graph, transcript, None, None)
+
+        # Composite strings must be de-anonymized, not dropped
+        subjects = {r.subject for r in result.relations}
+        objects = {r.object for r in result.relations}
+        assert "Alex's family" in subjects, f"Expected composite deanon, got {subjects}"
+        assert "downtown Millfield" in objects, f"Expected composite deanon, got {objects}"
+        # No residual placeholders should remain
+        for r in result.relations:
+            assert "Person_1" not in r.subject
+            assert "City_1" not in r.object
+
     def test_local_plausibility_filter_round_trip(self):
         """Local plausibility filter parses the standard array response."""
         from paramem.graph.extractor import _local_plausibility_filter

@@ -1149,6 +1149,21 @@ def _sota_pipeline(
     reverse_mapping = {v: k for k, v in mapping.items()}
     from paramem.graph.schema import Entity, Relation
 
+    # Substring replacement mirrors _anonymize_transcript(): word-boundary
+    # anchored, longest-placeholder-first to prevent partial matches.
+    # Handles composite strings like "Person_2's cousin" → "David's cousin".
+    _reverse_sorted = sorted(reverse_mapping.items(), key=lambda kv: -len(kv[0]))
+
+    def _deanonymize_field(value: str) -> str:
+        result = value
+        for placeholder, real_name in _reverse_sorted:
+            if not isinstance(placeholder, str) or not isinstance(real_name, str):
+                continue
+            if not placeholder:
+                continue
+            result = re.sub(rf"\b{re.escape(placeholder)}\b", real_name, result)
+        return result
+
     deanon_facts = []
     for fact in enriched_anon:
         if not isinstance(fact, dict):
@@ -1156,8 +1171,8 @@ def _sota_pipeline(
         deanon_facts.append(
             {
                 **fact,
-                "subject": reverse_mapping.get(fact.get("subject", ""), fact.get("subject", "")),
-                "object": reverse_mapping.get(fact.get("object", ""), fact.get("object", "")),
+                "subject": _deanonymize_field(fact.get("subject", "")),
+                "object": _deanonymize_field(fact.get("object", "")),
             }
         )
 
@@ -1382,13 +1397,20 @@ def _repair_anonymization_leaks(
     # transcript re-anonymization with the extended mapping.
     missed_names = {n for n in leaked if n not in hallucinated}
     if missed_names:
+        # Substring replacement — longest-first to prevent partial matches.
+        # Mirrors _anonymize_transcript() approach.
+        sorted_missed = sorted(missed_names, key=len, reverse=True)
         for f in facts:
             s = f.get("subject", "")
             o = f.get("object", "")
-            if isinstance(s, str) and s in missed_names:
-                f["subject"] = new_mapping[s]
-            if isinstance(o, str) and o in missed_names:
-                f["object"] = new_mapping[o]
+            if isinstance(s, str):
+                for name in sorted_missed:
+                    s = re.sub(rf"\b{re.escape(name)}\b", new_mapping[name], s)
+                f["subject"] = s
+            if isinstance(o, str):
+                for name in sorted_missed:
+                    o = re.sub(rf"\b{re.escape(name)}\b", new_mapping[name], o)
+                f["object"] = o
         anon_transcript = _anonymize_transcript(original_transcript, new_mapping)
 
     return facts, new_mapping, anon_transcript, status
