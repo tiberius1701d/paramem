@@ -133,7 +133,7 @@ speaker:
   enrollment_idle_timeout: 120     # seconds of /chat silence before LLM name extraction
   enrollment_reprompt_interval: 600  # seconds between re-prompting unknown speakers
   enrollment_check_interval: 15      # seconds between idle-loop checks
-  min_embedding_words: 5             # discard embeddings from shorter transcripts (noisy)
+  min_embedding_duration_seconds: 1.0  # discard embeddings from utterances shorter than this; pyannote needs sustained voice
   max_embeddings_per_profile: 50     # cap on stored embeddings per speaker
   redundancy_threshold: 0.95         # skip enrichment if similarity to centroid exceeds this
   grouping_threshold_factor: 0.6     # unknown grouping = low_threshold * this factor

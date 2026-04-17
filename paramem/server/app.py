@@ -86,8 +86,6 @@ _state = {
     # event loop (cooperative scheduling). Mutations are synchronous within each
     # handler, so no interleaving within a single dict operation. Safe without locks.
     "unknown_speakers": {},
-    # Global cooldown: first prompt waits for the full interval after startup
-    "last_enrollment_prompt": datetime.now(timezone.utc),
 }
 
 
@@ -290,6 +288,7 @@ async def lifespan(app: FastAPI):
                 speaker_store=_state.get("speaker_store"),
                 embedding_callback=_on_stt_embedding,
                 language_callback=_on_stt_language,
+                min_embedding_duration_seconds=config.speaker.min_embedding_duration_seconds,
             )
             logger.info("Wyoming STT server listening on port %d", config.stt.port)
         else:
@@ -580,18 +579,6 @@ async def chat(request: ChatRequest):
         if tracker is not None:
             tracker.record(detected_language, detected_language_prob)
 
-    # Discard embeddings from short utterances — pyannote needs enough voice
-    # data for a stable print. Short commands produce noisy, unreliable embeddings.
-    min_words = _state["config"].speaker.min_embedding_words
-    word_count = len(request.text.split()) if request.text else 0
-    if request.speaker_embedding and word_count < min_words:
-        logger.info(
-            "Embedding discarded: transcript too short (%d words < %d minimum)",
-            word_count,
-            min_words,
-        )
-        request.speaker_embedding = None
-
     # Speaker resolution: embedding → session history → anonymous.
     # Never let speaker ID failure kill the request — proceed as anonymous.
     try:
@@ -602,8 +589,8 @@ async def chat(request: ChatRequest):
     follow_up = None
     store = _state.get("speaker_store")
 
-    # Deferred enrollment: unknown voice → group by embedding silently.
-    # Prompt only after global cooldown elapses — never on first encounter.
+    # Deferred enrollment: unknown voice → group by embedding, prompt on first
+    # encounter for each group, then re-prompt after per-group cooldown.
     # Enrollment failure must never block the query.
     try:
         if speaker_id is None and request.speaker_embedding and store:
@@ -619,21 +606,29 @@ async def chat(request: ChatRequest):
                 logger.info("Unknown speaker — grouped into %s", unknown_group_id)
             else:
                 unknown_group_id = uuid.uuid4().hex[:8]
-                _state["unknown_speakers"][unknown_group_id] = {
+                group = {
                     "embeddings": [request.speaker_embedding],
                     "conversations": {conv_id},
                     "first_seen": now,
+                    "last_prompted": None,
+                    "last_extract_turn_count": 0,
                 }
+                _state["unknown_speakers"][unknown_group_id] = group
                 _state["pending_enrollments"].add(conv_id)
                 logger.info("Unknown speaker — new group %s", unknown_group_id)
 
-            # Global enrollment prompt cooldown
+            # Per-group enrollment prompt: fire on first encounter, re-prompt
+            # after reprompt_interval seconds of the same unresolved group.
             reprompt_interval = _state["config"].speaker.enrollment_reprompt_interval
-            last_prompt = _state["last_enrollment_prompt"]
-            if (now - last_prompt).total_seconds() >= reprompt_interval:
+            last_prompted = group.get("last_prompted")
+            if last_prompted is None or (now - last_prompted).total_seconds() >= reprompt_interval:
                 follow_up = _state["config"].speaker.enrollment_prompt
-                _state["last_enrollment_prompt"] = now
-                logger.info("Enrollment prompt sent (cooldown %ds)", reprompt_interval)
+                group["last_prompted"] = now
+                logger.info(
+                    "Enrollment prompt sent for group %s (interval %ds)",
+                    unknown_group_id,
+                    reprompt_interval,
+                )
     except Exception:
         logger.exception("Speaker enrollment failed — continuing without enrollment")
 
@@ -1288,6 +1283,12 @@ def _extract_and_start_training():
                 ha_validation=config.consolidation.extraction_ha_validation,
                 noise_filter=config.consolidation.extraction_noise_filter,
                 noise_filter_model=config.consolidation.extraction_noise_filter_model,
+                noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
+                ner_check=config.consolidation.extraction_ner_check,
+                ner_model=config.consolidation.extraction_ner_model,
+                plausibility_judge=config.consolidation.extraction_plausibility_judge,
+                plausibility_stage=config.consolidation.extraction_plausibility_stage,
+                verify_anonymization=config.consolidation.extraction_verify_anonymization,
             )
             _increment_key_sessions(loop, session_id)
 
@@ -1583,6 +1584,11 @@ async def _enrollment_idle_loop_inner(idle_timeout_seconds: int, check_interval:
                 del _state["unknown_speakers"][group_id]
                 continue
 
+            # Skip re-extraction when no new turns arrived since last attempt.
+            if len(all_turns) == group.get("last_extract_turn_count", 0):
+                continue
+            group["last_extract_turn_count"] = len(all_turns)
+
             async with gpu_lock():
                 loop = asyncio.get_running_loop()
                 extracted = await loop.run_in_executor(
@@ -1607,16 +1613,24 @@ async def _enrollment_idle_loop_inner(idle_timeout_seconds: int, check_interval:
                         group_id,
                         claimed,
                     )
+                    _state["pending_enrollments"] -= group["conversations"]
+                    del _state["unknown_speakers"][group_id]
                 else:
                     logger.info(
                         "Deferred enrollment skipped for group %s (voice already enrolled)",
                         group_id,
                     )
+                    _state["pending_enrollments"] -= group["conversations"]
+                    del _state["unknown_speakers"][group_id]
             else:
-                logger.info("No self-introduction found in group %s", group_id)
-
-            _state["pending_enrollments"] -= group["conversations"]
-            del _state["unknown_speakers"][group_id]
+                # Retain group: speaker may introduce themselves in a later
+                # utterance, or retro-claim may match them to an existing
+                # profile, or an admin may attach manually. Re-prompt fires
+                # via per-group cooldown on the next utterance after interval.
+                logger.info(
+                    "No self-introduction found in group %s — retaining for re-prompt",
+                    group_id,
+                )
 
 
 # --- GPU lifecycle ---

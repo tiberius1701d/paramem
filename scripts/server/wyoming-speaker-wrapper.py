@@ -25,70 +25,9 @@ Requirements:
 import argparse
 import logging
 
+from paramem.server.speaker_embedding import compute_speaker_embedding, load_embedding_model
+
 logger = logging.getLogger(__name__)
-
-# Lazy-loaded model singleton
-_embedding_model = None
-
-
-def _get_embedding_model():
-    """Lazy-load the pyannote speaker embedding model (first call ~300MB download)."""
-    global _embedding_model
-    if _embedding_model is not None:
-        return _embedding_model
-
-    try:
-        from pyannote.audio import Inference
-    except ImportError:
-        logger.error("pyannote-audio not installed. Install with: pip install paramem[speaker]")
-        return None
-
-    logger.info("Loading pyannote speaker embedding model...")
-    _embedding_model = Inference(
-        "pyannote/embedding",
-        window="whole",
-        device="cpu",
-    )
-    logger.info("Speaker embedding model loaded")
-    return _embedding_model
-
-
-def compute_speaker_embedding(
-    audio_bytes: bytes,
-    sample_rate: int = 16000,
-) -> list[float]:
-    """Compute a speaker embedding from raw PCM audio.
-
-    Args:
-        audio_bytes: Raw PCM audio (int16, mono).
-        sample_rate: Audio sample rate in Hz.
-
-    Returns:
-        Speaker embedding as a list of floats (typically 256-512 dim).
-        Empty list if pyannote-audio is not available or audio is too short.
-    """
-    model = _get_embedding_model()
-    if model is None:
-        return []
-
-    import numpy as np
-    import torch
-
-    # Convert raw PCM int16 to float32 waveform
-    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-    # Minimum audio length (~0.5s at 16kHz)
-    if len(audio_np) < sample_rate // 2:
-        logger.warning(
-            "Audio too short for speaker embedding: %d samples (%.2fs)",
-            len(audio_np),
-            len(audio_np) / sample_rate,
-        )
-        return []
-
-    waveform = torch.from_numpy(audio_np).unsqueeze(0)
-    embedding = model({"waveform": waveform, "sample_rate": sample_rate})
-    return embedding.flatten().tolist()
 
 
 def main():
@@ -109,6 +48,8 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
     )
+
+    load_embedding_model()
 
     # Test mode: compute embedding from a file
     if args.test_audio:

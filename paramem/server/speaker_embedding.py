@@ -28,14 +28,15 @@ def load_embedding_model() -> bool:
         logger.warning("pyannote-audio not installed — install with: pip install paramem[speaker]")
         return False
 
+    model_name = "pyannote/wespeaker-voxceleb-resnet34-LM"
     logger.info("Loading pyannote speaker embedding model...")
-    model = Model.from_pretrained("pyannote/embedding")
+    model = Model.from_pretrained(model_name)
     _embedding_model = Inference(
         model,
         window="whole",
         device=torch.device("cpu"),
     )
-    logger.info("Speaker embedding model loaded (4.3M params, CPU)")
+    logger.info("Speaker embedding model loaded: %s (CPU)", model_name)
     return True
 
 
@@ -47,22 +48,39 @@ def is_loaded() -> bool:
 def compute_speaker_embedding(
     audio_bytes: bytes,
     sample_rate: int = 16000,
+    min_duration_seconds: float = 1.0,
 ) -> list[float]:
     """Compute a speaker embedding from raw PCM audio (int16, mono).
 
-    Returns a list of floats (512 dim).
-    Empty list if model not loaded or audio is too short.
+    Uses the wespeaker-voxceleb-resnet34-LM model (256-dim speaker embedding).
+    Returns a list of floats. Empty list if model not loaded or audio is too short.
+
+    Args:
+        audio_bytes: Raw PCM audio data (int16, mono).
+        sample_rate: Sample rate of the audio in Hz.
+        min_duration_seconds: Minimum audio duration required to compute an
+            embedding. Utterances shorter than this threshold are discarded
+            because pyannote needs sustained voice for a stable fingerprint.
     """
     if _embedding_model is None:
         return []
 
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-    if len(audio_np) < sample_rate // 2:
+    # RMS normalisation — equalises gain across devices and recording conditions.
+    target_rms = 0.1  # ~-20 dBFS
+    current_rms = float(np.sqrt(np.mean(audio_np**2)))
+    if current_rms > 1e-6:
+        audio_np = audio_np * (target_rms / current_rms)
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+
+    min_samples = int(min_duration_seconds * sample_rate)
+    if len(audio_np) < min_samples:
         logger.warning(
-            "Audio too short for speaker embedding: %d samples (%.2fs)",
+            "Audio too short for speaker embedding: %d samples (%.2fs < %.1fs minimum)",
             len(audio_np),
             len(audio_np) / sample_rate,
+            min_duration_seconds,
         )
         return []
 

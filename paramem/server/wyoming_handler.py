@@ -47,6 +47,7 @@ class SpeakerSTTHandler(AsyncEventHandler):
         chat_callback=None,
         embedding_callback=None,
         language_callback=None,
+        min_embedding_duration_seconds: float = 1.0,
     ):
         super().__init__(reader, writer)
         self._stt = stt
@@ -54,6 +55,7 @@ class SpeakerSTTHandler(AsyncEventHandler):
         self._chat_callback = chat_callback
         self._embedding_callback = embedding_callback
         self._language_callback = language_callback
+        self._min_embedding_duration_seconds = min_embedding_duration_seconds
         self._audio_buffer = bytearray()
         self._sample_rate = 16000
         self._sample_width = 2
@@ -152,11 +154,19 @@ class SpeakerSTTHandler(AsyncEventHandler):
             await self._chat_callback(text, embedding)
 
     def _compute_embedding(self, audio_bytes: bytes) -> list[float] | None:
-        """Compute speaker embedding from audio on CPU."""
+        """Compute speaker embedding from audio on CPU.
+
+        Duration filtering is delegated to compute_speaker_embedding() via
+        min_duration_seconds so the gate is based on audio length, not word count.
+        """
         try:
             from paramem.server.speaker_embedding import compute_speaker_embedding
 
-            embedding = compute_speaker_embedding(audio_bytes, self._sample_rate)
+            embedding = compute_speaker_embedding(
+                audio_bytes,
+                self._sample_rate,
+                min_duration_seconds=self._min_embedding_duration_seconds,
+            )
             return embedding if embedding else None
         except ImportError:
             logger.debug("Speaker embedding not available — install paramem[speaker]")
@@ -210,8 +220,20 @@ async def start_wyoming_server(
     chat_callback=None,
     embedding_callback=None,
     language_callback=None,
+    min_embedding_duration_seconds: float = 1.0,
 ) -> AsyncServer:
     """Start the Wyoming STT server (non-blocking).
+
+    Args:
+        host: TCP host to bind.
+        port: TCP port to listen on.
+        stt: Loaded STT model instance.
+        speaker_store: Optional SpeakerStore for embedding enrichment.
+        chat_callback: Async callable forwarding (text, embedding) to /chat.
+        embedding_callback: Callable storing the latest embedding in server state.
+        language_callback: Callable storing the detected language in server state.
+        min_embedding_duration_seconds: Minimum audio duration to compute an
+            embedding; passed through to compute_speaker_embedding().
 
     Returns the server instance. Call server.stop() on shutdown.
     """
@@ -225,6 +247,7 @@ async def start_wyoming_server(
             chat_callback,
             embedding_callback,
             language_callback,
+            min_embedding_duration_seconds=min_embedding_duration_seconds,
         )
 
     server = AsyncServer.from_uri(f"tcp://{host}:{port}")

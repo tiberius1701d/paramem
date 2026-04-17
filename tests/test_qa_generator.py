@@ -7,6 +7,7 @@ LLM-based generation is validated by GPU experiments.
 from paramem.graph.qa_generator import (
     filter_procedural_relations,
     generate_qa_from_relations,
+    partition_relations,
 )
 
 
@@ -239,3 +240,41 @@ class TestFilterProceduralRelations:
         ]
         result = filter_procedural_relations(rels)
         assert len(result) == 1
+
+
+class TestPartitionRelations:
+    def _sample(self):
+        return [
+            {
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "relation_type": "factual",
+            },
+            {
+                "subject": "Alex",
+                "predicate": "prefers",
+                "object": "jazz",
+                "relation_type": "preference",
+            },
+            {
+                "subject": "Alex",
+                "predicate": "works_at",
+                "object": "SAP",
+                "relation_type": "factual",
+            },
+        ]
+
+    def test_procedural_enabled_splits_preferences_out(self):
+        episodic, procedural = partition_relations(self._sample(), procedural_enabled=True)
+        assert {r["predicate"] for r in episodic} == {"lives_in", "works_at"}
+        assert {r["predicate"] for r in procedural} == {"prefers"}
+
+    def test_procedural_disabled_keeps_all_in_episodic(self):
+        episodic, procedural = partition_relations(self._sample(), procedural_enabled=False)
+        assert len(episodic) == 3
+        assert procedural == []
+
+    def test_empty_input(self):
+        assert partition_relations([], procedural_enabled=True) == ([], [])
+        assert partition_relations([], procedural_enabled=False) == ([], [])

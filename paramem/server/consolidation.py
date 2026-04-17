@@ -307,41 +307,10 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
             loop.key_sessions[key] = loop.key_sessions.get(key, 0) + 1
 
 
-def _dedup_episodic(qa_list: list[dict]) -> list[dict]:
-    """Deduplicate episodic QA by (source_subject, source_predicate, source_object).
-
-    Keeps the first occurrence. Case-insensitive on subject/object to collapse
-    minor casing drift across sessions. Entries missing any identity field fall
-    back to a per-object identity so they survive rather than collide.
-    """
-    seen: set[tuple] = set()
-    out: list[dict] = []
-    for qa in qa_list:
-        subj = (qa.get("source_subject") or "").strip().lower()
-        pred = (qa.get("source_predicate") or "").strip().lower()
-        obj = (qa.get("source_object") or "").strip().lower()
-        key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(qa))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(qa)
-    return out
-
-
-def _dedup_procedural(rels: list[dict]) -> list[dict]:
-    """Deduplicate procedural relations by (subject, predicate, object)."""
-    seen: set[tuple] = set()
-    out: list[dict] = []
-    for rel in rels:
-        subj = (rel.get("subject") or "").strip().lower()
-        pred = (rel.get("predicate") or "").strip().lower()
-        obj = (rel.get("object") or "").strip().lower()
-        key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(rel))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(rel)
-    return out
+# Dedup moved onto ConsolidationLoop (see paramem/training/consolidation.py).
+# Re-exported as module-level aliases for existing call sites.
+_dedup_episodic = ConsolidationLoop.dedup_episodic
+_dedup_procedural = ConsolidationLoop.dedup_procedural
 
 
 def _save_simulation_results(

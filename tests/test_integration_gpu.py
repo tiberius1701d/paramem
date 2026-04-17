@@ -554,6 +554,77 @@ class TestStagingAdapterGPU:
         assert not (tmp_path / "episodic.old").exists()
 
 
+# --- 7c. _run_extract_graph helper end-to-end on GPU ---
+
+
+class TestRunExtractGraphHelper:
+    """Gap (a): the helper wrapper that every orchestrator goes through must
+    actually work end-to-end with a real model.
+
+    Unit tests (tests/test_extraction_pipeline_guard.py) prove the helper
+    threads args and guards PeftModel correctly; this test proves the whole
+    chain — `_extraction_kwargs` → `extract_graph` — executes on real hardware
+    without drift. SOTA gates are all disabled so the test depends only on the
+    local model.
+    """
+
+    def test_helper_runs_with_production_config(self, model_and_tokenizer, tmp_path):
+        """Run `_run_extract_graph` with the exact flags from configs/server.yaml.
+
+        Mirrors production: noise_filter, plausibility_judge, verify_anonymization,
+        NER — all set to whatever ships in server.yaml today. Skips when
+        prerequisites for the configured stack are missing (e.g.
+        ANTHROPIC_API_KEY for the cloud noise filter) rather than silently
+        running a weaker configuration.
+
+        Structured so a future @pytest.mark.parametrize can introduce other
+        provider/stage combinations without rewriting the scaffolding.
+        """
+        from paramem.graph.schema import SessionGraph
+        from paramem.server.config import load_server_config
+        from paramem.training.consolidation import ConsolidationLoop
+
+        model, tokenizer = model_and_tokenizer
+
+        server_config = load_server_config("configs/server.yaml")
+        cc = server_config.consolidation
+
+        if cc.extraction_noise_filter == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+            pytest.skip("ANTHROPIC_API_KEY not set; cannot exercise configured cloud noise filter")
+
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=tokenizer,
+            consolidation_config=server_config.consolidation_config,
+            training_config=server_config.training_config,
+            episodic_adapter_config=server_config.episodic_adapter_config,
+            semantic_adapter_config=server_config.semantic_adapter_config,
+            output_dir=tmp_path,
+            persist_graph=False,
+            save_cycle_snapshots=False,
+            prompts_dir=server_config.prompts_dir,
+            extraction_max_tokens=cc.extraction_max_tokens,
+            extraction_stt_correction=cc.extraction_stt_correction,
+            extraction_ha_validation=cc.extraction_ha_validation,
+            extraction_noise_filter=cc.extraction_noise_filter,
+            extraction_noise_filter_model=cc.extraction_noise_filter_model,
+            extraction_noise_filter_endpoint=cc.extraction_noise_filter_endpoint or None,
+            extraction_ner_check=cc.extraction_ner_check,
+            extraction_ner_model=cc.extraction_ner_model,
+            extraction_plausibility_judge=cc.extraction_plausibility_judge,
+            extraction_plausibility_stage=cc.extraction_plausibility_stage,
+            extraction_verify_anonymization=cc.extraction_verify_anonymization,
+        )
+
+        graph = loop._run_extract_graph(
+            "[user] My name is Alex. I live in Millfield.\n[assistant] Nice to meet you, Alex.",
+            "gap_a_session",
+        )
+
+        assert isinstance(graph, SessionGraph)
+        assert graph.session_id == "gap_a_session"
+
+
 # --- 8. Batch consolidation end-to-end ---
 
 

@@ -481,3 +481,102 @@ class TestShouldGreet:
         store.confirm_greeting("speaker1")
         result = store.should_greet("speaker2", interval_hours=24)
         assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# speaker_embedding module — unit tests (no pyannote model download required)
+# ---------------------------------------------------------------------------
+
+
+def _make_pcm(duration_seconds: float, sample_rate: int = 16000, amplitude: float = 0.5) -> bytes:
+    """Generate a constant-amplitude int16 mono PCM buffer for testing."""
+    import numpy as np
+
+    n_samples = int(duration_seconds * sample_rate)
+    value = int(amplitude * 32767)
+    samples = np.full(n_samples, value, dtype=np.int16)
+    return samples.tobytes()
+
+
+def test_rms_normalization_applied(monkeypatch):
+    """RMS normalisation equalises gain: loud and quiet inputs reach ~0.1 RMS.
+
+    The pyannote Inference call is monkeypatched to capture the waveform
+    actually passed to the model and return a dummy embedding.
+    """
+    import numpy as np
+    import torch
+
+    import paramem.server.speaker_embedding as mod
+
+    captured_waveforms = []
+
+    class _FakeInference:
+        def __call__(self, inputs):
+            captured_waveforms.append(inputs["waveform"].clone())
+            return torch.zeros(1, 256)  # dummy 256-dim embedding
+
+    mod._embedding_model = _FakeInference()
+    sample_rate = 16000
+
+    try:
+        # Loud: amplitude 0.9
+        loud_pcm = _make_pcm(2.0, sample_rate, amplitude=0.9)
+        mod.compute_speaker_embedding(loud_pcm, sample_rate)
+
+        # Quiet: amplitude 0.05
+        quiet_pcm = _make_pcm(2.0, sample_rate, amplitude=0.05)
+        mod.compute_speaker_embedding(quiet_pcm, sample_rate)
+    finally:
+        mod._embedding_model = None
+
+    assert len(captured_waveforms) == 2, "Expected two inference calls"
+
+    for wf in captured_waveforms:
+        audio = wf.squeeze(0).numpy()
+        rms = float(np.sqrt(np.mean(audio**2)))
+        assert abs(rms - 0.1) / 0.1 < 0.10, f"RMS after normalisation expected ≈0.1, got {rms:.4f}"
+
+
+def test_duration_gate_rejects_short_audio():
+    """Utterances shorter than min_duration_seconds return an empty list.
+
+    Uses a 0.5s buffer and the default threshold of 1.0s.  When the
+    Inference object is set, the duration gate must still reject before
+    calling it; for the longer-buffer assertion, Inference is monkeypatched
+    to return a dummy embedding so the test does not require a real model.
+    """
+    import torch
+
+    import paramem.server.speaker_embedding as mod
+
+    sample_rate = 16000
+    short_pcm = _make_pcm(0.5, sample_rate)  # 0.5s — below 1.0s threshold
+
+    class _FakeInference:
+        def __call__(self, inputs):
+            return torch.zeros(1, 256)
+
+    # With no model loaded, duration check is never reached — both paths return [].
+    # Load a fake model so the duration gate itself is exercised.
+    mod._embedding_model = _FakeInference()
+    try:
+        result_short = mod.compute_speaker_embedding(
+            short_pcm, sample_rate, min_duration_seconds=1.0
+        )
+        assert result_short == [], f"Expected [] for 0.5s audio, got {result_short}"
+
+        long_pcm = _make_pcm(1.2, sample_rate)
+        result_long = mod.compute_speaker_embedding(long_pcm, sample_rate, min_duration_seconds=1.0)
+        assert isinstance(result_long, list), "Expected list from 1.2s audio"
+        assert len(result_long) > 0, "Expected non-empty embedding for 1.2s audio"
+    finally:
+        mod._embedding_model = None
+
+
+def test_min_embedding_duration_seconds_config_default():
+    """SpeakerConfig default for min_embedding_duration_seconds is 1.0."""
+    from paramem.server.config import SpeakerConfig
+
+    cfg = SpeakerConfig()
+    assert cfg.min_embedding_duration_seconds == 1.0

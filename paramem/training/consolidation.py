@@ -17,8 +17,8 @@ from torch.utils.data import Dataset
 from paramem.graph.extractor import extract_graph, extract_procedural_graph
 from paramem.graph.merger import GraphMerger
 from paramem.graph.qa_generator import (
-    filter_procedural_relations,
     generate_qa_from_relations,
+    partition_relations,
 )
 from paramem.graph.scoring import (
     PromotionScorer,
@@ -128,6 +128,16 @@ class ConsolidationLoop:
         snapshot_dir: str | Path | None = None,
         persist_graph: bool = True,
         prompts_dir: str | Path | None = None,
+        extraction_stt_correction: bool = True,
+        extraction_ha_validation: bool = True,
+        extraction_noise_filter: str = "",
+        extraction_noise_filter_model: str = "claude-sonnet-4-6",
+        extraction_noise_filter_endpoint: str | None = None,
+        extraction_ner_check: bool = False,
+        extraction_ner_model: str = "en_core_web_sm",
+        extraction_plausibility_judge: str = "auto",
+        extraction_plausibility_stage: str = "deanon",
+        extraction_verify_anonymization: bool = True,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -152,6 +162,20 @@ class ConsolidationLoop:
 
         self.extraction_temperature = extraction_temperature
         self.extraction_max_tokens = extraction_max_tokens
+
+        # Extraction pipeline flags — the SOTA enrichment chain (anonymize →
+        # noise-filter → plausibility → de-anonymize → NER). Loop-level defaults
+        # propagate to every extraction; callers may override per call.
+        self.extraction_stt_correction = extraction_stt_correction
+        self.extraction_ha_validation = extraction_ha_validation
+        self.extraction_noise_filter = extraction_noise_filter
+        self.extraction_noise_filter_model = extraction_noise_filter_model
+        self.extraction_noise_filter_endpoint = extraction_noise_filter_endpoint
+        self.extraction_ner_check = extraction_ner_check
+        self.extraction_ner_model = extraction_ner_model
+        self.extraction_plausibility_judge = extraction_plausibility_judge
+        self.extraction_plausibility_stage = extraction_plausibility_stage
+        self.extraction_verify_anonymization = extraction_verify_anonymization
 
         # Graph state
         self.merger = GraphMerger()
@@ -272,6 +296,122 @@ class ConsolidationLoop:
             len(keyed_pairs),
         )
 
+    @staticmethod
+    def dedup_episodic(qa_list: list[dict]) -> list[dict]:
+        """Deduplicate episodic QA by (source_subject, source_predicate, source_object).
+
+        Case-insensitive; first occurrence wins. Entries missing identity fields
+        fall back to per-object identity so they survive rather than collide.
+        """
+        seen: set[tuple] = set()
+        out: list[dict] = []
+        for qa in qa_list:
+            subj = (qa.get("source_subject") or "").strip().lower()
+            pred = (qa.get("source_predicate") or "").strip().lower()
+            obj = (qa.get("source_object") or "").strip().lower()
+            key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(qa))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(qa)
+        return out
+
+    @staticmethod
+    def dedup_procedural(rels: list[dict]) -> list[dict]:
+        """Deduplicate procedural relations by (subject, predicate, object)."""
+        seen: set[tuple] = set()
+        out: list[dict] = []
+        for rel in rels:
+            subj = (rel.get("subject") or "").strip().lower()
+            pred = (rel.get("predicate") or "").strip().lower()
+            obj = (rel.get("object") or "").strip().lower()
+            key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(rel))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rel)
+        return out
+
+    def _extraction_kwargs(self, **overrides) -> dict:
+        """Build the full kwarg set passed to extract_graph / extract_procedural_graph.
+
+        Resolves each flag to the per-call override if given (not None), else
+        the loop-level default. Single source of truth for every extraction path.
+        """
+
+        def pick(name: str, fallback):
+            val = overrides.get(name, None)
+            return fallback if val is None else val
+
+        return dict(
+            temperature=self.extraction_temperature,
+            max_tokens=self.extraction_max_tokens,
+            prompts_dir=self.prompts_dir,
+            ha_context=overrides.get("ha_context"),
+            stt_correction=pick("stt_correction", self.extraction_stt_correction),
+            ha_validation=pick("ha_validation", self.extraction_ha_validation),
+            noise_filter=pick("noise_filter", self.extraction_noise_filter),
+            noise_filter_model=pick("noise_filter_model", self.extraction_noise_filter_model),
+            noise_filter_endpoint=pick(
+                "noise_filter_endpoint", self.extraction_noise_filter_endpoint
+            ),
+            speaker_name=overrides.get("speaker_name"),
+            ner_check=pick("ner_check", self.extraction_ner_check),
+            ner_model=pick("ner_model", self.extraction_ner_model),
+            plausibility_judge=pick("plausibility_judge", self.extraction_plausibility_judge),
+            plausibility_stage=pick("plausibility_stage", self.extraction_plausibility_stage),
+            verify_anonymization=pick("verify_anonymization", self.extraction_verify_anonymization),
+        )
+
+    def _run_extract_graph(
+        self,
+        session_transcript: str,
+        session_id: str,
+        **overrides,
+    ):
+        """Single entry-point to extract_graph with unified flags + adapter guard.
+
+        Every orchestrator (extract_session, run_cycle, future callers) goes
+        through this helper so the pipeline cannot diverge by accident.
+        """
+        from peft import PeftModel as _PeftModel
+
+        self._disable_gradient_checkpointing()
+        kwargs = self._extraction_kwargs(**overrides)
+        if isinstance(self.model, _PeftModel):
+            with self.model.disable_adapter():
+                return extract_graph(
+                    self.model, self.tokenizer, session_transcript, session_id, **kwargs
+                )
+        return extract_graph(self.model, self.tokenizer, session_transcript, session_id, **kwargs)
+
+    def _run_extract_procedural_graph(
+        self,
+        session_transcript: str,
+        session_id: str,
+        speaker_name: str | None = None,
+        stt_correction: bool | None = None,
+    ):
+        """Single entry-point to extract_procedural_graph with adapter guard."""
+        from peft import PeftModel as _PeftModel
+
+        self._disable_gradient_checkpointing()
+        stt = self.extraction_stt_correction if stt_correction is None else stt_correction
+        call_kwargs = dict(
+            max_tokens=self.extraction_max_tokens,
+            prompts_dir=self.prompts_dir,
+            stt_correction=stt,
+            speaker_name=speaker_name,
+        )
+        if isinstance(self.model, _PeftModel):
+            with self.model.disable_adapter():
+                return extract_procedural_graph(
+                    self.model, self.tokenizer, session_transcript, session_id, **call_kwargs
+                )
+        return extract_procedural_graph(
+            self.model, self.tokenizer, session_transcript, session_id, **call_kwargs
+        )
+
     def extract_session(
         self,
         session_transcript: str,
@@ -279,16 +419,16 @@ class ConsolidationLoop:
         speaker_id: str = "",
         speaker_name: str | None = None,
         ha_context: dict | None = None,
-        stt_correction: bool = True,
-        ha_validation: bool = True,
-        noise_filter: str = "",
-        noise_filter_model: str = "claude-sonnet-4-6",
+        stt_correction: bool | None = None,
+        ha_validation: bool | None = None,
+        noise_filter: str | None = None,
+        noise_filter_model: str | None = None,
         noise_filter_endpoint: str | None = None,
-        ner_check: bool = False,
-        ner_model: str = "en_core_web_sm",
-        plausibility_judge: str = "auto",
-        plausibility_stage: str = "deanon",
-        verify_anonymization: bool = True,
+        ner_check: bool | None = None,
+        ner_model: str | None = None,
+        plausibility_judge: str | None = None,
+        plausibility_stage: str | None = None,
+        verify_anonymization: bool | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """Extract and generate QA pairs from a session without training.
 
@@ -298,13 +438,9 @@ class ConsolidationLoop:
         logger.info("=== Extraction (session=%s) ===", session_id)
 
         # --- EXTRACT ---
-        self._disable_gradient_checkpointing()
-        from peft import PeftModel as _PeftModel
-
-        extraction_kwargs = dict(
-            temperature=self.extraction_temperature,
-            max_tokens=self.extraction_max_tokens,
-            prompts_dir=self.prompts_dir,
+        session_graph = self._run_extract_graph(
+            session_transcript,
+            session_id,
             ha_context=ha_context,
             stt_correction=stt_correction,
             ha_validation=ha_validation,
@@ -318,23 +454,6 @@ class ConsolidationLoop:
             plausibility_stage=plausibility_stage,
             verify_anonymization=verify_anonymization,
         )
-        if isinstance(self.model, _PeftModel):
-            with self.model.disable_adapter():
-                session_graph = extract_graph(
-                    self.model,
-                    self.tokenizer,
-                    session_transcript,
-                    session_id,
-                    **extraction_kwargs,
-                )
-        else:
-            session_graph = extract_graph(
-                self.model,
-                self.tokenizer,
-                session_transcript,
-                session_id,
-                **extraction_kwargs,
-            )
 
         logger.info(
             "Extracted %d entities, %d relations",
@@ -361,40 +480,22 @@ class ConsolidationLoop:
             for r in session_graph.relations
         ]
 
+        episodic_relations, procedural_rels = partition_relations(
+            session_relations, procedural_enabled=self.procedural_config is not None
+        )
         episodic_qa = generate_qa_from_relations(
-            session_relations, model=self.model, tokenizer=self.tokenizer
+            episodic_relations, model=self.model, tokenizer=self.tokenizer
         )
 
         # --- PROCEDURAL: separate extraction pass ---
-        procedural_rels = []
         if self.procedural_config is not None:
-            self._disable_gradient_checkpointing()
-            from peft import PeftModel as _PM
-
-            if isinstance(self.model, _PM):
-                with self.model.disable_adapter():
-                    proc_graph = extract_procedural_graph(
-                        self.model,
-                        self.tokenizer,
-                        session_transcript,
-                        session_id,
-                        max_tokens=self.extraction_max_tokens,
-                        prompts_dir=self.prompts_dir,
-                        stt_correction=stt_correction,
-                        speaker_name=speaker_name,
-                    )
-            else:
-                proc_graph = extract_procedural_graph(
-                    self.model,
-                    self.tokenizer,
-                    session_transcript,
-                    session_id,
-                    max_tokens=self.extraction_max_tokens,
-                    prompts_dir=self.prompts_dir,
-                    stt_correction=stt_correction,
-                    speaker_name=speaker_name,
-                )
-            procedural_rels = [
+            proc_graph = self._run_extract_procedural_graph(
+                session_transcript,
+                session_id,
+                speaker_name=speaker_name,
+                stt_correction=stt_correction,
+            )
+            procedural_rels.extend(
                 {
                     "subject": r.subject,
                     "predicate": r.predicate,
@@ -402,7 +503,11 @@ class ConsolidationLoop:
                     "relation_type": r.relation_type,
                 }
                 for r in proc_graph.relations
-            ]
+            )
+
+        # Unified dedup (identical policy as run_cycle + server path).
+        episodic_qa = self.dedup_episodic(episodic_qa)
+        procedural_rels = self.dedup_procedural(procedural_rels)
 
         self.last_session_graph = session_graph
         return episodic_qa, procedural_rels
@@ -746,33 +851,13 @@ class ConsolidationLoop:
         )
 
         # --- 1. EXTRACT ---
-        # Disable adapters for extraction (use base model reasoning)
-        self._disable_gradient_checkpointing()
-        from peft import PeftModel as _PeftModel
-
-        if isinstance(self.model, _PeftModel):
-            with self.model.disable_adapter():
-                session_graph = extract_graph(
-                    self.model,
-                    self.tokenizer,
-                    session_transcript,
-                    session_id,
-                    temperature=self.extraction_temperature,
-                    max_tokens=self.extraction_max_tokens,
-                    prompts_dir=self.prompts_dir,
-                    speaker_name=speaker_name,
-                )
-        else:
-            session_graph = extract_graph(
-                self.model,
-                self.tokenizer,
-                session_transcript,
-                session_id,
-                temperature=self.extraction_temperature,
-                max_tokens=self.extraction_max_tokens,
-                prompts_dir=self.prompts_dir,
-                speaker_name=speaker_name,
-            )
+        # Unified extraction path: same helper as extract_session(), so every
+        # SOTA pipeline flag configured on the loop is applied identically.
+        session_graph = self._run_extract_graph(
+            session_transcript,
+            session_id,
+            speaker_name=speaker_name,
+        )
 
         result.entities_extracted = len(session_graph.entities)
         result.relations_extracted = len(session_graph.relations)
@@ -811,21 +896,37 @@ class ConsolidationLoop:
             }
             for r in session_graph.relations
         ]
-        # When procedural adapter is enabled, exclude preference relations
-        # from episodic — they route to procedural instead
-        procedural_rels = []
+        episodic_relations, procedural_rels = partition_relations(
+            session_relations, procedural_enabled=self.procedural_config is not None
+        )
+
+        # Mirror extract_session(): run the dedicated procedural prompt so
+        # experiments exercise the same pipeline as production.
         if self.procedural_config is not None:
-            procedural_rels = filter_procedural_relations(session_relations)
-            procedural_set = set(id(r) for r in procedural_rels)
-            episodic_relations = [r for r in session_relations if id(r) not in procedural_set]
-        else:
-            episodic_relations = session_relations
+            proc_graph = self._run_extract_procedural_graph(
+                session_transcript,
+                session_id,
+                speaker_name=speaker_name,
+            )
+            procedural_rels.extend(
+                {
+                    "subject": r.subject,
+                    "predicate": r.predicate,
+                    "object": r.object,
+                    "relation_type": r.relation_type,
+                }
+                for r in proc_graph.relations
+            )
 
         episodic_qa = generate_qa_from_relations(
             episodic_relations,
             model=self.model,
             tokenizer=self.tokenizer,
         )
+
+        # Apply same dedup as server path (identical policy across all paths).
+        episodic_qa = self.dedup_episodic(episodic_qa)
+        procedural_rels = self.dedup_procedural(procedural_rels)
 
         # Promotion: relations for promoted entities (cap to keep training bounded)
         if new_promotions:
@@ -1156,7 +1257,7 @@ class ConsolidationLoop:
         """Train procedural adapter on preference/habit relations.
 
         Expects pre-filtered preference relations (caller runs
-        filter_procedural_relations before passing).
+        partition_relations before passing).
 
         Same mechanism as episodic: reconstruct existing keys from adapter
         weights, add new keys, retrain the full set. Knowledge lives in
@@ -1646,7 +1747,7 @@ def run_multi_session(
     semantic_adapter_config: AdapterConfig,
     wandb_config: Optional[WandbConfig] = None,
     output_dir: str | Path = "outputs/phase3",
-    extraction_temperature: float = 0.3,
+    extraction_temperature: float = 0.0,
 ) -> list[CycleResult]:
     """Run consolidation loop across multiple sessions.
 

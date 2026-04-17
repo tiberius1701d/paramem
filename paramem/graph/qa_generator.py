@@ -43,6 +43,26 @@ def filter_procedural_relations(relations: list[dict]) -> list[dict]:
     return result
 
 
+def partition_relations(
+    relations: list[dict], procedural_enabled: bool
+) -> tuple[list[dict], list[dict]]:
+    """Split session relations into (episodic, procedural) sets.
+
+    When procedural_enabled=True, preference relations route to the procedural
+    adapter and are removed from the episodic set to avoid duplicate encoding.
+    When procedural_enabled=False, everything stays in episodic so preferences
+    are never lost.
+
+    Called per-extraction so config changes are picked up automatically.
+    """
+    if not procedural_enabled:
+        return list(relations), []
+    procedural = filter_procedural_relations(relations)
+    proc_ids = {id(r) for r in procedural}
+    episodic = [r for r in relations if id(r) not in proc_ids]
+    return episodic, procedural
+
+
 # Few-shot examples covering diverse predicate types.
 # These teach the model the expected output format and conciseness.
 # Includes verbose/narrative objects to demonstrate extracting current state.
