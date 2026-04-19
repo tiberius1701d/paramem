@@ -44,8 +44,12 @@ from paramem.utils.config import AdapterConfig
 logger = logging.getLogger(__name__)
 
 # Shared grammar — same as systemd_timer.parse_schedule so there is one
-# source of truth for schedule string syntax.
-_INTERVAL_RE = re.compile(r"^every\s+(\d+)\s*([hm])$", re.IGNORECASE)
+# source of truth for schedule string syntax.  The ``every``-prefix is
+# canonical (emitted by the derived-period property so systemd_timer sees
+# the exact string it expects); the bare ``Nh`` / ``Nm`` shorthand is
+# accepted as user-facing input for ``refresh_cadence`` (lets operators
+# write ``12h`` instead of ``every 12h``).
+_INTERVAL_RE = re.compile(r"^(?:every\s+)?(\d+)\s*([hm])$", re.IGNORECASE)
 _DAILY_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 _OFF_VALUES = frozenset(("", "off", "disabled", "none"))
 
@@ -55,11 +59,11 @@ def compute_schedule_period_seconds(schedule: str) -> int | None:
 
     Accepted formats (same grammar as ``systemd_timer.parse_schedule``):
 
-    - ``"weekly"``    → 604800 seconds (7 days)
-    - ``"daily"``     → 86400 seconds (1 day)
-    - ``"every Nh"``  → N × 3600 seconds
-    - ``"every Nm"``  → N × 60 seconds
-    - ``"HH:MM"``     → 86400 seconds (daily)
+    - ``"weekly"``                → 604800 seconds (7 days)
+    - ``"daily"``                 → 86400 seconds (1 day)
+    - ``"every Nh"`` / ``"Nh"``   → N × 3600 seconds
+    - ``"every Nm"`` / ``"Nm"``   → N × 60 seconds
+    - ``"HH:MM"``                 → 86400 seconds (daily)
     - ``""`` / ``"off"`` / ``"disabled"`` / ``"none"`` → ``None`` (manual only)
 
     Returns:
@@ -93,73 +97,55 @@ def compute_schedule_period_seconds(schedule: str) -> int | None:
         raise ValueError(f"Invalid HH:MM schedule: {schedule!r}")
 
     raise ValueError(
-        f"Unrecognised schedule string: {schedule!r}. "
-        "Expected '', 'off', 'weekly', 'daily', 'HH:MM', 'every Nh', or 'every Nm'."
+        f"Unrecognised schedule string: {schedule!r}. Expected '', 'off', "
+        "'weekly', 'daily', 'HH:MM', 'Nh'/'Nm', or 'every Nh'/'every Nm'."
     )
 
 
 def current_interim_stamp(
-    schedule: str = "",
-    max_interim_count: int = 0,
+    refresh_cadence: str = "",
     *,
     _now: datetime | None = None,
 ) -> str:
-    """Return the current sub-interval's ``YYYYMMDDTHHMM`` stamp.
+    """Return the current refresh-interval's ``YYYYMMDDTHHMM`` stamp.
 
-    The stamp is floored to the nearest sub-interval boundary measured from
-    midnight of the current local day.  Two calls within the same sub-interval
-    return the same stamp, so a single interim adapter is reused for the entire
-    interval.
+    ``refresh_cadence`` IS the sub-interval directly — no division by
+    ``max_interim_count``. The stamp is floored to the nearest cadence
+    boundary measured from midnight of the current local day, so two calls
+    within the same cadence window return the same stamp and a single
+    interim adapter is reused for the entire window.
 
-    **When to call the zero-arg form.**  Pass no arguments only when you do not
-    have a schedule string and just want the current minute — for example when
-    generating a one-off stamp in a test.  The zero-arg form always returns the
-    current minute without any sub-interval flooring.
+    **When to call the zero-arg form.** Pass no arguments when you just
+    want the current minute — for example to generate a one-off stamp in a
+    test. The zero-arg form returns the raw current minute with no
+    flooring.
 
     Args:
-        schedule: Consolidation schedule string (``"every 2h"``, ``"03:00"``,
-            ``""``, etc.).  ``""`` / off-variants → fall back to flooring to
-            the nearest hour (sub-intervals still sensible, just coarser).
-        max_interim_count: Number of sub-intervals per consolidation period.
-            **Must be >= 1** when a real sub-interval calculation is desired.
-            Pass ``0`` only via the zero-arg form to get the raw current minute
-            stamp.  Callers must check ``max_interim_count == 0`` and handle
-            the queue-until-consolidation branch *before* calling this function.
-
-    Raises:
-        ValueError: when ``max_interim_count < 0`` or when ``max_interim_count``
-            is explicitly set to ``0`` alongside a non-empty schedule (the
-            queue-until-consolidation branch must be handled by the caller).
+        refresh_cadence: Interim refresh cadence (``"every 12h"``,
+            ``"every 30m"``, ``"daily"``, ``"HH:MM"``, etc.). An empty /
+            off-variant falls back to flooring to the nearest hour so
+            adapter names remain sensible boundaries even without a
+            configured cadence.
 
     Returns:
         Timestamp string, e.g. ``"20260418T1430"`` for 2026-04-18 14:30 local.
     """
     now = _now if _now is not None else datetime.now()
 
-    # Zero-arg backward-compatible form: return current minute.
-    if not schedule and max_interim_count == 0:
+    # Zero-arg form: return current minute with no flooring.
+    if not refresh_cadence:
         return now.strftime("%Y%m%dT%H%M")
 
-    if max_interim_count < 0:
-        raise ValueError(f"max_interim_count must be >= 0, got {max_interim_count}")
-    if max_interim_count == 0:
-        raise ValueError(
-            "max_interim_count == 0 means 'queue until consolidation' — "
-            "callers must handle this branch before calling current_interim_stamp()."
-        )
-
-    period = compute_schedule_period_seconds(schedule)
-
-    if period is None:
-        # Manual schedule: no period defined — floor to nearest hour so adapter
-        # names remain sensible boundaries even without a configured schedule.
+    sub_interval = compute_schedule_period_seconds(refresh_cadence)
+    if sub_interval is None:
+        # Off-variant (``"off"``/``"disabled"``/``"none"``): no cadence configured.
+        # Fall back to hourly flooring so stamps stay sensible. Callers that
+        # truly want to skip stamping should handle the queue-branch earlier.
         sub_interval = 3600
-    else:
-        sub_interval = period // max_interim_count
-        if sub_interval <= 0:
-            sub_interval = 1  # guard against misconfiguration
+    if sub_interval <= 0:
+        sub_interval = 1  # guard against misconfiguration
 
-    # Floor to the nearest sub-interval boundary measured from midnight local time.
+    # Floor to the nearest refresh-cadence boundary measured from midnight local time.
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     seconds_since_midnight = int((now - midnight).total_seconds())
     floored_seconds = (seconds_since_midnight // sub_interval) * sub_interval

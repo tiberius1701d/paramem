@@ -1,10 +1,15 @@
-"""Systemd user-timer reconciliation for the consolidation schedule.
+"""Systemd user-timer reconciliation for the full-consolidation cycle.
 
-The server owns its own schedule semantics (parsed from `consolidation.schedule`
-in server.yaml). On startup it renders the expected `paramem-consolidate.timer`
-and `paramem-consolidate.service` units, diffs them against what is currently
-installed under `~/.config/systemd/user/`, and reconciles with daemon-reload
-+ enable --now (or stop + disable when the schedule is "off").
+The server derives the full-consolidation period from
+``refresh_cadence × max_interim_count`` (see
+``ConsolidationScheduleConfig.consolidation_period_string``) and passes that
+derived period string to :func:`reconcile`. ``refresh_cadence`` is the only
+user-facing scheduling knob; this module never sees it directly. On startup
+the server renders the expected ``paramem-consolidate.timer`` and
+``paramem-consolidate.service`` units, diffs them against what is currently
+installed under ``~/.config/systemd/user/``, and reconciles with
+``daemon-reload`` + ``enable --now`` (or ``stop`` + ``disable`` when the
+derived period is "off"/empty).
 
 This replaces the in-process `_consolidation_scheduler` asyncio task. The
 in-process scheduler did not survive server restart — auto-reclaim restarts
@@ -14,8 +19,18 @@ timer is wall-clock driven and survives restarts.
 
 Accepted schedule strings (same parser as before, plus "off"):
     ""  / "off" / "disabled"  → no timer (manual /consolidate only)
-    "every Nh" / "every Nm"   → OnBootSec + OnUnitActiveSec
-    "HH:MM"                   → OnCalendar daily
+    "every Nh" (24 % N == 0)  → OnCalendar=*-*-* HH,...:00:00 + Persistent=true
+    "every Nh" (24 % N != 0)  → OnBootSec + OnUnitActiveSec (no catch-up)
+    "every Nm" (60 % N == 0)  → OnCalendar=*:MM,...:00 + Persistent=true
+    "every Nm" (60 % N != 0)  → OnBootSec + OnUnitActiveSec (no catch-up)
+    "weekly"                  → OnCalendar=Mon *-*-* 00:00:00 + Persistent=true
+    "HH:MM"                   → OnCalendar daily + Persistent=true
+    "daily"                   → OnCalendar *-*-* 03:00:00 + Persistent=true
+
+Interval cadences that divide evenly into 24h or 60min are converted to
+OnCalendar expressions so that systemd's ``Persistent=true`` can fire missed
+ticks on the next boot. Non-divisible cadences fall back to monotonic
+OnBootSec + OnUnitActiveSec; missed ticks are silently dropped in that case.
 """
 
 from __future__ import annotations
@@ -39,12 +54,50 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:8420/scheduled-tick"
 
 @dataclass(frozen=True)
 class TimerSpec:
-    """Rendered systemd timer unit parameters for a given schedule."""
+    """Rendered systemd timer unit parameters for a given schedule.
 
-    kind: str  # "off" | "interval" | "daily"
-    on_calendar: str | None = None  # daily mode
+    kind values:
+      "off"      — no timer installed.
+      "calendar" — OnCalendar + Persistent=true; catches up missed ticks on boot.
+      "daily"    — OnCalendar + Persistent=true; fixed daily wall-clock time.
+      "interval" — OnBootSec + OnUnitActiveSec; missed ticks are silently dropped.
+    """
+
+    kind: str  # "off" | "interval" | "calendar" | "daily"
+    on_calendar: str | None = None  # calendar / daily mode
     on_boot_sec: str | None = None  # interval mode
     on_unit_active_sec: str | None = None  # interval mode
+
+
+def _hours_to_calendar(n: int) -> str | None:
+    """Return an OnCalendar expression for every-N-hours if 24 % n == 0, else None.
+
+    Examples::
+
+        _hours_to_calendar(12) → "*-*-* 00,12:00:00"
+        _hours_to_calendar(6)  → "*-*-* 00,06,12,18:00:00"
+        _hours_to_calendar(24) → "*-*-* 00:00:00"
+        _hours_to_calendar(5)  → None
+    """
+    if n <= 0 or 24 % n != 0:
+        return None
+    hours = [f"{h:02d}" for h in range(0, 24, n)]
+    return f"*-*-* {','.join(hours)}:00:00"
+
+
+def _minutes_to_calendar(n: int) -> str | None:
+    """Return an OnCalendar expression for every-N-minutes if 60 % n == 0, else None.
+
+    Examples::
+
+        _minutes_to_calendar(15) → "*:00,15,30,45:00"
+        _minutes_to_calendar(30) → "*:00,30:00"
+        _minutes_to_calendar(13) → None
+    """
+    if n <= 0 or 60 % n != 0:
+        return None
+    minutes = [f"{m:02d}" for m in range(0, 60, n)]
+    return f"*:{','.join(minutes)}:00"
 
 
 def parse_schedule(schedule: str) -> TimerSpec | None:
@@ -53,9 +106,15 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     Accepted formats:
 
     - ``""`` / ``"off"`` / ``"disabled"`` / ``"none"`` → disabled timer.
-    - ``"weekly"`` → interval of 168h (604800 s); maps to ``OnUnitActiveSec=168h``.
+    - ``"weekly"`` → ``OnCalendar=Mon *-*-* 00:00:00`` + ``Persistent=true``.
     - ``"daily"`` → OnCalendar daily at 03:00 (same as ``"03:00"``).
-    - ``"every Nh"`` / ``"every Nm"`` → interval timer.
+    - ``"every Nh"`` where ``24 % N == 0`` → calendar timer at each N-hour mark
+      with ``Persistent=true`` (catches up missed ticks on boot).
+    - ``"every Nh"`` where ``24 % N != 0`` → monotonic interval timer; missed
+      ticks during outages are silently dropped.
+    - ``"every Nm"`` where ``60 % N == 0`` → calendar timer at each N-minute mark
+      with ``Persistent=true``.
+    - ``"every Nm"`` where ``60 % N != 0`` → monotonic interval timer.
     - ``"HH:MM"`` → daily OnCalendar timer at the given time.
 
     Returns TimerSpec(kind="off") for an explicit off setting.
@@ -66,17 +125,29 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
         return TimerSpec(kind="off")
 
     if s == "weekly":
-        return TimerSpec(kind="interval", on_boot_sec="168h", on_unit_active_sec="168h")
+        return TimerSpec(kind="calendar", on_calendar="Mon *-*-* 00:00:00")
 
     if s == "daily":
         return TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
 
-    m = re.fullmatch(r"every\s+(\d+)\s*([hm])", s)
+    # Accept both the canonical "every Nh/Nm" and the bare "Nh"/"Nm" shorthand.
+    # The shorthand lets refresh_cadence be written compactly in yaml; the
+    # canonical form is what the derived-period property emits for systemd.
+    m = re.fullmatch(r"(?:every\s+)?(\d+)\s*([hm])", s)
     if m:
         n, unit = int(m.group(1)), m.group(2)
         if n <= 0:
             return None
-        sec = f"{n}h" if unit == "h" else f"{n}min"
+        if unit == "h":
+            cal = _hours_to_calendar(n)
+            if cal is not None:
+                return TimerSpec(kind="calendar", on_calendar=cal)
+            sec = f"{n}h"
+        else:
+            cal = _minutes_to_calendar(n)
+            if cal is not None:
+                return TimerSpec(kind="calendar", on_calendar=cal)
+            sec = f"{n}min"
         return TimerSpec(kind="interval", on_boot_sec=sec, on_unit_active_sec=sec)
 
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
@@ -100,6 +171,14 @@ ExecStart=/usr/bin/curl -sS -X POST --max-time 10 {endpoint}
 
 
 def render_timer_unit(spec: TimerSpec) -> str:
+    """Render the systemd .timer unit text for the given spec.
+
+    Both ``"calendar"`` and ``"daily"`` kinds emit ``OnCalendar`` +
+    ``Persistent=true`` so that missed ticks fire on the next boot.
+    ``"interval"`` kind uses monotonic ``OnBootSec`` / ``OnUnitActiveSec``
+    and does NOT include ``Persistent=true`` (systemd ignores it for
+    monotonic timers; missed ticks during outages are silently dropped).
+    """
     lines = [
         "[Unit]",
         "Description=ParaMem consolidation scheduler",
@@ -110,7 +189,7 @@ def render_timer_unit(spec: TimerSpec) -> str:
     if spec.kind == "interval":
         lines.append(f"OnBootSec={spec.on_boot_sec}")
         lines.append(f"OnUnitActiveSec={spec.on_unit_active_sec}")
-    elif spec.kind == "daily":
+    elif spec.kind in ("calendar", "daily"):
         lines.append(f"OnCalendar={spec.on_calendar}")
         lines.append("Persistent=true")
     lines.extend(["", "[Install]", "WantedBy=timers.target", ""])
@@ -149,8 +228,10 @@ def reconcile(schedule: str, endpoint: str = DEFAULT_ENDPOINT) -> str:
     spec = parse_schedule(schedule)
     if spec is None:
         logger.error(
-            "Invalid consolidation.schedule: %r — expected '', 'off', 'HH:MM', "
-            "'every Nh', or 'every Nm'. Timer will be disabled.",
+            "Invalid derived consolidation period: %r — expected '', 'off', "
+            "'HH:MM', 'every Nh', or 'every Nm'. This is derived from "
+            "consolidation.refresh_cadence × max_interim_count; check those in "
+            "server.yaml. Timer will be disabled.",
             schedule,
         )
         spec = TimerSpec(kind="off")
@@ -187,9 +268,11 @@ def reconcile(schedule: str, endpoint: str = DEFAULT_ENDPOINT) -> str:
         _run_systemctl("restart", f"{TIMER_NAME}.timer")
 
     if spec.kind == "interval":
-        detail = f"every {spec.on_unit_active_sec}"
+        detail = f"every {spec.on_unit_active_sec} (no catch-up)"
+    elif spec.kind == "calendar":
+        detail = f"calendar {spec.on_calendar} (with catch-up)"
     else:
-        detail = f"daily at {spec.on_calendar}"
+        detail = f"daily at {spec.on_calendar} (with catch-up)"
     state = "updated" if (svc_changed or tmr_changed) else "already current"
     return f"consolidation timer: {state}, {detail}"
 

@@ -7,12 +7,16 @@ The model stays loaded — switching between training and inference is
 just flag flips (model.eval/train, gradient checkpointing), no reload.
 """
 
+import hashlib
+import json
 import logging
+import os
 import queue
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +34,102 @@ logger = logging.getLogger(__name__)
 
 # Sentinel placed on _job_queue to signal the persistent callable worker to exit.
 _WORKER_STOP = object()
+
+# Name of the atomic resume state file written inside output_dir/in_training/.
+_RESUME_STATE_FILE = "resume_state.json"
+
+
+def _fingerprint_keyed_pairs(keyed_pairs: list[dict]) -> str:
+    """Return a SHA-256 hex digest of the canonical serialisation of keyed_pairs.
+
+    Order-sensitive: two lists with the same items in different orders produce
+    different fingerprints.  This is intentional — the QA generator output
+    order encodes the key insertion sequence, so a genuinely identical job
+    produces identical pairs in the same order.
+
+    Args:
+        keyed_pairs: Training pairs as returned by the QA generator.
+
+    Returns:
+        Lowercase hex SHA-256 string.
+    """
+    serialised = json.dumps(keyed_pairs, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialised.encode()).hexdigest()
+
+
+def _fingerprint_training_config(
+    training_config: TrainingConfig, adapter_config: AdapterConfig
+) -> str:
+    """Return a SHA-256 hex digest of the training-relevant config fields.
+
+    Covers the fields that, if changed, would invalidate a checkpoint from a
+    prior training run (epoch count, batch size, LR, LoRA rank/alpha).
+
+    Args:
+        training_config: Server training config.
+        adapter_config: Per-adapter LoRA config.
+
+    Returns:
+        Lowercase hex SHA-256 string.
+    """
+    target_modules = adapter_config.target_modules
+    relevant = {
+        "num_epochs": training_config.num_epochs,
+        "batch_size": training_config.batch_size,
+        "gradient_accumulation_steps": training_config.gradient_accumulation_steps,
+        "lr_scheduler_type": training_config.lr_scheduler_type,
+        "weight_decay": training_config.weight_decay,
+        "warmup_steps": training_config.warmup_steps,
+        "warmup_ratio": training_config.warmup_ratio,
+        "rank": adapter_config.rank,
+        "alpha": adapter_config.alpha,
+        "learning_rate": adapter_config.learning_rate,
+        "target_modules": sorted(target_modules) if target_modules is not None else [],
+    }
+    serialised = json.dumps(relevant, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(serialised.encode()).hexdigest()
+
+
+def _write_resume_state_atomic(state_path: Path, state: dict) -> None:
+    """Write resume state to disk atomically using a temp-file + rename.
+
+    Args:
+        state_path: Absolute path to the target JSON file.
+        state: Dict to serialise.
+
+    Raises:
+        OSError: If the write or rename fails.
+    """
+    tmp_path = state_path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        tmp_path.replace(state_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _read_resume_state(state_path: Path) -> dict | None:
+    """Load resume state from disk.
+
+    Returns None if the file does not exist or cannot be parsed.
+
+    Args:
+        state_path: Path to the resume_state.json file.
+
+    Returns:
+        Parsed dict, or None.
+    """
+    if not state_path.exists():
+        return None
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.warning("Could not parse resume state at %s — discarding", state_path)
+        return None
 
 
 def _gpu_temp() -> int | None:
@@ -115,11 +215,14 @@ class _PauseForInferenceCallback(TrainerCallback):
         self._trainer._thermal_throttle(state.global_step)
 
     def on_epoch_end(self, args, state, control, **kwargs):
-        self._trainer._last_completed_epoch = int(state.epoch)
+        epoch = int(state.epoch)
+        self._trainer._last_completed_epoch = epoch
+        # Persist resume state so a crash during a later epoch can restart here.
+        self._trainer._write_resume_state(epoch, args.output_dir)
         # Also check thermal throttle at epoch boundaries
         self._trainer._thermal_throttle(state.global_step)
         if self._trainer._shutdown_requested:
-            logger.info("Shutdown requested — stopping after epoch %d", int(state.epoch))
+            logger.info("Shutdown requested — stopping after epoch %d", epoch)
             control.should_training_stop = True
 
 
@@ -176,6 +279,14 @@ class BackgroundTrainer:
         self._current_adapter = ""
         self._current_job: TrainingJob | None = None
         self._on_error: Callable[[], None] | None = None
+        # Fingerprints for the active training job, set at the start of
+        # _train_adapter and read by the epoch callback to write resume state.
+        self._active_keyed_pairs_fingerprint: str = ""
+        self._active_config_fingerprint: str = ""
+        self._active_total_epochs: int = 0
+        self._active_adapter_name: str = ""
+        self._active_inference_fallback: str = ""
+        self._active_started_at: str = ""
 
         # Callable-job queue for submit().  Holds (callable, fallback_adapter)
         # pairs or the _WORKER_STOP sentinel.  Drained by _run_callable_queue
@@ -498,6 +609,69 @@ class BackgroundTrainer:
                 timeout,
             )
 
+    def _resume_state_path(self) -> Path:
+        """Return the path to the resume_state.json file for the current output_dir.
+
+        Returns:
+            Absolute Path to output_dir/in_training/resume_state.json.
+        """
+        return self.output_dir / "in_training" / _RESUME_STATE_FILE
+
+    def _write_resume_state(self, last_completed_epoch: int, checkpoint_output_dir: str) -> None:
+        """Write the resume state file atomically after an epoch completes.
+
+        Finds the highest-numbered checkpoint directory inside
+        checkpoint_output_dir and records its path so the next restart can
+        pass it directly to trainer.train(resume_from_checkpoint=...).
+
+        Silently logs and returns on any error — a missing state file means
+        a fresh restart, which is always safe.
+
+        Args:
+            last_completed_epoch: The epoch number just completed (1-based).
+            checkpoint_output_dir: The HF Trainer output_dir containing
+                checkpoint-<step> subdirectories.
+        """
+        checkpoint_dir = Path(checkpoint_output_dir)
+        checkpoints = sorted(
+            checkpoint_dir.glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[1]) if p.name.split("-")[1].isdigit() else -1,
+        )
+        latest_checkpoint = str(checkpoints[-1]) if checkpoints else ""
+
+        state = {
+            "adapter_name": self._active_adapter_name,
+            "inference_fallback_adapter": self._active_inference_fallback,
+            "training_config_fingerprint": self._active_config_fingerprint,
+            "keyed_pairs_fingerprint": self._active_keyed_pairs_fingerprint,
+            "total_epochs": self._active_total_epochs,
+            "last_completed_epoch": last_completed_epoch,
+            "checkpoint_path": latest_checkpoint,
+            "started_at": self._active_started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            _write_resume_state_atomic(self._resume_state_path(), state)
+            logger.debug(
+                "Resume state written: adapter=%s epoch=%d/%d checkpoint=%s",
+                self._active_adapter_name,
+                last_completed_epoch,
+                self._active_total_epochs,
+                latest_checkpoint,
+            )
+        except Exception:
+            logger.exception("Failed to write resume state — crash recovery disabled for this run")
+
+    def _clear_resume_state(self) -> None:
+        """Remove the resume state file after a successful training run.
+
+        Safe to call even if the file does not exist.
+        """
+        try:
+            self._resume_state_path().unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Failed to remove resume state file")
+
     def _thermal_throttle(self, global_step: int):
         """Pause training if GPU temperature exceeds the configured limit.
 
@@ -604,28 +778,92 @@ class BackgroundTrainer:
     def _train_adapter(self, job: TrainingJob):
         """Train a single adapter via the in_training staging slot.
 
-        Flow:
-            1. Copy production adapter weights into in_training.
-            2. Activate in_training (training modifies staging only).
-            3. Train N epochs.
-            4. Copy in_training back to production slot on success.
-            5. Atomic save of production adapter to disk.
+        Flow (fresh start):
+            1. Compute fingerprints and check for a valid resume state.
+            2. Copy production adapter weights into in_training as the
+               starting point (skipped when resuming from a checkpoint).
+            3. Activate in_training (training modifies staging only).
+            4. Train N epochs, writing resume_state.json after each epoch.
+            5. On success: copy in_training → production, atomic save,
+               then remove resume_state.json and bg_checkpoint/.
+            6. On exception: leave resume state and checkpoint in place
+               so the next restart can pick up from the last epoch.
 
         If training fails or the server crashes, the production adapter on
         disk is untouched — it still holds the last committed cycle's weights.
         """
+        import shutil
+
         from paramem.models.loader import copy_adapter_weights, switch_adapter
 
         self._current_adapter = job.adapter_name
         self._current_job = job
         self._last_completed_epoch = 0
 
-        # Stage: copy production weights into in_training as the starting point
         if "in_training" not in self.model.peft_config:
             raise RuntimeError(
                 "in_training staging adapter not found — was ConsolidationLoop initialized?"
             )
-        copy_adapter_weights(self.model, src=job.adapter_name, dst="in_training")
+
+        # Compute fingerprints for this job and store them on self so the
+        # epoch callback can write the state file without re-computing.
+        kp_fingerprint = _fingerprint_keyed_pairs(job.keyed_pairs)
+        cfg_fingerprint = _fingerprint_training_config(self.training_config, job.adapter_config)
+        self._active_keyed_pairs_fingerprint = kp_fingerprint
+        self._active_config_fingerprint = cfg_fingerprint
+        self._active_total_epochs = self.training_config.num_epochs
+        self._active_adapter_name = job.adapter_name
+        self._active_inference_fallback = job.inference_fallback_adapter
+        self._active_started_at = datetime.now(timezone.utc).isoformat()
+
+        # Check for a valid resume state from a previous interrupted run.
+        resume_checkpoint: str | None = None
+        resume_state = _read_resume_state(self._resume_state_path())
+        if resume_state is not None:
+            state_kp_fp = resume_state.get("keyed_pairs_fingerprint", "")
+            state_cfg_fp = resume_state.get("training_config_fingerprint", "")
+            state_adapter = resume_state.get("adapter_name", "")
+            state_checkpoint = resume_state.get("checkpoint_path", "")
+
+            fingerprints_match = (
+                state_kp_fp == kp_fingerprint
+                and state_cfg_fp == cfg_fingerprint
+                and state_adapter == job.adapter_name
+            )
+            checkpoint_valid = bool(state_checkpoint) and Path(state_checkpoint).is_dir()
+
+            if fingerprints_match and checkpoint_valid:
+                resume_checkpoint = state_checkpoint
+                epoch_resumed = resume_state.get("last_completed_epoch", 0)
+                self._last_completed_epoch = epoch_resumed
+                logger.info(
+                    "Resuming %s from epoch %d/%d (checkpoint=%s)",
+                    job.adapter_name,
+                    epoch_resumed,
+                    self.training_config.num_epochs,
+                    state_checkpoint,
+                )
+            else:
+                # Stale state from a different job — wipe it and any old checkpoints.
+                checkpoint_dir_stale = self.output_dir / "in_training" / "bg_checkpoint"
+                if checkpoint_dir_stale.exists():
+                    shutil.rmtree(checkpoint_dir_stale)
+                self._clear_resume_state()
+                if not fingerprints_match:
+                    logger.info(
+                        "Resume state fingerprint mismatch for %s — starting fresh",
+                        job.adapter_name,
+                    )
+                else:
+                    logger.info(
+                        "Resume state checkpoint missing for %s — starting fresh",
+                        job.adapter_name,
+                    )
+
+        if resume_checkpoint is None:
+            # Fresh start: stage production weights into in_training.
+            copy_adapter_weights(self.model, src=job.adapter_name, dst="in_training")
+
         switch_adapter(self.model, "in_training")
         self.model.train()
 
@@ -680,20 +918,19 @@ class BackgroundTrainer:
         )
 
         logger.info(
-            "Training %s: %d examples, %d epochs",
+            "Training %s: %d examples, %d epochs%s",
             job.adapter_name,
             len(examples),
             self.training_config.num_epochs,
+            f" (resume from epoch {self._last_completed_epoch})" if resume_checkpoint else "",
         )
 
         try:
-            trainer.train()
+            trainer.train(resume_from_checkpoint=resume_checkpoint)
         except Exception:
-            # On training failure: restore sane model state before the
-            # exception propagates to _run_jobs. Production adapter on disk
-            # is untouched (commit is skipped), but the in-memory active
-            # adapter must be switched back to production so any lingering
-            # inference path doesn't operate on stale in_training state.
+            # On training failure: leave resume state and checkpoint intact
+            # so the next restart picks up from the last completed epoch.
+            # Restore sane model state so inference isn't broken.
             logger.exception("Training failed for adapter %s — restoring state", job.adapter_name)
             try:
                 switch_adapter(self.model, job.adapter_name)
@@ -704,7 +941,16 @@ class BackgroundTrainer:
                 logger.exception("Failed to restore model state after training error")
             raise
 
+        # Commit to production first, then clean up resume artefacts.
         self._commit_staging_to_production(job.adapter_name)
+
+        # Remove resume state and stale checkpoints only after the production
+        # save succeeds.  If _commit_staging_to_production raises, the state
+        # and checkpoint survive for the next restart.
+        self._clear_resume_state()
+        checkpoint_dir_done = self.output_dir / "in_training" / "bg_checkpoint"
+        if checkpoint_dir_done.exists():
+            shutil.rmtree(checkpoint_dir_done)
 
         self._last_completed_epoch = self.training_config.num_epochs
         logger.info("Training complete and committed: %s", job.adapter_name)

@@ -74,34 +74,42 @@ adapters:
 # ============================================================================
 # ParaMem has two memory tiers:
 #   * Main adapters (episodic / semantic / procedural) — long-term
-#     consolidated knowledge, refreshed on the full consolidation schedule.
+#     consolidated knowledge, refreshed on the full consolidation cycle.
 #   * Interim adapters (episodic_interim_YYYYMMDDTHHMM) — short-lived
-#     rolling buckets that absorb new facts between full consolidations so
-#     recall is possible without waiting a full cycle.
+#     per-window buckets that absorb new facts between full consolidations
+#     so recall is possible without waiting a full cycle.
 #
-# MECHANISM
-# - A timer fires the interim consolidation at sub-interval boundaries
-#   (activity-gated — see below). Extraction → create/reuse current interim
-#   → train → register. No per-turn hook.
-# - `schedule` fires the FULL consolidation cycle. A cycle collapses ALL
-#   active interim adapters into the mains via full replay, then deletes
-#   them. Full replay may distribute over days via BackgroundTrainer's
-#   pause/resume — it yields to inference and resumes when idle.
-# - `max_interim_count` divides the consolidation period into sub-intervals:
-#       interval = period(schedule) / max_interim_count
-#   Examples:
-#     schedule "weekly"   + max_interim_count 14 → one interim every 12h
-#                                                  (DEFAULT — 2×/day)
-#     schedule "weekly"   + max_interim_count 28 → one interim every 6h
-#     schedule "every 2h" + max_interim_count 7  → one interim every ~17 min
-#     schedule "every 2h" + max_interim_count 1  → one interim per cycle
-#                                                  (single pending bucket)
-# - max_interim_count=0 disables interims entirely: new facts queue in RAM
-#   (encrypted snapshot on graceful exit + periodic flush) until the next
-#   full consolidation. Recall delay = up to one full schedule period.
+# THE ONLY SCHEDULING KNOB — refresh_cadence
+# - `refresh_cadence` is how often a NEW interim adapter is minted (the
+#   interim tick interval). Grammar: "every Nh" / "every Nm" / "HH:MM"
+#   (daily) / "daily" / "" (manual only, no timer).
+# - The FULL consolidation period is DERIVED, not configured:
+#       full_cycle = refresh_cadence × max_interim_count
+#   Example (default): refresh_cadence="12h", max_interim_count=7
+#       → full consolidation every 84h (3.5 days), with at most 7
+#         concurrent interim adapters before the cycle fires.
+# - At each interim tick a new adapter episodic_interim_<stamp> is created
+#   (activity-gated) and trained. No rolling eviction — adapters accumulate
+#   until the full cycle, which collapses them into the mains via replay
+#   and deletes them. Cycle latency can distribute over time via
+#   BackgroundTrainer's pause/resume — it yields to inference and resumes
+#   when idle.
+#
+# INTERIM ADAPTER CAP — max_interim_count
+# - HARD CAP on concurrent interim adapters resident in VRAM.
+# - If extraction arrives after the cap is reached (full cycle late or
+#   skipped), the NEWEST interim adapter keeps absorbing new facts via a
+#   full 30-epoch retrain on (original indexed keys ∪ new QA). No rolling
+#   eviction of older adapters — that would silently discard temporal
+#   ordering. The adapter grows until the recall sanity check fails, at
+#   which point the snapshot is restored and that adapter is marked
+#   degenerated (no further learning until next full consolidation).
+# - Startup VRAM validator refuses to start if base + main adapters +
+#   max_interim_count + staging + KV cache exceeds the configured GPU
+#   budget.
 #
 # ACTIVITY GATING
-# - At each interim-timer tick, if no new session transcripts AND no queued
+# - At each interim tick, if no new session transcripts AND no queued
 #   pending triples since the last tick, the tick is a no-op — no new
 #   adapter is created, no training runs.
 # - After extraction, if every extracted triple is already in `seen_triples`
@@ -110,17 +118,17 @@ adapters:
 #   volume, not wall clock.
 #
 # RECALL LATENCY — INTENTIONAL
-# - With the default (weekly + 14 = 12h sub-interval), a fact spoken at 9 pm
-#   may not be recallable from parametric memory until the next 6 am tick.
-#   In-conversation context still carries the fact via the conversation
-#   buffer; cross-conversation recall within a 12h window falls back to the
+# - A fact spoken at 14:00 under refresh_cadence="12h" may not be recallable
+#   from parametric memory until the next tick boundary. In-conversation
+#   context still carries the fact via the conversation buffer;
+#   cross-conversation recall inside the refresh window falls back to the
 #   pending-queue or SOTA path.
 # - Rationale: if the user immediately consumes the answer, they rarely ask
-#   again within 12h. Facts that matter ("my daughter's play is tomorrow",
-#   "I prefer jazz at dinner") are either already in conversation context or
-#   benefit from consolidating over multiple exposures — a 12h delay is a
-#   feature, not a bug. Raise the frequency (e.g. `max_interim_count: 28`
-#   for 4×/day) if this trade-off doesn't fit your usage.
+#   again within the refresh window. Facts that matter ("my daughter's play
+#   is tomorrow", "I prefer jazz at dinner") are either already in
+#   conversation context or benefit from consolidating over multiple
+#   exposures. Shorten refresh_cadence only after confirming the startup
+#   validator still passes for your GPU budget.
 #
 # VRAM envelope is proven at startup from
 #   rank × target_modules × (main_count + max_interim_count + 1 staging)
@@ -128,7 +136,8 @@ adapters:
 # Server refuses to start if the configured topology exceeds the GPU.
 # ============================================================================
 consolidation:
-  schedule: "weekly"           # "weekly" | "HH:MM" (daily) | "every Nh"/"every Nm" | "" (manual only)
+  refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
+                               # 12h + max_interim_count=7 → full cycle every 84h (derived).
   mode: simulate               # "train" = full pipeline, "simulate" = extract only (saves graphs + QA to debug dir)
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
@@ -162,11 +171,21 @@ consolidation:
   extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
   extraction_ner_check: false                   # optional spaCy PII cross-check
   extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
-  # Max concurrent interim adapters in VRAM (rolling episodic_interim_YYYYMMDDTHHMM).
-  # Default 14 with schedule="weekly" → 2 interim ticks per day (every 12h).
-  # Raise for finer-grained recall (e.g. 28 for 4×/day, 168 for hourly).
-  # Validated at startup — server refuses to start if this exceeds budget.
-  max_interim_count: 14
+  # Max concurrent interim adapters in VRAM. Together with refresh_cadence
+  # this determines the derived full-consolidation period:
+  #     full_cycle = refresh_cadence × max_interim_count
+  # Default 7 + "12h" refresh → 84h full cycle. Validated at startup —
+  # server refuses to start if base + mains + this + staging + KV exceeds
+  # the configured GPU budget. Raise only after re-running the validator.
+  max_interim_count: 7
+  # Post-session (inline) training: extract and train facts immediately after
+  # each assistant response.  Default is false — facts accumulate via the
+  # scheduled consolidation cycle instead, which is lower-overhead and avoids
+  # continuous GPU use during conversations.  Set to true only if you need
+  # sub-cycle recall latency and your GPU budget allows continuous training.
+  # Missed triggers (server crash between session end and training start) are
+  # recovered automatically at the next startup via post_session_queue.json.
+  post_session_train_enabled: false
   # Thermal throttle: keeps the machine silent during background training.
   # Training pauses when GPU temp exceeds the limit and resumes when it cools.
   # Set to 0 to disable. Adjust to match your fan ramp-up threshold.

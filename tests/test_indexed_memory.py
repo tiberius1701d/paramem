@@ -472,8 +472,10 @@ class TestProbeKeysGroupedByAdapter:
             "episodic_interim_20260417T0000",
         ]
 
-    def test_skips_unloaded_adapter(self, monkeypatch, capsys):
+    def test_skips_unloaded_adapter(self, monkeypatch):
         """Unloaded adapter: warning emitted, no switch, keys map to None."""
+        import logging
+
         switch_calls = []
 
         def fake_switch(model, name):
@@ -491,26 +493,36 @@ class TestProbeKeysGroupedByAdapter:
             fake_switch,
         )
 
-        # Ensure WARNING messages reach stderr by setting root handler level.
-        import logging
+        # Attach a dedicated handler to capture the warning directly —
+        # sidesteps differences between pytest's caplog, capsys, and
+        # logging.lastResort behavior across environments.
+        import io
 
-        root = logging.getLogger()
-        root.setLevel(logging.WARNING)
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.WARNING)
+        target = logging.getLogger("paramem.training.indexed_memory")
+        prev_level = target.level
+        target.addHandler(handler)
+        target.setLevel(logging.WARNING)
 
-        # Only "episodic" is loaded; interim adapter is absent.
-        model = _make_stub_model(["episodic"])
-        tokenizer = _make_stub_tokenizer()
+        try:
+            # Only "episodic" is loaded; interim adapter is absent.
+            model = _make_stub_model(["episodic"])
+            tokenizer = _make_stub_tokenizer()
 
-        keys_by_adapter = {
-            "episodic": ["e1"],
-            "episodic_interim_20260417T0000": ["s1", "s2"],
-        }
+            keys_by_adapter = {
+                "episodic": ["e1"],
+                "episodic_interim_20260417T0000": ["s1", "s2"],
+            }
 
-        results = probe_keys_grouped_by_adapter(model, tokenizer, keys_by_adapter)
+            results = probe_keys_grouped_by_adapter(model, tokenizer, keys_by_adapter)
+        finally:
+            target.removeHandler(handler)
+            target.setLevel(prev_level)
 
-        captured = capsys.readouterr()
-        # Warning logged for the missing adapter (appears on stderr).
-        assert "episodic_interim_20260417T0000" in captured.err
+        # Warning logged for the missing adapter.
+        assert "episodic_interim_20260417T0000" in stream.getvalue()
 
         # No switch for the missing adapter; one switch for episodic.
         assert switch_calls == ["episodic"]

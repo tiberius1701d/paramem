@@ -211,8 +211,14 @@ class VoiceConfig:
 
 @dataclass
 class ConsolidationScheduleConfig:
-    schedule: str = (
-        "every 2h"  # "HH:MM" (daily) or "every Nh"/"every Nm" (interval) or "" (manual only)
+    # The interim refresh cadence — the only scheduling knob the operator sets.
+    # Every refresh_cadence a new episodic_interim_<stamp> adapter is minted
+    # (subject to the activity gate). Full consolidation fires every
+    # refresh_cadence × max_interim_count (derived; see
+    # consolidation_period_seconds / consolidation_period_string properties).
+    # Grammar: "every Nh" / "every Nm" / "HH:MM" (daily) / "daily" / "" (manual).
+    refresh_cadence: str = (
+        "12h"  # default: one new interim every 12h → 84h full consolidation at count=7
     )
     mode: str = "train"  # "train" = full pipeline, "simulate" = extract only
     promotion_threshold: int = 3
@@ -245,6 +251,15 @@ class ConsolidationScheduleConfig:
     # episodic_interim_YYYYMMDDTHHMM adapters resident in VRAM at any one time.
     # Must be proven to fit by the startup VRAM validator before the server starts.
     max_interim_count: int = 7
+    # Enable post-session (inline) training after each conversation turn.
+    # When True, a background job extracts facts from the session transcript and
+    # trains them onto the current interim adapter immediately after the
+    # assistant response is returned.  When False (default) post-session training
+    # is suppressed; facts accumulate only via the scheduled full-consolidation
+    # cycle.  Setting this True does NOT require changing ``mode`` — it is an
+    # independent gate so operators can enable inline training while keeping the
+    # full cycle in any mode.
+    post_session_train_enabled: bool = False
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -270,6 +285,37 @@ class ConsolidationScheduleConfig:
                 f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
                 f"local judging."
             )
+
+    @property
+    def consolidation_period_seconds(self) -> int | None:
+        """Full consolidation period in seconds — derived, not configured.
+
+        Returns ``refresh_cadence × max_interim_count`` seconds, or ``None``
+        when ``refresh_cadence`` is disabled (``""``/``"off"``/etc.). Used by
+        the systemd timer to schedule the full-consolidation cycle and by
+        ``pstatus`` to display the effective cadence.
+        """
+        from paramem.server.interim_adapter import compute_schedule_period_seconds
+
+        refresh_seconds = compute_schedule_period_seconds(self.refresh_cadence)
+        if refresh_seconds is None:
+            return None
+        return refresh_seconds * self.max_interim_count
+
+    @property
+    def consolidation_period_string(self) -> str:
+        """Human-readable form of :attr:`consolidation_period_seconds`.
+
+        Produces an ``"every Nh"`` / ``"every Nm"`` string compatible with
+        :func:`paramem.server.systemd_timer.parse_schedule`. Returns ``""``
+        (manual-only) when ``refresh_cadence`` is disabled.
+        """
+        total = self.consolidation_period_seconds
+        if total is None:
+            return ""
+        if total % 3600 == 0:
+            return f"every {total // 3600}h"
+        return f"every {total // 60}m"
 
 
 @dataclass
@@ -568,8 +614,28 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             else ServerAdapterConfig(rank=8, alpha=16, learning_rate=5e-5),
         )
 
-    # Consolidation
+    # Consolidation — refresh_cadence is the single user-facing scheduling knob.
+    # Legacy configs carry `schedule` (the old full-period setting); translate
+    # with a WARNING so the operator can update their yaml.
     consolidation_raw = raw.get("consolidation", {})
+    legacy_schedule = consolidation_raw.pop("schedule", None)
+    if legacy_schedule is not None:
+        if "refresh_cadence" in consolidation_raw:
+            logger.warning(
+                "consolidation.schedule=%r and consolidation.refresh_cadence=%r both "
+                "present in yaml — using refresh_cadence, ignoring legacy schedule. "
+                "Remove `schedule` from your config.",
+                legacy_schedule,
+                consolidation_raw["refresh_cadence"],
+            )
+        else:
+            consolidation_raw["refresh_cadence"] = legacy_schedule
+            logger.warning(
+                "consolidation.schedule=%r is deprecated — rename to "
+                "consolidation.refresh_cadence. Effective full consolidation period "
+                "is now refresh_cadence × max_interim_count.",
+                legacy_schedule,
+            )
     if consolidation_raw:
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
 

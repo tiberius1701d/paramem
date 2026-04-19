@@ -7,9 +7,17 @@ reconstruction fidelity across consolidation cycles.
 import json
 import logging
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Adapter-health status vocabulary. ``"healthy"`` is the default after a
+# successful training pass; ``"degenerated"`` is set when the recall
+# sanity check trips and the adapter must stop absorbing new keys until
+# the next full consolidation cycle.
+ADAPTER_HEALTH_HEALTHY = "healthy"
+ADAPTER_HEALTH_DEGENERATED = "degenerated"
 
 
 class KeyRegistry:
@@ -25,6 +33,14 @@ class KeyRegistry:
     interim adapter).  Legacy registries loaded from disk that lack this
     field default every key to ``"main"`` so existing deployments are
     unaffected.
+
+    The registry also carries an ``adapter_health`` map keyed by
+    ``adapter_id`` that records the learning-capacity status of each
+    adapter.  This is intentionally colocated with the key data so it
+    benefits from the same atomic-persist discipline (registry is the
+    "commit" signal — see consolidation.py's I5 ordering).  No personal
+    data leaks into health metadata, so storing it in the registry does
+    not widen the privacy surface.
     """
 
     def __init__(self):
@@ -33,6 +49,8 @@ class KeyRegistry:
         self._fidelity_history: dict[str, list[float]] = defaultdict(list)
         # key -> adapter_id string ("main" by default)
         self._adapter_id: dict[str, str] = {}
+        # adapter_id -> {"status", "reason", "updated_at", "keys_at_mark"}
+        self._adapter_health: dict[str, dict] = {}
 
     def add(self, key: str, adapter_id: str = "main") -> None:
         """Register a new active key.
@@ -131,11 +149,96 @@ class KeyRegistry:
         """
         return [k for k in self._active_keys if self._adapter_id.get(k, "main") == adapter_id]
 
+    # ------------------------------------------------------------------
+    # Adapter health
+    # ------------------------------------------------------------------
+
+    def set_adapter_health(
+        self,
+        adapter_id: str,
+        status: str,
+        *,
+        reason: str = "",
+        keys_at_mark: int | None = None,
+    ) -> None:
+        """Record the current learning-capacity status of an adapter.
+
+        Args:
+            adapter_id: Adapter name (``"episodic_interim_<stamp>"`` or a
+                main-tier name).
+            status: One of :data:`ADAPTER_HEALTH_HEALTHY` or
+                :data:`ADAPTER_HEALTH_DEGENERATED`.
+            reason: Human-readable justification (e.g. ``"recall 0.78 <
+                0.95 after retrain on 42 keys"``).  Surfaced in pstatus.
+            keys_at_mark: Number of keys the adapter was holding when the
+                status was set — makes the capacity ceiling observable
+                across runs.  Defaults to current key count for the adapter.
+        """
+        if keys_at_mark is None:
+            keys_at_mark = sum(1 for v in self._adapter_id.values() if v == adapter_id)
+        self._adapter_health[adapter_id] = {
+            "status": status,
+            "reason": reason,
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "keys_at_mark": int(keys_at_mark),
+        }
+
+    def get_adapter_health(self, adapter_id: str) -> dict | None:
+        """Return the health record for *adapter_id* or ``None`` if untracked.
+
+        An untracked adapter is treated as healthy by :meth:`is_adapter_healthy`.
+        """
+        record = self._adapter_health.get(adapter_id)
+        return dict(record) if record is not None else None
+
+    def list_adapter_health(self) -> dict[str, dict]:
+        """Return a copy of the full adapter_id → health-record map.
+
+        Used by ``/status`` / pstatus to surface every known health entry
+        (healthy + degenerated) without exposing the mutable internal
+        dict.
+        """
+        return {k: dict(v) for k, v in self._adapter_health.items()}
+
+    def is_adapter_healthy(self, adapter_id: str) -> bool:
+        """Return True unless *adapter_id* is explicitly marked degenerated.
+
+        Untracked adapters (no record) are considered healthy — a newly
+        minted interim adapter starts life absent from the map and
+        accrues a record only once someone calls :meth:`set_adapter_health`.
+        """
+        record = self._adapter_health.get(adapter_id)
+        if record is None:
+            return True
+        return record.get("status") != ADAPTER_HEALTH_DEGENERATED
+
+    def clear_interim_adapter_health(self) -> int:
+        """Drop every health entry whose ``adapter_id`` is an interim adapter.
+
+        Called at the end of a full consolidation cycle: every
+        ``*_interim_*`` adapter has just been collapsed into its main
+        tier, so any lingering health records would describe adapters
+        that no longer exist.  Main-tier records are preserved — they
+        still matter across cycles.
+
+        Returns:
+            Number of entries removed.
+        """
+        interim_keys = [k for k in self._adapter_health if "_interim_" in k]
+        for k in interim_keys:
+            del self._adapter_health[k]
+        return len(interim_keys)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
     def save(self, path: str | Path) -> None:
         """Persist registry to JSON.
 
-        Writes ``active_keys``, ``fidelity_history``, and ``adapter_id``
-        so that all per-key metadata survives a process restart.
+        Writes ``active_keys``, ``fidelity_history``, ``adapter_id``, and
+        ``adapter_health`` so every piece of per-key / per-adapter
+        metadata survives a process restart.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +246,7 @@ class KeyRegistry:
             "active_keys": self._active_keys,
             "fidelity_history": dict(self._fidelity_history),
             "adapter_id": dict(self._adapter_id),
+            "adapter_health": {k: dict(v) for k, v in self._adapter_health.items()},
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -152,9 +256,10 @@ class KeyRegistry:
     def load(cls, path: str | Path) -> "KeyRegistry":
         """Load registry from JSON. Returns empty registry if file missing.
 
-        Legacy files that lack the ``adapter_id`` field are handled
-        gracefully: every key defaults to ``"main"`` so existing
-        deployments load unchanged.
+        Legacy files that lack ``adapter_id`` or ``adapter_health`` are
+        handled gracefully: every key defaults to ``"main"`` for ownership
+        and the health map loads empty (all adapters treated as healthy
+        by :meth:`is_adapter_healthy`).
         """
         path = Path(path)
         registry = cls()
@@ -172,10 +277,15 @@ class KeyRegistry:
         adapter_id_map = data.get("adapter_id", {})
         for key in registry._active_keys:
             registry._adapter_id[key] = adapter_id_map.get(key, "main")
+        # Health map is optional; absent in pre-health-schema registries.
+        for adapter_id, record in data.get("adapter_health", {}).items():
+            if isinstance(record, dict) and "status" in record:
+                registry._adapter_health[adapter_id] = dict(record)
 
         logger.info(
-            "Key registry loaded from %s: %d active keys",
+            "Key registry loaded from %s: %d active keys, %d health entries",
             path,
             len(registry._active_keys),
+            len(registry._adapter_health),
         )
         return registry

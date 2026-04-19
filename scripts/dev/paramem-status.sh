@@ -74,38 +74,89 @@ def fmt_result(r):
         return f"no facts from {r.get('sessions', 0)} sessions"
     return status
 
+def short_model_id(mid):
+    # Strip HF org prefix so "mistralai/Mistral-7B-Instruct-v0.3" renders as
+    # "Mistral-7B-Instruct-v0.3" — the org is noise for a status line.
+    if not mid:
+        return ""
+    return mid.rsplit("/", 1)[-1]
+
 fields = {
     "mode": d.get("mode", "?"),
     "cloud_only_reason": d.get("cloud_only_reason") or "none",
     "model": d.get("model", "?"),
+    "model_id_short": short_model_id(d.get("model_id")),
+    "model_device": d.get("model_device") or "-",
+    "episodic_rank": d.get("episodic_rank") if d.get("episodic_rank") is not None else "-",
     "adapter_loaded": d.get("adapter_loaded", False),
+    # Render adapter inventory as a comma-separated "kind(count)" list so
+    # bash can echo it straight to the terminal without further parsing.
+    "adapter_config": ", ".join(
+        f"{k}({v})" for k, v in (d.get("adapter_config") or {}).items() if v
+    ) or "-",
+    "active_adapter": d.get("active_adapter") or "-",
     "keys_count": d.get("keys_count", 0),
     "pending_sessions": d.get("pending_sessions", 0),
     "consolidating": d.get("consolidating", False),
     "last_consolidation": d.get("last_consolidation") or "never",
     "last_result": fmt_result(d.get("last_consolidation_result")),
-    "schedule": d.get("schedule", "") or "-",
+    "refresh_cadence": d.get("refresh_cadence", "") or "-",
+    "consolidation_period": d.get("consolidation_period", "") or "-",
+    "max_interim_count": d.get("max_interim_count", 0),
     "mode_config": d.get("mode_config", "") or "-",
     "next_run": fmt_duration(d.get("next_run_seconds")),
+    "next_interim": fmt_duration(d.get("next_interim_seconds")),
     "scheduler_started": d.get("scheduler_started", False),
     "orphaned": d.get("orphaned_pending", 0),
     "oldest_age": fmt_duration(d.get("oldest_pending_seconds")),
     "speaker_profiles": d.get("speaker_profiles", 0),
     "pending_enrollments": d.get("pending_enrollments", 0),
+    "speaker_embedding_backend": d.get("speaker_embedding_backend") or "-",
+    "speaker_embedding_model": d.get("speaker_embedding_model") or "-",
+    "speaker_embedding_device": d.get("speaker_embedding_device") or "-",
     "stt_loaded": d.get("stt_loaded", False),
+    "stt_engine": d.get("stt_engine") or "-",
     "stt_model": d.get("stt_model") or "-",
+    "stt_device": d.get("stt_device") or "-",
+    "tts_loaded": d.get("tts_loaded", False),
+    "tts_engine": d.get("tts_engine") or "-",
+    "tts_languages": ",".join(d.get("tts_languages") or []) or "-",
+    "tts_device": d.get("tts_device") or "-",
     "bg_trainer_active": d.get("bg_trainer_active", False),
     "bg_trainer_adapter": d.get("bg_trainer_adapter") or "-",
+    # adapter_health: count degenerated so bash can render a warning banner
+    # without re-parsing the whole map.
+    "degenerated_count": sum(
+        1 for h in (d.get("adapter_health") or {}).values()
+        if h.get("status") == "degenerated"
+    ),
+    "adapter_health_count": len(d.get("adapter_health") or {}),
 }
 # Scalar line
 print("|".join(str(fields[k]) for k in [
-    "mode", "cloud_only_reason", "model", "adapter_loaded", "keys_count",
+    "mode", "cloud_only_reason", "model", "model_id_short", "model_device",
+    "episodic_rank", "adapter_loaded",
+    "adapter_config", "active_adapter", "keys_count",
     "pending_sessions", "consolidating", "last_consolidation", "last_result",
-    "schedule", "mode_config", "next_run", "scheduler_started",
+    "refresh_cadence", "consolidation_period", "max_interim_count",
+    "mode_config", "next_run", "next_interim", "scheduler_started",
     "orphaned", "oldest_age", "speaker_profiles", "pending_enrollments",
-    "stt_loaded", "stt_model",
+    "speaker_embedding_backend", "speaker_embedding_model",
+    "speaker_embedding_device",
+    "stt_loaded", "stt_engine", "stt_model", "stt_device",
+    "tts_loaded", "tts_engine", "tts_languages", "tts_device",
     "bg_trainer_active", "bg_trainer_adapter",
+    "degenerated_count", "adapter_health_count",
 ]))
+# Per-adapter spec lines: kind<TAB>rank<TAB>alpha<TAB>lr<TAB>target_kind
+for _kind, _spec in (d.get("adapter_specs") or {}).items():
+    print("ADPT\t{}\t{}\t{}\t{}\t{}".format(
+        _kind,
+        _spec.get("rank", "?"),
+        _spec.get("alpha", "?"),
+        _spec.get("learning_rate", "?"),
+        _spec.get("target_kind", "?"),
+    ))
 # Per-speaker lines: id<TAB>name<TAB>embeddings<TAB>pending<TAB>method
 for s in d.get("speakers", []):
     print("SPK\t{}\t{}\t{}\t{}\t{}".format(
@@ -113,15 +164,50 @@ for s in d.get("speakers", []):
         s.get("embeddings", 0), s.get("pending", 0),
         s.get("enroll_method", "unknown"),
     ))
+# Per-adapter health lines: adapter<TAB>status<TAB>reason<TAB>keys_at_mark<TAB>updated_at
+# Sorted: degenerated first so the most important rows surface at the top.
+health_items = list((d.get("adapter_health") or {}).items())
+health_items.sort(key=lambda kv: (kv[1].get("status") != "degenerated", kv[0]))
+for adapter_id, h in health_items:
+    print("HLT\t{}\t{}\t{}\t{}\t{}".format(
+        adapter_id,
+        h.get("status", "?"),
+        (h.get("reason") or "").replace("\t", " ").replace("\n", " "),
+        h.get("keys_at_mark", 0),
+        h.get("updated_at", ""),
+    ))
 PY
 )
 
-IFS='|' read -r mode cloud_only_reason model adapter_loaded keys_count pending_sessions \
-    consolidating last_consolidation last_result schedule mode_config next_run \
+IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
+    episodic_rank adapter_loaded \
+    adapter_config_str active_adapter keys_count pending_sessions \
+    consolidating last_consolidation last_result refresh_cadence consolidation_period \
+    max_interim_count mode_config next_run next_interim \
     scheduler_started orphaned oldest_age speaker_profiles pending_enrollments \
-    stt_loaded stt_model bg_trainer_active bg_trainer_adapter \
+    spk_emb_backend spk_emb_model spk_emb_device \
+    stt_loaded stt_engine stt_model stt_device \
+    tts_loaded tts_engine tts_languages tts_device \
+    bg_trainer_active bg_trainer_adapter \
+    degenerated_count adapter_health_count \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
+health_lines=$(echo "$parsed" | awk '/^HLT\t/')
+adapter_spec_lines=$(echo "$parsed" | awk '/^ADPT\t/')
+
+# Render a device string as a coloured tag. "cuda" and anything else
+# non-cpu map to "GPU" so the label stays hardware-agnostic — the
+# underlying string is still cuda today, but ROCm / MPS / future GPU
+# backends would land on the same green tag without a display change.
+fmt_device() {
+    case "$1" in
+        cpu)   echo -e "${YELLOW}CPU${RESET}" ;;
+        cuda)  echo -e "${GREEN}GPU${RESET}" ;;
+        mixed) echo -e "${YELLOW}mixed${RESET}" ;;
+        ""|-)  echo -e "${DIM}-${RESET}" ;;
+        *)     echo -e "${GREEN}GPU${RESET}" ;;
+    esac
+}
 
 # Mode display
 if [[ "$mode" == "local" ]]; then
@@ -166,13 +252,58 @@ if command -v nvidia-smi &>/dev/null; then
 fi
 
 echo -e "  PID:      ${server_pid}"
-echo -e "  Model:    ${CYAN}${model}${RESET}"
+# Model line: short name + configured variant + live device tag. The device
+# tag is hardware-agnostic — cuda/rocm/mps all map to "GPU" via fmt_device.
+model_line="${CYAN}${model}${RESET}"
+if [[ "$model_id_short" != "-" && -n "$model_id_short" ]]; then
+    model_line+=" (${DIM}${model_id_short}${RESET})"
+fi
+if [[ "$model_device" != "-" && -n "$model_device" ]]; then
+    model_line+=" on $(fmt_device "$model_device")"
+fi
+echo -e "  Model:    ${model_line}"
 
-# Adapter
-if [[ "$adapter_loaded" == "True" ]]; then
-    echo -e "  Adapter:  ${GREEN}loaded${RESET} (${keys_count} keys)"
+# Adapters: configured inventory + per-kind spec. Configuration comes
+# from yaml; active is whichever adapter `set_adapter()` last selected
+# (PEFT only keeps one active at a time). "loaded" would be misleading —
+# multiple adapters can be RESIDENT while only one is ACTIVE.
+echo -e "  Adapters: ${CYAN}${adapter_config_str}${RESET}"
+# Per-kind spec rows: episodic / semantic / procedural differ in
+# learning rate and target_kind (procedural adds MLP targets). Skip the
+# row when no kind is enabled.
+if [[ -n "$adapter_spec_lines" ]]; then
+    while IFS=$'\t' read -r _marker akind arank aalpha alr atgt; do
+        [[ -z "$akind" ]] && continue
+        echo -e "    ${DIM}${akind}${RESET}  r=${arank} α=${aalpha} lr=${alr} ${DIM}${atgt}${RESET}"
+    done <<< "$adapter_spec_lines"
+fi
+if [[ "$active_adapter" != "-" && -n "$active_adapter" ]]; then
+    echo -e "  Active:   ${GREEN}${active_adapter}${RESET} (${keys_count} keys)"
 else
-    echo -e "  Adapter:  ${DIM}not loaded${RESET}"
+    echo -e "  Active:   ${DIM}none${RESET}"
+fi
+
+# Adapter health — warn if any adapter is degenerated, list all tracked entries.
+# Health lines are pre-sorted so degenerated adapters appear first.
+if (( adapter_health_count > 0 )); then
+    if (( degenerated_count > 0 )); then
+        echo -e "  Health:   ${RED}${degenerated_count} degenerated${RESET} of ${adapter_health_count} tracked — new facts queued until next full consolidation"
+    else
+        echo -e "  Health:   ${GREEN}all ${adapter_health_count} healthy${RESET}"
+    fi
+    while IFS=$'\t' read -r _marker hname hstatus hreason hkeys hupdated; do
+        [[ -z "$hname" ]] && continue
+        if [[ "$hstatus" == "degenerated" ]]; then
+            status_tag="${RED}${hstatus}${RESET}"
+        else
+            status_tag="${DIM}${hstatus}${RESET}"
+        fi
+        row="    ${DIM}${hname}${RESET}  [${status_tag}]  (${hkeys} keys)"
+        if [[ -n "$hreason" ]]; then
+            row+="  ${DIM}${hreason}${RESET}"
+        fi
+        echo -e "$row"
+    done <<< "$health_lines"
 fi
 
 # Sessions
@@ -201,22 +332,41 @@ if [[ "$bg_trainer_active" == "True" ]]; then
     echo -e "  BG Train: ${GREEN}training${RESET} (${CYAN}${bg_trainer_adapter}${RESET})"
 fi
 
-# Scheduler
-if [[ "$schedule" == "-" || -z "$schedule" ]]; then
+# Scheduler — show interim cadence + derived full-cycle period.
+# Two separate "next" markers:
+#   - next interim: deterministic cadence boundary from midnight (when
+#     post_session_train rolls over to a new interim adapter stamp).
+#   - next full:    wall-clock time of the next systemd timer tick (the
+#     full-consolidation cycle = refresh_cadence × max_interim_count).
+if [[ "$refresh_cadence" == "-" || -z "$refresh_cadence" ]]; then
     echo -e "  Schedule: ${DIM}manual only${RESET} (mode: ${mode_config})"
 else
-    sched_line="${CYAN}${schedule}${RESET} (mode: ${mode_config})"
-    if [[ "$scheduler_started" != "True" ]]; then
-        sched_line+=" | ${DIM}first run pending${RESET}"
-    elif [[ "$next_run" != "-" ]]; then
-        sched_line+=" | next in ${next_run}"
-    fi
+    sched_line="refresh ${CYAN}${refresh_cadence}${RESET} × ${max_interim_count} = full cycle ${CYAN}${consolidation_period}${RESET} (mode: ${mode_config})"
     echo -e "  Schedule: ${sched_line}"
+    # Interim line: next cadence boundary (event-driven per-session training
+    # rolls over here).
+    if [[ "$next_interim" != "-" ]]; then
+        echo -e "            next interim in ${CYAN}${next_interim}${RESET}"
+    fi
+    # Full line: systemd timer wall-clock tick.
+    if [[ "$scheduler_started" != "True" ]]; then
+        echo -e "            next full   ${DIM}first run pending${RESET}"
+    elif [[ "$next_run" != "-" ]]; then
+        echo -e "            next full   in ${CYAN}${next_run}${RESET}"
+    fi
 fi
 
 # Pending enrollments
 if (( pending_enrollments > 0 )); then
     echo -e "  Enroll:   ${YELLOW}${pending_enrollments} awaiting name extraction${RESET}"
+fi
+
+# Speaker embedding backend (pyannote wespeaker on CPU by default).
+# Surfaced so a disabled or failed-load backend is visible alongside
+# STT/TTS. Skip entirely when none of the fields are populated.
+if [[ "$spk_emb_backend" != "-" && -n "$spk_emb_backend" ]]; then
+    spk_dev_tag=$(fmt_device "$spk_emb_device")
+    echo -e "  SpkEmbed: ${GREEN}${spk_emb_backend}${RESET} (${DIM}${spk_emb_model}${RESET} on ${spk_dev_tag})"
 fi
 
 # Speakers (name + method + embeddings + pending)
@@ -235,11 +385,30 @@ else
     echo -e "  Speakers: ${DIM}none enrolled${RESET}"
 fi
 
-# STT
+# STT — prepend engine family (whisper) so the backend is visible even when
+# only one exists today; when more STT backends land the label flexes.
 if [[ "$stt_loaded" == "True" ]]; then
-    echo -e "  STT:      ${GREEN}loaded${RESET} (${stt_model})"
+    stt_dev_tag=$(fmt_device "$stt_device")
+    stt_engine_prefix=""
+    if [[ "$stt_engine" != "-" && -n "$stt_engine" ]]; then
+        stt_engine_prefix="${stt_engine} "
+    fi
+    echo -e "  STT:      ${GREEN}loaded${RESET} (${stt_engine_prefix}${stt_model} on ${stt_dev_tag})"
 else
     echo -e "  STT:      ${DIM}not loaded${RESET}"
+fi
+
+# TTS — mirror STT so legal CPU fallback paths are visible. Engine family
+# (piper / mms_tts / piper+mms) makes mixed-backend fleets readable.
+if [[ "$tts_loaded" == "True" ]]; then
+    tts_dev_tag=$(fmt_device "$tts_device")
+    tts_engine_prefix=""
+    if [[ "$tts_engine" != "-" && -n "$tts_engine" ]]; then
+        tts_engine_prefix="${tts_engine} "
+    fi
+    echo -e "  TTS:      ${GREEN}loaded${RESET} (${tts_engine_prefix}${tts_languages} on ${tts_dev_tag})"
+else
+    echo -e "  TTS:      ${DIM}not loaded${RESET}"
 fi
 
 # Windows Update lock (read-only check — no elevation)

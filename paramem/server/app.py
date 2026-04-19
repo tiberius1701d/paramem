@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -39,10 +40,19 @@ from paramem.server.inference import (
     enqueue_post_session_train,
     handle_chat,
 )
+from paramem.server.post_session_queue import PostSessionQueue
 from paramem.server.router import QueryRouter
 from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
 from paramem.server.tools.ha_client import HAClient
-from paramem.server.vram_validator import ConfigurationError, validate_startup_vram
+from paramem.server.vram_validator import (
+    ConfigurationError,
+    assess_topology,
+    enforce_live_budget,
+    estimate_stt_bytes,
+    estimate_tts_bytes,
+    format_tier_table,
+    measure_external_vram,
+)
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
 logger = logging.getLogger(__name__)
@@ -72,6 +82,7 @@ _state = {
     "last_consolidation": None,
     "background_trainer": None,
     "reclaim_task": None,
+    "post_session_queue": None,  # PostSessionQueue instance (local mode only)
     "mode": "local",  # "local" or "cloud-only"
     "cloud_only_reason": None,  # "explicit", "training", "gpu_conflict", or None
     "cloud_only_startup": False,  # set by --cloud-only CLI flag before app start
@@ -117,19 +128,61 @@ class ChatResponse(BaseModel):
 
 class StatusResponse(BaseModel):
     model: str
+    # Full HF model identifier (e.g. "mistralai/Mistral-7B-Instruct-v0.3").
+    # Lets pstatus surface the variant alongside the short name.
+    model_id: str | None = None
+    model_device: str | None = None  # cuda / cpu / None (cloud-only)
     mode: str  # "local" or "cloud-only"
     cloud_only_reason: str | None  # "explicit", "training", "gpu_conflict", or None
-    adapter_loaded: bool
+    adapter_loaded: bool  # legacy: True when episodic main adapter is loaded
+    # Rank of the episodic LoRA adapter (load-bearing for indexed-key recall).
+    # None when no adapter is configured (cloud-only or all kinds disabled).
+    episodic_rank: int | None = None
+    # Per-kind adapter spec. Episodic / semantic / procedural can diverge in
+    # learning rate and target modules (procedural adds MLP targets for
+    # representational imprint), so each kind gets its own row. Shape:
+    #   {kind: {"rank", "alpha", "learning_rate", "target_kind"}}
+    # "target_kind" is "attn" when target_modules are attention-only, or
+    # "attn+mlp" when MLP layers are included.
+    adapter_specs: dict = {}
+    # Adapter inventory: kind → configured count (kinds absent with count==0).
+    # Main kinds (episodic/semantic/procedural) contribute 1 when enabled in
+    # yaml; "interim" contributes max_interim_count.
+    adapter_config: dict[str, int] = {}
+    # Name of the currently active adapter on the live PeftModel, or None
+    # when no adapters are loaded (fresh install / cloud-only).
+    active_adapter: str | None = None
     keys_count: int
     pending_sessions: int
     consolidating: bool
     last_consolidation: str | None
     speaker_profiles: int = 0
+    # Speaker-embedding backend (pyannote) + HF model id + device. None in
+    # three cases: speaker id disabled in yaml, pyannote not installed, or
+    # the model failed to load at startup.
+    speaker_embedding_backend: str | None = None
+    speaker_embedding_model: str | None = None
+    speaker_embedding_device: str | None = None
     stt_loaded: bool = False
     stt_model: str | None = None
-    schedule: str = ""  # raw consolidation.schedule config value
+    stt_device: str | None = None  # cuda / cpu / None (unloaded)
+    stt_engine: str | None = None  # "whisper" — backend family, currently fixed
+    tts_loaded: bool = False
+    tts_languages: list[str] = []  # loaded TTS voices by language code
+    tts_device: str | None = None  # cuda / cpu / mixed / None (unloaded)
+    # Backend family across loaded voices: "piper", "mms_tts", or "piper+mms"
+    # when voices span both. None when no TTS is loaded.
+    tts_engine: str | None = None
+    # Interim cadence knob + derived full-cycle period.
+    refresh_cadence: str = ""
+    consolidation_period: str = ""  # refresh_cadence × max_interim_count
+    max_interim_count: int = 0
     mode_config: str = ""  # "train" or "simulate"
-    next_run_seconds: int | None = None  # seconds until next scheduled run
+    next_run_seconds: int | None = None  # seconds until next FULL consolidation
+    # Seconds until the next interim cadence boundary (post_session_train
+    # rolls over to a new stamp at every such boundary). None when refresh
+    # cadence is disabled.
+    next_interim_seconds: int | None = None
     orphaned_pending: int = 0  # pending sessions without speaker_id
     oldest_pending_seconds: int | None = None
     speakers: list[dict] = []  # [{id, name, embeddings, pending, enroll_method}]
@@ -138,6 +191,8 @@ class StatusResponse(BaseModel):
     last_consolidation_result: dict | None = None  # last completed run summary
     pending_enrollments: int = 0  # unknown speakers awaiting name extraction
     scheduler_started: bool = False  # True once scheduler first ticked
+    # adapter_id -> {status, reason, updated_at, keys_at_mark}
+    adapter_health: dict = {}
 
 
 class ConsolidateResponse(BaseModel):
@@ -186,6 +241,53 @@ async def lifespan(app: FastAPI):
         _state["model"] = None
         _state["tokenizer"] = None
     else:
+        # Startup VRAM validation runs BEFORE loading the base model.
+        # On (re)start ParaMem's own footprint is wiped — the CUDA context
+        # begins empty for this process. ``torch.cuda.memory_allocated`` at
+        # this point therefore reports bytes held by OTHER GPU consumers
+        # (Windows desktop, another model server, etc.). That external
+        # occupancy is subtracted from the hardware cap to yield the live
+        # budget the configured topology must fit into. The topology math
+        # itself is hardware-agnostic — logged at INFO with a per-tier fit
+        # table so operators see what a bigger card would buy.
+        main_adapter_count = sum(
+            1
+            for adapter_cfg in (
+                config.adapters.episodic,
+                config.adapters.semantic,
+                config.adapters.procedural,
+            )
+            if adapter_cfg.enabled
+        )
+        stt_pre_bytes = estimate_stt_bytes(config.stt, cloud_only=cloud_only)
+        tts_pre_bytes = estimate_tts_bytes(config.tts, cloud_only=cloud_only)
+
+        if not torch.cuda.is_available():
+            logger.error(
+                "Local model mode requires a CUDA-capable GPU but none was detected. "
+                "Either provide a GPU, or start in cloud-only mode."
+            )
+            sys.exit(1)
+
+        assessment = assess_topology(
+            config.episodic_adapter_config,
+            max_interim_count=config.consolidation.max_interim_count,
+            model_name=config.model_name,
+            model_id=config.model_config.model_id,
+            main_adapter_count=main_adapter_count,
+            stt_bytes=stt_pre_bytes,
+            tts_bytes=tts_pre_bytes,
+        )
+        logger.info("VRAM topology assessment:\n%s", assessment.breakdown)
+        logger.info("%s", format_tier_table(assessment))
+
+        total_memory_bytes, external_bytes = measure_external_vram()
+        try:
+            enforce_live_budget(assessment, total_memory_bytes, external_bytes)
+        except ConfigurationError as exc:
+            logger.error("VRAM configuration error:\n%s", exc)
+            sys.exit(1)
+
         logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
         model, tokenizer = load_base_model(config.model_config)
 
@@ -205,30 +307,6 @@ async def lifespan(app: FastAPI):
             logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
         else:
             logger.info("No adapters found — starting fresh")
-
-        # Startup VRAM validation — refuse to start if the configured topology
-        # cannot fit in VRAM for the full week. Runs after model + adapters are
-        # loaded so the CUDA allocator snapshot is accurate.
-        main_adapter_count = sum(
-            1
-            for adapter_cfg in (
-                config.adapters.episodic,
-                config.adapters.semantic,
-                config.adapters.procedural,
-            )
-            if adapter_cfg.enabled
-        )
-        try:
-            validate_startup_vram(
-                model,
-                config.episodic_adapter_config,
-                max_interim_count=config.consolidation.max_interim_count,
-                model_name=config.model_name,
-                main_adapter_count=main_adapter_count,
-            )
-        except ConfigurationError as exc:
-            logger.error("VRAM configuration error:\n%s", exc)
-            sys.exit(1)
 
         # Load interim adapters that survived from a previous run (e.g. after a
         # restart before the weekly consolidation ran).  These live at
@@ -450,6 +528,27 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Local TTS: disabled")
 
+    # Post-load sanity: compare actual ParaMem allocation against the prediction.
+    # Not a gate — the pre-load check already enforced the budget against
+    # (total_memory − external_bytes). This surfaces any drift between the
+    # static VRAM tables (base model, STT, TTS) and reality, so calibration
+    # errors show up in logs rather than silently over-committing.
+    if _state.get("model") is not None and torch.cuda.is_available():
+        actual_bytes = torch.cuda.memory_allocated(0)
+        predicted_bytes = assessment.required_bytes
+        delta_mib = (actual_bytes - predicted_bytes) / (1024 * 1024)
+        logger.info(
+            "VRAM post-load sanity: predicted %.2f GiB, measured %.2f GiB (delta %+.0f MiB)",
+            predicted_bytes / 2**30,
+            actual_bytes / 2**30,
+            delta_mib,
+        )
+        if actual_bytes > predicted_bytes * 1.10:
+            logger.warning(
+                "Actual VRAM usage exceeds prediction by >10%% — "
+                "re-calibrate _MODEL_VRAM_BYTES / STT / TTS tables."
+            )
+
     # Initialize SOTA agent if configured
     _state["sota_agent"] = get_cloud_agent(config.sota_agent)
     if _state["sota_agent"]:
@@ -512,14 +611,24 @@ async def lifespan(app: FastAPI):
         ha_client=_state.get("ha_client"),
     )
 
-    # Reconcile the systemd user timer with config.consolidation.schedule.
-    # The timer fires POST /scheduled-tick on its schedule regardless of mode;
-    # the tick handler defers when GPU is busy rather than skipping silently.
-    # Timer survives server restart (unlike the old in-process asyncio task).
+    # Reconcile the systemd user timer with the DERIVED full consolidation
+    # period (= refresh_cadence × max_interim_count). The yaml exposes only
+    # refresh_cadence; the timer sees the full cycle via the derived
+    # ``consolidation_period_string`` property. Timer fires POST /scheduled-tick
+    # on that cadence regardless of mode; the tick handler defers when GPU is
+    # busy rather than skipping silently. Timer survives server restart.
     from paramem.server import systemd_timer
 
+    derived_period = config.consolidation.consolidation_period_string
+    logger.info(
+        "Consolidation cadence — refresh every %s, max_interim_count=%d, "
+        "derived full-consolidation period=%s",
+        config.consolidation.refresh_cadence or "<disabled>",
+        config.consolidation.max_interim_count,
+        derived_period or "<manual only>",
+    )
     try:
-        msg = systemd_timer.reconcile(config.consolidation.schedule)
+        msg = systemd_timer.reconcile(derived_period)
         logger.info("%s", msg)
     except Exception:
         logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
@@ -564,6 +673,87 @@ async def lifespan(app: FastAPI):
     if not cloud_only and config.speaker.enabled:
         idle_timeout = config.speaker.enrollment_idle_timeout
         _state["enrollment_task"] = asyncio.create_task(_enrollment_idle_loop(idle_timeout))
+
+    # Startup diagnostic: surface any in-flight training state left by a
+    # prior interrupted run.  The actual resume happens when the next
+    # training job for that adapter is submitted — this is informational only.
+    if _state.get("model") is not None:
+        from paramem.server.background_trainer import _RESUME_STATE_FILE, _read_resume_state
+
+        _resume_path = config.adapter_dir / "in_training" / _RESUME_STATE_FILE
+        _resume_state = _read_resume_state(_resume_path)
+        if _resume_state is not None and _resume_state.get("checkpoint_path"):
+            logger.info(
+                "Detected in-flight training state: adapter=%s epoch=%d/%d"
+                " — will resume when the job is next submitted",
+                _resume_state.get("adapter_name", "?"),
+                _resume_state.get("last_completed_epoch", 0),
+                _resume_state.get("total_epochs", 0),
+            )
+
+    # --- Post-session queue: persistent queue for missed training triggers ---
+    # Instantiate the queue in local mode so the chat handler can use it.
+    # In cloud-only mode there is no model to train — skip.
+    if not cloud_only:
+        _queue_path = config.adapter_dir / "post_session_queue.json"
+        # Ensure the adapter directory exists (may not exist on fresh install).
+        config.adapter_dir.mkdir(parents=True, exist_ok=True)
+        _state["post_session_queue"] = PostSessionQueue(_queue_path)
+
+        # Replay any entries that were enqueued before a previous restart.
+        # We need the ConsolidationLoop + BackgroundTrainer to replay — create
+        # them lazily here only when there are entries to process.
+        if config.consolidation.post_session_train_enabled:
+            _pending = _state["post_session_queue"].peek()
+            if _pending:
+                logger.info(
+                    "post_session_queue: %d pending entry(s) from previous run — replaying",
+                    len(_pending),
+                )
+                from paramem.server.background_trainer import BackgroundTrainer
+                from paramem.server.consolidation import create_consolidation_loop
+
+                if _state.get("consolidation_loop") is None:
+                    _replay_loop = create_consolidation_loop(
+                        _state["model"], _state["tokenizer"], config
+                    )
+                    _state["consolidation_loop"] = _replay_loop
+                    _state["model"] = _replay_loop.model
+
+                if _state.get("background_trainer") is None:
+                    _replay_bt = BackgroundTrainer(
+                        model=_state["model"],
+                        tokenizer=_state["tokenizer"],
+                        training_config=config.training_config,
+                        output_dir=config.adapter_dir,
+                        temp_limit=config.consolidation.training_temp_limit,
+                        temp_check_interval=config.consolidation.training_temp_check_interval,
+                    )
+                    _state["background_trainer"] = _replay_bt
+
+                # Drain and replay — entries are removed individually upon
+                # successful completion inside enqueue_post_session_train's
+                # wrapper (same pattern as the chat handler path).
+                _replay_entries = _state["post_session_queue"].drain()
+                for _entry in _replay_entries:
+                    # Re-enqueue via the same path as the chat handler uses.
+                    # The queue.remove() call on success is handled inside the
+                    # _run_post_session_train wrapper added below for the chat
+                    # handler path.  For replay we enqueue again so the
+                    # enqueue→train→remove pattern is preserved.
+                    _state["post_session_queue"].enqueue(_entry)
+                    enqueue_post_session_train(
+                        conversation_id=_entry["session_id"],
+                        transcript=_entry["transcript"],
+                        speaker_id=_entry["speaker_id"],
+                        speaker_name=_entry.get("speaker_name"),
+                        loop=_state["consolidation_loop"],
+                        background_trainer=_state["background_trainer"],
+                        config=config,
+                        state=_state,
+                    )
+    else:
+        _state["post_session_queue"] = None
 
     logger.info("ParaMem server ready — mode: %s, model: %s", _state["mode"], config.model_name)
 
@@ -828,20 +1018,36 @@ async def chat(request: ChatRequest):
 
     # Post-conversation training: after each assistant response, enqueue a
     # background job to extract and train onto the current interim adapter.
-    # Only fires when a speaker is identified (speaker_id is required for key
-    # ownership) and the consolidation mode is "train" (not "simulate").
+    # Only fires when:
+    #   - a speaker is identified (speaker_id is required for key ownership)
+    #   - post_session_train_enabled is True in the consolidation config
+    #   - the consolidation loop exists (initialised at startup or by first
+    #     consolidation run)
     # The job runs in a daemon thread — it never blocks the response path.
     # model handle is updated inside enqueue_post_session_train after training.
     if (
         speaker_id is not None
         and _state.get("consolidation_loop") is not None
-        and _state["config"].consolidation.mode == "train"
+        and _state["config"].consolidation.post_session_train_enabled
     ):
         transcript_turns = buffer.get_session_turns(request.conversation_id)
         if transcript_turns:
             transcript_text = "\n".join(
                 f"{t.get('role', 'user')}: {t.get('text', '')}" for t in transcript_turns
             )
+            # Persist the job to the queue BEFORE submitting to the trainer.
+            # If the server crashes between here and the training completing,
+            # the entry will be replayed on the next startup.
+            _psq = _state.get("post_session_queue")
+            if _psq is not None:
+                _psq.enqueue(
+                    {
+                        "session_id": request.conversation_id,
+                        "transcript": transcript_text,
+                        "speaker_id": speaker_id,
+                        "speaker_name": speaker,
+                    }
+                )
             enqueue_post_session_train(
                 conversation_id=request.conversation_id,
                 transcript=transcript_text,
@@ -851,6 +1057,7 @@ async def chat(request: ChatRequest):
                 background_trainer=_state.get("background_trainer"),
                 config=_state["config"],
                 state=_state,
+                post_session_queue=_psq,
             )
 
     # Resume training after inference — only if we paused (not stopped)
@@ -932,6 +1139,31 @@ async def status():
         hasattr(model, "peft_config") and "episodic" in model.peft_config if model else False
     )
 
+    # Adapter inventory: enumerate configured kinds + interim capacity. Main
+    # adapters contribute 1 each when enabled in yaml; interim contributes
+    # max_interim_count (the capacity ceiling enforced by the VRAM validator).
+    adapter_config_counts: dict[str, int] = {}
+    for kind, cfg in (
+        ("episodic", config.adapters.episodic),
+        ("semantic", config.adapters.semantic),
+        ("procedural", config.adapters.procedural),
+    ):
+        if cfg.enabled:
+            adapter_config_counts[kind] = 1
+    if config.consolidation.max_interim_count > 0:
+        adapter_config_counts["interim"] = config.consolidation.max_interim_count
+
+    # Currently active adapter on the live PeftModel. PEFT only keeps one
+    # adapter active at a time (set_adapter / switch_adapter). None when the
+    # model hasn't loaded (cloud-only) or no adapters exist yet.
+    active_adapter: str | None = None
+    if model is not None and hasattr(model, "active_adapter"):
+        raw_active = model.active_adapter
+        if isinstance(raw_active, list):
+            active_adapter = raw_active[0] if raw_active else None
+        else:
+            active_adapter = raw_active
+
     keys_count = 0
     if config.registry_path.exists():
         with open(config.registry_path) as f:
@@ -972,26 +1204,173 @@ async def status():
         if next_epoch - time.time() < 3.15e9:  # < ~100 years ahead
             next_run_seconds = max(0, int(next_epoch - time.time()))
 
+    # Next interim bucket boundary: post_session_train floors its stamp to
+    # the refresh_cadence boundary measured from midnight, so the next
+    # boundary is fully deterministic from the clock. None when cadence is
+    # disabled (manual-only mode).
+    from paramem.server.interim_adapter import compute_schedule_period_seconds
+
+    next_interim_seconds: int | None = None
+    _refresh_seconds = compute_schedule_period_seconds(config.consolidation.refresh_cadence)
+    if _refresh_seconds and _refresh_seconds > 0:
+        _now = datetime.now()
+        _midnight = _now.replace(hour=0, minute=0, second=0, microsecond=0)
+        _since_mid = int((_now - _midnight).total_seconds())
+        _next_boundary = ((_since_mid // _refresh_seconds) + 1) * _refresh_seconds
+        next_interim_seconds = max(0, _next_boundary - _since_mid)
+
     # Background trainer
     bt = _state.get("background_trainer")
     bg_active = bool(bt and getattr(bt, "is_training", False))
     bg_adapter = getattr(bt, "current_adapter_name", None) if bg_active else None
 
+    # Adapter health — stored in the KeyRegistry JSON (distinct from the
+    # SimHash registry at config.registry_path).  Surfaced to pstatus so a
+    # degenerated adapter is visible without grepping logs.
+    adapter_health: dict = {}
+    _key_reg_path = config.adapter_dir / "indexed_key_registry.json"
+    if _key_reg_path.exists():
+        try:
+            with open(_key_reg_path) as f:
+                _key_reg_json = json.load(f)
+            adapter_health = _key_reg_json.get("adapter_health", {}) or {}
+        except (OSError, json.JSONDecodeError):
+            adapter_health = {}
+
+    # TTS inventory: which languages are loaded and on which device. When
+    # voices span devices (one on CUDA, one on CPU) we report "mixed" so the
+    # fallback path is visible in pstatus without dumping per-voice rows.
+    tts_manager = _state.get("tts_manager")
+    tts_loaded = bool(tts_manager and tts_manager.is_loaded)
+    tts_languages: list[str] = tts_manager.available_languages if tts_loaded else []
+    tts_device: str | None = None
+    if tts_loaded:
+        _tts_devices = set(tts_manager.engine_devices.values())
+        if len(_tts_devices) == 1:
+            tts_device = next(iter(_tts_devices))
+        elif _tts_devices:
+            tts_device = "mixed"
+
+    stt = _state.get("stt")
+    stt_loaded = stt is not None and stt.is_loaded
+    # WhisperSTT keeps `self.device` as the RESOLVED device string (cuda/cpu)
+    # by the time load() returns True — "auto" is reassigned before load.
+    stt_device = stt.device if stt_loaded else None
+    # Only one STT backend family is supported today (faster-whisper).
+    stt_engine = "whisper" if stt_loaded else None
+
+    # TTS engine family: derive from the class name of each loaded engine
+    # (piper / mms_tts). "piper+mms" when voices span both backends.
+    tts_engine: str | None = None
+    if tts_loaded:
+        _kinds: set[str] = set()
+        for _eng in tts_manager._engines.values():
+            _cls = type(_eng).__name__.lower()
+            if "piper" in _cls:
+                _kinds.add("piper")
+            elif "mms" in _cls:
+                _kinds.add("mms_tts")
+        if len(_kinds) == 1:
+            tts_engine = next(iter(_kinds))
+        elif _kinds:
+            tts_engine = "piper+mms"
+
+    # Live device of the loaded LLM. Resolved from the first parameter's
+    # device so we reflect actual placement, not the config intent (which
+    # can diverge in cloud-only or CPU-fallback cases).
+    model_device: str | None = None
+    if model is not None:
+        try:
+            model_device = next(model.parameters()).device.type
+        except (StopIteration, AttributeError):
+            model_device = None
+
+    # HF model identifier from the registry. Safe even in cloud-only mode —
+    # model_config resolves off the registry and has no GPU dependency.
+    model_id: str | None = None
+    try:
+        model_id = config.model_config.model_id
+    except (KeyError, ValueError):
+        model_id = None
+
+    # Episodic adapter rank surfaces the primary knob for indexed-key recall.
+    episodic_rank = config.adapters.episodic.rank if config.adapters.episodic.enabled else None
+
+    # Per-kind adapter spec. Only include enabled kinds so pstatus doesn't
+    # display disabled rows. target_kind compresses target_modules into a
+    # category label — "attn+mlp" means MLP layers are in the set, else
+    # "attn". A caller interested in the exact list can hit the yaml.
+    def _target_kind(target_modules: list[str]) -> str:
+        for t in target_modules or []:
+            tl = t.lower()
+            if "mlp" in tl or "gate" in tl or "up_proj" in tl or "down_proj" in tl:
+                return "attn+mlp"
+        return "attn"
+
+    adapter_specs: dict[str, dict] = {}
+    for _kind, _cfg in (
+        ("episodic", config.adapters.episodic),
+        ("semantic", config.adapters.semantic),
+        ("procedural", config.adapters.procedural),
+    ):
+        if not _cfg.enabled:
+            continue
+        adapter_specs[_kind] = {
+            "rank": _cfg.rank,
+            "alpha": _cfg.alpha,
+            "learning_rate": _cfg.learning_rate,
+            "target_kind": _target_kind(_cfg.target_modules),
+        }
+
+    # Speaker-embedding backend. Only populate when the pyannote model is
+    # actually loaded — disabled / failed-load paths leave the fields None
+    # so pstatus can skip the row entirely.
+    speaker_embedding_backend: str | None = None
+    speaker_embedding_model: str | None = None
+    speaker_embedding_device: str | None = None
+    try:
+        from paramem.server import speaker_embedding as _spk_emb
+
+        if _spk_emb.is_loaded():
+            speaker_embedding_backend = _spk_emb.EMBEDDING_BACKEND
+            speaker_embedding_model = _spk_emb.EMBEDDING_MODEL_NAME
+            speaker_embedding_device = _spk_emb.EMBEDDING_DEVICE
+    except ImportError:
+        pass
+
     return StatusResponse(
         model=config.model_name,
+        model_id=model_id,
+        model_device=model_device,
+        episodic_rank=episodic_rank,
+        adapter_specs=adapter_specs,
+        speaker_embedding_backend=speaker_embedding_backend,
+        speaker_embedding_model=speaker_embedding_model,
+        speaker_embedding_device=speaker_embedding_device,
+        stt_engine=stt_engine,
+        tts_engine=tts_engine,
         mode=_state["mode"],
         cloud_only_reason=_state.get("cloud_only_reason"),
         adapter_loaded=adapter_loaded,
+        adapter_config=adapter_config_counts,
+        active_adapter=active_adapter,
         keys_count=keys_count,
         pending_sessions=summary["total"],
         consolidating=_state["consolidating"],
         last_consolidation=_state["last_consolidation"],
         speaker_profiles=store.profile_count if store else 0,
-        stt_loaded=_state.get("stt") is not None and _state["stt"].is_loaded,
-        stt_model=_state["stt"].model_name if _state.get("stt") else None,
-        schedule=config.consolidation.schedule,
+        stt_loaded=stt_loaded,
+        stt_model=stt.model_name if stt_loaded else None,
+        stt_device=stt_device,
+        tts_loaded=tts_loaded,
+        tts_languages=tts_languages,
+        tts_device=tts_device,
+        refresh_cadence=config.consolidation.refresh_cadence,
+        consolidation_period=config.consolidation.consolidation_period_string,
+        max_interim_count=config.consolidation.max_interim_count,
         mode_config=config.consolidation.mode,
         next_run_seconds=next_run_seconds,
+        next_interim_seconds=next_interim_seconds,
         orphaned_pending=summary["orphaned"],
         oldest_pending_seconds=summary["oldest_age_seconds"],
         speakers=speaker_rows,
@@ -1000,6 +1379,7 @@ async def status():
         last_consolidation_result=_state.get("last_consolidation_result"),
         pending_enrollments=len(_state.get("pending_enrollments") or []),
         scheduler_started=scheduler_active,
+        adapter_health=adapter_health,
     )
 
 

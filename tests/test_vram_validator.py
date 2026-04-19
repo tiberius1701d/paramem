@@ -23,6 +23,7 @@ import pytest
 from paramem.server.vram_validator import (
     _FALLBACK_BASE_BYTES,
     _LORA_DTYPE_BYTES,
+    _PEFT_OVERHEAD_PER_ADAPTER_BYTES,
     ConfigurationError,
     estimated_adapter_bytes,
     required_working_set_bytes,
@@ -51,8 +52,15 @@ _MISTRAL_ADAPTER = AdapterConfig(
 # Mistral 7B NF4 base model footprint (conservative estimate)
 _BASE_MODEL_BYTES = 4_000_000_000  # ~3.8 GiB
 
-# Free VRAM available: 7.5 GiB (generous headroom for these tests)
-_FREE_VRAM_BYTES = int(7.5 * _GiB)
+# Free VRAM after the base model is already loaded. The validator runs
+# post-load (see ``app.py`` lifespan), so ``mem_get_info`` reports free VRAM
+# with the base model's footprint already subtracted. On an 8 GiB card with a
+# ~3.8 GiB base model and ~1 GiB of CUDA context + allocator overhead, ~3 GiB
+# remains free. The fixed validator adds ``base_bytes`` back, giving an
+# effective budget of ~6.8 GiB — enough for the realistic config to fit while
+# large-rank / many-interim scenarios still overflow.
+_FREE_VRAM_BYTES = int(3 * _GiB)
+_TOTAL_VRAM_BYTES = int(8 * _GiB)
 
 # Tiny free VRAM that guarantees a failure in most tests
 _TINY_VRAM_BYTES = 128 * 1024 * 1024  # 128 MiB
@@ -89,7 +97,8 @@ def test_validate_passes_with_realistic_config():
     ):
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-        mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, int(8 * _GiB))
+        mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
 
         # Should not raise
         validate_startup_vram(
@@ -123,7 +132,8 @@ def test_validate_fails_when_too_many_interims():
     ):
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-        mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, int(8 * _GiB))
+        mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
 
         with pytest.raises(ConfigurationError) as exc_info:
             validate_startup_vram(
@@ -146,13 +156,13 @@ def test_validate_fails_when_too_many_interims():
 
 
 def test_validate_fails_with_huge_rank():
-    """rank=128 adapter with 4 modules, 7 sessions, and 7.5 GiB free should fail.
+    """rank=256 adapter with 4 modules, 7 sessions should overflow the 8 GiB cap.
 
     The error message must reference ``rank``.
     """
     high_rank_adapter = AdapterConfig(
-        rank=128,
-        alpha=256,
+        rank=256,
+        alpha=512,
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
         dropout=0.0,
     )
@@ -163,7 +173,8 @@ def test_validate_fails_with_huge_rank():
     ):
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-        mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, int(8 * _GiB))
+        mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
 
         with pytest.raises(ConfigurationError) as exc_info:
             validate_startup_vram(
@@ -238,7 +249,11 @@ def test_error_message_lists_actionable_knobs():
     ):
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-        mock_torch.cuda.mem_get_info.return_value = (_TINY_VRAM_BYTES, int(8 * _GiB))
+        mock_torch.cuda.mem_get_info.return_value = (_TINY_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+        # Hardware-cap path: total_memory drives the budget since commit task #17.
+        # Use the tiny value here so the topology overflows and the validator
+        # raises.
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TINY_VRAM_BYTES
 
         with pytest.raises(ConfigurationError) as exc_info:
             validate_startup_vram(
@@ -284,11 +299,94 @@ def test_estimated_adapter_bytes_mistral_rank8_four_modules():
            = 4 × 32 × 2 × 8 × 4096 × 2
            = 4 × 32 × 2 × 8 × 4096 × 2
     """
-    expected = 4 * 32 * 2 * 8 * 4096 * _LORA_DTYPE_BYTES
+    # Raw LoRA A+B bytes plus a flat PEFT per-adapter overhead (wrapper
+    # bookkeeping, padding).  Overhead is a validator-level constant and
+    # must be counted here so the test tracks the formula the validator
+    # actually uses.
+    expected = 4 * 32 * 2 * 8 * 4096 * _LORA_DTYPE_BYTES + _PEFT_OVERHEAD_PER_ADAPTER_BYTES
     result = estimated_adapter_bytes(_MISTRAL_ADAPTER, hidden_size=4096, num_layers=32)
     assert result == expected, (
         f"estimated_adapter_bytes mismatch: expected {expected}, got {result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-load path: validator runs before model load (canonical call site)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_pre_load_uses_static_base_model_lookup():
+    """Canonical call path: ``model=None`` before ``load_base_model``.
+
+    ``memory_allocated`` is never called; ``base_bytes`` comes from the static
+    ``_MODEL_VRAM_BYTES`` lookup. ``mem_get_info`` reports full card free
+    (minus external consumers only), which compares directly against
+    ``total_required`` with no add-back.
+    """
+    # Pre-load free VRAM ≈ total (no external consumers).
+    pre_load_free_bytes = int(7.5 * _GiB)
+
+    with patch("paramem.server.vram_validator.torch") as mock_torch:
+        mock_torch.cuda.is_available.return_value = True
+        mock_torch.cuda.mem_get_info.return_value = (
+            pre_load_free_bytes,
+            _TOTAL_VRAM_BYTES,
+        )
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
+        # memory_allocated must not be consulted on the pre-load path.
+        mock_torch.cuda.memory_allocated.side_effect = AssertionError(
+            "memory_allocated should not be called pre-load"
+        )
+
+        validate_startup_vram(
+            None,
+            _MISTRAL_ADAPTER,
+            max_interim_count=7,
+            model_name="mistral",
+            main_adapter_count=3,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression: post-load free VRAM must not double-count the base model
+# ---------------------------------------------------------------------------
+
+
+def test_post_load_free_vram_does_not_double_count_base_model():
+    """Back-compat: if the validator is called after the base model is loaded
+    (``model`` is a real object and ``memory_allocated`` > 0), the already-
+    loaded footprint is added back to available VRAM so that ``total_required``
+    (which still includes ``base_bytes``) is not double-counted.
+
+    Regression for commit 156ff44 → follow-up fix. The canonical call site is
+    now pre-load, but the post-load path is preserved for test harnesses and
+    any future caller that validates after load.
+    """
+    model = _mock_model()
+
+    with patch("paramem.server.vram_validator.torch") as mock_torch:
+        mock_torch.cuda.is_available.return_value = True
+        mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
+        # Realistic post-load reading: free VRAM is much less than total
+        # because the base model already occupies ~3.8 GiB.  The validator's
+        # hardware-cap path reads total_memory directly; mem_get_info is now
+        # vestigial but kept in the mock for back-compat with older code paths.
+        mock_torch.cuda.mem_get_info.return_value = (
+            _FREE_VRAM_BYTES,
+            _TOTAL_VRAM_BYTES,
+        )
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
+
+        # Topology that fits in total VRAM (7 interims at rank 8) but appears
+        # to overflow free VRAM alone — must be accepted once the base model
+        # cost is added back to available.
+        validate_startup_vram(
+            model,
+            _MISTRAL_ADAPTER,
+            max_interim_count=7,
+            model_name="mistral",
+            main_adapter_count=3,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -297,14 +395,16 @@ def test_estimated_adapter_bytes_mistral_rank8_four_modules():
 
 
 def test_vram_cap_gib_override_passes():
-    """When vram_cap_gib is provided, it overrides torch.cuda.mem_get_info."""
+    """When vram_cap_gib is provided, it overrides the hardware cap lookup."""
     model = _mock_model()
 
     with patch("paramem.server.vram_validator.torch") as mock_torch:
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-        # mem_get_info should NOT be called when cap is overridden
+        # Neither mem_get_info nor get_device_properties should be consulted
+        # when the caller passes an explicit cap.
         mock_torch.cuda.mem_get_info.side_effect = AssertionError("Should not be called")
+        mock_torch.cuda.get_device_properties.side_effect = AssertionError("Should not be called")
 
         # 8 GiB cap — should pass
         validate_startup_vram(
@@ -319,13 +419,14 @@ def test_vram_cap_gib_override_passes():
 
 def test_vram_cap_gib_override_fails():
     """When vram_cap_gib is very small, the validator raises ConfigurationError
-    without querying torch.cuda.mem_get_info."""
+    without querying the hardware-cap lookup."""
     model = _mock_model()
 
     with patch("paramem.server.vram_validator.torch") as mock_torch:
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
         mock_torch.cuda.mem_get_info.side_effect = AssertionError("Should not be called")
+        mock_torch.cuda.get_device_properties.side_effect = AssertionError("Should not be called")
 
         with pytest.raises(ConfigurationError):
             validate_startup_vram(
@@ -355,7 +456,11 @@ def test_breakdown_shown_in_failure_message():
     with patch("paramem.server.vram_validator.torch") as mock_torch:
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-        mock_torch.cuda.mem_get_info.return_value = (_TINY_VRAM_BYTES, int(8 * _GiB))
+        mock_torch.cuda.mem_get_info.return_value = (_TINY_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+        # Hardware-cap path: total_memory drives the budget since commit task #17.
+        # Use the tiny value here so the topology overflows and the validator
+        # raises.
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TINY_VRAM_BYTES
 
         with pytest.raises(ConfigurationError) as exc_info:
             validate_startup_vram(
@@ -399,7 +504,11 @@ def test_remediation_block_lists_all_knobs():
     with patch("paramem.server.vram_validator.torch") as mock_torch:
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-        mock_torch.cuda.mem_get_info.return_value = (_TINY_VRAM_BYTES, int(8 * _GiB))
+        mock_torch.cuda.mem_get_info.return_value = (_TINY_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+        # Hardware-cap path: total_memory drives the budget since commit task #17.
+        # Use the tiny value here so the topology overflows and the validator
+        # raises.
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TINY_VRAM_BYTES
 
         with pytest.raises(ConfigurationError) as exc_info:
             validate_startup_vram(
@@ -461,7 +570,8 @@ def test_breakdown_logged_on_success(caplog):
         with patch("paramem.server.vram_validator.torch") as mock_torch:
             mock_torch.cuda.is_available.return_value = True
             mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
-            mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, int(8 * _GiB))
+            mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+            mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
 
             validate_startup_vram(
                 model,
@@ -517,15 +627,17 @@ def test_warning_when_unknown_model_uses_fallback(caplog):
             mock_torch.cuda.is_available.return_value = True
             # Return 0 to force the static fallback path
             mock_torch.cuda.memory_allocated.return_value = 0
-            mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, int(8 * _GiB))
 
-            # Use empty model_name to trigger unknown-model path
+            # Use empty model_name to trigger unknown-model path; override
+            # vram_cap_gib to a generous value so the fallback topology fits
+            # and we can assert on the warning message alone.
             validate_startup_vram(
                 model,
                 _MISTRAL_ADAPTER,
                 max_interim_count=7,
                 model_name="",
                 main_adapter_count=3,
+                vram_cap_gib=8.0,
             )
     finally:
         named_logger.removeHandler(caplog.handler)
@@ -579,3 +691,367 @@ def test_no_gpu_raises_clear_error():
     assert "cloud-only" in error_text or "cloud_only" in error_text, (
         f"Error message must mention 'cloud-only' escape hatch. Got:\n{exc_info.value}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Integration: lifespan ordering (validator must run before load_base_model)
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_runs_validator_before_load_base_model():
+    """Integration guard for the startup lifecycle.
+
+    Exercises the FastAPI ``lifespan`` context with ``load_base_model``,
+    ``assess_topology``, ``measure_external_vram`` and ``enforce_live_budget``
+    replaced by spies. Asserts the correct call order:
+
+        assess_topology → measure_external_vram → enforce_live_budget →
+        load_base_model
+
+    This ordering is load-bearing: ``measure_external_vram`` snapshots
+    non-ParaMem GPU occupancy BEFORE the base model is loaded, so the live
+    budget is correctly computed from external consumers only. Moving
+    ``enforce_live_budget`` after ``load_base_model`` would count ParaMem's
+    own footprint as "external", producing a self-consistent but wrong
+    budget.
+    """
+    import asyncio
+
+    from paramem.server import app as server_app
+    from paramem.server.config import ServerConfig
+
+    class _Sentinel(Exception):
+        pass
+
+    calls: list[tuple] = []
+
+    def spy_assess(*args, **kwargs):
+        calls.append(("assess_topology",))
+        # Return a minimal-but-valid TopologyAssessment so enforce_live_budget
+        # can consume it without crashing on attribute access.
+        from paramem.server.vram_validator import TopologyAssessment
+
+        return TopologyAssessment(
+            required_bytes=1,
+            adapter_bytes=1,
+            base_bytes=1,
+            per_tier_fit={8: (True, 0)},
+            breakdown="stub",
+        )
+
+    def spy_measure(*args, **kwargs):
+        calls.append(("measure_external_vram",))
+        return (8 * 2**30, 0)  # 8 GiB total, 0 external
+
+    def spy_enforce(*args, **kwargs):
+        calls.append(("enforce_live_budget",))
+
+    def spy_load_base_model(*args, **kwargs):
+        calls.append(("load_base_model",))
+        raise _Sentinel("short-circuit after load_base_model is invoked")
+
+    config = ServerConfig(model_name="mistral")
+    config.cloud_only = False
+
+    saved_state = {
+        key: server_app._state.get(key) for key in ("config", "cloud_only_startup", "defer_model")
+    }
+
+    server_app._state["config"] = config
+    server_app._state["cloud_only_startup"] = False
+    server_app._state["defer_model"] = False
+
+    try:
+        with (
+            patch.object(server_app, "assess_topology", spy_assess),
+            patch.object(server_app, "measure_external_vram", spy_measure),
+            patch.object(server_app, "enforce_live_budget", spy_enforce),
+            patch.object(server_app, "load_base_model", spy_load_base_model),
+            patch.object(server_app, "_gpu_occupied", return_value=False),
+            patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        ):
+
+            async def _run() -> None:
+                async with server_app.lifespan(server_app.app):
+                    pass
+
+            with pytest.raises(_Sentinel):
+                asyncio.run(_run())
+    finally:
+        for key, value in saved_state.items():
+            if value is None:
+                server_app._state.pop(key, None)
+            else:
+                server_app._state[key] = value
+
+    expected_order = [
+        "assess_topology",
+        "measure_external_vram",
+        "enforce_live_budget",
+        "load_base_model",
+    ]
+    actual_order = [c[0] for c in calls]
+    assert actual_order == expected_order, (
+        f"Lifespan must invoke {expected_order} in order; got {actual_order}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STT / TTS VRAM accounting
+# ---------------------------------------------------------------------------
+
+
+class _FakeSTTConfig:
+    """Stand-in for ``paramem.server.config.STTConfig``. Only attributes the
+    estimator reads are populated — keeps tests decoupled from the real dataclass."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        device: str = "cuda",
+        model: str = "distil-large-v3",
+        compute_type: str = "int8",
+        cpu_fallback_model: str = "small",
+    ):
+        self.enabled = enabled
+        self.device = device
+        self.model = model
+        self.compute_type = compute_type
+        self.cpu_fallback_model = cpu_fallback_model
+
+
+class _FakeTTSVoice:
+    def __init__(self, *, engine: str, model: str = "", device: str | None = None):
+        self.engine = engine
+        self.model = model
+        self.device = device
+
+
+class _FakeTTSConfig:
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        device: str = "cuda",
+        voices: dict | None = None,
+    ):
+        self.enabled = enabled
+        self.device = device
+        self.voices = voices or {}
+
+
+def test_estimate_stt_bytes_matches_calibrated_table():
+    """``estimate_stt_bytes`` must match the calibrated formula: the stt.py
+    table entry × compute_type multiplier × calibration factor + headroom.
+    Calibration anchors math to the empirical 2026-04-19 GPU probe
+    (distil-large-v3 int8 = 960 MiB measured on RTX 5070 Laptop)."""
+    from paramem.server.stt import (
+        COMPUTE_TYPE_MULTIPLIER,
+        VRAM_ESTIMATES_INT8_MB,
+    )
+    from paramem.server.vram_validator import (
+        _STT_CALIBRATION_FACTOR,
+        _STT_CALIBRATION_HEADROOM_MB,
+        estimate_stt_bytes,
+    )
+
+    cfg = _FakeSTTConfig(model="distil-large-v3", compute_type="int8", device="cuda")
+    base_mb = VRAM_ESTIMATES_INT8_MB["distil-large-v3"]
+    multiplier = COMPUTE_TYPE_MULTIPLIER["int8"]
+    expected_mb = int(base_mb * multiplier * _STT_CALIBRATION_FACTOR) + _STT_CALIBRATION_HEADROOM_MB
+    assert estimate_stt_bytes(cfg) == expected_mb * 1024 * 1024
+
+
+def test_estimate_stt_bytes_zero_when_cpu_or_disabled():
+    """STT on CPU, disabled, or in cloud-only mode contributes 0 to GPU budget."""
+    from paramem.server.vram_validator import estimate_stt_bytes
+
+    assert estimate_stt_bytes(_FakeSTTConfig(enabled=False)) == 0
+    assert estimate_stt_bytes(_FakeSTTConfig(device="cpu")) == 0
+    assert estimate_stt_bytes(_FakeSTTConfig(device="cuda"), cloud_only=True) == 0
+
+
+def test_estimate_stt_bytes_scales_with_compute_type():
+    """float16 must weigh twice as much as int8 in the budget (after subtracting
+    the fixed calibration headroom)."""
+    from paramem.server.vram_validator import (
+        _STT_CALIBRATION_HEADROOM_MB,
+        estimate_stt_bytes,
+    )
+
+    int8_bytes = estimate_stt_bytes(_FakeSTTConfig(compute_type="int8"))
+    fp16_bytes = estimate_stt_bytes(_FakeSTTConfig(compute_type="float16"))
+    assert fp16_bytes > int8_bytes
+    # Model-portion (after removing fixed headroom) must double for float16.
+    _headroom = _STT_CALIBRATION_HEADROOM_MB * 1024 * 1024
+    assert (fp16_bytes - _headroom) >= 2 * (int8_bytes - _headroom) - 1
+
+
+def test_estimate_stt_bytes_unknown_model_falls_back_with_warning(caplog):
+    """Unknown Whisper model must use conservative fallback + warn.
+
+    Uses the same handler-attach pattern as ``tests/test_schema_config.py`` —
+    the vram_validator logger is not picked up by the default caplog fixture.
+    """
+    import logging
+
+    from paramem.server.vram_validator import _STT_FALLBACK_BYTES, estimate_stt_bytes
+
+    named = logging.getLogger("paramem.server.vram_validator")
+    orig_propagate = named.propagate
+    named.propagate = True
+    caplog.set_level(logging.WARNING, logger="paramem.server.vram_validator")
+    named.addHandler(caplog.handler)
+    try:
+        cfg = _FakeSTTConfig(model="totally-made-up-whisper-42")
+        result = estimate_stt_bytes(cfg)
+    finally:
+        named.removeHandler(caplog.handler)
+        named.propagate = orig_propagate
+    assert result == _STT_FALLBACK_BYTES
+    assert "not in VRAM_ESTIMATES_INT8_MB" in caplog.text
+
+
+def test_estimate_tts_bytes_piper_voices_share_single_ort_context():
+    """Multiple Piper voices on GPU should cost N × per-voice + ONE ORT
+    context — not N × ORT context. This is the piper-specific sharing that
+    justifies the _TTS_PIPER_ORT_CONTEXT_BYTES single-add design."""
+    from paramem.server.vram_validator import (
+        _TTS_PIPER_BYTES_PER_VOICE,
+        _TTS_PIPER_ORT_CONTEXT_BYTES,
+        estimate_tts_bytes,
+    )
+
+    cfg_one = _FakeTTSConfig(
+        voices={"en": _FakeTTSVoice(engine="piper", model="en_US-lessac-high")}
+    )
+    cfg_four = _FakeTTSConfig(
+        voices={
+            "en": _FakeTTSVoice(engine="piper", model="en_US-lessac-high"),
+            "de": _FakeTTSVoice(engine="piper", model="de_DE-thorsten-high"),
+            "fr": _FakeTTSVoice(engine="piper", model="fr_FR-siwis-medium"),
+            "es": _FakeTTSVoice(engine="piper", model="es_ES-davefx-medium"),
+        }
+    )
+    one = estimate_tts_bytes(cfg_one)
+    four = estimate_tts_bytes(cfg_four)
+    assert one == _TTS_PIPER_BYTES_PER_VOICE + _TTS_PIPER_ORT_CONTEXT_BYTES
+    assert four == 4 * _TTS_PIPER_BYTES_PER_VOICE + _TTS_PIPER_ORT_CONTEXT_BYTES
+
+
+def test_estimate_tts_bytes_mms_per_voice():
+    """MMS-TTS has no shared context — each voice holds its own model."""
+    from paramem.server.vram_validator import _TTS_MMS_BYTES_PER_VOICE, estimate_tts_bytes
+
+    cfg = _FakeTTSConfig(
+        voices={
+            "tl": _FakeTTSVoice(engine="mms", model="facebook/mms-tts-tgl"),
+            "sv": _FakeTTSVoice(engine="mms", model="facebook/mms-tts-swe"),
+        }
+    )
+    assert estimate_tts_bytes(cfg) == 2 * _TTS_MMS_BYTES_PER_VOICE
+
+
+def test_estimate_tts_bytes_voice_device_override_respected():
+    """A voice marked device='cpu' must not contribute to the GPU budget even
+    when the global tts.device is 'cuda'."""
+    from paramem.server.vram_validator import (
+        _TTS_PIPER_BYTES_PER_VOICE,
+        _TTS_PIPER_ORT_CONTEXT_BYTES,
+        estimate_tts_bytes,
+    )
+
+    cfg = _FakeTTSConfig(
+        device="cuda",
+        voices={
+            "en": _FakeTTSVoice(engine="piper", device="cpu"),  # forced CPU
+            "de": _FakeTTSVoice(engine="piper"),  # inherits cuda
+        },
+    )
+    # Only the "de" voice counts.
+    assert estimate_tts_bytes(cfg) == _TTS_PIPER_BYTES_PER_VOICE + _TTS_PIPER_ORT_CONTEXT_BYTES
+
+
+def test_estimate_tts_bytes_zero_when_disabled_or_cloud_only():
+    from paramem.server.vram_validator import estimate_tts_bytes
+
+    cfg = _FakeTTSConfig(
+        voices={"en": _FakeTTSVoice(engine="piper")},
+    )
+    assert estimate_tts_bytes(_FakeTTSConfig(enabled=False)) == 0
+    assert estimate_tts_bytes(cfg, cloud_only=True) == 0
+    cpu_cfg = _FakeTTSConfig(device="cpu", voices={"en": _FakeTTSVoice(engine="piper")})
+    assert estimate_tts_bytes(cpu_cfg) == 0
+
+
+def test_validate_includes_stt_tts_in_working_set():
+    """The combined (STT + TTS) cost must be deducted from the available
+    budget. Feeds the same config that would pass without STT/TTS and shows
+    that adding a 2-GiB STT + 1-GiB TTS footprint tips it into rejection."""
+    model = _mock_model()
+    # Baseline budget: base + adapters + headroom ≈ 5.3 GiB on 6.8 GiB effective.
+    # Adding 3 GiB of STT+TTS overflows.
+    stt_bytes = 2 * _GiB
+    tts_bytes = 1 * _GiB
+
+    with patch("paramem.server.vram_validator.torch") as mock_torch:
+        mock_torch.cuda.is_available.return_value = True
+        mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
+        mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_startup_vram(
+                model,
+                _MISTRAL_ADAPTER,
+                max_interim_count=7,
+                model_name="mistral",
+                main_adapter_count=3,
+                stt_bytes=stt_bytes,
+                tts_bytes=tts_bytes,
+            )
+    msg = str(exc_info.value)
+    assert "STT (Whisper)" in msg
+    assert "TTS voices on GPU" in msg
+    # Remediation must offer the STT/TTS knobs when they contribute.
+    assert "stt.device" in msg
+    assert "tts.device" in msg
+
+
+def test_validate_breakdown_omits_stt_tts_lines_when_zero(caplog):
+    """When STT/TTS bytes are 0 (all CPU), the breakdown must NOT include the
+    two extra rows — they'd be misleading."""
+    import logging
+
+    named = logging.getLogger("paramem.server.vram_validator")
+    orig_propagate = named.propagate
+    named.propagate = True
+    caplog.set_level(logging.INFO, logger="paramem.server.vram_validator")
+    named.addHandler(caplog.handler)
+
+    model = _mock_model()
+    try:
+        with patch("paramem.server.vram_validator.torch") as mock_torch:
+            mock_torch.cuda.is_available.return_value = True
+            mock_torch.cuda.memory_allocated.return_value = _BASE_MODEL_BYTES
+            mock_torch.cuda.mem_get_info.return_value = (_FREE_VRAM_BYTES, _TOTAL_VRAM_BYTES)
+            mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
+
+            validate_startup_vram(
+                model,
+                _MISTRAL_ADAPTER,
+                max_interim_count=7,
+                model_name="mistral",
+                main_adapter_count=3,
+                stt_bytes=0,
+                tts_bytes=0,
+            )
+    finally:
+        named.removeHandler(caplog.handler)
+        named.propagate = orig_propagate
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "VRAM check passed" in logged
+    assert "STT (Whisper)" not in logged
+    assert "TTS voices on GPU" not in logged

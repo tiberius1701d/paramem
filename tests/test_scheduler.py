@@ -19,47 +19,74 @@ class TestParseSchedule:
         assert parse_schedule("23:59") == TimerSpec(kind="daily", on_calendar="*-*-* 23:59:00")
         assert parse_schedule("0:00") == TimerSpec(kind="daily", on_calendar="*-*-* 00:00:00")
 
-    def test_interval_hours(self):
+    def test_interval_hours_calendar(self):
         assert parse_schedule("every 2h") == TimerSpec(
-            kind="interval", on_boot_sec="2h", on_unit_active_sec="2h"
+            kind="calendar", on_calendar="*-*-* 00,02,04,06,08,10,12,14,16,18,20,22:00:00"
         )
         assert parse_schedule("every 24h") == TimerSpec(
-            kind="interval", on_boot_sec="24h", on_unit_active_sec="24h"
+            kind="calendar", on_calendar="*-*-* 00:00:00"
         )
 
-    def test_interval_minutes(self):
-        assert parse_schedule("every 30m") == TimerSpec(
-            kind="interval", on_boot_sec="30min", on_unit_active_sec="30min"
+    def test_interval_hours_odd_stays_monotonic(self):
+        assert parse_schedule("every 5h") == TimerSpec(
+            kind="interval", on_boot_sec="5h", on_unit_active_sec="5h"
+        )
+        assert parse_schedule("every 7h") == TimerSpec(
+            kind="interval", on_boot_sec="7h", on_unit_active_sec="7h"
+        )
+
+    def test_interval_minutes_calendar(self):
+        assert parse_schedule("every 30m") == TimerSpec(kind="calendar", on_calendar="*:00,30:00")
+
+    def test_interval_minutes_odd_stays_monotonic(self):
+        assert parse_schedule("every 13m") == TimerSpec(
+            kind="interval", on_boot_sec="13min", on_unit_active_sec="13min"
         )
 
     def test_interval_whitespace_and_case(self):
         assert parse_schedule("EVERY 2H") == TimerSpec(
-            kind="interval", on_boot_sec="2h", on_unit_active_sec="2h"
+            kind="calendar", on_calendar="*-*-* 00,02,04,06,08,10,12,14,16,18,20,22:00:00"
         )
         assert parse_schedule("  every 2h  ") == TimerSpec(
-            kind="interval", on_boot_sec="2h", on_unit_active_sec="2h"
+            kind="calendar", on_calendar="*-*-* 00,02,04,06,08,10,12,14,16,18,20,22:00:00"
         )
 
     @pytest.mark.parametrize("off", ["", "   ", "off", "OFF", "disabled", "none"])
     def test_off_values(self, off):
         assert parse_schedule(off) == TimerSpec(kind="off")
 
-    @pytest.mark.parametrize("bad", ["bogus", "2h", "every 0h", "25:00", "12:60", "every"])
+    @pytest.mark.parametrize("bad", ["bogus", "every 0h", "25:00", "12:60", "every"])
     def test_invalid_returns_none(self, bad):
         assert parse_schedule(bad) is None
 
-    def test_weekly_returns_interval_168h(self):
-        """'weekly' → interval TimerSpec with 168h period (604800 s)."""
+    def test_bare_shorthand_calendar(self):
+        """Bare ``Nh``/``Nm`` shorthand converts to calendar when cadence is divisible."""
+        assert parse_schedule("2h") == TimerSpec(
+            kind="calendar", on_calendar="*-*-* 00,02,04,06,08,10,12,14,16,18,20,22:00:00"
+        )
+        assert parse_schedule("30m") == TimerSpec(kind="calendar", on_calendar="*:00,30:00")
+
+    def test_bare_shorthand_odd_stays_monotonic(self):
+        """Bare ``Nh``/``Nm`` shorthand with non-divisible cadence stays monotonic."""
+        assert parse_schedule("48H") == TimerSpec(
+            kind="interval", on_boot_sec="48h", on_unit_active_sec="48h"
+        )
+        assert parse_schedule("90M") == TimerSpec(
+            kind="interval", on_boot_sec="90min", on_unit_active_sec="90min"
+        )
+
+    def test_weekly_returns_calendar(self):
+        """'weekly' → calendar TimerSpec firing Monday 00:00 with Persistent=true."""
         spec = parse_schedule("weekly")
-        assert spec == TimerSpec(kind="interval", on_boot_sec="168h", on_unit_active_sec="168h")
+        assert spec == TimerSpec(kind="calendar", on_calendar="Mon *-*-* 00:00:00")
 
     def test_weekly_case_insensitive(self):
         """'Weekly' and 'WEEKLY' are accepted."""
         assert parse_schedule("Weekly") == TimerSpec(
-            kind="interval", on_boot_sec="168h", on_unit_active_sec="168h"
+            kind="calendar", on_calendar="Mon *-*-* 00:00:00"
         )
         assert parse_schedule("WEEKLY") == TimerSpec(
-            kind="interval", on_boot_sec="168h", on_unit_active_sec="168h"
+            kind="calendar", on_calendar="Mon *-*-* 00:00:00"
         )
 
     def test_daily_returns_daily_at_03_00(self):
@@ -87,17 +114,30 @@ class TestReconcile:
             msg = systemd_timer.reconcile("bogus")
         assert "disabled" in msg
 
-    def test_interval_writes_units(self, tmp_path, monkeypatch):
+    def test_calendar_interval_writes_units(self, tmp_path, monkeypatch):
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
         with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
             msg = systemd_timer.reconcile("every 2h")
-        assert "every 2h" in msg
+        assert "with catch-up" in msg
         timer = (tmp_path / "paramem-consolidate.timer").read_text()
-        assert "OnUnitActiveSec=2h" in timer
+        assert "OnCalendar=" in timer
+        assert "Persistent=true" in timer
+        assert "OnUnitActiveSec" not in timer
         svc = (tmp_path / "paramem-consolidate.service").read_text()
         assert "/scheduled-tick" in svc
+
+    def test_monotonic_interval_writes_units(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
+        monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
+        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+            msg = systemd_timer.reconcile("every 5h")
+        assert "no catch-up" in msg
+        timer = (tmp_path / "paramem-consolidate.timer").read_text()
+        assert "OnUnitActiveSec=5h" in timer
+        assert "Persistent=true" not in timer
 
     def test_daily_writes_oncalendar(self, tmp_path, monkeypatch):
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)

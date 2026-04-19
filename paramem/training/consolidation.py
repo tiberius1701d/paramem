@@ -35,7 +35,7 @@ from paramem.training.indexed_memory import (
     probe_key,
     save_registry,
 )
-from paramem.training.key_registry import KeyRegistry
+from paramem.training.key_registry import ADAPTER_HEALTH_DEGENERATED, KeyRegistry
 from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
 from paramem.training.trainer import GracefulShutdownCallback, train_adapter
 from paramem.utils.config import (
@@ -1720,6 +1720,7 @@ class ConsolidationLoop:
         schedule: str = "",
         max_interim_count: int = 7,
         stamp: str | None = None,
+        recall_sanity_threshold: float = 0.95,
     ) -> dict:
         """Extract one conversation, train onto the current interim adapter, register on success.
 
@@ -1836,19 +1837,72 @@ class ConsolidationLoop:
             }
 
         # --- 4. Normal branch: compute stamp and adapter name ---
+        # NOTE: ``schedule`` is the refresh_cadence here (historical parameter
+        # name kept on the method signature for call-site stability; semantics
+        # changed to match the new config model). The stamp IS the cadence
+        # boundary — no division by max_interim_count.
         if stamp is None:
             from paramem.server.interim_adapter import current_interim_stamp as _cis
 
-            stamp = _cis(schedule, max_interim_count)
+            stamp = _cis(schedule)
         adapter_name = f"episodic_interim_{stamp}"
 
-        # Create the interim adapter if this is the first fact of this sub-interval.
-        # create_interim_adapter is idempotent — no-op when the adapter already exists.
-        # The return value MUST be assigned back to self.model; PEFT's add_adapter may
-        # rebind the PeftModel wrapper.
+        # Cap-reached detection.  When every VRAM slot is occupied by an
+        # interim adapter for a previous sub-interval and the current
+        # sub-interval has not yet minted one, redirect the new keys into
+        # the *newest* existing interim and retrain it from scratch on the
+        # union of its old keys + the new ones.  This keeps the PEFT
+        # adapter count at or below ``max_interim_count`` without rolling
+        # eviction (which would silently drop knowledge).  The retrain is
+        # followed by a recall sanity probe; a failed probe rolls back to
+        # the snapshot and marks the adapter ``degenerated`` for the rest
+        # of the cycle.
+        cap_reached_absorb = False
         if adapter_name not in self.model.peft_config:
-            self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
-            logger.info("post_session_train: created interim adapter %s", adapter_name)
+            existing_interim = sorted(
+                a for a in self.model.peft_config if a.startswith("episodic_interim_")
+            )
+            if self.indexed_key_registry is not None and len(existing_interim) >= max_interim_count:
+                newest = existing_interim[-1]  # lex-max stamp = most recent
+                # Health gate: refuse to retrain an adapter already marked
+                # degenerated this cycle.  Queue the new facts in RAM so
+                # nothing is silently dropped; the next full consolidation
+                # clears the degenerated flag and folds the queue in.
+                if not self.indexed_key_registry.is_adapter_healthy(newest):
+                    if not hasattr(self, "pending_interim_triples"):
+                        self.pending_interim_triples: list[dict] = []
+                    self.pending_interim_triples.extend(episodic_qa)
+                    logger.warning(
+                        "post_session_train: newest interim %s is degenerated — "
+                        "queued %d triples for next full consolidation (pending: %d)",
+                        newest,
+                        len(episodic_qa),
+                        len(self.pending_interim_triples),
+                    )
+                    return {
+                        "triples_extracted": triples_extracted,
+                        "new_keys": [],
+                        "adapter_name": newest,
+                        "mode": "degenerated",
+                        "error": "target_adapter_degenerated",
+                    }
+                logger.info(
+                    "post_session_train: interim cap (%d >= %d) reached — "
+                    "absorbing %d new triples into newest interim %s via full retrain",
+                    len(existing_interim),
+                    max_interim_count,
+                    triples_extracted,
+                    newest,
+                )
+                adapter_name = newest
+                cap_reached_absorb = True
+            else:
+                # Normal: create a fresh interim adapter for this sub-interval.
+                # create_interim_adapter is idempotent — no-op when the adapter
+                # already exists.  The return value MUST be assigned back to
+                # self.model; PEFT's add_adapter may rebind the PeftModel wrapper.
+                self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
+                logger.info("post_session_train: created interim adapter %s", adapter_name)
 
         # --- 5. Assign keys to the new QA pairs ---
         if self.indexed_key_registry is None:
@@ -1884,7 +1938,21 @@ class ConsolidationLoop:
         # --- 6. Train episodic interim adapter ---
         # On failure, let the exception propagate; caller logs and returns error.
         # The registry is written AFTER both training passes succeed (I5 atomicity).
-        from paramem.models.loader import switch_adapter
+        from paramem.models.loader import copy_adapter_weights, create_adapter, switch_adapter
+
+        # Cap-reached retrain: snapshot the target adapter, then fresh-init its
+        # weights so the retrain starts from LoRA zeros rather than warm-starting
+        # from accumulated interference.  Snapshot is kept in a side slot and
+        # either discarded (success) or copied back (sanity fail).
+        snapshot_name: str | None = None
+        if cap_reached_absorb:
+            snapshot_name = f"{adapter_name}_retrain_snapshot"
+            if snapshot_name in self.model.peft_config:
+                self.model.delete_adapter(snapshot_name)
+            self.model = create_adapter(self.model, self.episodic_config, snapshot_name)
+            copy_adapter_weights(self.model, src=adapter_name, dst=snapshot_name)
+            self.model.delete_adapter(adapter_name)
+            self.model = create_adapter(self.model, self.episodic_config, adapter_name)
 
         switch_adapter(self.model, adapter_name)
         self._disable_gradient_checkpointing()
@@ -1910,6 +1978,55 @@ class ConsolidationLoop:
             run_name=f"interim-{adapter_name}-{session_id}",
             callbacks_extra=self._shutdown_callbacks,
         )
+
+        # --- 6a. Recall sanity probe (cap-reached retrain only) ---
+        # The normal append-to-existing path warm-starts from weights that
+        # already encode the earlier keys, so incremental degradation is
+        # rare.  The cap-reached retrain reinitialises and trains on every
+        # key the adapter has ever seen plus the new ones; if capacity is
+        # exhausted the probe is the only thing that catches it before the
+        # registry is mutated.
+        if cap_reached_absorb:
+            recall_rate = self._run_recall_sanity_probe(adapter_name, all_interim_keyed)
+            if recall_rate < recall_sanity_threshold:
+                # Rollback: restore snapshot weights, mark the adapter
+                # degenerated, skip procedural + registration, persist the
+                # registry so the flag survives a restart.
+                copy_adapter_weights(self.model, src=snapshot_name, dst=adapter_name)
+                self.model.delete_adapter(snapshot_name)
+                self.indexed_key_registry.set_adapter_health(
+                    adapter_name,
+                    ADAPTER_HEALTH_DEGENERATED,
+                    reason=(
+                        f"recall {recall_rate:.3f} < {recall_sanity_threshold:.2f} "
+                        f"after cap-reached retrain on {len(all_interim_keyed)} keys"
+                    ),
+                )
+                self.indexed_key_registry.save(self.output_dir / "indexed_key_registry.json")
+                logger.warning(
+                    "post_session_train: cap-reached retrain failed sanity "
+                    "(recall=%.3f < %.2f) on %s — rolled back, marked degenerated",
+                    recall_rate,
+                    recall_sanity_threshold,
+                    adapter_name,
+                )
+                if "episodic" in self.model.peft_config:
+                    switch_adapter(self.model, "episodic")
+                return {
+                    "triples_extracted": triples_extracted,
+                    "new_keys": [],
+                    "adapter_name": adapter_name,
+                    "mode": "degenerated",
+                    "error": f"recall_sanity_failed:{recall_rate:.3f}",
+                }
+            # Success — drop the snapshot slot and continue.
+            self.model.delete_adapter(snapshot_name)
+            snapshot_name = None
+            logger.info(
+                "post_session_train: cap-reached retrain passed sanity (recall=%.3f) on %s",
+                recall_rate,
+                adapter_name,
+            )
 
         # --- 6b. Train procedural main adapter (I1) ---
         # Procedural relations always go to the stable 'procedural' main adapter —
@@ -2361,38 +2478,8 @@ class ConsolidationLoop:
                     trainer._set_is_training(False)
                     trainer._current_job = prior_job
 
-            # e. Recall-sanity check (Step 7d).
-            # Probe a sample of up to 100 keys uniformly at random.
-            # adapter_name= MUST be passed explicitly — default "episodic" would
-            # silently probe the wrong tier for semantic/procedural.
-            probe_pairs = job.keyed_pairs
-            if len(probe_pairs) > 100:
-                probe_pairs = random.sample(probe_pairs, 100)
-
-            # Build a minimal simhash registry for the probe.
-            from paramem.training.indexed_memory import build_registry as _build_reg
-
-            probe_registry = _build_reg(probe_pairs)
-
-            try:
-                from experiments.utils.test_harness import evaluate_indexed_recall
-
-                self._disable_gradient_checkpointing()
-                recall_result = evaluate_indexed_recall(
-                    self.model,
-                    self.tokenizer,
-                    probe_pairs,
-                    probe_registry,
-                    adapter_name=tier,
-                )
-                recall_rate = recall_result["rate"]
-            except Exception:
-                logger.exception(
-                    "consolidate_interim_adapters: recall probe failed for tier %s — "
-                    "treating as recall=0.0 to trigger rollback",
-                    tier,
-                )
-                recall_rate = 0.0
+            # e. Recall-sanity check (Step 7d) — shared helper with cap-reached retrain.
+            recall_rate = self._run_recall_sanity_probe(tier, job.keyed_pairs)
 
             recall_per_tier[tier] = recall_rate
             logger.info(
@@ -2506,6 +2593,73 @@ class ConsolidationLoop:
             "rollback_tier": None,
         }
 
+    def _run_recall_sanity_probe(
+        self,
+        adapter_name: str,
+        keyed_pairs: list[dict],
+        *,
+        max_probe: int = 100,
+    ) -> float:
+        """Probe up to *max_probe* keyed pairs against *adapter_name* and return the recall rate.
+
+        Shared by :meth:`consolidate_interim_adapters` (Step 7) and the
+        cap-reached retrain path in :meth:`post_session_train`.  Keeping
+        the logic in one place makes the sanity contract identical
+        everywhere: same sample size, same probe harness, same failure
+        semantics (probe exception → ``0.0`` so callers treat it as a
+        rollback trigger rather than a mysterious skip).
+
+        The caller is responsible for deciding what to do with the
+        returned rate (threshold compare, rollback, health update).
+
+        Args:
+            adapter_name: Adapter to probe.  Must be loaded and switchable
+                (caller holds the GPU lock).  The default ``"episodic"``
+                in :func:`evaluate_indexed_recall` is deliberately NOT
+                relied on — silently probing the wrong tier would mask
+                tier-specific regressions.
+            keyed_pairs: Candidate pairs to probe.  Sampled uniformly
+                down to *max_probe* when longer.  An empty list returns
+                ``1.0`` (nothing to prove → healthy by default).
+            max_probe: Cap on probe size.  100 is chosen to keep the
+                probe cheap enough to run inline even inside the
+                post-session training path.
+
+        Returns:
+            Recall rate in ``[0.0, 1.0]``.  On probe-harness exception,
+            returns ``0.0`` so the caller trips its sanity threshold.
+        """
+        if not keyed_pairs:
+            return 1.0
+
+        probe_pairs = keyed_pairs
+        if len(probe_pairs) > max_probe:
+            probe_pairs = random.sample(probe_pairs, max_probe)
+
+        from paramem.training.indexed_memory import build_registry as _build_reg
+
+        probe_registry = _build_reg(probe_pairs)
+
+        try:
+            from experiments.utils.test_harness import evaluate_indexed_recall
+
+            self._disable_gradient_checkpointing()
+            recall_result = evaluate_indexed_recall(
+                self.model,
+                self.tokenizer,
+                probe_pairs,
+                probe_registry,
+                adapter_name=adapter_name,
+            )
+            return float(recall_result["rate"])
+        except Exception:
+            logger.exception(
+                "_run_recall_sanity_probe: recall probe failed for adapter %s — "
+                "returning 0.0 so caller trips the sanity gate",
+                adapter_name,
+            )
+            return 0.0
+
     def _append_capacity_ceiling_log(
         self,
         *,
@@ -2593,12 +2747,30 @@ class ConsolidationLoop:
             logger.info("Creating in_training staging adapter")
             self.model = create_adapter(self.model, self.episodic_config, "in_training")
 
-        # Clean stale staging checkpoints on disk — in_training is never
-        # authoritative on disk; only production adapters are.
+        # Clean stale staging checkpoints on disk unless a valid resume state
+        # is present — in that case the directory holds a live checkpoint that
+        # the BackgroundTrainer will use on the next job submission.
         stale_dir = Path(self.output_dir) / "in_training"
         if stale_dir.exists():
-            logger.info("Cleaning stale in_training checkpoints at %s", stale_dir)
-            shutil.rmtree(stale_dir)
+            from paramem.server.background_trainer import _RESUME_STATE_FILE, _read_resume_state
+
+            resume_state_path = stale_dir / _RESUME_STATE_FILE
+            resume_state = _read_resume_state(resume_state_path)
+            has_live_checkpoint = (
+                resume_state is not None
+                and bool(resume_state.get("checkpoint_path", ""))
+                and Path(resume_state["checkpoint_path"]).is_dir()
+            )
+            if has_live_checkpoint:
+                logger.info(
+                    "Preserving in_training state for resume: adapter=%s epoch=%d/%d",
+                    resume_state.get("adapter_name", "?"),
+                    resume_state.get("last_completed_epoch", 0),
+                    resume_state.get("total_epochs", 0),
+                )
+            else:
+                logger.info("Cleaning stale in_training checkpoints at %s", stale_dir)
+                shutil.rmtree(stale_dir)
 
         return self.model
 

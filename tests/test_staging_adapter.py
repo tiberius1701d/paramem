@@ -610,7 +610,7 @@ class TestMultiJobSequencing:
             def __init__(self, **kwargs):
                 pass
 
-            def train(self):
+            def train(self, resume_from_checkpoint=None):
                 calls.append(("train",))
 
         monkeypatch.setattr("paramem.server.background_trainer.Trainer", FakeTrainer)

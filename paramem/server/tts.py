@@ -372,6 +372,16 @@ class TTSManager:
         """Whether any loaded engine is on GPU."""
         return "cuda" in self._engine_devices.values()
 
+    @property
+    def engine_devices(self) -> dict[str, str]:
+        """Return a copy of the lang-code → actual-device map.
+
+        Surfaced for /status so pstatus can display the resolved device
+        (and flag legal CPU fallback paths) without poking the private
+        ``_engine_devices`` attribute.
+        """
+        return dict(self._engine_devices)
+
     def has_language(self, language: str) -> bool:
         """Check if a language has a loaded TTS engine."""
         return language in self._engines

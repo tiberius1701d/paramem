@@ -44,6 +44,7 @@ def enqueue_post_session_train(
     background_trainer,
     config: "ServerConfig",
     state: dict,
+    post_session_queue=None,
 ) -> None:
     """Enqueue a post-conversation training job on the BackgroundTrainer.
 
@@ -65,6 +66,13 @@ def enqueue_post_session_train(
     This function is intentionally side-effect free on the conversation path —
     it never blocks the response being returned to the caller.
 
+    When *post_session_queue* is provided the entry for *conversation_id* is
+    removed from the persistent queue on successful completion of
+    ``post_session_train``.  The caller is responsible for calling
+    ``post_session_queue.enqueue(...)`` **before** calling this function so
+    that a crash between enqueue and training-start is recoverable on the next
+    server restart.
+
     Args:
         conversation_id: The conversation identifier (used as ``session_id``).
         transcript: The full conversation transcript text (all turns joined).
@@ -77,11 +85,15 @@ def enqueue_post_session_train(
         config: Server config for ``schedule`` and ``max_interim_count``.
         state: Global ``_state`` dict; ``state["model"]`` is updated after
             training completes.
+        post_session_queue: Optional :class:`~paramem.server.post_session_queue.PostSessionQueue`
+            instance.  When provided, a successful training run removes
+            *conversation_id* from the queue so it is not replayed on the next
+            server restart.
     """
     if loop is None or background_trainer is None:
         return
 
-    schedule = config.consolidation.schedule
+    schedule = config.consolidation.refresh_cadence
     max_interim_count = config.consolidation.max_interim_count
 
     def _run_post_session_train() -> None:
@@ -104,8 +116,14 @@ def enqueue_post_session_train(
                 result.get("adapter_name"),
                 len(result.get("new_keys", [])),
             )
+            # Remove the entry from the persistent queue on success so it is
+            # not replayed on the next server restart.
+            if post_session_queue is not None:
+                post_session_queue.remove(conversation_id)
         except Exception:
             logger.exception("post_session_train failed for conversation %s", conversation_id)
+            # Entry intentionally left in queue on failure so a future restart
+            # can retry.
 
     background_trainer.submit(
         _run_post_session_train,

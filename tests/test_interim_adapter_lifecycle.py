@@ -8,7 +8,8 @@ Covers:
   - unload_interim_adapters with no interim adapters present returns empty list.
   - current_interim_stamp returns a correctly formatted timestamp.
   - compute_schedule_period_seconds parses all supported schedule grammars.
-  - current_interim_stamp(schedule, count) floors to the correct sub-interval.
+  - current_interim_stamp(refresh_cadence) floors to the correct cadence boundary.
+    refresh_cadence IS the sub-interval directly — no division by max_interim_count.
 
 No GPU required — all PEFT and model interactions use stub objects.
 """
@@ -511,39 +512,53 @@ class TestComputeSchedulePeriodSeconds:
 
 
 # ---------------------------------------------------------------------------
-# Test 7 — current_interim_stamp with schedule + count
+# Test 7 — current_interim_stamp with refresh_cadence
 # ---------------------------------------------------------------------------
 
 
-class TestCurrentInterimStampWithSchedule:
-    """Floor-to-sub-interval logic for current_interim_stamp(schedule, count)."""
+class TestCurrentInterimStampWithCadence:
+    """Floor-to-cadence logic for current_interim_stamp(refresh_cadence).
 
-    def test_every_2h_count_4_floors_to_30min_boundary(self) -> None:
-        """schedule='every 2h', count=4 → sub_interval=30min.
+    refresh_cadence IS the sub-interval directly — no division by
+    max_interim_count. Full consolidation period is derived elsewhere
+    (ConsolidationScheduleConfig.consolidation_period_string).
+    """
 
-        period = 7200, sub_interval = 7200/4 = 1800s (30 min).
-        At 14:47 → floor to 14:30.
+    def test_every_30m_floors_to_30min_boundary(self) -> None:
+        """refresh_cadence='every 30m' → boundary every 30 minutes from midnight.
+
+        At 14:47 → seconds_since_midnight = 14*3600+47*60 = 53220.
+        floored = (53220 // 1800) * 1800 = 29*1800 = 52200 = 14:30.
         """
         now = datetime(2026, 4, 18, 14, 47, 0)
-        stamp = current_interim_stamp("every 2h", 4, _now=now)
+        stamp = current_interim_stamp("every 30m", _now=now)
         assert stamp == "20260418T1430"
 
-    def test_every_2h_count_4_floor_at_exact_boundary(self) -> None:
+    def test_every_30m_floor_at_exact_boundary(self) -> None:
         """At exactly a 30-min boundary the stamp equals that boundary."""
         now = datetime(2026, 4, 18, 14, 30, 0)
-        stamp = current_interim_stamp("every 2h", 4, _now=now)
+        stamp = current_interim_stamp("every 30m", _now=now)
         assert stamp == "20260418T1430"
 
-    def test_daily_03_00_count_6_floors_to_4h_boundary(self) -> None:
-        """schedule='03:00', count=6 → sub_interval=4h.
+    def test_every_4h_floors_to_4h_boundary(self) -> None:
+        """refresh_cadence='every 4h' → boundary every 4h from midnight.
 
-        period = 86400, sub_interval = 86400/6 = 14400s (4h).
-        At 09:15 → seconds_since_midnight = 33300
+        At 09:15 → seconds_since_midnight = 33300.
         floored = (33300 // 14400) * 14400 = 28800 = 08:00.
         """
         now = datetime(2026, 4, 18, 9, 15, 0)
-        stamp = current_interim_stamp("03:00", 6, _now=now)
+        stamp = current_interim_stamp("every 4h", _now=now)
         assert stamp == "20260418T0800"
+
+    def test_daily_hhmm_floors_to_day_boundary(self) -> None:
+        """refresh_cadence='03:00' (daily) → 86400s boundary from midnight.
+
+        At 09:15 → seconds_since_midnight = 33300.
+        floored = (33300 // 86400) * 86400 = 0 = 00:00.
+        """
+        now = datetime(2026, 4, 18, 9, 15, 0)
+        stamp = current_interim_stamp("03:00", _now=now)
+        assert stamp == "20260418T0000"
 
     def test_zero_arg_form_returns_current_minute(self) -> None:
         """Zero-arg form (backward compat) returns floor-to-minute stamp."""
@@ -551,39 +566,35 @@ class TestCurrentInterimStampWithSchedule:
         stamp = current_interim_stamp(_now=now)
         assert stamp == "20260418T1447"
 
-    def test_max_interim_count_zero_raises_with_schedule(self) -> None:
-        """max_interim_count=0 with a real schedule raises ValueError.
+    def test_off_variant_cadence_floors_to_nearest_hour(self) -> None:
+        """Explicit off-variant ("off"/"disabled"/"none") falls back to 1-h boundaries.
 
-        Callers must handle the queue-until-consolidation branch before calling
-        current_interim_stamp.
+        Callers that want to skip stamping entirely should take the
+        queue-branch earlier rather than rely on this fallback. Empty
+        string is reserved for the zero-arg form (raw minute, no
+        flooring — see ``test_zero_arg_form_returns_current_minute``).
         """
-        with pytest.raises(ValueError, match="queue until consolidation"):
-            current_interim_stamp("every 2h", 0)
-
-    def test_negative_max_interim_count_raises(self) -> None:
-        """Negative max_interim_count is invalid and raises ValueError."""
-        with pytest.raises(ValueError, match=">="):
-            current_interim_stamp("every 2h", -1)
-
-    def test_manual_schedule_empty_floors_to_nearest_hour(self) -> None:
-        """Empty schedule with count > 0 falls back to 1-hour boundaries."""
         now = datetime(2026, 4, 18, 14, 47, 0)
-        stamp = current_interim_stamp("", 7, _now=now)
-        # sub_interval=3600; seconds_since_midnight = 14*3600+47*60 = 53220
-        # floored = (53220 // 3600) * 3600 = 50400 = 14:00
-        assert stamp == "20260418T1400"
+        for cadence in ("off", "disabled", "none"):
+            stamp = current_interim_stamp(cadence, _now=now)
+            # sub_interval=3600; seconds_since_midnight = 53220
+            # floored = (53220 // 3600) * 3600 = 50400 = 14:00
+            assert stamp == "20260418T1400", (
+                f"off-variant {cadence!r} should floor to 14:00, got {stamp}"
+            )
 
     def test_stamp_format_matches_yyyymmddthhmm(self) -> None:
         """The stamp always matches the YYYYMMDDTHHMM format."""
         now = datetime(2026, 4, 18, 9, 5, 0)
-        stamp = current_interim_stamp("every 2h", 4, _now=now)
+        stamp = current_interim_stamp("every 30m", _now=now)
         assert re.match(r"^\d{8}T\d{4}$", stamp), f"Unexpected format: {stamp!r}"
 
-    def test_every_2h_count_1_floors_to_2h_boundary(self) -> None:
-        """With count=1, sub_interval = full period (one bucket per cycle)."""
+    def test_every_2h_floors_to_2h_boundary(self) -> None:
+        """refresh_cadence='every 2h' → boundary every 2h from midnight.
+
+        At 14:47 → seconds_since_midnight = 53220.
+        floored = (53220 // 7200) * 7200 = 7*7200 = 50400 = 14:00.
+        """
         now = datetime(2026, 4, 18, 14, 47, 0)
-        # period = 7200, sub_interval = 7200/1 = 7200 (2h)
-        # seconds_since_midnight = 14*3600+47*60 = 53220
-        # floored = (53220 // 7200) * 7200 = 7*7200 = 50400 = 14:00
-        stamp = current_interim_stamp("every 2h", 1, _now=now)
+        stamp = current_interim_stamp("every 2h", _now=now)
         assert stamp == "20260418T1400"

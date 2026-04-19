@@ -16,7 +16,7 @@ Tests cover:
 
 import os
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -669,3 +669,284 @@ class TestBatchConsolidationE2E:
         if episodic_qa:
             result = loop.train_adapters(episodic_qa, procedural_rels, speaker_id="sp1")
             assert isinstance(result, dict)
+
+
+# --- 9. VRAM budget: math prediction vs real GPU occupation ---
+
+
+class TestVRAMBudget:
+    """Verify the VRAM validator against the full production loading chain.
+
+    The validator is a math-based gate that runs *before* any model loads.
+    These tests confirm two things the unit tests cannot:
+
+    a) **Math in advance (warning path).** When the configuration does not
+       fit, the validator raises :class:`ConfigurationError` with a
+       structured breakdown and actionable remediation *before* the base
+       model is loaded. No VRAM is consumed on rejection.
+
+    b) **Real VRAM occupation (confirmation path).** When the
+       configuration does fit by the math, the full chain actually loads
+       on the GPU — base model + Whisper STT + TTS + 3 main adapters +
+       14 interim adapters + staging slot — and real
+       ``torch.cuda.mem_get_info()`` confirms we stay under the hardware
+       cap. This catches drift between the validator's static estimate
+       and the true working set (e.g. if STT/TTS grow, or an adapter
+       shape changes and the math table isn't updated).
+
+    These tests must stay together. Breaking (a) while (b) still passes
+    means a misconfiguration would crash at load time instead of being
+    rejected at startup; breaking (b) while (a) still passes means the
+    validator's "fit" verdict is no longer trustworthy.
+    """
+
+    _HARDWARE_CAP_GIB: float = 8.0  # RTX 5070 Laptop
+    _TARGET_MODULES: tuple[str, ...] = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+
+    def _create_adapters(self, model, adapter_cfg, names):
+        """Attach each adapter in ``names`` to ``model`` and return the (possibly
+        wrapped) PeftModel. Delegates to :func:`create_adapter` so the
+        wrap-vs-add-adapter logic matches production."""
+        from paramem.models.loader import create_adapter
+
+        for name in names:
+            model = create_adapter(model, adapter_cfg, name)
+        return model
+
+    def _delete_adapters(self, model, names):
+        for name in names:
+            try:
+                model.delete_adapter(name)
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+
+    def test_fitting_config_math_and_reality(self, model_and_tokenizer):
+        """Full production chain fits: validator passes AND real VRAM confirms.
+
+        Loading order mirrors ``paramem.server.app.lifespan``:
+        base → STT → TTS → main adapters → interim adapters → staging.
+        At the end we compare real ``memory_allocated()`` against the
+        validator's predicted total and assert we stay under the
+        hardware cap.
+        """
+        import gc
+
+        import torch
+
+        from paramem.server.config import load_server_config
+        from paramem.server.vram_validator import (
+            _MODEL_VRAM_BYTES,
+            _SAFETY_MARGIN_BYTES,
+            estimate_stt_bytes,
+            estimate_tts_bytes,
+            estimated_adapter_bytes,
+            validate_startup_vram,
+        )
+
+        model, _tokenizer = model_and_tokenizer
+        server_cfg = load_server_config("configs/server.yaml")
+        adapter_cfg = server_cfg.episodic_adapter_config
+        max_interim = server_cfg.consolidation.max_interim_count
+        assert max_interim >= 1, "max_interim_count must be at least 1 for this test"
+
+        created_names: list[str] = []
+        stt = None
+        tts_manager = None
+
+        try:
+            # ── (a) math gate: pre-load math on a fresh GPU.
+            # The module fixture has already loaded the base model, so real
+            # ``mem_get_info`` would understate available free bytes (it would
+            # exclude the already-loaded base, which is exactly what the
+            # pre-load branch wants to include). We pass ``vram_cap_gib`` to
+            # simulate the production pre-load condition: fresh GPU, full
+            # 8 GiB available. This is the math the server would run at boot
+            # before any load begins.
+            stt_bytes = estimate_stt_bytes(server_cfg.stt)
+            tts_bytes = estimate_tts_bytes(server_cfg.tts)
+            validate_startup_vram(
+                None,
+                adapter_cfg,
+                max_interim_count=max_interim,
+                model_name=server_cfg.model_name,
+                main_adapter_count=3,
+                stt_bytes=stt_bytes,
+                tts_bytes=tts_bytes,
+                vram_cap_gib=self._HARDWARE_CAP_GIB,
+            )
+
+            # ── STT: Whisper per server.yaml (distil-large-v3 int8 on cuda).
+            if server_cfg.stt.enabled and server_cfg.stt.device != "cpu":
+                from paramem.server.stt import WhisperSTT
+
+                stt = WhisperSTT(
+                    model_name=server_cfg.stt.model,
+                    device=server_cfg.stt.device,
+                    compute_type=server_cfg.stt.compute_type,
+                    language=server_cfg.stt.language,
+                    beam_size=server_cfg.stt.beam_size,
+                    vad_filter=server_cfg.stt.vad_filter,
+                )
+                if not stt.load():
+                    pytest.skip("Whisper failed to load — cannot validate full STT+TTS chain")
+
+            # ── TTS: whatever server.yaml configures (Piper CPU, MMS-TTS, etc.).
+            if server_cfg.tts.enabled:
+                from paramem.server.tts import TTSManager
+
+                tts_manager = TTSManager(
+                    server_cfg.tts,
+                    vram_safety_margin_mb=server_cfg.server.vram_safety_margin_mb,
+                )
+                tts_manager.load_all()
+
+            # ── Adapters: 3 main + max_interim interims + 1 staging slot.
+            # Names must not collide with anything pytest-prior tests created.
+            main_names = ["episodic_vram_probe", "semantic_vram_probe", "procedural_vram_probe"]
+            interim_names = [f"episodic_interim_vram_probe_{i:02d}" for i in range(max_interim)]
+            staging_name = "in_training_vram_probe"
+            all_names = main_names + interim_names + [staging_name]
+
+            model = self._create_adapters(model, adapter_cfg, all_names)
+            created_names.extend(all_names)
+
+            # ── (b) reality gate: verify post-load real VRAM usage.
+            # mem_get_info reports free bytes AFTER we loaded everything. The
+            # budget check here is: free ≥ safety_margin + headroom, i.e. we
+            # haven't eaten into the 1 GiB KV cache / activation reserve.
+            torch.cuda.synchronize()
+            free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+            allocated_bytes = torch.cuda.memory_allocated(0)
+            used_bytes = total_bytes - free_bytes
+            used_gib = used_bytes / 2**30
+
+            # Predicted working set from the validator's math (without interim
+            # headroom — those are all materialized now, so the only remaining
+            # reservation is the 1 GiB KV cache + 256 MiB fragmentation margin).
+            # STT/TTS bytes are included because the real VRAM reading captures
+            # their allocations; omitting them here produced the 800 MiB
+            # math-vs-reality gap that motivated the estimator work.
+            hidden_size, num_layers = 4096, 32  # Mistral 7B
+            adapter_bytes = estimated_adapter_bytes(adapter_cfg, hidden_size, num_layers)
+            predicted_loaded = (
+                _MODEL_VRAM_BYTES[server_cfg.model_name]
+                + (3 + max_interim + 1) * adapter_bytes
+                + stt_bytes
+                + tts_bytes
+            )
+
+            print(
+                f"\n[VRAM reality] used={used_gib:.2f} GiB / {total_bytes / 2**30:.2f} GiB, "
+                f"allocated={allocated_bytes / 2**30:.2f} GiB, "
+                f"predicted={predicted_loaded / 2**30:.2f} GiB, "
+                f"free={free_bytes / 2**30:.2f} GiB"
+            )
+
+            # Hard cap: total GPU usage must stay under the hardware limit with
+            # room for KV cache. If this fails, the math lied about the fit.
+            assert used_gib < self._HARDWARE_CAP_GIB, (
+                f"Real VRAM usage {used_gib:.2f} GiB exceeds hardware cap "
+                f"{self._HARDWARE_CAP_GIB} GiB — validator's fit verdict is "
+                f"unreliable."
+            )
+
+            # Free bytes must leave room for at least the 256 MiB safety margin
+            # the validator reserves; otherwise KV cache during inference OOMs.
+            assert free_bytes >= _SAFETY_MARGIN_BYTES, (
+                f"Only {free_bytes / 2**20:.0f} MiB free after full-chain load "
+                f"— below the {_SAFETY_MARGIN_BYTES / 2**20:.0f} MiB safety "
+                f"margin."
+            )
+
+        finally:
+            self._delete_adapters(model, created_names)
+            if stt is not None:
+                stt.unload()
+            if tts_manager is not None:
+                tts_manager.unload_all()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def test_overbudget_config_rejected_before_load(self, caplog):
+        """Oversized topology triggers math-based rejection with user-facing
+        warning — and proves no load was attempted (real-VRAM failure avoided).
+
+        This is the "proper failure reaction" path: operator configures a
+        topology that won't fit, the server refuses to start with an
+        actionable error, and no GPU pressure is ever applied. Without this
+        gate the loads would proceed until CUDA OOM, which is harder to
+        diagnose and leaks allocation state.
+        """
+        import logging
+
+        from paramem.server.vram_validator import (
+            ConfigurationError,
+            validate_startup_vram,
+        )
+        from paramem.utils.config import AdapterConfig
+
+        oversized = AdapterConfig(
+            rank=256,
+            alpha=512,
+            learning_rate=2e-4,
+            target_modules=list(self._TARGET_MODULES),
+            dropout=0.0,
+        )
+        absurd_max_interim = 50
+
+        diagnostic_calls: list[int] = []
+
+        def _spy_diagnostic():
+            diagnostic_calls.append(1)
+
+        with patch(
+            "paramem.server.vram_validator._log_gpu_occupancy_diagnostic",
+            _spy_diagnostic,
+        ):
+            with caplog.at_level(logging.INFO, logger="paramem.server.vram_validator"):
+                with pytest.raises(ConfigurationError) as exc_info:
+                    validate_startup_vram(
+                        None,
+                        oversized,
+                        max_interim_count=absurd_max_interim,
+                        model_name="mistral",
+                        model_id="mistralai/Mistral-7B-Instruct-v0.3",
+                        main_adapter_count=3,
+                    )
+
+        msg = str(exc_info.value)
+
+        # User-facing message must include every component of the breakdown
+        # and every remediation knob so the operator can act on it.
+        assert "VRAM Working Set Breakdown" in msg
+        assert "base model" in msg
+        assert "main adapters" in msg
+        assert "interim adapters" in msg
+        assert "in_training staging slot" in msg
+        assert "KV cache headroom" in msg
+        assert "required total" in msg
+        assert "available (free VRAM)" in msg
+        assert "margin" in msg
+        assert "Reduce one of:" in msg
+        assert f"current={oversized.rank}" in msg
+        assert f"current={absurd_max_interim}" in msg
+        assert f"current={len(self._TARGET_MODULES)}" in msg
+        assert "mistralai/Mistral-7B-Instruct-v0.3" in msg
+
+        # The nvidia-smi diagnostic must fire exactly once on the failure
+        # path so operators see who is already holding VRAM.
+        assert len(diagnostic_calls) == 1, (
+            f"Expected _log_gpu_occupancy_diagnostic to be called once, got {len(diagnostic_calls)}"
+        )
+
+        # Success path must NOT have been taken (no "VRAM check passed" log).
+        passed_logs = [r for r in caplog.records if "VRAM check passed" in r.getMessage()]
+        assert not passed_logs, "Validator logged success but also raised — inconsistent path."

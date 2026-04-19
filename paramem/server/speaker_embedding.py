@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 
 _embedding_model = None
 
+# HF model id for the speaker-embedding backend. Exposed so /status can
+# surface the active backbone without the caller having to know pyannote.
+EMBEDDING_MODEL_NAME = "pyannote/wespeaker-voxceleb-resnet34-LM"
+EMBEDDING_BACKEND = "pyannote"
+EMBEDDING_DEVICE = "cpu"
+
 
 def load_embedding_model() -> bool:
     """Load the pyannote speaker embedding model at startup.
@@ -28,15 +34,14 @@ def load_embedding_model() -> bool:
         logger.warning("pyannote-audio not installed — install with: pip install paramem[speaker]")
         return False
 
-    model_name = "pyannote/wespeaker-voxceleb-resnet34-LM"
     logger.info("Loading pyannote speaker embedding model...")
-    model = Model.from_pretrained(model_name)
+    model = Model.from_pretrained(EMBEDDING_MODEL_NAME)
     _embedding_model = Inference(
         model,
         window="whole",
-        device=torch.device("cpu"),
+        device=torch.device(EMBEDDING_DEVICE),
     )
-    logger.info("Speaker embedding model loaded: %s (CPU)", model_name)
+    logger.info("Speaker embedding model loaded: %s (%s)", EMBEDDING_MODEL_NAME, EMBEDDING_DEVICE)
     return True
 
 

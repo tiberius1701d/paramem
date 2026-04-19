@@ -150,6 +150,9 @@ class WhisperSTT:
             logger.exception("Failed to load Whisper model")
             return False
 
+        # Update self.device to the resolved value so pstatus and other
+        # readers see "cuda"/"cpu" rather than the pre-load "auto" literal.
+        self.device = device
         logger.info("Whisper %s loaded on %s", self.model_name, device)
         return True
 
