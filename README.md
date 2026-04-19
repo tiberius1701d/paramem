@@ -73,7 +73,7 @@ All experiments run on a single RTX 5070 (8GB VRAM) using QLoRA 4-bit quantizati
 
 Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/extractor.py`): local LLM extraction with speaker-name injection → anonymization (real → placeholder mapping) → leak guard + repair → SOTA enrichment with brace-binding protocol (cloud sees only placeholders, new entities must round-trip via `{Prefix_N}` tokens grounded in the transcript) → de-anonymization with residual-placeholder sweep → plausibility filter → transcript-grounding gate (drops SOTA world-knowledge inferences). A fallback path runs local plausibility + grounding on raw extraction if the primary chain empties out. All stages fall forward and are configurable under `consolidation:` in `server.yaml`.
 
-**Background training** runs on a configurable interval (default: every 2 hours). The `BackgroundTrainer` pauses at step boundaries for inference requests and switches the model between eval/train mode automatically. A **simulation mode** (`consolidation.mode: simulate`) runs extraction only, saving results to a debug directory without training.
+**Background training** is driven by a systemd user timer whose period derives from `consolidation.refresh_cadence` (default `"12h"`). The full-consolidation period is derived, not configured: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Interim adapters absorb new facts between full cycles so recall does not wait a full period. `BackgroundTrainer` pauses at step boundaries for inference requests, switches the model between eval/train mode, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes from the last completed epoch rather than restarting from zero. A missed post-session training trigger is replayed from a persistent queue (`post_session_queue.json`) on startup. A **simulation mode** (`consolidation.mode: simulate`) runs extraction only, saving results to a debug directory without training.
 
 **Speaker identification** uses pyannote 512-dim voice embeddings with multi-embedding centroid matching and auto-enrichment on confirmed matches.
 
@@ -224,52 +224,30 @@ The server listens on port 8420. On startup it auto-detects GPU availability —
 
 ### Configuration
 
-Edit `configs/server.yaml`:
+`configs/server.yaml` is fully commented — every option has inline docs
+explaining its effect, privacy implications, and interaction with other
+options. A short map of the top-level sections:
 
-```yaml
-server:
-  host: "0.0.0.0"
-  port: 8420
-  reclaim_interval_minutes: 10
+| Section | Purpose |
+|---------|---------|
+| `cloud_only` | Opt-out of local PM — route every query to the SOTA cloud agent. Security-critical. |
+| `server` | Host, port, VRAM safety margin, auto-reclaim polling. |
+| `model` | Base model (`mistral`, `gemma`, `qwen3b`, `gemma4`). |
+| `debug`, `snapshot_key` | Privacy mode + Fernet key for encrypted session snapshots. |
+| `paths` | Data, sessions, debug, prompts directories. |
+| `adapters` | Per-adapter `enabled` / `rank` / `alpha` / `learning_rate` / `target_modules`. |
+| `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Also gates the extraction pipeline stages (noise filter, plausibility, anonymization, NER check) and thermal throttle. |
+| `agents` | SOTA cloud fallback (`sota` + `sota_providers`), HA conversation agent id. |
+| `tools.ha` | HA URL, token, language filter, entity allowlist, tool timeout. |
+| `sanitization` | PII gate for cloud egress (`off`/`warn`/`block`). |
+| `voice` | Voice prompt file, per-speaker greeting cadence. |
+| `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
+| `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
 
-model: mistral          # mistral | gemma | qwen3b | qwen | ministral | llama | gemma4
-
-paths:
-  data: data/ha
-  sessions: data/ha/sessions
-  prompts: configs/prompts
-
-adapters:
-  episodic:
-    enabled: true
-    rank: 8
-    alpha: 16
-
-consolidation:
-  schedule: "every 2h"  # "HH:MM" (daily) or "every Nh"/"every Nm" (interval); "" = manual only
-
-agents:
-  sota:                 # SOTA cloud fallback for reasoning queries
-    enabled: true
-    provider: anthropic
-    model: claude-sonnet-4-6
-    api_key: ${ANTHROPIC_API_KEY}
-  ha_agent_id: conversation.groq  # HA conversation agent for tool execution
-
-tools:
-  ha:
-    url: ${HA_URL}
-    token: ${HA_TOKEN}
-    auto_discover: true
-    supported_languages: [en, de, fr, es]
-    allowlist:
-      - light.*
-      - switch.*
-      - script.*
-      - climate.*
-      - media_player.*
-  tool_timeout_seconds: 10        # allows for VPN latency
-```
+Operational invariant: consolidation has exactly one user-facing scheduling
+knob (`consolidation.refresh_cadence`). Everything else derives from it.
+Scheduling is owned by a systemd user timer (`paramem-consolidate.timer`)
+with `Persistent=true`, so a trigger missed during suspend fires on resume.
 
 ### Architecture
 
@@ -283,6 +261,16 @@ Response → HA TTS → Sonos (announce)
 ```
 
 ParaMem owns memory (speaker identification, entity routing, adapter recall, consolidation). Home Assistant owns everything else (device control, search, weather, music, prompt engineering, model selection). Non-memory queries are forwarded to HA's configured conversation agent, which handles tool execution, entity resolution, and room-aware context internally.
+
+### Consolidation & Crash Safety
+
+- **Two adapter tiers:** committed main adapters (`episodic` / `semantic` / `procedural`) plus short-lived **interim adapters** minted at each `refresh_cadence` tick. Interim adapters absorb new facts so recall works inside a refresh window without waiting for the full cycle. They accumulate up to `max_interim_count` (default 7), capped by VRAM.
+- **Atomic full-cycle finalize:** at the full-consolidation boundary, all interim adapters are rebuilt into the mains via replay on `keyed_pairs ∪ all_interim_keys`, recall-sanity-checked, and purged. On sanity-check failure the cycle rolls back to the pre-finalize snapshot — mains and interim state are preserved.
+- **Staging slot:** a reserved `in_training` adapter slot isolates inference from model reload during consolidation — `/chat` never blocks on training.
+- **Epoch-level resume:** `BackgroundTrainer` writes `resume_state.json` + keeps the two most recent HF Trainer checkpoints in `bg_checkpoint/` at each epoch boundary. A crash mid-cycle resumes at the last completed epoch after SHA-256 fingerprint validation of `keyed_pairs` + training config. Stale state is discarded.
+- **Persistent post-session queue:** when `post_session_train_enabled: true`, each assistant turn enqueues the session via atomic temp-file + `os.replace` before the training hook fires. Startup drains leftover entries so a crash between session end and training start replays automatically.
+- **Systemd user timer:** `paramem-consolidate.timer` drives scheduling with `Persistent=true`, so a trigger missed while the laptop is suspended fires on resume.
+- **VRAM pre-load validator:** `paramem/server/vram_validator.py` proves base model + main adapters + `max_interim_count` + staging slot + STT + TTS + KV cache fits the configured budget before the server loads any weights. The server refuses to start rather than OOM mid-load.
 
 ### GPU Lifecycle
 
@@ -305,8 +293,9 @@ kill -SIGUSR1 $(pidof python -m paramem.server.app)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/chat` | POST | Send a message, get a response |
-| `/status` | GET | Server health, mode, model info, key count |
-| `/consolidate` | POST | Trigger consolidation manually |
+| `/status` | GET | Full operational snapshot — server mode, model id + device, per-adapter specs (`rank`/`alpha`/`lr`/`target_kind`), interim adapter inventory + capacity, speaker embedding backend/model/device, STT/TTS engines, enrolled speakers, pending sessions + orphans + oldest age, consolidating flag + BG trainer state, last consolidation result, schedule + next-run ETA |
+| `/consolidate` | POST | Trigger consolidation manually (blocking) |
+| `/refresh-ha` | POST | Rebuild the HA entity graph from `/api/states` + `/api/services` |
 
 **Chat request:**
 

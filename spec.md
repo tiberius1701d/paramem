@@ -96,7 +96,7 @@ This spec covers Phases 1–5 of the project:
 #### F5.1 Home Assistant Assist Pipeline
 
 - **F5.1a:** ParaMem server — standalone HTTP daemon wrapping the inference pipeline. Endpoints: `/chat`, `/consolidate`, `/status`. Model loaded once at startup, adapter always active. **IMPLEMENTED** — `paramem/server/app.py`, `inference.py`, `config.py`, `escalation.py`, `session_buffer.py`. Architecture decision: external service (not HA add-on) — crash isolation, independent lifecycle, GPU on separate hardware.
-- **F5.1b:** Scheduled consolidation with cooperative GPU sharing. `consolidation.schedule` accepts `"HH:MM"` (daily) or `"every Nh"`/`"every Nm"` (interval, default `"every 2h"`). Pipeline: extract graph from buffered session transcripts → merge → generate QA → assign keys → reinitialize adapter → train → persist. Training releases the GPU lock per step so voice turns interleave. **IMPLEMENTED** — `paramem/server/consolidation.py`, `_consolidation_scheduler` in `app.py`. Manual trigger via `POST /consolidate` (stop-the-world blocking path).
+- **F5.1b:** Scheduled consolidation with cooperative GPU sharing. Driven by a **systemd user timer** (`paramem-consolidate.timer`) whose period derives from `consolidation.refresh_cadence` (default `"12h"`). Full-consolidation period is derived as `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). `refresh_cadence` grammar: `"every Nh"` / `"every Nm"` / `"HH:MM"` (daily) / `"daily"` / `""` (manual only). Pipeline: extract graph from buffered session transcripts → merge → generate QA → assign keys → reinitialize adapter → train → persist. `BackgroundTrainer` releases the GPU lock per step so voice turns interleave, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes at the last completed epoch. **IMPLEMENTED** — `paramem/server/consolidation.py`, `paramem/server/background_trainer.py`, `paramem/server/systemd_timer.py`. Manual trigger via `POST /consolidate` (stop-the-world blocking path).
 - **F5.1c:** HA custom component — thin REST client forwarding conversation turns to the ParaMem server. Config flow for server URL. No GPU dependencies in HA's environment. **IMPLEMENTED** — `custom_components/paramem/`. Architecture decision: no routing layer needed — facts are in adapter weights, model answers directly. Routing was a Phase 4 assumption; indexed keys eliminated the need.
 - **F5.1d:** Temporal queries: keyword pattern matching resolves natural language time references → absolute date ranges. Registry filtered by `last_seen_at`. Matching keys probed and fed as context. Falls back to standard path if no keys match. **IMPLEMENTED** — `paramem/server/temporal.py`, integrated into `inference.py`.
 - **F5.1e:** Voice-first UX: system prompt instructs concise spoken output. Local-first with cloud escalation (MoE-style): local model answers personal queries directly; emits `[ESCALATE]` for general knowledge → server forwards rewritten query to cloud SOTA model, returns response verbatim. Only the query goes to cloud — never conversation history or personal data. **IMPLEMENTED** — dual-graph router in `paramem/server/router.py` (tri-path: PA / HA / SOTA), escalation stripping in `paramem/server/escalation.py`, voice prompt in `configs/prompts/ha_voice.txt` (path configured via `voice.prompt_file`). Routing target is decided by `match_source`, not by in-output `[ESCALATE:*]` tags — the plain `[ESCALATE]` tag remains as a secondary local-model fallback signal.
@@ -228,6 +228,49 @@ from Whisper propagated through the full inference pipeline.
 - **F5.7g:** Voice config: Piper for en/de/fr/es, MMS-TTS for tl (Tagalog).
   Per-voice device override possible.
 
+#### F5.8 Interim Adapters & Staging — Sub-Cycle Recall
+
+Multi-adapter interim routing so newly-extracted facts are recallable within a
+refresh window, not only after the next full consolidation.
+
+- **F5.8a:** Interim adapter minting: at each `refresh_cadence` tick, an
+  activity-gated interim adapter (`episodic_interim_<stamp>`) is trained on
+  facts extracted since the last tick. Adapters accumulate up to
+  `max_interim_count` (default 7), capped by VRAM.
+- **F5.8b:** Staging slot: an `in_training` adapter slot is reserved at startup
+  and during background training so inference continues on the currently-active
+  committed adapter — model reload never blocks `/chat`.
+- **F5.8c:** Atomic finalize (`consolidate_interim_adapters`): at the
+  full-consolidation boundary, all interim adapters are rebuilt into the main
+  tiers via replay on `keyed_pairs ∪ all_interim_keys`, the rebuilt mains
+  probed for recall sanity, interim adapters and directories purged, and the
+  cycle rolls back on sanity-check failure. See `paramem/training/consolidation.py::consolidate_interim_adapters`.
+- **F5.8d:** VRAM validator (`paramem/server/vram_validator.py`): proves the
+  full topology fits before loading the base model — accounts for base +
+  main adapters + max_interim_count + staging slot + STT + TTS + KV cache.
+  Server refuses to start when the envelope exceeds the configured budget.
+
+#### F5.9 Background Trainer Resume & Post-Session Queue
+
+Crash-safety for long consolidation runs and missed post-session hooks.
+
+- **F5.9a:** Epoch-level resume: `BackgroundTrainer` writes
+  `resume_state.json` (atomic) + keeps the two most recent HF Trainer
+  checkpoints in `bg_checkpoint/` at each epoch boundary. On restart it
+  matches SHA-256 fingerprints of `keyed_pairs` + `training_config` against
+  the persisted state; if still valid, training resumes from the recorded
+  checkpoint. Stale state is discarded.
+- **F5.9b:** Persistent post-session queue
+  (`paramem/server/post_session_queue.py`): when `post_session_train_enabled:
+  true`, each assistant turn enqueues `{session_id, transcript, speaker_id,
+  speaker_name}` via temp-file + `os.replace` before the training hook fires.
+  Server startup drains leftover entries so a crash between session end and
+  training start does not lose the signal.
+- **F5.9c:** Systemd user timer (`paramem-consolidate.timer`,
+  `paramem/server/systemd_timer.py`): single source of truth for scheduling.
+  `Persistent=true` so a missed trigger while the laptop is suspended fires
+  on resume. Replaces the in-process `_consolidation_scheduler`.
+
 ## Out of Scope (Phase 5)
 
 - Cloud deployment and multi-user support
@@ -277,7 +320,7 @@ from Whisper propagated through the full inference pipeline.
 
 ### Resolved (Phase 5)
 
-7. **Consolidation latency for voice UX:** *Resolved — cooperative background training.* `BackgroundTrainer` releases the GPU lock per step; voice turns interleave with training. Schedule is configurable (`consolidation.schedule`, default `"every 2h"`). Manual `POST /consolidate` remains available as a blocking path for reproducible timing.
+7. **Consolidation latency for voice UX:** *Resolved — cooperative background training.* `BackgroundTrainer` releases the GPU lock per step; voice turns interleave with training. Cadence is configurable via `consolidation.refresh_cadence` (default `"12h"`) — interim adapters are minted at that cadence and the full-consolidation cycle is derived as `refresh_cadence × max_interim_count`. Manual `POST /consolidate` remains available as a blocking path for reproducible timing.
 8. **HA integration architecture:** *Resolved — external service.* ParaMem runs as a standalone daemon on NAS/laptop. HA custom component is a thin REST client (~50 lines). Rationale: crash isolation (CUDA/OOM errors don't take down HA), independent lifecycle, dependency isolation (conda env stays untouched), can run on different machine from HA.
 9. **Memory-aware routing:** *Resolved — not needed.* Facts are in adapter weights; the model answers directly with the adapter active. No routing layer, no key enumeration for standard queries. Temporal queries use registry metadata to probe specific keys — the only case where key lookup is needed.
 10. **Agent role (local vs. cloud):** *Resolved — local-first with cloud escalation.* Local model always answers first. If it can't answer, emits `[ESCALATE]` → server forwards only the rewritten query to SOTA cloud model (never history or personal data). Cloud response returned verbatim. Fully functional without cloud.

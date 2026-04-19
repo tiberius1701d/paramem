@@ -2561,15 +2561,30 @@ Same speaker, pyannote 512-dim embeddings:
 - Wyoming STT on port 10300, REST API on port 8420
 - Speaker profiles persisted as JSON, deferred disk writes flushed on shutdown
 
-### Planned: Continuous Background Training
+### Cooperative Background Training (live)
 
-Current consolidation runs on a configurable schedule (default `every 2h`; also accepts `HH:MM` for daily) via a cooperative `BackgroundTrainer` that releases the GPU lock per step. An alternative architecture would train continuously in the background, interruptible on user activity:
+Consolidation is driven by a systemd user timer (`paramem-consolidate.timer`,
+`Persistent=true`) whose period derives from `consolidation.refresh_cadence`
+(default `12h`). The `BackgroundTrainer` releases the GPU lock per step so
+inference interleaves with training, and saves `resume_state.json` +
+`bg_checkpoint/` at each epoch boundary — a crash or `SIGUSR1` mid-cycle
+resumes at the last completed epoch instead of restarting from zero
+(SHA-256 fingerprint gate on `keyed_pairs` + training config).
 
-- HuggingFace Trainer supports checkpoint save/resume (optimizer state + LR scheduler + adapter weights)
-- `TrainerCallback.on_step_end` can check a pause flag and halt training mid-step
-- With QLoRA, no model unload needed — the base model stays in VRAM. Training and inference differ only in adapter mode (`model.train()` vs `model.eval()`) and optimizer state (~few MB for rank-8 LoRA)
-- On user activity: save checkpoint → switch to eval mode → serve inference → resume training
-- The mode switch is milliseconds, not seconds — no VRAM reallocation
-- Periodic snapshots as safe rollback points; discard partial epoch on interruption
+Two adapter tiers share the GPU:
 
-This would reduce the fact-encoding latency from "next morning" to minutes after conversation, approaching real-time incremental learning. The building blocks (Trainer checkpoints, GPU inference lock, adapter switching) already exist in the codebase.
+- **Main adapters** (`episodic` / `semantic` / `procedural`) — rebuilt at the
+  full-consolidation boundary.
+- **Interim adapters** (`episodic_interim_<stamp>`) — minted at each
+  `refresh_cadence` tick, activity-gated, capped by `max_interim_count`
+  (default 7, VRAM-gated via pre-load validator). At the full boundary,
+  `consolidate_interim_adapters` rebuilds the mains from
+  `keyed_pairs ∪ all_interim_keys`, sanity-checks recall, and purges interim
+  state atomically.
+
+Operational invariant: every consolidation still retrains the full key set
+via replay. True incremental learning without replay remains unsolved
+(Test 4b: catastrophic forgetting). Full retrain is acceptable today because
+the systemd timer fires outside active hours, interim adapters cover
+sub-cycle recall, and the epoch-resume mechanism lets a single cycle span
+wall-clock interruptions. Listed as future work.
