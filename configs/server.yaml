@@ -1,3 +1,39 @@
+# ============================================================================
+# CLOUD-ONLY INFERENCE — PRIVACY OPT-OUT
+# ============================================================================
+# When true, ParaMem routes EVERY query to the configured SOTA cloud agent
+# instead of the local parametric-memory model.
+#
+# SECURITY IMPLICATIONS
+# - Personal knowledge (conversations, preferences, relationships, schedules,
+#   health, finances) is transmitted to a third-party model provider and
+#   subject to their retention, logging, and training policies.
+# - Once sent, data cannot be recalled. Providers may retain prompts for
+#   abuse monitoring even when opt-out flags are set.
+# - This setting OVERRIDES ParaMem's primary privacy guarantee for
+#   conversation content — no local redaction layer intervenes.
+#
+# SCOPE
+# - Routing only. Local extraction and consolidation continue to run against
+#   captured transcripts, so the local memory stays warm if the user
+#   toggles this flag back off in the future.
+#
+# QUALITY CONSIDERATIONS (self-bias risk)
+# - If your extraction pipeline uses the SAME cloud model/provider that will
+#   answer inference queries, the LLM-judge stages (noise_filter,
+#   plausibility, ner_check, anonymization verify, STT correction) become
+#   "model-as-judge-for-itself": the judge rates its own outputs, confirming
+#   its own biases and systematically over- or under-filtering certain
+#   fact classes. Expected quality degradation.
+# - Mitigation: disable the LLM-judge stages (`extraction.*` toggles below)
+#   OR route them to a different provider than the inference agent.
+#
+# Default is false. Change to true ONLY if you have explicitly decided to
+# trust the configured SOTA provider with your household's personal data.
+# Takes precedence over the `--cloud-only` CLI flag.
+# ============================================================================
+cloud_only: false
+
 server:
   host: "0.0.0.0"
   port: 8420
@@ -33,13 +69,70 @@ adapters:
     alpha: 16
     learning_rate: 5.0e-5
 
+# ============================================================================
+# CONSOLIDATION — MEMORY TIER LIFECYCLE
+# ============================================================================
+# ParaMem has two memory tiers:
+#   * Main adapters (episodic / semantic / procedural) — long-term
+#     consolidated knowledge, refreshed on the full consolidation schedule.
+#   * Interim adapters (episodic_interim_YYYYMMDDTHHMM) — short-lived
+#     rolling buckets that absorb new facts between full consolidations so
+#     recall is possible without waiting a full cycle.
+#
+# MECHANISM
+# - A timer fires the interim consolidation at sub-interval boundaries
+#   (activity-gated — see below). Extraction → create/reuse current interim
+#   → train → register. No per-turn hook.
+# - `schedule` fires the FULL consolidation cycle. A cycle collapses ALL
+#   active interim adapters into the mains via full replay, then deletes
+#   them. Full replay may distribute over days via BackgroundTrainer's
+#   pause/resume — it yields to inference and resumes when idle.
+# - `max_interim_count` divides the consolidation period into sub-intervals:
+#       interval = period(schedule) / max_interim_count
+#   Examples:
+#     schedule "weekly"   + max_interim_count 14 → one interim every 12h
+#                                                  (DEFAULT — 2×/day)
+#     schedule "weekly"   + max_interim_count 28 → one interim every 6h
+#     schedule "every 2h" + max_interim_count 7  → one interim every ~17 min
+#     schedule "every 2h" + max_interim_count 1  → one interim per cycle
+#                                                  (single pending bucket)
+# - max_interim_count=0 disables interims entirely: new facts queue in RAM
+#   (encrypted snapshot on graceful exit + periodic flush) until the next
+#   full consolidation. Recall delay = up to one full schedule period.
+#
+# ACTIVITY GATING
+# - At each interim-timer tick, if no new session transcripts AND no queued
+#   pending triples since the last tick, the tick is a no-op — no new
+#   adapter is created, no training runs.
+# - After extraction, if every extracted triple is already in `seen_triples`
+#   (no new OR changed knowledge), training is also skipped.
+# - Result: adapter VRAM and router probe cost scale with real conversation
+#   volume, not wall clock.
+#
+# RECALL LATENCY — INTENTIONAL
+# - With the default (weekly + 14 = 12h sub-interval), a fact spoken at 9 pm
+#   may not be recallable from parametric memory until the next 6 am tick.
+#   In-conversation context still carries the fact via the conversation
+#   buffer; cross-conversation recall within a 12h window falls back to the
+#   pending-queue or SOTA path.
+# - Rationale: if the user immediately consumes the answer, they rarely ask
+#   again within 12h. Facts that matter ("my daughter's play is tomorrow",
+#   "I prefer jazz at dinner") are either already in conversation context or
+#   benefit from consolidating over multiple exposures — a 12h delay is a
+#   feature, not a bug. Raise the frequency (e.g. `max_interim_count: 28`
+#   for 4×/day) if this trade-off doesn't fit your usage.
+#
+# VRAM envelope is proven at startup from
+#   rank × target_modules × (main_count + max_interim_count + 1 staging)
+#   × base_model_size.
+# Server refuses to start if the configured topology exceeds the GPU.
+# ============================================================================
 consolidation:
-  schedule: "every 2h"         # "HH:MM" (daily) or "every Nh"/"every Nm" (interval) or "" (manual only)
+  schedule: "weekly"           # "weekly" | "HH:MM" (daily) | "every Nh"/"every Nm" | "" (manual only)
   mode: simulate               # "train" = full pipeline, "simulate" = extract only (saves graphs + QA to debug dir)
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
-  reconstruction_interval: 5   # run fidelity checks every N cycles
   decay_window: 10             # cycles before unreinforced keys decay
   extraction_max_tokens: 2048  # max output tokens for graph extraction
   extraction_stt_correction: true  # correct STT errors from assistant responses
@@ -69,6 +162,11 @@ consolidation:
   extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
   extraction_ner_check: false                   # optional spaCy PII cross-check
   extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
+  # Max concurrent interim adapters in VRAM (rolling episodic_interim_YYYYMMDDTHHMM).
+  # Default 14 with schedule="weekly" → 2 interim ticks per day (every 12h).
+  # Raise for finer-grained recall (e.g. 28 for 4×/day, 168 for hourly).
+  # Validated at startup — server refuses to start if this exceeds budget.
+  max_interim_count: 14
   # Thermal throttle: keeps the machine silent during background training.
   # Training pauses when GPU temp exceeds the limit and resumes when it cools.
   # Set to 0 to disable. Adjust to match your fan ramp-up threshold.

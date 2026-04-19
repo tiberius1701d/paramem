@@ -89,3 +89,6 @@ ha_automations/
 
 # Orchestrator-internal working docs (handovers, alignment plans, session logs)
 .agent/
+
+# Internal design plans and follow-up specs (not for public repo)
+docs/

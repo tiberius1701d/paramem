@@ -167,7 +167,6 @@ def main():
         max_active_keys=args.max_keys,
         key_retirement_threshold=0.1,
         key_retirement_cycles=3,
-        reconstruction_interval=5,
         promotion_threshold=3,
         decay_window=10,
     )

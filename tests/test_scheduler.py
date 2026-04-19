@@ -48,6 +48,30 @@ class TestParseSchedule:
     def test_invalid_returns_none(self, bad):
         assert parse_schedule(bad) is None
 
+    def test_weekly_returns_interval_168h(self):
+        """'weekly' → interval TimerSpec with 168h period (604800 s)."""
+        spec = parse_schedule("weekly")
+        assert spec == TimerSpec(kind="interval", on_boot_sec="168h", on_unit_active_sec="168h")
+
+    def test_weekly_case_insensitive(self):
+        """'Weekly' and 'WEEKLY' are accepted."""
+        assert parse_schedule("Weekly") == TimerSpec(
+            kind="interval", on_boot_sec="168h", on_unit_active_sec="168h"
+        )
+        assert parse_schedule("WEEKLY") == TimerSpec(
+            kind="interval", on_boot_sec="168h", on_unit_active_sec="168h"
+        )
+
+    def test_daily_returns_daily_at_03_00(self):
+        """'daily' → daily OnCalendar at 03:00 (privacy-friendly off-peak hour)."""
+        spec = parse_schedule("daily")
+        assert spec == TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
+
+    def test_daily_case_insensitive(self):
+        """'Daily' and 'DAILY' are accepted."""
+        assert parse_schedule("Daily") == TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
+        assert parse_schedule("DAILY") == TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
+
 
 class TestReconcile:
     """Reconcile never raises; systemctl calls are mocked."""

@@ -13,6 +13,7 @@ from paramem.training.indexed_memory import (
     compute_simhash,
     format_indexed_training,
     parse_recalled_pair,
+    probe_keys_grouped_by_adapter,
     simhash_confidence,
     validate_recall,
     verify_confidence,
@@ -402,3 +403,210 @@ class TestRecallTemplate:
     def test_template_with_arbitrary_key(self):
         result = RECALL_TEMPLATE.format(key="custom_key")
         assert "custom_key" in result
+
+
+# ---------------------------------------------------------------------------
+# Helpers for probe_keys_grouped_by_adapter tests
+# ---------------------------------------------------------------------------
+
+
+def _make_stub_model(adapter_names: list[str]):
+    """Return a lightweight stub model with peft_config set to the given names."""
+    model = MagicMock()
+    model.peft_config = {name: MagicMock() for name in adapter_names}
+    return model
+
+
+def _make_stub_tokenizer():
+    return MagicMock()
+
+
+def _stub_probe_key(expected_results: dict):
+    """Return a probe_key replacement that looks up results by key."""
+
+    def _probe(model, tokenizer, key, **kwargs):
+        return expected_results.get(key)
+
+    return _probe
+
+
+# ---------------------------------------------------------------------------
+# probe_keys_grouped_by_adapter
+# ---------------------------------------------------------------------------
+
+
+class TestProbeKeysGroupedByAdapter:
+    def test_minimises_switches(self, monkeypatch):
+        """switch_adapter is called once per group, not once per key."""
+        switch_calls = []
+
+        def fake_switch(model, name):
+            switch_calls.append(name)
+
+        def fake_probe(model, tokenizer, key, **kwargs):
+            return {"key": key, "answer": f"ans_{key}", "confidence": 1.0}
+
+        monkeypatch.setattr(
+            "paramem.training.indexed_memory.probe_key",
+            fake_probe,
+        )
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            fake_switch,
+        )
+
+        model = _make_stub_model(["procedural", "episodic", "episodic_interim_20260417T0000"])
+        tokenizer = _make_stub_tokenizer()
+
+        keys_by_adapter = {
+            "procedural": ["p1", "p2"],
+            "episodic": ["e1", "e2", "e3"],
+            "episodic_interim_20260417T0000": ["s1"],
+        }
+
+        probe_keys_grouped_by_adapter(model, tokenizer, keys_by_adapter)
+
+        assert switch_calls == [
+            "procedural",
+            "episodic",
+            "episodic_interim_20260417T0000",
+        ]
+
+    def test_skips_unloaded_adapter(self, monkeypatch, capsys):
+        """Unloaded adapter: warning emitted, no switch, keys map to None."""
+        switch_calls = []
+
+        def fake_switch(model, name):
+            switch_calls.append(name)
+
+        def fake_probe(model, tokenizer, key, **kwargs):
+            return {"key": key, "answer": f"ans_{key}", "confidence": 1.0}
+
+        monkeypatch.setattr(
+            "paramem.training.indexed_memory.probe_key",
+            fake_probe,
+        )
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            fake_switch,
+        )
+
+        # Ensure WARNING messages reach stderr by setting root handler level.
+        import logging
+
+        root = logging.getLogger()
+        root.setLevel(logging.WARNING)
+
+        # Only "episodic" is loaded; interim adapter is absent.
+        model = _make_stub_model(["episodic"])
+        tokenizer = _make_stub_tokenizer()
+
+        keys_by_adapter = {
+            "episodic": ["e1"],
+            "episodic_interim_20260417T0000": ["s1", "s2"],
+        }
+
+        results = probe_keys_grouped_by_adapter(model, tokenizer, keys_by_adapter)
+
+        captured = capsys.readouterr()
+        # Warning logged for the missing adapter (appears on stderr).
+        assert "episodic_interim_20260417T0000" in captured.err
+
+        # No switch for the missing adapter; one switch for episodic.
+        assert switch_calls == ["episodic"]
+        # Missing keys map to None.
+        assert results["s1"] is None
+        assert results["s2"] is None
+        # Loaded adapter still probed.
+        assert results["e1"] is not None
+
+    def test_results_match_per_key_probe(self, monkeypatch):
+        """Grouped probe returns the same results as probing keys individually."""
+        per_key_answers = {
+            "k1": {"key": "k1", "answer": "A1", "confidence": 1.0},
+            "k2": {"key": "k2", "answer": "A2", "confidence": 0.9},
+            "k3": {"key": "k3", "answer": "A3", "confidence": 0.8},
+        }
+
+        def fake_switch(model, name):
+            pass
+
+        def fake_probe(model, tokenizer, key, **kwargs):
+            return per_key_answers.get(key)
+
+        monkeypatch.setattr(
+            "paramem.training.indexed_memory.probe_key",
+            fake_probe,
+        )
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            fake_switch,
+        )
+
+        model = _make_stub_model(["episodic"])
+        tokenizer = _make_stub_tokenizer()
+
+        # Grouped call
+        grouped = probe_keys_grouped_by_adapter(model, tokenizer, {"episodic": ["k1", "k2", "k3"]})
+
+        # Per-key individual calls
+        per_key = {k: per_key_answers.get(k) for k in ["k1", "k2", "k3"]}
+
+        assert grouped == per_key
+
+    def test_empty_dict(self, monkeypatch):
+        """Empty input returns empty dict; switch_adapter never called."""
+        switch_calls = []
+
+        def fake_switch(model, name):
+            switch_calls.append(name)
+
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            fake_switch,
+        )
+
+        model = _make_stub_model(["episodic"])
+        tokenizer = _make_stub_tokenizer()
+
+        result = probe_keys_grouped_by_adapter(model, tokenizer, {})
+
+        assert result == {}
+        assert switch_calls == []
+
+    def test_preserves_caller_order(self, monkeypatch):
+        """switch_adapter is called in the order groups appear in the input dict."""
+        switch_calls = []
+
+        def fake_switch(model, name):
+            switch_calls.append(name)
+
+        def fake_probe(model, tokenizer, key, **kwargs):
+            return {"key": key, "answer": "x", "confidence": 1.0}
+
+        monkeypatch.setattr(
+            "paramem.training.indexed_memory.probe_key",
+            fake_probe,
+        )
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            fake_switch,
+        )
+
+        model = _make_stub_model(["procedural", "episodic", "episodic_interim_20260417T0000"])
+        tokenizer = _make_stub_tokenizer()
+
+        keys_by_adapter = {
+            "procedural": ["p1"],
+            "episodic": ["e1"],
+            "episodic_interim_20260417T0000": ["s1"],
+        }
+
+        probe_keys_grouped_by_adapter(model, tokenizer, keys_by_adapter)
+
+        # Must match insertion order, not alphabetical order.
+        assert switch_calls == [
+            "procedural",
+            "episodic",
+            "episodic_interim_20260417T0000",
+        ]

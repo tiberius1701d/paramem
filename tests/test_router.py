@@ -10,6 +10,7 @@ import pytest
 from paramem.server.router import (
     MAX_KEYS_PER_QUERY,
     QueryRouter,
+    _interim_sort_key,
     _is_interrogative,
 )
 
@@ -311,8 +312,13 @@ class TestQueryRouterRoutePA:
             plan = router.route("Tell me about Alic", speaker_id="alice")
             assert plan.match_source == "pa"
 
-    def test_adapter_order_procedural_semantic_episodic(self):
-        """Procedural steps come before semantic before episodic."""
+    def test_adapter_order_procedural_episodic_semantic(self):
+        """Procedural step comes before episodic and semantic.
+
+        CLAUDE.md inference assembly order: procedural (preferences) → episodic (recent)
+        → semantic (consolidated). Procedural-first is load-bearing for personalization.
+        When procedural is absent the remaining adapters still follow episodic → semantic.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             _write_keyed_pairs(
                 Path(tmp),
@@ -327,9 +333,9 @@ class TestQueryRouterRoutePA:
             router = QueryRouter(adapter_dir=Path(tmp))
             plan = router.route("Alice", speaker_id="alice")
             names = [s.adapter_name for s in plan.steps]
-            # semantic before episodic (procedural absent)
-            if "semantic" in names and "episodic" in names:
-                assert names.index("semantic") < names.index("episodic")
+            # episodic before semantic (procedural absent in this fixture)
+            if "episodic" in names and "semantic" in names:
+                assert names.index("episodic") < names.index("semantic")
 
 
 # ---------------------------------------------------------------------------
@@ -537,3 +543,190 @@ class TestQueryRouterMaxKeys:
             plan = router.route("Alice", speaker_id="alice")
             for step in plan.steps:
                 assert len(step.keys_to_probe) <= MAX_KEYS_PER_QUERY
+
+
+# ---------------------------------------------------------------------------
+# _interim_sort_key helper
+# ---------------------------------------------------------------------------
+
+
+class TestInterimSortKey:
+    """Unit tests for the private _interim_sort_key helper."""
+
+    def test_valid_interim_name_returns_stamp(self):
+        assert _interim_sort_key("episodic_interim_20260417T0000") == "20260417T0000"
+
+    def test_main_adapter_returns_none(self):
+        for name in ("episodic", "semantic", "procedural"):
+            assert _interim_sort_key(name) is None
+
+    def test_partial_prefix_returns_none(self):
+        assert _interim_sort_key("episodic_interim_") is None
+
+    def test_non_stamp_returns_none(self):
+        assert _interim_sort_key("episodic_interim_today") is None
+
+    def test_old_date_format_returns_none(self):
+        # The old YYYY-MM-DD format is no longer valid for interim adapters.
+        assert _interim_sort_key("episodic_interim_2026-04-17") is None
+
+    def test_extra_suffix_returns_none(self):
+        # Names with trailing text after the stamp are not valid interim names.
+        assert _interim_sort_key("episodic_interim_20260417T0000_partial") is None
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — Step 4: multi-adapter interim routing
+# ---------------------------------------------------------------------------
+
+
+class TestInterimAdapterRouting:
+    """Tests for Step 4 of multi-adapter interim routing.
+
+    All fixtures write real keyed_pairs.json files to a tmp directory and
+    construct a real QueryRouter — no mocking of internal state.
+    """
+
+    def test_route_groups_keys_by_adapter_directory(self):
+        """Entity in both episodic (main) and an interim adapter → two steps, main first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
+                subdir="episodic",
+            )
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("int1", "Alice", "Prague", speaker_id="alice")],
+                subdir="episodic_interim_20260417T0000",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            plan = router.route("Alice", speaker_id="alice")
+
+            names = [s.adapter_name for s in plan.steps]
+            assert "episodic" in names, "main episodic step missing"
+            assert "episodic_interim_20260417T0000" in names, "interim step missing"
+            assert names.index("episodic") < names.index("episodic_interim_20260417T0000"), (
+                "main must precede interim"
+            )
+
+    def test_route_interim_adapter_ordering(self):
+        """Multiple interim adapters: mains first, interims newest-first."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
+                subdir="episodic",
+            )
+            for stamp in ("20260415T0000", "20260416T0000", "20260417T0000"):
+                _write_keyed_pairs(
+                    Path(tmp),
+                    [_make_pair(f"int_{stamp}", "Alice", f"City_{stamp}", speaker_id="alice")],
+                    subdir=f"episodic_interim_{stamp}",
+                )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            plan = router.route("Alice", speaker_id="alice")
+
+            names = [s.adapter_name for s in plan.steps]
+            assert names[0] == "episodic", "episodic main must be first"
+            interim_names = [n for n in names if n.startswith("episodic_interim_")]
+            assert interim_names == [
+                "episodic_interim_20260417T0000",
+                "episodic_interim_20260416T0000",
+                "episodic_interim_20260415T0000",
+            ], f"Expected newest-first, got {interim_names}"
+
+    def test_route_speaker_scoping_applies_to_interim_keys(self):
+        """Interim key tagged with 'alice' is invisible to speaker_id='bob'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Interim adapter keyed to alice only
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("int1", "Alice", "Prague", speaker_id="alice")],
+                subdir="episodic_interim_20260417T0000",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            # Bob queries — allowed_keys will be empty → no step emitted
+            plan = router.route("Alice", speaker_id="bob")
+            interim_names = [s.adapter_name for s in plan.steps if "interim" in s.adapter_name]
+            assert interim_names == [], (
+                "Interim step must not appear when speaker scoping filters all keys"
+            )
+
+    def test_route_no_phantom_step_for_deleted_interim_dir(self):
+        """After reload() with the interim dir deleted, no step is emitted for it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
+                subdir="episodic",
+            )
+            interim_dir = Path(tmp) / "episodic_interim_20260417T0000"
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("int1", "Alice", "Prague", speaker_id="alice")],
+                subdir="episodic_interim_20260417T0000",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            # Confirm interim step present before deletion
+            plan_before = router.route("Alice", speaker_id="alice")
+            assert any("interim" in s.adapter_name for s in plan_before.steps), (
+                "Interim step should be present before dir removal"
+            )
+
+            # Simulate Step 7: delete the interim dir, then reload
+            import shutil
+
+            shutil.rmtree(interim_dir)
+            router.reload()
+
+            plan_after = router.route("Alice", speaker_id="alice")
+            interim_steps = [s for s in plan_after.steps if "interim" in s.adapter_name]
+            assert interim_steps == [], (
+                "No interim step should appear after reload() with interim dir deleted"
+            )
+
+    def test_route_interim_only_match_emits_interim_step(self):
+        """Entity matched ONLY in an interim adapter → one step for that interim."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # No main adapter keyed_pairs — only an interim subdir
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("int1", "Alice", "Vienna", speaker_id="alice")],
+                subdir="episodic_interim_20260417T0000",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            plan = router.route("Alice", speaker_id="alice")
+
+            assert len(plan.steps) == 1, f"Expected exactly one step, got {plan.steps}"
+            assert plan.steps[0].adapter_name == "episodic_interim_20260417T0000"
+            assert plan.match_source == "pa"
+
+    def test_route_three_mains_correct_order(self):
+        """All three mains + one interim: order must be procedural, episodic, semantic, interim.
+
+        CLAUDE.md inference assembly order: procedural (preferences) → episodic (recent)
+        → semantic (consolidated). Interim adapters follow all mains, newest-first.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            for adapter in ("episodic", "semantic", "procedural"):
+                _write_keyed_pairs(
+                    Path(tmp),
+                    [_make_pair(f"{adapter}1", "Alice", f"Fact_{adapter}", speaker_id="alice")],
+                    subdir=adapter,
+                )
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("int1", "Alice", "InterimFact", speaker_id="alice")],
+                subdir="episodic_interim_20260418T0000",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            plan = router.route("Alice", speaker_id="alice")
+
+            names = [s.adapter_name for s in plan.steps]
+            assert names[0] == "procedural", f"First step must be procedural, got {names}"
+            assert names[1] == "episodic", f"Second step must be episodic, got {names}"
+            assert names[2] == "semantic", f"Third step must be semantic, got {names}"
+            assert names[3] == "episodic_interim_20260418T0000", (
+                f"Fourth step must be the interim adapter, got {names}"
+            )

@@ -29,6 +29,7 @@ from paramem.training.curriculum import CurriculumSampler
 from paramem.training.indexed_memory import (
     assign_keys,
     build_registry,
+    compute_simhash,
     format_indexed_training,
     load_registry,
     probe_key,
@@ -256,6 +257,29 @@ class ConsolidationLoop:
         self.key_sessions: dict[str, int] = {}
         # Keys already promoted (prevent re-promotion after restart)
         self.promoted_keys: set[str] = set()
+
+        # RAM-only queue for max_interim_count==0 (queue-until-consolidation).
+        # Facts extracted when no interim adapter is configured accumulate here
+        # until the next consolidation cycle (Step 7) folds them into the mains.
+        # Privacy invariant: this list is never written to disk — what isn't
+        # trained doesn't exist.  Snapshot persistence is deferred (Step 7).
+        # TODO(Step 7): consume pending_interim_triples at the start of
+        # consolidate_interim_adapters() before training the full key set.
+        self.pending_interim_triples: list[dict] = []
+
+        # --- Multi-adapter interim routing state (Step 7) ---
+        # Set of triples already encoded into an interim adapter.  Reset at the
+        # start of every consolidate_interim_adapters() call — the full rebuild
+        # makes prior "seen" state irrelevant (Step 7e).  Not persisted to disk;
+        # restart cost is at most one window of duplicate QA generation.
+        self.seen_triples: set[tuple[str, str, str]] = set()
+
+        # Counter of triples encoded since the last successful full
+        # consolidation.  Incremented after each successful interim training
+        # pass (post_session_train "trained" path).  Reset only on successful
+        # consolidate_interim_adapters() completion.  Decoupled from
+        # seen_triples — it is NOT reset when seen_triples resets.
+        self.triples_since_last_full: int = 0
 
     def seed_key_metadata(self, metadata: dict) -> None:
         """Restore key-level metadata from persisted key_metadata.json.
@@ -1170,14 +1194,6 @@ class ConsolidationLoop:
         # Update episodic SimHash registry from ground-truth QA
         self.episodic_simhash = build_registry(episodic_keyed)
 
-        # Periodic fidelity check and retirement
-        should_check = (
-            self.config.reconstruction_interval > 0
-            and self.cycle_count % self.config.reconstruction_interval == 0
-        )
-        if should_check:
-            self._check_indexed_key_fidelity("episodic")
-
         return metrics.get("train_loss")
 
     def _run_indexed_key_semantic(
@@ -1266,6 +1282,12 @@ class ConsolidationLoop:
         Contradiction handling: when a new preference shares the same
         (speaker_id, subject, predicate) as an existing key, the old key
         is retired and replaced.
+
+        Registry/index invariant: all mutations to ``procedural_simhash``,
+        ``indexed_key_qa``, ``indexed_key_registry``, and
+        ``procedural_sp_index`` are deferred until **after**
+        ``train_adapter`` returns successfully.  If training raises, shared
+        state is left unchanged so the caller can safely retry or skip.
         """
         if not procedural_relations:
             return None
@@ -1282,11 +1304,15 @@ class ConsolidationLoop:
         if not new_qa:
             return None
 
-        # Assign keys with proc prefix — use per-relation speaker_id
+        # Assign keys with proc prefix — use per-relation speaker_id.
+        # Use a local tentative counter so self._procedural_next_index is not
+        # advanced until after train_adapter returns successfully.  If training
+        # raises, the index slots are not burned and a retry will reuse them.
         new_keyed = []
+        tentative_next_index = self._procedural_next_index
         for i, qa in enumerate(new_qa):
-            key = f"proc{self._procedural_next_index}"
-            self._procedural_next_index += 1
+            key = f"proc{tentative_next_index}"
+            tentative_next_index += 1
             # Get speaker from the original relation if available
             rel_speaker = (
                 procedural_relations[i].get("speaker_id", speaker_id)
@@ -1304,7 +1330,12 @@ class ConsolidationLoop:
             }
             new_keyed.append(keyed)
 
-        # Contradiction check: retire old keys with same (speaker, subject, predicate)
+        # Compute intended mutations without touching shared state yet.
+        # keys_to_retire: old contradicted keys that will be removed on success.
+        # new_sp_mappings: (sp_key -> new_key) entries for procedural_sp_index.
+        keys_to_retire: list[str] = []
+        new_sp_mappings: dict[tuple, str] = {}
+        new_key_set = {kp["key"] for kp in new_keyed}
         for kp in new_keyed:
             sp_key = (
                 kp["speaker_id"],
@@ -1318,29 +1349,18 @@ class ConsolidationLoop:
                     old_key,
                     sp_key,
                 )
-                self.procedural_simhash.pop(old_key, None)
-                self.indexed_key_qa.pop(old_key, None)
-                if self.indexed_key_registry is not None:
-                    self.indexed_key_registry.remove(old_key)
+                keys_to_retire.append(old_key)
+            new_sp_mappings[sp_key] = kp["key"]
 
-        # Store new QA pairs in shared indexed_key_qa and update indexes
-        for kp in new_keyed:
-            self.indexed_key_qa[kp["key"]] = kp
-            if self.indexed_key_registry is not None:
-                self.indexed_key_registry.add(kp["key"])
-            sp_key = (
-                kp["speaker_id"],
-                kp["source_subject"].lower(),
-                kp["source_predicate"].lower(),
-            )
-            self.procedural_sp_index[sp_key] = kp["key"]
-
-        # Reconstruct existing procedural keys from adapter weights
+        # Reconstruct existing procedural keys from adapter weights.
+        # existing_keys excludes both new keys and keys scheduled for retirement
+        # so the training set is identical to what a post-commit read would see.
+        retired_set = set(keys_to_retire)
         switch_adapter(self.model, "procedural")
         self._disable_gradient_checkpointing()
 
         existing_keys = [
-            k for k in self.procedural_simhash if k not in {kp["key"] for kp in new_keyed}
+            k for k in self.procedural_simhash if k not in new_key_set and k not in retired_set
         ]
         reconstructed = {}
         for key in existing_keys:
@@ -1364,7 +1384,9 @@ class ConsolidationLoop:
             len(existing_keys),
         )
 
-        # Build full procedural training set
+        # Build full procedural training set from reconstructed + fallback QA + new.
+        # Read existing QA from self.indexed_key_qa directly — shared state is still
+        # unmodified at this point.
         all_procedural = []
         for key in existing_keys:
             if key in reconstructed:
@@ -1390,6 +1412,7 @@ class ConsolidationLoop:
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
 
+        # train_adapter may raise — shared state must not have been mutated yet.
         metrics = train_adapter(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -1403,53 +1426,32 @@ class ConsolidationLoop:
             callbacks_extra=self._shutdown_callbacks,
         )
 
-        # Update procedural SimHash registry
-        self.procedural_simhash = build_registry(all_procedural)
+        # Training succeeded — apply all deferred mutations atomically.
+        # 1. Commit the next-index counter now that key slots are confirmed used.
+        self._procedural_next_index = tentative_next_index
+
+        # 2. Retire contradicted keys from all indexes.
+        for old_key in keys_to_retire:
+            self.procedural_simhash.pop(old_key, None)
+            self.indexed_key_qa.pop(old_key, None)
+            if self.indexed_key_registry is not None:
+                self.indexed_key_registry.remove(old_key)
+
+        # 3. Register new QA pairs, update sp_index, and add simhash entries.
+        #    Explicit incremental mutations keep all four indexes consistent and
+        #    symmetric — no full reconstruction needed, since existing-key hashes
+        #    are unchanged (compute_simhash is deterministic from key/question/answer).
+        for kp in new_keyed:
+            self.indexed_key_qa[kp["key"]] = kp
+            if self.indexed_key_registry is not None:
+                self.indexed_key_registry.add(kp["key"])
+            self.procedural_simhash[kp["key"]] = compute_simhash(
+                kp["key"], kp["question"], kp["answer"]
+            )
+        for sp_key, new_key in new_sp_mappings.items():
+            self.procedural_sp_index[sp_key] = new_key
 
         return metrics.get("train_loss")
-
-    def _check_indexed_key_fidelity(self, adapter_name: str) -> None:
-        """Probe indexed keys and retire those with sustained low confidence."""
-        switch_adapter(self.model, adapter_name)
-        self._disable_gradient_checkpointing()
-
-        registry = self.indexed_key_registry
-        simhash_map = {
-            "episodic": self.episodic_simhash,
-            "semantic": self.semantic_simhash,
-            "procedural": self.procedural_simhash,
-        }
-        simhash = simhash_map.get(adapter_name, self.episodic_simhash)
-
-        all_active = registry.list_active()
-        # Only check keys that belong to this adapter
-        prefix = "proc" if adapter_name == "procedural" else "graph"
-        active_keys = [k for k in all_active if k.startswith(prefix)]
-        retired = []
-        for key in active_keys:
-            recalled = probe_key(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=simhash,
-                confidence_threshold=0.0,
-            )
-            confidence = recalled["confidence"] if recalled else 0.0
-            registry.update_fidelity(key, confidence)
-
-            if registry.should_retire(
-                key,
-                threshold=self.config.key_retirement_threshold,
-                consecutive_cycles=self.config.key_retirement_cycles,
-            ):
-                registry.remove(key)
-                self.indexed_key_qa.pop(key, None)
-                simhash.pop(key, None)
-                retired.append(key)
-                logger.info("Retired indexed key '%s' (sustained low fidelity)", key)
-
-        if retired:
-            logger.info("Retired %d indexed keys from %s adapter", len(retired), adapter_name)
 
     @staticmethod
     def _indexed_dataset(examples: list[dict]) -> Dataset:
@@ -1672,16 +1674,891 @@ class ConsolidationLoop:
                 self.output_dir / "simhash_registry_procedural.json",
             )
 
-    def _training_output_dir(self, adapter_name: str) -> Path:
-        """Training checkpoint directory for the current cycle.
+    def _training_output_dir(self, adapter_name: str, *, interim_stamp: str | None = None) -> Path:
+        """Training checkpoint directory for the current cycle or interim pass.
 
-        When cycle snapshots are enabled, checkpoints go under output_dir.
-        When disabled, they go under snapshot_dir (debug) or a temp subdir
-        to keep the production adapter directory clean.
+        When *interim_stamp* is given (either directly or via the instance
+        attribute ``_current_interim_stamp`` set by ``post_session_train``),
+        the directory is derived from the stamp rather than ``cycle_count`` so
+        that consecutive post-session calls within the same sub-interval do not
+        share a directory, and calls across different stamps always land in
+        distinct directories.
+
+        For ordinary run_cycle / train_adapters calls (no stamp) the behaviour is
+        unchanged: snapshot_dir or output_dir with ``cycle_N`` infix.
+
+        Args:
+            adapter_name: The adapter being trained (e.g. ``"episodic"``,
+                ``"procedural"``).
+            interim_stamp: Optional YYYYMMDDTHHMM stamp used by
+                ``post_session_train`` to keep each sub-interval in its own
+                output directory.  When set, cycle_count is NOT used.  May also
+                be provided implicitly via ``self._current_interim_stamp``.
+
+        Returns:
+            Absolute :class:`~pathlib.Path` for training checkpoints.
         """
+        # Resolve stamp: explicit kwarg wins, then instance attribute (set by
+        # post_session_train to thread the stamp into helper methods like
+        # _run_indexed_key_procedural that don't accept it directly).
+        resolved_stamp = interim_stamp or getattr(self, "_current_interim_stamp", None)
+        if resolved_stamp is not None:
+            # Interim-pass layout: output_dir/interim_<stamp>/<adapter_name>/
+            return self.output_dir / f"interim_{resolved_stamp}" / adapter_name
         if self.save_cycle_snapshots and self.snapshot_dir:
             return self.snapshot_dir / f"cycle_{self.cycle_count}" / adapter_name
         return self.output_dir / f"cycle_{self.cycle_count}" / adapter_name
+
+    def post_session_train(
+        self,
+        session_transcript: str,
+        session_id: str,
+        *,
+        speaker_id: str = "",
+        speaker_name: str | None = None,
+        ha_context: dict | None = None,
+        schedule: str = "",
+        max_interim_count: int = 7,
+        stamp: str | None = None,
+    ) -> dict:
+        """Extract one conversation, train onto the current interim adapter, register on success.
+
+        This is the post-conversation training hook for multi-adapter interim routing.
+        "Session" here means one conversation (the existing meaning in the codebase),
+        not the adapter tier.  The adapter it trains into is the interim adapter
+        (``episodic_interim_YYYYMMDDTHHMM``).
+
+        Implementation ordering follows the CLAUDE.md ``seen_triples`` discipline:
+        register keys **only after** training returns successfully so that extraction
+        or training failures never leave orphaned keys in the registry.
+
+        If ``max_interim_count == 0``, new facts are appended to
+        ``self.pending_interim_triples`` (RAM-only) without training.  The pending
+        queue is consumed by the next consolidation cycle (Step 7).  What is not
+        trained does not exist on disk — this upholds the privacy invariant.
+
+        Procedural relations extracted from the same transcript are trained onto
+        the stable ``procedural`` main adapter (no interim tier for procedural —
+        preferences are small-volume and slow-changing).  This pass runs inline,
+        immediately after the episodic training pass and before any registry
+        writes, so a failure in either pass leaves the registry clean.
+
+        Registry write ordering (I5 atomicity):
+        1. Save adapter weights (episodic interim + procedural main).
+        2. Save SimHash registries.
+        3. Save keyed_pairs.json.
+        4. Save key registry (LAST — its presence signals a clean commit).
+
+        On restart, the lifespan consistency check scans the registry and drops
+        any entry whose adapter file is missing, recovering from a crash between
+        steps 1-3 and 4.
+
+        Args:
+            session_transcript: Raw transcript text for this conversation.
+            session_id: Unique conversation identifier (used by the extraction pipeline).
+            speaker_id: Speaker identifier for key ownership and preference scoping.
+            speaker_name: Human-readable speaker name for extraction personalisation.
+            ha_context: Optional Home Assistant context dict for location validation.
+            schedule: Consolidation schedule string (e.g. ``"every 2h"``, ``"03:00"``).
+                Used together with *max_interim_count* to compute the sub-interval stamp.
+            max_interim_count: Number of sub-intervals per consolidation period.
+                ``0`` → queue-until-consolidation branch (no interim adapter created).
+            stamp: Override the computed sub-interval stamp.  Injected by tests so the
+                flooring logic can be exercised without mocking ``datetime.now()``.
+
+        Returns:
+            Result dict with at minimum::
+
+                {
+                    "triples_extracted": int,
+                    "new_keys": list[str],
+                    "adapter_name": str | None,   # None if queued or noop
+                    "mode": "trained" | "queued" | "noop",
+                    "error": str | None,
+                }
+        """
+        from paramem.server.interim_adapter import create_interim_adapter
+        from paramem.training.indexed_memory import (
+            assign_keys,
+            build_registry,
+            format_indexed_training,
+        )
+
+        # --- 1. Extract ---
+        episodic_qa, procedural_rels = self.extract_session(
+            session_transcript,
+            session_id,
+            speaker_id=speaker_id,
+            speaker_name=speaker_name,
+            ha_context=ha_context,
+        )
+
+        triples_extracted = len(episodic_qa)
+        logger.info(
+            "post_session_train: session=%s extracted %d episodic QA pairs",
+            session_id,
+            triples_extracted,
+        )
+
+        # --- 2. Noop: no facts extracted ---
+        if triples_extracted == 0:
+            return {
+                "triples_extracted": 0,
+                "new_keys": [],
+                "adapter_name": None,
+                "mode": "noop",
+                "error": None,
+            }
+
+        # --- 3. Queue branch: max_interim_count == 0 ---
+        if max_interim_count == 0:
+            # Append to RAM queue for the next consolidation cycle (Step 7).
+            # The pending queue is picked up by consolidate() and folded into the
+            # cumulative graph before the main rebuild.  Queue lives in RAM;
+            # snapshot persistence is deferred — matches the privacy invariant
+            # "what isn't trained doesn't exist".
+            # TODO(Step 7): consume self.pending_interim_triples at the start of
+            # consolidate_interim_adapters() before training the full key set.
+            if not hasattr(self, "pending_interim_triples"):
+                self.pending_interim_triples: list[dict] = []
+            self.pending_interim_triples.extend(episodic_qa)
+            logger.info(
+                "post_session_train: max_interim_count=0 — queued %d triples (total pending: %d)",
+                len(episodic_qa),
+                len(self.pending_interim_triples),
+            )
+            return {
+                "triples_extracted": triples_extracted,
+                "new_keys": [],
+                "adapter_name": None,
+                "mode": "queued",
+                "error": None,
+            }
+
+        # --- 4. Normal branch: compute stamp and adapter name ---
+        if stamp is None:
+            from paramem.server.interim_adapter import current_interim_stamp as _cis
+
+            stamp = _cis(schedule, max_interim_count)
+        adapter_name = f"episodic_interim_{stamp}"
+
+        # Create the interim adapter if this is the first fact of this sub-interval.
+        # create_interim_adapter is idempotent — no-op when the adapter already exists.
+        # The return value MUST be assigned back to self.model; PEFT's add_adapter may
+        # rebind the PeftModel wrapper.
+        if adapter_name not in self.model.peft_config:
+            self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
+            logger.info("post_session_train: created interim adapter %s", adapter_name)
+
+        # --- 5. Assign keys to the new QA pairs ---
+        if self.indexed_key_registry is None:
+            logger.warning("post_session_train: no indexed key registry — aborting")
+            return {
+                "triples_extracted": triples_extracted,
+                "new_keys": [],
+                "adapter_name": adapter_name,
+                "mode": "noop",
+                "error": "no_registry",
+            }
+
+        # Tag QA pairs with speaker_id before key assignment.
+        for qa in episodic_qa:
+            if "speaker_id" not in qa:
+                qa["speaker_id"] = speaker_id
+
+        new_keyed = assign_keys(episodic_qa, start_index=self._indexed_next_index)
+
+        # Collect all existing keys for this interim adapter so we can rebuild
+        # the full training set (avoids catastrophic forgetting — same pattern
+        # as _run_indexed_key_episodic's full-replay approach).
+        existing_interim_keyed: list[dict] = []
+        for k in self.indexed_key_registry.keys_for_adapter(adapter_name):
+            qa_info = self.indexed_key_qa.get(k)
+            if qa_info is not None:
+                existing_interim_keyed.append(
+                    {"key": k, "question": qa_info["question"], "answer": qa_info["answer"]}
+                )
+
+        all_interim_keyed = existing_interim_keyed + new_keyed
+
+        # --- 6. Train episodic interim adapter ---
+        # On failure, let the exception propagate; caller logs and returns error.
+        # The registry is written AFTER both training passes succeed (I5 atomicity).
+        from paramem.models.loader import switch_adapter
+
+        switch_adapter(self.model, adapter_name)
+        self._disable_gradient_checkpointing()
+        examples = format_indexed_training(all_interim_keyed, self.tokenizer, max_length=1024)
+        dataset = self._indexed_dataset(examples)
+        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
+        self._enable_gradient_checkpointing()
+
+        from paramem.training.trainer import train_adapter as _train_adapter
+
+        _train_adapter(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            train_dataset=dataset,
+            adapter_name=adapter_name,
+            training_config=training_config,
+            adapter_config=self.episodic_config,
+            wandb_config=self.wandb_config,
+            # I3: use interim_stamp so consecutive post-session calls within the
+            # same sub-interval do NOT share a directory, and different stamps
+            # always produce distinct directories.
+            output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
+            run_name=f"interim-{adapter_name}-{session_id}",
+            callbacks_extra=self._shutdown_callbacks,
+        )
+
+        # --- 6b. Train procedural main adapter (I1) ---
+        # Procedural relations always go to the stable 'procedural' main adapter —
+        # no interim tier for procedural (preferences are small-volume,
+        # slow-changing).  This pass runs inline so a failure here also leaves the
+        # registry clean (registry writes happen in step 7 below).
+        #
+        # _run_indexed_key_procedural calls self._training_output_dir("procedural")
+        # internally.  We set _current_interim_stamp so _training_output_dir routes
+        # checkpoints under the same interim_<stamp> directory rather than
+        # cycle_<N>, keeping each post-session pass in its own directory (I3).
+        # The attribute is cleared in a finally block regardless of outcome.
+        if self.procedural_config is not None and procedural_rels:
+            self._current_interim_stamp = stamp
+            try:
+                self._run_indexed_key_procedural(
+                    procedural_rels,
+                    speaker_id=speaker_id,
+                )
+            finally:
+                self._current_interim_stamp = None
+
+        # --- 7. Register episodic keys ONLY after both training passes succeed ---
+        # Procedural keys are registered inside _run_indexed_key_procedural (same
+        # invariant — keys added only after train_adapter returns).
+        new_key_ids: list[str] = []
+        for kp in new_keyed:
+            k = kp["key"]
+            self.indexed_key_registry.add(k, adapter_id=adapter_name)
+            self.indexed_key_qa[k] = {
+                "key": k,
+                "question": kp["question"],
+                "answer": kp["answer"],
+                "source_subject": kp.get("source_subject", ""),
+                "source_object": kp.get("source_object", ""),
+                "speaker_id": kp.get("speaker_id", speaker_id),
+            }
+            new_key_ids.append(k)
+        self._indexed_next_index += len(new_keyed)
+
+        # I5 — Registry-last write order.  Adapter weights must hit disk first;
+        # then SimHash; then keyed_pairs.json; then the registry.  The registry
+        # is the "commit" signal: its presence means every preceding file is
+        # complete.  If the process is killed between adapter-save and
+        # registry-save, the lifespan consistency check (app.py) drops the
+        # orphan registry entries on the next startup.
+
+        # Step 1: Save adapter weights so the router and startup loader can pick them up.
+        from paramem.models.loader import save_adapter as _save_adapter
+
+        _save_adapter(self.model, self.output_dir, adapter_name)
+        if self.procedural_config is not None and "procedural" in self.model.peft_config:
+            _save_adapter(self.model, self.output_dir, "procedural")
+
+        # Step 2: Save SimHash registries.
+        interim_simhash = build_registry(all_interim_keyed)
+        save_registry(
+            interim_simhash,
+            self.output_dir / f"simhash_registry_{adapter_name}.json",
+        )
+        # Procedural simhash is updated inside _run_indexed_key_procedural; persist
+        # the updated state here so it survives a restart even if the process is
+        # killed before the full _save_adapters() call at end of run_cycle.
+        if self.procedural_config is not None and procedural_rels:
+            save_registry(
+                self.procedural_simhash,
+                self.output_dir / "simhash_registry_procedural.json",
+            )
+
+        # Step 3: Save keyed_pairs.json inside the interim adapter subdir so the
+        # router can index entity→key mappings without loading every adapter.
+        interim_pairs = [
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+            for kp in all_interim_keyed
+        ]
+        import json as _json
+        import os as _os
+
+        interim_dir = self.output_dir / adapter_name
+        interim_dir.mkdir(parents=True, exist_ok=True)
+        _tmp = interim_dir / "keyed_pairs.json.tmp"
+        with open(_tmp, "w") as _f:
+            _json.dump(interim_pairs, _f, indent=2)
+        _os.replace(_tmp, interim_dir / "keyed_pairs.json")
+
+        # Step 4 (LAST): Persist key registry — its presence is the commit signal.
+        self.indexed_key_registry.save(self.output_dir / "indexed_key_registry.json")
+
+        # Restore the main episodic adapter as the active adapter so subsequent
+        # inference probes default to the consolidated tier.
+        if "episodic" in self.model.peft_config:
+            switch_adapter(self.model, "episodic")
+
+        logger.info(
+            "post_session_train: trained %s — %d new keys, %d total keys",
+            adapter_name,
+            len(new_key_ids),
+            len(all_interim_keyed),
+        )
+
+        return {
+            "triples_extracted": triples_extracted,
+            "new_keys": new_key_ids,
+            "adapter_name": adapter_name,
+            "mode": "trained",
+            "error": None,
+        }
+
+    def consolidate_interim_adapters(
+        self,
+        trainer=None,
+        router=None,
+        recall_sanity_threshold: float = 0.95,
+        refresh_epochs: int = 30,
+    ) -> dict:
+        """Weekly refresh: collapse all episodic_interim_* adapters into the main tiers.
+
+        This method MUST be invoked via BackgroundTrainer.submit() so that the
+        GPU lock is held for the entire call duration.  It MUST NOT be called
+        directly without the lock, and MUST NOT call gpu_lock_sync() internally
+        (non-reentrant threading.Lock would deadlock).
+
+        Invariants (enforced by the entry guard):
+        - _gpu_thread_lock is held by the caller on entry.
+        - The finalize block (registry rewrite → interim purge → router reload)
+          runs as plain sequential statements — no training calls, no HF Trainer-
+          driven routines.  Do not smuggle a training call into the finalize
+          section; the _PauseForInferenceCallback only fires at epoch/step
+          boundaries and would not protect non-training code paths.
+
+        Steps:
+        1. Verify the GPU lock is held (entry guard — leak-safe pattern).
+        2. Reset seen_triples (fresh rebuild makes prior state irrelevant).
+        3. Walk all active keys, re-derive their tier from the cumulative graph,
+           handle graph-drift keys, and build per-tier keyed-pair lists.
+        4. Load backup adapters (if available) and all interim adapters into PEFT.
+        5. For each tier (episodic → semantic → procedural):
+           a. Set active adapter to <tier>_backup before deleting the main.
+           b. delete_adapter(<tier>) + create_adapter(<tier>).
+           c. Set <tier>_is_training=True, call _train_adapter, set False.
+           d. Recall-sanity check; on failure roll back and abort.
+        6. Atomic finalize: registry rewrite → unload_interim_adapters → router reload.
+        7. On success: reset triples_since_last_full; unload backup adapters.
+
+        Args:
+            trainer: BackgroundTrainer instance (must be the one holding the GPU
+                lock via submit()).  Required for per-tier B2 re-arm pattern.
+            router: Router instance whose reload() is called at the end of the
+                atomic finalize sequence.  Optional — skipped when None.
+            recall_sanity_threshold: Minimum recall rate to accept a rebuilt tier
+                (default 0.95).  Tiers below this trigger rollback and abort.
+            refresh_epochs: Number of training epochs for the full per-tier
+                rebuild (default 30; matches the per-key baseline from Tests 1-7b).
+
+        Returns:
+            Result dict with keys:
+                {
+                    "tiers_rebuilt": list[str],
+                    "graph_drift_count": int,
+                    "keys_per_tier": dict[str, int],
+                    "recall_per_tier": dict[str, float],
+                    "rolled_back": bool,
+                    "rollback_tier": str | None,
+                }
+        """
+        from paramem.models.loader import create_adapter
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.server.interim_adapter import unload_interim_adapters
+
+        # --- Entry guard: verify the GPU lock is held by the caller (leak-safe) ---
+        acquired = _gpu_thread_lock.acquire(blocking=False)
+        if acquired:
+            # The lock was NOT held — we just accidentally acquired it ourselves.
+            # Release immediately before raising so the process is recoverable.
+            _gpu_thread_lock.release()
+            raise RuntimeError(
+                "consolidate_interim_adapters requires the caller to hold "
+                "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
+            )
+
+        # --- Step 1: Reset seen_triples ---
+        self.seen_triples = set()
+
+        # --- Step 2: Snapshot cumulative graph ---
+        graph = self.merger.graph
+
+        # --- Step 3: Re-derive per-tier keyed-pair lists ---
+        # Build a lookup from (subject, predicate, object) → relation_type in
+        # the cumulative graph so we can re-derive the tier for each key.
+        graph_triple_to_type: dict[tuple[str, str, str], str] = {}
+        for rel in getattr(graph, "relations", []) if hasattr(graph, "relations") else []:
+            triple = (
+                getattr(rel, "subject", ""),
+                getattr(rel, "predicate", ""),
+                getattr(rel, "object", ""),
+            )
+            graph_triple_to_type[triple] = getattr(rel, "relation_type", "factual")
+
+        active_keys = self.indexed_key_registry.list_active() if self.indexed_key_registry else []
+
+        tier_keyed: dict[str, list[dict]] = {
+            "episodic": [],
+            "semantic": [],
+            "procedural": [],
+        }
+        graph_drift_count = 0
+
+        for key in active_keys:
+            qa_info = self.indexed_key_qa.get(key)
+            if qa_info is None:
+                # No QA metadata — skip (should not happen with intact registry)
+                logger.warning("consolidate_interim_adapters: no QA metadata for key %s", key)
+                continue
+
+            src_subj = qa_info.get("source_subject", "")
+            src_pred = qa_info.get("source_predicate", "")
+            src_obj = qa_info.get("source_object", "")
+            triple_key = (src_subj, src_pred, src_obj)
+
+            current_adapter_id = self.indexed_key_registry.get_adapter_id(key)
+
+            # Try to re-derive tier from the cumulative graph.
+            relation_type = graph_triple_to_type.get(triple_key)
+            if relation_type is not None:
+                # Re-derive tier using the same partition_relations policy.
+                dummy_rel = [
+                    {
+                        "subject": src_subj,
+                        "predicate": src_pred,
+                        "object": src_obj,
+                        "relation_type": relation_type,
+                    }
+                ]
+                ep_rels, proc_rels = partition_relations(
+                    dummy_rel, procedural_enabled=self.procedural_config is not None
+                )
+                if proc_rels:
+                    tier = "procedural"
+                elif ep_rels:
+                    # Determine if this is episodic or semantic based on the
+                    # current adapter_id (semantic keys stay semantic).
+                    if current_adapter_id == "semantic":
+                        tier = "semantic"
+                    else:
+                        tier = "episodic"
+                else:
+                    tier = "episodic"
+            else:
+                # Graph drift: triple not found in cumulative graph.
+                graph_drift_count += 1
+                logger.info(
+                    "graph_drift_key key=%s source_subject=%r source_predicate=%r "
+                    "source_object=%r current_adapter_id=%r",
+                    key,
+                    src_subj,
+                    src_pred,
+                    src_obj,
+                    current_adapter_id,
+                )
+                # Apply the interim-adapter bucketing rule:
+                #   episodic_interim_* → episodic
+                #   non-interim adapter_id → must be one of the three main tiers
+                if current_adapter_id.startswith(
+                    ("episodic_interim_", "semantic_interim_", "procedural_interim_")
+                ):
+                    tier = current_adapter_id.split("_interim_")[0]
+                else:
+                    assert current_adapter_id in {
+                        "episodic",
+                        "semantic",
+                        "procedural",
+                        "main",  # legacy default from KeyRegistry
+                    }, (
+                        f"Registry invariant violation: key {key!r} has "
+                        f"unexpected adapter_id {current_adapter_id!r}"
+                    )
+                    tier = (
+                        current_adapter_id
+                        if current_adapter_id in {"episodic", "semantic", "procedural"}
+                        else "episodic"
+                    )
+
+            tier_keyed[tier].append(
+                {
+                    "key": key,
+                    "question": qa_info["question"],
+                    "answer": qa_info["answer"],
+                }
+            )
+
+        # Warn if graph drift exceeds 10 % of active keys.
+        if active_keys and graph_drift_count > len(active_keys) * 0.10:
+            logger.warning(
+                "consolidate_interim_adapters: high graph drift (%d / %d keys = %.0f%%) — "
+                "indicates merge regression or drifted corpus; review recommended",
+                graph_drift_count,
+                len(active_keys),
+                100.0 * graph_drift_count / len(active_keys),
+            )
+
+        logger.info(
+            "consolidate_interim_adapters: key distribution — episodic=%d semantic=%d "
+            "procedural=%d drift=%d",
+            len(tier_keyed["episodic"]),
+            len(tier_keyed["semantic"]),
+            len(tier_keyed["procedural"]),
+            graph_drift_count,
+        )
+
+        # --- Step 4: Build per-tier TrainingJob objects ---
+        # Must be constructed before any tier rebuild begins so that
+        # inference_fallback_adapter is set to the backup adapter name.
+        # Because the public train_adapter (not BackgroundTrainer._train_adapter)
+        # is called here, _current_job is NOT updated automatically.  The
+        # per-tier loop manually swaps trainer._current_job to the tier-specific
+        # job before calling train_adapter so that pause() reads the correct
+        # inference_fallback_adapter for each tier rebuild.
+        from paramem.server.background_trainer import TrainingJob
+
+        refresh_training_config = self._make_training_config(num_epochs=refresh_epochs)
+
+        jobs_by_tier = {
+            "episodic": TrainingJob(
+                keyed_pairs=tier_keyed["episodic"],
+                adapter_name="episodic",
+                adapter_config=self.episodic_config,
+                inference_fallback_adapter="episodic_backup",
+            ),
+            "semantic": TrainingJob(
+                keyed_pairs=tier_keyed["semantic"],
+                adapter_name="semantic",
+                adapter_config=self.semantic_config,
+                inference_fallback_adapter="semantic_backup",
+            ),
+            "procedural": TrainingJob(
+                keyed_pairs=tier_keyed["procedural"],
+                adapter_name="procedural",
+                adapter_config=self.procedural_config or self.episodic_config,
+                inference_fallback_adapter="procedural_backup",
+            ),
+        }
+
+        # --- Step 5: Per-tier fresh-adapter rebuild ---
+        # Load backup adapters (PEFT load-or-skip idempotency: NC-2).
+        # In the absence of a real encrypted backup dir we skip the load
+        # and fall back to the live main adapters as the de-facto backup.
+        # Production systems should implement the Fernet backup path (Step 7d).
+        for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
+            if backup_name not in self.model.peft_config:
+                # No backup available — copy main weights into backup slot.
+                # This keeps PEFT adapter count ≥ 5 throughout the rebuild.
+                base_tier = backup_name.replace("_backup", "")
+                if base_tier in self.model.peft_config:
+                    from paramem.models.loader import copy_adapter_weights
+
+                    self.model = create_adapter(self.model, self.episodic_config, backup_name)
+                    copy_adapter_weights(self.model, src=base_tier, dst=backup_name)
+                    logger.info(
+                        "consolidate_interim_adapters: created in-memory backup %s from %s",
+                        backup_name,
+                        base_tier,
+                    )
+
+        tiers_rebuilt: list[str] = []
+        recall_per_tier: dict[str, float] = {}
+        rollback_tier: str | None = None
+
+        for tier in ("episodic", "semantic", "procedural"):
+            backup_name = f"{tier}_backup"
+            job = jobs_by_tier[tier]
+
+            if not job.keyed_pairs:
+                logger.info(
+                    "consolidate_interim_adapters: no keys for tier %s — skipping rebuild", tier
+                )
+                continue
+
+            # a. Switch active adapter away from the tier being rebuilt so
+            #    delete_adapter does not fire a PEFT UserWarning and auto-pick.
+            if backup_name in self.model.peft_config:
+                from paramem.models.loader import switch_adapter
+
+                switch_adapter(self.model, backup_name)
+
+            # b. delete_adapter(<tier>) + create_adapter(<tier>) — safe because
+            #    ≥5 adapters remain at this point ({2 other mains + 3 backups +
+            #    N interims}).
+            if tier in self.model.peft_config:
+                self.model.delete_adapter(tier)
+                logger.debug("consolidate_interim_adapters: deleted adapter %s", tier)
+
+            tier_cfg = (
+                self.episodic_config
+                if tier == "episodic"
+                else (
+                    self.semantic_config
+                    if tier == "semantic"
+                    else (self.procedural_config or self.episodic_config)
+                )
+            )
+            self.model = create_adapter(self.model, tier_cfg, tier)
+            logger.debug("consolidate_interim_adapters: created fresh adapter %s", tier)
+
+            # c. Set <tier> active for training.
+            from paramem.models.loader import switch_adapter as _sw
+
+            _sw(self.model, tier)
+
+            # d. B2 re-arm: flip _is_training True BEFORE _train_adapter,
+            #    False in finally so it fires on success AND failure.
+            #    Also swap _current_job to the per-tier job so that pause()
+            #    reads the correct inference_fallback_adapter (e.g.
+            #    "episodic_backup") during this tier's rebuild.  The prior
+            #    sentinel (installed by _run_callable_queue) is restored in
+            #    the finally block to preserve the outer invariant.
+            prior_job = None
+            if trainer is not None:
+                prior_job = trainer._current_job
+                trainer._current_job = job
+                trainer._set_is_training(True)
+            try:
+                # Format training data and update job config for refresh epochs.
+                from paramem.training.indexed_memory import format_indexed_training
+                from paramem.training.trainer import train_adapter as _train_adapter_fn
+
+                examples = format_indexed_training(job.keyed_pairs, self.tokenizer, max_length=1024)
+                if examples:
+                    dataset = self._indexed_dataset(examples)
+                    self._enable_gradient_checkpointing()
+                    _train_adapter_fn(
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        train_dataset=dataset,
+                        adapter_name=tier,
+                        training_config=refresh_training_config,
+                        adapter_config=tier_cfg,
+                        wandb_config=self.wandb_config,
+                        output_dir=self.output_dir / "consolidation_refresh" / tier,
+                        run_name=f"consolidate-{tier}",
+                        callbacks_extra=self._shutdown_callbacks,
+                    )
+                    logger.info(
+                        "consolidate_interim_adapters: trained %s on %d keys",
+                        tier,
+                        len(job.keyed_pairs),
+                    )
+            finally:
+                if trainer is not None:
+                    trainer._set_is_training(False)
+                    trainer._current_job = prior_job
+
+            # e. Recall-sanity check (Step 7d).
+            # Probe a sample of up to 100 keys uniformly at random.
+            # adapter_name= MUST be passed explicitly — default "episodic" would
+            # silently probe the wrong tier for semantic/procedural.
+            probe_pairs = job.keyed_pairs
+            if len(probe_pairs) > 100:
+                probe_pairs = random.sample(probe_pairs, 100)
+
+            # Build a minimal simhash registry for the probe.
+            from paramem.training.indexed_memory import build_registry as _build_reg
+
+            probe_registry = _build_reg(probe_pairs)
+
+            try:
+                from experiments.utils.test_harness import evaluate_indexed_recall
+
+                self._disable_gradient_checkpointing()
+                recall_result = evaluate_indexed_recall(
+                    self.model,
+                    self.tokenizer,
+                    probe_pairs,
+                    probe_registry,
+                    adapter_name=tier,
+                )
+                recall_rate = recall_result["rate"]
+            except Exception:
+                logger.exception(
+                    "consolidate_interim_adapters: recall probe failed for tier %s — "
+                    "treating as recall=0.0 to trigger rollback",
+                    tier,
+                )
+                recall_rate = 0.0
+
+            recall_per_tier[tier] = recall_rate
+            logger.info(
+                "consolidate_interim_adapters: recall check tier=%s rate=%.3f threshold=%.3f",
+                tier,
+                recall_rate,
+                recall_sanity_threshold,
+            )
+
+            if recall_rate < recall_sanity_threshold:
+                # Capacity ceiling hit — rollback and abort.
+                rollback_tier = tier
+                logger.error(
+                    "consolidate_interim_adapters: recall %.3f < threshold %.3f for tier %s "
+                    "— rolling back and aborting finalize",
+                    recall_rate,
+                    recall_sanity_threshold,
+                    tier,
+                )
+                self._append_capacity_ceiling_log(
+                    tier=tier,
+                    n_keys_pre=len(job.keyed_pairs),
+                    n_keys_post=len(job.keyed_pairs),
+                    recall_pre=1.0,  # assume pre-refresh was at threshold
+                    recall_post=recall_rate,
+                )
+                # Restore from backup: copy backup weights back into the main tier.
+                if backup_name in self.model.peft_config:
+                    from paramem.models.loader import copy_adapter_weights
+
+                    _sw(self.model, backup_name)
+                    if tier not in self.model.peft_config:
+                        self.model = create_adapter(self.model, self.episodic_config, tier)
+                    copy_adapter_weights(self.model, src=backup_name, dst=tier)
+                    logger.info(
+                        "consolidate_interim_adapters: restored %s from %s after ceiling trip",
+                        tier,
+                        backup_name,
+                    )
+                return {
+                    "tiers_rebuilt": tiers_rebuilt,
+                    "graph_drift_count": graph_drift_count,
+                    "keys_per_tier": {t: len(v) for t, v in tier_keyed.items()},
+                    "recall_per_tier": recall_per_tier,
+                    "rolled_back": True,
+                    "rollback_tier": rollback_tier,
+                }
+
+            tiers_rebuilt.append(tier)
+
+        # flip off _is_training at finalize entry (belt-and-braces).
+        if trainer is not None:
+            trainer._set_is_training(False)
+
+        # --- Step 6: Atomic finalize ---
+        # Invariant: registry rewrite FIRST, Router.reload() LAST.
+        # The finalize block runs purely as registry / disk / PEFT / router ops.
+        # No _train_adapter() call, no HF Trainer-driven routine may appear here.
+
+        # 6a. Registry rewrite (MUST be first).
+        if self.indexed_key_registry is not None:
+            for tier, pairs in tier_keyed.items():
+                for kp in pairs:
+                    self.indexed_key_registry.set_adapter_id(kp["key"], tier)
+            registry_path = self.output_dir / "indexed_key_registry.json"
+            self.indexed_key_registry.save(registry_path)
+            logger.info("consolidate_interim_adapters: registry rewritten to %s", registry_path)
+
+        # 6b. Interim purge — single call covers both PEFT delete AND on-disk rmtree.
+        unload_interim_adapters(self.model, self.output_dir)
+        logger.info("consolidate_interim_adapters: interim adapters unloaded")
+
+        # 6c. Router reload (MUST be last).
+        if router is not None:
+            try:
+                router.reload()
+                logger.info("consolidate_interim_adapters: router reloaded")
+            except Exception:
+                logger.exception("consolidate_interim_adapters: router reload failed")
+
+        # --- Step 7: Success commit ---
+        self.triples_since_last_full = 0
+
+        # Unload backup adapters (the three mains remain loaded throughout).
+        for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
+            if backup_name in self.model.peft_config:
+                self.model.delete_adapter(backup_name)
+                logger.debug(
+                    "consolidate_interim_adapters: unloaded backup adapter %s",
+                    backup_name,
+                )
+
+        # Restore episodic as the active adapter for subsequent inference.
+        if "episodic" in self.model.peft_config:
+            from paramem.models.loader import switch_adapter as _sw2
+
+            _sw2(self.model, "episodic")
+
+        logger.info(
+            "consolidate_interim_adapters: complete — rebuilt %s, drift=%d",
+            tiers_rebuilt,
+            graph_drift_count,
+        )
+
+        return {
+            "tiers_rebuilt": tiers_rebuilt,
+            "graph_drift_count": graph_drift_count,
+            "keys_per_tier": {t: len(v) for t, v in tier_keyed.items()},
+            "recall_per_tier": recall_per_tier,
+            "rolled_back": False,
+            "rollback_tier": None,
+        }
+
+    def _append_capacity_ceiling_log(
+        self,
+        *,
+        tier: str,
+        n_keys_pre: int,
+        n_keys_post: int,
+        recall_pre: float,
+        recall_post: float,
+        log_path: str | Path | None = None,
+    ) -> None:
+        """Append one JSONL row to the capacity-ceiling log.
+
+        Creates the parent directory if absent (idempotent).  Each row records
+        the tier, key counts, and recall rates at the time of a ceiling event so
+        operators can diagnose capacity degradation without re-running evals.
+
+        Args:
+            tier: The adapter tier that tripped the ceiling (``"episodic"`` etc.).
+            n_keys_pre: Number of keys in the tier before the rebuild attempt.
+            n_keys_post: Number of keys in the tier after the rebuild attempt.
+            recall_pre: Estimated recall rate before the rebuild (1.0 by default
+                when no pre-rebuild probe is available).
+            recall_post: Recall rate measured immediately after the rebuild.
+            log_path: Override path for the JSONL file.  Defaults to
+                ``outputs/capacity_ceiling.jsonl``.
+        """
+        import datetime
+        import json
+
+        if log_path is None:
+            log_path = Path("outputs") / "capacity_ceiling.jsonl"
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        row = {
+            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+            "tier": tier,
+            "n_keys_pre": n_keys_pre,
+            "n_keys_post": n_keys_post,
+            "recall_pre": recall_pre,
+            "recall_post": recall_post,
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+        logger.warning(
+            "capacity_ceiling_event tier=%s recall_pre=%.3f recall_post=%.3f keys=%d log=%s",
+            tier,
+            recall_pre,
+            recall_post,
+            n_keys_post,
+            log_path,
+        )
 
     def _ensure_adapters(self):
         """Create adapters that don't exist yet.

@@ -50,12 +50,26 @@ class TimerSpec:
 def parse_schedule(schedule: str) -> TimerSpec | None:
     """Parse a schedule string into a systemd TimerSpec.
 
+    Accepted formats:
+
+    - ``""`` / ``"off"`` / ``"disabled"`` / ``"none"`` → disabled timer.
+    - ``"weekly"`` → interval of 168h (604800 s); maps to ``OnUnitActiveSec=168h``.
+    - ``"daily"`` → OnCalendar daily at 03:00 (same as ``"03:00"``).
+    - ``"every Nh"`` / ``"every Nm"`` → interval timer.
+    - ``"HH:MM"`` → daily OnCalendar timer at the given time.
+
     Returns TimerSpec(kind="off") for an explicit off setting.
     Returns None on malformed input (caller logs + falls back to off).
     """
     s = (schedule or "").strip().lower()
     if s in ("", "off", "disabled", "none"):
         return TimerSpec(kind="off")
+
+    if s == "weekly":
+        return TimerSpec(kind="interval", on_boot_sec="168h", on_unit_active_sec="168h")
+
+    if s == "daily":
+        return TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
 
     m = re.fullmatch(r"every\s+(\d+)\s*([hm])", s)
     if m:

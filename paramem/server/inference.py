@@ -35,6 +35,84 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY_TURNS = 10
 
 
+def enqueue_post_session_train(
+    conversation_id: str,
+    transcript: str,
+    speaker_id: str,
+    speaker_name: str | None,
+    loop,
+    background_trainer,
+    config: "ServerConfig",
+    state: dict,
+) -> None:
+    """Enqueue a post-conversation training job on the BackgroundTrainer.
+
+    Submits a callable wrapping ``loop.post_session_train`` to
+    ``BackgroundTrainer.submit()``.  The single-slot worker thread holds the
+    GPU lock for the duration of each job, so jobs from concurrent ``/chat``
+    turns queue behind one another and execute serially.  This eliminates the
+    concurrent-turn race on ``ConsolidationLoop._indexed_next_index`` and
+    ``seen_triples``.
+
+    ``inference_fallback_adapter`` is set to ``"episodic"`` (the stable main
+    adapter) so that inference during a paused training job reads committed
+    weights rather than mid-training staging state.
+
+    After ``post_session_train`` returns, ``state["model"]`` is updated with
+    ``loop.model`` to pick up any PeftModel handle rebinding that
+    ``create_interim_adapter`` may have performed.
+
+    This function is intentionally side-effect free on the conversation path —
+    it never blocks the response being returned to the caller.
+
+    Args:
+        conversation_id: The conversation identifier (used as ``session_id``).
+        transcript: The full conversation transcript text (all turns joined).
+        speaker_id: Speaker identifier for key ownership scoping.
+        speaker_name: Human-readable speaker name for extraction personalisation.
+        loop: The live ``ConsolidationLoop`` instance (``_state["consolidation_loop"]``).
+        background_trainer: The live ``BackgroundTrainer`` instance
+            (``_state["background_trainer"]``).  Must not be ``None`` — callers
+            should guard with ``background_trainer is not None`` before calling.
+        config: Server config for ``schedule`` and ``max_interim_count``.
+        state: Global ``_state`` dict; ``state["model"]`` is updated after
+            training completes.
+    """
+    if loop is None or background_trainer is None:
+        return
+
+    schedule = config.consolidation.schedule
+    max_interim_count = config.consolidation.max_interim_count
+
+    def _run_post_session_train() -> None:
+        """Execute post_session_train and update state. Runs in BackgroundTrainer worker."""
+        try:
+            result = loop.post_session_train(
+                session_transcript=transcript,
+                session_id=conversation_id,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+                schedule=schedule,
+                max_interim_count=max_interim_count,
+            )
+            # After post_session_train returns, update global model handle in case
+            # create_interim_adapter rebound the PeftModel wrapper.
+            state["model"] = loop.model
+            logger.info(
+                "post_session_train complete: mode=%s, adapter=%s, new_keys=%d",
+                result.get("mode"),
+                result.get("adapter_name"),
+                len(result.get("new_keys", [])),
+            )
+        except Exception:
+            logger.exception("post_session_train failed for conversation %s", conversation_id)
+
+    background_trainer.submit(
+        _run_post_session_train,
+        inference_fallback_adapter="episodic",
+    )
+
+
 def _language_instruction(language: str | None, config: ServerConfig | None = None) -> str:
     """Return a language instruction string, or empty for English/unknown.
 
@@ -333,18 +411,21 @@ def _probe_and_reason(
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
-    For each adapter (procedural → semantic → episodic):
-      1. Switch to it
-      2. Probe its keys
-      3. Collect recalled facts into that layer's section
+    Builds a ``keys_by_adapter`` dict from ``plan.steps`` (preserving router
+    order: procedural → episodic → semantic → session adapters newest-first),
+    dispatches to ``probe_keys_grouped_by_adapter`` for a single
+    ``switch_adapter`` call per adapter group, then reassembles per-layer
+    facts for context augmentation.
 
-    After all adapters are probed, disable adapters and let the base
-    model reason over the layered context.
+    After probing, restores the model to the ``episodic`` adapter so the next
+    query starts from a predictable state. The reasoning phase uses
+    ``model.disable_adapter()`` so the active adapter during generation does
+    not matter — only the post-return state (restored here) does.
     """
     from peft import PeftModel
 
     from paramem.models.loader import switch_adapter
-    from paramem.training.indexed_memory import probe_key
+    from paramem.training.indexed_memory import probe_keys_grouped_by_adapter
 
     registry = _load_simhash_registry(config.registry_path)
 
@@ -354,19 +435,36 @@ def _probe_and_reason(
         "episodic": "Recent knowledge",
     }
 
+    # Build ordered keys_by_adapter dict from routing steps.
+    # Insertion order matches router output (procedural → episodic → semantic
+    # → session adapters newest-first).  Use a plain dict — Python 3.7+
+    # guarantees insertion-order preservation.
+    keys_by_adapter: dict[str, list[str]] = {}
+    for step in plan.steps:
+        keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
+
+    # One switch_adapter call per adapter group.
+    probe_results = probe_keys_grouped_by_adapter(
+        model,
+        tokenizer,
+        keys_by_adapter,
+        registry=registry,
+    )
+
+    # Restore predictable adapter state: episodic is the main adapter for
+    # PM inference. The reasoning phase uses disable_adapter() so this only
+    # matters for subsequent queries, not the current one.
+    if hasattr(model, "peft_config") and "episodic" in model.peft_config:
+        switch_adapter(model, "episodic")
+
+    # Reassemble per-step facts so each adapter's results go to its layer.
     layers: dict[str, list[str]] = {}
     successful_keys = []
 
     for step in plan.steps:
-        if hasattr(model, "peft_config") and step.adapter_name in model.peft_config:
-            switch_adapter(model, step.adapter_name)
-        elif step.adapter_name != "episodic":
-            logger.info("Adapter %s not loaded, skipping", step.adapter_name)
-            continue
-
         layer_facts = []
         for key in step.keys_to_probe:
-            result = probe_key(model, tokenizer, key, registry=registry)
+            result = probe_results.get(key)
             if result and "failure_reason" not in result:
                 layer_facts.append(f"- {result.get('answer', '')}")
                 successful_keys.append(key)

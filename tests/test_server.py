@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -356,3 +357,112 @@ class TestKeyMetadata:
 
         vc = VoiceConfig(prompt_file="nonexistent.txt", system_prompt="Fallback prompt")
         assert vc.load_prompt() == "Fallback prompt"
+
+
+class TestProbeAndReasonDispatch:
+    """Test that _probe_and_reason dispatches to probe_keys_grouped_by_adapter."""
+
+    def _make_plan(self, steps):
+        """Build a RoutingPlan from a list of (adapter_name, keys) tuples."""
+        from paramem.server.router import RoutingPlan, RoutingStep
+
+        return RoutingPlan(
+            steps=[RoutingStep(adapter_name=a, keys_to_probe=list(k)) for a, k in steps],
+            strategy="direct",
+            match_source="pa",
+        )
+
+    def _make_model(self, adapter_names):
+        """Stub model with peft_config for the given adapter names."""
+        model = MagicMock()
+        model.peft_config = {name: MagicMock() for name in adapter_names}
+        return model
+
+    def test_dispatches_to_grouped_probe_with_correct_groups(self, monkeypatch, tmp_path):
+        """_probe_and_reason builds keys_by_adapter in step order and calls
+        probe_keys_grouped_by_adapter with those groups."""
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        captured = {}
+
+        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
+            captured["keys_by_adapter"] = dict(keys_by_adapter)
+            # Return all keys as successful probes.
+            results = {}
+            for keys in keys_by_adapter.values():
+                for k in keys:
+                    results[k] = {"key": k, "answer": f"ans_{k}", "confidence": 1.0}
+            return results
+
+        # _probe_and_reason uses a lazy local import from paramem.training.indexed_memory,
+        # so we patch at the source module.
+        monkeypatch.setattr(
+            "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+            fake_grouped,
+        )
+
+        # Stub out downstream calls.
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            lambda model, name: None,
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference._load_simhash_registry",
+            lambda path: {},
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.sanitize_for_cloud",
+            lambda text, mode=None: (text, []),
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.generate_answer",
+            lambda model, tokenizer, prompt, **kwargs: "final answer",
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference._build_messages",
+            lambda text, history, system_prompt, tokenizer: [{"role": "user", "content": text}],
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+
+        model = self._make_model(["episodic", "procedural"])
+        # Disable PeftModel isinstance check so disable_adapter branch is skipped.
+        monkeypatch.setattr(
+            "paramem.server.inference.PeftModel",
+            type(None),
+            raising=False,
+        )
+
+        # Write a minimal voice prompt file.
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("You are an assistant.")
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+
+        plan = self._make_plan(
+            [
+                ("procedural", ["p1", "p2"]),
+                ("episodic", ["e1"]),
+            ]
+        )
+
+        from paramem.server.inference import _probe_and_reason
+
+        _probe_and_reason(
+            text="What do I like?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+        )
+
+        assert "keys_by_adapter" in captured, "probe_keys_grouped_by_adapter was not called"
+        kba = captured["keys_by_adapter"]
+        # Both groups present.
+        assert list(kba.keys()) == ["procedural", "episodic"], (
+            f"Expected ['procedural', 'episodic'], got {list(kba.keys())}"
+        )
+        assert kba["procedural"] == ["p1", "p2"]
+        assert kba["episodic"] == ["e1"]

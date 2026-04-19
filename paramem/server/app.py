@@ -17,6 +17,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -27,15 +28,21 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from paramem.models.loader import load_adapter, load_base_model, unload_model
+from paramem.models.loader import load_adapter, load_base_model, switch_adapter, unload_model
 from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import TTSConfig, load_server_config
 from paramem.server.consolidation import run_consolidation
 from paramem.server.ha_graph import HAEntityGraph
-from paramem.server.inference import ChatResult, _escalate_to_sota, handle_chat
+from paramem.server.inference import (
+    ChatResult,
+    _escalate_to_sota,
+    enqueue_post_session_train,
+    handle_chat,
+)
 from paramem.server.router import QueryRouter
-from paramem.server.session_buffer import SessionBuffer
+from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
 from paramem.server.tools.ha_client import HAClient
+from paramem.server.vram_validator import ConfigurationError, validate_startup_vram
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
 logger = logging.getLogger(__name__)
@@ -145,7 +152,16 @@ async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
     config = _state["config"]
 
-    cloud_only = _state.get("cloud_only_startup", False) or _state.get("defer_model", False)
+    # cloud_only is enabled if ANY of the following is true:
+    #   1. --cloud-only CLI flag was passed at startup.
+    #   2. cloud_only: true is set in server.yaml (YAML cannot be silently overridden).
+    #   3. --defer-model flag was passed (start cloud-only then auto-reclaim GPU).
+    # OR is the correct combiner: both are opt-in signals for cloud-only mode.
+    cloud_only = (
+        _state.get("cloud_only_startup", False)
+        or config.cloud_only
+        or _state.get("defer_model", False)
+    )
 
     # Track why we're cloud-only
     if _state.get("cloud_only_startup", False):
@@ -189,6 +205,84 @@ async def lifespan(app: FastAPI):
             logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
         else:
             logger.info("No adapters found — starting fresh")
+
+        # Startup VRAM validation — refuse to start if the configured topology
+        # cannot fit in VRAM for the full week. Runs after model + adapters are
+        # loaded so the CUDA allocator snapshot is accurate.
+        main_adapter_count = sum(
+            1
+            for adapter_cfg in (
+                config.adapters.episodic,
+                config.adapters.semantic,
+                config.adapters.procedural,
+            )
+            if adapter_cfg.enabled
+        )
+        try:
+            validate_startup_vram(
+                model,
+                config.episodic_adapter_config,
+                max_interim_count=config.consolidation.max_interim_count,
+                model_name=config.model_name,
+                main_adapter_count=main_adapter_count,
+            )
+        except ConfigurationError as exc:
+            logger.error("VRAM configuration error:\n%s", exc)
+            sys.exit(1)
+
+        # Load interim adapters that survived from a previous run (e.g. after a
+        # restart before the weekly consolidation ran).  These live at
+        # adapter_dir/episodic_interim_YYYYMMDDTHHMM/ alongside the main adapters.
+        # PEFT crashes if adapter_config.json exists without adapter_model.safetensors
+        # (CLAUDE.md), so we validate both files before calling load_adapter.
+        for _interim_path in sorted(config.adapter_dir.glob("episodic_interim_*")):
+            if not _interim_path.is_dir():
+                continue
+            if (
+                not (_interim_path / "adapter_config.json").exists()
+                or not (_interim_path / "adapter_model.safetensors").exists()
+            ):
+                logger.warning("Skipping half-present interim adapter: %s", _interim_path.name)
+                continue
+            _interim_name = _interim_path.name
+            model = load_adapter(model, str(config.adapter_dir), _interim_name)
+            logger.info("Loaded interim adapter: %s", _interim_name)
+
+        # Restore the main episodic adapter as the active adapter so that all
+        # inference probes default to the consolidated tier.  Only needed when at
+        # least one adapter is present; on a fresh install peft_config is absent.
+        if hasattr(model, "peft_config") and "episodic" in model.peft_config:
+            switch_adapter(model, "episodic")
+
+        # I5 — Registry consistency check on startup.
+        # If the process was killed between adapter-save and registry-save in
+        # post_session_train, the registry may contain entries whose adapter
+        # safetensors file is missing.  Drop such entries and log a warning so
+        # the adapter is rebuilt at the next post-session training pass.
+        _registry_path = config.adapter_dir / "indexed_key_registry.json"
+        if _registry_path.exists():
+            from paramem.training.key_registry import KeyRegistry as _KeyRegistry
+
+            _reg = _KeyRegistry.load(_registry_path)
+            _orphaned: list[str] = []
+            for _key in list(_reg.list_active()):
+                _aid = _reg.get_adapter_id(_key)
+                # Only interim adapters need this check — main adapters are
+                # saved by _save_adapters() which is always a complete write.
+                # Interim safetensors live at adapter_dir/<adapter_id>/adapter_model.safetensors
+                if _aid.startswith("episodic_interim_"):
+                    _weights = config.adapter_dir / _aid / "adapter_model.safetensors"
+                    if not _weights.exists():
+                        _reg.remove(_key)
+                        _orphaned.append(_key)
+            if _orphaned:
+                logger.warning(
+                    "Startup registry check: dropped %d orphan key(s) whose adapter "
+                    "weights are missing (adapter save was interrupted): %s",
+                    len(_orphaned),
+                    _orphaned,
+                )
+                _reg.save(_registry_path)
 
         _state["model"] = model
         _state["tokenizer"] = tokenizer
@@ -731,6 +825,33 @@ async def chat(request: ChatRequest):
     )
     response_text = result.text
     buffer.append(request.conversation_id, "assistant", response_text)
+
+    # Post-conversation training: after each assistant response, enqueue a
+    # background job to extract and train onto the current interim adapter.
+    # Only fires when a speaker is identified (speaker_id is required for key
+    # ownership) and the consolidation mode is "train" (not "simulate").
+    # The job runs in a daemon thread — it never blocks the response path.
+    # model handle is updated inside enqueue_post_session_train after training.
+    if (
+        speaker_id is not None
+        and _state.get("consolidation_loop") is not None
+        and _state["config"].consolidation.mode == "train"
+    ):
+        transcript_turns = buffer.get_session_turns(request.conversation_id)
+        if transcript_turns:
+            transcript_text = "\n".join(
+                f"{t.get('role', 'user')}: {t.get('text', '')}" for t in transcript_turns
+            )
+            enqueue_post_session_train(
+                conversation_id=request.conversation_id,
+                transcript=transcript_text,
+                speaker_id=speaker_id,
+                speaker_name=speaker,
+                loop=_state["consolidation_loop"],
+                background_trainer=_state.get("background_trainer"),
+                config=_state["config"],
+                state=_state,
+            )
 
     # Resume training after inference — only if we paused (not stopped)
     if training_paused and bg_trainer is not None:

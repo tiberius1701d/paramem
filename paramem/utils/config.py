@@ -88,7 +88,6 @@ class ConsolidationConfig:
     key_retirement_threshold: float = 0.1
     key_retirement_cycles: int = 3
     indexed_key_replay_enabled: bool = False
-    reconstruction_interval: int = 5
 
 
 @dataclass

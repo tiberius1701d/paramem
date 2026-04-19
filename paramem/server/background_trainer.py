@@ -8,6 +8,7 @@ just flag flips (model.eval/train, gradient checkpointing), no reload.
 """
 
 import logging
+import queue
 import subprocess
 import threading
 import time
@@ -26,6 +27,9 @@ from paramem.training.indexed_memory import format_indexed_training
 from paramem.utils.config import AdapterConfig, TrainingConfig
 
 logger = logging.getLogger(__name__)
+
+# Sentinel placed on _job_queue to signal the persistent callable worker to exit.
+_WORKER_STOP = object()
 
 
 def _gpu_temp() -> int | None:
@@ -46,11 +50,29 @@ def _gpu_temp() -> int | None:
 
 @dataclass
 class TrainingJob:
-    """A single adapter training job."""
+    """A single adapter training job.
+
+    Attributes:
+        keyed_pairs: Pre-tokenized training pairs for this adapter.
+        adapter_name: Name of the production adapter being trained (e.g.
+            ``"episodic"`` or ``"episodic_interim_20260418T1430"``).
+        adapter_config: LoRA config for the adapter.
+        inference_fallback_adapter: Adapter to activate when training is paused
+            for inference.  Must be a **committed** adapter slot with stable
+            weights — never the mid-training ``in_training`` staging slot.
+
+            For interim-adapter jobs (this Step 6): ``"episodic"`` (the stable
+            main).  For main consolidation refresh jobs (Step 7): the backed-up
+            prior main adapter name.
+
+            Defaults to ``"episodic"`` so existing callers that create
+            ``TrainingJob`` without this field continue to work correctly.
+    """
 
     keyed_pairs: list[dict]
     adapter_name: str
     adapter_config: AdapterConfig
+    inference_fallback_adapter: str = "episodic"
 
 
 class _PauseForInferenceCallback(TrainerCallback):
@@ -152,7 +174,21 @@ class BackgroundTrainer:
         self._is_training = False
         self._last_completed_epoch = 0
         self._current_adapter = ""
+        self._current_job: TrainingJob | None = None
         self._on_error: Callable[[], None] | None = None
+
+        # Callable-job queue for submit().  Holds (callable, fallback_adapter)
+        # pairs or the _WORKER_STOP sentinel.  Drained by _run_callable_queue
+        # on a single persistent daemon worker thread that lives for the
+        # process lifetime.  A persistent worker eliminates the race where a
+        # concurrent submit() call sees is_alive()==True on a thread that has
+        # already decided to exit (queue empty) but not yet terminated.
+        self._job_queue: queue.SimpleQueue = queue.SimpleQueue()
+        # Guards one-time worker-thread creation.  After the first submit() the
+        # worker is alive for the process lifetime; subsequent submit() calls
+        # skip the creation path entirely.
+        self._worker_lock = threading.Lock()
+        self._worker_thread: threading.Thread | None = None
 
     @property
     def is_training(self) -> bool:
@@ -233,13 +269,25 @@ class BackgroundTrainer:
                 self._training_paused.clear()
                 return False
 
-            # Switch to production adapter (last committed snapshot) so inference
-            # queries the user's established knowledge, not mid-training weights.
-            # Guard: _current_adapter is set by _train_adapter; if pause() races
-            # before the first job starts, fall back to a sane production slot.
+            # Switch to the committed production adapter so inference queries the
+            # user's established knowledge, not mid-training weights.
+            #
+            # Use the job's explicit inference_fallback_adapter rather than
+            # _current_adapter: for interim-adapter jobs the current adapter is
+            # the episodic_interim_* slot, which contains staging-copy weights
+            # that must NOT be exposed to inference during a pause.  The fallback
+            # is always "episodic" (main) for Step-6 jobs and the prior committed
+            # main for Step-7 refresh jobs.
+            #
+            # Guard: _current_job is set by _train_adapter; if pause() races
+            # before the first job starts, fall back to "episodic".
             from paramem.models.loader import switch_adapter
 
-            target = self._current_adapter or "episodic"
+            target = (
+                self._current_job.inference_fallback_adapter
+                if self._current_job is not None
+                else "episodic"
+            )
             if target in self.model.peft_config:
                 switch_adapter(self.model, target)
                 logger.debug("Paused: switched to production adapter '%s'", target)
@@ -308,6 +356,147 @@ class BackgroundTrainer:
 
         self._is_training = False
         return self._last_completed_epoch
+
+    def submit(
+        self,
+        fn: Callable[[], None],
+        *,
+        inference_fallback_adapter: str = "episodic",
+    ) -> None:
+        """Enqueue a callable job to run serially in the background worker.
+
+        Non-blocking — returns immediately after queuing.  Jobs from concurrent
+        ``/chat`` turns are serialised: the second job waits in the queue until
+        the first completes.  This eliminates concurrent-turn races on shared
+        ``ConsolidationLoop`` state (``_indexed_next_index``, ``seen_triples``).
+
+        The GPU lock (``gpu_lock_sync``) is held for the duration of each job so
+        that concurrent STT/TTS inference requests are correctly serialised via
+        ``pause()`` / ``resume()``.
+
+        ``inference_fallback_adapter`` is stored as a sentinel
+        :class:`TrainingJob` on ``self._current_job`` so that
+        :meth:`pause` switches to the correct committed adapter
+        (``"episodic"`` for post-session jobs) rather than whatever adapter was
+        last active during training.
+
+        The callable worker thread is started once on the first
+        :meth:`submit` call and lives for the process lifetime (persistent
+        daemon).  This eliminates the race where a concurrent caller sees
+        ``is_alive() == True`` on a thread that has already decided to exit
+        (queue empty) but has not yet terminated, causing a new job to be
+        silently stranded in the queue.
+
+        Args:
+            fn: Zero-argument callable to execute under the GPU lock.
+            inference_fallback_adapter: Adapter to activate if ``pause()``
+                is called while ``fn`` is executing.  Must name a committed
+                adapter slot with stable weights.  Defaults to ``"episodic"``.
+        """
+        self._job_queue.put((fn, inference_fallback_adapter))
+        with self._worker_lock:
+            if self._worker_thread is None:
+                self._worker_thread = threading.Thread(
+                    target=self._run_callable_queue,
+                    daemon=True,
+                    name="bg-trainer-callable",
+                )
+                self._worker_thread.start()
+
+    def _run_callable_queue(self) -> None:
+        """Drain the callable-job queue serially under the GPU lock.
+
+        Started once by the first :meth:`submit` call and runs for the
+        process lifetime (persistent daemon thread).  Blocks on
+        ``_job_queue.get()`` between jobs so no jobs are ever stranded.
+
+        The previous implementation used ``get_nowait()`` and exited when the
+        queue was empty.  That introduced a race: a concurrent ``submit()``
+        could see ``is_alive() == True`` (thread not yet terminated) and skip
+        starting a new worker, leaving the new job in the queue forever.
+        The persistent-worker design eliminates the race entirely — there is
+        always exactly one worker thread alive after the first submit.
+
+        Each job runs under ``gpu_lock_sync()`` to prevent concurrent GPU
+        access from consolidation training or inference.  A sentinel
+        :class:`TrainingJob` with ``inference_fallback_adapter`` set is
+        installed on ``self._current_job`` so that :meth:`pause` can switch
+        to the correct committed adapter when yielding to inference.
+
+        The loop exits only when the :data:`_WORKER_STOP` sentinel is
+        dequeued, which is sent by :meth:`_stop_callable_worker` during
+        process shutdown.
+        """
+        from paramem.server.gpu_lock import gpu_lock_sync
+
+        while True:
+            item = self._job_queue.get()  # blocks until a job (or sentinel) arrives
+            if item is _WORKER_STOP:
+                break
+
+            fn, fallback_adapter = item
+
+            # Install a sentinel so pause() reads the correct fallback adapter.
+            sentinel = TrainingJob(
+                keyed_pairs=[],
+                adapter_name="_callable_",
+                adapter_config=AdapterConfig(),
+                inference_fallback_adapter=fallback_adapter,
+            )
+            self._current_job = sentinel
+            self._is_training = True
+            try:
+                with gpu_lock_sync():
+                    fn()
+            except Exception:
+                logger.exception("submit() job failed")
+            finally:
+                self._current_job = None
+                self._is_training = False
+
+    def _set_is_training(self, value: bool) -> None:
+        """Override the ``_is_training`` flag from inside a submitted callable.
+
+        Used by ``consolidate_interim_adapters`` to mark non-training phases
+        (between per-tier ``_train_adapter`` calls; the entire finalize block)
+        so ``pause()`` short-circuits and inference waits on the GPU lock alone
+        instead of timing out on the never-firing
+        ``_PauseForInferenceCallback``.
+
+        No locking is needed: the writer (this method, called from inside the
+        callable that holds the GPU lock) and the reader (``pause()``'s
+        ``if not self._is_training: return True`` guard) perform simple boolean
+        operations that are atomic under the GIL, and the callable is the sole
+        writer while the GPU lock is held.
+
+        Args:
+            value: ``True`` to re-arm training mode before a ``_train_adapter``
+                call; ``False`` to mark a non-training gap or the finalize block.
+        """
+        self._is_training = value
+
+    def _stop_callable_worker(self, timeout: float = 5.0) -> None:
+        """Signal the callable worker to exit and wait for it to terminate.
+
+        Sends :data:`_WORKER_STOP` through the queue so the persistent daemon
+        thread exits cleanly.  Safe to call even if no worker has ever been
+        started.
+
+        Args:
+            timeout: Seconds to wait for the worker thread to join.  If the
+                thread is still alive after the timeout a warning is logged and
+                the method returns — the daemon will be killed on process exit.
+        """
+        with self._worker_lock:
+            if self._worker_thread is None:
+                return
+            self._job_queue.put(_WORKER_STOP)
+        self._worker_thread.join(timeout=timeout)
+        if self._worker_thread.is_alive():
+            logger.warning(
+                "Callable worker did not exit within %.1fs; will be killed on process exit",
+                timeout,
+            )
 
     def _thermal_throttle(self, global_step: int):
         """Pause training if GPU temperature exceeds the configured limit.
@@ -428,6 +617,7 @@ class BackgroundTrainer:
         from paramem.models.loader import copy_adapter_weights, switch_adapter
 
         self._current_adapter = job.adapter_name
+        self._current_job = job
         self._last_completed_epoch = 0
 
         # Stage: copy production weights into in_training as the starting point

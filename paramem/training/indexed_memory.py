@@ -518,6 +518,74 @@ def probe_all_keys(
     }
 
 
+def probe_keys_grouped_by_adapter(
+    model,
+    tokenizer,
+    keys_by_adapter: dict[str, list[str]],
+    max_new_tokens: int = 200,
+    registry: dict[str, int] | None = None,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+) -> dict[str, dict | None]:
+    """Probe keys grouped by owning adapter. One switch_adapter per group.
+
+    Iterates ``keys_by_adapter`` in insertion order — the caller is responsible
+    for passing groups in the desired probe order (e.g. procedural → episodic →
+    semantic → session adapters newest-first, as produced by the router).
+
+    For each ``(adapter_name, keys)`` group:
+    - If the adapter is not present in ``model.peft_config``, emits a WARNING
+      and maps every key in the group to ``None`` (matches the missing-key
+      convention of ``probe_all_keys``).
+    - Otherwise switches to the adapter once via ``switch_adapter`` and calls
+      ``probe_key`` for every key in the group.
+
+    Returns a merged ``dict[str, dict | None]`` keyed by individual key names
+    across all groups.
+
+    Args:
+        model: A PeftModel instance with one or more loaded adapters.
+        tokenizer: Tokenizer matching the model.
+        keys_by_adapter: Ordered mapping of adapter name → list of key names to
+            probe under that adapter.
+        max_new_tokens: Maximum tokens to generate per probe.
+        registry: Optional SimHash registry for confidence verification.
+        confidence_threshold: Minimum confidence to accept a recalled pair.
+
+    Returns:
+        Flat dict mapping each key name to its ``probe_key`` result (a result
+        dict on success, or ``None`` / a failure dict on failure).
+    """
+    from paramem.models.loader import switch_adapter
+
+    results: dict[str, dict | None] = {}
+
+    for adapter_name, keys in keys_by_adapter.items():
+        if not hasattr(model, "peft_config") or adapter_name not in model.peft_config:
+            logger.warning(
+                "Adapter '%s' not loaded — skipping %d key(s): %s",
+                adapter_name,
+                len(keys),
+                keys,
+            )
+            for key in keys:
+                results[key] = None
+            continue
+
+        switch_adapter(model, adapter_name)
+
+        for key in keys:
+            results[key] = probe_key(
+                model,
+                tokenizer,
+                key,
+                max_new_tokens=max_new_tokens,
+                registry=registry,
+                confidence_threshold=confidence_threshold,
+            )
+
+    return results
+
+
 def validate_recall(
     recalled: dict | None,
     original: dict,

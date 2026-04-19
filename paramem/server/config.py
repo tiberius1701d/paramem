@@ -218,7 +218,6 @@ class ConsolidationScheduleConfig:
     promotion_threshold: int = 3
     retain_sessions: bool = True
     indexed_key_replay: bool = True  # indexed key training mechanism
-    reconstruction_interval: int = 5  # run fidelity checks every N cycles
     decay_window: int = 10  # cycles before unreinforced keys decay
     extraction_max_tokens: int = 2048  # max output tokens for graph extraction
     extraction_stt_correction: bool = True  # correct STT errors from assistant responses
@@ -242,6 +241,10 @@ class ConsolidationScheduleConfig:
     extraction_verify_anonymization: bool = True  # forward-path privacy guard
     extraction_ner_check: bool = False  # optional spaCy PII cross-check
     extraction_ner_model: str = "en_core_web_sm"  # spaCy model when ner_check=True
+    # Maximum number of concurrent interim adapters. Caps the rolling
+    # episodic_interim_YYYYMMDDTHHMM adapters resident in VRAM at any one time.
+    # Must be proven to fit by the startup VRAM validator before the server starts.
+    max_interim_count: int = 7
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -405,6 +408,12 @@ class ServerConfig:
     server: ServerNetConfig = field(default_factory=ServerNetConfig)
     model_name: str = "mistral"
     debug: bool = True
+    # cloud_only: route every query to the configured SOTA agent instead of the
+    # local parametric-memory model.  Routing only — extraction and consolidation
+    # continue to run.  Combined with the --cloud-only CLI flag via OR: either
+    # source being True enables cloud-only mode.  See configs/server.yaml for the
+    # full privacy and quality implications.
+    cloud_only: bool = False
     snapshot_key: str = ""  # Fernet key for encrypted session snapshots; auto-generated if empty
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
@@ -499,7 +508,6 @@ class ServerConfig:
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
-            reconstruction_interval=self.consolidation.reconstruction_interval,
             decay_window=self.consolidation.decay_window,
         )
 
@@ -524,6 +532,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     config.server = ServerNetConfig(**raw.get("server", {}))
     config.model_name = raw.get("model", config.model_name)
     config.debug = raw.get("debug", config.debug)
+    config.cloud_only = bool(raw.get("cloud_only", config.cloud_only))
     config.snapshot_key = raw.get("snapshot_key", config.snapshot_key)
 
     # Paths — resolve relative paths against config file directory so they

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -64,6 +65,22 @@ class RoutingPlan:
     imperative: bool = False
     # HA domains of matched entities/verbs
     ha_domains: list[str] = field(default_factory=list)
+
+
+_INTERIM_PREFIX = "episodic_interim_"
+_INTERIM_DATE_RE = re.compile(r"^episodic_interim_(\d{8}T\d{4})$")
+
+
+def _interim_sort_key(adapter_name: str) -> str | None:
+    """Extract the YYYYMMDDTHHMM stamp from an episodic_interim_YYYYMMDDTHHMM name.
+
+    Returns the stamp string (used for descending sort in route() so the
+    most-recently-created interim adapter is probed first), or None if
+    *adapter_name* does not match the interim-adapter naming pattern.
+    Non-interim adapters are not affected by this helper.
+    """
+    m = _INTERIM_DATE_RE.match(adapter_name)
+    return m.group(1) if m else None
 
 
 _INTERROGATIVE_PREFIXES = frozenset(
@@ -282,7 +299,14 @@ class QueryRouter:
         steps = []
         if has_pa:
             adapter_keys = self._resolve_keys(pa_entities, allowed_keys)
-            for adapter_name in ["procedural", "semantic", "episodic"]:
+
+            # 1. Main adapters in CLAUDE.md inference assembly order:
+            #    procedural (preferences) → episodic (recent) → semantic (consolidated).
+            #    Procedural-first is load-bearing: behavioral preferences must surface
+            #    before any episodic/semantic context for the PA to feel personalized.
+            #    See feedback_router_procedural_first.md.
+            _MAIN_ORDER = ["procedural", "episodic", "semantic"]
+            for adapter_name in _MAIN_ORDER:
                 if adapter_name in adapter_keys:
                     keys = list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY]
                     steps.append(
@@ -292,16 +316,30 @@ class QueryRouter:
                         )
                     )
 
-            # Include any other adapters (personas, etc.)
-            known = {"procedural", "semantic", "episodic"}
+            # 2. Interim adapters (episodic_interim_YYYYMMDDTHHMM) newest-first, then
+            #    any other non-main adapters in arbitrary order.  Separating the two
+            #    groups ensures the stamp-descending sort only touches interim names.
+            known = set(_MAIN_ORDER)
+            interims: list[tuple[str, set[str]]] = []
+            others: list[tuple[str, set[str]]] = []
             for adapter_name, keys in adapter_keys.items():
                 if adapter_name not in known:
-                    steps.append(
-                        RoutingStep(
-                            adapter_name=adapter_name,
-                            keys_to_probe=list(keys)[:MAX_KEYS_PER_QUERY],
-                        )
+                    if _interim_sort_key(adapter_name) is not None:
+                        interims.append((adapter_name, keys))
+                    else:
+                        others.append((adapter_name, keys))
+
+            # Newest stamp first — YYYYMMDDTHHMM sorts lexicographically so
+            # descending string order gives the most recently created interim first.
+            interims.sort(key=lambda item: _interim_sort_key(item[0]) or "", reverse=True)
+
+            for adapter_name, keys in interims + others:
+                steps.append(
+                    RoutingStep(
+                        adapter_name=adapter_name,
+                        keys_to_probe=list(keys)[:MAX_KEYS_PER_QUERY],
                     )
+                )
 
         strategy = "targeted_probe" if steps else "direct"
 
