@@ -31,6 +31,10 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
     bash scripts/net/win-port-forward.sh || echo "  Warning: port forward failed (non-fatal)"
 fi
 
+# Reconcile headless-boot state (linger + Windows scheduled task) with
+# configs/server.yaml. Non-fatal: WARNs and continues if elevation is absent.
+bash scripts/setup/headless-boot.sh || echo "  Warning: headless-boot reconcile failed (non-fatal)"
+
 EXTRA_ARGS="${PARAMEM_EXTRA_ARGS:-}"
 
 if [ "${1:-}" = "--background" ]; then

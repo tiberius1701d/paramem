@@ -222,6 +222,8 @@ curl http://localhost:8420/status
 
 The server listens on port 8420. On startup it auto-detects GPU availability — if another process holds the GPU (e.g., a training run), it starts in cloud-only mode and auto-reclaims once the GPU is free.
 
+Set `headless_boot: true` in `configs/server.yaml` to have the server come up before any interactive login. On every start, `scripts/setup/headless-boot.sh` reconciles OS-level state with the flag: it enables/disables systemd user linger, and on WSL hosts registers/removes a Windows scheduled task (`ParaMem-Start-WSL-Boot`) that launches the WSL VM at system startup. The reconciler is idempotent and non-fatal — if elevation is unavailable it WARNs with the exact manual command. When invoked without a TTY (systemd path), it pops a WSL console window so sudo can be approved interactively.
+
 ### Configuration
 
 `configs/server.yaml` is fully commented — every option has inline docs
@@ -231,6 +233,7 @@ options. A short map of the top-level sections:
 | Section | Purpose |
 |---------|---------|
 | `cloud_only` | Opt-out of local PM — route every query to the SOTA cloud agent. Security-critical. |
+| `headless_boot` | Auto-start the server before any interactive login. Reconciles systemd linger + (WSL) a Windows startup task on every start via `scripts/setup/headless-boot.sh`. |
 | `server` | Host, port, VRAM safety margin, auto-reclaim polling. |
 | `model` | Base model (`mistral`, `gemma`, `qwen3b`, `gemma4`). |
 | `debug`, `snapshot_key` | Privacy mode + Fernet key for encrypted session snapshots. |

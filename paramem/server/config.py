@@ -460,6 +460,13 @@ class ServerConfig:
     # source being True enables cloud-only mode.  See configs/server.yaml for the
     # full privacy and quality implications.
     cloud_only: bool = False
+    # headless_boot: ensure the server auto-starts before any interactive login.
+    # True  → systemd user linger enabled for the current user AND (WSL only) a
+    #         Windows scheduled task at system startup that launches the WSL VM.
+    # False → linger disabled, Windows task removed (server starts on first login).
+    # Reconciled on every startup by scripts/setup/headless-boot.sh (non-fatal,
+    # logs WARN if elevation is unavailable and drift exists).
+    headless_boot: bool = False
     snapshot_key: str = ""  # Fernet key for encrypted session snapshots; auto-generated if empty
     paths: PathsConfig = field(default_factory=PathsConfig)
     adapters: ServerAdaptersConfig = field(default_factory=ServerAdaptersConfig)
@@ -579,6 +586,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     config.model_name = raw.get("model", config.model_name)
     config.debug = raw.get("debug", config.debug)
     config.cloud_only = bool(raw.get("cloud_only", config.cloud_only))
+    config.headless_boot = bool(raw.get("headless_boot", config.headless_boot))
     config.snapshot_key = raw.get("snapshot_key", config.snapshot_key)
 
     # Paths — resolve relative paths against config file directory so they

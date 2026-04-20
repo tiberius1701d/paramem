@@ -34,6 +34,39 @@
 # ============================================================================
 cloud_only: false
 
+# ============================================================================
+# HEADLESS BOOT — AUTO-START WITHOUT USER LOGIN
+# ============================================================================
+# When true, the server reconciles two OS-level settings on every startup so
+# the ParaMem stack comes up after a full machine reboot without any user
+# login:
+#
+#   1. systemd user linger    — `loginctl enable-linger $USER`
+#      Makes the user's systemd manager (and therefore paramem-server.service)
+#      start at boot instead of at first login. Requires sudo.
+#
+#   2. Windows scheduled task — `ParaMem-Start-WSL-Boot` (WSL hosts only)
+#      Runs `wsl.exe -d <distro> -u <user> --exec /bin/true` at Windows
+#      startup to trigger the WSL2 VM before any interactive Windows login.
+#      Runs as SYSTEM — requires a one-time UAC approval when created.
+#
+# Reconciliation happens in `scripts/setup/headless-boot.sh`, invoked by
+# `scripts/server/start-server.sh` right after the port-forward step. The
+# script compares desired state (this flag) to current state and applies or
+# reverses as needed. It is non-fatal: if elevation (sudo / UAC) is not
+# available in the current context, it WARNs with the exact command to run
+# and lets the server start anyway.
+#
+# Caveats
+# - Initial transition requires an interactive session (TTY for sudo, Windows
+#   desktop for UAC). Edit this flag, then run `bash
+#   scripts/server/start-server.sh` or `bash scripts/setup/headless-boot.sh`
+#   once from a terminal to apply.
+# - On non-WSL hosts only the linger half is reconciled — step 2 is skipped.
+# - Flipping this flag back to false reverses both steps on the next startup.
+# ============================================================================
+headless_boot: true
+
 server:
   host: "0.0.0.0"
   port: 8420
