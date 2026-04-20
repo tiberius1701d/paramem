@@ -264,3 +264,24 @@ class TestPersistence:
     def test_load_nonexistent(self, merger):
         graph = merger.load_graph("/nonexistent/path.json")
         assert graph.number_of_nodes() == 0
+
+    def test_fuzzy_tier_case_fold(self):
+        """'Alexander' and 'alexander' must merge via exact-normalization tier."""
+        from paramem.graph.schema import Entity, SessionGraph
+
+        m = GraphMerger(similarity_threshold=85.0)
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[Entity(name="Alexander", entity_type="person")],
+            relations=[],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[Entity(name="alexander", entity_type="person")],
+            relations=[],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+        assert m.graph.number_of_nodes() == 1

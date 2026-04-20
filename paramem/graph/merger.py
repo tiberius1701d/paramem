@@ -184,8 +184,12 @@ class GraphMerger:
         """Initialize merger.
 
         Args:
+            similarity_threshold: Minimum rapidfuzz token_sort_ratio score (0–100)
+                for the fuzzy tier of entity resolution.
             strategy: "graph" for predicate-matching only,
                 "model" for graph + LLM semantic resolution.
+            model: Optional LLM for model-based contradiction resolution.
+            tokenizer: Tokenizer paired with *model*.
         """
         self.similarity_threshold = similarity_threshold
         self.strategy = strategy
@@ -242,41 +246,52 @@ class GraphMerger:
     def _resolve_entity(self, entity: Entity) -> str:
         """Resolve an entity name to its canonical form in the graph.
 
-        Uses exact normalization first, then fuzzy matching.
+        Two-tier resolution, short-circuits on first hit:
+
+        1. **Exact normalized** — ``name.strip().lower()`` match.
+        2. **Fuzzy** — ``rapidfuzz.token_sort_ratio`` at ``similarity_threshold``,
+           same ``entity_type`` only.
+
+        Returns the canonical node name from the graph, or ``entity.name`` when
+        no match is found (new node to be inserted).
         """
         normalized = _normalize_name(entity.name)
 
-        # Exact match on normalized names
+        # Tier 1: Exact match on normalized names
         for node in self.graph.nodes:
             if _normalize_name(node) == normalized:
                 return node
 
-        # Fuzzy match
-        best_match = None
-        best_score = 0.0
+        # Tier 2: Fuzzy match
+        fuzzy_best: str | None = None
+        fuzzy_score: float = 0.0
         for node in self.graph.nodes:
             node_data = self.graph.nodes[node]
             # Only match against same entity type
             if node_data.get("entity_type") != entity.entity_type:
                 continue
             score = fuzz.token_sort_ratio(normalized, _normalize_name(node))
-            if score > best_score and score >= self.similarity_threshold:
-                best_score = score
-                best_match = node
+            if score > fuzzy_score and score >= self.similarity_threshold:
+                fuzzy_score = score
+                fuzzy_best = node
 
-        if best_match is not None:
+        if fuzzy_best is not None:
             logger.debug(
-                "Fuzzy matched '%s' -> '%s' (score=%.1f)",
+                "Fuzzy matched '%s' -> '%s' (score=%.1f, method=fuzzy)",
                 entity.name,
-                best_match,
-                best_score,
+                fuzzy_best,
+                fuzzy_score,
             )
-            return best_match
+            return fuzzy_best
 
         return entity.name
 
     def _upsert_entity(
-        self, canonical: str, entity: Entity, session_id: str, timestamp: str
+        self,
+        canonical: str,
+        entity: Entity,
+        session_id: str,
+        timestamp: str,
     ) -> None:
         """Insert or update an entity node."""
         if canonical in self.graph:
