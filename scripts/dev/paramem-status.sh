@@ -124,6 +124,13 @@ fields = {
     "tts_device": d.get("tts_device") or "-",
     "bg_trainer_active": d.get("bg_trainer_active", False),
     "bg_trainer_adapter": d.get("bg_trainer_adapter") or "-",
+    # Thermal throttle policy (quiet-hours). mode: on|off|hours in the UI,
+    # corresponds to always_on / always_off / auto on the server side.
+    "throttle_mode": (d.get("thermal_policy") or {}).get("mode") or "-",
+    "throttle_start": (d.get("thermal_policy") or {}).get("start") or "-",
+    "throttle_end": (d.get("thermal_policy") or {}).get("end") or "-",
+    "throttle_temp_limit": (d.get("thermal_policy") or {}).get("temp_limit") if (d.get("thermal_policy") or {}).get("temp_limit") is not None else "-",
+    "throttle_active": (d.get("thermal_policy") or {}).get("currently_throttling", False),
     # adapter_health: count degenerated so bash can render a warning banner
     # without re-parsing the whole map.
     "degenerated_count": sum(
@@ -146,6 +153,8 @@ print("|".join(str(fields[k]) for k in [
     "stt_loaded", "stt_engine", "stt_model", "stt_device",
     "tts_loaded", "tts_engine", "tts_languages", "tts_device",
     "bg_trainer_active", "bg_trainer_adapter",
+    "throttle_mode", "throttle_start", "throttle_end",
+    "throttle_temp_limit", "throttle_active",
     "degenerated_count", "adapter_health_count",
 ]))
 # Per-adapter spec lines: kind<TAB>rank<TAB>alpha<TAB>lr<TAB>target_kind
@@ -189,6 +198,8 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     stt_loaded stt_engine stt_model stt_device \
     tts_loaded tts_engine tts_languages tts_device \
     bg_trainer_active bg_trainer_adapter \
+    throttle_mode throttle_start throttle_end \
+    throttle_temp_limit throttle_active \
     degenerated_count adapter_health_count \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
@@ -330,6 +341,36 @@ fi
 # Background trainer
 if [[ "$bg_trainer_active" == "True" ]]; then
     echo -e "  BG Train: ${GREEN}training${RESET} (${CYAN}${bg_trainer_adapter}${RESET})"
+fi
+
+# Thermal throttle (quiet-hours). Three UI modes: on | off | hours.
+#   always_on  → on     (always throttled — server room noisy, always silent)
+#   always_off → off    (never throttled — cellar/server room, noise fine)
+#   auto       → hours  (silent during [start, end), loud otherwise)
+if [[ "$throttle_mode" != "-" && -n "$throttle_mode" ]]; then
+    throttle_temp_tag=""
+    if [[ "$throttle_temp_limit" != "-" && -n "$throttle_temp_limit" ]]; then
+        throttle_temp_tag=" ≤${throttle_temp_limit}°C"
+    fi
+    case "$throttle_mode" in
+        always_on)
+            echo -e "  Throttle: ${CYAN}on${RESET} (${GREEN}always silent${RESET}${throttle_temp_tag})"
+            ;;
+        always_off)
+            echo -e "  Throttle: ${CYAN}off${RESET} (${DIM}never throttles${RESET})"
+            ;;
+        auto)
+            if [[ "$throttle_active" == "True" ]]; then
+                state_tag="${GREEN}silent now${RESET}"
+            else
+                state_tag="${DIM}loud now${RESET}"
+            fi
+            echo -e "  Throttle: ${CYAN}hours${RESET} ${throttle_start}–${throttle_end}${throttle_temp_tag} | ${state_tag}"
+            ;;
+        *)
+            echo -e "  Throttle: ${DIM}${throttle_mode}${RESET}"
+            ;;
+    esac
 fi
 
 # Scheduler — show interim cadence + derived full-cycle period.

@@ -193,6 +193,11 @@ class StatusResponse(BaseModel):
     scheduler_started: bool = False  # True once scheduler first ticked
     # adapter_id -> {status, reason, updated_at, keys_at_mark}
     adapter_health: dict = {}
+    # Thermal-throttle / quiet-hours policy snapshot.
+    # mode: "always_on" | "always_off" | "auto"
+    # start/end: "HH:MM" local (populated for all modes, consumed only when mode=auto)
+    # currently_throttling: true iff the thermal throttle is active right now
+    thermal_policy: dict = {}
 
 
 class ConsolidateResponse(BaseModel):
@@ -728,6 +733,9 @@ async def lifespan(app: FastAPI):
                         output_dir=config.adapter_dir,
                         temp_limit=config.consolidation.training_temp_limit,
                         temp_check_interval=config.consolidation.training_temp_check_interval,
+                        quiet_hours_mode=config.consolidation.quiet_hours_mode,
+                        quiet_hours_start=config.consolidation.quiet_hours_start,
+                        quiet_hours_end=config.consolidation.quiet_hours_end,
                     )
                     _state["background_trainer"] = _replay_bt
 
@@ -1224,6 +1232,25 @@ async def status():
     bg_active = bool(bt and getattr(bt, "is_training", False))
     bg_adapter = getattr(bt, "current_adapter_name", None) if bg_active else None
 
+    # Thermal-throttle / quiet-hours snapshot. Read from the loaded config so the
+    # block is present even before the BackgroundTrainer has been constructed.
+    # ``currently_throttling`` reflects the policy gate only; the actual throttle
+    # additionally requires ``training_temp_limit > 0`` and temp above limit —
+    # surfaced here is "would the policy allow throttling right now".
+    from paramem.server.background_trainer import is_thermal_policy_active
+
+    thermal_policy = {
+        "mode": config.consolidation.quiet_hours_mode,
+        "start": config.consolidation.quiet_hours_start,
+        "end": config.consolidation.quiet_hours_end,
+        "temp_limit": config.consolidation.training_temp_limit,
+        "currently_throttling": is_thermal_policy_active(
+            config.consolidation.quiet_hours_mode,
+            config.consolidation.quiet_hours_start,
+            config.consolidation.quiet_hours_end,
+        ),
+    }
+
     # Adapter health — stored in the KeyRegistry JSON (distinct from the
     # SimHash registry at config.registry_path).  Surfaced to pstatus so a
     # degenerated adapter is visible without grepping logs.
@@ -1376,6 +1403,7 @@ async def status():
         speakers=speaker_rows,
         bg_trainer_active=bg_active,
         bg_trainer_adapter=bg_adapter,
+        thermal_policy=thermal_policy,
         last_consolidation_result=_state.get("last_consolidation_result"),
         pending_enrollments=len(_state.get("pending_enrollments") or []),
         scheduler_started=scheduler_active,
@@ -1899,6 +1927,9 @@ def _extract_and_start_training():
         output_dir=config.adapter_dir,
         temp_limit=config.consolidation.training_temp_limit,
         temp_check_interval=config.consolidation.training_temp_check_interval,
+        quiet_hours_mode=config.consolidation.quiet_hours_mode,
+        quiet_hours_start=config.consolidation.quiet_hours_start,
+        quiet_hours_end=config.consolidation.quiet_hours_end,
     )
 
     def _on_training_error():
