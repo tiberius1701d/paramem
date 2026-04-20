@@ -39,6 +39,41 @@ _WORKER_STOP = object()
 _RESUME_STATE_FILE = "resume_state.json"
 
 
+def is_thermal_policy_active(
+    mode: str,
+    start: str,
+    end: str,
+    now: datetime | None = None,
+) -> bool:
+    """Pure predicate: is the thermal throttle active under this quiet-hours policy?
+
+    Shared between ``BackgroundTrainer._should_throttle_now`` and the ``/status``
+    endpoint so the latter can report policy state without a live trainer.
+
+    See ``ConsolidationScheduleConfig`` for mode semantics. Invalid windows in
+    ``auto`` mode fall back to ``True`` (prefer-silence default).
+    """
+    if mode == "always_off":
+        return False
+    if mode == "always_on":
+        return True
+    # mode == "auto"
+    try:
+        sh, sm = (int(x) for x in start.split(":"))
+        eh, em = (int(x) for x in end.split(":"))
+    except Exception:
+        return True
+    t = (now or datetime.now()).time()
+    cur = t.hour * 60 + t.minute
+    s = sh * 60 + sm
+    e = eh * 60 + em
+    if s == e:
+        return True
+    if s < e:
+        return s <= cur < e
+    return cur >= s or cur < e
+
+
 def _fingerprint_keyed_pairs(keyed_pairs: list[dict]) -> str:
     """Return a SHA-256 hex digest of the canonical serialisation of keyed_pairs.
 
@@ -252,6 +287,9 @@ class BackgroundTrainer:
         output_dir: str | Path = "data/ha/adapters",
         temp_limit: int = 0,
         temp_check_interval: int = 5,
+        quiet_hours_mode: str = "always_on",
+        quiet_hours_start: str = "22:00",
+        quiet_hours_end: str = "07:00",
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -259,6 +297,9 @@ class BackgroundTrainer:
         self.output_dir = Path(output_dir)
         self._temp_limit = temp_limit  # 0 = disabled
         self._temp_check_interval = temp_check_interval
+        self._quiet_hours_mode = quiet_hours_mode
+        self._quiet_hours_start = quiet_hours_start
+        self._quiet_hours_end = quiet_hours_end
 
         self._inference_requested = threading.Event()
         self._inference_done = threading.Event()
@@ -672,6 +713,19 @@ class BackgroundTrainer:
         except Exception:
             logger.exception("Failed to remove resume state file")
 
+    def _should_throttle_now(self, now: datetime | None = None) -> bool:
+        """Whether the thermal throttle is active right now under the quiet-hours policy.
+
+        Thin wrapper around ``is_thermal_policy_active`` that reads the fields
+        the trainer was constructed with. See that helper for mode semantics.
+        """
+        return is_thermal_policy_active(
+            self._quiet_hours_mode,
+            self._quiet_hours_start,
+            self._quiet_hours_end,
+            now,
+        )
+
     def _thermal_throttle(self, global_step: int):
         """Pause training if GPU temperature exceeds the configured limit.
 
@@ -679,11 +733,16 @@ class BackgroundTrainer:
         when GPU temp stays below the ramp-up threshold. Training pauses
         until the GPU cools back down, then resumes automatically.
 
-        Controlled by training_temp_limit in server.yaml (0 = disabled).
+        Controlled by ``training_temp_limit`` (0 = disabled) and gated by
+        the quiet-hours policy: outside quiet hours the throttle is a no-op
+        even at hot temperatures, letting training run unthrottled when
+        nobody is listening to fan noise.
         """
         if self._temp_limit <= 0:
             return
         if global_step % self._temp_check_interval != 0:
+            return
+        if not self._should_throttle_now():
             return
 
         temp = _gpu_temp()
@@ -702,6 +761,16 @@ class BackgroundTrainer:
 
         while temp is not None and temp > self._temp_limit:
             if self._shutdown_requested:
+                acquire_gpu()
+                return
+            # Quiet-hours window may end mid-wait (e.g. 07:00 arrives) — in
+            # that case we no longer care about fan noise and resume even if
+            # still hot.
+            if not self._should_throttle_now():
+                logger.info(
+                    "Thermal throttle: quiet-hours window ended at %d°C — resuming",
+                    temp,
+                )
                 acquire_gpu()
                 return
             time.sleep(5)

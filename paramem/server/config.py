@@ -234,6 +234,18 @@ class ConsolidationScheduleConfig:
     extraction_noise_filter_endpoint: str = ""  # custom endpoint for OpenAI-compatible providers
     training_temp_limit: int = 0  # GPU temp ceiling for background training (0 = disabled)
     training_temp_check_interval: int = 5  # check temp every N training steps
+    # Quiet-hours policy: schedules when the thermal throttle is active.
+    # Smartphone-style sleep mode for the thermal gate.
+    #   "always_on"  — throttle 24/7 (shared living space; dataclass fallback)
+    #   "always_off" — throttle never (server rack / cellar PC; ignore fan noise)
+    #   "auto"       — throttle only inside [start, end) window (daytime-at-work etc.)
+    # Window uses naive local time, is half-open (end exclusive), and wraps past
+    # midnight when end < start (e.g. start=22:00 end=07:00 silences 22:00–07:00).
+    # Shipped YAMLs both use "auto": default.yaml 22:00–07:00 (home/night),
+    # server.yaml 07:00–22:00 (work-laptop daytime).
+    quiet_hours_mode: str = "always_on"
+    quiet_hours_start: str = "22:00"
+    quiet_hours_end: str = "07:00"
     # --- Extraction-pipeline stages (all configurable) ---
     #
     # Plausibility filter: final quality gate on extracted facts.
@@ -301,6 +313,27 @@ class ConsolidationScheduleConfig:
                 f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
                 f"local judging."
             )
+
+        # Quiet-hours: reject unknown modes and malformed windows early.
+        mode = self.quiet_hours_mode
+        if mode not in ("always_on", "always_off", "auto"):
+            raise ValueError(
+                f"quiet_hours_mode={mode!r} must be one of 'always_on', 'always_off', 'auto'."
+            )
+        if mode == "auto":
+            for fld, val in (
+                ("quiet_hours_start", self.quiet_hours_start),
+                ("quiet_hours_end", self.quiet_hours_end),
+            ):
+                try:
+                    h, m = val.split(":")
+                    hh, mm = int(h), int(m)
+                    if not (0 <= hh < 24 and 0 <= mm < 60):
+                        raise ValueError
+                except Exception:
+                    raise ValueError(
+                        f"{fld}={val!r} must be HH:MM (24h); got invalid value."
+                    ) from None
 
     @property
     def consolidation_period_seconds(self) -> int | None:

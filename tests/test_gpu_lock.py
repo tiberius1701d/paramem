@@ -247,6 +247,171 @@ class TestThermalThrottle:
                     mock_acquire.assert_called_once()
 
 
+class TestQuietHoursPolicy:
+    """Quiet-hours gate for the thermal throttle (smartphone sleep mode).
+
+    The ``auto`` (hours-driven) branch is the real feature and gets the bulk of
+    coverage here — ``always_on`` / ``always_off`` are simple short-circuits.
+    """
+
+    def _dt(self, hh: int, mm: int = 0):
+        from datetime import datetime
+
+        return datetime(2026, 4, 20, hh, mm)
+
+    # --- Pure predicate ---
+
+    def test_always_on_returns_true_ignoring_window(self):
+        from paramem.server.background_trainer import is_thermal_policy_active
+
+        # Window strings are ignored in always_on mode.
+        assert is_thermal_policy_active("always_on", "07:00", "22:00", self._dt(3)) is True
+        assert is_thermal_policy_active("always_on", "07:00", "22:00", self._dt(15)) is True
+
+    def test_always_off_returns_false_ignoring_window(self):
+        from paramem.server.background_trainer import is_thermal_policy_active
+
+        assert is_thermal_policy_active("always_off", "00:00", "23:59", self._dt(3)) is False
+        assert is_thermal_policy_active("always_off", "00:00", "23:59", self._dt(15)) is False
+
+    def test_auto_daytime_window_work_laptop(self):
+        """07:00–22:00 throttle — matches the server.yaml work-laptop profile."""
+        from paramem.server.background_trainer import is_thermal_policy_active
+
+        # Inside window: at the desk, throttle on.
+        assert is_thermal_policy_active("auto", "07:00", "22:00", self._dt(7, 0)) is True
+        assert is_thermal_policy_active("auto", "07:00", "22:00", self._dt(14, 30)) is True
+        assert is_thermal_policy_active("auto", "07:00", "22:00", self._dt(21, 59)) is True
+        # Outside window: overnight, fans free to spin.
+        assert is_thermal_policy_active("auto", "07:00", "22:00", self._dt(6, 59)) is False
+        assert is_thermal_policy_active("auto", "07:00", "22:00", self._dt(22, 0)) is False
+        assert is_thermal_policy_active("auto", "07:00", "22:00", self._dt(2, 0)) is False
+
+    def test_auto_nighttime_window_home_install(self):
+        """22:00–07:00 throttle — matches the default.yaml home-install profile."""
+        from paramem.server.background_trainer import is_thermal_policy_active
+
+        # Inside midnight-crossing window.
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(22, 0)) is True
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(23, 59)) is True
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(0, 0)) is True
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(6, 59)) is True
+        # Outside: daytime, training unthrottled.
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(7, 0)) is False
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(15, 0)) is False
+        assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(21, 59)) is False
+
+    def test_auto_malformed_window_falls_back_to_on(self):
+        """Garbage HH:MM must not silently disable the throttle — prefer-silence default."""
+        from paramem.server.background_trainer import is_thermal_policy_active
+
+        assert is_thermal_policy_active("auto", "not-a-time", "07:00", self._dt(15)) is True
+        assert is_thermal_policy_active("auto", "", "", self._dt(15)) is True
+
+    def test_auto_degenerate_zero_length_window(self):
+        """start == end is a zero-length window — treat as silent always."""
+        from paramem.server.background_trainer import is_thermal_policy_active
+
+        assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(12, 0)) is True
+        assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(3, 0)) is True
+
+    # --- Integration with the throttle ---
+
+    def test_throttle_skipped_when_policy_inactive(self):
+        """always_off makes _thermal_throttle a no-op even at scalding temps."""
+        from paramem.server.background_trainer import BackgroundTrainer
+
+        bt = BackgroundTrainer(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            training_config=MagicMock(),
+            temp_limit=55,
+            temp_check_interval=5,
+            quiet_hours_mode="always_off",
+        )
+        with patch("paramem.server.background_trainer._gpu_temp", return_value=80) as mock_temp:
+            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
+                bt._thermal_throttle(5)
+                # Gate short-circuits before the temperature probe runs.
+                mock_temp.assert_not_called()
+                mock_release.assert_not_called()
+
+    def test_throttle_runs_in_auto_mode_inside_window(self):
+        """auto mode with a current-time in window behaves like always_on."""
+        from paramem.server.background_trainer import BackgroundTrainer
+
+        bt = BackgroundTrainer(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            training_config=MagicMock(),
+            temp_limit=55,
+            temp_check_interval=5,
+            quiet_hours_mode="auto",
+            quiet_hours_start="00:00",
+            quiet_hours_end="23:59",  # effectively always in window
+        )
+        temps = iter([70, 40])
+        with patch("paramem.server.background_trainer._gpu_temp", side_effect=temps):
+            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
+                with patch("paramem.server.gpu_lock.acquire_gpu") as mock_acquire:
+                    with patch("time.sleep"):
+                        bt._thermal_throttle(5)
+                        mock_release.assert_called_once()
+                        mock_acquire.assert_called_once()
+
+    def test_sleep_loop_exits_early_when_window_ends(self):
+        """If quiet-hours ends while we're waiting for cooldown, resume even if still hot."""
+        from paramem.server.background_trainer import BackgroundTrainer
+
+        bt = BackgroundTrainer(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            training_config=MagicMock(),
+            temp_limit=55,
+            temp_check_interval=5,
+            quiet_hours_mode="auto",
+            quiet_hours_start="00:00",
+            quiet_hours_end="23:59",
+        )
+        # First _should_throttle_now call (gate at entry) → True, triggers throttle.
+        # Second call (entry of sleep loop) → False, breaks out.
+        gate_answers = iter([True, False])
+        with patch("paramem.server.background_trainer._gpu_temp", return_value=70):
+            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
+                with patch("paramem.server.gpu_lock.acquire_gpu") as mock_acquire:
+                    with patch.object(
+                        bt, "_should_throttle_now", side_effect=lambda: next(gate_answers)
+                    ):
+                        bt._thermal_throttle(5)
+                        mock_release.assert_called_once()
+                        # Re-acquires even though temp never dropped below limit.
+                        mock_acquire.assert_called_once()
+
+    # --- Config validator ---
+
+    def test_config_rejects_unknown_mode(self):
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="quiet_hours_mode"):
+            ConsolidationScheduleConfig(quiet_hours_mode="maybe")
+
+    def test_config_rejects_malformed_window_in_auto(self):
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="quiet_hours_start"):
+            ConsolidationScheduleConfig(quiet_hours_mode="auto", quiet_hours_start="2500")
+        with pytest.raises(ValueError, match="quiet_hours_end"):
+            ConsolidationScheduleConfig(quiet_hours_mode="auto", quiet_hours_end="7:99")
+
+    def test_config_accepts_malformed_window_when_not_auto(self):
+        """Validator only enforces HH:MM format in auto mode — other modes ignore it."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        # Garbage strings accepted because mode won't consume them.
+        ConsolidationScheduleConfig(quiet_hours_mode="always_on", quiet_hours_start="bogus")
+        ConsolidationScheduleConfig(quiet_hours_mode="always_off", quiet_hours_end="25:99")
+
+
 class TestGpuTemp:
     def test_gpu_temp_returns_int(self):
         from paramem.server.background_trainer import _gpu_temp

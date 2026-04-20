@@ -241,7 +241,7 @@ options. A short map of the top-level sections:
 | `debug`, `snapshot_key` | Privacy mode + Fernet key for encrypted session snapshots. |
 | `paths` | Data, sessions, debug, prompts directories. |
 | `adapters` | Per-adapter `enabled` / `rank` / `alpha` / `learning_rate` / `target_modules`. |
-| `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Also gates the extraction pipeline stages (noise filter, plausibility, anonymization, NER check) and thermal throttle. |
+| `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Also gates the extraction pipeline stages (noise filter, plausibility, anonymization, NER check) and the thermal-throttle quiet-hours policy (`quiet_hours_mode` = `always_on`/`always_off`/`auto` with `start`/`end`). |
 | `agents` | SOTA cloud fallback (`sota` + `sota_providers`), HA conversation agent id. |
 | `tools.ha` | HA URL, token, language filter, entity allowlist, tool timeout. |
 | `sanitization` | PII gate for cloud egress (`off`/`warn`/`block`). |

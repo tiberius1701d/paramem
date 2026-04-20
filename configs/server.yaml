@@ -224,6 +224,16 @@ consolidation:
   # Set to 0 to disable. Adjust to match your fan ramp-up threshold.
   training_temp_limit: 55      # GPU temp ceiling in °C (0 = disabled)
   training_temp_check_interval: 5  # check GPU temp every N training steps
+  # Quiet-hours policy — schedules *when* the thermal throttle above applies.
+  # This host is a work laptop: silent at the desk during the day, free to
+  # spin fans overnight when nobody is listening. For a stationary home
+  # install, default.yaml uses the inverted (nighttime) window instead.
+  #   "always_on"  — throttle 24/7
+  #   "always_off" — throttle never (server rack, cellar)
+  #   "auto"       — throttle only inside [start, end] (wraps past midnight)
+  quiet_hours_mode: auto
+  quiet_hours_start: "07:00"
+  quiet_hours_end: "22:00"
   entity_similarity_threshold: 85.0        # rapidfuzz token_sort_ratio minimum (0-100)
   # --- Graph-level SOTA enrichment (Task #10) ---
   # Post-merge enrichment pass over the cumulative knowledge graph at every full
