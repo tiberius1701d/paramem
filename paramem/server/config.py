@@ -271,6 +271,11 @@ class ConsolidationScheduleConfig:
     graph_enrichment_enabled: bool = True
     graph_enrichment_neighborhood_hops: int = 2
     graph_enrichment_max_entities_per_pass: int = 50
+    # Mini-enrichment at interim-adapter rollover (per sub-interval, default 12h).
+    # Amortises enrichment cost across the 84h full-consolidation cycle. Gated
+    # on a minimum triple-floor so low-traffic sub-intervals skip the pass.
+    graph_enrichment_interim_enabled: bool = True
+    graph_enrichment_min_triples_floor: int = 20
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.

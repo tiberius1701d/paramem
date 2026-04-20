@@ -68,6 +68,8 @@ consolidation:
   graph_enrichment_enabled: true              # set to false to disable entirely
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
+  graph_enrichment_interim_enabled: true     # mini-pass at interim rollover (per sub-interval)
+  graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
   promotion_threshold: 3       # cycles before episodic -> semantic
   decay_window: 10             # cycles before unreinforced memories fade
   procedural_detection_window: 5

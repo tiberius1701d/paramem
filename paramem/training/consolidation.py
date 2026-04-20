@@ -150,6 +150,8 @@ class ConsolidationLoop:
         graph_enrichment_enabled: bool = True,
         graph_enrichment_neighborhood_hops: int = 2,
         graph_enrichment_max_entities_per_pass: int = 50,
+        graph_enrichment_interim_enabled: bool = True,
+        graph_enrichment_min_triples_floor: int = 20,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -193,6 +195,12 @@ class ConsolidationLoop:
         self.graph_enrichment_enabled = graph_enrichment_enabled
         self.graph_enrichment_neighborhood_hops = graph_enrichment_neighborhood_hops
         self.graph_enrichment_max_entities_per_pass = graph_enrichment_max_entities_per_pass
+        # Interim mini-enrichment: fires at sub-interval rollover when enough
+        # new triples have accumulated. RAM-only counter, reset after each
+        # successful enrichment pass (full or interim).
+        self.graph_enrichment_interim_enabled = graph_enrichment_interim_enabled
+        self.graph_enrichment_min_triples_floor = graph_enrichment_min_triples_floor
+        self._triples_since_last_enrichment = 0
 
         gc = graph_config or GraphConfig()
         self.merger = GraphMerger(
@@ -505,6 +513,7 @@ class ConsolidationLoop:
 
         # --- MERGE ---
         self.merger.merge(session_graph)
+        self._triples_since_last_enrichment += len(session_graph.relations)
 
         # Save graph snapshot if debug mode
         if self.save_cycle_snapshots and self.snapshot_dir:
@@ -1915,6 +1924,32 @@ class ConsolidationLoop:
                 adapter_name = newest
                 cap_reached_absorb = True
             else:
+                # Sub-interval rollover: first session of a new stamp.  If the
+                # floor is crossed and interim enrichment is enabled, run a
+                # mini graph-enrichment pass on the cumulative graph now so
+                # the 84h full-consolidation amortises its SOTA cost across
+                # the interim windows.  Wrapped so any SOTA failure is
+                # logged but never blocks interim adapter creation.
+                if (
+                    self.graph_enrichment_interim_enabled
+                    and self._triples_since_last_enrichment
+                    >= self.graph_enrichment_min_triples_floor
+                ):
+                    logger.info(
+                        "post_session_train: interim rollover — running mini "
+                        "graph-enrichment (triples_since_last=%d ≥ floor=%d)",
+                        self._triples_since_last_enrichment,
+                        self.graph_enrichment_min_triples_floor,
+                    )
+                    try:
+                        self._run_graph_enrichment()
+                    except Exception as _mini_exc:
+                        logger.warning(
+                            "post_session_train: mini graph-enrichment raised "
+                            "— interim creation continues: %s",
+                            _mini_exc,
+                        )
+
                 # Normal: create a fresh interim adapter for this sub-interval.
                 # create_interim_adapter is idempotent — no-op when the adapter
                 # already exists.  The return value MUST be assigned back to
@@ -2415,6 +2450,9 @@ class ConsolidationLoop:
             total_new,
             total_merges,
         )
+        # Reset the accumulator — any subsequent interim-rollover pass must
+        # re-cross the floor before firing again.
+        self._triples_since_last_enrichment = 0
         return {
             "chunks": calls_made,
             "new_edges": total_new,

@@ -233,6 +233,11 @@ consolidation:
   graph_enrichment_enabled: true              # set to false to disable entirely
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
+  # Mini-enrichment at interim-adapter rollover (sub-interval boundary,
+  # default 12h). Amortises the 84h enrichment cost across the cycle.
+  # Fires only when enough new triples have accumulated since the last pass.
+  graph_enrichment_interim_enabled: true
+  graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

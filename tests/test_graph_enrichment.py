@@ -860,3 +860,275 @@ class TestGraphEnrichWithSotaUnit:
         _, same_as, _ = result
         # Only the valid [Alice, Alicia] entry survives; ["bad", [1,2]] are skipped
         assert same_as == [["Alice", "Alicia"]]
+
+
+class TestInterimEnrichmentHook:
+    """Rollover mini-enrichment inside post_session_train.
+
+    The rollover hook fires inside the 'normal fresh-interim' branch of
+    post_session_train, i.e. when a new sub-interval stamp opens.  It
+    reuses `_run_graph_enrichment`, so these tests only verify the
+    gating logic and the accumulator lifecycle.  The full enrichment
+    path is covered by TestRunGraphEnrichment.
+    """
+
+    def test_counter_increments_on_extract_session_merge(self, tmp_path):
+        """extract_session increments the accumulator by len(relations)."""
+        loop = _make_loop(tmp_path)
+        assert loop._triples_since_last_enrichment == 0
+
+        # Drive a session graph straight through the merge path — no LLM.
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+
+        sg = SessionGraph(
+            session_id="s1",
+            timestamp="2026-04-20T12:00:00Z",
+            entities=[
+                Entity(name="A", entity_type="person"),
+                Entity(name="B", entity_type="person"),
+            ],
+            relations=[
+                Relation(subject="A", predicate="knows", object="B", relation_type="social"),
+                Relation(subject="B", predicate="knows", object="A", relation_type="social"),
+            ],
+        )
+
+        with patch.object(loop, "_run_extract_graph", return_value=sg):
+            loop.extract_session("ignored-transcript", "s1")
+
+        assert loop._triples_since_last_enrichment == 2
+
+    def test_counter_resets_after_successful_enrichment(self, tmp_path):
+        """After _run_graph_enrichment returns non-skipped, the counter is zero."""
+        loop = _make_loop(tmp_path)
+        loop._triples_since_last_enrichment = 42
+        _populate_graph(loop.merger.graph, n_persons=12)
+
+        canned = ([], [], "raw")  # Empty enrichment output — still a "successful" pass
+        with (
+            patch("paramem.training.consolidation._graph_enrich_with_sota", return_value=canned),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "x"}, clear=False),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert loop._triples_since_last_enrichment == 0
+
+    def test_counter_preserved_when_enrichment_skipped(self, tmp_path):
+        """Skipped enrichment (e.g. graph-size floor) must NOT reset the counter."""
+        loop = _make_loop(tmp_path)
+        loop._triples_since_last_enrichment = 99
+        # Graph has < 10 nodes → floor skip path.
+        assert loop.merger.graph.number_of_nodes() < 10
+
+        result = loop._run_graph_enrichment()
+
+        assert result["skipped"] is True
+        assert loop._triples_since_last_enrichment == 99
+
+    def test_rollover_hook_fires_above_floor(self, tmp_path):
+        """Normal fresh-interim branch with counter ≥ floor → _run_graph_enrichment called."""
+        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=5)
+        loop._triples_since_last_enrichment = 10  # over floor
+
+        # Stub extract_session to return episodic QA; skip the real extraction.
+        loop.extract_session = MagicMock(
+            return_value=(
+                [
+                    {
+                        "question": "q",
+                        "answer": "a",
+                        "source_subject": "S",
+                        "source_predicate": "p",
+                        "source_object": "O",
+                    }
+                ],
+                [],
+            )
+        )
+        loop.indexed_key_registry = None  # drive into no-registry early return
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
+
+        # Stub the interim-adapter creation; PEFT is fully mocked.
+        loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
+        with patch(
+            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+        ):
+            loop.post_session_train(
+                session_transcript="t",
+                session_id="s1",
+                schedule="12h",
+                max_interim_count=7,
+                stamp="20260420T1200",
+            )
+
+        loop._run_graph_enrichment.assert_called_once()
+
+    def test_rollover_hook_skipped_below_floor(self, tmp_path):
+        """Counter < floor → _run_graph_enrichment NOT called."""
+        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=50)
+        loop._triples_since_last_enrichment = 5  # well below floor
+
+        loop.extract_session = MagicMock(
+            return_value=(
+                [
+                    {
+                        "question": "q",
+                        "answer": "a",
+                        "source_subject": "S",
+                        "source_predicate": "p",
+                        "source_object": "O",
+                    }
+                ],
+                [],
+            )
+        )
+        loop.indexed_key_registry = None
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+
+        loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
+        with patch(
+            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+        ):
+            loop.post_session_train(
+                session_transcript="t",
+                session_id="s1",
+                schedule="12h",
+                max_interim_count=7,
+                stamp="20260420T1200",
+            )
+
+        loop._run_graph_enrichment.assert_not_called()
+
+    def test_rollover_hook_respects_interim_disabled_flag(self, tmp_path):
+        """graph_enrichment_interim_enabled=False → hook never fires, even above floor."""
+        loop = _make_loop(
+            tmp_path,
+            graph_enrichment_interim_enabled=False,
+            graph_enrichment_min_triples_floor=5,
+        )
+        loop._triples_since_last_enrichment = 100  # way over floor
+
+        loop.extract_session = MagicMock(
+            return_value=(
+                [
+                    {
+                        "question": "q",
+                        "answer": "a",
+                        "source_subject": "S",
+                        "source_predicate": "p",
+                        "source_object": "O",
+                    }
+                ],
+                [],
+            )
+        )
+        loop.indexed_key_registry = None
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
+
+        loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
+        with patch(
+            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+        ):
+            loop.post_session_train(
+                session_transcript="t",
+                session_id="s1",
+                schedule="12h",
+                max_interim_count=7,
+                stamp="20260420T1200",
+            )
+
+        loop._run_graph_enrichment.assert_not_called()
+
+    def test_rollover_hook_swallows_sota_exception(self, tmp_path):
+        """Exception in _run_graph_enrichment must NOT break post_session_train."""
+        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=1)
+        loop._triples_since_last_enrichment = 10
+
+        loop.extract_session = MagicMock(
+            return_value=(
+                [
+                    {
+                        "question": "q",
+                        "answer": "a",
+                        "source_subject": "S",
+                        "source_predicate": "p",
+                        "source_object": "O",
+                    }
+                ],
+                [],
+            )
+        )
+        loop.indexed_key_registry = None
+        loop._run_graph_enrichment = MagicMock(side_effect=RuntimeError("sota blew up"))
+
+        loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
+        with patch(
+            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+        ):
+            # Must NOT raise — the hook is wrapped.
+            result = loop.post_session_train(
+                session_transcript="t",
+                session_id="s1",
+                schedule="12h",
+                max_interim_count=7,
+                stamp="20260420T1200",
+            )
+
+        loop._run_graph_enrichment.assert_called_once()
+        # no_registry path returns mode="noop" with error — the point is no uncaught raise.
+        assert result["mode"] == "noop"
+
+    def test_rollover_hook_skipped_on_cap_reached_absorb(self, tmp_path):
+        """Cap-reached absorb path (degenerated early-return) does NOT fire the hook.
+
+        Rather than driving the full cap-reached retrain (which pulls in
+        every heavy training dependency), we trip the degenerated health
+        gate which short-circuits the absorb branch before any lazy
+        imports — still proving the rollover hook is structurally bound
+        to the normal-branch else, not the cap-reached if.
+        """
+        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=1)
+        loop._triples_since_last_enrichment = 100  # over floor
+
+        loop.extract_session = MagicMock(
+            return_value=(
+                [
+                    {
+                        "question": "q",
+                        "answer": "a",
+                        "source_subject": "S",
+                        "source_predicate": "p",
+                        "source_object": "O",
+                    }
+                ],
+                [],
+            )
+        )
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
+
+        existing_stamp = "20260419T1200"
+        current_stamp = "20260420T1200"
+        newest_name = f"episodic_interim_{existing_stamp}"
+        loop.model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            newest_name: MagicMock(),
+        }
+
+        # Mark the newest interim degenerated → post_session_train returns
+        # early with mode="degenerated" before any imports or training.
+        registry = MagicMock()
+        registry.is_adapter_healthy.return_value = False
+        loop.indexed_key_registry = registry
+
+        result = loop.post_session_train(
+            session_transcript="t",
+            session_id="s1",
+            schedule="12h",
+            max_interim_count=1,
+            stamp=current_stamp,
+        )
+
+        assert result["mode"] == "degenerated"
+        loop._run_graph_enrichment.assert_not_called()

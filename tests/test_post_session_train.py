@@ -103,6 +103,15 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.merger = MagicMock()
     loop.merger.graph = MagicMock()
     loop.merger.graph.nodes = []
+    # Graph-enrichment knobs (Task #10). Hook fires inside the normal
+    # fresh-interim branch; default to disabled for these unit tests so the
+    # hook stays inert and we don't need to stub _run_graph_enrichment.
+    loop.graph_enrichment_enabled = False
+    loop.graph_enrichment_neighborhood_hops = 2
+    loop.graph_enrichment_max_entities_per_pass = 50
+    loop.graph_enrichment_interim_enabled = False
+    loop.graph_enrichment_min_triples_floor = 20
+    loop._triples_since_last_enrichment = 0
 
     return loop
 
