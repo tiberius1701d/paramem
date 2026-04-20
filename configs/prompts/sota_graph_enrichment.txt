@@ -1,0 +1,67 @@
+You are operating over a pre-merged, cross-transcript knowledge graph.
+The triples below were extracted from multiple conversations and merged
+into a single cumulative graph. Your task has two parts:
+
+1. **Second-order relations** — identify cross-session relations that are
+   implied by co-presence but were never explicitly stated. Examples:
+   if Alice works_at Acme and Bob works_at Acme, emit colleague_of(Alice, Bob).
+   If Alice lives_in Portland and Bob lives_in Portland, emit neighbor_of only
+   if additional evidence (same street, same building) supports it — do not
+   infer purely from city co-presence.
+
+2. **same_as pairs** — identify nodes that refer to the same real-world entity
+   under different surface forms (e.g. "Alice" / "Alicia", "Bob Smith" / "Robert Smith",
+   "ACME Corp" / "Acme Corporation"). Emit as [canonical, variant] pairs where
+   canonical is the more complete or specific form (e.g. "Yang Ming" is more
+   complete than "Mr. Yang" or "Ming"; prefer full name over honorific-only
+   or given-name-only variants).
+
+Rules for relations:
+- Only emit relations you are confident about (confidence >= 0.7).
+- Do NOT emit relations already present in the input triples.
+- Do NOT hallucinate connections between entities that merely share a graph.
+- **Avoid bare `knows(A, B)` unless the input triples provide direct
+  evidence of acquaintance (e.g. an explicit interaction, shared
+  activity, or stated relationship). Graph co-presence alone is not
+  evidence.** Prefer a more specific predicate (colleague_of, friend_of,
+  classmate_of, family_of, neighbor_of) when justified. If no
+  specific predicate is justified, emit nothing rather than `knows`.
+- For symmetric predicates (colleague_of, friend_of, neighbor_of, sibling_of,
+  married_to, knows), emit only ONE direction: the one where subject < object
+  lexicographically.
+- relation_type must be one of: factual, temporal, preference, social.
+  Use "social" for interpersonal relations, "factual" for all others.
+- subject and object must be strings that appear as nodes in the input graph.
+
+Rules for same_as:
+- **Do NOT merge two person entities whose family-name (surname) tokens
+  differ.** E.g. "Zhang Min" and "Wang Min" are NOT the same person even
+  though they share "Min" — different surnames mean different people.
+  Merge only when one name is a clear subset/variant of the other:
+  honorific + name ("Mr. Yang" ↔ "Yang Ming"), nickname ↔ full name
+  ("Alice" ↔ "Alicia Smith"), given-name ↔ full name ("Ming" ↔ "Yang Ming"),
+  or formal ↔ informal ("Robert" ↔ "Bob Smith").
+- **Emit each same_as pair exactly once.** Do not repeat the same
+  logical pair (even in reversed order or with slight surface-form
+  variation) across the list.
+- Strip honorifics (Mr., Mrs., Ms., Dr., Prof., Professor) when
+  judging whether two names refer to the same person — the honorific
+  is not part of the identity.
+- Only emit same_as when you have reasonable evidence (shared
+  attributes, overlapping relations, compatible roles). Never merge
+  purely because two names sound similar.
+
+Input triples (JSON):
+{triples_json}
+
+Return ONLY valid JSON with this schema:
+{{
+  "relations": [
+    {{"subject": "...", "predicate": "...", "object": "...", "relation_type": "...", "confidence": 0.0}}
+  ],
+  "same_as": [
+    ["canonical_name", "variant_name"]
+  ]
+}}
+
+Both "relations" and "same_as" may be empty lists. No other keys. No commentary outside the JSON block.

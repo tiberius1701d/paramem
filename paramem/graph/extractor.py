@@ -2247,6 +2247,134 @@ def _filter_with_sota(
     return _parse_facts_response(raw), None, raw
 
 
+# ---------------------------------------------------------------------------
+# Graph-level SOTA enrichment (Task #10)
+# ---------------------------------------------------------------------------
+
+_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT = (
+    "You are a knowledge graph enrichment assistant operating over a pre-merged "
+    "cross-transcript graph. Emit cross-session second-order relations and same_as "
+    "pairs for duplicate entities. Output valid JSON only."
+)
+
+_DEFAULT_GRAPH_ENRICHMENT_PROMPT = """\
+You are operating over a pre-merged, cross-transcript knowledge graph.
+Identify second-order cross-session relations implied by the input triples,
+and same_as pairs for nodes that refer to the same real-world entity.
+
+Rules:
+- Only emit relations with confidence >= 0.7.
+- Do NOT emit relations already in the input.
+- For symmetric predicates emit only ONE direction (subject < object, lexicographically).
+- relation_type must be one of: factual, temporal, preference, social.
+- subject and object must be node names from the input graph.
+
+Input triples (JSON):
+{triples_json}
+
+Return ONLY valid JSON:
+{{"relations": [{{"subject": "...", "predicate": "...", "object": "...",
+"relation_type": "...", "confidence": 0.0}}], "same_as": [["canonical", "variant"]]}}
+"""
+
+
+def _graph_enrich_with_sota(
+    triples: list[dict],
+    api_key: str,
+    provider: str = "anthropic",
+    filter_model: str = "claude-sonnet-4-6",
+    endpoint: str | None = None,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+) -> tuple[list[dict], list[list[str]], str | None] | None:
+    """SOTA graph-level enrichment pass over a pre-merged cumulative graph.
+
+    Sends a subgraph serialized as triples to a SOTA provider and requests
+    two outputs:
+    - New cross-session second-order relations not already in the graph.
+    - ``same_as`` pairs identifying duplicate nodes under different surface forms.
+
+    Loads ``sota_graph_enrichment.txt`` with ``_DEFAULT_GRAPH_ENRICHMENT_PROMPT``
+    as fallback. The prompt uses a ``{triples_json}`` placeholder.
+
+    Args:
+        triples: List of ``{"subject", "predicate", "object", "relation_type"}``
+            dicts representing the chunk subgraph.
+        api_key: Provider API key.
+        provider: SOTA provider name (e.g. ``"anthropic"``).
+        filter_model: Model identifier for the provider.
+        endpoint: Custom endpoint for OpenAI-compatible providers.
+        max_tokens: Maximum tokens in the SOTA response.
+        temperature: Sampling temperature (0.0 for deterministic output).
+
+    Returns:
+        ``(new_relations, same_as_pairs, raw_response)`` on success, or
+        ``None`` when the SOTA call fails or the response cannot be parsed.
+        ``new_relations`` is a list of relation dicts; ``same_as_pairs`` is a
+        list of ``[canonical, variant]`` pairs.
+    """
+    enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", _DEFAULT_GRAPH_ENRICHMENT_PROMPT)
+    try:
+        prompt = enrichment_prompt.format(triples_json=json.dumps(triples, indent=2))
+    except KeyError as exc:
+        logger.warning("Graph enrichment prompt has unexpected placeholder: %s", exc)
+        return None
+
+    raw = _sota_call(
+        prompt,
+        api_key,
+        provider,
+        filter_model,
+        endpoint,
+        max_tokens,
+        temperature,
+        system_prompt=_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT,
+    )
+    if raw is None:
+        return None
+
+    # Parse response: preferred schema {"relations": [...], "same_as": [...]}
+    try:
+        json_str = _extract_json_block(raw)
+        parsed = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Graph enrichment response parse failed: %s", exc)
+        return None
+
+    if isinstance(parsed, list):
+        # Legacy bare-array: treat as relations, no same_as.
+        logger.debug("Graph enrichment: bare-array response (no same_as)")
+        return parsed, [], raw
+
+    if not isinstance(parsed, dict):
+        logger.warning("Graph enrichment: unexpected response type %s", type(parsed).__name__)
+        return None
+
+    new_relations: list[dict] = parsed.get("relations") or []
+    raw_same_as = parsed.get("same_as") or []
+
+    # Validate same_as entries: must be 2-element lists/tuples of non-empty strings.
+    same_as_pairs: list[list[str]] = []
+    for pair in raw_same_as:
+        if (
+            isinstance(pair, (list, tuple))
+            and len(pair) == 2
+            and isinstance(pair[0], str)
+            and isinstance(pair[1], str)
+            and pair[0]
+            and pair[1]
+        ):
+            same_as_pairs.append([pair[0], pair[1]])
+        else:
+            logger.debug("Graph enrichment: malformed same_as entry skipped: %r", pair)
+
+    if not isinstance(new_relations, list):
+        logger.warning("Graph enrichment: 'relations' is not a list, ignoring")
+        new_relations = []
+
+    return new_relations, same_as_pairs, raw
+
+
 def _plausibility_filter_with_sota(
     enriched_anon_facts: list[dict],
     api_key: str,

@@ -6,6 +6,7 @@ episodic and semantic adapters.
 """
 
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -14,8 +15,13 @@ from typing import Optional
 
 from torch.utils.data import Dataset
 
-from paramem.graph.extractor import extract_graph, extract_procedural_graph
-from paramem.graph.merger import GraphMerger
+from paramem.graph.extractor import (
+    PROVIDER_KEY_ENV,
+    _graph_enrich_with_sota,
+    extract_graph,
+    extract_procedural_graph,
+)
+from paramem.graph.merger import GraphMerger, _normalize_predicate
 from paramem.graph.qa_generator import (
     generate_qa_from_relations,
     partition_relations,
@@ -41,6 +47,7 @@ from paramem.training.trainer import GracefulShutdownCallback, train_adapter
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
+    GraphConfig,
     TrainingConfig,
     WandbConfig,
 )
@@ -139,6 +146,10 @@ class ConsolidationLoop:
         extraction_plausibility_judge: str = "auto",
         extraction_plausibility_stage: str = "deanon",
         extraction_verify_anonymization: bool = True,
+        graph_config: Optional[GraphConfig] = None,
+        graph_enrichment_enabled: bool = True,
+        graph_enrichment_neighborhood_hops: int = 2,
+        graph_enrichment_max_entities_per_pass: int = 50,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -178,8 +189,15 @@ class ConsolidationLoop:
         self.extraction_plausibility_stage = extraction_plausibility_stage
         self.extraction_verify_anonymization = extraction_verify_anonymization
 
-        # Graph state
-        self.merger = GraphMerger()
+        # Graph-level SOTA enrichment knobs (Task #10).
+        self.graph_enrichment_enabled = graph_enrichment_enabled
+        self.graph_enrichment_neighborhood_hops = graph_enrichment_neighborhood_hops
+        self.graph_enrichment_max_entities_per_pass = graph_enrichment_max_entities_per_pass
+
+        gc = graph_config or GraphConfig()
+        self.merger = GraphMerger(
+            similarity_threshold=gc.entity_similarity_threshold,
+        )
         self.scorer = PromotionScorer()
         self.last_session_graph = None
         if graph_path:
@@ -2135,6 +2153,276 @@ class ConsolidationLoop:
             "error": None,
         }
 
+    def _run_graph_enrichment(self) -> dict:
+        """Post-merge graph-level SOTA enrichment pass (Task #10).
+
+        Runs at full consolidation over the cumulative ``merger.graph`` to
+        capture cross-transcript second-order relations that per-transcript
+        enrichment cannot see.  Folds in coreference resolution via
+        ``same_as`` pairs emitted by the SOTA response.
+
+        The method mutates ``self.merger.graph`` in place: first applying
+        ``same_as`` node contractions, then inserting new edges tagged with
+        ``source="graph_enrichment"``.
+
+        Early-return conditions (all return ``skipped=True``):
+        - ``graph_enrichment_enabled`` is ``False``.
+        - Graph has fewer than 10 nodes (floor — too little signal).
+        - ``extraction_noise_filter`` is empty (no SOTA provider configured).
+        - Provider env-var is absent (API key not set).
+
+        Chunking strategy:
+        Entities are ranked by ``recurrence_count`` descending.  For each
+        focal entity an N-hop ego-graph is built (``radius=neighborhood_hops``).
+        Chunks are deduplicated by node frozenset so overlapping ego-graphs do
+        not re-send the same payload.  The number of chunks is capped at
+        ``ceil(total_nodes / max_entities_per_pass)`` to prevent O(N) SOTA
+        calls on large graphs.
+
+        Returns:
+            Diagnostics dict with keys:
+                - ``chunks`` (int): number of SOTA calls made.
+                - ``new_edges`` (int): edges added to the graph.
+                - ``same_as_merges`` (int): node contractions applied.
+                - ``skipped`` (bool): ``True`` when enrichment was bypassed.
+                - ``skip_reason`` (str | None): reason token when skipped.
+        """
+        import math
+
+        import networkx as nx
+
+        _empty = {"chunks": 0, "new_edges": 0, "same_as_merges": 0}
+
+        if not self.graph_enrichment_enabled:
+            logger.info("graph_enrichment: disabled — skipping")
+            return {**_empty, "skipped": True, "skip_reason": "disabled"}
+
+        graph = self.merger.graph
+        node_count = graph.number_of_nodes()
+
+        if node_count < 10:
+            logger.info(
+                "graph_enrichment: graph too small (%d nodes < 10 floor) — skipping",
+                node_count,
+            )
+            return {**_empty, "skipped": True, "skip_reason": "floor"}
+
+        provider = self.extraction_noise_filter
+        if not provider:
+            logger.info("graph_enrichment: no SOTA provider configured — skipping")
+            return {**_empty, "skipped": True, "skip_reason": "no_provider"}
+
+        key_env = PROVIDER_KEY_ENV.get(provider, "")
+        api_key = os.environ.get(key_env, "") if key_env else ""
+        if not api_key:
+            logger.warning(
+                "graph_enrichment: provider=%r env_var=%r not set — skipping",
+                provider,
+                key_env,
+            )
+            return {**_empty, "skipped": True, "skip_reason": "no_api_key"}
+
+        filter_model = self.extraction_noise_filter_model
+        endpoint = self.extraction_noise_filter_endpoint or None
+        max_entities = max(1, self.graph_enrichment_max_entities_per_pass)
+        hops = max(1, self.graph_enrichment_neighborhood_hops)
+
+        # Rank nodes by recurrence descending.
+        nodes_by_recurrence = sorted(
+            graph.nodes(data=True),
+            key=lambda nd: nd[1].get("recurrence_count", 0),
+            reverse=True,
+        )
+
+        # Build deduplicated chunks from N-hop ego-graphs.
+        undirected = graph.to_undirected(as_view=True)
+        seen_chunks: set[frozenset] = set()
+        chunks: list[list[str]] = []
+        chunk_cap = max(1, math.ceil(node_count / max_entities))
+
+        for focal, _ in nodes_by_recurrence:
+            if len(chunks) >= chunk_cap:
+                break
+            if focal not in undirected:
+                continue
+            ego = nx.ego_graph(undirected, focal, radius=hops)
+            nodes = list(ego.nodes)
+            if len(nodes) > max_entities:
+                # Trim: keep focal + top-(cap-1) neighbours by degree.
+                neighbours = sorted(
+                    (n for n in nodes if n != focal),
+                    key=lambda n: undirected.degree(n),
+                    reverse=True,
+                )
+                nodes = [focal] + neighbours[: max_entities - 1]
+            key = frozenset(nodes)
+            if key in seen_chunks:
+                continue
+            seen_chunks.add(key)
+            chunks.append(nodes)
+
+        total_new = 0
+        total_merges = 0
+        calls_made = 0
+        seen_merge_keys: set[frozenset] = set()
+
+        for chunk_nodes in chunks:
+            try:
+                chunk_subgraph = graph.subgraph(chunk_nodes)
+                triples = _serialize_subgraph_triples(chunk_subgraph)
+                result = _graph_enrich_with_sota(
+                    triples,
+                    api_key,
+                    provider,
+                    filter_model,
+                    endpoint,
+                )
+                calls_made += 1
+                if result is None:
+                    logger.warning("graph_enrichment: SOTA call returned None for chunk")
+                    continue
+                new_rels, same_as_pairs, _raw = result
+            except Exception as exc:
+                logger.warning(
+                    "graph_enrichment: exception during SOTA call — %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+
+            # Apply same_as contractions FIRST so subsequent edge inserts
+            # reference canonical nodes. Gate on:
+            #   1. Both endpoints exist in the live graph.
+            #   2. Unordered-pair dedup across the whole enrichment pass.
+            #   3. Surface-form safety gate (token-subset + Jaro-Winkler).
+            coref_map: dict[str, str] = {}
+            for pair in same_as_pairs:
+                keep, drop = pair[0], pair[1]
+                if keep == drop:
+                    continue
+                if keep not in graph or drop not in graph:
+                    logger.debug(
+                        "graph_enrichment: same_as skip — keep=%r drop=%r not both in graph",
+                        keep,
+                        drop,
+                    )
+                    continue
+                merge_key = frozenset({keep.lower(), drop.lower()})
+                if merge_key in seen_merge_keys:
+                    logger.debug(
+                        "graph_enrichment: same_as dedup — %r / %r already seen",
+                        keep,
+                        drop,
+                    )
+                    continue
+                seen_merge_keys.add(merge_key)
+                if not _safe_to_merge_surface(keep, drop):
+                    logger.info(
+                        "graph_enrichment: same_as rejected by surface gate — %r / %r",
+                        keep,
+                        drop,
+                    )
+                    continue
+                try:
+                    nx.contracted_nodes(graph, keep, drop, self_loops=False, copy=False)
+                    total_merges += 1
+                    coref_map[drop] = keep
+                    logger.debug("graph_enrichment: contracted %r → %r", drop, keep)
+                except Exception as exc:
+                    logger.warning(
+                        "graph_enrichment: same_as contraction failed %r → %r: %s",
+                        drop,
+                        keep,
+                        exc,
+                    )
+
+            def _resolve_name(name: str) -> str:
+                # Follow drop→keep chains with a visited guard.
+                seen: set[str] = set()
+                while name in coref_map and name not in seen:
+                    seen.add(name)
+                    name = coref_map[name]
+                return name
+
+            # Apply new edges.
+            fallback_rtype = "factual"
+            valid_rtypes = {"factual", "temporal", "preference", "social"}
+            for rel in new_rels:
+                if not isinstance(rel, dict):
+                    continue
+                # Remap endpoints through this chunk's coref map so edges
+                # referencing a to-be-dropped node still land on the canonical.
+                subj = _resolve_name(rel.get("subject", ""))
+                raw_pred = rel.get("predicate", "")
+                obj = _resolve_name(rel.get("object", ""))
+                rtype = rel.get("relation_type", fallback_rtype)
+                if rtype not in valid_rtypes:
+                    rtype = fallback_rtype
+                pred = _normalize_predicate(raw_pred)
+                if not (subj and pred and obj and subj != obj):
+                    continue
+
+                # Canonicalize symmetric predicates so (A,P,B) and (B,P,A)
+                # collapse to a single direction (subj < obj lexicographically).
+                if pred in _SYMMETRIC_ENRICHMENT_PREDICATES and subj > obj:
+                    subj, obj = obj, subj
+
+                # Ensure both endpoint nodes exist.
+                for node_name in (subj, obj):
+                    if node_name not in graph:
+                        graph.add_node(
+                            node_name,
+                            entity_type="concept",
+                            attributes={},
+                            recurrence_count=1,
+                            sessions=[],
+                            first_seen="graph_enrichment",
+                            last_seen="graph_enrichment",
+                        )
+
+                # Skip exact-triple duplicates.
+                duplicate = any(
+                    d.get("predicate") == pred and tgt == obj
+                    for _, tgt, d in graph.out_edges(subj, data=True)
+                )
+                if duplicate:
+                    continue
+
+                try:
+                    confidence = float(rel.get("confidence", 0.8))
+                except (TypeError, ValueError):
+                    confidence = 0.8
+                # Safety net for the prompt-level 0.7 rule: discard low-confidence
+                # enriched edges even if the model ignored its own instruction.
+                if confidence < 0.7:
+                    continue
+
+                graph.add_edge(
+                    subj,
+                    obj,
+                    predicate=pred,
+                    relation_type=rtype,
+                    confidence=confidence,
+                    source="graph_enrichment",
+                    sessions=[],
+                )
+                total_new += 1
+
+        logger.info(
+            "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d",
+            provider,
+            calls_made,
+            total_new,
+            total_merges,
+        )
+        return {
+            "chunks": calls_made,
+            "new_edges": total_new,
+            "same_as_merges": total_merges,
+            "skipped": False,
+            "skip_reason": None,
+        }
+
     def consolidate_interim_adapters(
         self,
         trainer=None,
@@ -2209,6 +2497,26 @@ class ConsolidationLoop:
 
         # --- Step 1: Reset seen_triples ---
         self.seen_triples = set()
+
+        # --- Step 1b: Graph-level SOTA enrichment (Task #10) ---
+        # Runs after all per-session merges are complete and before
+        # partition_relations so enriched edges flow into all tiers identically.
+        # Mutates self.merger.graph in place.  Wrapped in try/except so a SOTA
+        # failure cannot abort consolidation.
+        try:
+            enrichment_result = self._run_graph_enrichment()
+            if not enrichment_result.get("skipped"):
+                logger.info(
+                    "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
+                    enrichment_result.get("chunks", 0),
+                    enrichment_result.get("new_edges", 0),
+                    enrichment_result.get("same_as_merges", 0),
+                )
+        except Exception as _enrich_exc:
+            logger.warning(
+                "graph_enrichment raised unexpected exception — consolidation continues: %s",
+                _enrich_exc,
+            )
 
         # --- Step 2: Snapshot cumulative graph ---
         graph = self.merger.graph
@@ -2833,3 +3141,104 @@ def _mentions_any(text: str, terms: set[str]) -> bool:
     """Check if text mentions any of the given terms."""
     text_lower = text.lower()
     return any(term in text_lower for term in terms)
+
+
+_SYMMETRIC_ENRICHMENT_PREDICATES = frozenset(
+    {
+        "colleague_of",
+        "friend_of",
+        "neighbor_of",
+        "sibling_of",
+        "married_to",
+        "teammate_of",
+        "classmate_of",
+        "shares_interest_with",
+        "attended_with",
+        "knows",
+        "family_of",
+    }
+)
+
+
+_SAME_AS_HONORIFICS = {
+    "mr",
+    "mrs",
+    "ms",
+    "dr",
+    "prof",
+    "professor",
+    "sir",
+    "madam",
+    "mister",
+}
+
+
+def _strip_honorifics(name: str) -> list[str]:
+    """Return lowercased tokens of ``name`` with trailing-dot honorifics removed."""
+    toks = []
+    for raw in name.lower().split():
+        t = raw.rstrip(".,")
+        if t and t not in _SAME_AS_HONORIFICS:
+            toks.append(t)
+    return toks
+
+
+def _safe_to_merge_surface(a: str, b: str) -> bool:
+    """Heuristic gate: is it safe to merge two surface forms as the same entity?
+
+    Two-stage check:
+
+    1. Token-subset after honorific strip. "Mr. Yang" → {"yang"} is a
+       subset of "Yang Ming" → {"yang", "ming"}. Safe.
+    2. Single-token diff + Jaro-Winkler on the distinct tokens only.
+       "Catherine Holmes" / "Katherine Holmes" share "holmes"; JW on
+       "catherine" vs "katherine" ≈ 0.95 → accept. "Zhang Min" /
+       "Wang Min" share "min"; JW on "zhang" vs "wang" ≈ 0.50 →
+       reject. Multi-token symmetric difference always rejects.
+
+    Returns ``False`` on empty or all-honorific inputs.
+    """
+    a_toks = _strip_honorifics(a)
+    b_toks = _strip_honorifics(b)
+    if not a_toks or not b_toks:
+        return False
+    a_set = set(a_toks)
+    b_set = set(b_toks)
+    if a_set <= b_set or b_set <= a_set:
+        return True
+    only_a = a_set - b_set
+    only_b = b_set - a_set
+    if len(only_a) != 1 or len(only_b) != 1:
+        return False
+    from rapidfuzz.distance import JaroWinkler
+
+    jw = JaroWinkler.normalized_similarity(next(iter(only_a)), next(iter(only_b)))
+    return jw >= 0.85
+
+
+def _serialize_subgraph_triples(subgraph) -> list[dict]:
+    """Serialize a NetworkX subgraph into a list of triple dicts.
+
+    Iterates ``subgraph.edges(data=True)`` and produces one dict per edge with
+    keys ``subject``, ``predicate``, ``object``, and ``relation_type``.  The
+    ``predicate`` field is taken directly from the edge ``"predicate"``
+    attribute; ``relation_type`` defaults to ``"factual"`` when absent.
+
+    Args:
+        subgraph: A NetworkX (Multi)DiGraph subgraph view or instance.
+
+    Returns:
+        List of ``{"subject": str, "predicate": str, "object": str,
+        "relation_type": str}`` dicts, one per directed edge.
+    """
+    triples = []
+    for src, tgt, data in subgraph.edges(data=True):
+        triples.append(
+            {
+                "subject": str(src),
+                "predicate": str(data.get("predicate", "")),
+                "object": str(tgt),
+                "relation_type": str(data.get("relation_type", "factual")),
+            }
+        )
+    return triples

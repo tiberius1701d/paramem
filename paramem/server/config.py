@@ -11,6 +11,7 @@ import yaml
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
+    GraphConfig,
     ModelConfig,
     TrainingConfig,
 )
@@ -260,6 +261,16 @@ class ConsolidationScheduleConfig:
     # independent gate so operators can enable inline training while keeping the
     # full cycle in any mode.
     post_session_train_enabled: bool = False
+    # entity_similarity_threshold mirrors GraphConfig (paramem/utils/config.py);
+    # bridged into GraphMerger construction via ServerConfig.graph_config.
+    entity_similarity_threshold: float = 85.0
+    # --- Graph-level SOTA enrichment (Task #10) ---
+    # Runs at full consolidation over the cumulative graph to capture
+    # cross-transcript second-order relations that per-transcript enrichment
+    # cannot see. Reuses the noise-filter SOTA credentials.
+    graph_enrichment_enabled: bool = True
+    graph_enrichment_neighborhood_hops: int = 2
+    graph_enrichment_max_entities_per_pass: int = 50
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -562,6 +573,16 @@ class ServerConfig:
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
+        )
+
+    @property
+    def graph_config(self) -> GraphConfig:
+        """Build GraphConfig for GraphMerger construction.
+
+        Mirrors ``entity_similarity_threshold`` from ``self.consolidation``.
+        """
+        return GraphConfig(
+            entity_similarity_threshold=self.consolidation.entity_similarity_threshold,
         )
 
 

@@ -51,6 +51,10 @@ def create_consolidation_loop(
         snapshot_dir=config.debug_dir if config.debug else None,
         persist_graph=False,
         prompts_dir=config.prompts_dir,
+        graph_config=config.graph_config,
+        graph_enrichment_enabled=config.consolidation.graph_enrichment_enabled,
+        graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,
+        graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
     )
 
     # Seed key metadata from disk (survives restarts)

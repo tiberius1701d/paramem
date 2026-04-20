@@ -224,6 +224,15 @@ consolidation:
   # Set to 0 to disable. Adjust to match your fan ramp-up threshold.
   training_temp_limit: 55      # GPU temp ceiling in °C (0 = disabled)
   training_temp_check_interval: 5  # check GPU temp every N training steps
+  entity_similarity_threshold: 85.0        # rapidfuzz token_sort_ratio minimum (0-100)
+  # --- Graph-level SOTA enrichment (Task #10) ---
+  # Post-merge enrichment pass over the cumulative knowledge graph at every full
+  # consolidation. Captures cross-transcript second-order relations and resolves
+  # entity coreference (same_as pairs) that per-transcript enrichment cannot see.
+  # Reuses the extraction_noise_filter SOTA credentials — no new provider config.
+  graph_enrichment_enabled: true              # set to false to disable entirely
+  graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
+  graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.
