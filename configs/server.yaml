@@ -295,6 +295,31 @@ tools:
 sanitization:
   mode: block           # off, warn, block — controls PII detection for cloud queries
 
+# ============================================================================
+# ABSTENTION — LAST-RESORT CONFABULATION GUARD
+# ============================================================================
+# When all of the following hold simultaneously:
+#   * no local parametric-memory match (adapter has no relevant fact)
+#   * no Home Assistant entity match
+#   * the sanitizer blocked cloud escalation (query is self-referential /
+#     personal — e.g. "Where do I live?", "What's my birthday?")
+# ...the server would otherwise fall through to the bare base model with no
+# context. That path confabulates confident personal data (observed:
+# untrained adapter + "Where do I live?" → "New York City").
+#
+# When enabled, the server returns `response` verbatim instead of invoking
+# the base model. Deterministic, zero hallucination risk on the last-resort
+# branch.
+#
+# Prompt-only abstention at 7B-9B is unreliable (AbstentionBench, NeurIPS
+# 2025) — a deterministic short-circuit is the only fix that does not leak
+# confabulated personal data on the sanitizer-blocked path. Disable only if
+# a downstream layer handles the empty-knowledge case without confabulation.
+# ============================================================================
+abstention:
+  enabled: true
+  response: "I don't have that information stored yet."
+
 voice:
   prompt_file: configs/prompts/ha_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)

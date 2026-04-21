@@ -305,6 +305,13 @@ def handle_chat(
     else:
         logger.info("Sanitizer blocked query: %s", sanitization_findings)
 
+    # Abstention: no local match + sanitizer blocked cloud → canned response.
+    # The bare base model would otherwise confabulate personal data here
+    # (e.g. "Where do I live?" → "New York City" on an untrained adapter).
+    if sanitized_text is None and config.abstention.enabled:
+        logger.info("Abstention: no local match + sanitizer blocked cloud")
+        return ChatResult(text=config.abstention.response)
+
     # All cloud services failed — local base model as last resort
     return _base_model_answer(
         text,

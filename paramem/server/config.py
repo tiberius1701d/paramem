@@ -191,6 +191,20 @@ class SanitizationConfig:
 
 
 @dataclass
+class AbstentionConfig:
+    """Last-resort confabulation guard.
+
+    When no local parametric-memory match exists AND the sanitizer blocked
+    cloud escalation (personal / self-referential query), ``handle_chat``
+    would otherwise fall through to the bare base model with no context and
+    confabulate. When ``enabled``, ``response`` is returned verbatim instead.
+    """
+
+    enabled: bool = True
+    response: str = "I don't have that information stored yet."
+
+
+@dataclass
 class VoiceConfig:
     prompt_file: str = "configs/prompts/ha_voice.txt"
     system_prompt: str = ""
@@ -525,6 +539,7 @@ class ServerConfig:
     ha_agent_id: str = "conversation.groq"  # HA conversation agent for escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
+    abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
@@ -741,6 +756,11 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     sanitization_raw = raw.get("sanitization", {})
     if sanitization_raw:
         config.sanitization = SanitizationConfig(**sanitization_raw)
+
+    # Abstention
+    abstention_raw = raw.get("abstention", {})
+    if abstention_raw:
+        config.abstention = AbstentionConfig(**abstention_raw)
 
     voice_raw = raw.get("voice", {})
     if voice_raw:
