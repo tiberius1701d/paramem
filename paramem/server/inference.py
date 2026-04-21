@@ -450,7 +450,10 @@ def _probe_and_reason(
     from peft import PeftModel
 
     from paramem.models.loader import switch_adapter
-    from paramem.training.indexed_memory import probe_keys_grouped_by_adapter
+    from paramem.training.indexed_memory import (
+        probe_keys_from_disk,
+        probe_keys_grouped_by_adapter,
+    )
 
     registry = _load_simhash_registry(config.registry_path)
 
@@ -468,19 +471,24 @@ def _probe_and_reason(
     for step in plan.steps:
         keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
 
-    # One switch_adapter call per adapter group.
-    probe_results = probe_keys_grouped_by_adapter(
-        model,
-        tokenizer,
-        keys_by_adapter,
-        registry=registry,
-    )
+    # Simulate mode: recall from disk-persisted keyed_pairs.json instead of
+    # probing adapter weights. Blackbox-equivalent under perfect recall.
+    if config.consolidation.mode == "simulate":
+        probe_results = probe_keys_from_disk(config.adapter_dir, keys_by_adapter)
+    else:
+        # One switch_adapter call per adapter group.
+        probe_results = probe_keys_grouped_by_adapter(
+            model,
+            tokenizer,
+            keys_by_adapter,
+            registry=registry,
+        )
 
-    # Restore predictable adapter state: episodic is the main adapter for
-    # PM inference. The reasoning phase uses disable_adapter() so this only
-    # matters for subsequent queries, not the current one.
-    if hasattr(model, "peft_config") and "episodic" in model.peft_config:
-        switch_adapter(model, "episodic")
+        # Restore predictable adapter state: episodic is the main adapter for
+        # PM inference. The reasoning phase uses disable_adapter() so this only
+        # matters for subsequent queries, not the current one.
+        if hasattr(model, "peft_config") and "episodic" in model.peft_config:
+            switch_adapter(model, "episodic")
 
     # Reassemble per-step facts so each adapter's results go to its layer.
     layers: dict[str, list[str]] = {}

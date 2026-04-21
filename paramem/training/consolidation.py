@@ -319,7 +319,10 @@ class ConsolidationLoop:
         for kp in keyed_pairs:
             key = kp["key"]
             self.indexed_key_qa[key] = kp
-            if self.indexed_key_registry and key not in self.indexed_key_registry.list_active():
+            if (
+                self.indexed_key_registry is not None
+                and key not in self.indexed_key_registry.list_active()
+            ):
                 self.indexed_key_registry.add(key)
             subject = kp.get("source_subject", "").lower()
             predicate = kp.get("source_predicate", "").lower()
@@ -331,6 +334,36 @@ class ConsolidationLoop:
             len(self.procedural_sp_index),
             len(keyed_pairs),
         )
+
+    def seed_episodic_qa(self, keyed_pairs: list[dict]) -> None:
+        """Rebuild indexed_key_qa from persisted episodic keyed_pairs.
+
+        Called at startup. Mirrors seed_procedural_qa but skips the sp_index
+        (episodic keys have no speaker/subject/predicate contradiction scope).
+        Required by simulate mode so a cold-start run does not clobber
+        keyed_pairs.json with a subset containing only new-cycle keys.
+        """
+        for kp in keyed_pairs:
+            key = kp["key"]
+            self.indexed_key_qa[key] = kp
+            if (
+                self.indexed_key_registry is not None
+                and key not in self.indexed_key_registry.list_active()
+            ):
+                self.indexed_key_registry.add(key)
+        logger.info("Seeded episodic indexed_key_qa: %d keys", len(keyed_pairs))
+
+    def seed_semantic_qa(self, keyed_pairs: list[dict]) -> None:
+        """Rebuild indexed_key_qa from persisted semantic keyed_pairs."""
+        for kp in keyed_pairs:
+            key = kp["key"]
+            self.indexed_key_qa[key] = kp
+            if (
+                self.indexed_key_registry is not None
+                and key not in self.indexed_key_registry.list_active()
+            ):
+                self.indexed_key_registry.add(key)
+        logger.info("Seeded semantic indexed_key_qa: %d keys", len(keyed_pairs))
 
     @staticmethod
     def dedup_episodic(qa_list: list[dict]) -> list[dict]:
@@ -586,6 +619,154 @@ class ConsolidationLoop:
 
         logger.info("Training complete: %s", result)
         return result
+
+    def simulated_training(
+        self,
+        all_episodic_qa: list[dict],
+        all_procedural_relations: list[dict],
+        speaker_id: str = "",
+    ) -> dict:
+        """Mirror train_adapters without weight updates or adapter saves.
+
+        Simulate is a blackbox-equivalent of train: same extraction pipeline,
+        key assignment, contradiction handling, and SimHash construction from
+        ground-truth QA. The delta is that existing-key admission comes from
+        disk-seeded indexed_key_qa instead of probing adapter weights — under
+        perfect recall, probe_key would return identical content.
+
+        Caller is responsible for NOT marking sessions consolidated and for
+        skipping the adapter save / key-metadata persist.
+        """
+        self.cycle_count += 1
+        result: dict = {"simulated": True}
+
+        if self.indexed_key_registry is None:
+            logger.warning("No indexed key registry — skipping simulated training")
+            return result
+
+        if all_episodic_qa:
+            self._simulate_indexed_key_episodic(all_episodic_qa)
+
+        if self.procedural_config is not None and all_procedural_relations:
+            self._simulate_indexed_key_procedural(all_procedural_relations, speaker_id=speaker_id)
+
+        logger.info("Simulated training complete (no weight update)")
+        return result
+
+    def _simulate_indexed_key_episodic(self, session_qa: list[dict]) -> None:
+        """Simulate counterpart of _run_indexed_key_episodic.
+
+        Assigns keys to new session QA, admits existing keys from seeded
+        indexed_key_qa, rebuilds episodic_simhash from ground-truth QA.
+        Skips probe_key reconstruction and the train call.
+        """
+        new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
+        for kp in new_keyed:
+            self.indexed_key_registry.add(kp["key"])
+            self.indexed_key_qa[kp["key"]] = {
+                "key": kp["key"],
+                "question": kp["question"],
+                "answer": kp["answer"],
+                "source_subject": kp.get("source_subject", ""),
+                "source_object": kp.get("source_object", ""),
+                "speaker_id": kp.get("speaker_id", ""),
+            }
+        self._indexed_next_index += len(new_keyed)
+
+        active_keys = self.indexed_key_registry.list_active()
+        new_key_set = {kp["key"] for kp in new_keyed}
+        existing_keys = [
+            k
+            for k in active_keys
+            if k.startswith("graph") and k not in new_key_set and k not in self.semantic_simhash
+        ]
+
+        episodic_keyed: list[dict] = []
+        for key in existing_keys:
+            if key in self.indexed_key_qa:
+                qa = self.indexed_key_qa[key]
+                episodic_keyed.append(
+                    {"key": key, "question": qa["question"], "answer": qa["answer"]}
+                )
+        episodic_keyed.extend(new_keyed)
+
+        if not episodic_keyed:
+            return
+
+        self.episodic_simhash = build_registry(episodic_keyed)
+        logger.info("Simulated episodic: %d keys registered", len(episodic_keyed))
+
+    def _simulate_indexed_key_procedural(
+        self,
+        procedural_relations: list[dict],
+        speaker_id: str = "",
+    ) -> None:
+        """Simulate counterpart of _run_indexed_key_procedural.
+
+        Runs the same base-model QA distillation (extraction-side, not
+        parametric recall), applies the same contradiction retirement, and
+        registers new keys. No deferred-mutation discipline needed because
+        there is no train call that can fail.
+        """
+        if not procedural_relations:
+            return
+
+        logger.info("Simulated procedural: %d relations", len(procedural_relations))
+
+        new_qa = generate_qa_from_relations(
+            procedural_relations, model=self.model, tokenizer=self.tokenizer
+        )
+        if not new_qa:
+            return
+
+        new_keyed: list[dict] = []
+        for i, qa in enumerate(new_qa):
+            key = f"proc{self._procedural_next_index}"
+            self._procedural_next_index += 1
+            rel_speaker = (
+                procedural_relations[i].get("speaker_id", speaker_id)
+                if i < len(procedural_relations)
+                else speaker_id
+            )
+            new_keyed.append(
+                {
+                    "key": key,
+                    "question": qa["question"],
+                    "answer": qa["answer"],
+                    "source_subject": qa.get("source_subject", ""),
+                    "source_object": qa.get("source_object", ""),
+                    "source_predicate": qa.get("source_predicate", ""),
+                    "speaker_id": rel_speaker,
+                }
+            )
+
+        for kp in new_keyed:
+            sp_key = (
+                kp["speaker_id"],
+                kp["source_subject"].lower(),
+                kp["source_predicate"].lower(),
+            )
+            old_key = self.procedural_sp_index.get(sp_key)
+            if old_key and old_key in self.procedural_simhash:
+                logger.info("Simulated procedural contradiction: retiring %s", old_key)
+                self.procedural_simhash.pop(old_key, None)
+                self.indexed_key_qa.pop(old_key, None)
+                if self.indexed_key_registry is not None:
+                    self.indexed_key_registry.remove(old_key)
+
+        for kp in new_keyed:
+            self.indexed_key_qa[kp["key"]] = kp
+            if self.indexed_key_registry is not None:
+                self.indexed_key_registry.add(kp["key"])
+            self.procedural_simhash[kp["key"]] = compute_simhash(
+                kp["key"], kp["question"], kp["answer"]
+            )
+            sp_key = (
+                kp["speaker_id"],
+                kp["source_subject"].lower(),
+                kp["source_predicate"].lower(),
+            )
+            self.procedural_sp_index[sp_key] = kp["key"]
 
     def prepare_training_data(
         self,

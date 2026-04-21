@@ -586,6 +586,84 @@ def probe_keys_grouped_by_adapter(
     return results
 
 
+def probe_keys_from_disk(
+    adapter_dir: Path,
+    keys_by_adapter: dict[str, list[str]],
+) -> dict[str, dict | None]:
+    """Disk-recall counterpart of probe_keys_grouped_by_adapter.
+
+    Reads keyed_pairs.json files on disk instead of generating from adapter
+    weights. Used by simulate mode so inference-time recall mirrors what a
+    perfect-recall train run would produce — same shape, same content.
+
+    On-disk layout (produced by ``_save_keyed_pairs_for_router``):
+      * episodic: ``adapter_dir/keyed_pairs.json``
+      * other:    ``adapter_dir/<adapter_name>/keyed_pairs.json``
+
+    Missing files, missing keys, and malformed JSON all map to ``None`` —
+    matches the per-key failure shape of ``probe_keys_grouped_by_adapter``.
+
+    Returns:
+        Flat ``dict[str, dict | None]`` keyed by individual key names.
+        Hits include ``{key, question, answer, confidence=1.0, raw_output}``
+        so downstream consumers can treat the result identically to a live
+        probe under perfect recall.
+    """
+    results: dict[str, dict | None] = {}
+
+    for adapter_name, keys in keys_by_adapter.items():
+        if not keys:
+            continue
+
+        if adapter_name == "episodic":
+            kp_path = adapter_dir / "keyed_pairs.json"
+        else:
+            kp_path = adapter_dir / adapter_name / "keyed_pairs.json"
+
+        if not kp_path.exists():
+            logger.warning(
+                "keyed_pairs.json missing for adapter '%s' at %s — %d key(s) unresolved",
+                adapter_name,
+                kp_path,
+                len(keys),
+            )
+            for key in keys:
+                results[key] = None
+            continue
+
+        try:
+            with open(kp_path) as f:
+                pairs = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read %s: %s — %d key(s) unresolved", kp_path, exc, len(keys))
+            for key in keys:
+                results[key] = None
+            continue
+
+        index = {entry["key"]: entry for entry in pairs if "key" in entry}
+
+        for key in keys:
+            entry = index.get(key)
+            if entry is None:
+                results[key] = None
+                continue
+            results[key] = {
+                "key": key,
+                "question": entry.get("question", ""),
+                "answer": entry.get("answer", ""),
+                "confidence": 1.0,
+                "raw_output": json.dumps(
+                    {
+                        "key": key,
+                        "question": entry.get("question", ""),
+                        "answer": entry.get("answer", ""),
+                    }
+                ),
+            }
+
+    return results
+
+
 def validate_recall(
     recalled: dict | None,
     original: dict,

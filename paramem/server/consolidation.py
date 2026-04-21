@@ -64,14 +64,23 @@ def create_consolidation_loop(
     if metadata:
         loop.seed_key_metadata(metadata)
 
-    # Seed procedural QA from keyed_pairs.json (for contradiction index)
+    # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.
+    # Required by simulate mode so cold-start recall reads the full set;
+    # harmless for train mode (train reconstructs from weights and overwrites).
+    ep_kp_path = config.adapter_dir / "keyed_pairs.json"
+    if ep_kp_path.exists():
+        with open(ep_kp_path) as f:
+            loop.seed_episodic_qa(json.load(f))
+
+    sem_kp_path = config.adapter_dir / "semantic" / "keyed_pairs.json"
+    if sem_kp_path.exists():
+        with open(sem_kp_path) as f:
+            loop.seed_semantic_qa(json.load(f))
+
     proc_kp_path = config.adapter_dir / "procedural" / "keyed_pairs.json"
     if proc_kp_path.exists():
-        import json
-
         with open(proc_kp_path) as f:
-            proc_pairs = json.load(f)
-        loop.seed_procedural_qa(proc_pairs)
+            loop.seed_procedural_qa(json.load(f))
 
     return loop
 
@@ -212,27 +221,52 @@ def run_consolidation(
             len(all_procedural_rels),
         )
 
-    # --- Simulate mode: extract only, skip training ---
+    # --- Simulate mode: full pipeline minus weight update, minus archival ---
+    # Blackbox-equivalent to train: same key assignment, same contradiction
+    # handling, same SimHash registry, same on-disk keyed_pairs + registry.
+    # Deltas (intentional):
+    #   * no LoRA weight update  → recall at inference reads disk
+    #   * no mark_consolidated   → sessions keep feeding extraction until a real
+    #                              train cycle consolidates them (the merger is
+    #                              idempotent on (subject, predicate, object))
     simulate = config.consolidation.mode == "simulate"
     if simulate:
-        if config.debug:
-            try:
+        primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
+        try:
+            sim_result = loop.simulated_training(
+                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker_sim
+            )
+
+            newly_promoted = _promote_mature_keys(loop, config)
+
+            _save_keyed_pairs_for_router(loop, config)
+            _save_registry(loop, config)
+            _save_key_metadata(loop, config)
+
+            if config.debug:
                 _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
-            except Exception:
-                logger.exception(
-                    "Simulation save failed — leaving %d sessions pending",
-                    len(session_ids),
-                )
-                raise
-        session_buffer.mark_consolidated(session_ids)
+        except Exception:
+            logger.exception(
+                "Simulated consolidation failed — leaving %d sessions pending",
+                len(session_ids),
+            )
+            raise
+
+        # NOTE: sessions intentionally NOT marked consolidated — simulate never
+        # retires pending work. A later train cycle will consolidate them.
         elapsed = time.time() - start_time
         summary = {
             "status": "simulated",
             "sessions": len(session_ids),
             "total_relations": total_relations,
+            "newly_promoted": len(newly_promoted),
             "episodic_qa": len(all_episodic_qa),
             "procedural_rels": len(all_procedural_rels),
+            "episodic_keys": len(loop.episodic_simhash),
+            "semantic_keys": len(loop.semantic_simhash),
+            "procedural_keys": len(loop.procedural_simhash),
             "elapsed_seconds": round(elapsed, 1),
+            "simulated": sim_result.get("simulated", True),
             "loop": loop,
         }
         logger.info("Simulation complete: %s", {k: v for k, v in summary.items() if k != "loop"})

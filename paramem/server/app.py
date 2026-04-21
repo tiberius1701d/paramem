@@ -2145,23 +2145,40 @@ def _extract_and_start_training():
         _state["consolidating"] = False
         return
 
-    # --- Simulate mode: save results, skip training ---
+    # --- Simulate mode: full pipeline minus weight update, minus archival ---
+    # Blackbox-equivalent to train: same key assignment, contradiction handling,
+    # SimHash registry, on-disk keyed_pairs + registry. Intentional deltas:
+    #   * no LoRA weight update  → inference recalls from disk
+    #   * no mark_consolidated   → pending sessions keep feeding extraction
+    #                              (merger is idempotent on s/p/o)
     if config.consolidation.mode == "simulate":
-        if config.debug:
-            _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
-        session_buffer.mark_consolidated(session_ids)
+        primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
+        with gpu_lock_sync():
+            sim_result = loop.simulated_training(
+                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker_sim
+            )
+            newly_promoted = _promote_mature_keys(loop, config)
+            _save_keyed_pairs_for_router(loop, config)
+            _save_registry(loop, config)
+            _save_key_metadata(loop, config)
+            if config.debug:
+                _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
+
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
         _state["last_consolidation_result"] = {
             "status": "simulated",
             "sessions": len(session_ids),
             "episodic_qa": len(all_episodic_qa),
             "procedural_rels": len(all_procedural_rels),
+            "newly_promoted": len(newly_promoted),
+            "simulated": sim_result.get("simulated", True),
         }
         _state["consolidating"] = False
         logger.info(
-            "Simulation complete: %d episodic QA, %d procedural rels",
+            "Simulation complete: %d episodic QA, %d procedural rels, %d promoted",
             len(all_episodic_qa),
             len(all_procedural_rels),
+            len(newly_promoted),
         )
         return
 

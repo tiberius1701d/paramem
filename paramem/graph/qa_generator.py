@@ -241,6 +241,15 @@ def generate_qa_from_relations(
     When model/tokenizer are not provided, falls back to simple templates
     for unit testing.
 
+    Generation runs in a clean inference state:
+      - any active LoRA adapter is disabled so the base model drives output;
+      - gradient checkpointing is disabled so HF's KV cache stays active
+        (checkpointing silently disables the cache, producing garbage).
+    Prior state for both is restored on return. Without this, QA distillation
+    drifts across cycles — the train path leaves checkpointing enabled after
+    episodic training, so the subsequent procedural ``generate`` call runs
+    without KV cache and falls through to the template fallback.
+
     Args:
         relations: List of relation dicts with subject, predicate, object.
         model: Base model for LLM-based generation.
@@ -249,6 +258,32 @@ def generate_qa_from_relations(
     Returns:
         List of dicts with 'question', 'answer', and source metadata keys.
     """
+    if model is None or tokenizer is None:
+        return _run_qa_generation(relations, model, tokenizer)
+
+    try:
+        from peft import PeftModel
+    except ImportError:
+        PeftModel = None
+
+    is_peft = PeftModel is not None and isinstance(model, PeftModel)
+    was_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
+    if was_checkpointing:
+        model.gradient_checkpointing_disable()
+
+    try:
+        if is_peft:
+            with model.disable_adapter():
+                return _run_qa_generation(relations, model, tokenizer)
+        return _run_qa_generation(relations, model, tokenizer)
+    finally:
+        if was_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+
+def _run_qa_generation(relations: list[dict], model, tokenizer) -> list[dict]:
     qa_pairs = []
 
     for rel in relations:
