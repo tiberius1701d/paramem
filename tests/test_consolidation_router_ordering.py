@@ -100,8 +100,6 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_qa=None):
     loop.merger.graph = MagicMock(relations=[])
     loop.indexed_key_registry = registry if registry is not None else MagicMock()
     loop.indexed_key_qa = indexed_key_qa if indexed_key_qa is not None else {}
-    loop.seen_triples = set()
-    loop.triples_since_last_full = 0
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop.persist_graph = False
@@ -214,7 +212,6 @@ class TestB2RearmPattern:
         registry.get_adapter_id.return_value = "episodic"
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 1
 
         # Create a stub trainer to record _set_is_training calls.
         stub_trainer = MagicMock()
@@ -325,7 +322,6 @@ class TestB2RearmPattern:
         registry.get_adapter_id.side_effect = _get_adapter_id
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 3
 
         stub_trainer = MagicMock()
         stub_trainer._current_job = None
@@ -458,7 +454,6 @@ class TestPerTierInferenceFallbackAdapter:
         registry.get_adapter_id.side_effect = _get_adapter_id
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 3
 
         # Stub trainer with real attribute tracking.
         stub_trainer = MagicMock()
@@ -573,7 +568,6 @@ class TestPerTierInferenceFallbackAdapter:
         registry.get_adapter_id.side_effect = _get_adapter_id
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 2
 
         # Set a sentinel as the "outer" _current_job so we can detect restoration.
         sentinel_job = TrainingJob(
@@ -699,7 +693,6 @@ class TestCapacityCeilingRollback:
         registry.get_adapter_id.return_value = "episodic"
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 3  # must NOT be reset on rollback
 
         _gpu_thread_lock.acquire()
         try:
@@ -733,10 +726,6 @@ class TestCapacityCeilingRollback:
 
         assert result["rolled_back"] is True
         assert result["rollback_tier"] == "episodic"
-        # triples_since_last_full must NOT be reset on rollback.
-        assert loop.triples_since_last_full == 3, (
-            "triples_since_last_full must not be reset on rollback"
-        )
         # The ceiling log helper must have been called.
         mock_log.assert_called_once()
 
@@ -768,7 +757,6 @@ class TestCapacityCeilingRollback:
         registry.get_adapter_id.return_value = "episodic"
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 5
 
         _gpu_thread_lock.acquire()
         try:
@@ -801,8 +789,6 @@ class TestCapacityCeilingRollback:
             _gpu_thread_lock.release()
 
         assert result["rolled_back"] is False
-        # triples_since_last_full reset to 0 on success.
-        assert loop.triples_since_last_full == 0
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +827,6 @@ class TestAtomicFinalizeOrdering:
         registry.get_adapter_id.return_value = "episodic"
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 2
 
         call_order: list[str] = []
 
@@ -948,7 +933,6 @@ class TestAtomicFinalizeOrdering:
         registry.add("graph1", adapter_id="episodic_interim_20260418T0000")
 
         loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
-        loop.triples_since_last_full = 1
 
         _gpu_thread_lock.acquire()
         try:

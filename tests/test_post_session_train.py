@@ -1058,10 +1058,13 @@ class TestRegistryLastWriteOrder:
     """I5: registry save must be the LAST disk write; adapter-save failure = no registry entry."""
 
     def test_registry_saved_after_adapter_weights(self, tmp_path: Path) -> None:
-        """Registry save must happen after save_adapter, not before.
+        """Registry save (save_from_bytes) must happen after save_adapter.
 
-        We verify this by checking that save_adapter is called before
-        save (KeyRegistry.save) in the call sequence.
+        After the I5 reorder (§2.5), the call sequence is:
+        save_bytes → hash → keyed_pairs.json → build_manifest_for →
+        save_adapter → save_registry (SimHash) → save_from_bytes.
+
+        We verify: save_adapter precedes save_from_bytes in the call sequence.
         """
         from paramem.training.key_registry import KeyRegistry
 
@@ -1074,8 +1077,8 @@ class TestRegistryLastWriteOrder:
         def _record_save_adapter(*args, **kwargs):
             call_order.append("save_adapter")
 
-        def _record_save_registry(path):
-            call_order.append("save_registry")
+        def _record_save_from_bytes(payload, path, **kwargs):
+            call_order.append("save_from_bytes")
 
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
@@ -1089,29 +1092,34 @@ class TestRegistryLastWriteOrder:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.training.consolidation.save_registry"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch(
                 "paramem.models.loader.save_adapter",
                 side_effect=_record_save_adapter,
             ),
-            patch.object(KeyRegistry, "save", side_effect=_record_save_registry),
+            patch.object(KeyRegistry, "save_from_bytes", side_effect=_record_save_from_bytes),
         ):
             loop.post_session_train(
                 "Transcript", "conv-i5-001", schedule="every 2h", max_interim_count=4, stamp=stamp
             )
 
-        # save_adapter must precede save_registry (registry is the commit signal).
+        # save_adapter must precede save_from_bytes (registry is the commit signal).
         assert "save_adapter" in call_order, "save_adapter was not called"
-        assert "save_registry" in call_order, "registry save was not called"
+        assert "save_from_bytes" in call_order, "registry save_from_bytes was not called"
         last_save_adapter = max(i for i, c in enumerate(call_order) if c == "save_adapter")
-        first_save_registry = min(i for i, c in enumerate(call_order) if c == "save_registry")
-        assert last_save_adapter < first_save_registry, (
-            f"save_adapter must come before save_registry; order was: {call_order}"
+        first_save_from_bytes = min(i for i, c in enumerate(call_order) if c == "save_from_bytes")
+        assert last_save_adapter < first_save_from_bytes, (
+            f"save_adapter must come before save_from_bytes; order was: {call_order}"
         )
 
     def test_adapter_save_failure_means_no_registry_entry(self, tmp_path: Path) -> None:
-        """If save_adapter raises, registry must not be written.
+        """If save_adapter raises, registry must not be written to disk.
 
-        Simulates a crash between adapter-save and registry-save.
+        After the I5 reorder (§2.5), save_from_bytes (the actual on-disk
+        write) comes AFTER save_adapter.  If save_adapter raises, the
+        exception propagates before save_from_bytes is reached, so the
+        registry file is never created.  save_bytes (step 1) is in-memory
+        only and never touches disk.
         """
         loop = _make_mock_loop(tmp_path)
         stamp = "20260418T1430"
@@ -1133,6 +1141,7 @@ class TestRegistryLastWriteOrder:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.training.consolidation.save_registry"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter", side_effect=_fail_save_adapter),
         ):
             with pytest.raises(OSError, match="disk full"):
@@ -1144,7 +1153,7 @@ class TestRegistryLastWriteOrder:
                     stamp=stamp,
                 )
 
-        # Registry must not exist on disk (save_adapter failed before registry write).
+        # Registry must not exist on disk (save_adapter failed before save_from_bytes).
         assert not registry_path.exists(), "Registry must not be written when adapter save fails"
 
     def test_restart_consistency_check_drops_orphan_keys(self, tmp_path: Path) -> None:
@@ -1224,3 +1233,172 @@ class TestRegistryLastWriteOrder:
         # Registry file mtime should NOT have changed (no orphans found, no rewrite).
         _reg2 = KeyRegistry.load(registry_path)
         assert "graph1" in _reg2.list_active()
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — save_from_bytes guard (§2.5 defence-in-depth)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveFromBytesGuard:
+    """KeyRegistry.save_from_bytes raises when called outside consolidation window."""
+
+    def test_save_from_bytes_raises_when_not_consolidating(self, tmp_path: Path) -> None:
+        """_require_consolidating=True + consolidating=False → RuntimeError."""
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("k1")
+        payload = reg.save_bytes()
+        path = tmp_path / "registry.json"
+
+        with pytest.raises(RuntimeError, match="_require_consolidating"):
+            reg.save_from_bytes(
+                payload,
+                path,
+                _require_consolidating=True,
+                consolidating=False,
+            )
+
+        # File must NOT have been written
+        assert not path.exists()
+
+    def test_save_from_bytes_succeeds_when_consolidating(self, tmp_path: Path) -> None:
+        """_require_consolidating=True + consolidating=True → success."""
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("k1")
+        payload = reg.save_bytes()
+        path = tmp_path / "registry.json"
+
+        reg.save_from_bytes(payload, path, _require_consolidating=True, consolidating=True)
+        assert path.exists()
+
+    def test_save_from_bytes_opt_out_succeeds(self, tmp_path: Path) -> None:
+        """_require_consolidating=False bypasses the guard (experiment path)."""
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("k1")
+        payload = reg.save_bytes()
+        path = tmp_path / "registry.json"
+
+        # Should succeed regardless of consolidating flag
+        reg.save_from_bytes(
+            payload,
+            path,
+            _require_consolidating=False,
+            consolidating=False,
+        )
+        assert path.exists()
+
+    def test_save_bytes_then_save_from_bytes_byte_identity(self, tmp_path: Path) -> None:
+        """Bytes from save_bytes() written via save_from_bytes() must equal save() output."""
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("key1")
+        reg.add("key2")
+        reg.set_adapter_health("episodic", "healthy", reason="test")
+
+        path_a = tmp_path / "reg_a.json"
+        path_b = tmp_path / "reg_b.json"
+
+        payload = reg.save_bytes()
+        reg.save(path_a)
+        reg.save_from_bytes(payload, path_b, _require_consolidating=False)
+
+        assert path_a.read_bytes() == path_b.read_bytes(), (
+            "save_from_bytes must produce byte-identical output to save()"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 13 — meta.json written inside post_session_train slot (§2.5)
+# ---------------------------------------------------------------------------
+
+
+class TestManifestWrittenPostSession:
+    """post_session_train must embed meta.json in the interim adapter slot.
+
+    Verifies that build_manifest_for is called and atomic_save_adapter
+    writes meta.json alongside the adapter weights.  Uses a real
+    atomic_save_adapter invocation (model.save_pretrained writes stub
+    files) so the on-disk assertion is genuine.
+    """
+
+    def test_meta_json_written_in_interim_slot(self, tmp_path: Path) -> None:
+        """meta.json must be present in the timestamped slot after post_session_train."""
+        from paramem.adapters.manifest import AdapterManifest, read_manifest
+
+        loop = _make_mock_loop(tmp_path)
+        stamp = "20260418T1430"
+        adapter_name = f"episodic_interim_{stamp}"
+        loop.model.peft_config[adapter_name] = MagicMock()
+
+        # model.save_pretrained writes stub adapter files into the pending slot
+        # so atomic_save_adapter can complete the six-step sequence.
+        def _fake_save_pretrained(path, selected_adapters=None):
+            p = Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "adapter_model.safetensors").write_bytes(b"weights")
+            (p / "adapter_config.json").write_text("{}")
+
+        loop.model.save_pretrained.side_effect = _fake_save_pretrained
+
+        # Provide JSON-serialisable config attributes so build_manifest_for can
+        # produce a valid manifest without fingerprinting real model weights.
+        loop.model.config._name_or_path = "test-base-model"
+        loop.model.config._commit_hash = None
+        # base_model.model.state_dict() returns an empty dict → base_hash = UNKNOWN
+        loop.model.base_model.model.state_dict.return_value = {}
+        # Tokenizer: provide a name_or_path string.
+        loop.tokenizer.name_or_path = "test-tokenizer"
+        loop.tokenizer.backend_tokenizer = None
+        loop.tokenizer.vocab_size = 32000
+        # LoRA config attributes for the interim adapter.
+        lora_cfg = MagicMock()
+        lora_cfg.r = 4
+        lora_cfg.lora_alpha = 8
+        lora_cfg.lora_dropout = 0.0
+        lora_cfg.target_modules = ["q_proj"]
+        lora_cfg.bias = "none"
+        loop.model.peft_config[adapter_name] = lora_cfg
+
+        with (
+            patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
+            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.training.trainer.train_adapter"),
+            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_make_training_config", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch("paramem.training.consolidation.save_registry"),
+        ):
+            result = loop.post_session_train(
+                "Transcript",
+                "conv-manifest-001",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
+
+        assert result["mode"] == "trained"
+
+        # Locate the timestamped slot created by atomic_save_adapter.
+        adapter_dir = tmp_path / adapter_name
+        slots = [d for d in adapter_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert slots, f"No slot dir created under {adapter_dir}"
+        slot = slots[0]
+
+        # meta.json must be present in the slot.
+        assert (slot / "meta.json").exists(), f"meta.json missing from slot {slot}"
+
+        # Manifest must be parseable and reference the correct adapter name.
+        manifest = read_manifest(slot)
+        assert isinstance(manifest, AdapterManifest)
+        assert manifest.name == adapter_name

@@ -77,6 +77,8 @@ from experiments.utils.test_harness import (  # noqa: E402
     model_output_dir,
     setup_logging,
 )
+from paramem.adapters import resolve_adapter_slot  # noqa: E402
+from paramem.adapters.manifest import build_manifest_for  # noqa: E402
 from paramem.evaluation.recall import generate_answer  # noqa: E402
 from paramem.graph.qa_generator import generate_qa_from_relations  # noqa: E402
 from paramem.models.loader import (  # noqa: E402
@@ -1086,7 +1088,16 @@ def run_control_shuffled(
         if current_epoch > 0:
             prev_adapter = control_dir / f"epoch_{current_epoch:03d}" / "adapter"
             if prev_adapter.exists():
-                model = load_adapter(model, prev_adapter, adapter_name)
+                _slot = resolve_adapter_slot(prev_adapter, adapter_name, "")
+                if _slot is not None:
+                    if isinstance(model, PeftModel):
+                        model.load_adapter(str(_slot), adapter_name=adapter_name)
+                    else:
+                        model = PeftModel.from_pretrained(
+                            model, str(_slot), adapter_name=adapter_name
+                        )
+                else:
+                    model = load_adapter(model, prev_adapter, adapter_name)
             else:
                 model = create_adapter(model, adapter_config, adapter_name)
         else:
@@ -1127,7 +1138,15 @@ def run_control_shuffled(
         epoch_dir.mkdir(parents=True, exist_ok=True)
 
         # Save adapter
-        save_adapter(model, epoch_dir / "adapter", adapter_name)
+        _mf_shuffled = build_manifest_for(
+            model,
+            tokenizer,
+            adapter_name,
+            registry_path=None,
+            keyed_pairs_path=epoch_dir / "keyed_pairs.json",
+            key_count=len(shuffled_pairs),
+        )
+        save_adapter(model, epoch_dir / "adapter", adapter_name, manifest=_mf_shuffled)
 
         # Probe (no rephrased for shuffled control)
         model.gradient_checkpointing_disable()
@@ -1317,7 +1336,14 @@ def run_experiment(
         adapter_dir = output_dir / f"epoch_{current_epoch:03d}" / "adapter"
         if adapter_dir.exists():
             logger.info("Loading adapter from E%d", current_epoch)
-            model = load_adapter(model, adapter_dir, adapter_name)
+            _slot = resolve_adapter_slot(adapter_dir, adapter_name, "")
+            if _slot is not None:
+                if isinstance(model, PeftModel):
+                    model.load_adapter(str(_slot), adapter_name=adapter_name)
+                else:
+                    model = PeftModel.from_pretrained(model, str(_slot), adapter_name=adapter_name)
+            else:
+                model = load_adapter(model, adapter_dir, adapter_name)
         else:
             logger.warning("No adapter at E%d, starting fresh", current_epoch)
             model = create_adapter(model, adapter_config, adapter_name)
@@ -1369,7 +1395,16 @@ def run_experiment(
         if current_epoch > 0:
             prev_adapter = output_dir / f"epoch_{current_epoch:03d}" / "adapter"
             if prev_adapter.exists():
-                model = load_adapter(model, prev_adapter, adapter_name)
+                _slot = resolve_adapter_slot(prev_adapter, adapter_name, "")
+                if _slot is not None:
+                    if isinstance(model, PeftModel):
+                        model.load_adapter(str(_slot), adapter_name=adapter_name)
+                    else:
+                        model = PeftModel.from_pretrained(
+                            model, str(_slot), adapter_name=adapter_name
+                        )
+                else:
+                    model = load_adapter(model, prev_adapter, adapter_name)
             else:
                 model = create_adapter(model, adapter_config, adapter_name)
         else:
@@ -1412,7 +1447,15 @@ def run_experiment(
 
         # Save adapter checkpoint
         logger.info("  Saving adapter at E%d...", current_epoch)
-        save_adapter(model, epoch_dir / "adapter", adapter_name)
+        _mf_main = build_manifest_for(
+            model,
+            tokenizer,
+            adapter_name,
+            registry_path=None,
+            keyed_pairs_path=epoch_dir / "keyed_pairs.json",
+            key_count=len(keyed_pairs),
+        )
+        save_adapter(model, epoch_dir / "adapter", adapter_name, manifest=_mf_main)
         with open(epoch_dir / "keyed_pairs.json", "w") as f:
             json.dump(keyed_pairs, f, indent=2, ensure_ascii=False)
         with open(epoch_dir / "train_loss.json", "w") as f:

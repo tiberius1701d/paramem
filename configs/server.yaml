@@ -145,8 +145,8 @@ adapters:
 # - At each interim tick, if no new session transcripts AND no queued
 #   pending triples since the last tick, the tick is a no-op — no new
 #   adapter is created, no training runs.
-# - After extraction, if every extracted triple is already in `seen_triples`
-#   (no new OR changed knowledge), training is also skipped.
+# - After extraction, duplicate triples are filtered by the graph merger
+#   (idempotent on subject/predicate/object); no new knowledge → no training.
 # - Result: adapter VRAM and router probe cost scale with real conversation
 #   volume, not wall clock.
 #

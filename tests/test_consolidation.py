@@ -4,6 +4,8 @@ These are unit tests that mock the model/extraction to test
 the consolidation logic without requiring GPU.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from paramem.evaluation.consolidation_metrics import (
@@ -161,7 +163,6 @@ class TestExtractionPathParity:
         extract_procedural_spy=None,
         **loop_kwargs,
     ):
-        from unittest.mock import MagicMock
 
         from paramem.graph.qa_generator import generate_qa_from_relations as _real_qa
         from paramem.graph.schema import Entity, Relation, SessionGraph
@@ -533,7 +534,6 @@ class TestAnonymousSpeakerNotSkipped:
 
     def _make_mock_loop(self):
         """Minimal mock ConsolidationLoop with the attributes run_consolidation touches."""
-        from unittest.mock import MagicMock
 
         loop = MagicMock()
         loop.shutdown_requested = False
@@ -645,3 +645,159 @@ class TestAnonymousSpeakerNotSkipped:
 
         # Text-only sessions without a speaker_id must NOT reach extract_session.
         loop.extract_session.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _save_adapters: meta.json written in every saved slot (Slice 3a §2.4.1)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveAdaptersManifest:
+    """_save_adapters must embed meta.json in each adapter slot (Slice 3a)."""
+
+    def _make_save_loop(self, tmp_path):
+        """Return a minimal ConsolidationLoop wired for _save_adapters testing."""
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        model = MagicMock()
+
+        # Provide JSON-serialisable attributes so build_manifest_for can
+        # produce a valid manifest without fingerprinting real model weights.
+        model.config._name_or_path = "test-base-model"
+        model.config._commit_hash = None
+        model.base_model.model.state_dict.return_value = {}
+        lora_cfg = MagicMock()
+        lora_cfg.r = 4
+        lora_cfg.lora_alpha = 8
+        lora_cfg.lora_dropout = 0.0
+        lora_cfg.target_modules = ["q_proj"]
+        lora_cfg.bias = "none"
+        model.peft_config = {"episodic": lora_cfg}
+
+        def _fake_save_pretrained(path, selected_adapters=None):
+            from pathlib import Path
+
+            p = Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "adapter_model.safetensors").write_bytes(b"weights")
+            (p / "adapter_config.json").write_text("{}")
+
+        model.save_pretrained.side_effect = _fake_save_pretrained
+
+        tokenizer = MagicMock()
+        tokenizer.name_or_path = "test-tokenizer"
+        tokenizer.backend_tokenizer = None
+        tokenizer.vocab_size = 32000
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = model
+        loop.tokenizer = tokenizer
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(num_epochs=1)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = None
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop.output_dir = tmp_path
+        loop.snapshot_dir = None
+        loop.save_cycle_snapshots = False
+        loop.indexed_key_registry = KeyRegistry()
+        loop.indexed_key_qa = {}
+        loop.cycle_count = 0
+        loop.merger = MagicMock()
+        loop.episodic_simhash = {}
+        loop.semantic_simhash = {}
+        loop.procedural_simhash = {}
+        return loop
+
+    def test_save_adapters_writes_meta_json(self, tmp_path):
+        """_save_adapters must write meta.json inside the episodic slot."""
+        from paramem.adapters.manifest import AdapterManifest, read_manifest
+
+        loop = self._make_save_loop(tmp_path)
+
+        # Seed the registry and keyed_pairs so build_manifest_for has something to hash.
+        from paramem.training.key_registry import KeyRegistry
+
+        loop.indexed_key_registry = KeyRegistry()
+        loop.indexed_key_registry.add("graph1", adapter_id="episodic")
+        registry_path = tmp_path / "indexed_key_registry.json"
+        loop.indexed_key_registry.save(registry_path)
+
+        loop._save_adapters()
+
+        adapter_dir = tmp_path / "episodic"
+        slots = [d for d in adapter_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert slots, f"No slot dir created under {adapter_dir}"
+        slot = slots[0]
+
+        assert (slot / "meta.json").exists(), f"meta.json missing from slot {slot}"
+
+        manifest = read_manifest(slot)
+        assert isinstance(manifest, AdapterManifest)
+        assert manifest.name == "episodic"
+
+    def test_save_adapters_roundtrip_find_live_slot(self, tmp_path):
+        """_save_adapters → find_live_slot must match the fresh slot (I5 roundtrip).
+
+        Regression guard for the blocker where ``_save_adapters`` hashed the
+        stale on-disk registry, then overwrote it.  The post-save on-disk
+        registry hash must equal ``manifest.registry_sha256`` so
+        ``find_live_slot`` can mount the adapter after restart.
+        """
+        import hashlib
+
+        from paramem.adapters.manifest import find_live_slot, read_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = self._make_save_loop(tmp_path)
+
+        # Seed registry + keyed_pairs state so every hash input is populated.
+        loop.indexed_key_registry = KeyRegistry()
+        loop.indexed_key_registry.add("graph1", adapter_id="episodic")
+        loop.indexed_key_qa = {
+            "graph1": {
+                "key": "graph1",
+                "question": "What colour is the sky?",
+                "answer": "Blue.",
+                "source_subject": "sky",
+                "source_object": "blue",
+            }
+        }
+        loop.episodic_simhash = {"graph1": 0xABCDEF}
+
+        # Pre-seed a *different* registry file on disk so the old codepath
+        # (hash-before-overwrite) would produce a mismatch — ensures this
+        # test fails under the pre-fix implementation.
+        stale_registry = KeyRegistry()
+        stale_registry.add("stale_key", adapter_id="episodic")
+        stale_registry.save(tmp_path / "indexed_key_registry.json")
+
+        loop._save_adapters()
+
+        # Live hash = hash of whatever is on disk post-save.
+        live_hash = hashlib.sha256(
+            (tmp_path / "indexed_key_registry.json").read_bytes()
+        ).hexdigest()
+
+        slot = find_live_slot(tmp_path / "episodic", live_hash)
+        assert slot is not None, (
+            "find_live_slot returned None — manifest.registry_sha256 does "
+            "not match on-disk hash (I5 reorder broken)"
+        )
+
+        manifest = read_manifest(slot)
+        assert manifest.registry_sha256 == live_hash
+        # key_count must reflect the post-save registry (graph1), not the
+        # stale pre-existing registry (stale_key).
+        assert manifest.key_count == 1
+
+        # keyed_pairs.json must live inside the adapter-kind dir and match
+        # the hash stamped in the manifest.
+        kp_path = tmp_path / "episodic" / "keyed_pairs.json"
+        assert kp_path.exists()
+        kp_hash = hashlib.sha256(kp_path.read_bytes()).hexdigest()
+        assert manifest.keyed_pairs_sha256 == kp_hash

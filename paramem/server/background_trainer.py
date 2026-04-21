@@ -520,7 +520,7 @@ class BackgroundTrainer:
         Non-blocking — returns immediately after queuing.  Jobs from concurrent
         ``/chat`` turns are serialised: the second job waits in the queue until
         the first completes.  This eliminates concurrent-turn races on shared
-        ``ConsolidationLoop`` state (``_indexed_next_index``, ``seen_triples``).
+        ``ConsolidationLoop`` state (``_indexed_next_index``).
 
         The GPU lock (``gpu_lock_sync``) is held for the duration of each job so
         that concurrent STT/TTS inference requests are correctly serialised via
@@ -1029,14 +1029,37 @@ class BackgroundTrainer:
 
         Order matters: weights must be copied BEFORE the atomic save so that
         save_pretrained serializes the just-committed production slot, not
-        the pre-commit state. Encapsulated in one method to prevent
-        accidental reordering.
+        the pre-commit state.  A manifest is built and embedded in the slot
+        so the startup validator can match it against the live registry hash.
+
+        The BG trainer never mutates the registry (§2.4.3), so the manifest's
+        ``registry_sha256`` is derived by reading the current on-disk registry
+        bytes directly (no ``save_bytes``/``save_from_bytes`` split needed here).
         """
+        from paramem.adapters.manifest import build_manifest_for
         from paramem.models.loader import atomic_save_adapter, copy_adapter_weights
 
         copy_adapter_weights(self.model, src="in_training", dst=production_name)
+
+        registry_path = self.output_dir / "indexed_key_registry.json"
+        kp_path = self.output_dir / production_name / "keyed_pairs.json"
+        manifest = None
+        try:
+            manifest = build_manifest_for(
+                self.model,
+                self.tokenizer,
+                production_name,
+                registry_path=registry_path if registry_path.exists() else None,
+                keyed_pairs_path=kp_path if kp_path.exists() else None,
+            )
+        except Exception:
+            logger.warning(
+                "_commit_staging_to_production: manifest build failed for %s — saving without",
+                production_name,
+            )
+
         target_dir = self.output_dir / production_name
-        atomic_save_adapter(self.model, target_dir, production_name)
+        atomic_save_adapter(self.model, target_dir, production_name, manifest=manifest)
 
 
 class _SimpleDataset:

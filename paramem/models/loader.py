@@ -332,70 +332,142 @@ def switch_adapter(model: PeftModel, adapter_name: str) -> None:
     logger.debug("Switched to adapter: %s", adapter_name)
 
 
-def save_adapter(model: PeftModel, path: str | Path, adapter_name: str) -> None:
-    """Save a specific adapter to disk."""
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(path), selected_adapters=[adapter_name])
-    logger.info("Adapter '%s' saved to %s", adapter_name, path)
+def save_adapter(
+    model: PeftModel,
+    path: str | Path,
+    adapter_name: str,
+    *,
+    manifest=None,
+) -> None:
+    """Save a specific adapter to disk via the atomic slot-dir path.
+
+    Thin forwarder to :func:`atomic_save_adapter`.  All callers receive
+    slot-dir layout (``path/<ts>/adapter_*.*``) automatically.
+
+    Args:
+        model: PeftModel whose adapter weights are saved.
+        path: Parent directory that will hold the timestamped slot.
+        adapter_name: Name of the adapter to save.
+        manifest: Optional :class:`paramem.adapters.manifest.AdapterManifest`
+            to write alongside the adapter files.  When ``None``, no
+            ``meta.json`` is written.
+    """
+    atomic_save_adapter(model, path, adapter_name, manifest=manifest)
 
 
-def atomic_save_adapter(model: PeftModel, target_dir: str | Path, adapter_name: str) -> None:
-    """Save adapter atomically: write to temp dir, fsync, rename.
+def atomic_save_adapter(
+    model: PeftModel,
+    target_dir: str | Path,
+    adapter_name: str,
+    *,
+    manifest=None,
+) -> Path:
+    """Save adapter atomically into a timestamped slot directory.
 
-    The final `target_dir` contains the adapter files directly
-    (`adapter_config.json`, `adapter_model.safetensors`). PEFT's
-    `save_pretrained` nests files in a subdirectory named after the
-    adapter; this function flattens the result so `target_dir` matches
-    the convention used by `load_adapter` / `PeftModel.from_pretrained`.
+    Implements the six-step in-pending-flatten sequence from the plan:
 
-    Guarantees that either the new adapter or the old one is on disk —
-    never a torn state.
+    1. Ensure ``target_dir`` and ``target_dir/.pending/`` exist; pick a
+       collision-safe ``<ts>`` stamp and create ``pending_slot =
+       target_dir/.pending/<ts>/``.
+    2. ``model.save_pretrained(pending_slot, selected_adapters=[adapter_name])``.
+       PEFT may write ``pending_slot/<adapter_name>/`` (nested) or directly
+       into ``pending_slot/`` (flat — some PEFT versions).
+    3. **Flatten inside ``pending_slot``**: if ``pending_slot/<adapter_name>/``
+       exists, iterate its children and rename each up one level into
+       ``pending_slot/``, then rmdir the now-empty nested directory.  If the
+       nested directory is absent, this step is a no-op.
+    4. If *manifest* is not ``None``, write ``pending_slot/meta.json`` via
+       :func:`paramem.adapters.manifest.write_manifest`.
+    5. fsync ``pending_slot`` (best-effort; ``OSError`` tolerated on
+       filesystems that don't support directory fsync).
+    6. Atomic rename ``pending_slot → target_dir/<ts>/`` (the final slot).
+       fsync ``target_dir`` for durability.
+
+    Old ``.tmp.{pid}`` and ``.old`` paths are gone — all staging happens
+    inside ``.pending/`` which :func:`paramem.backup.backup.sweep_orphan_pending`
+    cleans on startup.
+
+    Args:
+        model: PeftModel whose adapter weights are saved.
+        target_dir: Adapter-kind directory.  Slots are created as
+            ``target_dir/<ts>/``.
+        adapter_name: Name of the adapter (must be in
+            ``model.peft_config``).
+        manifest: Optional :class:`paramem.adapters.manifest.AdapterManifest`
+            to write into the pending slot as ``meta.json`` before
+            promotion.  When ``None``, no ``meta.json`` is written.
+
+    Returns:
+        Path to the final (promoted) slot directory.
     """
     import os
-    import shutil
+    import time
 
     target_dir = Path(target_dir)
-    target_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging_dir = target_dir.parent / f"{target_dir.name}.tmp.{os.getpid()}"
-    backup_dir = target_dir.parent / f"{target_dir.name}.old"
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clean up leftovers from prior crashes
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir)
+    # Step 1 — pending root + collision-retry timestamp
+    pending_root = target_dir / ".pending"
+    pending_root.mkdir(exist_ok=True)
 
-    staging_dir.mkdir(parents=True)
-    # PEFT writes into staging_dir/{adapter_name}/adapter_*.*
-    model.save_pretrained(str(staging_dir), selected_adapters=[adapter_name])
+    ts = _make_slot_ts()
+    pending_slot = pending_root / ts
+    for _attempt in range(10):
+        if not pending_slot.exists():
+            break
+        time.sleep(1)
+        ts = _make_slot_ts()
+        pending_slot = pending_root / ts
+    pending_slot.mkdir(parents=True, exist_ok=False)
 
-    nested = staging_dir / adapter_name
-    if not nested.exists():
-        # Some PEFT versions write directly to staging_dir when only one
-        # adapter is selected. Fall back to staging_dir itself.
-        nested = staging_dir
+    # Step 2 — PEFT save into pending slot
+    model.save_pretrained(str(pending_slot), selected_adapters=[adapter_name])
 
-    # fsync the nested directory to ensure metadata hits disk
+    # Step 3 — Flatten inside pending_slot
+    # PEFT may write <pending_slot>/<adapter_name>/adapter_*.*
+    nested = pending_slot / adapter_name
+    if nested.exists() and nested.is_dir():
+        for child in list(nested.iterdir()):
+            child.rename(pending_slot / child.name)
+        nested.rmdir()
+
+    # Step 4 — Write manifest alongside adapter files (before fsync/rename)
+    if manifest is not None:
+        from paramem.adapters.manifest import write_manifest
+
+        write_manifest(pending_slot, manifest)
+
+    # Step 5 — fsync pending_slot
     try:
-        fd = os.open(str(nested), os.O_RDONLY)
+        fd = os.open(str(pending_slot), os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
     except OSError:
-        # fsync on directory not supported on all filesystems; continue
         pass
 
-    # Swap: existing → backup, nested → target, clean up
-    if target_dir.exists():
-        target_dir.rename(backup_dir)
-    nested.rename(target_dir)
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir)
-    logger.info("Adapter '%s' atomically saved to %s", adapter_name, target_dir)
+    # Step 6 — Atomic promotion: .pending/<ts> → target_dir/<ts>
+    final_slot = target_dir / ts
+    pending_slot.rename(final_slot)
+    try:
+        fd = os.open(str(target_dir), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+    logger.info("Adapter '%s' saved to slot %s", adapter_name, final_slot)
+    return final_slot
+
+
+def _make_slot_ts() -> str:
+    """Return a ``YYYYMMDD-HHMMSS`` UTC timestamp string for slot naming."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
 def copy_adapter_weights(model: PeftModel, src: str, dst: str) -> None:

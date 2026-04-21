@@ -51,9 +51,9 @@ def enqueue_post_session_train(
     Submits a callable wrapping ``loop.post_session_train`` to
     ``BackgroundTrainer.submit()``.  The single-slot worker thread holds the
     GPU lock for the duration of each job, so jobs from concurrent ``/chat``
-    turns queue behind one another and execute serially.  This eliminates the
-    concurrent-turn race on ``ConsolidationLoop._indexed_next_index`` and
-    ``seen_triples``.
+    turns queue behind one another and execute serially.  This eliminates
+    concurrent-turn races on shared ``ConsolidationLoop`` state
+    (``_indexed_next_index``).
 
     ``inference_fallback_adapter`` is set to ``"episodic"`` (the stable main
     adapter) so that inference during a paused training job reads committed

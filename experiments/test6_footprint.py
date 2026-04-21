@@ -39,7 +39,8 @@ from experiments.utils.test_harness import (  # noqa: E402
     setup_logging,
     train_indexed_keys,
 )
-from paramem.models.loader import unload_model  # noqa: E402
+from paramem.adapters.manifest import build_manifest_for  # noqa: E402
+from paramem.models.loader import atomic_save_adapter, unload_model  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -370,7 +371,15 @@ def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_
     # Save final adapter weights only (not training checkpoints)
     # for accurate storage measurement
     final_adapter_dir = scale_dir / "final_adapter"
-    model.save_pretrained(final_adapter_dir, selected_adapters=[adapter_name])
+    _mf_final = build_manifest_for(
+        model,
+        tokenizer,
+        adapter_name,
+        registry_path=None,
+        keyed_pairs_path=None,
+        key_count=scale,
+    )
+    atomic_save_adapter(model, final_adapter_dir, adapter_name, manifest=_mf_final)
 
     return model, subset_kp, subset_registry, adapter_name, train_time, metrics
 

@@ -1,8 +1,7 @@
 """Tests for the staging adapter flow (in_training slot for on-the-fly training)."""
 
-import os
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -101,6 +100,11 @@ class TestCopyAdapterWeights:
 
 class TestAtomicSaveAdapter:
     def test_creates_target_directory(self, tmp_path):
+        """atomic_save_adapter creates target_dir and a timestamped slot under it.
+
+        Post-Slice-3a: adapter files live in target_dir/<ts>/, not in target_dir
+        itself.  Verify the slot exists and contains the adapter files.
+        """
         model = MagicMock()
 
         def fake_save(path, selected_adapters):
@@ -111,19 +115,31 @@ class TestAtomicSaveAdapter:
         model.save_pretrained.side_effect = fake_save
 
         target = tmp_path / "episodic"
-        atomic_save_adapter(model, target, "episodic")
+        slot = atomic_save_adapter(model, target, "episodic")
 
+        # target_dir itself exists
         assert target.exists()
-        assert (target / "adapter_model.safetensors").exists()
+        # Slot is a direct child of target_dir
+        assert slot.parent == target
+        assert (slot / "adapter_model.safetensors").exists()
         # No stale tmp or old dirs
         leftovers = list(tmp_path.glob("episodic.*"))
         assert leftovers == []
 
     def test_replaces_existing_directory(self, tmp_path):
+        """Slot-dir layout preserves history — old slot is NOT removed.
+
+        Semantic change from the old flat layout: the old slot is retained
+        alongside the new slot.  Retention/pruning happens separately (Slice 3b).
+        The new slot must contain the new file; both slots are visible.
+        """
         model = MagicMock()
         target = tmp_path / "episodic"
-        target.mkdir()
-        (target / "old_file").write_text("old")
+
+        # Create a pre-existing slot that looks like an old save
+        old_slot = target / "20260420-000000"
+        old_slot.mkdir(parents=True)
+        (old_slot / "old_file").write_text("old")
 
         def fake_save(path, selected_adapters):
             Path(path).mkdir(parents=True, exist_ok=True)
@@ -131,30 +147,89 @@ class TestAtomicSaveAdapter:
 
         model.save_pretrained.side_effect = fake_save
 
-        atomic_save_adapter(model, target, "episodic")
+        new_slot = atomic_save_adapter(model, target, "episodic")
 
-        assert (target / "new_file").exists()
-        assert not (target / "old_file").exists()
-        # Backup should be cleaned up
+        # New slot has the new file
+        assert (new_slot / "new_file").exists()
+        # Old slot is RETAINED (slot-dir preserves history)
+        assert (old_slot / "old_file").exists()
+        # No .old backup dirs (old codepath gone)
         assert not (tmp_path / "episodic.old").exists()
 
     def test_cleans_stale_tmp_before_write(self, tmp_path):
-        """If a prior crash left a .tmp directory, it should be removed."""
+        """Stale .pending/<ts>/ dirs from prior crashes are cleaned by sweep_orphan_pending.
+
+        The old .tmp.{pid} codepath is gone; .pending/<ts>/ is the new staging
+        area.  Verify that a stale pending slot does not prevent a new save and
+        that sweep_orphan_pending removes it.
+        """
+        from paramem.backup.backup import sweep_orphan_pending
+
         model = MagicMock()
         target = tmp_path / "episodic"
-        stale_tmp = tmp_path / f"episodic.tmp.{os.getpid()}"
-        stale_tmp.mkdir()
-        (stale_tmp / "junk").write_text("junk")
+        target.mkdir()
+
+        # Simulate a stale pending slot from a prior crash
+        stale_pending = target / ".pending" / "20260420-120000"
+        stale_pending.mkdir(parents=True)
+        (stale_pending / "junk").write_text("junk")
+
+        # sweep_orphan_pending should remove the stale slot
+        sweep_orphan_pending(target)
+        assert not stale_pending.exists()
 
         def fake_save(path, selected_adapters):
             Path(path).mkdir(parents=True, exist_ok=True)
             (Path(path) / "adapter_model.safetensors").write_bytes(b"x")
 
         model.save_pretrained.side_effect = fake_save
-        atomic_save_adapter(model, target, "episodic")
+        slot = atomic_save_adapter(model, target, "episodic")
 
-        assert target.exists()
-        assert not stale_tmp.exists()
+        assert slot.exists()
+        assert (slot / "adapter_model.safetensors").exists()
+
+    def test_peft_nested_subdir_flatten_inside_pending_slot(self, tmp_path):
+        """Verify PEFT-nested subdir is flattened INSIDE .pending before outer rename.
+
+        This guards against: (1) flattening too early (before save_pretrained),
+        (2) flattening too late (after outer rename).  The flatten must happen
+        at step 3 of the six-step sequence, inside the pending slot.
+        """
+        pending_state: dict = {}
+        original_rename = Path.rename
+
+        def _intercept_rename(self_path, target_):
+            # Intercept only the outer rename from .pending/<ts>/ to final slot
+            if (
+                ".pending" in str(self_path)
+                and self_path.is_dir()
+                and self_path.parent.name == ".pending"
+            ):
+                pending_state["files"] = [f.name for f in self_path.iterdir()]
+                pending_state["has_nested"] = (self_path / "episodic").exists()
+            return original_rename(self_path, target_)
+
+        def fake_save_nested(path, selected_adapters):
+            nested = Path(path) / "episodic"
+            nested.mkdir(parents=True, exist_ok=True)
+            (nested / "adapter_model.safetensors").write_bytes(b"weights")
+            (nested / "adapter_config.json").write_text("{}")
+
+        model = MagicMock()
+        model.save_pretrained.side_effect = fake_save_nested
+
+        with patch.object(Path, "rename", _intercept_rename):
+            final_slot = atomic_save_adapter(model, tmp_path / "episodic", "episodic")
+
+        # Flatten must have run before outer rename
+        assert not pending_state.get("has_nested", True), (
+            "Nested subdir must be absent inside pending slot at rename time"
+        )
+        assert "adapter_model.safetensors" in pending_state.get("files", [])
+
+        # Final slot must also be flat
+        assert (final_slot / "adapter_model.safetensors").exists()
+        assert not (final_slot / "episodic").exists()
 
 
 class TestStagingFlowContracts:
@@ -326,7 +401,10 @@ class TestCommitStagingToProduction:
             training_config=MagicMock(),
             output_dir=tmp_path,
         )
-        bt._commit_staging_to_production("episodic")
+        # Patch build_manifest_for so this weight-copy / save-path test is
+        # not coupled to the manifest serialization path.
+        with patch("paramem.adapters.manifest.build_manifest_for", return_value=None):
+            bt._commit_staging_to_production("episodic")
 
         # Verify weights copied
         for name, p in model.named_parameters():
@@ -589,7 +667,7 @@ class TestMultiJobSequencing:
         def fake_switch(model, name):
             calls.append(("switch", name))
 
-        def fake_atomic_save(model, target_dir, adapter_name):
+        def fake_atomic_save(model, target_dir, adapter_name, **kwargs):
             calls.append(("save", adapter_name, str(target_dir)))
 
         import paramem.models.loader as loader_mod

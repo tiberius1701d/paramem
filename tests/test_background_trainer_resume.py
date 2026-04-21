@@ -837,3 +837,116 @@ class TestSuccessfulCompletionCleanup:
 
         assert not state_path.exists(), "resume_state.json must be removed after success"
         assert not checkpoint_root.exists(), "bg_checkpoint/ must be removed after success"
+
+
+# ---------------------------------------------------------------------------
+# Manifest: meta.json written in slot + registry hash reads disk (§2.4.3)
+# ---------------------------------------------------------------------------
+
+
+class TestBgTrainerManifest:
+    """_commit_staging_to_production embeds meta.json in the adapter slot."""
+
+    def _configure_model_for_manifest(self, bt):
+        """Set JSON-serialisable attributes on the stub model so build_manifest_for works."""
+        bt.model.config._name_or_path = "test-base-model"
+        bt.model.config._commit_hash = None
+        bt.model.base_model.model.state_dict.return_value = {}
+        bt.tokenizer.name_or_path = "test-tokenizer"
+        bt.tokenizer.backend_tokenizer = None
+        bt.tokenizer.vocab_size = 32000
+        lora_cfg = MagicMock()
+        lora_cfg.r = 4
+        lora_cfg.lora_alpha = 8
+        lora_cfg.lora_dropout = 0.0
+        lora_cfg.target_modules = ["q_proj"]
+        lora_cfg.bias = "none"
+        bt.model.peft_config["episodic"] = lora_cfg
+
+    def test_bg_trainer_writes_meta_json_in_slot(self, tmp_path: Path) -> None:
+        """meta.json must be present in the timestamped slot after commit.
+
+        model.save_pretrained writes stub adapter files so atomic_save_adapter
+        can complete the six-step sequence and write meta.json alongside them.
+        """
+        from paramem.adapters.manifest import AdapterManifest, read_manifest
+
+        bt = _make_bt(tmp_path)
+        self._configure_model_for_manifest(bt)
+
+        # model.save_pretrained writes stub files into the pending slot.
+        def _fake_save_pretrained(path, selected_adapters=None):
+            p = Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "adapter_model.safetensors").write_bytes(b"weights")
+            (p / "adapter_config.json").write_text("{}")
+
+        bt.model.save_pretrained.side_effect = _fake_save_pretrained
+
+        with patch("paramem.models.loader.copy_adapter_weights"):
+            bt._commit_staging_to_production("episodic")
+
+        adapter_dir = tmp_path / "episodic"
+        slots = [d for d in adapter_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert slots, f"No slot dir created under {adapter_dir}"
+        slot = slots[0]
+
+        assert (slot / "meta.json").exists(), f"meta.json missing from slot {slot}"
+
+        manifest = read_manifest(slot)
+        assert isinstance(manifest, AdapterManifest)
+        assert manifest.name == "episodic"
+
+    def test_bg_trainer_manifest_registry_hash_reads_disk(self, tmp_path: Path) -> None:
+        """manifest.registry_sha256 must equal sha256 of the on-disk registry.
+
+        BackgroundTrainer never calls save_bytes (§2.4.3): it is read-only on
+        the registry.  The manifest's registry_sha256 is derived by reading the
+        on-disk file directly inside build_manifest_for.
+        """
+        import hashlib
+
+        from paramem.adapters.manifest import read_manifest
+        from paramem.training.key_registry import KeyRegistry
+
+        # Seed an on-disk registry file.
+        reg = KeyRegistry()
+        reg.add("graph1", adapter_id="episodic")
+        registry_path = tmp_path / "indexed_key_registry.json"
+        reg.save(registry_path)
+        expected_hash = hashlib.sha256(registry_path.read_bytes()).hexdigest()
+
+        bt = _make_bt(tmp_path)
+        self._configure_model_for_manifest(bt)
+
+        def _fake_save_pretrained(path, selected_adapters=None):
+            p = Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "adapter_model.safetensors").write_bytes(b"weights")
+            (p / "adapter_config.json").write_text("{}")
+
+        bt.model.save_pretrained.side_effect = _fake_save_pretrained
+
+        save_bytes_called = []
+
+        with (
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch.object(
+                KeyRegistry,
+                "save_bytes",
+                side_effect=lambda: save_bytes_called.append(1) or reg.save_bytes(),
+            ),
+        ):
+            bt._commit_staging_to_production("episodic")
+
+        assert save_bytes_called == [], (
+            "BackgroundTrainer must NOT call save_bytes — registry is read-only (§2.4.3)"
+        )
+
+        adapter_dir = tmp_path / "episodic"
+        slots = [d for d in adapter_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert slots, "No slot created"
+        manifest = read_manifest(slots[0])
+        assert manifest.registry_sha256 == expected_hash, (
+            f"Expected registry_sha256={expected_hash!r}, got {manifest.registry_sha256!r}"
+        )

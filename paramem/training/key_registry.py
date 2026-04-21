@@ -240,17 +240,74 @@ class KeyRegistry:
         ``adapter_health`` so every piece of per-key / per-adapter
         metadata survives a process restart.
         """
+        payload = self.save_bytes()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        logger.info("Key registry saved to %s (%d keys)", path, len(self._active_keys))
+
+    def save_bytes(self) -> bytes:
+        """Serialize the registry to UTF-8 JSON bytes WITHOUT writing to disk.
+
+        Returns the canonical bytes that :meth:`save` would write.  Callers
+        in the I5 consolidation path hash these bytes to obtain
+        ``registry_sha256`` before writing the adapter manifest, then call
+        :meth:`save_from_bytes` with the same payload so the on-disk hash
+        is byte-identical to the manifested hash.
+
+        Returns:
+            UTF-8 encoded JSON bytes (canonical, sorted keys, indent=2).
+        """
         data = {
             "active_keys": self._active_keys,
             "fidelity_history": dict(self._fidelity_history),
             "adapter_id": dict(self._adapter_id),
             "adapter_health": {k: dict(v) for k, v in self._adapter_health.items()},
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-        logger.info("Key registry saved to %s (%d keys)", path, len(self._active_keys))
+        return json.dumps(data, indent=2).encode("utf-8")
+
+    def save_from_bytes(
+        self,
+        payload: bytes,
+        path: "str | Path",
+        *,
+        _require_consolidating: bool = True,
+        consolidating: bool = True,
+    ) -> None:
+        """Write pre-serialized registry bytes to *path*.
+
+        This is the second half of the I5 serialization-barrier split.
+        The bytes must come from :meth:`save_bytes` so the on-disk content
+        is byte-identical to whatever was hashed for the manifest.
+
+        Args:
+            payload: Bytes from :meth:`save_bytes` (not re-serialized).
+            path: Destination file path.
+            _require_consolidating: When ``True`` (default), asserts that
+                the caller is running inside a consolidation window by
+                checking the *consolidating* argument.  Set to ``False``
+                for experiment harnesses that do not have a consolidation
+                context.
+            consolidating: The caller's consolidation-context flag.  In the
+                server path, callers read ``_state["consolidating"]`` and
+                forward it here.  Experiment callers pass ``False`` alongside
+                ``_require_consolidating=False``.
+
+        Raises:
+            RuntimeError: When ``_require_consolidating=True`` and
+                ``consolidating=False`` — prevents accidental registry writes
+                outside the serialization-guarded consolidation window.
+        """
+        if _require_consolidating and not consolidating:
+            raise RuntimeError(
+                "KeyRegistry.save_from_bytes called outside a consolidation window "
+                "(_require_consolidating=True but consolidating=False).  "
+                "This is a defence-in-depth assertion — see plan §2.5."
+            )
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        logger.info("Key registry written from bytes to %s (%d bytes)", path, len(payload))
 
     @classmethod
     def load(cls, path: str | Path) -> "KeyRegistry":

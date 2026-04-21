@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from paramem.models.loader import load_adapter, load_base_model, switch_adapter, unload_model
+from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import TTSConfig, load_server_config
 from paramem.server.consolidation import run_consolidation
@@ -195,6 +195,11 @@ class StatusResponse(BaseModel):
     scheduler_started: bool = False  # True once scheduler first ticked
     # adapter_id -> {status, reason, updated_at, keys_at_mark}
     adapter_health: dict = {}
+    # Per-adapter manifest-provenance rows (distinct from adapter_health).
+    # Keyed by adapter name; empty when all manifests are healthy.
+    # Schema per row: {status, reason, field, severity, slot_path, checked_at}.
+    # Populated by _mount_adapters_from_slots at startup; surfaced to /status.
+    adapter_manifest: dict = {}
     # Thermal-throttle / quiet-hours policy snapshot.
     # mode: "always_on" | "always_off" | "auto"
     # start/end: "HH:MM" local (populated for all modes, consumed only when mode=auto)
@@ -208,6 +213,327 @@ class StatusResponse(BaseModel):
 
 class ConsolidateResponse(BaseModel):
     status: str
+
+
+# --- Adapter mount helper (Slice 3a) ---
+
+
+def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
+    """Load enabled adapters from slot-dir layout with manifest verification.
+
+    Implements the startup validator specified in §2.1 of the migration plan.
+    For each enabled adapter kind:
+
+    1. Sweep orphan ``.pending`` dirs.
+    2. Resolve the live registry SHA-256.
+    3. Call ``find_live_slot`` to locate the matching slot.
+    4. Read the manifest; compare base model / tokenizer / LoRA fingerprints.
+    5. Mount matching slots; record mismatch / missing rows in
+       ``state["adapter_manifest_status"]``.
+
+    Interim adapters (``episodic_interim_*``) are handled with the same logic.
+    The registry consistency check (I5 / orphan-key cleanup) runs here after
+    all mounts complete.
+
+    Args:
+        model: Base model (or existing PeftModel) to load adapters onto.
+        tokenizer: Loaded tokenizer (for fingerprint comparison).
+        config: Loaded ``ServerConfig``.
+        state: The global ``_state`` dict (mutated in-place for manifest status).
+
+    Returns:
+        The updated model (PeftModel when any adapter was loaded, otherwise
+        the original base model).
+    """
+    from datetime import datetime, timezone
+
+    from peft import PeftModel
+
+    from paramem.adapters.manifest import (
+        ManifestNotFoundError,
+        ManifestSchemaError,
+        find_live_slot,
+        read_manifest,
+    )
+    from paramem.backup.backup import sweep_orphan_pending
+    from paramem.backup.hashing import content_sha256_path
+
+    manifest_status: dict = state.setdefault("adapter_manifest_status", {})
+
+    # Compute live registry hash once (used for all adapter kinds).
+    _registry_path = config.adapter_dir / "indexed_key_registry.json"
+    live_registry_sha256 = ""
+    if _registry_path.exists():
+        try:
+            live_registry_sha256 = content_sha256_path(_registry_path)
+        except OSError:
+            live_registry_sha256 = ""
+
+    def _checked_at() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _is_primary(name: str) -> bool:
+        """Episodic is primary (red on mismatch); others are secondary (yellow)."""
+        return name == "episodic"
+
+    def _record_row(name: str, status: str, reason: str, severity: str, slot_path=None, field=None):
+        manifest_status[name] = {
+            "status": status,
+            "reason": reason,
+            "field": field,
+            "severity": severity,
+            "slot_path": str(slot_path.name) if slot_path else None,
+            "checked_at": _checked_at(),
+        }
+
+    def _load_one(name: str, slot: Path):
+        """Mount a single adapter from *slot* onto *model* (mutates nonlocal model).
+
+        Does not overwrite an existing manifest status row — caller may have already
+        recorded a manifest_missing or migrated_unverified row before calling this.
+        """
+        nonlocal model
+        try:
+            if isinstance(model, PeftModel):
+                model.load_adapter(str(slot), adapter_name=name)
+            else:
+                model = PeftModel.from_pretrained(model, str(slot), adapter_name=name)
+            logger.info("Mounted adapter %s from slot %s", name, slot.name)
+        except Exception as exc:
+            logger.error("Failed to load adapter %s from %s: %s", name, slot, exc)
+            # Only record load_failed if there is no prior manifest row
+            if name not in manifest_status:
+                _record_row(
+                    name,
+                    "manifest_missing",
+                    "load_failed",
+                    "red" if _is_primary(name) else "yellow",
+                    slot,
+                )
+
+    # ---- Main adapter kinds ----
+    main_adapters = [
+        ("episodic", config.adapters.episodic),
+        ("semantic", config.adapters.semantic),
+        ("procedural", config.adapters.procedural),
+    ]
+
+    for name, adapter_cfg in main_adapters:
+        if not adapter_cfg.enabled:
+            continue
+
+        kind_dir = config.adapter_dir / name
+        # Sweep stale pending slots before scanning
+        if kind_dir.exists():
+            sweep_orphan_pending(kind_dir)
+
+        slot = find_live_slot(kind_dir, live_registry_sha256)
+
+        if slot is None:
+            # Check whether any slots exist at all (distinguishes fresh install from mismatch)
+            has_slots = (
+                kind_dir.exists()
+                and any(e for e in kind_dir.iterdir() if not e.name.startswith(".") and e.is_dir())
+                if kind_dir.exists()
+                else False
+            )
+            if has_slots:
+                severity = "red" if _is_primary(name) else "yellow"
+                _record_row(name, "no_matching_slot", "no_matching_slot", severity)
+                logger.warning("Adapter %s: no slot matching registry hash — skipping mount", name)
+            else:
+                logger.info("Adapter %s: no slots found — fresh install", name)
+            continue
+
+        # Read and verify manifest
+        try:
+            manifest = read_manifest(slot)
+        except ManifestNotFoundError:
+            severity = "red" if _is_primary(name) else "yellow"
+            _record_row(name, "manifest_missing", "manifest_missing", severity, slot)
+            # Still mount — weights are present even without manifest
+            _load_one(name, slot)
+            continue
+        except ManifestSchemaError as exc:
+            severity = "red" if _is_primary(name) else "yellow"
+            _record_row(name, "mismatch", "manifest_unreadable", severity, slot)
+            logger.warning("Adapter %s: corrupt meta.json (%s) — skipping mount", name, exc)
+            continue
+
+        # Fingerprint comparison
+        mismatch_field = _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg)
+        if mismatch_field is not None:
+            severity = "red" if _is_primary(name) else "yellow"
+            _record_row(name, "mismatch", "fingerprint_mismatch", severity, slot, mismatch_field)
+            logger.warning(
+                "Adapter %s: fingerprint mismatch on field '%s' — skipping mount",
+                name,
+                mismatch_field,
+            )
+            continue
+
+        # Check for UNKNOWN fields
+        unknown_field = _first_unknown_field(manifest)
+        if unknown_field is not None:
+            if manifest.synthesized:
+                # synthesized + UNKNOWN → yellow (acceptable transient state)
+                _record_row(
+                    name,
+                    "migrated_unverified",
+                    "unknown_fields_in_manifest",
+                    "yellow",
+                    slot,
+                    unknown_field,
+                )
+            else:
+                # fresh-built + UNKNOWN → red (build_manifest_for failed silently)
+                _record_row(
+                    name,
+                    "migrated_unverified",
+                    "unknown_fields_in_manifest",
+                    "red",
+                    slot,
+                    unknown_field,
+                )
+            logger.info(
+                "Adapter %s: UNKNOWN field '%s' in manifest (synthesized=%s)"
+                " — mounting with warning",
+                name,
+                unknown_field,
+                manifest.synthesized,
+            )
+
+        _load_one(name, slot)
+
+    # ---- Interim adapters ----
+    for _interim_path in sorted(config.adapter_dir.glob("episodic_interim_*")):
+        if not _interim_path.is_dir():
+            continue
+        sweep_orphan_pending(_interim_path)
+        _interim_name = _interim_path.name
+
+        slot = find_live_slot(_interim_path, live_registry_sha256)
+        if slot is None:
+            # Fallback: old flat layout (no slot-dir yet) — look for adapter files directly
+            if (_interim_path / "adapter_config.json").exists() and (
+                _interim_path / "adapter_model.safetensors"
+            ).exists():
+                logger.info("Loading interim adapter (flat layout): %s", _interim_name)
+                try:
+                    if isinstance(model, PeftModel):
+                        model.load_adapter(str(_interim_path), adapter_name=_interim_name)
+                    else:
+                        model = PeftModel.from_pretrained(
+                            model, str(_interim_path), adapter_name=_interim_name
+                        )
+                except Exception as exc:
+                    logger.error("Failed to load interim adapter %s: %s", _interim_name, exc)
+            else:
+                logger.warning("Interim adapter %s: no matching slot — skipping", _interim_name)
+            continue
+
+        _load_one(_interim_name, slot)
+
+    # ---- I5 — Registry consistency check ----
+    # Drop orphan registry entries whose adapter slot is missing.
+    if _registry_path.exists():
+        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
+
+        _reg = _KeyRegistry.load(_registry_path)
+        _orphaned: list[str] = []
+        for _key in list(_reg.list_active()):
+            _aid = _reg.get_adapter_id(_key)
+            if _aid.startswith("episodic_interim_"):
+                # Slot-dir: check via find_live_slot
+                _aid_dir = config.adapter_dir / _aid
+                _slot = find_live_slot(_aid_dir, live_registry_sha256)
+                if _slot is None:
+                    # Also check flat layout fallback
+                    _flat_weights = _aid_dir / "adapter_model.safetensors"
+                    if not _flat_weights.exists():
+                        _reg.remove(_key)
+                        _orphaned.append(_key)
+        if _orphaned:
+            logger.warning(
+                "Startup registry check: dropped %d orphan key(s) whose adapter "
+                "weights are missing (adapter save was interrupted): %s",
+                len(_orphaned),
+                _orphaned,
+            )
+            _reg.save(_registry_path)
+
+    if hasattr(model, "peft_config") and model.peft_config:
+        logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
+    else:
+        logger.info("No adapters found — starting fresh")
+
+    return model
+
+
+def _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg) -> "str | None":
+    """Compare manifest fingerprints against live runtime state.
+
+    Skips UNKNOWN values (cannot verify).  Returns the name of the first
+    mismatching field, or ``None`` when all non-UNKNOWN fields match.
+
+    Args:
+        manifest: :class:`~paramem.adapters.manifest.AdapterManifest` to check.
+        model: Live base model (or PeftModel) with ``config`` attribute.
+        tokenizer: Live tokenizer.
+        adapter_cfg: Per-adapter config from server.yaml (rank, alpha, etc.).
+
+    Returns:
+        Field name string on mismatch, ``None`` on match.
+    """
+    from paramem.adapters.manifest import UNKNOWN
+
+    # base_model.sha — most specific identifier
+    live_sha = getattr(getattr(model, "config", None), "_commit_hash", None) or UNKNOWN
+    if manifest.base_model.sha != UNKNOWN and live_sha != UNKNOWN:
+        if manifest.base_model.sha != live_sha:
+            return "base_model.sha"
+
+    # base_model.repo
+    live_repo = getattr(getattr(model, "config", None), "_name_or_path", None) or UNKNOWN
+    if manifest.base_model.repo != UNKNOWN and live_repo != UNKNOWN:
+        if manifest.base_model.repo != live_repo:
+            return "base_model.repo"
+
+    # LoRA shape
+    if isinstance(manifest.lora.rank, int) and manifest.lora.rank != 0:
+        if manifest.lora.rank != adapter_cfg.rank:
+            return "lora.rank"
+    if isinstance(manifest.lora.alpha, int) and manifest.lora.alpha != 0:
+        if manifest.lora.alpha != adapter_cfg.alpha:
+            return "lora.alpha"
+    if manifest.lora.target_modules:
+        live_targets = tuple(sorted(adapter_cfg.target_modules or []))
+        if manifest.lora.target_modules != live_targets:
+            return "lora.target_modules"
+
+    return None
+
+
+def _first_unknown_field(manifest) -> "str | None":
+    """Return the name of the first UNKNOWN-valued field, or None.
+
+    Only checks fields that are material for adapter verification.
+    """
+    from paramem.adapters.manifest import UNKNOWN
+
+    checks = [
+        ("base_model.repo", manifest.base_model.repo),
+        ("base_model.sha", manifest.base_model.sha),
+        ("base_model.hash", manifest.base_model.hash),
+        ("tokenizer.name_or_path", manifest.tokenizer.name_or_path),
+        ("registry_sha256", manifest.registry_sha256),
+    ]
+    for field, value in checks:
+        if value == UNKNOWN:
+            return field
+    if manifest.key_count == UNKNOWN:
+        return "key_count"
+    return None
 
 
 # --- Lifespan ---
@@ -307,76 +633,18 @@ async def lifespan(app: FastAPI):
         logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
         model, tokenizer = load_base_model(config.model_config)
 
-        # Load enabled adapters that exist on disk
-        for adapter_name, adapter_cfg in (
-            ("episodic", config.adapters.episodic),
-            ("semantic", config.adapters.semantic),
-            ("procedural", config.adapters.procedural),
-        ):
-            if not adapter_cfg.enabled:
-                continue
-            adapter_path = config.adapter_dir / adapter_name
-            if adapter_path.exists():
-                logger.info("Loading adapter: %s from %s", adapter_name, adapter_path)
-                model = load_adapter(model, str(config.adapter_dir), adapter_name)
-        if hasattr(model, "peft_config") and model.peft_config:
-            logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
-        else:
-            logger.info("No adapters found — starting fresh")
+        # Initialize manifest-related state (new Slice-3a surface).
+        _state["adapter_manifest_status"] = {}
+        _state["base_model_hash_cache"] = {}
 
-        # Load interim adapters that survived from a previous run (e.g. after a
-        # restart before the weekly consolidation ran).  These live at
-        # adapter_dir/episodic_interim_YYYYMMDDTHHMM/ alongside the main adapters.
-        # PEFT crashes if adapter_config.json exists without adapter_model.safetensors
-        # (CLAUDE.md), so we validate both files before calling load_adapter.
-        for _interim_path in sorted(config.adapter_dir.glob("episodic_interim_*")):
-            if not _interim_path.is_dir():
-                continue
-            if (
-                not (_interim_path / "adapter_config.json").exists()
-                or not (_interim_path / "adapter_model.safetensors").exists()
-            ):
-                logger.warning("Skipping half-present interim adapter: %s", _interim_path.name)
-                continue
-            _interim_name = _interim_path.name
-            model = load_adapter(model, str(config.adapter_dir), _interim_name)
-            logger.info("Loaded interim adapter: %s", _interim_name)
+        # Load adapters using the slot-dir resolver with manifest verification.
+        model = _mount_adapters_from_slots(model, tokenizer, config, _state)
 
         # Restore the main episodic adapter as the active adapter so that all
         # inference probes default to the consolidated tier.  Only needed when at
         # least one adapter is present; on a fresh install peft_config is absent.
         if hasattr(model, "peft_config") and "episodic" in model.peft_config:
             switch_adapter(model, "episodic")
-
-        # I5 — Registry consistency check on startup.
-        # If the process was killed between adapter-save and registry-save in
-        # post_session_train, the registry may contain entries whose adapter
-        # safetensors file is missing.  Drop such entries and log a warning so
-        # the adapter is rebuilt at the next post-session training pass.
-        _registry_path = config.adapter_dir / "indexed_key_registry.json"
-        if _registry_path.exists():
-            from paramem.training.key_registry import KeyRegistry as _KeyRegistry
-
-            _reg = _KeyRegistry.load(_registry_path)
-            _orphaned: list[str] = []
-            for _key in list(_reg.list_active()):
-                _aid = _reg.get_adapter_id(_key)
-                # Only interim adapters need this check — main adapters are
-                # saved by _save_adapters() which is always a complete write.
-                # Interim safetensors live at adapter_dir/<adapter_id>/adapter_model.safetensors
-                if _aid.startswith("episodic_interim_"):
-                    _weights = config.adapter_dir / _aid / "adapter_model.safetensors"
-                    if not _weights.exists():
-                        _reg.remove(_key)
-                        _orphaned.append(_key)
-            if _orphaned:
-                logger.warning(
-                    "Startup registry check: dropped %d orphan key(s) whose adapter "
-                    "weights are missing (adapter save was interrupted): %s",
-                    len(_orphaned),
-                    _orphaned,
-                )
-                _reg.save(_registry_path)
 
         _state["model"] = model
         _state["tokenizer"] = tokenizer
@@ -1440,6 +1708,7 @@ async def status():
         pending_enrollments=len(_state.get("pending_enrollments") or []),
         scheduler_started=scheduler_active,
         adapter_health=adapter_health,
+        adapter_manifest=_state.get("adapter_manifest_status", {}),
         config_drift=_state.get("config_drift", {}),
     )
 

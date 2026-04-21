@@ -37,6 +37,7 @@ from experiments.utils.test_harness import (  # noqa: E402
     setup_logging,
     train_indexed_keys,
 )
+from paramem.adapters.manifest import build_manifest_for  # noqa: E402
 from paramem.models.loader import switch_adapter, unload_model  # noqa: E402
 from paramem.training.indexed_memory import (  # noqa: E402
     assign_keys,
@@ -148,7 +149,15 @@ def main():
         # Save checkpoint
         from paramem.models.loader import save_adapter
 
-        save_adapter(model, output_dir / "cycle_0" / "checkpoint", adapter_name)
+        _mf_c0 = build_manifest_for(
+            model,
+            tokenizer,
+            adapter_name,
+            registry_path=None,
+            keyed_pairs_path=None,
+            key_count=len(keyed_pairs),
+        )
+        save_adapter(model, output_dir / "cycle_0" / "checkpoint", adapter_name, manifest=_mf_c0)
 
         # Track all keys trained so far
         trained_keys = list(keyed_pairs)
@@ -316,10 +325,19 @@ def main():
             )
 
             # Save checkpoint
+            _mf_cycle = build_manifest_for(
+                model,
+                tokenizer,
+                adapter_name,
+                registry_path=None,
+                keyed_pairs_path=None,
+                key_count=len(trained_keys),
+            )
             save_adapter(
                 model,
                 output_dir / f"cycle_{cycle}" / "checkpoint",
                 adapter_name,
+                manifest=_mf_cycle,
             )
 
         # Phase 6: Full-replay retrain on all 45 keys

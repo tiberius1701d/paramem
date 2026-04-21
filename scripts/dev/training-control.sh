@@ -909,7 +909,14 @@ PYEOF
         if [[ -f "$phase_dir/progress.json" ]]; then
             _show_epoch_progress "$phase_dir" "$current_phase"
         elif [[ -d "$phase_dir/adapter" ]]; then
-            local mtime=$(date -r "$phase_dir/adapter" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            local newest_slot
+            newest_slot=$(ls -td "$phase_dir/adapter"/*/ 2>/dev/null | head -1)
+            local mtime
+            if [[ -n "$newest_slot" ]]; then
+                mtime=$(date -r "$newest_slot" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            else
+                mtime=""
+            fi
             echo -e "  Training:   ${DIM}starting (adapter mtime: ${mtime})${RESET}"
         else
             echo -e "  Training:   ${DIM}starting (no progress yet)${RESET}"

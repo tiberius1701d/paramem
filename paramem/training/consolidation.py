@@ -293,20 +293,6 @@ class ConsolidationLoop:
         # consolidate_interim_adapters() before training the full key set.
         self.pending_interim_triples: list[dict] = []
 
-        # --- Multi-adapter interim routing state (Step 7) ---
-        # Set of triples already encoded into an interim adapter.  Reset at the
-        # start of every consolidate_interim_adapters() call — the full rebuild
-        # makes prior "seen" state irrelevant (Step 7e).  Not persisted to disk;
-        # restart cost is at most one window of duplicate QA generation.
-        self.seen_triples: set[tuple[str, str, str]] = set()
-
-        # Counter of triples encoded since the last successful full
-        # consolidation.  Incremented after each successful interim training
-        # pass (post_session_train "trained" path).  Reset only on successful
-        # consolidate_interim_adapters() completion.  Decoupled from
-        # seen_triples — it is NOT reset when seen_triples resets.
-        self.triples_since_last_full: int = 0
-
     def seed_key_metadata(self, metadata: dict) -> None:
         """Restore key-level metadata from persisted key_metadata.json.
 
@@ -1669,20 +1655,122 @@ class ConsolidationLoop:
         )
 
     def _save_adapters(self) -> None:
-        """Save adapters and registries to disk.
+        """Save adapters and registries to disk using the I5 reorder (§2.5).
 
         Saves to two locations:
         - output_dir/episodic/, output_dir/semantic/ — latest state (server use)
         - output_dir/cycle_N/episodic/, cycle_N/semantic/ — per-cycle snapshots (analysis)
-        """
-        # Latest state at flat paths
-        save_adapter(self.model, self.output_dir, "episodic")
-        if "semantic" in self.model.peft_config:
-            save_adapter(self.model, self.output_dir, "semantic")
-        if "procedural" in self.model.peft_config:
-            save_adapter(self.model, self.output_dir, "procedural")
 
-        # Per-cycle snapshots (debug/analysis only)
+        I5 ordering (mirrors ``post_session_train`` step 7):
+          1. ``save_bytes`` → in-memory registry bytes (no disk write).
+          2. ``sha256`` the bytes so the manifest can stamp them pre-write.
+          3. Write ``keyed_pairs.json`` per adapter into the adapter-kind
+             directory using byte-identical format to
+             ``_save_keyed_pairs_for_router`` (safe re-write by caller).
+          4. Build manifest with ``registry_sha256_override=hash`` +
+             ``keyed_pairs_path`` for each adapter.
+          5. Save adapter weights + manifest into the new slot.
+          6. Per-cycle snapshots (no manifest).
+          7. SimHash registries.
+          8. ``save_from_bytes`` — flush the identical registry bytes; this
+             is the commit signal for ``find_live_slot``.
+
+        Crash semantics: a kill after step 5 but before step 8 leaves the
+        new slot present with a manifest stamping the new registry hash,
+        while the on-disk registry still carries the old hash.
+        ``find_live_slot`` won't match → slot is latent, harmless.
+        """
+        import hashlib as _hashlib
+        import json as _json
+        import os as _os
+
+        from paramem.adapters.manifest import build_manifest_for
+
+        registry_path = self.output_dir / "indexed_key_registry.json"
+        fingerprint_cache = getattr(self, "fingerprint_cache", None)
+
+        # I5 Step 1+2: Serialise registry to bytes and hash them — no disk I/O.
+        payload: "bytes | None" = None
+        registry_sha256: "str | None" = None
+        if self.indexed_key_registry is not None:
+            payload = self.indexed_key_registry.save_bytes()
+            registry_sha256 = _hashlib.sha256(payload).hexdigest()
+
+        # I5 Step 3: Write keyed_pairs.json into each adapter-kind dir.  Must
+        # be byte-identical to ``_save_keyed_pairs_for_router._write_keyed_pairs``
+        # because that helper runs after this method and would otherwise
+        # invalidate the manifest hash with a re-write.
+        def _write_kp(adapter_name: str, simhash_registry: dict) -> "Path | None":
+            if not simhash_registry:
+                return None
+            pairs: list[dict] = []
+            for key in simhash_registry:
+                qa = self.indexed_key_qa.get(key) if self.indexed_key_qa else None
+                if qa is None:
+                    continue
+                entry = {
+                    "key": key,
+                    "question": qa["question"],
+                    "answer": qa["answer"],
+                }
+                for meta_key in (
+                    "source_subject",
+                    "source_object",
+                    "source_predicate",
+                    "speaker_id",
+                ):
+                    if meta_key in qa:
+                        entry[meta_key] = qa[meta_key]
+                pairs.append(entry)
+            adapter_dir = self.output_dir / adapter_name
+            adapter_dir.mkdir(parents=True, exist_ok=True)
+            tmp = adapter_dir / "keyed_pairs.json.tmp"
+            with open(tmp, "w") as f:
+                _json.dump(pairs, f, indent=2)
+            _os.replace(tmp, adapter_dir / "keyed_pairs.json")
+            return adapter_dir / "keyed_pairs.json"
+
+        def _build(name: str, kp_path: "Path | None") -> "object | None":
+            try:
+                return build_manifest_for(
+                    self.model,
+                    self.tokenizer,
+                    name,
+                    registry_path=None,
+                    keyed_pairs_path=kp_path,
+                    key_count=len(self.indexed_key_registry) if self.indexed_key_registry else None,
+                    base_model_hash_cache=fingerprint_cache,
+                    registry_sha256_override=registry_sha256,
+                )
+            except Exception:  # noqa: BLE001
+                return None
+
+        # I5 Steps 3–5 per adapter: keyed_pairs → manifest → slot save.
+        ep_kp = _write_kp("episodic", self.episodic_simhash)
+        save_adapter(
+            self.model,
+            self.output_dir / "episodic",
+            "episodic",
+            manifest=_build("episodic", ep_kp),
+        )
+        if "semantic" in self.model.peft_config:
+            sem_kp = _write_kp("semantic", self.semantic_simhash)
+            save_adapter(
+                self.model,
+                self.output_dir / "semantic",
+                "semantic",
+                manifest=_build("semantic", sem_kp),
+            )
+        if "procedural" in self.model.peft_config:
+            proc_kp = _write_kp("procedural", self.procedural_simhash)
+            save_adapter(
+                self.model,
+                self.output_dir / "procedural",
+                "procedural",
+                manifest=_build("procedural", proc_kp),
+            )
+
+        # I5 Step 6: Per-cycle snapshots (debug/analysis only — no manifest).
         if self.save_cycle_snapshots:
             base = self.snapshot_dir if self.snapshot_dir else self.output_dir
             cycle_dir = base / f"cycle_{self.cycle_count}"
@@ -1692,14 +1780,18 @@ class ConsolidationLoop:
             if "procedural" in self.model.peft_config:
                 save_adapter(self.model, cycle_dir / "procedural", "procedural")
 
-        if self.indexed_key_registry is not None:
-            self.indexed_key_registry.save(self.output_dir / "indexed_key_registry.json")
+        # I5 Steps 7–8: SimHash registries, then the registry commit signal.
+        if self.indexed_key_registry is not None and payload is not None:
             save_registry(self.episodic_simhash, self.output_dir / "simhash_registry_episodic.json")
             save_registry(self.semantic_simhash, self.output_dir / "simhash_registry_semantic.json")
             save_registry(
                 self.procedural_simhash,
                 self.output_dir / "simhash_registry_procedural.json",
             )
+            # LAST: flush the exact bytes that were hashed in step 2, so
+            # ``find_live_slot`` on restart can match meta.registry_sha256
+            # against hashlib.sha256(registry_path.read_bytes()).
+            self.indexed_key_registry.save_from_bytes(payload, registry_path, consolidating=True)
 
     def _training_output_dir(self, adapter_name: str, *, interim_stamp: str | None = None) -> Path:
         """Training checkpoint directory for the current cycle or interim pass.
@@ -1756,9 +1848,9 @@ class ConsolidationLoop:
         not the adapter tier.  The adapter it trains into is the interim adapter
         (``episodic_interim_YYYYMMDDTHHMM``).
 
-        Implementation ordering follows the CLAUDE.md ``seen_triples`` discipline:
-        register keys **only after** training returns successfully so that extraction
-        or training failures never leave orphaned keys in the registry.
+        Failure-safe ordering: register keys **only after** training returns
+        successfully so that extraction or training failures never leave
+        orphaned keys in the registry.
 
         If ``max_interim_count == 0``, new facts are appended to
         ``self.pending_interim_triples`` (RAM-only) without training.  The pending
@@ -1771,15 +1863,20 @@ class ConsolidationLoop:
         immediately after the episodic training pass and before any registry
         writes, so a failure in either pass leaves the registry clean.
 
-        Registry write ordering (I5 atomicity):
-        1. Save adapter weights (episodic interim + procedural main).
-        2. Save SimHash registries.
-        3. Save keyed_pairs.json.
-        4. Save key registry (LAST — its presence signals a clean commit).
+        Registry write ordering (I5 atomicity §2.5):
+        1. ``save_bytes()`` — serialise registry to bytes without writing.
+        2. ``sha256(payload)`` — hash for manifest pre-stamp.
+        3. Write keyed_pairs.json atomically.
+        4. Hash keyed_pairs.json for manifest.
+        5. Build manifest with ``registry_sha256_override``.
+        6. ``save_adapter(..., manifest=manifest)`` — adapter + manifest on disk.
+        7. Save SimHash registries.
+        8. ``save_from_bytes(payload, path)`` — flush registry bytes (LAST).
 
-        On restart, the lifespan consistency check scans the registry and drops
-        any entry whose adapter file is missing, recovering from a crash between
-        steps 1-3 and 4.
+        The registry is the commit signal: its presence on disk means every
+        preceding file is complete.  On restart, the lifespan consistency check
+        scans the registry and drops any entry whose adapter slot is missing,
+        recovering from a crash between steps 6 and 8.
 
         Args:
             session_transcript: Raw transcript text for this conversation.
@@ -2120,21 +2217,72 @@ class ConsolidationLoop:
             new_key_ids.append(k)
         self._indexed_next_index += len(new_keyed)
 
-        # I5 — Registry-last write order.  Adapter weights must hit disk first;
-        # then SimHash; then keyed_pairs.json; then the registry.  The registry
-        # is the "commit" signal: its presence means every preceding file is
-        # complete.  If the process is killed between adapter-save and
-        # registry-save, the lifespan consistency check (app.py) drops the
-        # orphan registry entries on the next startup.
+        # I5 — Manifest-first registry-last write order (§2.5).
+        #
+        # The manifest must stamp ``registry_sha256`` at save time, but the
+        # registry isn't on disk yet.  We therefore serialize the registry to
+        # bytes first (``save_bytes``), hash those bytes, build the manifest
+        # with the hash override, write adapter weights (which embeds the
+        # manifest), and only then flush the registry bytes to disk via
+        # ``save_from_bytes``.  The registry is the commit signal: its
+        # presence on disk means every preceding file is complete.
+        #
+        # Crash semantics: a kill between step 6 and step 8 leaves the
+        # adapter on disk but the old registry hash.  ``find_live_slot``
+        # won't match → slot is latent, harmless.  Full recovery requires
+        # a new consolidation cycle.
+        import hashlib as _hashlib
+        import json as _json
+        import os as _os
 
-        # Step 1: Save adapter weights so the router and startup loader can pick them up.
+        from paramem.adapters.manifest import build_manifest_for as _build_manifest_for
         from paramem.models.loader import save_adapter as _save_adapter
 
-        _save_adapter(self.model, self.output_dir, adapter_name)
-        if self.procedural_config is not None and "procedural" in self.model.peft_config:
-            _save_adapter(self.model, self.output_dir, "procedural")
+        registry_path = self.output_dir / "indexed_key_registry.json"
 
-        # Step 2: Save SimHash registries.
+        # Step 1: Serialise registry to bytes without writing to disk.
+        payload = self.indexed_key_registry.save_bytes()
+
+        # Step 2: Hash the bytes so the manifest can stamp them pre-write.
+        registry_sha256 = _hashlib.sha256(payload).hexdigest()
+
+        # Step 3: Write keyed_pairs.json inside the interim adapter subdir so
+        # the router can index entity→key mappings without loading the adapter.
+        interim_pairs = [
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
+            for kp in all_interim_keyed
+        ]
+        interim_dir = self.output_dir / adapter_name
+        interim_dir.mkdir(parents=True, exist_ok=True)
+        _tmp = interim_dir / "keyed_pairs.json.tmp"
+        with open(_tmp, "w") as _f:
+            _json.dump(interim_pairs, _f, indent=2)
+        _os.replace(_tmp, interim_dir / "keyed_pairs.json")
+        kp_path = interim_dir / "keyed_pairs.json"
+
+        # Step 5: Build manifest with pre-computed registry_sha256.
+        fingerprint_cache = getattr(self, "fingerprint_cache", None)
+        try:
+            manifest = _build_manifest_for(
+                self.model,
+                self.tokenizer,
+                adapter_name,
+                registry_path=None,
+                keyed_pairs_path=kp_path,
+                key_count=len(self.indexed_key_registry) if self.indexed_key_registry else None,
+                base_model_hash_cache=fingerprint_cache,
+                registry_sha256_override=registry_sha256,
+            )
+        except Exception:
+            logger.warning("post_session_train: manifest build failed — saving without manifest")
+            manifest = None
+
+        # Step 6: Save adapter weights + manifest (new commit point).
+        _save_adapter(self.model, self.output_dir / adapter_name, adapter_name, manifest=manifest)
+        if self.procedural_config is not None and "procedural" in self.model.peft_config:
+            _save_adapter(self.model, self.output_dir / "procedural", "procedural")
+
+        # Step 7: Save SimHash registries.
         interim_simhash = build_registry(all_interim_keyed)
         save_registry(
             interim_simhash,
@@ -2149,24 +2297,9 @@ class ConsolidationLoop:
                 self.output_dir / "simhash_registry_procedural.json",
             )
 
-        # Step 3: Save keyed_pairs.json inside the interim adapter subdir so the
-        # router can index entity→key mappings without loading every adapter.
-        interim_pairs = [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in all_interim_keyed
-        ]
-        import json as _json
-        import os as _os
-
-        interim_dir = self.output_dir / adapter_name
-        interim_dir.mkdir(parents=True, exist_ok=True)
-        _tmp = interim_dir / "keyed_pairs.json.tmp"
-        with open(_tmp, "w") as _f:
-            _json.dump(interim_pairs, _f, indent=2)
-        _os.replace(_tmp, interim_dir / "keyed_pairs.json")
-
-        # Step 4 (LAST): Persist key registry — its presence is the commit signal.
-        self.indexed_key_registry.save(self.output_dir / "indexed_key_registry.json")
+        # Step 8 (LAST): Flush registry bytes — identical to the bytes hashed
+        # in step 2, so ``find_live_slot`` can match the manifest stamp.
+        self.indexed_key_registry.save_from_bytes(payload, registry_path, consolidating=True)
 
         # Restore the main episodic adapter as the active adapter so subsequent
         # inference probes default to the consolidated tier.
@@ -2485,17 +2618,16 @@ class ConsolidationLoop:
 
         Steps:
         1. Verify the GPU lock is held (entry guard — leak-safe pattern).
-        2. Reset seen_triples (fresh rebuild makes prior state irrelevant).
-        3. Walk all active keys, re-derive their tier from the cumulative graph,
+        2. Walk all active keys, re-derive their tier from the cumulative graph,
            handle graph-drift keys, and build per-tier keyed-pair lists.
-        4. Load backup adapters (if available) and all interim adapters into PEFT.
-        5. For each tier (episodic → semantic → procedural):
+        3. Load backup adapters (if available) and all interim adapters into PEFT.
+        4. For each tier (episodic → semantic → procedural):
            a. Set active adapter to <tier>_backup before deleting the main.
            b. delete_adapter(<tier>) + create_adapter(<tier>).
            c. Set <tier>_is_training=True, call _train_adapter, set False.
            d. Recall-sanity check; on failure roll back and abort.
-        6. Atomic finalize: registry rewrite → unload_interim_adapters → router reload.
-        7. On success: reset triples_since_last_full; unload backup adapters.
+        5. Atomic finalize: registry rewrite → unload_interim_adapters → router reload.
+        6. On success: unload backup adapters.
 
         Args:
             trainer: BackgroundTrainer instance (must be the one holding the GPU
@@ -2533,10 +2665,7 @@ class ConsolidationLoop:
                 "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
             )
 
-        # --- Step 1: Reset seen_triples ---
-        self.seen_triples = set()
-
-        # --- Step 1b: Graph-level SOTA enrichment (Task #10) ---
+        # --- Graph-level SOTA enrichment (Task #10) ---
         # Runs after all per-session merges are complete and before
         # partition_relations so enriched edges flow into all tiers identically.
         # Mutates self.merger.graph in place.  Wrapped in try/except so a SOTA
@@ -2907,8 +3036,6 @@ class ConsolidationLoop:
                 logger.exception("consolidate_interim_adapters: router reload failed")
 
         # --- Step 7: Success commit ---
-        self.triples_since_last_full = 0
-
         # Unload backup adapters (the three mains remain loaded throughout).
         for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
             if backup_name in self.model.peft_config:

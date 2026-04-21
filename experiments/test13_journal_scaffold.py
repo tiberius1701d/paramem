@@ -99,6 +99,8 @@ from experiments.utils.test_harness import (  # noqa: E402
     save_results,
     setup_logging,
 )
+from paramem.adapters import resolve_adapter_slot  # noqa: E402
+from paramem.adapters.manifest import build_manifest_for  # noqa: E402
 from paramem.models.loader import (  # noqa: E402
     create_adapter,
     load_adapter,
@@ -508,7 +510,15 @@ def phase_A(
     final_recall = evaluate_indexed_recall(
         model, tokenizer, keyed, registry, adapter_name="episodic"
     )
-    save_adapter(model, phase_dir / "adapter", "episodic")
+    _manifest_A = build_manifest_for(
+        model,
+        tokenizer,
+        "episodic",
+        registry_path=None,
+        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        key_count=len(keyed),
+    )
+    save_adapter(model, phase_dir / "adapter", "episodic", manifest=_manifest_A)
     save_phase_artifacts(
         phase_dir,
         keyed,
@@ -595,7 +605,15 @@ def phase_B(
         unchanged_registry,
         adapter_name="episodic",
     )
-    save_adapter(model, phase_dir / "adapter", "episodic")
+    _manifest_B = build_manifest_for(
+        model,
+        tokenizer,
+        "episodic",
+        registry_path=None,
+        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        key_count=len(swap_keyed),
+    )
+    save_adapter(model, phase_dir / "adapter", "episodic", manifest=_manifest_B)
     save_phase_artifacts(
         phase_dir,
         swap_keyed,
@@ -681,7 +699,15 @@ def phase_C1(
     final_recall = evaluate_indexed_recall(
         model, tokenizer, keyed, registry, adapter_name="journal"
     )
-    save_adapter(model, phase_dir / "adapter", "journal")
+    _manifest_C1 = build_manifest_for(
+        model,
+        tokenizer,
+        "journal",
+        registry_path=None,
+        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        key_count=len(keyed),
+    )
+    save_adapter(model, phase_dir / "adapter", "journal", manifest=_manifest_C1)
     save_phase_artifacts(
         phase_dir,
         keyed,
@@ -770,7 +796,15 @@ def phase_C2(
     )
 
     leaks_on_fill = leakage_count(fill_final["per_key"])
-    save_adapter(model, phase_dir / "adapter", "journal")
+    _manifest_C2 = build_manifest_for(
+        model,
+        tokenizer,
+        "journal",
+        registry_path=None,
+        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        key_count=len(fill_keyed),
+    )
+    save_adapter(model, phase_dir / "adapter", "journal", manifest=_manifest_C2)
     save_phase_artifacts(
         phase_dir,
         fill_keyed,
@@ -968,7 +1002,16 @@ def main():
         if "A" in phases_wanted:
             if marker_exists(output_dir, "A"):
                 logger.info("A already complete — loading adapter from disk")
-                model = load_adapter(model, output_dir / "A" / "adapter", "episodic")
+                _slot_A = resolve_adapter_slot(output_dir / "A" / "adapter", "episodic", "")
+                if _slot_A is not None:
+                    if isinstance(model, PeftModel):
+                        model.load_adapter(str(_slot_A), adapter_name="episodic")
+                    else:
+                        model = PeftModel.from_pretrained(
+                            model, str(_slot_A), adapter_name="episodic"
+                        )
+                else:
+                    model = load_adapter(model, output_dir / "A" / "adapter", "episodic")
                 base_keyed, _ = read_keyed(output_dir, "A")
             else:
                 model, base_keyed, _, _ = phase_A(model, tokenizer, qa_pool, args, output_dir)
@@ -983,7 +1026,16 @@ def main():
             else:
                 if base_keyed is None:
                     logger.info("Loading A's adapter for B warm-start")
-                    model = load_adapter(model, output_dir / "A" / "adapter", "episodic")
+                    _slot_A_b = resolve_adapter_slot(output_dir / "A" / "adapter", "episodic", "")
+                    if _slot_A_b is not None:
+                        if isinstance(model, PeftModel):
+                            model.load_adapter(str(_slot_A_b), adapter_name="episodic")
+                        else:
+                            model = PeftModel.from_pretrained(
+                                model, str(_slot_A_b), adapter_name="episodic"
+                            )
+                    else:
+                        model = load_adapter(model, output_dir / "A" / "adapter", "episodic")
                     base_keyed, _ = read_keyed(output_dir, "A")
                 swap_answers = qa_pool[TOTAL_KEYS : TOTAL_KEYS + SWAP_KEYS]
                 phase_B(model, tokenizer, base_keyed, swap_answers, args, output_dir)
@@ -1012,7 +1064,16 @@ def main():
             if "C1" in phases_wanted:
                 if marker_exists(output_dir, "C1"):
                     logger.info("C1 already complete — loading adapter from disk")
-                    model = load_adapter(model, output_dir / "C1" / "adapter", "journal")
+                    _slot_C1 = resolve_adapter_slot(output_dir / "C1" / "adapter", "journal", "")
+                    if _slot_C1 is not None:
+                        if isinstance(model, PeftModel):
+                            model.load_adapter(str(_slot_C1), adapter_name="journal")
+                        else:
+                            model = PeftModel.from_pretrained(
+                                model, str(_slot_C1), adapter_name="journal"
+                            )
+                    else:
+                        model = load_adapter(model, output_dir / "C1" / "adapter", "journal")
                     c1_keyed, _ = read_keyed(output_dir, "C1")
                 else:
                     model, c1_keyed, _, _ = phase_C1(model, tokenizer, qa_pool, args, output_dir)
@@ -1027,7 +1088,18 @@ def main():
                 else:
                     if c1_keyed is None:
                         logger.info("Loading C1's adapter for C2 fill")
-                        model = load_adapter(model, output_dir / "C1" / "adapter", "journal")
+                        _slot_C1_c2 = resolve_adapter_slot(
+                            output_dir / "C1" / "adapter", "journal", ""
+                        )
+                        if _slot_C1_c2 is not None:
+                            if isinstance(model, PeftModel):
+                                model.load_adapter(str(_slot_C1_c2), adapter_name="journal")
+                            else:
+                                model = PeftModel.from_pretrained(
+                                    model, str(_slot_C1_c2), adapter_name="journal"
+                                )
+                        else:
+                            model = load_adapter(model, output_dir / "C1" / "adapter", "journal")
                         c1_keyed, _ = read_keyed(output_dir, "C1")
                     phase_C2(model, tokenizer, c1_keyed, qa_pool, args, output_dir)
                     if paused_requested():
