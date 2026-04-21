@@ -10,7 +10,7 @@
 #   source ~/.local/bin/training-control.sh
 #
 #   training_pause       # Signal: stop after current cycle/checkpoint
-#   training_resume [N]  # Launch test N (8, 9, or 10). Default: 8.
+#   training_resume [N]  # Launch test N (8, 9, 10, 10b, 11, 13). Default: 8.
 #   training_status      # Show pause state + GPU + progress for all tests
 #
 # Recommended aliases (add to ~/.bashrc):
@@ -41,18 +41,21 @@ TEST_SCRIPTS[9]="experiments/test9_natural_recall.py"
 TEST_SCRIPTS[10]="experiments/test10_grokking.py"
 TEST_SCRIPTS["10b"]="experiments/test10b_diverse_rephrase.py"
 TEST_SCRIPTS[11]="experiments/test11_adapter_extraction.py"
+TEST_SCRIPTS[13]="experiments/test13_journal_scaffold.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
 TEST_OUTPUT_DIRS[10]="outputs/test10_grokking"
 TEST_OUTPUT_DIRS["10b"]="outputs/test10b_diverse_rephrase"
 TEST_OUTPUT_DIRS[11]="outputs/test11_adapter_extraction"
+TEST_OUTPUT_DIRS[13]="outputs/test13_journal_scaffold"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
 TEST_PGREP[10]="test10_grokking"
 TEST_PGREP["10b"]="test10b_diverse_rephrase"
 TEST_PGREP[11]="test11_adapter_extraction"
+TEST_PGREP[13]="test13_journal_scaffold"
 
 # --- Colors (inherit from gpu-cooldown.sh, add extras) ---
 BLUE='\033[0;34m'
@@ -195,7 +198,7 @@ _release_server_gpu() {
 
 _find_running_test() {
     # Returns the test number of the currently running test, or empty
-    for t in 8 9 10 10b 11; do
+    for t in 8 9 10 10b 11 13; do
         if pgrep -f "${TEST_PGREP[$t]}" >/dev/null 2>&1; then
             echo "$t"
             return
@@ -355,7 +358,8 @@ training_pause() {
 # training_resume [--yes] [test_number]
 #
 # Clear the pause signal and launch the specified test.
-# Default: test 8. Usage: tresume, tresume 8, tresume --yes 10
+# Default: test 8. Usage: tresume, tresume 13, tresume --yes 10b
+# Registered tests: 8, 9, 10, 10b, 11, 13
 #
 training_resume() {
     local auto_yes=false
@@ -367,7 +371,7 @@ training_resume() {
 
     # Validate test number
     if [[ -z "${TEST_SCRIPTS[$test_num]}" ]]; then
-        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10."
+        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13."
         return 1
     fi
 
@@ -540,7 +544,7 @@ print(labels.get(r, r or ''))
     fi
 
     # Show status for each test (reuses $running from above)
-    for test_num in 8 9 10 10b 11; do
+    for test_num in 8 9 10 10b 11 13; do
         _show_test_status "$test_num" "$running"
     done
 
@@ -551,6 +555,31 @@ _show_test_status() {
     local test_num="$1"
     local running_test="$2"
     local output_dir="${TEST_OUTPUT_DIRS[$test_num]}"
+
+    # Test 13 uses per-phase *_done.json markers, not state.json — dispatch early.
+    if [[ "$test_num" == "13" ]]; then
+        local latest_run_dir
+        latest_run_dir=$(find "$PROJECT_DIR/$output_dir" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+        if [[ -z "$latest_run_dir" ]]; then
+            if [[ "$running_test" == "$test_num" ]]; then
+                echo ""
+                echo -e "  ${BOLD}Test 13${RESET} ${GREEN}RUNNING${RESET}"
+                echo "  ────────────────────────────────────────"
+                echo -e "  ${DIM}Preparing run directory...${RESET}"
+            fi
+            return
+        fi
+        local is_running=""
+        if [[ "$running_test" == "$test_num" ]]; then
+            is_running=" ${GREEN}RUNNING${RESET}"
+        fi
+        echo ""
+        echo -e "  ${BOLD}Test 13${RESET}${is_running}"
+        echo "  ────────────────────────────────────────"
+        _show_test13_status "$latest_run_dir"
+        return
+    fi
+
     local state_file=$(_find_latest_state "$output_dir")
 
     # Skip tests with no state
@@ -813,6 +842,84 @@ if fc:
     fi
 
     echo -e "  Last saved: ${DIM}${last_time}${RESET}"
+}
+
+_show_test13_status() {
+    # Argument: path to a specific run dir, e.g.
+    #   outputs/test13_journal_scaffold/mistral/20260420_215617
+    local run_dir="$1"
+    local model_name=$(basename "$(dirname "$run_dir")")
+    local run_name=$(basename "$run_dir")
+
+    echo -e "  Model:      ${CYAN}${model_name}${RESET}"
+    echo -e "  Run:        ${DIM}${run_name}${RESET}"
+
+    # Per-phase summary read directly from *_done.json markers.
+    python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+import json, sys, os
+run_dir = sys.argv[1]
+phases = ("A", "B", "C1", "C2")
+any_done = False
+for p in phases:
+    marker = os.path.join(run_dir, p, f"{p}_done.json")
+    if not os.path.exists(marker):
+        continue
+    any_done = True
+    try:
+        d = json.load(open(marker))
+    except Exception:
+        continue
+    first = d.get("first_perfect_epoch")
+    stable = d.get("stable_perfect_epoch")
+    n = d.get("n_keys")
+    wall = d.get("wall_seconds")
+    retention = d.get("retention_unchanged_80", {}).get("rate")
+    leak = d.get("placeholder_leakage_on_fills")
+    parts = [f"n={n}" if n is not None else None,
+             f"first={first}" if first is not None else None,
+             f"stable={stable}" if stable is not None else None,
+             f"wall={wall:.0f}s" if isinstance(wall, (int, float)) else None,
+             f"retention={retention:.2f}" if retention is not None else None,
+             f"leakage={leak}" if leak is not None else None]
+    summary = "  ".join(s for s in parts if s)
+    print(f"  {p}:        \x1b[32m\u2713\x1b[0m {summary}")
+if not any_done:
+    print("  \x1b[2mNo phase markers yet — Phase A likely in progress.\x1b[0m")
+PYEOF
+
+    # Detect the in-progress phase by checking which marker is missing.
+    local current_phase=""
+    for p in A B C1 C2; do
+        if [[ ! -f "$run_dir/$p/${p}_done.json" ]]; then
+            current_phase="$p"
+            break
+        fi
+    done
+
+    # Paused marker written by test13 after a clean pause exit.
+    # Takes precedence over the "Current: Phase X" line — the run isn't
+    # in-progress, it's waiting for tresume.
+    if [[ -f "$run_dir/paused.json" ]]; then
+        local after
+        after=$(python3 -c "import json; print(json.load(open('$run_dir/paused.json')).get('stopped_after_phase','?'))" 2>/dev/null)
+        echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped after Phase ${after} — tresume to continue)${RESET}"
+    elif [[ -n "$current_phase" ]]; then
+        local phase_dir="$run_dir/$current_phase"
+        echo -e "  Current:    ${YELLOW}Phase ${current_phase}${RESET}"
+        if [[ -f "$phase_dir/progress.json" ]]; then
+            _show_epoch_progress "$phase_dir" "$current_phase"
+        elif [[ -d "$phase_dir/adapter" ]]; then
+            local mtime=$(date -r "$phase_dir/adapter" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+            echo -e "  Training:   ${DIM}starting (adapter mtime: ${mtime})${RESET}"
+        else
+            echo -e "  Training:   ${DIM}starting (no progress yet)${RESET}"
+        fi
+    fi
+
+    # Final results.json if all phases done.
+    if [[ -f "$run_dir/results.json" ]]; then
+        echo -e "  Final:      ${GREEN}all phases complete${RESET}"
+    fi
 }
 
 _show_epoch_progress() {

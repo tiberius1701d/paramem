@@ -1973,6 +1973,90 @@ single model lifecycle.
 
 ---
 
+## Test 13: Placeholder Generalization (Journal-Scaffold)
+
+**Script:** `experiments/test13_journal_scaffold.py`
+**Status:** A + B COMPLETE (2026-04-21). C1 + C2 PENDING (scheduled
+for overnight resume via `tresume 13`).
+
+### What it tests
+
+Whether a LoRA adapter pre-trained with *placeholder* answers forms a
+stable `key → question → slot` structure that a later real-answer update
+can fill faster, without residual leakage from the placeholder content.
+
+**This is not a scaling test.** Scaling is settled: Test 8 cycle 56 fit
+550 keys in a single rank-8 adapter on Mistral 7B, and adapter
+multiplication + registry namespacing handles aggregation beyond that.
+Effective single-adapter capacity is data-dependent and bounded by
+triple-content diversity, not by a universal ceiling. Test 13 isolates
+*training cost amortization*: if placeholder scaffolds work, per-session
+adapter training becomes cheap enough to run during silent hours, and
+pre-trained scaffolds become shippable.
+
+### Design
+
+Four phases on Mistral 7B, N=200, swap=40, rank=8, 30 epochs max per phase.
+
+- **A — Fresh**: 200 brand-new keys, real (Q, A). Baseline convergence.
+- **B — Answer-swap**: start from A's adapter. Overwrite 40 keys with
+  different answers (same key + Q). Warm-start behavior.
+- **C1 — Scaffold** (pending): fresh adapter "journal". Train 200 keys
+  where 40 have `TBD-k` placeholders. Must converge to 200/200.
+- **C2 — Fill** (pending): start from C1. Replace `TBD-k` with real
+  answers. Measures fill-speed + retention + placeholder leakage.
+
+### A + B results (2026-04-21)
+
+| Phase | Converged | first_perfect | stable_perfect | Wall time | Train loss |
+|-------|-----------|---------------|----------------|-----------|------------|
+| A     | 199/200   | —             | —              | 7h 26m    | 0.155      |
+| B     | 40/40     | epoch 15      | epoch 18       | 99 min    | 0.202      |
+
+**Phase A never reached 200/200** — peaked at 199/200 from epoch 24
+onwards. Post-run probe identified the failing key as `graph23`. Its
+source triple collides with `graph26`: identical question string, answer
+strings are paraphrases of the same facts (college classmates / music /
+photography / friendship). The model under key `graph23` emitted
+`graph26`'s phrasing. SimHash confidence 0.734 — below the 0.75
+threshold. This is a **data-hygiene failure, not a capacity failure**:
+duplicate upstream triples produced two near-identical keys; gradient
+descent compressed them to a single distributed representation and
+emitted one phrasing under both keys. The `graph23` outlier is
+documented in the script docstring; a triple-level dedup scan now runs
+at qa_pool load and logs the colliding pairs (`graph23/graph26`,
+`graph35/graph37`, `graph56/graph58`).
+
+**Phase B is a clean warm-start win**: 40/40 at epoch 15, stable by
+epoch 18, from zero recall at epoch 1. Warm-starting from A's adapter
+lets the swap converge in 15 epochs vs A's 24+ for comparable recall
+on the base set. The per-epoch recall curve (0→0→0→0→0→0→0→0→0→0→0→0→
+0→0→40→40→40→38→40→40) is characteristic of a phase transition: nearly
+flat for 14 epochs, then a single-epoch jump to perfect. Loss decreased
+smoothly throughout; loss is not a reliable signal for fact encoding.
+
+### Probe overhead (for future planners)
+
+Phase A's 7h 26m wall time vs Test 8 baselines (~2h 20m for comparable
+keys) is driven by the per-epoch `RecallProbeCallback`: 200 keys × 30
+epochs × ~2.2 s per probe ≈ 3h 40m of probe time alone. Training
+compute is consistent with baseline. The probe cadence is a deliberate
+design cost — needed to locate `first_perfect_epoch` / `stable_perfect_epoch`
+for the comparison. Future tests that don't need per-epoch resolution
+should probe every 3–5 epochs instead.
+
+### Open: C1 + C2
+
+Decision rule preserved from the design: C2 epochs ≤ B epochs +
+retention ≈ 1.0 + zero leakage → scaffold confirmed. If C1/C2 fails
+only on the known data-hygiene outliers (`graph23` etc.), that is not
+a scaffold regression — it is the same noise floor as A/B. A placeholder-
+variant ablation (`TBD-k` vs in-distribution decoy vs OOD prose vs
+nonsense strings) is captured in paper_notes as a follow-up if C2
+leaks or fails to converge.
+
+---
+
 ## 6-Model Extraction Comparison (2026-04-14)
 
 **Script:** `scripts/dev/compare_extraction.py`
