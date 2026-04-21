@@ -516,3 +516,132 @@ class TestCurriculumDecayProtection:
         # First kept (protected), second decayed (exposure met)
         assert len(loop.episodic_replay_pool) == 1
         assert loop.episodic_replay_pool[0]["question"] == "Where does Alex live?"
+
+
+# ---------------------------------------------------------------------------
+# Server consolidation — anonymous speaker skip removal (Slice 3-pre)
+# ---------------------------------------------------------------------------
+
+
+class TestAnonymousSpeakerNotSkipped:
+    """Speaker{N} sessions must flow through extraction, not be silently discarded.
+
+    Verifies that run_consolidation (paramem.server.consolidation) calls
+    loop.extract_session for sessions whose speaker_id is 'Speaker3' —
+    i.e. the old hard-skip on falsy speaker_id is gone.
+    """
+
+    def _make_mock_loop(self):
+        """Minimal mock ConsolidationLoop with the attributes run_consolidation touches."""
+        from unittest.mock import MagicMock
+
+        loop = MagicMock()
+        loop.shutdown_requested = False
+        loop.merger = MagicMock()
+        loop.merger.graph = MagicMock()
+        loop.merger.graph.nodes = []
+        loop.indexed_key_qa = {}
+        loop.key_sessions = {}
+        loop.promoted_keys = set()
+        loop.episodic_simhash = {}
+        loop.semantic_simhash = {}
+        loop.procedural_simhash = {}
+        # extract_session returns ([], []) so no training path is triggered.
+        loop.extract_session = MagicMock(return_value=([], []))
+        loop.train_adapters = MagicMock(return_value={})
+        loop.cycle_count = 0
+        return loop
+
+    def _make_config(self, tmp_path):
+        """Minimal ServerConfig pointing at a temp directory.
+
+        Uses PathsConfig so that adapter_dir, key_metadata_path, and
+        registry_path resolve under tmp_path without needing property setters.
+        """
+        from paramem.server.config import PathsConfig, ServerConfig
+
+        config = ServerConfig()
+        config.paths = PathsConfig(data=tmp_path / "ha")
+        (tmp_path / "ha" / "adapters").mkdir(parents=True, exist_ok=True)
+        return config
+
+    def _make_session_buffer(self, tmp_path, speaker_id):
+        """SessionBuffer with a single in-memory session for the given speaker_id.
+
+        Sets speaker identity before appending turns so the turns carry the
+        speaker_id and get_pending() returns it as the dominant speaker.
+        """
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        conv_id = "conv-anon-test"
+        if speaker_id is not None:
+            # Set speaker before appending so turns carry the speaker_id.
+            buffer.set_speaker(conv_id, speaker_id, speaker_id)
+        buffer.append(conv_id, "user", "Hello there")
+        buffer.append(conv_id, "assistant", "Hi!")
+        return buffer
+
+    def test_anonymous_speaker_id_not_skipped(self, tmp_path):
+        """Sessions with speaker_id='Speaker3' reach extract_session."""
+        from paramem.server.consolidation import run_consolidation
+
+        loop = self._make_mock_loop()
+        config = self._make_config(tmp_path)
+        buffer = self._make_session_buffer(tmp_path, speaker_id="Speaker3")
+
+        run_consolidation(
+            model=None,
+            tokenizer=None,
+            config=config,
+            session_buffer=buffer,
+            loop=loop,
+        )
+
+        loop.extract_session.assert_called_once()
+        call_kwargs = loop.extract_session.call_args
+        # First positional arg is the transcript; keyword arg is speaker_id.
+        assert call_kwargs.kwargs.get("speaker_id") == "Speaker3"
+
+    def test_named_speaker_not_skipped(self, tmp_path):
+        """Named (enrolled) speaker IDs continue to reach extract_session."""
+        from paramem.server.consolidation import run_consolidation
+
+        loop = self._make_mock_loop()
+        config = self._make_config(tmp_path)
+        buffer = self._make_session_buffer(tmp_path, speaker_id="abc12345")
+
+        run_consolidation(
+            model=None,
+            tokenizer=None,
+            config=config,
+            session_buffer=buffer,
+            loop=loop,
+        )
+
+        loop.extract_session.assert_called_once()
+        assert loop.extract_session.call_args.kwargs.get("speaker_id") == "abc12345"
+
+    def test_none_speaker_id_still_skipped(self, tmp_path):
+        """Truly-None speaker_id (text-only, no voice) is skipped at consolidation.
+
+        Sessions with no speaker_id must not reach extract_session because a
+        None speaker_id would key procedural_sp_index on (None, subject, predicate),
+        causing unrelated text-only sessions to cross-retire each other's procedural keys.
+        """
+        from paramem.server.consolidation import run_consolidation
+
+        loop = self._make_mock_loop()
+        config = self._make_config(tmp_path)
+        buffer = self._make_session_buffer(tmp_path, speaker_id=None)
+
+        run_consolidation(
+            model=None,
+            tokenizer=None,
+            config=config,
+            session_buffer=buffer,
+            loop=loop,
+        )
+
+        # Text-only sessions without a speaker_id must NOT reach extract_session.
+        loop.extract_session.assert_not_called()

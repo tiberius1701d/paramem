@@ -938,6 +938,21 @@ async def chat(request: ChatRequest):
                     unknown_group_id,
                     reprompt_interval,
                 )
+
+            # Promote to a canonical Speaker{N} ID so facts flow through
+            # extraction and adapter training. Orthogonal to the enrollment
+            # prompt above — that coordinates "what's your name?" prompts;
+            # this ensures sessions are not silently discarded at consolidation.
+            try:
+                anon_id = store.register_anonymous(request.speaker_embedding)
+                speaker_id = anon_id
+                # Anonymous speakers use their canonical ID as the display name until disclosure
+                buffer.set_speaker(conv_id, anon_id, anon_id)
+                logger.info("Anonymous speaker promoted to canonical ID: %s", anon_id)
+            except Exception:
+                logger.exception(
+                    "register_anonymous failed — session will proceed without speaker attribution"
+                )
     except Exception:
         logger.exception("Speaker enrollment failed — continuing without enrollment")
 

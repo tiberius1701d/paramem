@@ -125,9 +125,16 @@ def run_consolidation(
 
         session_ids.append(session_id)
 
-        # Skip anonymous sessions — no speaker, no key ownership
+        # Skip truly-None sessions (no speaker ID assigned, i.e. text-only sessions
+        # with no voice channel). Named speakers and anonymous Speaker{N} IDs both
+        # flow through extraction. A None speaker_id would key procedural_sp_index
+        # on (None, subject, predicate), causing unrelated text-only sessions to
+        # collide and cross-retire each other's procedural keys.
         if not session_speaker_id:
-            logger.warning("Skipping session %s: no speaker_id", session_id)
+            logger.debug(
+                "Session %s has no speaker_id — skipping (text-only, no voice attribution)",
+                session_id,
+            )
             continue
 
         speaker_name = None

@@ -285,10 +285,10 @@ def test_speaker_v3_migration_adds_language(tmp_path):
     store = SpeakerStore(path)
     assert store.get_preferred_language("abc123") is None
 
-    # After flush, file should be v4
+    # After flush, file should be v5
     store.flush()
     data = json.loads(path.read_text())
-    assert data["version"] == 4
+    assert data["version"] == 5
     assert data["speakers"]["abc123"]["preferred_language"] == ""
 
 

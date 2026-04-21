@@ -31,18 +31,20 @@ _DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Outpu
 def build_speaker_context(speaker_name: str | None) -> str:
     """Single source of truth for the extraction-prompt speaker directive.
 
-    Empty string when the speaker cannot be identified, leaving the generic
-    "Speaker" fallback in the prompt examples. When known, pins the real
-    name as the canonical subject across every extracted fact.
+    Empty string when the speaker cannot be identified, leaving the
+    ``{SPEAKER_NAME}`` slot in the few-shots unsubstituted (the prompt's
+    closing note tells the model never to emit that literal string).
+    When known, pins the real name — which may be a real first name
+    ("Alice") or an opaque anonymous id ("Speaker7") — as the canonical
+    subject across every extracted fact.
     """
     if not speaker_name:
         return ""
-    # Leading + trailing newlines form a visually-separated block in the prompt;
-    # when speaker is unknown, the slot collapses to empty and no blank remains.
     return (
         f"\nThe current speaker is {speaker_name}. Use the exact string "
         f"'{speaker_name}' as the subject of every fact about the speaker; "
-        f"do NOT use 'Speaker', 'User', 'I', or any other placeholder.\n"
+        f"do NOT use '{{SPEAKER_NAME}}', 'SPEAKER_NAME', 'Speaker_Name', "
+        f"'Speaker', 'User', 'I', or any other placeholder.\n"
     )
 
 
@@ -136,7 +138,7 @@ def extract_procedural_graph(
         speaker_name: Real name of the speaker (e.g. from voice enrollment).
             When provided, injected into the prompt via ``build_speaker_context``
             so the model uses the real name as the subject of every extracted
-            preference instead of the generic "Speaker" placeholder. Mirrors
+            preference instead of the ``SPEAKER_NAME`` slot. Mirrors
             the same parameter on ``extract_graph``.
     """
     from paramem.evaluation.recall import generate_answer
@@ -305,7 +307,7 @@ def _generate_extraction(
     When `speaker_name` is provided (e.g. from voice enrollment in production,
     or from session metadata in the test harness), inject it into the prompt
     so the model uses the real name as subject instead of guessing or emitting
-    a placeholder like "Speaker".
+    the ``SPEAKER_NAME`` slot from the few-shots.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages

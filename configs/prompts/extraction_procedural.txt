@@ -16,10 +16,15 @@ Rules:
 {predicate_examples}
 
 POSITIVE example — transcript: "[user] Play some jazz. [user] Play jazz again."
-{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Jazz", "entity_type": "preference", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker", "predicate": "listens_to", "object": "Jazz", "relation_type": "preference", "confidence": 0.8}}],
- "summary": "Speaker listens to jazz (requested multiple times)."}}
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "listens_to", "object": "Jazz", "relation_type": "preference", "confidence": 0.8}}],
+ "summary": "{{SPEAKER_NAME}} listens to jazz (requested multiple times)."}}
+
+Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
+speaker's real identifier (e.g. "Alice", "Speaker7") via the directive above.
+Never emit the literal strings "{{SPEAKER_NAME}}", "SPEAKER_NAME", or
+"Speaker_Name" in your output.
 
 NEGATIVE example — transcript: "[user] Play some music. [assistant] Playing on Office Speaker."
 Extract: NONE — a generic play command without a specific preference.

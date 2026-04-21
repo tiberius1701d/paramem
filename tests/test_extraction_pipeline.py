@@ -929,7 +929,18 @@ class TestSpeakerContextInjection:
         assert "Ye Jie" in out
         assert "'Ye Jie'" in out
         # Must forbid generic fallback strings so the model cannot emit them.
-        for forbidden in ("Speaker", "User", "'I'"):
+        # {SPEAKER_NAME} is the wrapped slot used in the few-shots; the bare
+        # and title-cased forms stay listed because the graph normalizer
+        # title-cases the bare form and because Mistral occasionally emits
+        # "Speaker"/"User"/"I" as training-data fallbacks.
+        for forbidden in (
+            "{SPEAKER_NAME}",
+            "SPEAKER_NAME",
+            "Speaker_Name",
+            "Speaker",
+            "User",
+            "'I'",
+        ):
             assert forbidden in out, f"directive must mention {forbidden!r}"
 
 

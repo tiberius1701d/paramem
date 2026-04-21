@@ -305,7 +305,7 @@ def test_file_created_on_first_enroll(tmp_path, sample_embedding):
     store.enroll("Alice", sample_embedding)
     assert path.exists()
     data = json.loads(path.read_text())
-    assert data["version"] == 4
+    assert data["version"] == 5
     assert len(data["speakers"]) == 1
     profile = list(data["speakers"].values())[0]
     assert "embeddings" in profile
@@ -313,13 +313,14 @@ def test_file_created_on_first_enroll(tmp_path, sample_embedding):
 
 
 def test_legacy_v1_migration(tmp_path, sample_embedding):
-    """Legacy v1 name-keyed format is auto-migrated to v3."""
+    """Legacy v1 name-keyed format is auto-migrated to v5."""
     path = tmp_path / "profiles.json"
     legacy_data = {"speakers": {"Alice": sample_embedding}}
     path.write_text(json.dumps(legacy_data))
 
     store = SpeakerStore(path)
     assert store.profile_count == 1
+    assert store._next_anon_index == 0
 
     result = store.match(sample_embedding)
     assert result.name == "Alice"
@@ -327,12 +328,12 @@ def test_legacy_v1_migration(tmp_path, sample_embedding):
     assert len(result.speaker_id) == 8
 
     data = json.loads(path.read_text())
-    assert data["version"] == 4
+    assert data["version"] == 5
     assert all("name" in v and "embeddings" in v for v in data["speakers"].values())
 
 
 def test_legacy_v2_migration(tmp_path, sample_embedding):
-    """v2 single-embedding format is auto-migrated to v3 multi-embedding."""
+    """v2 single-embedding format is auto-migrated to v5 multi-embedding."""
     path = tmp_path / "profiles.json"
     v2_data = {
         "speakers": {"abc12345": {"name": "Alice", "embedding": sample_embedding}},
@@ -342,13 +343,14 @@ def test_legacy_v2_migration(tmp_path, sample_embedding):
 
     store = SpeakerStore(path)
     assert store.profile_count == 1
+    assert store._next_anon_index == 0
 
     result = store.match(sample_embedding)
     assert result.name == "Alice"
     assert result.speaker_id == "abc12345"
 
     data = json.loads(path.read_text())
-    assert data["version"] == 4
+    assert data["version"] == 5
     profile = data["speakers"]["abc12345"]
     assert "embeddings" in profile
     assert "embedding" not in profile
@@ -580,3 +582,243 @@ def test_min_embedding_duration_seconds_config_default():
 
     cfg = SpeakerConfig()
     assert cfg.min_embedding_duration_seconds == 1.0
+
+
+# ---------------------------------------------------------------------------
+# register_anonymous — anonymous speaker ID promotion (Slice 3-pre)
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterAnonymous:
+    """Tests for SpeakerStore.register_anonymous."""
+
+    def test_first_registration_returns_speaker0(self, tmp_path, sample_embedding):
+        """First unrecognized voice gets Speaker0."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        anon_id = store.register_anonymous(sample_embedding)
+        assert anon_id == "Speaker0"
+
+    def test_second_distinct_embedding_gets_speaker1(
+        self, tmp_path, sample_embedding, different_embedding
+    ):
+        """Two distinct voices get incrementing IDs."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        id0 = store.register_anonymous(sample_embedding)
+        id1 = store.register_anonymous(different_embedding)
+        assert id0 == "Speaker0"
+        assert id1 == "Speaker1"
+
+    def test_same_embedding_returns_same_id(self, tmp_path, sample_embedding):
+        """Re-registering the same embedding is idempotent (centroid match)."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        id_first = store.register_anonymous(sample_embedding)
+        id_second = store.register_anonymous(sample_embedding)
+        assert id_first == id_second
+        # Counter must not have advanced on the second call.
+        assert store._next_anon_index == 1
+
+    def test_counter_persists_across_reload(self, tmp_path, sample_embedding, different_embedding):
+        """next_anon_index survives a SpeakerStore reload from disk."""
+        path = tmp_path / "profiles.json"
+        store1 = SpeakerStore(path)
+        store1.register_anonymous(sample_embedding)
+        store1.register_anonymous(different_embedding)
+        assert store1._next_anon_index == 2
+
+        # Reload from disk.
+        store2 = SpeakerStore(path)
+        assert store2._next_anon_index == 2
+        # Next allocation continues from 2. Use strict thresholds so emb3 is
+        # definitely below low_threshold and gets a fresh allocation rather than
+        # tentatively matching one of the anonymous profiles under the default
+        # thresholds (high=0.60, low=0.45).
+        store2_strict = SpeakerStore(path, high_threshold=0.90, low_threshold=0.80)
+        emb3 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        id_new = store2_strict.register_anonymous(emb3)
+        assert id_new == "Speaker2"
+
+    def test_disk_has_version5_and_next_anon_index(self, tmp_path, sample_embedding):
+        """JSON on disk has version: 5 and next_anon_index field after registration."""
+        path = tmp_path / "profiles.json"
+        store = SpeakerStore(path)
+        store.register_anonymous(sample_embedding)
+        data = json.loads(path.read_text())
+        assert data["version"] == 5
+        assert "next_anon_index" in data
+        assert data["next_anon_index"] == 1
+
+    def test_v4_migration_sets_next_anon_index_zero(self, tmp_path, sample_embedding):
+        """Loading a v4-format file sets next_anon_index=0 and bumps version to 5."""
+        path = tmp_path / "profiles.json"
+        # Craft a valid v4 store.
+        v4_data = {
+            "speakers": {
+                "abc12345": {
+                    "name": "Alice",
+                    "embeddings": [sample_embedding],
+                    "preferred_language": "",
+                    "enroll_method": "self_introduced",
+                }
+            },
+            "last_greeted": {},
+            "version": 4,
+        }
+        path.write_text(json.dumps(v4_data))
+
+        store = SpeakerStore(path)
+        # Migration sets the counter to 0.
+        assert store._next_anon_index == 0
+        # Disk is rewritten as v5 immediately on load.
+        data = json.loads(path.read_text())
+        assert data["version"] == 5
+        assert data.get("next_anon_index") == 0
+
+    def test_empty_embedding_raises(self, tmp_path):
+        """register_anonymous rejects an empty embedding."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        with pytest.raises(ValueError, match="non-empty"):
+            store.register_anonymous([])
+
+    def test_named_speaker_not_overwritten(self, tmp_path, sample_embedding):
+        """A voice already enrolled under a real name returns the named ID."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        named_id = store.enroll("Alice", sample_embedding)
+        assert named_id is not None
+        # register_anonymous should return the existing named profile via centroid match.
+        anon_id = store.register_anonymous(sample_embedding)
+        assert anon_id == named_id
+        # No anonymous profile should have been created.
+        assert store._next_anon_index == 0
+        profiles = store.list_profiles()
+        assert len(profiles) == 1
+        assert profiles[0]["name"] == "Alice"
+
+    def test_anonymous_profile_uses_enroll_method_anonymous_voice(self, tmp_path, sample_embedding):
+        """Anonymous profiles record enroll_method='anonymous_voice'."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        anon_id = store.register_anonymous(sample_embedding)
+        profiles = {p["id"]: p for p in store.list_profiles()}
+        assert profiles[anon_id]["enroll_method"] == "anonymous_voice"
+
+    def test_get_name_returns_speaker_id_for_anonymous(self, tmp_path, sample_embedding):
+        """For anonymous profiles name==speaker_id so get_name returns the ID."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        anon_id = store.register_anonymous(sample_embedding)
+        assert store.get_name(anon_id) == anon_id
+
+
+# ---------------------------------------------------------------------------
+# enroll() upgrade-in-place for anonymous profiles (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestEnrollUpgradesAnonymous:
+    """enroll() must upgrade anonymous Speaker{N} profiles rather than reject."""
+
+    def test_enroll_after_register_anonymous_upgrades_profile(self, tmp_path, sample_embedding):
+        """After register_anonymous creates Speaker0, enrolling with the same voice
+        and a real name returns Speaker0 (not a new UUID), upgrades the name, and
+        sets enroll_method to the requested method.
+        """
+        store = SpeakerStore(tmp_path / "profiles.json")
+        anon_id = store.register_anonymous(sample_embedding)
+        assert anon_id == "Speaker0"
+
+        result_id = store.enroll("Alice", sample_embedding)
+        assert result_id == "Speaker0", "enroll() must return the existing anonymous ID"
+        assert store.get_name("Speaker0") == "Alice"
+        profiles = {p["id"]: p for p in store.list_profiles()}
+        assert profiles["Speaker0"]["enroll_method"] == "self_introduced"
+        # Profile count must not increase — upgrade in-place only.
+        assert store.profile_count == 1
+
+    def test_enroll_against_named_profile_still_rejected(
+        self, tmp_path, sample_embedding, different_embedding
+    ):
+        """Enrolling a voice already present as a named profile still returns None.
+
+        Prevents the same voice registering under two different names.
+        Uses strict thresholds so the two test embeddings are well-separated.
+        """
+        store = SpeakerStore(tmp_path / "profiles.json", high_threshold=0.90, low_threshold=0.70)
+        alice_id = store.enroll("Alice", sample_embedding)
+        assert alice_id is not None
+
+        # Attempt to enroll the same voice (sample_embedding) under a new name.
+        result = store.enroll("Bob", sample_embedding)
+        assert result is None
+        assert store.profile_count == 1
+
+
+# ---------------------------------------------------------------------------
+# register_anonymous tentative-match semantics (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterAnonymousTentative:
+    """Tentative matches behave correctly: reuse anonymous, isolate named."""
+
+    def _make_tentative_store(self, tmp_path: object) -> "SpeakerStore":
+        """Return a store with high_threshold=0.95, low_threshold=0.50 so that
+        embeddings with cosine similarity in [0.50, 0.95) are tentative.
+        """
+        return SpeakerStore(
+            tmp_path / "profiles.json",
+            high_threshold=0.95,
+            low_threshold=0.50,
+        )
+
+    def _make_tentative_pair(self) -> tuple[list[float], list[float]]:
+        """Return two embeddings whose cosine similarity is ~0.71 (tentative zone
+        for thresholds high=0.95, low=0.50).
+
+        [1,0,0,0] and [0.7,0.7,0,0] have cosine similarity ≈ 0.707.
+        """
+        import math
+
+        a = [1.0, 0.0, 0.0, 0.0]
+        b_raw = [0.7, 0.7, 0.0, 0.0]
+        norm_b = math.sqrt(sum(x * x for x in b_raw))
+        b = [x / norm_b for x in b_raw]
+        return a, b
+
+    def test_tentative_against_anonymous_reuses_same_id(self, tmp_path):
+        """A tentative match against an anonymous profile reuses that profile.
+
+        Avoids split-identity when the same speaker's embedding varies slightly
+        across sessions but remains within the tentative zone.
+        """
+        store = self._make_tentative_store(tmp_path)
+        emb_a, emb_b = self._make_tentative_pair()
+
+        id_a = store.register_anonymous(emb_a)
+        assert id_a == "Speaker0"
+
+        # emb_b is tentatively similar to emb_a / Speaker0 (anonymous).
+        id_b = store.register_anonymous(emb_b)
+        assert id_b == "Speaker0", (
+            "Tentative match against anonymous profile must reuse the existing ID"
+        )
+        # Counter must not advance — no new profile created.
+        assert store._next_anon_index == 1
+
+    def test_tentative_against_named_allocates_new_speaker(self, tmp_path):
+        """A tentative match against a named profile allocates a new Speaker{N}.
+
+        Protects named-profile centroids from contamination by ambiguous voices.
+        """
+        store = self._make_tentative_store(tmp_path)
+        emb_a, emb_b = self._make_tentative_pair()
+
+        # Enroll emb_a as a named speaker.
+        alice_id = store.enroll("Alice", emb_a)
+        assert alice_id is not None
+
+        # emb_b is tentative against Alice's profile — must not contaminate it.
+        anon_id = store.register_anonymous(emb_b)
+        assert anon_id != alice_id
+        assert anon_id == "Speaker0"
+        # Alice's profile must remain unchanged.
+        assert store.get_name(alice_id) == "Alice"
+        profiles = {p["id"]: p for p in store.list_profiles()}
+        assert profiles[alice_id]["enroll_method"] != "anonymous_voice"

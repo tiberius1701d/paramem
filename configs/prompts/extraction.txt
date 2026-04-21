@@ -36,28 +36,33 @@ Predicate examples (use these exact forms when they apply):
 - If none fit, create a new snake_case predicate (e.g. "competed_in")
 
 POSITIVE example — transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
-{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Frankfurt", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
- "summary": "Speaker's sister lives in Frankfurt (name corrected from assistant response)."}}
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}}'s sister lives in Frankfurt (name corrected from assistant response)."}}
 
 POSITIVE example — transcript: "[user] I enjoy reading science fiction."
-{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Science Fiction", "entity_type": "preference", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker", "predicate": "likes", "object": "Science Fiction", "relation_type": "preference", "confidence": 1.0}}],
- "summary": "Speaker enjoys reading science fiction."}}
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Science Fiction", "relation_type": "preference", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} enjoys reading science fiction."}}
 
 POSITIVE example — transcript: "[user] I work at Siemens in the R&D group."
-{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Siemens", "entity_type": "organization", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker works at Siemens in R&D."}}
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} works at Siemens in R&D."}}
 
 POSITIVE example — transcript: "[user] Our wedding anniversary is on June 14th."
-{{"entities": [{{"name": "Speaker", "entity_type": "person", "attributes": {{}}}},
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Wedding Anniversary", "entity_type": "event", "attributes": {{"date": "June 14"}}}}],
- "relations": [{{"subject": "Speaker", "predicate": "celebrates", "object": "Wedding Anniversary", "relation_type": "temporal", "confidence": 1.0}}],
- "summary": "Speaker's wedding anniversary is June 14."}}
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "celebrates", "object": "Wedding Anniversary", "relation_type": "temporal", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}}'s wedding anniversary is June 14."}}
+
+Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
+speaker's real identifier (e.g. "Alice", "Speaker7") via the directive above.
+Never emit the literal strings "{{SPEAKER_NAME}}", "SPEAKER_NAME", or
+"Speaker_Name" in your output.
 
 NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."
 Extract: NONE — asking about weather in a location is curiosity, not a personal fact about where the speaker lives.

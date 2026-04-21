@@ -26,6 +26,12 @@ from paramem.graph.schema_config import (
 # such tokens must be gone.
 _LEFTOVER_PLACEHOLDER = re.compile(r"(?<!\{)\{[A-Za-z_]+\}(?!\})")
 
+# `{SPEAKER_NAME}` appears literally in the rendered prompt: the few-shot
+# examples show the subject slot wrapped in template-variable syntax so the
+# model recognises it as a substitution target rather than a literal name.
+# It is produced by writing ``{{SPEAKER_NAME}}`` in the prompt source.
+_INTENTIONAL_LITERALS = {"{SPEAKER_NAME}"}
+
 
 class TestExtractionPromptRender:
     def setup_method(self):
@@ -52,7 +58,9 @@ class TestExtractionPromptRender:
             predicate_examples=format_predicate_examples(),
             relation_types=format_relation_types(),
         )
-        leftover = _LEFTOVER_PLACEHOLDER.findall(rendered)
+        leftover = [
+            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
+        ]
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
     def test_every_entity_type_in_rendered_output(self):
@@ -103,7 +111,9 @@ class TestProceduralPromptRender:
             entity_types=format_entity_types(scope="procedural"),
             predicate_examples=format_predicate_examples(scope="procedural"),
         )
-        leftover = _LEFTOVER_PLACEHOLDER.findall(rendered)
+        leftover = [
+            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
+        ]
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
     def test_procedural_entity_types_in_rendered_output(self):

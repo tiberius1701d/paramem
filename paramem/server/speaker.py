@@ -24,7 +24,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_PROFILE_VERSION = 4
+_PROFILE_VERSION = 5
 
 
 @dataclass
@@ -100,6 +100,7 @@ class SpeakerStore:
         self._last_greeted: dict[str, str] = {}  # speaker_id → ISO timestamp
         self._lock = threading.Lock()  # guards profile mutations and saves
         self._dirty = False  # deferred save flag for enrichment batching
+        self._next_anon_index: int = 0  # monotonic counter for anonymous speaker IDs
         self._load()
 
     def _load(self) -> None:
@@ -118,19 +119,28 @@ class SpeakerStore:
         version = data.get("version", 1)
 
         self._last_greeted = data.get("last_greeted", {})
+        self._next_anon_index = data.get("next_anon_index", 0)
 
         if version >= _PROFILE_VERSION:
             self._profiles = data.get("speakers", {})
+        elif version == 4:
+            # v4 → v5: add next_anon_index field (defaulted to 0 above)
+            self._profiles = data.get("speakers", {})
+            logger.info("Migrated speaker store v4 → v5 (anonymous index)")
+            self._save()
         elif version == 3:
-            # v3 → v4: add preferred_language field
+            # v3 → v5: add preferred_language + next_anon_index fields
             self._profiles = data.get("speakers", {})
             for profile in self._profiles.values():
                 profile.setdefault("preferred_language", "")
             if self._profiles:
-                logger.info("Migrated %d v3 profiles to v4 (language)", len(self._profiles))
+                logger.info(
+                    "Migrated %d v3 profiles to v5 (language, anonymous index)",
+                    len(self._profiles),
+                )
                 self._save()
         elif version == 2:
-            # v2 → v4: single "embedding" → list "embeddings" + preferred_language
+            # v2 → v5: single "embedding" → list "embeddings" + preferred_language
             legacy = data.get("speakers", {})
             self._profiles = {}
             for speaker_id, profile in legacy.items():
@@ -141,10 +151,10 @@ class SpeakerStore:
                     "preferred_language": "",
                 }
             if self._profiles:
-                logger.info("Migrated %d v2 profiles to v4", len(self._profiles))
+                logger.info("Migrated %d v2 profiles to v5", len(self._profiles))
                 self._save()
         else:
-            # v1 → v4: name-keyed → UUID-keyed + multi-embedding + preferred_language
+            # v1 → v5: name-keyed → UUID-keyed + multi-embedding + preferred_language
             legacy = data.get("speakers", {})
             self._profiles = {}
             for name, embedding in legacy.items():
@@ -155,7 +165,7 @@ class SpeakerStore:
                     "preferred_language": "",
                 }
             if self._profiles:
-                logger.info("Migrated %d v1 profiles to v4", len(self._profiles))
+                logger.info("Migrated %d v1 profiles to v5", len(self._profiles))
                 self._save()
 
         # Back-fill enroll_method for profiles written before that field existed.
@@ -261,6 +271,7 @@ class SpeakerStore:
                     {
                         "speakers": self._profiles,
                         "last_greeted": self._last_greeted,
+                        "next_anon_index": self._next_anon_index,
                         "version": _PROFILE_VERSION,
                     },
                     f,
@@ -378,11 +389,29 @@ class SpeakerStore:
             return None
 
         with self._lock:
-            # Reject if this voice is already enrolled (check inside lock
-            # to prevent concurrent enrolls of the same voice).
+            # Check inside lock to prevent concurrent enrolls of the same voice.
             # NOTE: match() is read-only and must NOT acquire _lock (would deadlock).
             existing = self.match(embedding)
             if existing.speaker_id is not None and existing.confidence >= self.high_threshold:
+                matched_profile = self._profiles.get(existing.speaker_id, {})
+                if matched_profile.get("enroll_method") == "anonymous_voice":
+                    # Upgrade the anonymous profile in-place: assign a real name
+                    # and update the enroll method. Preserves the Speaker{N} ID
+                    # so deferred-identity-binding can resolve it at consolidation.
+                    matched_profile["name"] = display_name
+                    matched_profile["enroll_method"] = method
+                    if embedding not in matched_profile["embeddings"]:
+                        matched_profile["embeddings"].append(embedding)
+                    self._invalidate_centroid(existing.speaker_id)
+                    self._save()
+                    logger.info(
+                        "Upgraded anonymous profile %s → named '%s'",
+                        existing.speaker_id,
+                        display_name,
+                    )
+                    return existing.speaker_id
+                # High-confidence match against a named profile — reject to prevent
+                # duplicate enrollment of the same voice under a different name.
                 logger.warning(
                     "Enrollment rejected: voice already enrolled as '%s' (id=%s, conf=%.2f)",
                     existing.name,
@@ -410,6 +439,85 @@ class SpeakerStore:
         logger.info(
             "Enrolled speaker: %s (id=%s, %d-dim embedding)",
             display_name,
+            speaker_id,
+            len(embedding),
+        )
+        return speaker_id
+
+    def register_anonymous(self, embedding: list[float]) -> str:
+        """Register or retrieve a canonical anonymous speaker ID for a voice embedding.
+
+        Promotes an unrecognized-voice speaker to a stable ``Speaker{N}`` identifier
+        so their sessions flow through extraction, graph storage, and adapter training.
+        The ``Speaker{N}`` format uses BPE-stable tokens matching the proven ``graph{N}``
+        indexed-key convention.
+
+        Algorithm:
+        1. Call ``match(embedding)``: if a high-confidence (non-tentative) hit exists,
+           return that existing speaker_id — handles cross-session centroid recognition.
+        2. Otherwise allocate ``Speaker{N}`` (globally monotonic counter), create the
+           profile with ``enroll_method="anonymous_voice"``, increment the counter,
+           and persist.
+
+        The method is idempotent for the same embedding: after the first registration
+        the centroid matches on subsequent calls and step 1 returns the existing ID.
+
+        Args:
+            embedding: L2-normalized voice embedding from STT.
+
+        Returns:
+            Canonical speaker_id string (e.g. ``"Speaker0"``).
+
+        Raises:
+            Exception: Only if the underlying ``_save`` fails (disk full, permissions).
+                Callers should wrap in try/except and fall back to anonymous on error.
+        """
+        if not embedding:
+            raise ValueError("register_anonymous requires a non-empty embedding")
+
+        # Step 1: check if the voice already has a profile.
+        # Tentative matches against anonymous profiles are reused to avoid
+        # split-identity across sessions with slightly varying voice embeddings.
+        # Tentative matches against named profiles allocate a new Speaker{N} to
+        # protect named-profile centroids from ambiguous-voice contamination.
+        existing = self.match(embedding)
+        if existing.speaker_id is not None:
+            if not existing.tentative:
+                # High-confidence match — always reuse.
+                return existing.speaker_id
+            # Tentative match: reuse only if the matched profile is anonymous.
+            matched_method = self._profiles.get(existing.speaker_id, {}).get("enroll_method")
+            if matched_method == "anonymous_voice":
+                return existing.speaker_id
+
+        # Step 2: allocate a new anonymous profile.
+        with self._lock:
+            # Re-check under lock to guard against concurrent registration of the
+            # same voice from two simultaneous requests.
+            existing_locked = self.match(embedding)
+            if existing_locked.speaker_id is not None:
+                if not existing_locked.tentative:
+                    return existing_locked.speaker_id
+                # Tentative: reuse anonymous, fall through for named.
+                matched_method_locked = self._profiles.get(existing_locked.speaker_id, {}).get(
+                    "enroll_method"
+                )
+                if matched_method_locked == "anonymous_voice":
+                    return existing_locked.speaker_id
+
+            speaker_id = f"Speaker{self._next_anon_index}"
+            self._next_anon_index += 1
+            self._profiles[speaker_id] = {
+                "name": speaker_id,
+                "embeddings": [embedding],
+                "preferred_language": "",
+                "enroll_method": "anonymous_voice",
+            }
+            self._invalidate_centroid(speaker_id)
+            self._save()
+
+        logger.info(
+            "Registered anonymous speaker: %s (%d-dim embedding)",
             speaker_id,
             len(embedding),
         )
