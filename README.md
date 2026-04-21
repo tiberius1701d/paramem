@@ -12,7 +12,14 @@ Personal AI agents need persistent memory. Current approaches — RAG, text-base
 
 ParaMem takes a different approach inspired by biological memory consolidation. Session experiences are extracted into a knowledge graph, converted to QA training pairs, and compressed into LoRA adapter weights through replay-and-consolidation cycles. The model *learns* your facts — they become part of its parameters, not entries in a database.
 
-The core mechanism is **indexed key retrieval**: each fact gets a unique key (`graph1`, `graph2`, ...) and the adapter learns to recall the exact QA pair when prompted with that key. A SimHash registry provides hallucination detection — the system knows what it knows and rejects queries for facts it hasn't learned.
+The core mechanism is **indexed key retrieval**: each fact gets a unique key (`graph1`, `graph2`, ...) and the adapter learns to recall the exact QA pair when prompted with that key. A SimHash registry provides hallucination detection — the system knows what it knows and rejects queries for facts it hasn't learned. At inference, the full pipeline is **enumerate → reconstruct → reason**: the adapter surfaces every fact under its key, the recalled facts become explicit context, and the base model reasons over them.
+
+## Status
+
+- **Scale:** 550/550 keys at 100% recall on Mistral 7B (rank 8, 56 consolidation cycles, 11 characters, 280 sessions). No ceiling indicator in the training signal — run paused at 550, not stopped.
+- **Live deployment:** Running as a Home Assistant conversation agent on WSL2 + RTX 5070, with local Whisper STT, pyannote speaker identification, Piper / MMS-TTS, and tri-path routing (parametric memory → HA tools → SOTA cloud).
+- **Pipeline:** 7-stage privacy-aware extraction (local extract → anonymize → SOTA enrichment with brace-binding → de-anonymize → plausibility → transcript-grounding gate), graph-level SOTA enrichment at full consolidation, anti-confabulation voice prompt, deferred identity binding with BPE-stable `Speaker{N}` placeholders.
+- **Crash safety:** epoch-level resume with SHA-256 fingerprint validation, Fernet-encrypted session snapshots, persistent post-session queue, systemd timer with `Persistent=true`.
 
 ## Key Results
 
@@ -20,24 +27,29 @@ The core mechanism is **indexed key retrieval**: each fact gets a unique key (`g
 
 | Test | Gemma 2 9B | Mistral 7B | Qwen 2.5 3B |
 |------|-----------|-----------|-------------|
-| Indexed recall at scale | 100/100 | 54/54 | 20/20 |
+| Indexed recall at tested scale | 100/100 at 100 keys | **550/550 at 550 keys** (no ceiling found, 56 cycles, 11 characters) | 20/20 at 20 keys |
+| Natural-language recall at 550 keys (41-cycle sweep, 21→550) | — | 100% keyed, 99.6% direct, overlap 0.995 | — |
 | Incremental learning (add 5, retrain all) | 15/15 | 15/15 | 15/15 |
-| Contradiction resolution (16 fact updates) | 16/16 | 16/16 | — |
+| Contradiction resolution (persistent adapter, 10 fact updates + 6 controls) | 16/16 current recall, 0 forgetting, overwrite in 1 cycle | 16/16 current recall, 0 forgetting, overwrite in 1 cycle | — |
+| Multi-session pipeline (10 sessions, 30 facts) | 30/30 | 30/30 | — |
 | Consolidation loop (10 cycles) | 100% | 100% | 100% |
-| PM vs RAG reasoning quality (embedding sim.) | 0.687 vs 0.679 | 0.566 vs 0.525 | — |
+| Warm-start consolidation (answer-swap on 40 of 200 keys) | — | 40/40 at epoch 15, stable by 18 | — |
+| PM vs RAG reasoning quality (same context, embedding sim.) | 0.687 vs 0.679 | 0.566 vs 0.525 | — |
 | Full replay: recall after 5 add cycles | 44/45 | 45/45 | — |
-| Hallucination detection (SimHash registry) | 5/5 blocked | 5/5 blocked | 5/5 blocked |
+| Hallucination detection (SimHash registry, untrained keys) | 5/5 blocked | 5/5 blocked | 5/5 blocked |
 
-*— = not tested (Qwen 2.5 3B is a base model without structured output capability, used only for development experiments with pre-defined QA pairs)*
+*— = not tested. Qwen 2.5 3B is a base model without structured-output capability and is used only for development experiments over pre-defined QA pairs (no graph extraction).*
 
 **What doesn't:**
 
 | Test | Gemma 2 9B | Mistral 7B |
 |------|-----------|-----------|
-| No replay: old key survival after 5 add cycles | 4/40 | 0/40 |
-| Adapter composition (additive or merged) | fails | fails |
+| No-replay incremental: old-key survival after 5 add cycles | 4/40 | 0/40 |
+| Adapter composition (additive — both adapters active) | 0/50 persona A, 1/50 persona B | 0/50 persona A, 1/50 persona B |
+| Adapter weight merging (`[0.5, 0.5]`) | 0/50, 1/50 | 0/50, 1/50 |
+| Grokking at rank 8 (1,590 epochs, constant LR, WD=0.1) | — | not observed — shortcut baseline strictly beats 3-hop at every checkpoint |
 
-All experiments run on a single RTX 5070 (8GB VRAM) using QLoRA 4-bit quantization.
+All experiments run on a single RTX 5070 Laptop (8 GB VRAM, 60 W TGP) using QLoRA 4-bit quantization. Adapter size is fixed at 27 MB independent of key count.
 
 ## Architecture
 
@@ -333,10 +345,9 @@ A custom conversation agent for Home Assistant is included in `custom_components
 ParaMem includes a local voice pipeline for privacy-first operation:
 
 - **Local STT:** Whisper distil-large-v3 on GPU via Wyoming protocol (port 10300). CPU fallback: distil-small.en.
-- **Speaker identification:** Pyannote 512-dim voice embeddings. Multi-embedding profiles with L2-normalized centroid matching for cross-device robustness. Auto-enrichment on confirmed matches.
-- **TTS to Sonos:** ESPHome voice satellites fire `esphome.tts_uri` events, HA automation routes to room-appropriate Sonos speaker via `media_player.play_media` with `announce: true`.
-
-Tested voice satellites: ReSpeaker Lite (living room), ESP32 S3 Box 3 (office).
+- **Speaker identification:** pyannote 512-dim voice embeddings. Multi-embedding profiles (up to 50 per speaker) with L2-normalized centroid matching for cross-device robustness. Auto-enrichment on confirmed matches. Deferred identity binding keeps anonymous utterances bound to a BPE-stable `Speaker{N}` placeholder until the speaker discloses a name, after which the graph is retro-claimed without a rewrite at training time (name resolves at render).
+- **Multilingual TTS:** Piper voices per language with MMS-TTS fallback; language detection on the response text, speaker binding so each speaker's preferred voice persists, routed to media players via HA.
+- **Anti-confabulation voice prompt:** a separate system prompt at the voice turn tells the model not to invent facts about the speaker when the parametric memory has nothing to say, and to fall through to the SOTA path cleanly.
 
 ## Data
 
@@ -373,24 +384,52 @@ See `benchmarking.md` → "Extraction Probe Sweep" for paired LME/PerLTQA result
 
 ## Extended Evaluation Suite
 
-Seven experiments validating the parametric memory mechanism. Each is a standalone script in `experiments/`.
+Standalone experiments in `experiments/`. Each writes timestamped results to `outputs/testN_*/{model}/{timestamp}/results.json`. See `benchmarking.md` for full protocols and per-cycle tables.
 
-| Test | What it measures |
-|------|------------------|
-| `test1_scale_expansion.py` | Recall at 10–100 keys with on-the-fly distillation |
-| `test2_contradictions.py` | Contradiction detection and resolution over time |
-| `test3_inference.py` | Reasoning quality parity with RAG |
-| `test4_reinforcement.py` | Cumulative train-delete-retrain robustness |
-| `test5_natural_recall.py` | Keyed vs natural recall gap (motivates key mechanism) |
-| `test6_footprint.py` | Storage footprint: adapter vs RAG index at scale |
-| `test7_second_persona.py` | Multi-persona generalization + isolation |
+**Core pipeline (Tests 1–7):**
+
+| Test | What it measures | Headline result |
+|------|------------------|-----------------|
+| `test1_scale_expansion` | Recall at 10–100 keys with on-the-fly distillation | 100/100 (Gemma), 54/54 (Mistral, extraction-capped) |
+| `test2_contradictions` | Temporal contradiction detection + resolution | All same-predicate contradictions detected |
+| `test2b_incremental_contradictions` | Persistent-adapter contradiction resolution | 16/16 current recall, overwrite in 1 cycle, 0 forgetting |
+| `test3_inference` | Reasoning quality parity with RAG | PM ≥ RAG under equivalent context |
+| `test4_reinforcement` | Cumulative train-delete-retrain (10 sessions, 30 facts) | 30/30 both models |
+| `test4b_incremental_no_replay` | Incremental training without replay | 0–4/40 old-key survival — full replay required |
+| `test5_natural_recall` | Keyed vs natural-language recall | Keyed ≫ natural — motivates the key mechanism |
+| `test6_footprint` | Storage: adapter vs RAG index at scale | Adapter O(1) (27 MB), RAG linear |
+| `test7_second_persona` | Multi-persona generalization + isolation | Similar recall, minimal cross-contamination |
+| `test7b_merged_personas` | Adapter composition / weight merging | Fails for indexed-key recall (0–1/50) |
+
+**Scaling & boundaries (Tests 8–13):**
+
+| Test | What it measures | Headline result |
+|------|------------------|-----------------|
+| `test8_large_scale` | Full-pipeline scaling (extract → QA → train) | **550/550 at 550 keys**, Mistral 7B, 56 cycles, 11 characters, no ceiling |
+| `test9_natural_recall` | Natural recall emergence vs scale | 100% keyed / 99.6% direct at 550 keys, 41 cycles |
+| `test10_grokking` | 3-hop compositional generalization | No grokking through 1,590 epochs (constant LR, WD=0.1) |
+| `test10b_diverse_rephrase` | Surface-form generalization | Rephrasing hits plateau with scale |
+| `test11_adapter_extraction` | Graph extraction: adapter ON vs OFF | Base model extracts better; adapter must stay off for extraction |
+| `test13_journal_scaffold` | Placeholder → fill warm-start (A + B complete) | A: 199/200 fresh; B: 40/40 answer-swap at epoch 15 |
+
+**Consolidation-path experiments:**
+
+| Script | What it measures |
+|--------|------------------|
+| `f4_9c_test1_capacity.py` | Per-fact recall at 20 keys (Qwen dev) |
+| `f4_9c_test2_incremental.py` | 10 + 5 incremental (Qwen dev) |
+| `f4_9c_test3_two_adapter.py` | Episodic → semantic promotion (Qwen dev) |
+| `f4_10_indexed_consolidation.py` | 10-cycle consolidation loop (Qwen dev) |
+| `weight_diff_analysis.py` | Weight-landscape perturbation per single key added |
+| `dataset_probe.py` | End-to-end pipeline diagnostics on PerLTQA / LongMemEval |
 
 ```bash
 # Run a single test
 python experiments/test1_scale_expansion.py --model gemma
-```
 
-Results are saved to `outputs/testN_*/{model}/{timestamp}/results.json`.
+# Full-pipeline scaling run (resumable via tpause / tresume)
+python experiments/test8_large_scale.py --model mistral
+```
 
 ## Paper
 
