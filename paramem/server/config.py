@@ -220,7 +220,7 @@ class VoiceConfig:
             return self.system_prompt
         return (
             "You are a personal memory assistant. Answer concisely in 1-2 spoken sentences. "
-            "Speak naturally as if you simply remember."
+            "Use only facts that appear in the context above. Never invent personal details."
         )
 
 
