@@ -183,6 +183,22 @@ echo "======================================="
 echo ""
 
 # ========================================================================
+# Cleanup on exit — undo HA side-effects triggered during the test
+# (music started in §8, kitchen lights turned on in §6). Runs on any
+# exit path including failure. Silent; best-effort.
+# ========================================================================
+cleanup_ha_state() {
+    [ -n "${SERVER:-}" ] || return 0
+    curl -sf -m 10 -X POST "$SERVER/chat" \
+        -H "Content-Type: application/json" \
+        -d '{"text":"Stop the music","conversation_id":"cleanup-'$$'"}' >/dev/null 2>&1 || true
+    curl -sf -m 10 -X POST "$SERVER/chat" \
+        -H "Content-Type: application/json" \
+        -d '{"text":"Turn off the kitchen lights","conversation_id":"cleanup-'$$'"}' >/dev/null 2>&1 || true
+}
+trap cleanup_ha_state EXIT
+
+# ========================================================================
 # Prerequisites
 # ========================================================================
 echo "--- Prerequisites ---"
@@ -344,10 +360,89 @@ else
 fi
 
 # ========================================================================
-# 9. Status Endpoint Fields
+# 9. Abstention Short-Circuit
+# ========================================================================
+# Self-referential query + untrained adapter → canned response (no inference).
+# Gate on local mode + keys=0 so "no PA match" is guaranteed; otherwise the
+# router might legitimately answer from the adapter and skip the branch.
+echo ""
+echo "--- 9. Abstention Short-Circuit ---"
+if [ "$mode" = "local" ] && [ "$keys" -eq 0 ]; then
+    abstention_resp=$(python3 -c "
+import yaml
+with open('configs/server.yaml') as f:
+    c = yaml.safe_load(f) or {}
+a = c.get('abstention', {}) or {}
+if a.get('enabled', True):
+    print(a.get('response', \"I don't have that information stored yet.\"))
+" 2>/dev/null)
+
+    if [ -z "$abstention_resp" ]; then
+        skip "abstention: self-referential query" "abstention disabled in config"
+    else
+        start_ms=$(($(date +%s%N) / 1000000))
+        ab_resp=$(curl -sf -X POST "$SERVER/chat" \
+            -H "Content-Type: application/json" \
+            -d '{"text":"Where do I live?","conversation_id":"abstention-test-'$$'","speaker":"TestUser"}' 2>/dev/null) || {
+            echo "  FAIL  abstention: self-referential — server unreachable"
+            FAIL=$((FAIL + 1))
+            ab_resp=""
+        }
+        end_ms=$(($(date +%s%N) / 1000000))
+        elapsed=$(( end_ms - start_ms ))
+
+        if [ -n "$ab_resp" ]; then
+            ab_text=$(echo "$ab_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('text',''))" 2>/dev/null)
+            ab_esc=$(echo "$ab_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('escalated', False))" 2>/dev/null)
+
+            if [ "$ab_text" = "$abstention_resp" ] && [ "$ab_esc" = "False" ]; then
+                # Deterministic short-circuit bypasses model inference — expect sub-second.
+                if [ "$elapsed" -lt 1000 ]; then
+                    echo "  PASS  abstention: self-referential query (${elapsed}ms, short-circuit)"
+                else
+                    echo "  PASS  abstention: self-referential query (${elapsed}ms, slow but correct)"
+                fi
+                log_verbose "response: $ab_text"
+                PASS=$((PASS + 1))
+            else
+                echo "  FAIL  abstention: self-referential query (${elapsed}ms)"
+                echo "        expected text: $abstention_resp  escalated=False"
+                echo "        got text:      $ab_text  escalated=$ab_esc"
+                FAIL=$((FAIL + 1))
+            fi
+        fi
+
+        # Anonymous speaker: speaker=null. speaker_id is sufficient for
+        # attribution per deferred-identity-binding design; the short-circuit
+        # must still fire without a disclosed name.
+        anon_resp=$(curl -sf -X POST "$SERVER/chat" \
+            -H "Content-Type: application/json" \
+            -d '{"text":"What is my birthday?","conversation_id":"abstention-anon-'$$'","speaker":null}' 2>/dev/null)
+        if [ -n "$anon_resp" ]; then
+            anon_text=$(echo "$anon_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('text',''))" 2>/dev/null)
+            if [ "$anon_text" = "$abstention_resp" ]; then
+                echo "  PASS  abstention: anonymous speaker"
+                PASS=$((PASS + 1))
+            else
+                echo "  FAIL  abstention: anonymous speaker"
+                echo "        expected: $abstention_resp"
+                echo "        got:      $anon_text"
+                FAIL=$((FAIL + 1))
+            fi
+        else
+            echo "  FAIL  abstention: anonymous speaker — server unreachable"
+            FAIL=$((FAIL + 1))
+        fi
+    fi
+else
+    skip "abstention short-circuit" "requires local mode + keys=0 (mode=$mode, keys=$keys)"
+fi
+
+# ========================================================================
+# 10. Status Endpoint Fields
 # ========================================================================
 echo ""
-echo "--- 9. Status Endpoint ---"
+echo "--- 10. Status Endpoint ---"
 status_ok=$(echo "$status" | python3 -c "
 import sys, json
 s = json.load(sys.stdin)
