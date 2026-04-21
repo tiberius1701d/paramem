@@ -65,7 +65,8 @@ TRANSCRIPT = (
 
 # Probe exercises two subject shapes through the same prompt machinery:
 #   - anonymous opaque id ("Speaker7"), which must survive as a literal subject
-#     so the Slice-3 alias map has a rewritable anchor in the graph;
+#     so bridge-window triples (extract-before-disclosure) stay attributable to
+#     a stable grouping ID that store.get_name() can resolve at render time;
 #   - real first name ("Alice"), the production case — any regression here
 #     would silently break named-speaker extraction across all of Slice 2.
 SUBJECT_ANON = "Speaker7"
