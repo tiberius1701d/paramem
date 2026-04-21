@@ -82,6 +82,8 @@ _state = {
     "last_consolidation": None,
     "background_trainer": None,
     "reclaim_task": None,
+    "config_path": None,
+    "config_drift_task": None,
     "post_session_queue": None,  # PostSessionQueue instance (local mode only)
     "mode": "local",  # "local" or "cloud-only"
     "cloud_only_reason": None,  # "explicit", "training", "gpu_conflict", or None
@@ -198,6 +200,10 @@ class StatusResponse(BaseModel):
     # start/end: "HH:MM" local (populated for all modes, consumed only when mode=auto)
     # currently_throttling: true iff the thermal throttle is active right now
     thermal_policy: dict = {}
+    # Config drift state: {detected, loaded_hash, disk_hash, last_checked_at}.
+    # Populated after startup; empty dict when server started without a config path
+    # (cloud-only test mode).
+    config_drift: dict = {}
 
 
 class ConsolidateResponse(BaseModel):
@@ -211,6 +217,11 @@ class ConsolidateResponse(BaseModel):
 async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
     config = _state["config"]
+
+    from paramem.server.drift import drift_poll_loop, initial_drift_state
+
+    if _state.get("config_path"):
+        _state["config_drift"] = initial_drift_state(Path(_state["config_path"]))
 
     # cloud_only is enabled if ANY of the following is true:
     #   1. --cloud-only CLI flag was passed at startup.
@@ -678,6 +689,10 @@ async def lifespan(app: FastAPI):
     if not cloud_only and config.speaker.enabled:
         idle_timeout = config.speaker.enrollment_idle_timeout
         _state["enrollment_task"] = asyncio.create_task(_enrollment_idle_loop(idle_timeout))
+    if _state.get("config_path"):
+        _state["config_drift_task"] = asyncio.create_task(
+            drift_poll_loop(Path(_state["config_path"]), _state)
+        )
 
     # Startup diagnostic: surface any in-flight training state left by a
     # prior interrupted run.  The actual resume happens when the next
@@ -772,10 +787,12 @@ async def lifespan(app: FastAPI):
     if store:
         store.flush()
 
-    if _state["reclaim_task"]:
+    if _state.get("reclaim_task"):
         _state["reclaim_task"].cancel()
     if _state.get("enrollment_task"):
         _state["enrollment_task"].cancel()
+    if _state.get("config_drift_task"):
+        _state["config_drift_task"].cancel()
     wyoming_server = _state.get("wyoming_server")
     if wyoming_server is not None:
         wyoming_server.stop()
@@ -1408,6 +1425,7 @@ async def status():
         pending_enrollments=len(_state.get("pending_enrollments") or []),
         scheduler_started=scheduler_active,
         adapter_health=adapter_health,
+        config_drift=_state.get("config_drift", {}),
     )
 
 
@@ -2279,6 +2297,7 @@ def main():
 
     config = load_server_config(args.config)
     _state["config"] = config
+    _state["config_path"] = args.config
     _state["cloud_only_startup"] = args.cloud_only
     _state["defer_model"] = args.defer_model
 
