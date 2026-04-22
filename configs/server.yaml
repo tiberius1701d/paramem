@@ -375,16 +375,45 @@ tts:
       # device: cpu            # per-voice override (default: inherit from tts.device)
 
 # ============================================================================
-# SECURITY — BACKUP SETTINGS (Slice 3b.2)
+# SECURITY — BACKUP SETTINGS (Slice 3b.2 + Slice 6a)
 # ============================================================================
-# Uncomment to override the default orphan-sweep window for migration crash
-# recovery.  The orphan sweep deletes pre-migration backup slots written by
-# a crashed /migration/confirm step 2 (backup created but rename never ran)
-# when the backup's pre_trial_hash matches the live config and the backup
-# was created within this many hours of the server restart.
+# orphan_sweep (Slice 3b.2): max age in hours for crashed pre-migration
+# backup slots. 0 disables orphan sweep entirely. Default 24.
 #
-# Default: 24 hours.  Set to 0 to disable orphan sweep entirely.
+# retention (Slice 6a): per-tier retention budget. Spec rules apply in this
+# precedence (strongest first):
+#   1. max_total_disk_gb — global cap across all tiers; new backups refused
+#      when reached, DISK PRESSURE alert raised at 80% of cap.
+#   2. per-tier max_disk_gb (e.g. manual) — same behaviour scoped to tier.
+#   3. tier `keep` counts — oldest-within-tier pruned first.
+#   4. pre_migration entries within last 30 days are immune from rule 3.
+#   5. manual entries are immune from time + count pruning, subject to 1+2.
+# Live A-backup slots referenced by state/trial.json are NEVER pruned while
+# TRIAL is active (immunity is unconditional — outranks every rule).
+#
+# schedule: "daily HH:MM" / "every Nh" / "every Nm" / "off". Same grammar
+# as consolidation.refresh_cadence. "off" disables the scheduled backup
+# timer entirely (manual backups via CLI still work — see Slice 6b).
+#
+# artifacts: subset of [config, graph, registry]. Each element becomes a
+# slot directory under data/ha/backups/<artifact>/<ts>/.
+#
+# max_total_disk_gb: global cap. The retention engine enforces rules 2+3+4+5
+# against this; the runner enforces rule 1 (write refusal at 100%).
+#
+# Defaults shown below. Uncomment to override.
 # security:
 #   backups:
 #     orphan_sweep:
 #       max_age_hours: 24
+#     retention:
+#       daily:         { keep: 7 }
+#       weekly:        { keep: 4 }
+#       monthly:       { keep: 12 }
+#       yearly:        { keep: 3 }
+#       pre_migration: { keep: 10 }
+#       trial_adapter: { keep: 5 }
+#       manual:        { keep: "unlimited", max_disk_gb: 5 }
+#     schedule: "daily 04:00"
+#     artifacts: [config, graph, registry]
+#     max_total_disk_gb: 20

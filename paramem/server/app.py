@@ -158,6 +158,47 @@ class ChatResponse(BaseModel):
     follow_up: str | None = None  # Server-initiated follow-up (e.g. introduction)
 
 
+class BackupBlock(BaseModel):
+    """Backup subsystem state for /status.  Spec §L485–500 (Slice 6a).
+
+    All fields default to ``None`` / ``0`` / ``False`` so a never-run server
+    (no ``state/backup.json``) still serialises a valid block.
+
+    Attributes
+    ----------
+    schedule:
+        The configured backup schedule string (e.g. ``"daily 04:00"``).  Added
+        beyond the spec to let pstatus choose the rendering branch without
+        re-fetching the config.
+    last_success_at:
+        ISO-8601 UTC timestamp of the most recent successful backup run.
+    last_failure_at:
+        ISO-8601 UTC timestamp of the most recent failed backup run.
+    last_failure_reason:
+        Short error string from the most recent failure.
+    next_scheduled_at:
+        ISO-8601 UTC timestamp of the next scheduled run (read from the live
+        systemd timer state).
+    stale:
+        ``True`` when ``last_success_at`` is older than 2× the configured
+        cadence interval.  Always ``False`` when ``schedule="off"`` or
+        ``last_success_at is None``.
+    disk_used_bytes:
+        Total bytes used across all backup slots.
+    disk_cap_bytes:
+        Global disk cap in bytes (``max_total_disk_gb * 1024**3``).
+    """
+
+    schedule: str = ""
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
+    last_failure_reason: str | None = None
+    next_scheduled_at: str | None = None
+    stale: bool = False
+    disk_used_bytes: int = 0
+    disk_cap_bytes: int = 0
+
+
 class StatusResponse(BaseModel):
     model: str
     # Full HF model identifier (e.g. "mistralai/Mistral-7B-Instruct-v0.3").
@@ -259,6 +300,9 @@ class StatusResponse(BaseModel):
     #   gates          : copy of _state["migration"]["trial"]["gates"], or None
     #   comparison     : {"rendered": bool, "flags": list[str]} or None
     migration: dict = {}
+    # Backup subsystem state (Slice 6a). Always present; fields default to
+    # None/0/False when no scheduled backup has run yet.
+    backup: BackupBlock = BackupBlock()
     # ISO-8601 UTC timestamp of when the server process started (Slice 5a Fix 2).
     # Required so pstatus can render the "applied <YYYY-MM-DD>" part of the
     # Migrate footer (spec L458).
@@ -1309,6 +1353,20 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
 
+    # Reconcile the scheduled-backup timer (Slice 6a).
+    from paramem.backup import timer as backup_timer
+
+    backup_schedule = config.security.backups.schedule or ""
+    try:
+        backup_msg = backup_timer.reconcile(
+            backup_schedule,
+            python_path=sys.executable,
+            project_root=str(Path(__file__).resolve().parent.parent.parent),
+        )
+        logger.info("%s", backup_msg)
+    except Exception:
+        logger.exception("Failed to reconcile backup timer — continuing without scheduled backups")
+
     # Graceful shutdown: save encrypted session snapshot before exit.
     # SIGUSR1 (GPU release for training) and SIGTERM (systemd stop) both
     # trigger a snapshot so unconsolidated conversations survive restarts.
@@ -2094,6 +2152,95 @@ async def status():
 
     hold_block = _get_hold_state()
 
+    # Slice 6a — Backup block.  Reads state/backup.json (written by the runner),
+    # computes current disk usage, derives next-scheduled-at and stale flag.
+    # The entire block is guarded: a MagicMock config (used in unit tests) or
+    # any transient I/O error must not crash /status — fall back to an empty
+    # default BackupBlock instead.
+    backup_block = BackupBlock()
+    try:
+        from paramem.backup import retention as _backup_retention
+        from paramem.backup import state as _backup_state
+        from paramem.backup import timer as _backup_timer
+        from paramem.backup.timer import _backup_timer_interval_seconds
+
+        _backups_root = (config.paths.data / "backups").resolve()
+        _state_dir = (config.paths.data / "state").resolve()
+
+        # Read persisted runner state — None when no run has ever happened.
+        _backup_record = None
+        try:
+            _backup_record = _backup_state.read_backup_state(_state_dir)
+        except Exception:
+            logger.exception("Failed to read backup state — surfacing empty block")
+
+        # Disk usage — always fresh (TTL-cached in retention module).
+        _disk_used_bytes: int = 0
+        _disk_cap_bytes: int = 0
+        try:
+            _disk_usage = _backup_retention.compute_disk_usage(
+                _backups_root, config.security.backups
+            )
+            _disk_used_bytes = _disk_usage.total_bytes
+            _disk_cap_bytes = _disk_usage.cap_bytes
+        except Exception:
+            logger.exception("Failed to compute backup disk usage — defaulting to 0")
+            try:
+                _disk_cap_bytes = int(config.security.backups.max_total_disk_gb * 1024**3)
+            except Exception:
+                _disk_cap_bytes = 0
+
+        # Next scheduled — read from the live backup timer state when installed.
+        _backup_timer_state = _backup_timer.cached_timer_state(max_age_seconds=5)
+        _next_scheduled_at: str | None = None
+        _next_us = _backup_timer_state.get("next_elapse_us") or ""
+        if str(_next_us).isdigit():
+            _next_epoch = int(_next_us) / 1_000_000
+            if _next_epoch - time.time() < 3.15e9:  # sanity: within ~100 years
+                _next_scheduled_at = datetime.fromtimestamp(
+                    _next_epoch, tz=timezone.utc
+                ).isoformat()
+
+        # Stale — last success older than 2× cadence interval.  False when
+        # schedule=off or last_success_at is None.
+        _raw_schedule = config.security.backups.schedule
+        _schedule_str = (str(_raw_schedule) if _raw_schedule else "").strip().lower()
+        _stale = False
+        if (
+            _backup_record
+            and _backup_record.last_success_at
+            and _schedule_str
+            not in (
+                "",
+                "off",
+                "disabled",
+                "none",
+            )
+        ):
+            _interval_s = _backup_timer_interval_seconds(_schedule_str)
+            if _interval_s and _interval_s > 0:
+                try:
+                    _last_ok = datetime.fromisoformat(_backup_record.last_success_at)
+                    if _last_ok.tzinfo is None:
+                        _last_ok = _last_ok.replace(tzinfo=timezone.utc)
+                    _age = (datetime.now(timezone.utc) - _last_ok).total_seconds()
+                    _stale = _age > 2 * _interval_s
+                except Exception:
+                    pass  # malformed timestamp — leave stale=False
+
+        backup_block = BackupBlock(
+            schedule=str(_raw_schedule) if _raw_schedule else "",
+            last_success_at=_backup_record.last_success_at if _backup_record else None,
+            last_failure_at=_backup_record.last_failure_at if _backup_record else None,
+            last_failure_reason=(_backup_record.last_failure_reason if _backup_record else None),
+            next_scheduled_at=_next_scheduled_at,
+            stale=_stale,
+            disk_used_bytes=_disk_used_bytes,
+            disk_cap_bytes=_disk_cap_bytes,
+        )
+    except Exception:
+        logger.exception("Failed to build backup block — returning empty default")
+
     return StatusResponse(
         model=config.model_name,
         model_id=model_id,
@@ -2141,6 +2288,7 @@ async def status():
         config_drift=_state.get("config_drift", {}),
         attention=attention_block,
         migration=migration_block,
+        backup=backup_block,
         hold=hold_block,
         server_started_at=_state.get("server_started_at", ""),
     )

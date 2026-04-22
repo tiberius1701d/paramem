@@ -134,14 +134,56 @@ class OrphanSweepConfig:
 
 
 @dataclass
-class ServerBackupsConfig:
-    """Sub-config for backup-related security settings (Slice 3b.2 subset).
+class RetentionTierConfig:
+    """Per-tier retention knobs (Slice 6a).
 
-    Merged into ``SecurityConfig`` chain as ``security.backups``.  Retention
-    policy (Slice 6) will add more fields here.
+    Attributes
+    ----------
+    keep:
+        Maximum slots to retain in the tier (oldest pruned first).  Integer,
+        or the literal string ``"unlimited"`` for tiers like ``manual`` that
+        should never be time-pruned.  ``0`` disables emission for the tier
+        (runner skips writing; existing slots are treated as obsolete and
+        pruned by ``prune()``).
+    max_disk_gb:
+        Optional per-tier disk cap (``None`` = no per-tier cap).  When set
+        and exceeded, oldest-first slots within the tier are pruned regardless
+        of ``keep``.  Spec §L572 (rule 2).
+    """
+
+    keep: int | str = 7  # int OR Literal["unlimited"]; YAML loader coerces
+    max_disk_gb: float | None = None
+
+
+@dataclass
+class RetentionConfig:
+    """Per-tier retention configuration.  Spec §L552–566 (Slice 6a)."""
+
+    daily: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=7))
+    weekly: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=4))
+    monthly: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=12))
+    yearly: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=3))
+    pre_migration: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=10))
+    trial_adapter: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=5))
+    manual: RetentionTierConfig = field(
+        default_factory=lambda: RetentionTierConfig(keep="unlimited", max_disk_gb=5.0)
+    )
+
+
+@dataclass
+class ServerBackupsConfig:
+    """Sub-config for security.backups.  Slice 3b.2 introduced ``orphan_sweep``;
+    Slice 6a adds ``retention``, ``schedule``, ``artifacts``, and
+    ``max_total_disk_gb``.
+
+    Merged into ``SecurityConfig`` chain as ``security.backups``.
     """
 
     orphan_sweep: OrphanSweepConfig = field(default_factory=OrphanSweepConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
+    schedule: str = "daily 04:00"  # "off" disables scheduled backups
+    artifacts: list[str] = field(default_factory=lambda: ["config", "graph", "registry"])
+    max_total_disk_gb: float = 20.0  # global cap across all tiers (spec §L566, L571)
 
 
 @dataclass
@@ -817,13 +859,75 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             if isinstance(voice_data, dict):
                 config.tts.voices[lang_code] = TTSVoiceConfig(**voice_data)
 
-    # Security — nested: security.backups.orphan_sweep.max_age_hours
+    # Security — nested: security.backups.{orphan_sweep, retention, schedule,
+    # artifacts, max_total_disk_gb}  (Slice 3b.2 + Slice 6a)
     security_raw = raw.get("security") or {}
     backups_raw = security_raw.get("backups") or {}
+
+    # orphan_sweep — preserved from Slice 3b.2
     orphan_raw = backups_raw.get("orphan_sweep") or {}
-    if orphan_raw:
-        config.security = SecurityConfig(
-            backups=ServerBackupsConfig(orphan_sweep=OrphanSweepConfig(**orphan_raw))
+    orphan_cfg = OrphanSweepConfig(**orphan_raw) if orphan_raw else OrphanSweepConfig()
+
+    # retention — per-tier dict; coerce keep="unlimited" string verbatim,
+    # coerce numeric keep to int, coerce max_disk_gb to float when set.
+    retention_raw = backups_raw.get("retention") or {}
+    retention_cfg = RetentionConfig()
+    for _tier_name in (
+        "daily",
+        "weekly",
+        "monthly",
+        "yearly",
+        "pre_migration",
+        "trial_adapter",
+        "manual",
+    ):
+        _tier_raw = retention_raw.get(_tier_name)
+        if _tier_raw is None:
+            continue
+        _keep = _tier_raw.get("keep", getattr(retention_cfg, _tier_name).keep)
+        _max_disk_gb = _tier_raw.get("max_disk_gb")
+        if isinstance(_keep, str) and _keep != "unlimited":
+            try:
+                _keep = int(_keep)
+            except ValueError:
+                raise ValueError(
+                    f"security.backups.retention.{_tier_name}.keep must be int "
+                    f'or "unlimited"; got {_keep!r}'
+                ) from None
+        elif isinstance(_keep, float):
+            _keep = int(_keep)
+        setattr(
+            retention_cfg,
+            _tier_name,
+            RetentionTierConfig(
+                keep=_keep,
+                max_disk_gb=float(_max_disk_gb) if _max_disk_gb is not None else None,
+            ),
         )
+
+    schedule = backups_raw.get("schedule", "daily 04:00")
+    artifacts = list(backups_raw.get("artifacts", ["config", "graph", "registry"]))
+    max_total_disk_gb = float(backups_raw.get("max_total_disk_gb", 20.0))
+
+    # Validate artifacts — must be non-empty subset of {config, graph, registry}.
+    _valid_artifacts = {"config", "graph", "registry"}
+    for _art in artifacts:
+        if _art not in _valid_artifacts:
+            raise ValueError(
+                f"security.backups.artifacts: invalid entry {_art!r}; "
+                f"must be a subset of {sorted(_valid_artifacts)}"
+            )
+    if not artifacts:
+        raise ValueError(f"security.backups.artifacts must be non-empty; got {artifacts!r}")
+
+    config.security = SecurityConfig(
+        backups=ServerBackupsConfig(
+            orphan_sweep=orphan_cfg,
+            retention=retention_cfg,
+            schedule=schedule,
+            artifacts=artifacts,
+            max_total_disk_gb=max_total_disk_gb,
+        )
+    )
 
     return config

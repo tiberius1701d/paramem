@@ -243,6 +243,20 @@ print("MIGRATE\t{}\t{}\t{}".format(
     _config_rev,
     _applied_date,
 ))
+# Slice 6a — Backup footer: BACKUP<TAB>schedule<TAB>last_success_at<TAB>
+#   last_failure_at<TAB>last_failure_reason<TAB>next_scheduled_at<TAB>
+#   stale<TAB>disk_used_bytes<TAB>disk_cap_bytes
+_b = d.get("backup") or {}
+print("BACKUP\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}".format(
+    _b.get("schedule") or "",
+    _b.get("last_success_at") or "",
+    _b.get("last_failure_at") or "",
+    (_b.get("last_failure_reason") or "").replace("\t", " ").replace("\n", " "),
+    _b.get("next_scheduled_at") or "",
+    "true" if _b.get("stale") else "false",
+    int(_b.get("disk_used_bytes") or 0),
+    int(_b.get("disk_cap_bytes") or 0),
+))
 PY
 )
 
@@ -631,6 +645,62 @@ if [[ "$tts_loaded" == "True" ]]; then
     echo -e "  TTS:      ${GREEN}loaded${RESET} (${tts_engine_prefix}${tts_languages} on ${tts_dev_tag})"
 else
     echo -e "  TTS:      ${DIM}not loaded${RESET}"
+fi
+
+# Slice 6a — Backup footer (spec §L457). Always rendered when the line is
+# present; edge cases pick distinct messages.
+backup_line=$(echo "$parsed" | awk '/^BACKUP\t/' | head -1)
+if [[ -n "$backup_line" ]]; then
+    IFS=$'\t' read -r _bm \
+        bk_schedule bk_last_ok bk_last_fail bk_fail_reason \
+        bk_next bk_stale bk_used_bytes bk_cap_bytes \
+        <<< "$backup_line"
+
+    # Prettier byte counts: GB with one decimal.
+    fmt_gb() {
+        python3 -c "import sys; b=int(sys.argv[1]); print(f'{b/1024**3:.1f}')" "$1" 2>/dev/null || echo "?"
+    }
+    bk_used_gb=$(fmt_gb "${bk_used_bytes:-0}")
+    bk_cap_gb=$(fmt_gb "${bk_cap_bytes:-0}")
+
+    # Compact ISO timestamps to "YYYY-MM-DD HH:MM" for display.
+    fmt_ts() {
+        if [[ -z "$1" ]]; then echo ""; else
+            echo "$1" | sed 's/T/ /; s/:[0-9][0-9]\(\.[0-9]*\)\?\(Z\|+.*\)\?$//'
+        fi
+    }
+    bk_last_ok_disp=$(fmt_ts "$bk_last_ok")
+    bk_last_fail_disp=$(fmt_ts "$bk_last_fail")
+    bk_next_disp=$(fmt_ts "$bk_next")
+
+    case "$bk_schedule" in
+        ""|off|disabled|none)
+            echo -e "  Backup:   ${DIM}scheduled backups disabled${RESET}"
+            ;;
+        *)
+            # Failure-newer-than-success → red FAILED line.
+            if [[ -n "$bk_last_fail" && ( -z "$bk_last_ok" || "$bk_last_fail" > "$bk_last_ok" ) ]]; then
+                echo -e "  Backup:   ${RED}FAILED ${bk_last_fail_disp} — ${bk_fail_reason}${RESET}"
+            elif [[ -z "$bk_last_ok" ]]; then
+                # Never run.
+                if [[ -n "$bk_next_disp" ]]; then
+                    echo -e "  Backup:   ${DIM}never run — timer fires at ${bk_next_disp}${RESET}"
+                else
+                    echo -e "  Backup:   ${DIM}never run${RESET}"
+                fi
+            elif [[ "$bk_stale" == "true" ]]; then
+                # Yellow STALE.
+                echo -e "  Backup:   ${YELLOW}STALE — last ok ${bk_last_ok_disp}, next ${bk_next_disp}${RESET}"
+            else
+                # Normal-state: last ok (schedule), next, disk tag.
+                disk_tag=""
+                if [[ "$bk_cap_gb" != "0.0" && -n "$bk_cap_gb" ]]; then
+                    disk_tag=" ${DIM}(${bk_used_gb}/${bk_cap_gb} GB)${RESET}"
+                fi
+                echo -e "  Backup:   last ok ${CYAN}${bk_last_ok_disp}${RESET} (${bk_schedule}), next ${CYAN}${bk_next_disp}${RESET}${disk_tag}"
+            fi
+            ;;
+    esac
 fi
 
 # Windows Update lock (read-only check — no elevation)
