@@ -41,6 +41,10 @@ class TestDestructiveSamples:
             "cloud_only",
             "snapshot_key",
             "adapters.episodic.target_modules",  # extension field
+            # Condition 1: alpha has identical blast radius to rank — Destructive.
+            "adapters.episodic.alpha",
+            "adapters.semantic.alpha",
+            "adapters.procedural.alpha",
         ]
         for path in destructive_paths:
             assert classify(path) == Tier.DESTRUCTIVE, (
@@ -58,7 +62,6 @@ class TestPipelineAlteringSamples:
             "agents.sota.provider",
             "agents.sota_providers.anthropic.model",
             "debug",
-            "adapters.episodic.alpha",
         ]
         for path in pipeline_paths:
             assert classify(path) == Tier.PIPELINE_ALTERING, (

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Final, Iterator
+from typing import Any, Final, Iterator
 
 
 class Tier(Enum):
@@ -84,7 +84,7 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     # --- adapters (wildcard for any adapter name) ---
     "adapters.*.enabled": Tier.DESTRUCTIVE,
     "adapters.*.rank": Tier.DESTRUCTIVE,
-    "adapters.*.alpha": Tier.PIPELINE_ALTERING,
+    "adapters.*.alpha": Tier.DESTRUCTIVE,
     "adapters.*.learning_rate": Tier.PIPELINE_ALTERING,
     # Extension fields (not in shipped yaml — documented in config_impact.md)
     "adapters.*.target_modules": Tier.DESTRUCTIVE,
@@ -184,6 +184,56 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
 }
 
 
+_DEFAULT_DYNAMIC_CONTAINERS: frozenset[str] = frozenset({"adapters", "sota_providers", "voices"})
+
+
+def walk_dict_leaves(
+    node: object,
+    *,
+    prefix: str = "",
+    dynamic_containers: frozenset[str] = _DEFAULT_DYNAMIC_CONTAINERS,
+) -> Iterator[tuple[str, Any]]:
+    """Yield ``(dotted_path, value)`` for every leaf in a nested dict.
+
+    This is the shared traversal helper used by both the tier-diff engine
+    (``paramem.server.migration._walk_leaves``) and the shipped-path enumerator
+    (``iter_shipped_paths``).  Extracting the logic here means a single change
+    keeps both consumers consistent.
+
+    Dynamic containers (``adapters``, ``sota_providers``, ``voices``) are
+    traversed using their concrete child names — e.g.
+    ``adapters.episodic.rank`` — not a wildcard form.  The :func:`classify`
+    function handles wildcard expansion internally.
+
+    Parameters
+    ----------
+    node:
+        The current YAML node (dict, list, or scalar).
+    prefix:
+        Accumulated dotted-path prefix.  Pass ``""`` at the root call.
+    dynamic_containers:
+        Names of container keys whose children are concrete dynamic names
+        (not sub-keys of the parent schema).  Defaults to
+        ``{"adapters", "sota_providers", "voices"}``.
+
+    Yields
+    ------
+    tuple[str, Any]
+        ``(dotted_path, value)`` for each leaf node in dict-insertion order.
+        Non-dict nodes at the root yield ``(prefix, node)`` directly.
+    """
+    if not isinstance(node, dict):
+        yield prefix, node
+        return
+    for key, value in node.items():
+        child = f"{prefix}.{key}" if prefix else key
+        parent_key = prefix.split(".")[-1] if prefix else ""
+        if parent_key in dynamic_containers or isinstance(value, dict):
+            yield from walk_dict_leaves(value, prefix=child, dynamic_containers=dynamic_containers)
+        else:
+            yield child, value
+
+
 def classify(dotted_path: str) -> Tier:
     """Return the migration tier for a dotted ``server.yaml`` path.
 
@@ -251,6 +301,8 @@ def iter_shipped_paths(server_yaml_path: Path) -> Iterator[str]:
       the wildcard form classifies each concrete name, not that the concrete
       form itself appears in :data:`CLASSIFICATION`.
 
+    Implemented as a thin wrapper around :func:`walk_dict_leaves`.
+
     Parameters
     ----------
     server_yaml_path:
@@ -266,21 +318,5 @@ def iter_shipped_paths(server_yaml_path: Path) -> Iterator[str]:
     with open(server_yaml_path) as fh:
         data = yaml.safe_load(fh)
 
-    _DYNAMIC_CONTAINERS = {"adapters", "sota_providers", "voices"}
-
-    def _walk(node: object, prefix: str) -> Iterator[str]:
-        if not isinstance(node, dict):
-            yield prefix
-            return
-        for key, value in node.items():
-            child = f"{prefix}.{key}" if prefix else key
-            parent_key = prefix.split(".")[-1] if prefix else ""
-            if parent_key in _DYNAMIC_CONTAINERS:
-                # Dynamic container: recurse with concrete name, yield sub-keys
-                yield from _walk(value, child)
-            elif isinstance(value, dict):
-                yield from _walk(value, child)
-            else:
-                yield child
-
-    yield from _walk(data, "")
+    for path, _ in walk_dict_leaves(data):
+        yield path

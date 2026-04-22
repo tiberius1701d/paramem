@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from paramem.cli import backup, migrate, migrate_status
+from paramem.cli import backup, migrate, migrate_cancel, migrate_status
 
 CLI_VERSION = "0.1.0"
 
@@ -81,6 +81,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit raw JSON response instead of formatted output.",
     )
 
+    # --- migrate-cancel ---
+    p_mc = subparsers.add_parser(
+        "migrate-cancel",
+        help="Cancel the current staged migration candidate.",
+        description=("POST /migration/cancel. Ships in Slice 3b.1."),
+    )
+    p_mc.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON response instead of formatted output.",
+    )
+
     # --- backup ---
     p_backup = subparsers.add_parser(
         "backup",
@@ -136,6 +148,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "migrate-status":
         return migrate_status.run(args)
+
+    if args.command == "migrate-cancel":
+        return migrate_cancel.run(args)
 
     if args.command == "backup":
         if args.backup_command == "list":

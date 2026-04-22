@@ -106,6 +106,8 @@ _state = {
     # event loop (cooperative scheduling). Mutations are synchronous within each
     # handler, so no interleaving within a single dict operation. Safe without locks.
     "unknown_speakers": {},
+    "migration": None,  # MigrationStashState — populated in lifespan
+    "server_started_at": "",  # ISO-8601 UTC timestamp set in lifespan
 }
 
 
@@ -213,6 +215,155 @@ class StatusResponse(BaseModel):
 
 class ConsolidateResponse(BaseModel):
     status: str
+
+
+# --- Migration schemas (Slice 3b.1) ---
+
+
+class TierDiffRow(BaseModel):
+    """One row in the tier-classified field-change list.
+
+    Attributes
+    ----------
+    dotted_path:
+        Dotted yaml key path (e.g. ``"adapters.episodic.rank"``).
+    old_value:
+        Value in the live config, or ``None`` when the field is new.
+    new_value:
+        Value in the candidate config, or ``None`` when the field is removed.
+    tier:
+        Impact tier string: ``"destructive"`` / ``"pipeline_altering"``
+        / ``"operational"``.
+    """
+
+    dotted_path: str
+    old_value: object = None
+    new_value: object = None
+    tier: str
+
+
+class ShapeChange(BaseModel):
+    """One field-level LoRA shape delta for a single adapter.
+
+    Attributes
+    ----------
+    adapter:
+        Adapter name (e.g. ``"episodic"``).
+    field:
+        LoRA field name: ``"rank"``, ``"alpha"``, ``"target_modules"``,
+        or ``"dropout"``.
+    old_value:
+        Value in the on-disk ``meta.json``, or ``None`` when unavailable.
+    new_value:
+        Value requested by the candidate config.
+    consequence:
+        Human-readable consequence string (spec §L257–271).
+    """
+
+    adapter: str
+    field: str
+    old_value: object = None
+    new_value: object = None
+    consequence: str
+
+
+class PreviewRequest(BaseModel):
+    """Request body for ``POST /migration/preview``.
+
+    Attributes
+    ----------
+    candidate_path:
+        Absolute local filesystem path to the candidate ``server.yaml``.
+    """
+
+    candidate_path: str
+
+
+class PreviewResponse(BaseModel):
+    """Response body for ``POST /migration/preview`` and ``GET /migration/diff``.
+
+    Attributes
+    ----------
+    state:
+        ``"STAGING"`` after a successful preview.
+    candidate_path:
+        Echo of the validated candidate path.
+    candidate_hash:
+        Full hex SHA-256 of the candidate file bytes.
+    staged_at:
+        ISO-8601 UTC timestamp when STAGING was entered.
+    simulate_mode_override:
+        ``True`` when the candidate sets ``consolidation.mode: simulate``.
+    unified_diff:
+        Unified diff of live vs candidate YAML text.
+    tier_diff:
+        Tier-classified change rows (destructive first).
+    shape_changes:
+        Shape-change rows for enabled adapters with on-disk meta.json.
+    pre_flight_fail:
+        ``None`` in Slice 3b.1; Slice 3b.2 passes ``"disk_pressure"`` etc.
+        when pre-flight checks fire.  Always present in the response so
+        callers can check the field unconditionally (Condition 3).
+    """
+
+    state: str
+    candidate_path: str
+    candidate_hash: str
+    staged_at: str
+    simulate_mode_override: bool
+    unified_diff: str
+    tier_diff: list[TierDiffRow]
+    shape_changes: list[ShapeChange]
+    pre_flight_fail: str | None = None
+
+
+# MigrationDiffResponse is an alias — same shape as PreviewResponse.
+MigrationDiffResponse = PreviewResponse
+
+
+class MigrationStatusResponse(BaseModel):
+    """Response body for ``GET /migration/status``.
+
+    Attributes
+    ----------
+    state:
+        ``"LIVE"`` or ``"STAGING"``.
+    candidate_path:
+        Path of the staged candidate, or ``None`` when LIVE.
+    candidate_hash:
+        SHA-256 of the staged candidate, or ``None`` when LIVE.
+    staged_at:
+        ISO-8601 UTC timestamp when STAGING was entered, or ``None``.
+    simulate_mode_override:
+        ``True`` when the staged candidate sets ``consolidation.mode: simulate``.
+    consolidating:
+        ``True`` when a consolidation run is currently in progress.
+    server_started_at:
+        ISO-8601 UTC timestamp when the server lifespan started (Condition 6).
+    """
+
+    state: str
+    candidate_path: str | None = None
+    candidate_hash: str | None = None
+    staged_at: str | None = None
+    simulate_mode_override: bool = False
+    consolidating: bool = False
+    server_started_at: str = ""
+
+
+class MigrationCancelResponse(BaseModel):
+    """Response body for ``POST /migration/cancel``.
+
+    Attributes
+    ----------
+    state:
+        Always ``"LIVE"`` — the server has returned to LIVE state.
+    cleared_path:
+        The candidate path that was discarded.
+    """
+
+    state: str
+    cleared_path: str
 
 
 # --- Adapter mount helper (Slice 3a) ---
@@ -545,6 +696,12 @@ async def lifespan(app: FastAPI):
     config = _state["config"]
 
     from paramem.server.drift import drift_poll_loop, initial_drift_state
+    from paramem.server.migration import initial_migration_state
+
+    # Record server start time for /migration/status (Condition 6).
+    _state["server_started_at"] = datetime.now(timezone.utc).isoformat()
+    # Seed the migration stash to LIVE so the endpoint is available immediately.
+    _state["migration"] = initial_migration_state()
 
     if _state.get("config_path"):
         _state["config_drift"] = initial_drift_state(Path(_state["config_path"]))
@@ -1817,6 +1974,268 @@ async def consolidate():
     future.add_done_callback(_consolidation_done_callback)
 
     return ConsolidateResponse(status="started")
+
+
+# --- Migration endpoints (Slice 3b.1) ---
+
+
+@app.post("/migration/preview", response_model=PreviewResponse)
+async def migration_preview(request: PreviewRequest):
+    """Stage a candidate ``server.yaml`` and return a preview diff.
+
+    Validates the candidate path, parses the YAML, computes the unified diff,
+    tier-classified change list, and shape-change block, then stores the stash
+    in ``_state["migration"]`` with ``state="STAGING"``.  **No files are
+    written** — disk writes, atomic swap, trial marker, and TRIAL state ship
+    in Slice 3b.2.
+
+    Concurrency note: ``_state["consolidating"]`` is read once at the top of
+    this handler.  The flag is mutated from a mix of event-loop callbacks and
+    worker threads (see ``paramem/server/app.py`` for the ~10 mutation sites —
+    several are inside executor/worker-thread callbacks such as
+    ``_extract_and_start_training`` no-data branches and ``_on_training_error``).
+    A single ``bool`` read under CPython's GIL is atomic, so the worst case is
+    observing a stale value across the read-to-action gap — at most a few
+    microseconds of mutex slack between consolidation and migration.  This is
+    acceptable for the STAGING-only preview gate.  Slice 3b.2's
+    ``/migration/confirm`` will tighten the mutex with an ``asyncio.Lock`` or
+    CAS-style transition on ``_state["migration"]["state"]``.
+
+    Errors
+    ------
+    400 ``candidate_path_invalid``
+        Relative, missing, unreadable, cross-filesystem, or not a regular file.
+    400 ``candidate_unparseable``
+        ``yaml.safe_load`` raised on the candidate bytes (Condition 7).
+    409 ``consolidating``
+        A consolidation run is currently in progress.
+    409 ``already_staging``
+        The migration stash is already in ``STAGING`` state.
+    409 ``trial_active``
+        A trial is in progress (unreachable in Slice 3b.1 — Slice 3b.2 wires
+        TRIAL state).
+    """
+    from fastapi import HTTPException
+
+    from paramem.server.migration import (
+        _parse_candidate,
+        _sha256_bytes,
+        compute_shape_changes,
+        compute_tier_diff,
+        compute_unified_diff,
+        detect_simulate_mode,
+        initial_migration_state,
+        render_preview_response,
+        validate_candidate_path,
+    )
+
+    # --- Concurrency gate: read once, race-free under cooperative scheduling ---
+    if _state.get("consolidating", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "consolidating",
+                "message": "Consolidation is currently running. Retry after it completes.",
+            },
+        )
+
+    migration = _state.get("migration") or initial_migration_state()
+    current_state = migration.get("state", "LIVE")
+
+    if current_state == "STAGING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "already_staging",
+                "message": "A candidate is already staged. POST /migration/cancel first.",
+            },
+        )
+
+    if current_state == "TRIAL":  # pragma: no cover — Slice 3b.2 wires TRIAL state
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "trial_active",
+                "message": "A trial is active. Accept or rollback before staging a new candidate.",
+            },
+        )
+
+    # --- Validate path ---
+    config = _state.get("config")
+    live_config_path = (
+        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+    )
+
+    try:
+        candidate_path = validate_candidate_path(request.candidate_path, live_config_path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "candidate_path_invalid", "message": str(exc)},
+        ) from exc
+
+    # --- Read candidate ---
+    candidate_bytes = candidate_path.read_bytes()
+    candidate_hash = _sha256_bytes(candidate_bytes)
+    try:
+        candidate_text = candidate_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        candidate_text = candidate_bytes.decode("latin-1")
+
+    # --- Parse candidate (yaml.safe_load, NOT load_server_config) ---
+    try:
+        parsed_candidate = _parse_candidate(candidate_bytes)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "candidate_unparseable", "message": str(exc)},
+        ) from exc
+
+    # --- Read live yaml for diff ---
+    live_text = live_config_path.read_text(encoding="utf-8") if live_config_path.exists() else ""
+    import yaml as _yaml
+
+    live_yaml = _yaml.safe_load(live_text.encode("utf-8")) if live_text else {}
+    if not isinstance(live_yaml, dict):
+        live_yaml = {}
+
+    # --- Compute diffs ---
+    unified_diff = compute_unified_diff(live_text, candidate_text)
+    tier_diff = compute_tier_diff(live_yaml, parsed_candidate)
+
+    # --- Shape-change detection ---
+    adapter_dir = config.adapter_dir if config is not None else Path("data/ha/adapters")
+    live_registry_sha256 = ""
+    if config is not None:
+        registry_path = None
+        try:
+            if hasattr(config, "paths") and config.paths.data is not None:
+                registry_path = config.paths.data / "registry" / "key_metadata.json"
+        except (AttributeError, TypeError):
+            registry_path = None
+        if registry_path is None:
+            registry_path = Path(str(adapter_dir)).parent / "registry" / "key_metadata.json"
+        if registry_path.exists():
+            from paramem.backup.hashing import content_sha256_path
+
+            try:
+                live_registry_sha256 = content_sha256_path(registry_path)
+            except OSError:
+                live_registry_sha256 = ""
+
+    shape_changes = compute_shape_changes(parsed_candidate, adapter_dir, live_registry_sha256)
+
+    # --- Detect simulate-mode ---
+    simulate_mode_override = detect_simulate_mode(parsed_candidate)
+
+    # --- Build stash ---
+    from paramem.server.migration import MigrationStashState
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    stash = MigrationStashState(
+        state="STAGING",
+        candidate_path=str(candidate_path),
+        candidate_hash=candidate_hash,
+        candidate_bytes=candidate_bytes,
+        candidate_text=candidate_text,
+        parsed_candidate=parsed_candidate,
+        staged_at=now_iso,
+        simulate_mode_override=simulate_mode_override,
+        shape_changes=shape_changes,
+        tier_diff=tier_diff,
+        unified_diff=unified_diff,
+    )
+    _state["migration"] = stash
+
+    payload = render_preview_response(stash, pre_flight_fail=None)
+    return PreviewResponse(**payload)
+
+
+@app.post("/migration/cancel", response_model=MigrationCancelResponse)
+async def migration_cancel():
+    """Clear the staged candidate and return to LIVE state.
+
+    Returns the candidate path that was discarded so the caller can confirm
+    which staging session was cancelled.
+
+    Errors
+    ------
+    409 ``not_staging``
+        The server is not currently in STAGING state (nothing to cancel).
+    """
+    from fastapi import HTTPException
+
+    from paramem.server.migration import initial_migration_state
+
+    migration = _state.get("migration") or initial_migration_state()
+    current_state = migration.get("state", "LIVE")
+
+    if current_state != "STAGING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "not_staging",
+                "message": "No candidate is staged; nothing to cancel.",
+            },
+        )
+
+    cleared_path = migration.get("candidate_path", "")
+    _state["migration"] = initial_migration_state()
+    return MigrationCancelResponse(state="LIVE", cleared_path=cleared_path)
+
+
+@app.get("/migration/status", response_model=MigrationStatusResponse)
+async def migration_status():
+    """Return the current migration state and server metadata.
+
+    Never raises — returns LIVE defaults when no preview has been requested.
+    """
+    from paramem.server.migration import initial_migration_state
+
+    migration = _state.get("migration") or initial_migration_state()
+    ms = migration.get("state", "LIVE")
+
+    return MigrationStatusResponse(
+        state=ms,
+        candidate_path=migration.get("candidate_path") or None,
+        candidate_hash=migration.get("candidate_hash") or None,
+        staged_at=migration.get("staged_at") or None,
+        simulate_mode_override=bool(migration.get("simulate_mode_override", False)),
+        consolidating=bool(_state.get("consolidating", False)),
+        server_started_at=_state.get("server_started_at", ""),
+    )
+
+
+@app.get("/migration/diff", response_model=MigrationDiffResponse)
+async def migration_diff():
+    """Return the diff for the currently-staged candidate.
+
+    Same payload shape as ``/migration/preview``.  Valid only when STAGING.
+
+    Errors
+    ------
+    409 ``not_staging``
+        The server is not currently in STAGING state.
+    """
+    from fastapi import HTTPException
+
+    from paramem.server.migration import initial_migration_state, render_preview_response
+
+    migration = _state.get("migration") or initial_migration_state()
+    current_state = migration.get("state", "LIVE")
+
+    if current_state != "STAGING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "not_staging",
+                "message": "No candidate is staged; POST /migration/preview first.",
+            },
+        )
+
+    payload = render_preview_response(migration, pre_flight_fail=None)
+    return MigrationDiffResponse(**payload)
 
 
 def _cloud_only_route(
