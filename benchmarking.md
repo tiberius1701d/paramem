@@ -416,6 +416,15 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
    A single Trainer call with callback-based probing reaches 100%. This is a
    training methodology issue, not an adapter capacity issue.
 
+#### Status (2026-04-22)
+
+- **Closed:** loss-based early stopping. No threshold is both safe and useful
+  given the ~10–15 epoch gap between loss convergence and the recall phase
+  transition. Production keeps the fixed 30-epoch budget.
+- **Open:** recall-probing early stopping. Stop when recall on a held-out key
+  probe plateaus at 100% for `patience` consecutive epochs. Unimplemented;
+  the only remaining lever. See `early_stopping.md` for scoping.
+
 ---
 
 ## Test 2: Contradiction Resolution
