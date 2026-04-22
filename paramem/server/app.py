@@ -239,6 +239,13 @@ class StatusResponse(BaseModel):
     # Populated after startup; empty dict when server started without a config path
     # (cloud-only test mode).
     config_drift: dict = {}
+    # Deferred-mode GPU hold (PARAMEM_EXTRA_ARGS=--defer-model in systemd --user
+    # env).  Set by gpu_guard / tresume when an ML workload wants the GPU; the
+    # server stays cloud-only until the holder clears it.  Surfaces the owner
+    # PID + liveness so an operator can spot orphaned holds (SIGKILLed test
+    # processes) and clear with ``pstatus --force-local``.  Schema:
+    #   {hold_active, owner_pid, owner_alive, age_seconds, owner_hint}
+    hold: dict = {}
 
 
 class ConsolidateResponse(BaseModel):
@@ -2036,6 +2043,8 @@ async def status():
     except ImportError:
         pass
 
+    hold_block = _get_hold_state()
+
     return StatusResponse(
         model=config.model_name,
         model_id=model_id,
@@ -2081,7 +2090,32 @@ async def status():
         adapter_health=adapter_health,
         adapter_manifest=_state.get("adapter_manifest_status", {}),
         config_drift=_state.get("config_drift", {}),
+        hold=hold_block,
     )
+
+
+@app.post("/gpu/force-local")
+async def gpu_force_local():
+    """Operator override: drop any PARAMEM_EXTRA_ARGS=--defer-model hold and,
+    if the current process is in defer mode, restart so the next boot loads
+    the model locally.
+
+    Called by ``pstatus --force-local``.  Use when /status or pstatus reports
+    an orphaned hold (``hold.owner_alive == false`` or ``owner_pid == null``
+    after auto-reclaim has stopped).  Idempotent: safe when no hold is set.
+    """
+    hold_before = _get_hold_state()
+    cleared = _clear_hold_env()
+    will_restart = bool(_state.get("defer_model", False))
+    if cleared and will_restart:
+        _restart_service()
+    return {
+        "cleared": cleared,
+        "was_active": hold_before["hold_active"],
+        "owner_pid": hold_before["owner_pid"],
+        "owner_alive": hold_before["owner_alive"],
+        "will_restart": cleared and will_restart,
+    }
 
 
 @app.post("/refresh-ha")
@@ -4367,6 +4401,141 @@ def _gpu_occupied() -> bool:
     return _gpu_has_compute_processes()
 
 
+_HOLD_ENV_VARS = (
+    "PARAMEM_EXTRA_ARGS",
+    "PARAMEM_HOLD_PID",
+    "PARAMEM_HOLD_STARTED_AT",
+    "PARAMEM_HOLD_CMD",
+)
+
+
+def _unquote_systemd_value(v: str) -> str:
+    """Reverse systemd's ANSI-C quoting on ``show-environment`` output.
+
+    systemd emits values containing shell-special characters (spaces,
+    slashes, quotes, …) as ``$'...'`` with backslash escapes.  Simple
+    values are emitted verbatim.  Double-quoted form is also accepted
+    for forward compatibility.
+    """
+    if len(v) >= 3 and v.startswith("$'") and v.endswith("'"):
+        inner = v[2:-1]
+        try:
+            return inner.encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except UnicodeDecodeError:
+            return inner
+    if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    return v
+
+
+def _read_systemd_user_env() -> dict[str, str]:
+    """Read the current systemd --user environment block.
+
+    Needed because PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_* are set via
+    ``systemctl --user set-environment`` and are inherited by services at
+    start time.  An already-running process keeps its original os.environ
+    snapshot, so we re-read systemd's block to get the live value.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return {}
+    env: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = _unquote_systemd_value(v)
+    return env
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with the given PID exists.
+
+    Uses signal 0 (no-op) which only checks existence + permissions.
+    PermissionError means the PID exists but is owned by another user —
+    still counts as alive for our purposes.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _get_hold_state() -> dict:
+    """Inspect the PARAMEM_EXTRA_ARGS=--defer-model hold in systemd --user env.
+
+    Returned dict shape:
+        {
+            "hold_active":   bool,         # env var set with --defer-model
+            "owner_pid":     int | None,   # from PARAMEM_HOLD_PID, if stamped
+            "owner_alive":   bool | None,  # PID liveness; None when unstamped
+            "age_seconds":   int | None,   # now - PARAMEM_HOLD_STARTED_AT
+            "owner_hint":    str | None,   # PARAMEM_HOLD_CMD, e.g. "python / paramem.server.app"
+        }
+
+    Used by /status for operator visibility and by _auto_reclaim_loop to
+    distinguish a legitimate mid-training hold from an orphaned env var.
+    """
+    env = _read_systemd_user_env()
+    extra_args = env.get("PARAMEM_EXTRA_ARGS", "")
+    hold_active = "--defer-model" in extra_args
+    if not hold_active:
+        return {
+            "hold_active": False,
+            "owner_pid": None,
+            "owner_alive": None,
+            "age_seconds": None,
+            "owner_hint": None,
+        }
+    pid_str = env.get("PARAMEM_HOLD_PID", "").strip()
+    owner_pid: int | None = None
+    if pid_str.isdigit():
+        owner_pid = int(pid_str)
+    owner_alive: bool | None = None
+    if owner_pid is not None:
+        owner_alive = _pid_alive(owner_pid)
+    started_str = env.get("PARAMEM_HOLD_STARTED_AT", "").strip()
+    age_seconds: int | None = None
+    if started_str.isdigit():
+        age_seconds = max(0, int(time.time()) - int(started_str))
+    owner_hint = env.get("PARAMEM_HOLD_CMD") or None
+    return {
+        "hold_active": True,
+        "owner_pid": owner_pid,
+        "owner_alive": owner_alive,
+        "age_seconds": age_seconds,
+        "owner_hint": owner_hint,
+    }
+
+
+def _clear_hold_env() -> bool:
+    """Unset PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_PID / PARAMEM_HOLD_STARTED_AT.
+
+    Returns True on success.  Idempotent — safe to call when variables are
+    already unset.
+    """
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "unset-environment", *_HOLD_ENV_VARS],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        logger.exception("Failed to unset PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_*")
+        return False
+
+
 def _gpu_has_compute_processes() -> bool:
     """Check if any non-server process is using the GPU."""
     try:
@@ -4395,9 +4564,20 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
     """Periodically check if GPU is free and reclaim it.
 
     Only started when the server is in cloud-only/defer mode (no model loaded).
-    Checks every interval_minutes whether any GPU compute process is still
-    running. If not, restarts the service to get a clean CUDA context with
-    the model loaded.
+    Each tick:
+
+    1. If any non-server GPU compute process is running → wait.
+    2. Else inspect the hold state (PARAMEM_EXTRA_ARGS in systemd --user env):
+       - Hold cleared → reclaim: restart for a clean model load.
+       - Hold set, holder PID alive → legitimate mid-training window
+         (cooldown, model swap) → keep polling, do not restart.
+       - Hold set, holder PID dead or unregistered → orphan suspected →
+         emit one WARN and exit the loop.  Operator clears via
+         ``pstatus --force-local`` (POST /gpu/force-local).
+
+    Exiting on orphan stops the infinite systemctl-restart loop that was
+    happening when a SIGKILLed test left PARAMEM_EXTRA_ARGS=--defer-model
+    behind: visibility over silent auto-heal, per design.
     """
     interval_seconds = interval_minutes * 60
     while True:
@@ -4405,8 +4585,34 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
         if _gpu_has_compute_processes():
             logger.debug("Auto-reclaim: GPU still occupied, waiting")
             continue
-        logger.info("Auto-reclaim: GPU free — restarting for clean model load")
-        _restart_service()
+        hold = _get_hold_state()
+        if not hold["hold_active"]:
+            logger.info("Auto-reclaim: GPU free — restarting for clean model load")
+            _restart_service()
+            return
+        owner_pid = hold["owner_pid"]
+        owner_alive = hold["owner_alive"]
+        if owner_alive is True:
+            # Holder alive (mid-cycle model swap or similar) — respect the hold.
+            logger.debug(
+                "Auto-reclaim: compute-free but holder PID %s alive — waiting",
+                owner_pid,
+            )
+            continue
+        if owner_alive is False:
+            logger.warning(
+                "Auto-reclaim: PARAMEM_EXTRA_ARGS=--defer-model still set but "
+                "holder PID %s is dead — orphaned hold. Clear and reclaim with "
+                "`pstatus --force-local` (POST /gpu/force-local).",
+                owner_pid,
+            )
+        else:
+            logger.warning(
+                "Auto-reclaim: PARAMEM_EXTRA_ARGS=--defer-model still set but no "
+                "holder PID registered — suspected orphan. Clear and reclaim with "
+                "`pstatus --force-local` (POST /gpu/force-local)."
+            )
+        return
 
 
 def _restart_service():

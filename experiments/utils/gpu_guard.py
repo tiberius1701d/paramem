@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 
+from paramem.utils.gpu_hold import format_cmd_hint
 from paramem.utils.notify import ML_FINISHED, ML_PAUSED, ML_RESUMED, ML_STARTED, notify_ml
 
 logger = logging.getLogger(__name__)
@@ -440,6 +441,35 @@ class _GPUGuard:
             self._released_server = True
             print("  GPU released by server.")
 
+        # Stamp ownership of the PARAMEM_EXTRA_ARGS=--defer-model hold so the
+        # server can distinguish a legitimate mid-training hold from an
+        # orphaned env var left behind by a SIGKILLed test.  PARAMEM_EXTRA_ARGS
+        # itself is set by ``_release_server_gpu`` in training-control.sh
+        # before this process launches; we only add the identity fields.
+        # PARAMEM_HOLD_CMD is a short hint ("python / paramem.experiments.testN")
+        # that survives holder death so pstatus can still name the orphan.
+        # /status surfaces these for pstatus and auto-reclaim uses owner_alive
+        # to decide whether to reclaim.  Cleared in __exit__.
+        hint = format_cmd_hint(sys.argv)
+        stamp_args = [
+            "systemctl",
+            "--user",
+            "set-environment",
+            f"PARAMEM_HOLD_PID={os.getpid()}",
+            f"PARAMEM_HOLD_STARTED_AT={int(time.time())}",
+        ]
+        if hint:
+            stamp_args.append(f"PARAMEM_HOLD_CMD={hint}")
+        try:
+            subprocess.run(
+                stamp_args,
+                check=False,
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
         notify_ml(ML_STARTED)
         self._sleep_inhibitor.start()
         return self
@@ -459,7 +489,15 @@ class _GPUGuard:
         # main()'s fallback in app.py handle that case independently.
         try:
             subprocess.run(
-                ["systemctl", "--user", "unset-environment", "PARAMEM_EXTRA_ARGS"],
+                [
+                    "systemctl",
+                    "--user",
+                    "unset-environment",
+                    "PARAMEM_EXTRA_ARGS",
+                    "PARAMEM_HOLD_PID",
+                    "PARAMEM_HOLD_STARTED_AT",
+                    "PARAMEM_HOLD_CMD",
+                ],
                 check=False,
                 capture_output=True,
                 timeout=5,

@@ -2,7 +2,9 @@
 # paramem-status.sh — Show ParaMem server status
 #
 # Usage:
-#   pstatus          # show server status
+#   pstatus                # show server status
+#   pstatus --force-local  # clear any PARAMEM_EXTRA_ARGS=--defer-model hold
+#                            and restart the server so it boots in local mode
 #
 # Alias (add to ~/.bashrc):
 #   alias pstatus='bash ~/.local/bin/paramem-status.sh'
@@ -10,6 +12,25 @@
 set -euo pipefail
 
 PARAMEM_SERVER_PORT=8420
+
+# --force-local: clear the deferred-mode hold and restart into local mode.
+# Intended for operator use when auto-reclaim has flagged an orphaned hold
+# (holder PID dead or no PID registered) and stopped looping.  Hits
+# POST /gpu/force-local on the running server.
+if [[ "${1:-}" == "--force-local" ]]; then
+    resp=$(curl -s --max-time 10 -X POST \
+        "http://localhost:${PARAMEM_SERVER_PORT}/gpu/force-local" 2>/dev/null || true)
+    if [[ -z "$resp" ]]; then
+        echo "Server unreachable — clearing environment directly."
+        systemctl --user unset-environment \
+            PARAMEM_EXTRA_ARGS PARAMEM_HOLD_PID PARAMEM_HOLD_STARTED_AT PARAMEM_HOLD_CMD || true
+        systemctl --user restart paramem-server || true
+        echo "Done. Run pstatus to verify mode."
+        exit 0
+    fi
+    echo "$resp"
+    exit 0
+fi
 
 # Colors
 BOLD="\033[1m"
@@ -138,6 +159,20 @@ fields = {
         if h.get("status") == "degenerated"
     ),
     "adapter_health_count": len(d.get("adapter_health") or {}),
+    # Deferred-mode hold — owner_alive is "yes" / "no" / "-" (unknown) so
+    # bash can render a coloured status tag without re-parsing the JSON.
+    # owner_hint is the short cmd tag ("python / paramem.server.app") so
+    # operators recognise the holder even after SIGKILL — "-" when unstamped.
+    # Strip "|" to keep the bash scalar line (pipe-delimited) parsable.
+    "hold_active": (d.get("hold") or {}).get("hold_active", False),
+    "hold_owner_pid": (d.get("hold") or {}).get("owner_pid") if (d.get("hold") or {}).get("owner_pid") is not None else "-",
+    "hold_owner_alive": (
+        "yes" if (d.get("hold") or {}).get("owner_alive") is True
+        else "no" if (d.get("hold") or {}).get("owner_alive") is False
+        else "-"
+    ),
+    "hold_age": fmt_duration((d.get("hold") or {}).get("age_seconds")),
+    "hold_owner_hint": ((d.get("hold") or {}).get("owner_hint") or "-").replace("|", "/"),
 }
 # Scalar line
 print("|".join(str(fields[k]) for k in [
@@ -156,6 +191,8 @@ print("|".join(str(fields[k]) for k in [
     "throttle_mode", "throttle_start", "throttle_end",
     "throttle_temp_limit", "throttle_active",
     "degenerated_count", "adapter_health_count",
+    "hold_active", "hold_owner_pid", "hold_owner_alive", "hold_age",
+    "hold_owner_hint",
 ]))
 # Per-adapter spec lines: kind<TAB>rank<TAB>alpha<TAB>lr<TAB>target_kind
 for _kind, _spec in (d.get("adapter_specs") or {}).items():
@@ -201,6 +238,8 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     throttle_mode throttle_start throttle_end \
     throttle_temp_limit throttle_active \
     degenerated_count adapter_health_count \
+    hold_active hold_owner_pid hold_owner_alive hold_age \
+    hold_owner_hint \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
 health_lines=$(echo "$parsed" | awk '/^HLT\t/')
@@ -262,7 +301,33 @@ if command -v nvidia-smi &>/dev/null; then
     fi
 fi
 
-echo -e "  PID:      ${server_pid}"
+# PID line — append hold annotation when a deferred-mode hold is active.
+# The server PID stays the primary number; the annotation names the holder
+# (test process) by its stamped cmd hint.  Orphaned holds get a yellow
+# tag + the reclaim hint so the row itself is self-documenting.
+pid_line="  PID:      ${server_pid}"
+if [[ "$hold_active" == "True" ]]; then
+    cmd_tag=""
+    if [[ "$hold_owner_hint" != "-" && -n "$hold_owner_hint" ]]; then
+        cmd_tag=" [${hold_owner_hint}]"
+    fi
+    age_tag=""
+    if [[ "$hold_age" != "-" ]]; then
+        age_tag=" (age ${hold_age})"
+    fi
+    case "$hold_owner_alive" in
+        yes)
+            pid_line+=" ${DIM}(held by${cmd_tag}${age_tag})${RESET}"
+            ;;
+        no)
+            pid_line+=" ${YELLOW}(orphaned hold by${cmd_tag}${age_tag} — pstatus --force-local)${RESET}"
+            ;;
+        *)
+            pid_line+=" ${YELLOW}(orphaned hold, no holder registered — pstatus --force-local)${RESET}"
+            ;;
+    esac
+fi
+echo -e "$pid_line"
 # Model line: short name + configured variant + live device tag. The device
 # tag is hardware-agnostic — cuda/rocm/mps all map to "GPU" via fmt_device.
 model_line="${CYAN}${model}${RESET}"

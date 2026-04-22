@@ -305,14 +305,53 @@ kill -SIGUSR1 $(pidof python -m paramem.server.app)
 # Server auto-reclaims when GPU is free (default: 10min polling)
 ```
 
+#### Deferred-mode hold and orphan recovery
+
+ML workloads started through `experiments/utils/gpu_guard.py` (or the
+`tresume` shell flow) set `PARAMEM_EXTRA_ARGS=--defer-model` in the
+systemd user environment so the server stays cloud-only for the duration
+of the run.  The holder also stamps `PARAMEM_HOLD_PID`,
+`PARAMEM_HOLD_STARTED_AT`, and `PARAMEM_HOLD_CMD` so the server can tell
+a legitimate mid-training hold apart from an orphaned env var left
+behind by a `SIGKILL`ed test.
+
+`/status` surfaces the hold as:
+
+```json
+{"hold": {"hold_active": true, "owner_pid": 12345, "owner_alive": true,
+          "age_seconds": 240, "owner_hint": "python / experiments.test8_large_scale"}}
+```
+
+`pstatus` renders it inline on the PID row.  Three cases:
+
+| State | PID-row annotation | Meaning |
+|-------|--------------------|---------|
+| Alive holder | `(held by [python / experiments.test8_large_scale] (age 4m))` | Legitimate mid-training hold — auto-reclaim respects it. |
+| Orphaned (holder PID dead) | `(orphaned hold by [...] (age 15m) — pstatus --force-local)` (yellow) | `SIGKILL`ed test.  Auto-reclaim has emitted a single WARN and stopped looping. |
+| Orphaned (no holder registered) | `(orphaned hold, no holder registered — pstatus --force-local)` (yellow) | `PARAMEM_EXTRA_ARGS` set by legacy caller / manual tinkering. |
+
+Operator recovery is a single command:
+
+```bash
+pstatus --force-local
+# → POST /gpu/force-local: clears PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_*
+#   and, if the running server is in --defer-model, restarts so the
+#   next boot loads the model locally.
+```
+
+Auto-reclaim **never auto-clears orphans** — by design, visibility over
+silent self-healing.  The loop stops on orphan detection and waits for
+the operator.
+
 ### API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/chat` | POST | Send a message, get a response |
-| `/status` | GET | Full operational snapshot — server mode, model id + device, per-adapter specs (`rank`/`alpha`/`lr`/`target_kind`), interim adapter inventory + capacity, speaker embedding backend/model/device, STT/TTS engines, enrolled speakers, pending sessions + orphans + oldest age, consolidating flag + BG trainer state, last consolidation result, schedule + next-run ETA |
+| `/status` | GET | Full operational snapshot — server mode, model id + device, per-adapter specs (`rank`/`alpha`/`lr`/`target_kind`), interim adapter inventory + capacity, speaker embedding backend/model/device, STT/TTS engines, enrolled speakers, pending sessions + orphans + oldest age, consolidating flag + BG trainer state, last consolidation result, schedule + next-run ETA, deferred-mode `hold` block (owner PID + liveness + age + cmd hint) |
 | `/consolidate` | POST | Trigger consolidation manually (blocking) |
 | `/refresh-ha` | POST | Rebuild the HA entity graph from `/api/states` + `/api/services` |
+| `/gpu/force-local` | POST | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, restart into local mode.  Called by `pstatus --force-local`.  Idempotent. |
 
 **Chat request:**
 

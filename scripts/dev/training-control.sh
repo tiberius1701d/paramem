@@ -21,7 +21,14 @@
 # GPU lifecycle (service-level):
 #   tresume stops the ParaMem service, restarts it with --defer-model
 #   (cloud-only, no GPU). Training runs with exclusive GPU access.
-#   When training finishes, the server auto-reclaims by restarting.
+#   When training finishes cleanly, gpu_guard.__exit__ clears the
+#   PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_* systemd env vars and the server
+#   auto-reclaims on the next 10-min tick.
+#
+# Orphan recovery (SIGKILLed test, env vars left behind):
+#   Auto-reclaim detects the orphan (hold set + holder PID dead) and
+#   stops looping after one WARN. Run `pstatus --force-local` (or POST
+#   /gpu/force-local) to clear the stamps and restart into local mode.
 #
 # ============================================================================
 
