@@ -1985,8 +1985,8 @@ single model lifecycle.
 ## Test 13: Placeholder Generalization (Journal-Scaffold)
 
 **Script:** `experiments/test13_journal_scaffold.py`
-**Status:** A + B COMPLETE (2026-04-21). C1 + C2 PENDING (scheduled
-for overnight resume via `tresume 13`).
+**Status:** ALL FOUR PHASES COMPLETE (2026-04-22). Run dir:
+`outputs/test13_journal_scaffold/mistral/20260420_231031/`.
 
 ### What it tests
 
@@ -2005,64 +2005,130 @@ pre-trained scaffolds become shippable.
 
 ### Design
 
-Four phases on Mistral 7B, N=200, swap=40, rank=8, 30 epochs max per phase.
+Four phases on Mistral 7B, N=200, swap=40, rank=8, 30 epochs per phase.
 
 - **A — Fresh**: 200 brand-new keys, real (Q, A). Baseline convergence.
 - **B — Answer-swap**: start from A's adapter. Overwrite 40 keys with
   different answers (same key + Q). Warm-start behavior.
-- **C1 — Scaffold** (pending): fresh adapter "journal". Train 200 keys
-  where 40 have `TBD-k` placeholders. Must converge to 200/200.
-- **C2 — Fill** (pending): start from C1. Replace `TBD-k` with real
-  answers. Measures fill-speed + retention + placeholder leakage.
+- **C1 — Scaffold**: fresh adapter "journal". Train 200 keys where
+  40 have `TBD-k` placeholders. Must converge to 200/200.
+- **C2 — Fill**: start from C1. Replace `TBD-k` with real answers.
+  Measures fill-speed + retention + placeholder leakage.
 
-### A + B results (2026-04-21)
+### Convergence results (2026-04-22)
 
-| Phase | Converged | first_perfect | stable_perfect | Wall time | Train loss |
-|-------|-----------|---------------|----------------|-----------|------------|
-| A     | 199/200   | —             | —              | 7h 26m    | 0.155      |
-| B     | 40/40     | epoch 15      | epoch 18       | 99 min    | 0.202      |
+| Phase | N     | first_perfect | stable_perfect | 95%+ epoch | Final recall    | Wall   | Train loss |
+|-------|------:|--------------:|---------------:|-----------:|----------------:|-------:|-----------:|
+| A     | 200   |             — |              — |         22 | 199/200 (0.995) | 7h 27m |      0.155 |
+| B     |  40   |            15 |             18 |         10 |   40/40 (1.000) | 1h 39m |      0.202 |
+| C1    | 200   |             — |              — |         21 | 199/200 (0.995) | 6h 32m |      0.171 |
+| C2    |  40   |            10 |             11 |          4 |   40/40 (1.000) | 1h 38m |      0.106 |
 
-**Phase A never reached 200/200** — peaked at 199/200 from epoch 24
-onwards. Post-run probe identified the failing key as `graph23`. Its
-source triple collides with `graph26`: identical question string, answer
-strings are paraphrases of the same facts (college classmates / music /
-photography / friendship). The model under key `graph23` emitted
-`graph26`'s phrasing. SimHash confidence 0.734 — below the 0.75
-threshold. This is a **data-hygiene failure, not a capacity failure**:
-duplicate upstream triples produced two near-identical keys; gradient
-descent compressed them to a single distributed representation and
-emitted one phrasing under both keys. The `graph23` outlier is
-documented in the script docstring; a triple-level dedup scan now runs
-at qa_pool load and logs the colliding pairs (`graph23/graph26`,
-`graph35/graph37`, `graph56/graph58`).
+`first_perfect=null` in A and C1 is the same data-hygiene noise floor:
+the `graph23 ↔ graph26` collision (identical question string, answers
+paraphrase the same facts — college classmates / music / photography /
+friendship). SimHash confidence 0.734, just below the 0.75 gate. Both
+phases plateau at 199/200 from epoch 23–24 onward. Triple-level dedup
+scan at qa_pool load logs the colliding pairs (`graph23/graph26`,
+`graph35/graph37`, `graph56/graph58`). Not a scaffold regression.
 
-**Phase B is a clean warm-start win**: 40/40 at epoch 15, stable by
-epoch 18, from zero recall at epoch 1. Warm-starting from A's adapter
-lets the swap converge in 15 epochs vs A's 24+ for comparable recall
-on the base set. The per-epoch recall curve (0→0→0→0→0→0→0→0→0→0→0→0→
-0→0→40→40→40→38→40→40) is characteristic of a phase transition: nearly
-flat for 14 epochs, then a single-epoch jump to perfect. Loss decreased
-smoothly throughout; loss is not a reliable signal for fact encoding.
+### Retention and leakage (end-of-phase)
+
+| Phase | Retention on 160 unchanged | Placeholder leakage on fills |
+|-------|---------------------------:|-----------------------------:|
+| B     |                9/160 (5.6%) |                            — |
+| C2    |              60/160 (37.5%) |                            0 |
+
+### Interpretation
+
+1. **Scaffolding gives a real warm-start, not a null.** C2 starts at
+   mean_confidence 0.574 at epoch 1 vs B's 0.231 — the key→Q→slot
+   bindings pre-formed in C1 survive the fill. stable_perfect drops
+   from 18 (B) to 11 (C2) — ~39% fewer epochs to converge on identical
+   target set size.
+2. **Zero placeholder leakage.** No `TBD` tokens appear in fill outputs
+   after C2. The slot knows what key it carries; the TBD value is
+   fully overwritten. Structural scaffolding does not poison content.
+3. **Retention improves 6.7× but is not solved.** C2 preserves 37.5%
+   of unchanged keys vs B's 5.6%. Pre-forming slots gives unchanged
+   keys meaningful protection during a partial update, but two-thirds
+   are still corrupted. Sits between full replay (~100%) and naive
+   overwrite (~6%).
+4. **Scaffold has no initial-training cost.** A and C1 curves are
+   nearly identical; C1 actually edges ahead from epoch 18 onward
+   (0.80 vs 0.695). Adding 40 placeholder slots among 160 real pairs
+   does not slow convergence to 99.5%.
+
+### Decision-rule outcome
+
+| Design rule | Outcome |
+|---|---|
+| B epochs ≪ A AND retention(B) ≈ 1.0 → warm-start real | **Partial.** B converges fast on swap keys (stable-perfect at e18), retention collapses to 5.6%. Warm-start ≠ safe-in-place rewrite. |
+| C2 epochs ≈ B AND retention(C) ≈ 1.0 AND leakage=0 → scaffold confirmed | **Partial-strong.** C2 is *faster* than B (e11 vs e18). leakage=0 confirmed. retention=37.5% — better but not ≈1.0. |
+| C2 leakage > 0 OR C2 ≫ B → scaffold buys nothing | **Rejected.** Neither condition triggered. |
+
+### Terminology
+
+This is **not grokking**. No delayed generalization on held-out
+reasoning was tested. The observable is *epochs-to-recall uplift on
+content replacement when (key, Q) structure is pre-formed*, plus
+partial protection of unchanged slots. The A↔B phase transition noted
+in the 2026-04-21 handover, now paired with C1↔C2 matching evidence,
+is consistent with structural-slot pre-formation, not emergent
+generalization.
 
 ### Probe overhead (for future planners)
 
-Phase A's 7h 26m wall time vs Test 8 baselines (~2h 20m for comparable
+Phase A's 7h 27m wall time vs Test 8 baselines (~2h 20m for comparable
 keys) is driven by the per-epoch `RecallProbeCallback`: 200 keys × 30
-epochs × ~2.2 s per probe ≈ 3h 40m of probe time alone. Training
+epochs × ~1.5 s per probe ≈ 2h 30m of probe time alone. Training
 compute is consistent with baseline. The probe cadence is a deliberate
 design cost — needed to locate `first_perfect_epoch` / `stable_perfect_epoch`
 for the comparison. Future tests that don't need per-epoch resolution
 should probe every 3–5 epochs instead.
 
-### Open: C1 + C2
+### Open question: where does retention damage start?
 
-Decision rule preserved from the design: C2 epochs ≤ B epochs +
-retention ≈ 1.0 + zero leakage → scaffold confirmed. If C1/C2 fails
-only on the known data-hygiene outliers (`graph23` etc.), that is not
-a scaffold regression — it is the same noise floor as A/B. A placeholder-
-variant ablation (`TBD-k` vs in-distribution decoy vs OOD prose vs
-nonsense strings) is captured in paper_notes as a follow-up if C2
-leaks or fails to converge.
+Test 13's `RecallProbeCallback` only probes the TARGET set each epoch
+(swap in B, fill in C2). The unchanged 160 keys are probed *once*, at
+the end of the phase. This means we have target-recall curves but no
+retention curves — we cannot answer "at what epoch does damage start?"
+or "is retention at stable-perfect (e11) higher than at e30?"
+
+This matters because:
+- If retention at e11 is materially higher than at e30, early-stopping
+  on fill stable-perfect is not just a speed lever — it is a retention
+  lever. That would stack with scaffold's 39% speed advantage.
+- If retention is already degraded by e11, scaffolds only buy speed.
+
+### Test 13b: retention-curve re-run (scheduled)
+
+**Script:** `experiments/test13b_retention_curve.py`
+**Status:** design approved 2026-04-22, implementation under review.
+
+Single-phase re-run of C2 from the saved C1 adapter with:
+- `DualRecallProbeCallback` probing both fill-40 AND unchanged-160
+  every epoch.
+- `save_strategy="epoch"`, `save_total_limit=30` — keep every HF
+  Trainer checkpoint for post-hoc probe replay.
+- Identical hyperparameters to C2 (rank=8, lr=1e-4, batch=1,
+  grad_accum=2, seed=42, 30 epochs).
+
+Expected wall ~3h 30m (40-key train ~120s + 40-key fill probe ~60s +
+160-key retention probe ~240s ≈ 420s/epoch × 30). Disk ~1.9 GB
+(30 × ~60 MB HF checkpoints including optimizer/scheduler/rng state).
+
+Outputs at `outputs/test13b_retention_curve/mistral/<ts>/`. Derived
+fields in `results.json`: `fill_stable_perfect`,
+`retention_at_fill_stable_perfect`, `retention_at_final`,
+`retention_peak_epoch`, `retention_knee_epoch`,
+`epochs_between_fill_converged_and_retention_decay`.
+
+**Deferred follow-up:** rerun Phase B with the same dual-probe to
+produce the matching retention curve under warm-start-without-scaffold.
+Only worth running if 13b shows a clear knee. A placeholder-variant
+ablation (`TBD-k` vs in-distribution decoy vs OOD prose vs nonsense)
+remains on the paper_notes follow-up list.
 
 ---
 
