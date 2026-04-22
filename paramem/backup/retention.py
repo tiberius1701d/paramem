@@ -303,10 +303,6 @@ def prune(
     - Rule 5 (manual immunity): manual tier exempt from rule 3; rule 2 still
       applies when ``manual.max_disk_gb`` is set.
 
-    Legacy slots without a ``tier`` field in their sidecar default to
-    ``tier="manual"`` (safer — exempt from time-based pruning).  A WARN is
-    logged per legacy slot.
-
     Sort order within tier: by ``meta.created_at`` (UTC datetime from
     ``BackupRecord``), newest-first.  Oldest slots are pruned first within
     rules 2 and 3.
@@ -352,14 +348,10 @@ def prune(
     by_tier: dict[str, list] = {}  # tier -> list of BackupRecord (newest-first order retained)
 
     for record in all_records:
-        tier = record.meta.tier if record.meta.tier else None
-        if not tier:
-            logger.warning(
-                "prune: legacy slot %s has no tier field — defaulting to 'manual'",
-                record.slot_dir,
-            )
-            tier = "manual"
-        by_tier.setdefault(tier, []).append(record)
+        # enumerate_backups enforces schema validation via read_meta, which
+        # requires 'tier' as a mandatory field (MetaSchemaError → slot skipped).
+        # Therefore every BackupRecord that reaches this loop has a non-empty tier.
+        by_tier.setdefault(record.meta.tier, []).append(record)
 
     # Within each tier, records come from enumerate_backups in newest-first
     # order. We need oldest-first for pruning within rules 2 and 3.

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from paramem.backup.enumerate import enumerate_backups
 from paramem.backup.retention import (
     collect_immune_paths,
     compute_disk_usage,
@@ -505,3 +506,54 @@ class TestKeepZeroDisablesTier:
         result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
         assert slot.exists()
         assert result.deleted == []
+
+
+# ---------------------------------------------------------------------------
+# Cleanup 1 invariant — every enumerated BackupRecord has a non-empty tier
+# ---------------------------------------------------------------------------
+
+
+class TestEnumeratedRecordTierInvariant:
+    def test_enumerated_backup_record_always_has_non_empty_tier(self, tmp_path):
+        """enumerate_backups skips slots without 'tier'; all returned records have tier.
+
+        Pins the dependency that the dead legacy-tier branch in prune() relied
+        on: read_meta requires 'tier' as a mandatory field (MetaSchemaError on
+        absence), so enumerate_backups never emits a BackupRecord with an empty
+        tier.  This test creates one valid slot and one tier-less sidecar and
+        asserts that only the valid slot is returned, with a non-empty tier.
+        """
+        root = tmp_path / "backups"
+
+        # Valid slot — has tier field.
+        valid_slot = _write_slot(root, "config", _ts(0), "daily")
+
+        # Malformed slot — sidecar missing the 'tier' field entirely.
+        bad_ts = _ts(1)
+        bad_slot = root / "config" / bad_ts
+        bad_slot.mkdir(parents=True, exist_ok=True)
+        bad_meta = {
+            "schema_version": 1,
+            "kind": "config",
+            "timestamp": bad_ts,
+            "content_sha256": "abc",
+            "size_bytes": 50,
+            "encrypted": False,
+            "encrypt_at_rest": "auto",
+            "key_fingerprint": None,
+            # "tier" intentionally omitted
+            "label": None,
+        }
+        (bad_slot / f"config-{bad_ts}.meta.json").write_text(json.dumps(bad_meta), encoding="utf-8")
+        (bad_slot / f"config-{bad_ts}.bin").write_bytes(b"x" * 50)
+
+        records = enumerate_backups(root, kind=None)
+
+        # Only the valid slot is returned; the tier-less slot is skipped.
+        assert len(records) == 1
+        assert records[0].slot_dir == valid_slot.resolve()
+
+        # Every returned record must have a non-empty tier — the invariant
+        # that makes the legacy-tier default branch in prune() unreachable.
+        for record in records:
+            assert record.meta.tier, f"BackupRecord for {record.slot_dir} has empty tier field"

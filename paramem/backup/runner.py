@@ -104,6 +104,11 @@ def run_scheduled_backup(
        caller (runner CLI) skips the state-file write so ``/status`` keeps
        reflecting the previous run.
 
+    1b. **keep=0 short-circuit** — when the target tier's ``keep == 0``,
+        return a no-op success immediately with all artifacts in
+        ``skipped_artifacts``.  Avoids writing + immediately pruning; the
+        ``prune()`` call (step 4) handles removal of any existing slots.
+
     2. **Disk-pressure write gate** (rule 1) — compute current disk usage.
        When ``pct_of_cap >= 1.0``, refuse the write.  Return
        ``success=False`` with ``error="disk_pressure: ..."`` and all
@@ -186,6 +191,24 @@ def run_scheduled_backup(
             label=label,
             written_slots={},
             skipped_artifacts=[],
+            error=None,
+            prune_result_summary=None,
+        )
+
+    # Step 1b: keep=0 short-circuit — tier emission is disabled; no writes needed.
+    tier_cfg = getattr(backups_cfg.retention, tier, None)
+    if tier_cfg is not None and tier_cfg.keep == 0:
+        reason = f"tier keep=0 — emission disabled for tier '{tier}'"
+        logger.info("run_scheduled_backup: %s", reason)
+        skipped = [(a, reason) for a in artifacts_cfg]
+        return ScheduledBackupResult(
+            started_at=started_at,
+            completed_at=_completed_now(),
+            success=True,
+            tier=tier,
+            label=label,
+            written_slots={},
+            skipped_artifacts=skipped,
             error=None,
             prune_result_summary=None,
         )

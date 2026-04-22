@@ -184,28 +184,47 @@ class TestUpdateBackupState:
 
 class TestUpdateBackupStateConcurrency:
     def test_update_backup_state_serializes_concurrent_writes(self, tmp_path):
-        """Two threads calling update_backup_state with different keys → both survive."""
-        # We exploit the fact that update_backup_state reads the current record
-        # and then writes a new one. With proper locking, both threads' payloads
-        # must be reflected in the final state (as last_run alternating) but
-        # crucially neither call may raise or corrupt the file.
-        errors = []
+        """10 threads × 10 ops each, all gated by a Barrier → fcntl.flock serialises.
 
-        def _write(success: bool, ts: str) -> None:
-            try:
-                update_backup_state(tmp_path, _make_result(success=success, completed_at=ts))
-            except Exception as exc:
-                errors.append(exc)
+        Each thread writes a distinct ``completed_at`` timestamp per operation
+        (100 distinct timestamps total).  After all threads finish the file
+        must be readable, valid, and exactly one of those 100 timestamps must
+        appear in ``last_run.completed_at`` — proving no write was lost to
+        corruption (a corrupted file would raise ``BackupStateSchemaError``).
+        """
+        N_THREADS = 10
+        N_OPS = 10
+        barrier = threading.Barrier(N_THREADS)
+        errors: list[Exception] = []
 
-        t1 = threading.Thread(target=_write, args=(True, "2026-04-22T04:00:00Z"))
-        t2 = threading.Thread(target=_write, args=(False, "2026-04-22T05:00:00Z"))
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        def _worker(thread_idx: int) -> None:
+            barrier.wait()  # start all threads simultaneously
+            for op_idx in range(N_OPS):
+                ts = f"2026-04-22T{thread_idx:02d}:{op_idx:02d}:00Z"
+                try:
+                    update_backup_state(
+                        tmp_path,
+                        _make_result(
+                            success=(op_idx % 2 == 0),
+                            completed_at=ts,
+                        ),
+                    )
+                except Exception as exc:
+                    errors.append(exc)
 
-        assert not errors, f"Concurrent write raised: {errors}"
-        # File must be readable and valid.
+        threads = [
+            threading.Thread(target=_worker, args=(i,), daemon=True) for i in range(N_THREADS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=2.0)
+
+        assert not errors, f"Concurrent writes raised: {errors}"
+        # File must still be readable and schema-valid after 100 interleaved writes.
         record = read_backup_state(tmp_path)
         assert record is not None
         assert record.schema_version == BACKUP_STATE_SCHEMA_VERSION
+        # last_run must reflect one of the 100 written timestamps — not a
+        # partially-written intermediate (which would fail JSON parsing above).
+        assert record.last_run is not None

@@ -284,3 +284,75 @@ class TestRunnerCallsPrune:
         call_kwargs = mock_prune.call_args.kwargs
         assert call_kwargs["backups_root"] == backups_root
         assert call_kwargs["dry_run"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cleanup 2 — keep=0 short-circuit skips emission
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerSkipsEmissionWhenKeepIsZero:
+    def test_runner_skips_emission_when_target_tier_keep_is_zero(self, tmp_path):
+        """daily.keep=0 → runner returns success without writing any slots.
+
+        Verifies three properties:
+        - success=True and written_slots={} (no write performed).
+        - All configured artifacts appear in skipped_artifacts with reason
+          indicating the tier keep=0 short-circuit.
+        - No slot directories are created under backups_root.
+        """
+        config = _make_server_config(tmp_path)
+        # Set daily.keep to 0 directly — RetentionTierConfig is a plain mutable dataclass.
+        config.security.backups.retention.daily.keep = 0
+
+        state_dir = (config.paths.data / "state").resolve()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        backups_root = (config.paths.data / "backups").resolve()
+        backups_root.mkdir(parents=True, exist_ok=True)
+        config.paths.data.mkdir(parents=True, exist_ok=True)
+
+        live_config = tmp_path / "server.yaml"
+        live_config.write_bytes(b"model: mistral\n")
+        config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
+        config.paths.key_metadata.write_text('{"keys": {}}', encoding="utf-8")
+
+        loop = _mock_loop()
+        result = run_scheduled_backup(
+            server_config=config,
+            loop=loop,
+            state_dir=state_dir,
+            backups_root=backups_root,
+            live_config_path=live_config,
+            tier="daily",
+        )
+
+        # Must succeed without writing.
+        assert result.success
+        assert result.written_slots == {}
+        assert result.error is None
+        assert result.prune_result_summary is None
+
+        # Every configured artifact must appear in skipped_artifacts with the
+        # keep=0 reason, not a false failure marker.
+        skip_reasons = {a: r for a, r in result.skipped_artifacts}
+        for artifact in config.security.backups.artifacts:
+            assert artifact in skip_reasons, f"{artifact} not in skipped_artifacts"
+            assert "keep=0" in skip_reasons[artifact]
+
+        # No slot directories created under backups_root.
+        artifact_dirs = (
+            [d for d in backups_root.iterdir() if d.is_dir() and not d.name.startswith(".")]
+            if backups_root.exists()
+            else []
+        )
+        assert artifact_dirs == [], f"Unexpected dirs created: {artifact_dirs}"
+
+        # State file must reflect no failure when the caller propagates the result.
+        from paramem.backup.state import read_backup_state, update_backup_state
+
+        update_backup_state(state_dir, result)
+        state = read_backup_state(state_dir)
+        assert state is not None
+        assert state.last_failure_at is None, (
+            "keep=0 no-op must not write a failure timestamp to the state file"
+        )
