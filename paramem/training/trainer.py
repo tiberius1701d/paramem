@@ -114,6 +114,7 @@ def train_adapter(
     run_name: Optional[str] = None,
     callbacks_extra: Optional[list] = None,
     active_adapters: Optional[list[str]] = None,
+    resume_from_checkpoint: Optional[str | Path] = None,
 ) -> dict:
     """Train a LoRA adapter on the given dataset.
 
@@ -121,7 +122,19 @@ def train_adapter(
     forward pass (for chained/compositional training). Only adapter_name
     receives gradients — caller must freeze others via set_requires_grad.
 
-    Returns training metrics dict.
+    Args:
+        resume_from_checkpoint: Optional path to an HF Trainer checkpoint
+            directory (e.g. ``adapter/checkpoint-120``). When provided, HF
+            Trainer restores optimizer state, LR schedule, and step count from
+            that checkpoint so training continues without resetting Adam
+            momentum. When ``None`` (default), a fresh training run starts.
+            Mirrors the semantics of
+            ``paramem.server.background_trainer.BackgroundTrainer._train_adapter``
+            which already uses ``trainer.train(resume_from_checkpoint=...)``.
+
+    Returns:
+        Training metrics dict (same as before; ``resume_from_checkpoint`` does
+        not change the shape of the returned dict).
     """
     if output_dir is None:
         output_dir = Path("outputs") / "adapters" / adapter_name
@@ -207,7 +220,8 @@ def train_adapter(
         adapter_config.learning_rate,
     )
 
-    result = trainer.train()
+    ckpt_arg = str(resume_from_checkpoint) if resume_from_checkpoint is not None else None
+    result = trainer.train(resume_from_checkpoint=ckpt_arg)
     metrics = result.metrics
 
     model.save_pretrained(str(output_dir), selected_adapters=[adapter_name])

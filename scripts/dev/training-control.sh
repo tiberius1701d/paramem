@@ -42,6 +42,7 @@ TEST_SCRIPTS[10]="experiments/test10_grokking.py"
 TEST_SCRIPTS["10b"]="experiments/test10b_diverse_rephrase.py"
 TEST_SCRIPTS[11]="experiments/test11_adapter_extraction.py"
 TEST_SCRIPTS[13]="experiments/test13_journal_scaffold.py"
+TEST_SCRIPTS["13b"]="experiments/test13b_retention_curve.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
@@ -49,6 +50,7 @@ TEST_OUTPUT_DIRS[10]="outputs/test10_grokking"
 TEST_OUTPUT_DIRS["10b"]="outputs/test10b_diverse_rephrase"
 TEST_OUTPUT_DIRS[11]="outputs/test11_adapter_extraction"
 TEST_OUTPUT_DIRS[13]="outputs/test13_journal_scaffold"
+TEST_OUTPUT_DIRS["13b"]="outputs/test13b_retention_curve"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
@@ -56,6 +58,7 @@ TEST_PGREP[10]="test10_grokking"
 TEST_PGREP["10b"]="test10b_diverse_rephrase"
 TEST_PGREP[11]="test11_adapter_extraction"
 TEST_PGREP[13]="test13_journal_scaffold"
+TEST_PGREP["13b"]="test13b_retention_curve"
 
 # --- Colors (inherit from gpu-cooldown.sh, add extras) ---
 BLUE='\033[0;34m'
@@ -198,7 +201,7 @@ _release_server_gpu() {
 
 _find_running_test() {
     # Returns the test number of the currently running test, or empty
-    for t in 8 9 10 10b 11 13; do
+    for t in 8 9 10 10b 11 13 13b; do
         if pgrep -f "${TEST_PGREP[$t]}" >/dev/null 2>&1; then
             echo "$t"
             return
@@ -371,7 +374,7 @@ training_resume() {
 
     # Validate test number
     if [[ -z "${TEST_SCRIPTS[$test_num]}" ]]; then
-        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13."
+        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b."
         return 1
     fi
 
@@ -544,7 +547,7 @@ print(labels.get(r, r or ''))
     fi
 
     # Show status for each test (reuses $running from above)
-    for test_num in 8 9 10 10b 11 13; do
+    for test_num in 8 9 10 10b 11 13 13b; do
         _show_test_status "$test_num" "$running"
     done
 
@@ -577,6 +580,30 @@ _show_test_status() {
         echo -e "  ${BOLD}Test 13${RESET}${is_running}"
         echo "  ────────────────────────────────────────"
         _show_test13_status "$latest_run_dir"
+        return
+    fi
+
+    # Test 13b uses fill_done.json marker and progress.json — dispatch early.
+    if [[ "$test_num" == "13b" ]]; then
+        local latest_run_dir
+        latest_run_dir=$(find "$PROJECT_DIR/$output_dir" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+        if [[ -z "$latest_run_dir" ]]; then
+            if [[ "$running_test" == "$test_num" ]]; then
+                echo ""
+                echo -e "  ${BOLD}Test 13b${RESET} ${GREEN}RUNNING${RESET}"
+                echo "  ────────────────────────────────────────"
+                echo -e "  ${DIM}Preparing run directory...${RESET}"
+            fi
+            return
+        fi
+        local is_running=""
+        if [[ "$running_test" == "$test_num" ]]; then
+            is_running=" ${GREEN}RUNNING${RESET}"
+        fi
+        echo ""
+        echo -e "  ${BOLD}Test 13b${RESET}${is_running}"
+        echo "  ────────────────────────────────────────"
+        _show_test13b_status "$latest_run_dir"
         return
     fi
 
@@ -926,6 +953,50 @@ PYEOF
     # Final results.json if all phases done.
     if [[ -f "$run_dir/results.json" ]]; then
         echo -e "  Final:      ${GREEN}all phases complete${RESET}"
+    fi
+}
+
+_show_test13b_status() {
+    # Argument: path to a specific run dir, e.g.
+    #   outputs/test13b_retention_curve/mistral/20260422_120000
+    local run_dir="$1"
+    local model_name=$(basename "$(dirname "$run_dir")")
+    local run_name=$(basename "$run_dir")
+
+    echo -e "  Model:      ${CYAN}${model_name}${RESET}"
+    echo -e "  Run:        ${DIM}${run_name}${RESET}"
+
+    if [[ -f "$run_dir/fill_done.json" ]]; then
+        python3 - "$run_dir/fill_done.json" <<'PYEOF' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+first = d.get("first_perfect_epoch")
+stable = d.get("stable_perfect_epoch")
+knee = d.get("retention_knee_epoch")
+n_fill = d.get("n_fill")
+n_unch = d.get("n_unchanged")
+final_fill = d.get("final_fill", {})
+final_ret = d.get("final_retention", {})
+wall = d.get("wall_seconds")
+print(f"  fill:       \x1b[32m✓\x1b[0m n={n_fill}  first={first}  stable={stable}  final={final_fill.get('recall','?')}/{final_fill.get('total','?')}")
+print(f"  retention:  knee=E{knee}  final={final_ret.get('recall','?')}/{final_ret.get('total','?')}  n_probed={n_unch}")
+if isinstance(wall, (int, float)):
+    print(f"  Wall:       {wall:.0f}s")
+PYEOF
+        echo -e "  Final:      ${GREEN}fill_done — complete${RESET}"
+        return
+    fi
+
+    if [[ -f "$run_dir/paused.json" ]]; then
+        local stopped_epoch
+        stopped_epoch=$(python3 -c "import json; print(json.load(open('$run_dir/paused.json')).get('stopped_after_epoch','?'))" 2>/dev/null)
+        echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped after epoch ${stopped_epoch} — tresume 13b to continue)${RESET}"
+    elif [[ -f "$run_dir/progress.json" ]]; then
+        _show_epoch_progress "$run_dir" "fill_retention_curve"
+    elif [[ -f "$run_dir/fill_keyed.json" ]]; then
+        echo -e "  State:      ${DIM}starting (data prepared, training not yet begun)${RESET}"
+    else
+        echo -e "  State:      ${DIM}no progress yet${RESET}"
     fi
 }
 
