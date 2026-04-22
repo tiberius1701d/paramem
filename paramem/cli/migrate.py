@@ -501,6 +501,30 @@ def render_preview(result: dict, server_url: str) -> int:
     _render_unified_diff(unified_diff)
     print()
 
+    # Slice 6b — pre-flight check short-circuit.
+    # If the server detected a pre-flight failure (e.g. disk pressure), the
+    # state is still LIVE (Decision A) — no /migration/cancel POST is needed.
+    pre_flight_fail = result.get("pre_flight_fail")
+    if pre_flight_fail is not None:
+        if pre_flight_fail == "disk_pressure":
+            used_gb = result.get("pre_flight_disk_used_gb") or 0.0
+            cap_gb = result.get("pre_flight_disk_cap_gb") or 0.0
+            # Spec L582–586 wording, with Decision-C CLI naming.
+            print(
+                f"Migration will fail at step 2 (pre-migration backup) — backup store\n"
+                f"at {used_gb:.2f} / {cap_gb:.2f} GB. Run `paramem backup-prune` or raise\n"
+                f"security.backups.max_total_disk_gb before retrying.",
+                file=sys.stderr,
+            )
+        else:
+            # Forward-compat: unknown pre-flight code (future slice).
+            print(
+                f"paramem migrate: pre-flight check failed: {pre_flight_fail!r}",
+                file=sys.stderr,
+            )
+        # No _post_cancel — state is still LIVE (Decision A); nothing to cancel.
+        return 1
+
     # 6. Proceed prompt
     try:
         answer = input("  Proceed? [y/N] ").strip().lower()

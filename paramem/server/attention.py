@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -417,18 +418,147 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
 # ---------------------------------------------------------------------------
 
 
-def _collect_backup_items(state: dict) -> list[AttentionItem]:
+def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
     """Emit backup-failure / stale / disk-pressure items.
 
-    Stub — Slice 6 implements this populator.
+    Emit order: FAILED → DISK PRESSURE → STALE.  Multiple alerts can fire
+    simultaneously (all 3 possible at the same time).
+
+    Conditions
+    ----------
+    FAILED:
+        ``last_failure_at`` is newer than ``last_success_at`` (or
+        ``last_success_at`` is None).
+    DISK PRESSURE:
+        Current backup-store usage ≥ 80% of global cap.  Level ``info``
+        at 80–99%; level ``failed`` at ≥ 100%.
+    STALE:
+        ``last_success_at`` older than ``2 × schedule_interval`` AND
+        schedule is not ``"off"`` / ``""`` AND ``last_success_at`` is
+        not None.
+
+    Silently returns ``[]`` when ``config`` is ``None`` (unit-test shim),
+    when backup modules are unavailable, or when reading state raises
+    ``BackupStateSchemaError`` (treated as "never run" so only non-state
+    alerts still evaluate).
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+    config:
+        Loaded ``ServerConfig``.  ``None`` → return ``[]`` immediately.
+
+    Returns
+    -------
+    list[AttentionItem]
+        Zero or more items in FAILED → DISK PRESSURE → STALE order.
     """
-    return []
+    if config is None:
+        return []
+
+    try:
+        from paramem.backup import retention as _retention
+        from paramem.backup import state as _bk_state
+        from paramem.backup.timer import _backup_timer_interval_seconds
+    except ImportError:
+        return []
+
+    items: list[AttentionItem] = []
+
+    backups_cfg = config.security.backups
+    state_dir = (config.paths.data / "state").resolve()
+    backups_root = (config.paths.data / "backups").resolve()
+
+    # -- Read persisted backup state (None when no run has ever happened). --
+    try:
+        record = _bk_state.read_backup_state(state_dir)
+    except _bk_state.BackupStateSchemaError:
+        # Malformed state: treated as "never run".  DISK PRESSURE still evaluates
+        # (it reads the filesystem directly), but FAILED and STALE are skipped.
+        record = None
+
+    raw_schedule = backups_cfg.schedule or ""
+    schedule_str = str(raw_schedule).strip().lower()
+
+    # -- Alert 1: Backup FAILED (level=failed) --
+    # Trigger: last_failure_at is newer than last_success_at (or last_success_at is None).
+    if record and record.last_failure_at:
+        last_succ = record.last_success_at or ""
+        if record.last_failure_at > last_succ:  # ISO strings compare correctly as UTC
+            reason = record.last_failure_reason or "(unknown)"
+            items.append(
+                AttentionItem(
+                    kind="backup_failed",
+                    level="failed",
+                    summary=(f"Backup: FAILED {record.last_failure_at[:19]} — {reason}"),
+                    action_hint="Inspect the backup runner logs.",
+                    age_seconds=_age_seconds_from_iso(record.last_failure_at),
+                )
+            )
+
+    # -- Alert 2: Backup DISK PRESSURE (level=info at 80–99%, failed at ≥100%) --
+    try:
+        usage = _retention.compute_disk_usage(backups_root, backups_cfg)
+    except Exception:
+        usage = None  # silently skip DISK PRESSURE alert on scan failure
+
+    if usage is not None and usage.cap_bytes > 0:
+        pct = usage.pct_of_cap
+        if pct >= 0.80:
+            lvl = "failed" if pct >= 1.0 else "info"
+            cap_gb = backups_cfg.max_total_disk_gb
+            items.append(
+                AttentionItem(
+                    kind="backup_disk_pressure",
+                    level=lvl,
+                    summary=(f"Backup: DISK {int(pct * 100)}% of {cap_gb} GB cap — prune required"),
+                    action_hint="Run paramem backup-prune.",
+                    age_seconds=None,
+                )
+            )
+
+    # -- Alert 3: Backup STALE (level=info) --
+    # Skipped when schedule="off" (or empty/disabled) or when no successful run yet.
+    if record and record.last_success_at and schedule_str not in ("", "off", "disabled", "none"):
+        interval = _backup_timer_interval_seconds(schedule_str)
+        if interval and interval > 0:
+            age = _age_seconds_from_iso(record.last_success_at)
+            if age is not None and age > 2 * interval:
+                # Human-readable age.
+                if age >= 86400:
+                    age_human = f"{age // 86400}d"
+                elif age >= 3600:
+                    age_human = f"{age // 3600}h"
+                else:
+                    age_human = f"{age // 60}m"
+                items.append(
+                    AttentionItem(
+                        kind="backup_stale",
+                        level="info",
+                        summary=(
+                            f"Backup: STALE — last success {age_human} ago "
+                            f"(schedule: {raw_schedule})"
+                        ),
+                        action_hint=(
+                            "Run paramem backup-create or wait for the next scheduled cycle."
+                        ),
+                        age_seconds=age,
+                    )
+                )
+
+    return items
 
 
 def _collect_key_rotation_items(state: dict) -> list[AttentionItem]:
     """Emit key-rotation items when snapshot key fingerprint changed.
 
     Stub — Slice 7 implements this populator.
+
+    Note: signature is intentionally ``(state)``-only.  Slice 7 will extend
+    this to ``(state, config)`` when it implements the populator.  Do NOT
+    unify the signature with ``_collect_backup_items`` prematurely — this
+    stub is the Slice 7 extension point.
     """
     return []
 
@@ -437,15 +567,93 @@ def _collect_encryption_items(state: dict) -> list[AttentionItem]:
     """Emit encryption-degraded items when encrypt_at_rest=always but no key.
 
     Stub — Slice 7 implements this populator.
+
+    Note: signature is intentionally ``(state)``-only.  Slice 7 will extend
+    this to ``(state, config)`` when it implements the populator.  Do NOT
+    unify the signature with ``_collect_backup_items`` prematurely — this
+    stub is the Slice 7 extension point.
     """
     return []
 
 
-def _collect_pre_flight_items(state: dict) -> list[AttentionItem]:
-    """Emit pre-flight-fail items from the last /migration/preview check.
+def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
+    """Emit migration pre-flight fail items (disk pressure, etc.).
 
-    Stub — Slice 6 implements this populator.
+    Re-computes the disk-pressure check at every ``/status`` poll using the
+    cached ``compute_disk_usage`` (5s TTL — no filesystem re-walk per poll).
+
+    Suppressed during STAGING / TRIAL — those states have already passed
+    pre-flight at ``/preview`` time, or are mid-trial where pre-flight is
+    irrelevant.
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+    config:
+        Loaded ``ServerConfig``.  ``None`` → return ``[]`` immediately.
+
+    Returns
+    -------
+    list[AttentionItem]
+        Zero or one item when disk pressure would block a migration preview.
     """
+    if config is None:
+        return []
+
+    migration = state.get("migration") or {}
+    mig_state = migration.get("state", "LIVE")
+    if mig_state in ("STAGING", "TRIAL"):
+        return []  # suppression rule — pre-flight is only relevant in LIVE state
+
+    # Re-compute the disk-pressure check.  loop may be None (cloud-only mode).
+    try:
+        from paramem.backup.preflight import compute_pre_flight_check
+    except ImportError:
+        return []
+
+    loop = state.get("consolidation_loop")
+    backups_root = (config.paths.data / "backups").resolve()
+
+    live_config_path_raw = state.get("config_path")
+    live_config_path = (
+        Path(live_config_path_raw) if live_config_path_raw else Path("configs/server.yaml")
+    )
+
+    try:
+        registry_path = config.paths.data / "registry" / "key_metadata.json"
+    except (AttributeError, TypeError):
+        registry_path = None
+
+    try:
+        pf = compute_pre_flight_check(
+            server_config=config,
+            loop=loop,
+            backups_root=backups_root,
+            live_config_path=live_config_path,
+            registry_path=registry_path,
+        )
+    except Exception:
+        return []  # scan failure — silent; do not crash /status
+
+    if pf.fail_code == "disk_pressure":
+        used_gb = pf.disk_used_bytes / (1024**3)
+        cap_gb = pf.disk_cap_bytes / (1024**3)
+        return [
+            AttentionItem(
+                kind="migration_pre_flight_fail",
+                level="info",
+                summary=(
+                    f"Migration: PRE-FLIGHT FAIL — disk pressure "
+                    f"(used {used_gb:.1f} of {cap_gb:.1f} GB cap)"
+                ),
+                action_hint=(
+                    "Run paramem backup-prune to free space, or raise "
+                    "security.backups.max_total_disk_gb."
+                ),
+                age_seconds=None,
+            )
+        ]
     return []
 
 
@@ -486,10 +694,14 @@ def collect_attention_items(
     items.extend(_collect_migration_items(state))
     items.extend(_collect_consolidation_items(state))
     items.extend(_collect_sweeper_items(state))
-    items.extend(_collect_backup_items(state))  # stub
+    # NOTE: _collect_backup_items and _collect_pre_flight_items take (state, config) —
+    # updated in Slice 6b.  The Slice 7 stubs _collect_key_rotation_items and
+    # _collect_encryption_items intentionally keep the (state)-only signature so they
+    # remain valid extension points; do NOT unify them here before Slice 7 fills them.
+    items.extend(_collect_backup_items(state, config))
     items.extend(_collect_config_drift_items(state))
-    items.extend(_collect_key_rotation_items(state))  # stub
-    items.extend(_collect_encryption_items(state))  # stub
+    items.extend(_collect_key_rotation_items(state))  # stub — Slice 7
+    items.extend(_collect_encryption_items(state))  # stub — Slice 7
     items.extend(_collect_adapter_fingerprint_items(state))
-    items.extend(_collect_pre_flight_items(state))  # stub
+    items.extend(_collect_pre_flight_items(state, config))
     return items

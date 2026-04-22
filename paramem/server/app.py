@@ -411,6 +411,8 @@ class PreviewResponse(BaseModel):
     tier_diff: list[TierDiffRow]
     shape_changes: list[ShapeChange]
     pre_flight_fail: str | None = None
+    pre_flight_disk_used_gb: float | None = None
+    pre_flight_disk_cap_gb: float | None = None
 
 
 # MigrationDiffResponse is an alias — same shape as PreviewResponse.
@@ -2614,9 +2616,63 @@ async def migration_preview(request: PreviewRequest):
     # --- Detect simulate-mode ---
     simulate_mode_override = detect_simulate_mode(parsed_candidate)
 
-    # --- Build stash ---
+    # --- Pre-flight (Slice 6b): disk-pressure gate on backup store ---
+    # compute_pre_flight_check guards itself against MagicMock / non-real configs
+    # (returns no-pressure result when max_total_disk_gb is not a real numeric).
+    # No call-site guard needed here.
+    from paramem.backup.preflight import compute_pre_flight_check as _compute_pre_flight
     from paramem.server.migration import MigrationStashState
 
+    _registry_path_for_pf = None
+    try:
+        if config is not None and hasattr(config, "paths") and config.paths.data is not None:
+            _registry_path_for_pf = config.paths.data / "registry" / "key_metadata.json"
+    except (AttributeError, TypeError):
+        _registry_path_for_pf = None
+
+    try:
+        _backups_root_for_pf = (config.paths.data / "backups").resolve()
+    except (AttributeError, TypeError):
+        _backups_root_for_pf = Path("data/ha/backups").resolve()
+
+    pre_flight = None
+    try:
+        pre_flight = _compute_pre_flight(
+            server_config=config,
+            loop=_state.get("consolidation_loop"),
+            backups_root=_backups_root_for_pf,
+            live_config_path=live_config_path,
+            registry_path=_registry_path_for_pf,
+        )
+    except Exception:
+        # Defensive: pre-flight failure must not block the preview entirely.
+        pre_flight = None
+
+    if pre_flight is not None and pre_flight.fail_code is not None:
+        # State stays LIVE (Decision A) — do NOT store the stash.
+        # Build a preview-only (non-stored) stash for render_preview_response.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        preview_stash = MigrationStashState(
+            state="LIVE",
+            candidate_path=str(candidate_path),
+            candidate_hash=candidate_hash,
+            candidate_bytes=candidate_bytes,
+            candidate_text=candidate_text,
+            parsed_candidate=parsed_candidate,
+            staged_at=now_iso,
+            simulate_mode_override=simulate_mode_override,
+            shape_changes=shape_changes,
+            tier_diff=tier_diff,
+            unified_diff=unified_diff,
+            trial=None,
+            recovery_required=list(_state.get("migration", {}).get("recovery_required", [])),
+        )
+        payload = render_preview_response(preview_stash, pre_flight_fail=pre_flight.fail_code)
+        payload["pre_flight_disk_used_gb"] = pre_flight.disk_used_bytes / (1024**3)
+        payload["pre_flight_disk_cap_gb"] = pre_flight.disk_cap_bytes / (1024**3)
+        return PreviewResponse(**payload)
+
+    # --- Build stash (pre-flight passed) ---
     now_iso = datetime.now(timezone.utc).isoformat()
 
     stash = MigrationStashState(
@@ -3955,6 +4011,661 @@ async def migration_rollback():
             restart_required=True,
             restart_hint=_RESTART_HINT,
         )
+
+
+# ---------------------------------------------------------------------------
+# Slice 6b — Backup REST endpoints
+# ---------------------------------------------------------------------------
+
+
+class BackupListItem(BaseModel):
+    """One row in the ``/backup/list`` response.
+
+    Attributes
+    ----------
+    backup_id:
+        Slot directory name (e.g. ``"20260421-04000012"``).
+    kind:
+        Artifact kind string (``"config"`` | ``"graph"`` | ``"registry"`` |
+        ``"snapshot"`` | ``"resume"``).
+    tier:
+        Backup tier (``"daily"`` | ``"manual"`` | ``"pre_migration"`` | …).
+    timestamp:
+        ISO-8601 UTC timestamp derived from the slot directory name.
+    size_bytes:
+        Total file size of the slot on disk.
+    label:
+        Optional operator-supplied annotation; ``None`` when absent.
+    path:
+        Absolute path to the slot directory.
+    """
+
+    backup_id: str
+    kind: str
+    tier: str
+    timestamp: str
+    size_bytes: int
+    label: str | None
+    path: str
+
+
+class BackupListResponse(BaseModel):
+    """Response body for ``GET /backup/list``.
+
+    Attributes
+    ----------
+    items:
+        Backup records, newest-first.
+    disk_used_bytes:
+        Current total backup-store usage.
+    disk_cap_bytes:
+        Global cap (``max_total_disk_gb * 1024**3``).
+    """
+
+    items: list[BackupListItem]
+    disk_used_bytes: int
+    disk_cap_bytes: int
+
+
+class BackupCreateRequest(BaseModel):
+    """Request body for ``POST /backup/create``.
+
+    Attributes
+    ----------
+    kinds:
+        Artifact kinds to back up.  ``None`` or ``[]`` → default
+        ``["config", "graph", "registry"]``.
+    label:
+        Optional annotation written into each slot sidecar.
+    """
+
+    kinds: list[str] | None = None
+    label: str | None = None
+
+
+class SkippedArtifact(BaseModel):
+    """One skipped artifact entry in ``BackupCreateResponse``.
+
+    Attributes
+    ----------
+    kind:
+        Artifact kind that was skipped.
+    reason:
+        Human-readable reason (e.g. ``"registry empty (no keys yet)"``).
+    """
+
+    kind: str
+    reason: str
+
+
+class BackupCreateResponse(BaseModel):
+    """Response body for ``POST /backup/create``.
+
+    Attributes
+    ----------
+    success:
+        ``True`` when at least one artifact was written; ``False`` on
+        disk-pressure refusal or write error.
+    tier:
+        Always ``"manual"`` for operator-initiated backups.
+    written_slots:
+        Mapping of artifact name → absolute slot directory path.
+    skipped_artifacts:
+        Artifacts that were not written, with reasons.
+    error:
+        Short error description when ``success=False``; ``None`` otherwise.
+    """
+
+    success: bool
+    tier: str
+    written_slots: dict[str, str]
+    skipped_artifacts: list[SkippedArtifact] = []
+    error: str | None
+
+
+class BackupRestoreRequest(BaseModel):
+    """Request body for ``POST /backup/restore``.
+
+    Attributes
+    ----------
+    backup_id:
+        Slot directory name to restore (e.g. ``"20260421-04000012"``).
+    """
+
+    backup_id: str
+
+
+class BackupRestoreResponse(BaseModel):
+    """Response body for ``POST /backup/restore``.
+
+    Attributes
+    ----------
+    restored:
+        Mapping of artifact kind → live path that was overwritten.
+    backed_up_pre_restore:
+        Mapping of kind → safety backup slot path taken before restore.
+    restart_required:
+        Always ``True`` — the server must be restarted to load the restored config.
+    restart_hint:
+        Human-readable restart command.
+    """
+
+    restored: dict[str, str]
+    backed_up_pre_restore: dict[str, str]
+    restart_required: bool = True
+    restart_hint: str
+
+
+class BackupPruneRequest(BaseModel):
+    """Request body for ``POST /backup/prune``.
+
+    Attributes
+    ----------
+    dry_run:
+        When ``True``, populate ``would_delete_next`` but do not delete.
+    """
+
+    dry_run: bool = False
+
+
+class BackupPruneResponse(BaseModel):
+    """Response body for ``POST /backup/prune``.
+
+    Attributes
+    ----------
+    deleted:
+        Slot directories removed (stringified paths).
+    preserved_immune:
+        Slots saved by live-TRIAL immunity.
+    preserved_pre_migration_window:
+        Slots saved by the 30-day pre-migration window immunity (rule 4).
+    would_delete_next:
+        Dry-run preview: slots that would be deleted on the next non-dry-run call.
+    disk_usage_before:
+        Disk usage snapshot before any deletions.
+    disk_usage_after:
+        Disk usage snapshot after deletions (equals before in dry-run).
+    invalid_slots:
+        ``[[path, reason]]`` pairs for slots with unreadable sidecars.
+    dry_run:
+        Echoes the request flag.
+    """
+
+    deleted: list[str]
+    preserved_immune: list[str]
+    preserved_pre_migration_window: list[str]
+    would_delete_next: list[str]
+    disk_usage_before: dict
+    disk_usage_after: dict
+    invalid_slots: list[list[str]]
+    dry_run: bool
+
+
+@app.get("/backup/list", response_model=BackupListResponse)
+async def backup_list(kind: str | None = None):
+    """Enumerate backups across all kinds, newest-first.
+
+    Query parameter ``kind`` filters by artifact kind (``"config"`` |
+    ``"graph"`` | ``"registry"`` | ``"snapshot"`` | ``"resume"``).
+    Unknown values return 400 ``kind_invalid``.
+
+    Reads via ``enumerate_backups(backups_root, kind=...)``.  Size is taken
+    from the sum of file sizes in each slot directory.
+
+    Errors
+    ------
+    400 ``kind_invalid``
+        When ``kind`` is not in ``ArtifactKind`` enum values.
+    """
+    from fastapi import HTTPException
+
+    from paramem.backup.enumerate import enumerate_backups
+    from paramem.backup.retention import compute_disk_usage
+
+    config = _state.get("config")
+
+    # Resolve backups_root.
+    if config is not None:
+        try:
+            backups_root = (config.paths.data / "backups").resolve()
+        except (AttributeError, TypeError):
+            backups_root = Path("data/ha/backups").resolve()
+    else:
+        backups_root = Path("data/ha/backups").resolve()
+
+    # Validate and coerce kind query parameter.
+    kind_enum = None
+    if kind is not None:
+        try:
+            kind_enum = ArtifactKind(kind)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "kind_invalid",
+                    "message": (
+                        f"kind must be one of {[k.value for k in ArtifactKind]}; got {kind!r}"
+                    ),
+                },
+            )
+
+    records = enumerate_backups(backups_root, kind=kind_enum)
+
+    # Build BackupListItem list.
+    from paramem.backup.retention import _slot_size_bytes
+
+    items: list[BackupListItem] = []
+    for record in records:
+        # Compute slot size.
+        size = _slot_size_bytes(record.slot_dir)
+        # Convert timestamp to ISO-8601 (YYYYMMDD-HHMMSSff → datetime str).
+        ts = record.created_at.isoformat()
+        items.append(
+            BackupListItem(
+                backup_id=record.slot_dir.name,
+                kind=record.kind.value,
+                tier=record.meta.tier,
+                timestamp=ts,
+                size_bytes=size,
+                label=record.label,
+                path=str(record.slot_dir),
+            )
+        )
+
+    # Disk usage (TTL-cached).
+    disk_used_bytes = 0
+    disk_cap_bytes = 0
+    if config is not None:
+        try:
+            backups_cfg = config.security.backups
+            usage = compute_disk_usage(backups_root, backups_cfg)
+            disk_used_bytes = usage.total_bytes
+            disk_cap_bytes = usage.cap_bytes
+        except Exception:
+            pass
+
+    return BackupListResponse(
+        items=items,
+        disk_used_bytes=disk_used_bytes,
+        disk_cap_bytes=disk_cap_bytes,
+    )
+
+
+@app.post("/backup/create", response_model=BackupCreateResponse)
+async def backup_create(req: BackupCreateRequest):
+    """Take an immediate manual backup of the requested artifacts.
+
+    Delegates to ``run_scheduled_backup`` with ``tier="manual"`` and a
+    per-call shallow-cloned config with ``.artifacts`` replaced by the
+    request's ``kinds`` list (defaults to ``["config", "graph", "registry"]``).
+
+    Persists the result via ``update_backup_state`` so the next ``/status``
+    reflects the freshly-updated ``last_success_at``.
+
+    Errors
+    ------
+    400 ``kind_invalid``
+        When any entry in ``kinds`` is not ``"config"``, ``"graph"``, or
+        ``"registry"``.
+    """
+    import dataclasses
+
+    from fastapi import HTTPException
+
+    from paramem.backup.runner import run_scheduled_backup
+    from paramem.backup.state import update_backup_state
+
+    _VALID_KINDS = {"config", "graph", "registry"}
+
+    # Validate kinds.
+    kinds = req.kinds
+    if not kinds:
+        kinds = ["config", "graph", "registry"]
+
+    for k in kinds:
+        if k not in _VALID_KINDS:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "kind_invalid",
+                    "message": (f"kind must be one of {sorted(_VALID_KINDS)}; got {k!r}"),
+                },
+            )
+
+    config = _state.get("config")
+    if config is None:
+        # Cloud-only or uninitialized — still attempt with a default config fallback.
+        from paramem.server.config import PathsConfig, SecurityConfig, ServerConfig
+
+        _fallback_config = ServerConfig.__new__(ServerConfig)
+        _fallback_config.paths = PathsConfig()
+        _fallback_config.security = SecurityConfig()
+        config = _fallback_config
+
+    # Build a per-call copy of the backups config with the requested artifacts.
+    # dataclasses.replace performs a shallow copy; retention is shared by reference
+    # (safe because run_scheduled_backup only reads it).
+    per_call_backups_cfg = dataclasses.replace(config.security.backups, artifacts=kinds)
+
+    # Build a temporary server_config with the replaced backups config.
+    import dataclasses as _dc
+
+    per_call_security = _dc.replace(config.security, backups=per_call_backups_cfg)
+
+    # We cannot use dataclasses.replace on ServerConfig directly because it may
+    # not be a plain dataclass in all test shims. Build a shallow wrapper instead.
+    class _ConfigProxy:
+        """Thin proxy that swaps in the per-call security config."""
+
+        def __init__(self, base, security):
+            self._base = base
+            self.security = security
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+    proxy_config = _ConfigProxy(config, per_call_security)
+
+    state_dir = (config.paths.data / "state").resolve()
+    backups_root = (config.paths.data / "backups").resolve()
+    live_config_path = (
+        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+    )
+    loop = _state.get("consolidation_loop")
+
+    result = run_scheduled_backup(
+        server_config=proxy_config,
+        loop=loop,
+        state_dir=state_dir,
+        backups_root=backups_root,
+        live_config_path=live_config_path,
+        tier="manual",
+        label=req.label,
+    )
+
+    # Persist state so /status shows updated last_success_at.
+    try:
+        update_backup_state(state_dir, result)
+    except Exception as exc:
+        logger.warning("backup_create: update_backup_state failed: %s", exc)
+
+    skipped = [SkippedArtifact(kind=k, reason=r) for k, r in result.skipped_artifacts]
+
+    return BackupCreateResponse(
+        success=result.success,
+        tier=result.tier,
+        written_slots=result.written_slots,
+        skipped_artifacts=skipped,
+        error=result.error,
+    )
+
+
+@app.post("/backup/restore", response_model=BackupRestoreResponse)
+async def backup_restore(req: BackupRestoreRequest):
+    """Restore a **config** backup atop the live server.yaml.
+
+    Only ``kind="config"`` is supported in Slice 6b (restore-kind-restriction).
+    Graph / registry restore is deferred to a future slice that has an
+    offline-coordinator path.
+
+    Atomic restore sequence (decrypt-first, then safety backup, then rename):
+
+    1. Verify preconditions (no TRIAL/STAGING, no active consolidation).
+    2. Locate the slot by ``backup_id``.
+    3. Assert ``kind == config`` (400 otherwise).
+    4. Decrypt backup via ``backup.read(slot_dir)`` → plaintext bytes.
+    5. Take a manual safety backup of the current live config.
+    6. Write plaintext to ``live_config_path + ".restore-pending"``, fsync,
+       ``os.rename`` to live path, fsync parent.
+    7. Append recovery banner to ``_state["migration"]["recovery_required"]``.
+    8. Return 200.
+
+    Errors
+    ------
+    409 ``trial_active``
+        Migration state is TRIAL.
+    409 ``staging_active``
+        Migration state is STAGING.
+    409 ``consolidating``
+        A consolidation run is in progress.
+    404 ``not_found``
+        No slot with the given ``backup_id`` exists.
+    400 ``restore_kind_not_supported``
+        The slot is not kind=config.
+    500 ``restore_decrypt_failed``
+        Decryption failed (wrong key, corrupted backup).
+    500 ``config_restore_failed``
+        Atomic rename of the restore temp file failed.
+    """
+    from fastapi import HTTPException
+
+    from paramem.backup.backup import read as backup_read
+    from paramem.backup.backup import write as backup_write_fn
+    from paramem.backup.encryption import SecurityBackupsConfig as EncSecurityConfig
+    from paramem.backup.enumerate import enumerate_backups
+    from paramem.server.migration import initial_migration_state
+
+    # --- Step 1: Precondition checks ---
+    migration = _state.get("migration") or initial_migration_state()
+    mig_state = migration.get("state", "LIVE")
+
+    if mig_state == "TRIAL":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "trial_active",
+                "state": "TRIAL",
+                "message": ("Cannot restore during TRIAL. Accept or rollback the migration first."),
+            },
+        )
+    if mig_state == "STAGING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "staging_active",
+                "state": "STAGING",
+                "message": ("Cannot restore during STAGING. Cancel the migration first."),
+            },
+        )
+    if _state.get("consolidating"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "consolidating",
+                "message": "Consolidation is running; wait for completion before restoring.",
+            },
+        )
+
+    config = _state.get("config")
+    if config is not None:
+        try:
+            backups_root = (config.paths.data / "backups").resolve()
+        except (AttributeError, TypeError):
+            backups_root = Path("data/ha/backups").resolve()
+    else:
+        backups_root = Path("data/ha/backups").resolve()
+
+    # --- Step 2: Locate slot ---
+    all_records = enumerate_backups(backups_root, kind=None)
+    target_record = None
+    for record in all_records:
+        if record.slot_dir.name == req.backup_id:
+            target_record = record
+            break
+
+    if target_record is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "not_found",
+                "message": f"No backup slot found with backup_id={req.backup_id!r}.",
+            },
+        )
+
+    # --- Step 3: Kind gate (only config in 6b) ---
+    if target_record.kind != ArtifactKind.CONFIG:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "restore_kind_not_supported",
+                "message": (
+                    f"Only kind='config' restore is supported in this release. "
+                    f"Found kind={target_record.kind.value!r} at {req.backup_id}."
+                ),
+            },
+        )
+
+    # --- Step 4: Decrypt backup (BEFORE safety backup — order matters) ---
+    try:
+        plaintext_bytes, _meta = backup_read(target_record.slot_dir)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "restore_decrypt_failed",
+                "message": f"Failed to read/decrypt backup slot: {exc}",
+            },
+        ) from exc
+
+    live_config_path = (
+        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+    )
+
+    # --- Step 5: Safety backup of current live config ---
+    safety_slot_path: str = ""
+    safety_label = f"pre_restore_safety_{req.backup_id}"
+    try:
+        enc_cfg = EncSecurityConfig()
+        safety_slot = backup_write_fn(
+            ArtifactKind.CONFIG,
+            live_config_path.read_bytes() if live_config_path.exists() else b"",
+            meta_fields={"tier": "manual", "label": safety_label},
+            base_dir=backups_root / "config",
+            security_config=enc_cfg,
+        )
+        safety_slot_path = str(safety_slot)
+    except Exception as exc:
+        logger.error("backup_restore: safety backup failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "config_restore_failed",
+                "message": f"Safety backup failed; restore aborted: {exc}",
+            },
+        ) from exc
+
+    # --- Step 6: Atomic restore ---
+    restore_pending = live_config_path.with_suffix(live_config_path.suffix + ".restore-pending")
+    try:
+        restore_pending.write_bytes(plaintext_bytes)
+        # fsync the temp file.
+        with open(restore_pending, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.rename(str(restore_pending), str(live_config_path))
+        # fsync parent directory for rename durability.
+        _dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
+        try:
+            os.fsync(_dir_fd)
+        except OSError as _fsync_exc:
+            logger.warning("backup_restore: parent fsync failed: %s", _fsync_exc)
+        finally:
+            os.close(_dir_fd)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "config_restore_failed",
+                "message": (
+                    f"Failed to atomically rename restore temp file: {exc}. "
+                    f"Safety backup is at {safety_slot_path}."
+                ),
+            },
+        ) from exc
+
+    # --- Step 7: Append recovery banner ---
+    if "migration" not in _state:
+        _state["migration"] = initial_migration_state()
+    if "recovery_required" not in _state["migration"]:
+        _state["migration"]["recovery_required"] = []
+    _state["migration"]["recovery_required"].append(
+        f"Restored config from backup {req.backup_id} — restart to clear recovery banner."
+    )
+
+    return BackupRestoreResponse(
+        restored={"config": str(live_config_path)},
+        backed_up_pre_restore={"config": safety_slot_path},
+        restart_required=True,
+        restart_hint="systemctl --user restart paramem-server",
+    )
+
+
+@app.post("/backup/prune", response_model=BackupPruneResponse)
+async def backup_prune(req: BackupPruneRequest):
+    """Apply the 5-rule retention policy.
+
+    Thin wrapper over ``retention.prune()``.  Serialises ``PruneResult``
+    into the response — ``DiskUsage`` dicts include ``total_bytes``,
+    ``by_tier``, ``cap_bytes``, and ``pct_of_cap``.
+
+    Errors
+    ------
+    500 ``prune_failed``
+        Unexpected error during pruning (e.g. permission denied).
+    """
+    from fastapi import HTTPException
+
+    from paramem.backup.retention import prune
+
+    config = _state.get("config")
+    if config is not None:
+        try:
+            backups_root = (config.paths.data / "backups").resolve()
+            state_dir = (config.paths.data / "state").resolve()
+            backups_cfg = config.security.backups
+        except (AttributeError, TypeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "prune_failed", "message": f"Config error: {exc}"},
+            ) from exc
+    else:
+        from paramem.server.config import ServerBackupsConfig
+
+        backups_root = Path("data/ha/backups").resolve()
+        state_dir = Path("data/ha/state").resolve()
+        backups_cfg = ServerBackupsConfig()
+
+    try:
+        pr = prune(
+            backups_root=backups_root,
+            state_dir=state_dir,
+            config=backups_cfg,
+            dry_run=req.dry_run,
+        )
+    except Exception as exc:
+        logger.error("backup_prune: prune() raised: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "prune_failed", "message": str(exc)},
+        ) from exc
+
+    def _du_to_dict(du) -> dict:
+        return {
+            "total_bytes": du.total_bytes,
+            "by_tier": du.by_tier,
+            "cap_bytes": du.cap_bytes,
+            "pct_of_cap": du.pct_of_cap,
+        }
+
+    return BackupPruneResponse(
+        deleted=[str(p) for p in pr.deleted],
+        preserved_immune=[str(p) for p in pr.preserved_immune],
+        preserved_pre_migration_window=[str(p) for p in pr.preserved_pre_migration_window],
+        would_delete_next=[str(p) for p in pr.would_delete_next],
+        disk_usage_before=_du_to_dict(pr.disk_usage_before),
+        disk_usage_after=_du_to_dict(pr.disk_usage_after),
+        invalid_slots=[[str(p), r] for p, r in pr.invalid_slots],
+        dry_run=req.dry_run,
+    )
 
 
 def _cloud_only_route(

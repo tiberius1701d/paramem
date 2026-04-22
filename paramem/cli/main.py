@@ -21,7 +21,10 @@ import argparse
 import sys
 
 from paramem.cli import (
-    backup,
+    backup_create,
+    backup_list,
+    backup_prune,
+    backup_restore,
     migrate,
     migrate_accept,
     migrate_cancel,
@@ -132,21 +135,80 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit raw JSON response instead of formatted output.",
     )
 
-    # --- backup ---
-    p_backup = subparsers.add_parser(
-        "backup",
-        help="Backup management subcommands.",
-        description="Manage ParaMem artifact backups.",
+    # --- backup-list ---
+    p_bl = subparsers.add_parser(
+        "backup-list",
+        help="List backup slots (newest-first).",
+        description="GET /backup/list.",
     )
-    backup_sub = p_backup.add_subparsers(dest="backup_command", metavar="SUBCOMMAND")
-    backup_sub.required = True
+    p_bl.add_argument(
+        "--kind",
+        choices=["config", "graph", "registry", "snapshot", "resume"],
+        default=None,
+        help="Filter by artifact kind.",
+    )
+    p_bl.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON response instead of formatted output.",
+    )
 
-    p_backup_list = backup_sub.add_parser(
-        "list",
-        help="List available backup slots.",
-        description=("GET /backup/list. Ships in Slice 6."),
+    # --- backup-create ---
+    p_bc = subparsers.add_parser(
+        "backup-create",
+        help="Take a manual backup now.",
+        description="POST /backup/create.",
     )
-    p_backup_list.add_argument(
+    p_bc.add_argument(
+        "--kinds",
+        default="config,graph,registry",
+        metavar="KINDS",
+        help=(
+            "Comma-separated list of artifact kinds to back up (default: config,graph,registry)."
+        ),
+    )
+    p_bc.add_argument(
+        "--label",
+        default=None,
+        metavar="LABEL",
+        help="Optional annotation written into each slot's sidecar.",
+    )
+    p_bc.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON response instead of formatted output.",
+    )
+
+    # --- backup-restore ---
+    p_br = subparsers.add_parser(
+        "backup-restore",
+        help="Restore a config backup (only kind=config supported).",
+        description="POST /backup/restore.",
+    )
+    p_br.add_argument(
+        "backup_id",
+        metavar="BACKUP_ID",
+        help="Slot directory name to restore (e.g. 20260421-04000012).",
+    )
+    p_br.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON response instead of formatted output.",
+    )
+
+    # --- backup-prune ---
+    p_bp = subparsers.add_parser(
+        "backup-prune",
+        help="Apply the 5-rule retention policy.",
+        description="POST /backup/prune.",
+    )
+    p_bp.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Preview what would be deleted without removing anything.",
+    )
+    p_bp.add_argument(
         "--json",
         action="store_true",
         help="Emit raw JSON response instead of formatted output.",
@@ -197,9 +259,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "migrate-rollback":
         return migrate_rollback.run(args)
 
-    if args.command == "backup":
-        if args.backup_command == "list":
-            return backup.run(args)
+    if args.command == "backup-list":
+        return backup_list.run(args)
+
+    if args.command == "backup-create":
+        return backup_create.run(args)
+
+    if args.command == "backup-restore":
+        return backup_restore.run(args)
+
+    if args.command == "backup-prune":
+        return backup_prune.run(args)
 
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)

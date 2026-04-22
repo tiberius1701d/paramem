@@ -103,20 +103,20 @@ class TestMigrateStatusJsonFlag:
         assert parsed == fake_response, "JSON output must round-trip the response"
 
 
-class TestBackupList404PrintsSlice6Message:
-    def test_backup_list_404_prints_slice6_message(self, monkeypatch, capsys):
-        """ServerUnavailable from /backup/list → rc=1, message mentions Slice 6."""
-
-        def _raise(*_args, **_kwargs):
-            raise http_client.ServerUnavailable("404 from /backup/list")
-
-        monkeypatch.setattr(http_client, "get_json", _raise)
-
-        rc = main(["backup", "list"])
+class TestLegacyBackupParentNoSubactionErrorsWithHint:
+    def test_legacy_backup_parent_no_subaction_errors_with_hint(self, capsys):
+        """main(['backup']) errors (argparse unknown choice) mentioning backup-* subcommands."""
+        # argparse raises SystemExit(2) for unknown subcommands.
+        with pytest.raises(SystemExit) as exc_info:
+            main(["backup"])
+        assert exc_info.value.code == 2
         captured = capsys.readouterr()
-
-        assert rc == 1, f"Expected exit 1, got {rc}"
-        assert "Slice 6" in captured.err, "Stderr must mention Slice 6 for backup list"
+        combined = captured.out + captured.err
+        # argparse shows the valid choices; at least one backup-* command must appear.
+        assert any(
+            name in combined
+            for name in ("backup-list", "backup-create", "backup-restore", "backup-prune")
+        ), f"Expected at least one backup-* subcommand in argparse error output: {combined!r}"
 
 
 class TestParamemHelp:
@@ -159,14 +159,14 @@ class TestMigrateHTTPError:
 
 class TestBackupListHTTPError:
     def test_backup_list_http_500_prints_body_and_returns_1(self, monkeypatch, capsys):
-        """ServerHTTPError from get_json on backup list → rc=1 with diagnostic body."""
+        """ServerHTTPError from get_json on backup-list → rc=1 with diagnostic body."""
 
         def _raise(*_args, **_kwargs):
             raise http_client.ServerHTTPError(503, "http://x/backup/list", "maintenance")
 
         monkeypatch.setattr(http_client, "get_json", _raise)
 
-        rc = main(["backup", "list"])
+        rc = main(["backup-list"])
         captured = capsys.readouterr()
 
         assert rc == 1, f"Expected exit 1, got {rc}"

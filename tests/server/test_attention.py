@@ -528,12 +528,14 @@ def test_adapter_fingerprint_manifest_missing():
 
 
 def test_stub_populators_return_empty():
-    """All stub populators return [] (forward-compat guardrail for Slices 6/7)."""
+    """All stub populators return [] when config=None (forward-compat guardrail for Slices 6/7)."""
     state = _live_state()
-    assert _collect_backup_items(state) == []
+    # _collect_backup_items and _collect_pre_flight_items now take (state, config) after Slice 6b.
+    # Passing config=None exercises the early-return guard.
+    assert _collect_backup_items(state, None) == []
     assert _collect_key_rotation_items(state) == []
     assert _collect_encryption_items(state) == []
-    assert _collect_pre_flight_items(state) == []
+    assert _collect_pre_flight_items(state, None) == []
 
 
 # ---------------------------------------------------------------------------
