@@ -229,6 +229,28 @@ class TestPreviewErrors:
         detail = resp.json().get("detail", {})
         assert detail.get("error") == "already_staging"
 
+    def test_preview_409_when_trial_active(self, client, state, tmp_path):
+        """TRIAL state → 409 trial_active.
+
+        Fix 4: the ``# pragma: no cover`` was removed because this branch is
+        now reachable in production (3b.2 wires TRIAL state).
+        """
+        state["migration"]["state"] = "TRIAL"
+        state["migration"]["trial"] = {
+            "started_at": "2026-04-22T01:00:00+00:00",
+            "pre_trial_config_sha256": "a" * 64,
+            "candidate_config_sha256": "b" * 64,
+            "backup_paths": {},
+            "trial_adapter_dir": "/tmp/trial_adapter",
+            "trial_graph_dir": "/tmp/trial_graph",
+            "gates": {"status": "pending"},
+        }
+        cand = _write_candidate(tmp_path)
+        resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+        assert resp.status_code == 409
+        detail = resp.json().get("detail", {})
+        assert detail.get("error") == "trial_active"
+
 
 # ---------------------------------------------------------------------------
 # POST /migration/cancel
@@ -452,3 +474,92 @@ class TestPreviewRegistryPathNoneGracefulDegradation:
         body = resp.json()
         # Graceful degradation: shape_changes may be empty (no registry found) but no crash.
         assert isinstance(body["shape_changes"], list)
+
+
+# ---------------------------------------------------------------------------
+# MigrationStatusResponse contract tests — §10.6 (Slice 3b.2)
+# ---------------------------------------------------------------------------
+
+
+class TestStatusContractSlice3b2:
+    """Forward-compat TRIAL fields added by 3b.2 (spec §4.2).
+
+    Ensures 3b.1 callers see safe defaults (None / empty) and TRIAL callers
+    see the populated fields.
+    """
+
+    def test_status_live_has_nil_trial_fields(self, client, state):
+        """LIVE state: all new TRIAL fields default to None / []."""
+        resp = client.get("/migration/status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == "LIVE"
+        # Forward-compat fields must all be absent-or-None when not in TRIAL.
+        assert body.get("trial_started_at") is None
+        assert body.get("pre_trial_config_sha256") is None
+        assert body.get("candidate_config_sha256") is None
+        assert body.get("backup_paths") is None
+        assert body.get("trial_adapter_dir") is None
+        assert body.get("trial_graph_dir") is None
+        assert body.get("gates") is None
+        assert body.get("recovery_required") == []
+
+    def test_status_trial_includes_gates_for_long_poll(self, state, monkeypatch):
+        """TRIAL state: response includes gates, trial_adapter_dir, etc."""
+        import asyncio  # noqa: PLC0415
+
+        import paramem.server.app as _app_module
+
+        state["migration"]["state"] = "TRIAL"
+        state["migration"]["trial"] = {
+            "started_at": "2026-04-22T01:00:00+00:00",
+            "pre_trial_config_sha256": "a" * 64,
+            "candidate_config_sha256": "b" * 64,
+            "backup_paths": {
+                "config": "/abs/backups/config/slot1",
+                "graph": "/abs/backups/graph/slot1",
+                "registry": "/abs/backups/registry/slot1",
+            },
+            "trial_adapter_dir": "/abs/ha/trial_adapter",
+            "trial_graph_dir": "/abs/ha/trial_graph",
+            "gates": {"status": "no_new_sessions", "completed_at": "2026-04-22T02:00:00+00:00"},
+        }
+        state["migration"]["recovery_required"] = []
+        if "migration_lock" not in state:
+            state["migration_lock"] = asyncio.Lock()
+
+        monkeypatch.setattr(_app_module, "_state", state)
+        test_client = TestClient(_app_module.app, raise_server_exceptions=False)
+        resp = test_client.get("/migration/status")
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["state"] == "TRIAL"
+        assert body["trial_started_at"] == "2026-04-22T01:00:00+00:00"
+        assert body["pre_trial_config_sha256"] == "a" * 64
+        assert body["candidate_config_sha256"] == "b" * 64
+        assert body["trial_adapter_dir"] == "/abs/ha/trial_adapter"
+        assert body["trial_graph_dir"] == "/abs/ha/trial_graph"
+        assert body["gates"]["status"] == "no_new_sessions"
+
+    def test_status_recovery_required_surfaces_ambiguous_row(self, state, monkeypatch):
+        """After AMBIGUOUS recovery → response.recovery_required has the row."""
+        import asyncio  # noqa: PLC0415
+
+        import paramem.server.app as _app_module
+
+        state["migration"]["state"] = "LIVE"
+        state["migration"]["recovery_required"] = [
+            "Migration: RECOVERY REQUIRED — pre-migration backup has hash abc12345 "
+            "but live config hash is def67890"
+        ]
+        if "migration_lock" not in state:
+            state["migration_lock"] = asyncio.Lock()
+
+        monkeypatch.setattr(_app_module, "_state", state)
+        test_client = TestClient(_app_module.app, raise_server_exceptions=False)
+        resp = test_client.get("/migration/status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["recovery_required"]) == 1
+        assert "RECOVERY REQUIRED" in body["recovery_required"][0]

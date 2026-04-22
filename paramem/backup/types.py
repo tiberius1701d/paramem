@@ -122,6 +122,15 @@ class ArtifactMeta:
     key_fingerprint: str | None
     tier: str
     label: str | None = None
+    pre_trial_hash: str | None = None
+    """SHA-256 of the live config at the moment /migration/confirm ran step 2.
+
+    Written into every pre-migration backup's sidecar by the confirm handler.
+    Used by crash recovery (case 3/4) to correlate an orphan backup with the
+    live config hash.  Optional (default None) — absent in all non-migration
+    backups; adding it is non-breaking per the schema-version contract (see
+    module docstring).
+    """
 
 
 # ---------------------------------------------------------------------------

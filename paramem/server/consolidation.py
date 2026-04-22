@@ -26,12 +26,22 @@ def create_consolidation_loop(
     model,
     tokenizer,
     config: ServerConfig,
+    state_provider=None,
 ) -> ConsolidationLoop:
     """Create a ConsolidationLoop configured for the server.
 
     Graph is transient (persist_graph=False). Key metadata is seeded
     from key_metadata.json to restore cycle count, promoted keys, and
     per-key session counts across server restarts.
+
+    Parameters
+    ----------
+    state_provider:
+        Optional zero-argument callable returning the server ``_state`` dict.
+        Passed to ``ConsolidationLoop`` so ``run_cycle`` can call
+        ``guard_trial_state`` and raise ``TrialActiveError`` when a migration
+        TRIAL is active.  Experiment scripts that do not pass ``state_provider``
+        are unaffected (default ``None`` → guard is a no-op).
     """
     loop = ConsolidationLoop(
         model=model,
@@ -57,6 +67,7 @@ def create_consolidation_loop(
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
         graph_enrichment_interim_enabled=config.consolidation.graph_enrichment_interim_enabled,
         graph_enrichment_min_triples_floor=config.consolidation.graph_enrichment_min_triples_floor,
+        state_provider=state_provider,
     )
 
     # Seed key metadata from disk (survives restarts)
@@ -85,6 +96,29 @@ def create_consolidation_loop(
     return loop
 
 
+def _do_mark_consolidated(session_buffer, session_ids, callback):
+    """Invoke the mark-consolidated callback or fall back to the buffer method.
+
+    When *callback* is ``None``, ``session_buffer.mark_consolidated(session_ids)``
+    is called (standard production path).  When *callback* is not ``None`` it is
+    called instead, allowing the trial path to pass a no-op so pending sessions
+    remain in the buffer (spec L364 — "transcript sweeper blocks archive+delete").
+
+    Parameters
+    ----------
+    session_buffer:
+        The live session buffer.
+    session_ids:
+        List of session IDs that finished extraction/training.
+    callback:
+        Optional callable accepting ``session_ids``.  ``None`` → use buffer method.
+    """
+    if callback is None:
+        session_buffer.mark_consolidated(session_ids)
+    else:
+        callback(session_ids)
+
+
 def run_consolidation(
     model,
     tokenizer,
@@ -93,6 +127,7 @@ def run_consolidation(
     loop: ConsolidationLoop | None = None,
     ha_context: dict | None = None,
     speaker_store=None,
+    mark_consolidated_callback=None,
 ) -> dict:
     """Run consolidation on all pending sessions.
 
@@ -100,6 +135,15 @@ def run_consolidation(
     - Phase 1: Extract graphs and generate QA for each session
     - Phase 2: Train all adapters once on the accumulated QA
     - Phase 3: Save artifacts and mark sessions consolidated
+
+    Parameters
+    ----------
+    mark_consolidated_callback:
+        Optional callable invoked with ``session_ids`` after a successful
+        train cycle.  When ``None``, ``session_buffer.mark_consolidated`` is
+        called directly (production behaviour).  Pass ``None`` explicitly for
+        the trial consolidation path so pending sessions remain in the buffer
+        and ``/migration/rollback`` can restore the full queue (spec L364).
 
     Returns a result dict including the loop instance for reuse.
     """
@@ -198,7 +242,7 @@ def run_consolidation(
 
     if not all_episodic_qa and not all_procedural_rels:
         logger.info("No QA pairs extracted — skipping training")
-        session_buffer.mark_consolidated(session_ids)
+        _do_mark_consolidated(session_buffer, session_ids, mark_consolidated_callback)
         return {
             "status": "no_facts",
             "sessions": len(session_ids),
@@ -284,15 +328,27 @@ def run_consolidation(
     # This fallback is only used when a relation lacks a speaker_id.
     primary_speaker = speaker_ids[-1] if speaker_ids else ""
     try:
-        train_result = loop.train_adapters(
+        # Task #7 fix (train branch only): train without the internal _save_adapters call,
+        # then promote mature keys so _save_adapters captures post-promotion SimHash
+        # membership in the manifest's keyed_pairs_sha256.  The redundant
+        # _save_keyed_pairs_for_router call below is removed because _save_adapters
+        # already writes keyed_pairs.json per adapter as part of the I5 reorder.
+        #
+        # NOTE: the simulate branch (above, line ~242) still calls
+        # _save_keyed_pairs_for_router because it uses simulated_training which does
+        # NOT call _save_adapters — the simulate path's _save_keyed_pairs_for_router
+        # is the only kp write in that branch and must be preserved.
+        train_result = loop.train_adapters_no_save(
             all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
         )
 
-        # Key-level promotion: promote keys that reached the threshold
+        # Key-level promotion: promote keys that reached the threshold.
+        # Must run BEFORE _save_adapters so the manifest reflects post-promotion
+        # SimHash membership (Task #7 fix).
         newly_promoted = _promote_mature_keys(loop, config)
 
-        # --- Phase 3: Save ---
-        _save_keyed_pairs_for_router(loop, config)
+        # --- Phase 3: Save adapters (writes keyed_pairs.json per adapter internally) ---
+        loop._save_adapters()
         _save_registry(loop, config)
         _save_key_metadata(loop, config)
     except Exception:
@@ -302,7 +358,7 @@ def run_consolidation(
         )
         raise
 
-    session_buffer.mark_consolidated(session_ids)
+    _do_mark_consolidated(session_buffer, session_ids, mark_consolidated_callback)
 
     elapsed = time.time() - start_time
 

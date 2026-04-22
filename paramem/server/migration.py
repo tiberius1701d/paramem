@@ -47,11 +47,44 @@ logger = logging.getLogger(__name__)
 # Type aliases
 # ---------------------------------------------------------------------------
 
-MigrationStateLiteral = Literal["LIVE", "STAGING"]
+MigrationStateLiteral = Literal["LIVE", "STAGING", "TRIAL"]
 
 # ---------------------------------------------------------------------------
 # TypedDicts for structured data
 # ---------------------------------------------------------------------------
+
+
+class TrialSlotPaths(TypedDict):
+    """Absolute paths to the three pre-migration backup slot directories.
+
+    Written into the trial marker and surfaced via ``/migration/status`` for
+    the 3b.3 rollback path and Slice 6 restore-on-rollback.
+    """
+
+    config: str
+    graph: str
+    registry: str
+
+
+class TrialStash(TypedDict):
+    """In-memory mirror of ``TrialMarker`` stored on ``_state["migration"]["trial"]``.
+
+    Populated by ``/migration/confirm`` (step 5) and by crash recovery
+    (RESUME_TRIAL case).  Sentinel ``None`` in LIVE/STAGING.
+
+    The ``gates`` sub-dict is initially ``{"status": "pending"}`` when the
+    trial consolidation is running and updated to ``{"status": "no_new_sessions",
+    "completed_at": <iso>}`` or ``{"status": "trial_exception", "exception": ...}``
+    on completion.  Slice 4 will replace this with real gate evaluation.
+    """
+
+    started_at: str
+    pre_trial_config_sha256: str
+    candidate_config_sha256: str
+    backup_paths: TrialSlotPaths
+    trial_adapter_dir: str
+    trial_graph_dir: str
+    gates: dict
 
 
 class TierDiffRow(TypedDict):
@@ -146,6 +179,8 @@ class MigrationStashState(TypedDict):
     shape_changes: list[ShapeChange]
     tier_diff: list[TierDiffRow]
     unified_diff: str
+    trial: "TrialStash | None"
+    recovery_required: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +214,8 @@ def initial_migration_state() -> MigrationStashState:
         shape_changes=[],
         tier_diff=[],
         unified_diff="",
+        trial=None,
+        recovery_required=[],
     )
 
 

@@ -118,6 +118,40 @@ VALIDATED_TRAINING_CONFIG = TrainingConfig(
 
 
 @dataclass
+class OrphanSweepConfig:
+    """Config knob for migration crash-recovery orphan sweep.
+
+    ``max_age_hours`` is the look-back window for the orphan-sweep case in
+    ``recover_migration_state``.  Pre-migration backup slots created within
+    this window and whose ``pre_trial_hash`` matches the live config are
+    considered orphaned step-2 artifacts and deleted on startup.  Slots
+    outside the window are left in place (operator visibility).
+
+    Absence of the key in ``server.yaml`` yields the 24h default.
+    """
+
+    max_age_hours: int = 24
+
+
+@dataclass
+class ServerBackupsConfig:
+    """Sub-config for backup-related security settings (Slice 3b.2 subset).
+
+    Merged into ``SecurityConfig`` chain as ``security.backups``.  Retention
+    policy (Slice 6) will add more fields here.
+    """
+
+    orphan_sweep: OrphanSweepConfig = field(default_factory=OrphanSweepConfig)
+
+
+@dataclass
+class SecurityConfig:
+    """Top-level security configuration block."""
+
+    backups: ServerBackupsConfig = field(default_factory=ServerBackupsConfig)
+
+
+@dataclass
 class ServerNetConfig:
     host: str = "0.0.0.0"
     port: int = 8420
@@ -514,6 +548,7 @@ class ServerAdaptersConfig:
 
 @dataclass
 class ServerConfig:
+    security: SecurityConfig = field(default_factory=SecurityConfig)
     server: ServerNetConfig = field(default_factory=ServerNetConfig)
     model_name: str = "mistral"
     debug: bool = True
@@ -781,5 +816,14 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
         for lang_code, voice_data in voices_raw.items():
             if isinstance(voice_data, dict):
                 config.tts.voices[lang_code] = TTSVoiceConfig(**voice_data)
+
+    # Security — nested: security.backups.orphan_sweep.max_age_hours
+    security_raw = raw.get("security") or {}
+    backups_raw = security_raw.get("backups") or {}
+    orphan_raw = backups_raw.get("orphan_sweep") or {}
+    if orphan_raw:
+        config.security = SecurityConfig(
+            backups=ServerBackupsConfig(orphan_sweep=OrphanSweepConfig(**orphan_raw))
+        )
 
     return config

@@ -24,9 +24,11 @@ from paramem.cli import http_client
 def _trial_json_path(server_url: str) -> Path:
     """Return the conventional path to ``state/trial.json`` on the local host.
 
-    The path is relative to the project root (where the server runs).  In a
-    deployed setup the server and CLI share the same host (spec §L187), so
-    the relative path resolves correctly.
+    Per spec §L516–545 and Correction 4, the marker lives at
+    ``data/ha/state/trial.json`` (inside the ``data/ha/`` tree, NOT at a
+    bare ``state/`` path).  The CLI and server always share the same host
+    (spec §L187), so this relative path resolves correctly when the CLI is
+    invoked from the project root.
 
     Parameters
     ----------
@@ -37,10 +39,10 @@ def _trial_json_path(server_url: str) -> Path:
     Returns
     -------
     Path
-        Relative path ``state/trial.json`` resolved from the current working
-        directory.
+        Relative path ``data/ha/state/trial.json`` resolved from the current
+        working directory.
     """
-    return Path("state") / "trial.json"
+    return Path("data") / "ha" / "state" / "trial.json"
 
 
 def run(args: argparse.Namespace) -> int:

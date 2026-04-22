@@ -105,6 +105,15 @@ class CycleResult:
     decayed_nodes: list[str] = field(default_factory=list)
 
 
+class TrialActiveError(RuntimeError):
+    """Raised by ConsolidationLoop.guard_trial_state when a migration TRIAL is active.
+
+    Bubbles up to /scheduled-tick and /consolidate handlers, which return
+    409 trial_active.  Experiment scripts that do not carry server _state
+    never trigger this error (guard is a no-op when state is None).
+    """
+
+
 class ConsolidationLoop:
     """Manages the full consolidation pipeline across sessions.
 
@@ -152,7 +161,14 @@ class ConsolidationLoop:
         graph_enrichment_max_entities_per_pass: int = 50,
         graph_enrichment_interim_enabled: bool = True,
         graph_enrichment_min_triples_floor: int = 20,
+        state_provider=None,
     ):
+        # Optional callable that returns the server ``_state`` dict.  When
+        # provided, ``run_cycle`` calls ``self.guard_trial_state(state_provider())``
+        # at entry to block new consolidation cycles during a migration TRIAL.
+        # Experiment scripts pass nothing (default ``None``) so the guard is a
+        # no-op and experiment paths are unaffected.
+        self.state_provider = state_provider
         self.model = model
         self.tokenizer = tokenizer
         self.config = consolidation_config
@@ -292,6 +308,36 @@ class ConsolidationLoop:
         # TODO(Step 7): consume pending_interim_triples at the start of
         # consolidate_interim_adapters() before training the full key set.
         self.pending_interim_triples: list[dict] = []
+
+    def guard_trial_state(self, state: dict | None) -> None:
+        """Raise TrialActiveError when a migration TRIAL is in progress.
+
+        Called at the top of run_cycle and from /scheduled-tick and
+        /consolidate handlers to block new consolidation cycles while the
+        operator reviews trial results.
+
+        Parameters
+        ----------
+        state:
+            The server ``_state`` dict, or ``None`` for experiment scripts
+            that do not carry server state.  When ``None``, this method is
+            a no-op so experiment paths are unaffected.
+
+        Raises
+        ------
+        TrialActiveError
+            When ``state["migration"]["state"] == "TRIAL"``.
+        """
+        if state is None:
+            return
+        migration = state.get("migration")
+        if migration is None:
+            return
+        if migration.get("state") == "TRIAL":
+            raise TrialActiveError(
+                "consolidation blocked: a migration TRIAL is active. "
+                "Use POST /migration/accept or POST /migration/rollback to proceed."
+            )
 
     def seed_key_metadata(self, metadata: dict) -> None:
         """Restore key-level metadata from persisted key_metadata.json.
@@ -592,6 +638,14 @@ class ConsolidationLoop:
 
         Called after all sessions have been extracted.
         Returns dict with train losses per adapter.
+
+        Note: this method trains AND saves.  The server consolidation path
+        (paramem/server/consolidation.py train branch) uses
+        ``train_adapters_no_save`` followed by ``_promote_mature_keys`` then
+        ``_save_adapters`` so the manifest's ``keyed_pairs_sha256`` reflects
+        post-promotion membership (Task #7 fix).  Experiment scripts use this
+        combined method directly and are unaffected (no promotion step exists
+        in the experiment path).
         """
         self.cycle_count += 1
         result = {}
@@ -618,6 +672,62 @@ class ConsolidationLoop:
         self._save_adapters()
 
         logger.info("Training complete: %s", result)
+        return result
+
+    def train_adapters_no_save(
+        self,
+        all_episodic_qa: list[dict],
+        all_procedural_relations: list[dict],
+        speaker_id: str = "",
+    ) -> dict:
+        """Train all adapters without saving to disk.
+
+        Identical to ``train_adapters`` except ``_save_adapters()`` is NOT
+        called.  The server consolidation train branch uses this method so
+        that ``_promote_mature_keys`` can run between training and the save,
+        ensuring the adapter manifest's ``keyed_pairs_sha256`` reflects
+        post-promotion SimHash membership (Task #7 fix).
+
+        Callers are responsible for calling ``_save_adapters()`` after
+        promotion.
+
+        Parameters
+        ----------
+        all_episodic_qa:
+            Deduplicated episodic QA pairs for this cycle.
+        all_procedural_relations:
+            Deduplicated procedural relations for this cycle.
+        speaker_id:
+            Fallback speaker scope for procedural contradiction detection.
+
+        Returns
+        -------
+        dict
+            Same structure as ``train_adapters``: ``episodic_train_loss``,
+            ``procedural_train_loss`` (when applicable).
+        """
+        self.cycle_count += 1
+        result = {}
+
+        if self.indexed_key_registry is None:
+            logger.warning("No indexed key registry — skipping training (no_save)")
+            return result
+
+        # --- EPISODIC ---
+        if all_episodic_qa:
+            episodic_loss = self._run_indexed_key_episodic(all_episodic_qa, new_promotions=[])
+            if episodic_loss is not None:
+                result["episodic_train_loss"] = episodic_loss
+
+        # --- PROCEDURAL ---
+        if self.procedural_config is not None and all_procedural_relations:
+            procedural_loss = self._run_indexed_key_procedural(
+                all_procedural_relations, speaker_id=speaker_id
+            )
+            if procedural_loss is not None:
+                result["procedural_train_loss"] = procedural_loss
+
+        logger.info("Training complete (no save): %s", result)
         return result
 
     def simulated_training(
@@ -1050,6 +1160,10 @@ class ConsolidationLoop:
         Legacy method — extracts and trains in one pass.
         Used by experiment scripts. Server uses extract_session + train_adapters.
 
+        Raises ``TrialActiveError`` before any extraction when a migration TRIAL
+        is active (gated via the injected ``state_provider``; experiment scripts
+        that do not set ``state_provider`` are unaffected).
+
         Args:
             session_transcript: The raw session transcript text.
             session_id: Unique identifier for this session.
@@ -1058,6 +1172,10 @@ class ConsolidationLoop:
         Returns:
             CycleResult with metrics and timing.
         """
+        # Guard: block new cycles during a migration TRIAL.
+        if self.state_provider is not None:
+            self.guard_trial_state(self.state_provider())
+
         start_time = time.time()
         self.cycle_count += 1
         result = CycleResult(cycle_index=self.cycle_count, session_id=session_id)

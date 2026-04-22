@@ -11,6 +11,7 @@ GPU lifecycle (service-level):
 
 import argparse
 import asyncio
+import hashlib as _hashlib
 import json
 import logging
 import os
@@ -29,6 +30,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+# Migration / backup imports at module level so tests can patch them.
+from paramem.backup.backup import write as backup_write
+from paramem.backup.encryption import SecurityBackupsConfig
+from paramem.backup.types import ArtifactKind
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import TTSConfig, load_server_config
@@ -44,6 +49,11 @@ from paramem.server.post_session_queue import PostSessionQueue
 from paramem.server.router import QueryRouter
 from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
 from paramem.server.tools.ha_client import HAClient
+from paramem.server.trial_state import (
+    TrialMarker,
+    clear_trial_marker,
+    write_trial_marker,
+)
 from paramem.server.vram_validator import (
     ConfigurationError,
     assess_topology,
@@ -56,6 +66,24 @@ from paramem.server.vram_validator import (
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
 logger = logging.getLogger(__name__)
+
+
+def _rename_config(src: "str | Path", dst: "str | Path") -> None:
+    """Rename *src* to *dst* for the atomic config swap in step 4 of confirm.
+
+    Extracted to a module-level function so integration tests can patch it
+    independently from os.rename (which is also used by backup.atomic and
+    trial_state for their own atomic renames).
+
+    Parameters
+    ----------
+    src:
+        Source path (candidate config file).
+    dst:
+        Destination path (live config file).
+    """
+    os.rename(src, dst)
+
 
 # Resolve nvidia-smi at import time. On WSL2 it lives in /usr/lib/wsl/lib
 # which systemd may not have on PATH; on native Linux it's typically in
@@ -327,7 +355,7 @@ class MigrationStatusResponse(BaseModel):
     Attributes
     ----------
     state:
-        ``"LIVE"`` or ``"STAGING"``.
+        ``"LIVE"``, ``"STAGING"``, or ``"TRIAL"``.
     candidate_path:
         Path of the staged candidate, or ``None`` when LIVE.
     candidate_hash:
@@ -340,6 +368,24 @@ class MigrationStatusResponse(BaseModel):
         ``True`` when a consolidation run is currently in progress.
     server_started_at:
         ISO-8601 UTC timestamp when the server lifespan started (Condition 6).
+    trial_started_at:
+        ISO-8601 UTC timestamp when TRIAL was entered, or ``None``.
+    pre_trial_config_sha256:
+        SHA-256 of the live config before the atomic rename, or ``None``.
+    candidate_config_sha256:
+        SHA-256 of the candidate config, or ``None``.
+    backup_paths:
+        Dict of absolute backup slot paths, or ``None``.
+    trial_adapter_dir:
+        Absolute path to the trial adapter directory, or ``None``.
+    trial_graph_dir:
+        Absolute path to the trial graph directory, or ``None``.
+    gates:
+        Trial gate status dict (``{"status": "pending"|"no_new_sessions"|
+        "trial_exception", ...}``), or ``None``.
+    recovery_required:
+        Human-readable rows populated when AMBIGUOUS recovery was detected.
+        Empty list otherwise.
     """
 
     state: str
@@ -349,6 +395,52 @@ class MigrationStatusResponse(BaseModel):
     simulate_mode_override: bool = False
     consolidating: bool = False
     server_started_at: str = ""
+    # Forward-compat fields for 3b.3 long-poll and operator visibility.
+    trial_started_at: str | None = None
+    pre_trial_config_sha256: str | None = None
+    candidate_config_sha256: str | None = None
+    backup_paths: dict | None = None
+    trial_adapter_dir: str | None = None
+    trial_graph_dir: str | None = None
+    gates: dict | None = None
+    recovery_required: list[str] = []
+
+
+class ConfirmRequest(BaseModel):
+    """Request body for ``POST /migration/confirm``.
+
+    No parameters — the server uses the in-memory STAGING stash.
+    """
+
+
+class ConfirmResponse(BaseModel):
+    """Response body for ``POST /migration/confirm``.
+
+    Attributes
+    ----------
+    state:
+        Always ``"TRIAL"`` on success.
+    trial_started_at:
+        ISO-8601 UTC timestamp when TRIAL was entered.
+    pre_trial_config_sha256:
+        SHA-256 of the live config before the atomic rename.
+    candidate_config_sha256:
+        SHA-256 of the candidate bytes.
+    backup_paths:
+        Absolute paths to the three pre-migration backup slot directories.
+    trial_adapter_dir:
+        Absolute path to the trial adapter directory.
+    trial_graph_dir:
+        Absolute path to the trial graph directory.
+    """
+
+    state: str
+    trial_started_at: str
+    pre_trial_config_sha256: str
+    candidate_config_sha256: str
+    backup_paths: dict[str, str]
+    trial_adapter_dir: str
+    trial_graph_dir: str
 
 
 class MigrationCancelResponse(BaseModel):
@@ -697,11 +789,78 @@ async def lifespan(app: FastAPI):
 
     from paramem.server.drift import drift_poll_loop, initial_drift_state
     from paramem.server.migration import initial_migration_state
+    from paramem.server.migration_recovery import (
+        MigrationRecoveryResult,
+        RecoveryAction,
+        recover_migration_state,
+    )
 
     # Record server start time for /migration/status (Condition 6).
     _state["server_started_at"] = datetime.now(timezone.utc).isoformat()
     # Seed the migration stash to LIVE so the endpoint is available immediately.
     _state["migration"] = initial_migration_state()
+
+    # Create the migration lock (must be inside a running event loop).
+    _state["migration_lock"] = asyncio.Lock()
+
+    # --- Crash recovery: inspect disk state BEFORE drift init ---
+    # This ensures _state["migration"] reflects any partially-completed
+    # /migration/confirm before any request handler can observe stale state.
+    try:
+        live_config_path = (
+            Path(_state["config_path"])
+            if _state.get("config_path")
+            else Path("configs/server.yaml")
+        )
+        state_dir = config.paths.data / "state"
+        backups_root = config.paths.data / "backups"
+        max_age_hours = getattr(
+            getattr(getattr(config, "security", None), "backups", None),
+            "orphan_sweep",
+            None,
+        )
+        max_age_hours = max_age_hours.max_age_hours if max_age_hours is not None else 24
+
+        recovery_result: MigrationRecoveryResult = recover_migration_state(
+            state_dir=state_dir,
+            live_config_path=live_config_path,
+            backups_root=backups_root,
+            max_age_hours=max_age_hours,
+        )
+
+        # Emit the recovery log lines.
+        for level, msg in recovery_result.log_lines:
+            getattr(logger, level.lower(), logger.info)(msg)
+
+        # Seed _state["migration"] from recovery result.
+        if (
+            recovery_result.action == RecoveryAction.RESUME_TRIAL
+            and recovery_result.trial_marker is not None
+        ):
+            m = recovery_result.trial_marker
+            from paramem.server.migration import TrialStash
+
+            trial_stash: TrialStash = TrialStash(
+                started_at=m.started_at,
+                pre_trial_config_sha256=m.pre_trial_config_sha256,
+                candidate_config_sha256=m.candidate_config_sha256,
+                backup_paths={
+                    "config": m.backup_paths.get("config", ""),
+                    "graph": m.backup_paths.get("graph", ""),
+                    "registry": m.backup_paths.get("registry", ""),
+                },
+                trial_adapter_dir=m.trial_adapter_dir,
+                trial_graph_dir=m.trial_graph_dir,
+                gates={"status": "pending"},
+            )
+            _state["migration"]["state"] = "TRIAL"
+            _state["migration"]["trial"] = trial_stash
+            _state["migration"]["recovery_required"] = []
+        elif recovery_result.recovery_required:
+            _state["migration"]["recovery_required"] = list(recovery_result.recovery_required)
+
+    except Exception as _recovery_exc:  # noqa: BLE001
+        logger.error("migration recovery failed unexpectedly: %s", _recovery_exc, exc_info=True)
 
     if _state.get("config_path"):
         _state["config_drift"] = initial_drift_state(Path(_state["config_path"]))
@@ -1160,7 +1319,10 @@ async def lifespan(app: FastAPI):
 
                 if _state.get("consolidation_loop") is None:
                     _replay_loop = create_consolidation_loop(
-                        _state["model"], _state["tokenizer"], config
+                        _state["model"],
+                        _state["tokenizer"],
+                        config,
+                        state_provider=lambda: _state,
                     )
                     _state["consolidation_loop"] = _replay_loop
                     _state["model"] = _replay_loop.model
@@ -1949,7 +2111,26 @@ async def scheduled_tick():
     Runs the cooperative extract + background-train path. If the GPU is
     unavailable (cloud-only or bg training active), returns a 'deferred'
     status — the timer will fire again on its next wall-clock tick.
+
+    Returns 409 ``trial_active`` when a migration TRIAL is in progress
+    (spec §L302–303 — "refuses new cycles" while TRIAL is active).
     """
+    from fastapi import HTTPException
+
+    # Guard: block new cycles while a migration TRIAL is active.
+    migration = _state.get("migration", {})
+    if migration.get("state") == "TRIAL":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "trial_active",
+                "message": (
+                    "A migration TRIAL is active — consolidation is blocked. "
+                    "Use POST /migration/accept or POST /migration/rollback to proceed."
+                ),
+            },
+        )
+
     _state["scheduler_last_tick_epoch"] = time.time()
     status = _maybe_trigger_scheduled_consolidation()
     _state["scheduler_last_tick_status"] = status
@@ -1958,7 +2139,26 @@ async def scheduled_tick():
 
 @app.post("/consolidate", response_model=ConsolidateResponse)
 async def consolidate():
-    """Trigger consolidation manually."""
+    """Trigger consolidation manually.
+
+    Returns 409 ``trial_active`` when a migration TRIAL is in progress.
+    """
+    from fastapi import HTTPException
+
+    # Guard: block consolidation while a migration TRIAL is active.
+    migration = _state.get("migration", {})
+    if migration.get("state") == "TRIAL":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "trial_active",
+                "message": (
+                    "A migration TRIAL is active — consolidation is blocked. "
+                    "Use POST /migration/accept or POST /migration/rollback to proceed."
+                ),
+            },
+        )
+
     if _state["mode"] == "cloud-only":
         return ConsolidateResponse(status="rejected_cloud_only")
     if _state["consolidating"]:
@@ -2051,7 +2251,7 @@ async def migration_preview(request: PreviewRequest):
             },
         )
 
-    if current_state == "TRIAL":  # pragma: no cover — Slice 3b.2 wires TRIAL state
+    if current_state == "TRIAL":
         raise HTTPException(
             status_code=409,
             detail={
@@ -2145,6 +2345,8 @@ async def migration_preview(request: PreviewRequest):
         shape_changes=shape_changes,
         tier_diff=tier_diff,
         unified_diff=unified_diff,
+        trial=None,
+        recovery_required=list(_state.get("migration", {}).get("recovery_required", [])),
     )
     _state["migration"] = stash
 
@@ -2185,6 +2387,447 @@ async def migration_cancel():
     return MigrationCancelResponse(state="LIVE", cleared_path=cleared_path)
 
 
+@app.post("/migration/confirm", response_model=ConfirmResponse)
+async def migration_confirm(request: ConfirmRequest):
+    """Atomically transition from STAGING to TRIAL.
+
+    Implements the 5-step atomic ordering (spec §L277–283):
+
+    1. Acquire migration lock + verify STAGING + verify not consolidating.
+    2. Write 3 pre-migration backup slots (config, graph, registry).
+    3. Write ``state/trial.json`` marker.
+    4. ``os.rename(candidate → configs/server.yaml)`` — atomic config swap.
+    5. Set ``_state["migration"]["state"] = "TRIAL"``; kick off trial
+       consolidation via ``asyncio.create_task``.
+
+    Each step's failure rolls back all previously-completed steps and returns
+    an appropriate 5xx error.  The migration lock is unconditionally released
+    in a ``finally`` block (Correction 1).
+
+    Errors
+    ------
+    409 ``consolidating``
+        A consolidation run is in progress.
+    409 ``not_staging``
+        The server is not in STAGING state.
+    409 ``migration_in_progress``
+        A concurrent confirm is already holding the lock.
+    409 ``trial_active``
+        The server is already in TRIAL (post-recovery edge case).
+    500 ``backup_write_failed``
+        Step 2 failed; no state change.
+    500 ``marker_write_failed``
+        Step 3 failed; step-2 backups deleted.
+    500 ``config_swap_failed``
+        Step 4 failed; marker and backups deleted.
+    """
+    from fastapi import HTTPException
+
+    from paramem.server.migration import TrialStash, initial_migration_state
+
+    # --- Step 1: Pre-checks (outside the lock for fast fail) ---
+    if _state.get("consolidating", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "consolidating",
+                "message": "Consolidation is currently running. Retry after it completes.",
+            },
+        )
+
+    migration = _state.get("migration") or initial_migration_state()
+    current_state = migration.get("state", "LIVE")
+
+    if current_state == "TRIAL":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "trial_active",
+                "message": (
+                    "A trial is already active. "
+                    "Accept or rollback before confirming a new candidate."
+                ),
+            },
+        )
+
+    if current_state != "STAGING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "not_staging",
+                "message": "No candidate is staged. POST /migration/preview first.",
+            },
+        )
+
+    # --- Acquire the migration lock (non-blocking try) ---
+    lock: asyncio.Lock = _state.get("migration_lock") or asyncio.Lock()
+    if lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "migration_in_progress",
+                "message": "A migration confirm is already in progress.",
+            },
+        )
+
+    # Prepare paths from config.
+    config = _state.get("config")
+    live_config_path = (
+        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+    )
+    if config is not None:
+        state_dir = (config.paths.data / "state").resolve()
+        backups_root = (config.paths.data / "backups").resolve()
+    else:
+        state_dir = (Path("data/ha/state")).resolve()
+        backups_root = (Path("data/ha/backups")).resolve()
+
+    trial_adapter_dir = str((state_dir.parent / "trial_adapter").resolve())
+    trial_graph_dir = str((state_dir.parent / "trial_graph").resolve())
+
+    # Security config for backup.write()
+    sec_cfg = SecurityBackupsConfig()
+
+    async with lock:
+        # Re-check inside the lock (state may have changed while waiting).
+        migration = _state.get("migration") or initial_migration_state()
+        current_state = migration.get("state", "LIVE")
+        if current_state == "TRIAL":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "trial_active",
+                    "message": "State changed to TRIAL while acquiring lock.",
+                },
+            )
+        if current_state != "STAGING":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "not_staging",
+                    "message": "Staging state was lost while acquiring lock.",
+                },
+            )
+        if _state.get("consolidating", False):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "consolidating",
+                    "message": "Consolidation started while acquiring lock.",
+                },
+            )
+
+        # Snapshot the STAGING stash fields we need.
+        candidate_path_str = migration.get("candidate_path", "")
+        candidate_hash = migration.get("candidate_hash", "")
+
+        # Steps 2–4 are wrapped in try/finally so the lock is always released
+        # even on partial failure (Correction 1).
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # --- Step 2: snapshot pre-trial hashes, write 3 backups ---
+        pre_trial_hash = ""
+        if live_config_path.exists():
+            pre_trial_hash = _hashlib.sha256(live_config_path.read_bytes()).hexdigest()
+
+        written_slots: list[Path] = []
+        try:
+            # 2a: Config backup — read live config bytes.
+            config_bytes = live_config_path.read_bytes() if live_config_path.exists() else b""
+            config_slot = backup_write(
+                ArtifactKind.CONFIG,
+                config_bytes,
+                meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
+                base_dir=backups_root / "config",
+                security_config=sec_cfg,
+            )
+            written_slots.append(config_slot)
+
+            # 2b: Graph backup — use merger.save_bytes() when loop is available.
+            loop_obj = _state.get("consolidation_loop")
+            if loop_obj is not None and hasattr(loop_obj, "merger"):
+                graph_bytes = loop_obj.merger.save_bytes()
+            else:
+                graph_bytes = b"{}"
+            graph_slot = backup_write(
+                ArtifactKind.GRAPH,
+                graph_bytes,
+                meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
+                base_dir=backups_root / "graph",
+                security_config=sec_cfg,
+            )
+            written_slots.append(graph_slot)
+
+            # 2c: Registry backup.
+            if config is not None:
+                registry_bytes = (
+                    config.key_metadata_path.read_bytes()
+                    if config.key_metadata_path.exists()
+                    else b"{}"
+                )
+            else:
+                registry_bytes = b"{}"
+            registry_slot = backup_write(
+                ArtifactKind.REGISTRY,
+                registry_bytes,
+                meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
+                base_dir=backups_root / "registry",
+                security_config=sec_cfg,
+            )
+            written_slots.append(registry_slot)
+
+        except Exception as exc:
+            # Step 2 failure: clean up any written slots.
+            for slot in written_slots:
+                try:
+                    shutil.rmtree(slot)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "backup_write_failed",
+                    "message": f"Failed to write pre-migration backups: {exc}",
+                },
+            ) from exc
+
+        # --- Step 3: Write trial marker ---
+        marker = TrialMarker(
+            schema_version=1,
+            started_at=now_iso,
+            pre_trial_config_sha256=pre_trial_hash,
+            candidate_config_sha256=candidate_hash,
+            backup_paths={
+                "config": str(config_slot.resolve()),
+                "graph": str(graph_slot.resolve()),
+                "registry": str(registry_slot.resolve()),
+            },
+            trial_adapter_dir=trial_adapter_dir,
+            trial_graph_dir=trial_graph_dir,
+        )
+        try:
+            write_trial_marker(state_dir, marker)
+        except Exception as exc:
+            # Step 3 failure: delete step-2 backups.
+            for slot in written_slots:
+                try:
+                    shutil.rmtree(slot)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "marker_write_failed",
+                    "message": f"Failed to write trial marker: {exc}",
+                },
+            ) from exc
+
+        # --- Step 4: Atomic rename candidate → live config ---
+        # Uses _rename_config (module-level) so tests can patch it independently
+        # from os.rename (which backup.atomic also uses for its own renames).
+        candidate_path = Path(candidate_path_str)
+        try:
+            _rename_config(candidate_path, live_config_path)
+            # fsync parent for rename durability.
+            dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
+        except Exception as exc:
+            # Step 4 failure: delete marker and all backups.
+            try:
+                clear_trial_marker(state_dir)
+            except OSError:
+                pass
+            for slot in written_slots:
+                try:
+                    shutil.rmtree(slot)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "config_swap_failed",
+                    "message": f"Atomic config rename failed: {exc}",
+                },
+            ) from exc
+
+        # --- Step 5: Update _state and kick off trial consolidation ---
+        trial_stash = TrialStash(
+            started_at=now_iso,
+            pre_trial_config_sha256=pre_trial_hash,
+            candidate_config_sha256=candidate_hash,
+            backup_paths={
+                "config": str(config_slot.resolve()),
+                "graph": str(graph_slot.resolve()),
+                "registry": str(registry_slot.resolve()),
+            },
+            trial_adapter_dir=trial_adapter_dir,
+            trial_graph_dir=trial_graph_dir,
+            gates={"status": "pending"},
+        )
+        _state["migration"]["state"] = "TRIAL"
+        _state["migration"]["trial"] = trial_stash
+        _state["migration"]["recovery_required"] = []
+
+        # Kick off trial consolidation as a background task.
+        asyncio.create_task(_run_trial_consolidation())
+
+        return ConfirmResponse(
+            state="TRIAL",
+            trial_started_at=now_iso,
+            pre_trial_config_sha256=pre_trial_hash,
+            candidate_config_sha256=candidate_hash,
+            backup_paths={
+                "config": str(config_slot.resolve()),
+                "graph": str(graph_slot.resolve()),
+                "registry": str(registry_slot.resolve()),
+            },
+            trial_adapter_dir=trial_adapter_dir,
+            trial_graph_dir=trial_graph_dir,
+        )
+
+
+async def _run_trial_consolidation() -> None:
+    """Run a trial consolidation cycle in the background.
+
+    Acquires the GPU lock, reloads config from the newly-active server.yaml,
+    builds a trial ConsolidationLoop with overrides (mode=train, paths →
+    state/trial_adapter/, persist_graph=True on state/trial_graph/), and
+    calls ``run_consolidation`` with ``mark_consolidated_callback=lambda _: None``.
+
+    The ``mark_consolidated_callback`` no-op ensures that
+    ``session_buffer.mark_consolidated`` is **never** called from the trial
+    loop (spec L364 — "Transcript sweeper blocks archive+delete").  Pending
+    sessions remain in the buffer after the trial cycle completes so that
+    ``/migration/rollback`` (3b.3) can restore the full queue, and
+    ``/migration/accept`` (3b.3) can call ``mark_consolidated`` itself.
+
+    On completion, sets ``_state["migration"]["trial"]["gates"]`` to either
+    ``{"status": "no_new_sessions", ...}`` or ``{"status": "trial_exception",
+    "exception": ...}``.  Slice 4 replaces the gate dict with real quality gates.
+    """
+    from paramem.server.config import load_server_config
+
+    try:
+        from paramem.server.gpu_lock import gpu_lock_sync
+
+        live_config_path = (
+            Path(_state["config_path"])
+            if _state.get("config_path")
+            else Path("configs/server.yaml")
+        )
+
+        # Reload config from the newly-active candidate.
+        trial_config = load_server_config(live_config_path)
+        # Override: trial mode is always "train" regardless of what the candidate
+        # config specifies (Resolved Decision 27, spec L239).
+        trial_config.consolidation.mode = "train"
+
+        # Determine trial adapter and graph paths from the marker.
+        migration = _state.get("migration", {})
+        trial_data = migration.get("trial") or {}
+        trial_adapter_dir_str = trial_data.get("trial_adapter_dir", "")
+        trial_graph_dir_str = trial_data.get("trial_graph_dir", "")
+
+        if trial_adapter_dir_str:
+            trial_config.paths.data = Path(trial_adapter_dir_str).parent.parent
+
+        model = _state.get("model")
+        tokenizer = _state.get("tokenizer")
+
+        if model is None or tokenizer is None:
+            logger.warning("trial consolidation: model not loaded (cloud-only mode?), skipping")
+            _update_trial_gates({"status": "trial_exception", "exception": "model not loaded"})
+            return
+
+        loop = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: _build_trial_loop(
+                model,
+                tokenizer,
+                trial_config,
+                Path(trial_adapter_dir_str) if trial_adapter_dir_str else None,
+                Path(trial_graph_dir_str) if trial_graph_dir_str else None,
+            ),
+        )
+
+        session_buffer = _state.get("session_buffer")
+        ha_context = _state.get("ha_context")
+        speaker_store = _state.get("speaker_store")
+
+        def _run():
+            with gpu_lock_sync():
+                from paramem.server.consolidation import run_consolidation as _run_consol
+
+                return _run_consol(
+                    model,
+                    tokenizer,
+                    trial_config,
+                    session_buffer,
+                    loop=loop,
+                    ha_context=ha_context,
+                    speaker_store=speaker_store,
+                    # Trial path: do NOT call mark_consolidated — pending sessions
+                    # stay in the buffer so /migration/rollback (3b.3) can restore
+                    # the full queue (spec L364).
+                    mark_consolidated_callback=lambda _: None,
+                )
+
+        summary = await asyncio.get_running_loop().run_in_executor(None, _run)
+        completed_at = datetime.now(timezone.utc).isoformat()
+        gates = {
+            # TODO Slice 4: replace with real gate evaluation
+            "status": "no_new_sessions",
+            "completed_at": completed_at,
+            "summary": {k: v for k, v in summary.items() if k != "loop"},
+        }
+        _update_trial_gates(gates)
+        logger.info("trial consolidation complete: status=%s", gates["status"])
+
+    except Exception as exc:  # noqa: BLE001
+        completed_at = datetime.now(timezone.utc).isoformat()
+        _update_trial_gates(
+            {"status": "trial_exception", "exception": str(exc), "completed_at": completed_at}
+        )
+        logger.exception("trial consolidation failed: %s", exc)
+
+
+def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_graph_dir):
+    """Build a ConsolidationLoop for the trial, overriding output paths."""
+    from paramem.server.consolidation import create_consolidation_loop
+
+    if trial_adapter_dir is not None:
+        trial_config.paths.data = trial_adapter_dir.parent.parent
+
+    loop = create_consolidation_loop(model, tokenizer, trial_config)
+
+    if trial_adapter_dir is not None:
+        loop.output_dir = trial_adapter_dir
+        trial_adapter_dir.mkdir(parents=True, exist_ok=True)
+
+    if trial_graph_dir is not None:
+        loop.persist_graph = True
+        loop.graph_path = trial_graph_dir / "cumulative_graph.json"
+        trial_graph_dir.mkdir(parents=True, exist_ok=True)
+
+    return loop
+
+
+def _update_trial_gates(gates: dict) -> None:
+    """Update ``_state["migration"]["trial"]["gates"]`` safely."""
+    migration = _state.get("migration")
+    if migration is None:
+        return
+    trial = migration.get("trial")
+    if trial is None:
+        return
+    trial["gates"] = gates
+
+
 @app.get("/migration/status", response_model=MigrationStatusResponse)
 async def migration_status():
     """Return the current migration state and server metadata.
@@ -2196,6 +2839,7 @@ async def migration_status():
     migration = _state.get("migration") or initial_migration_state()
     ms = migration.get("state", "LIVE")
 
+    trial = migration.get("trial") or {}
     return MigrationStatusResponse(
         state=ms,
         candidate_path=migration.get("candidate_path") or None,
@@ -2204,6 +2848,15 @@ async def migration_status():
         simulate_mode_override=bool(migration.get("simulate_mode_override", False)),
         consolidating=bool(_state.get("consolidating", False)),
         server_started_at=_state.get("server_started_at", ""),
+        # Forward-compat TRIAL fields (3b.3 long-poll).
+        trial_started_at=trial.get("started_at") or None,
+        pre_trial_config_sha256=trial.get("pre_trial_config_sha256") or None,
+        candidate_config_sha256=trial.get("candidate_config_sha256") or None,
+        backup_paths=trial.get("backup_paths") or None,
+        trial_adapter_dir=trial.get("trial_adapter_dir") or None,
+        trial_graph_dir=trial.get("trial_graph_dir") or None,
+        gates=trial.get("gates") or None,
+        recovery_required=list(migration.get("recovery_required") or []),
     )
 
 
@@ -2483,7 +3136,12 @@ def _extract_and_start_training():
     # Create or reuse consolidation loop
     loop = _state.get("consolidation_loop")
     if loop is None:
-        loop = create_consolidation_loop(_state["model"], _state["tokenizer"], config)
+        loop = create_consolidation_loop(
+            _state["model"],
+            _state["tokenizer"],
+            config,
+            state_provider=lambda: _state,
+        )
         _state["consolidation_loop"] = loop
         _state["model"] = loop.model
 
@@ -3008,6 +3666,7 @@ def main():
     # Setup
     project_root = Path(__file__).parent.parent.parent
     load_dotenv(project_root / ".env")
+
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     logging.basicConfig(

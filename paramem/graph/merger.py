@@ -496,6 +496,20 @@ class GraphMerger:
             triples.append((subject, data.get("predicate", "related_to"), obj))
         return triples
 
+    def save_bytes(self) -> bytes:
+        """Return the serialized graph as bytes; mirror of save_graph(path) for in-memory consumers.
+
+        Produces the same JSON that save_graph would write to disk, but returns
+        the bytes without performing any I/O.  Used by /migration/confirm step 2
+        to capture a point-in-time snapshot of the graph for the pre-migration
+        backup without requiring a temporary file.
+
+        Returns:
+            UTF-8-encoded JSON bytes (node-link format, indent=2).
+        """
+        data = nx.node_link_data(self.graph)
+        return json.dumps(data, indent=2).encode("utf-8")
+
     def save_graph(self, path: str | Path) -> None:
         """Save cumulative graph to JSON."""
         path = Path(path)

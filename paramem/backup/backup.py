@@ -307,6 +307,7 @@ def write(
         key_fingerprint=key_fp,
         tier=meta_fields.get("tier", "manual"),
         label=meta_fields.get("label"),
+        pre_trial_hash=meta_fields.get("pre_trial_hash"),
     )
     sidecar_path = write_meta(pending_slot, meta)
 

@@ -110,6 +110,7 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
         "key_fingerprint": meta.key_fingerprint,
         "tier": meta.tier,
         "label": meta.label,
+        "pre_trial_hash": meta.pre_trial_hash,
     }
 
     sidecar_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -226,6 +227,7 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
         key_fingerprint=raw.get("key_fingerprint"),
         tier=raw["tier"],
         label=raw.get("label"),
+        pre_trial_hash=raw.get("pre_trial_hash"),
     )
 
 

@@ -373,3 +373,18 @@ tts:
       engine: mms
       model: facebook/mms-tts-tgl
       # device: cpu            # per-voice override (default: inherit from tts.device)
+
+# ============================================================================
+# SECURITY — BACKUP SETTINGS (Slice 3b.2)
+# ============================================================================
+# Uncomment to override the default orphan-sweep window for migration crash
+# recovery.  The orphan sweep deletes pre-migration backup slots written by
+# a crashed /migration/confirm step 2 (backup created but rename never ran)
+# when the backup's pre_trial_hash matches the live config and the backup
+# was created within this many hours of the server restart.
+#
+# Default: 24 hours.  Set to 0 to disable orphan sweep entirely.
+# security:
+#   backups:
+#     orphan_sweep:
+#       max_age_hours: 24
