@@ -21,6 +21,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
@@ -840,3 +841,169 @@ def evaluate_gates(
         _unmount_trial_probe(model, mount_state)
 
     return [g1, g2, g3, g4]
+
+
+# ---------------------------------------------------------------------------
+# TrialLogCapture — context manager for capturing WARN/ERROR/CRITICAL logs
+# ---------------------------------------------------------------------------
+
+
+class TrialLogCapture:
+    """Context manager that captures WARNING/ERROR/CRITICAL records emitted
+    while inside the ``with`` block.
+
+    Attaches to the root logger so records from any submodule
+    (consolidation, training, gates, extraction) are captured regardless
+    of their logger name (all submodule loggers propagate to root by
+    default).
+
+    Counts records at or above the configured ``level`` and tracks
+    distinct exception class names.  Class names are extracted from
+    ``record.exc_info[0].__name__`` when the record carries exception
+    information, or via best-effort parsing of ``record.exc_text`` when
+    not.
+
+    Thread safety: :meth:`logging.Logger.addHandler` and
+    :meth:`logging.Logger.removeHandler` are thread-safe (wrapped by the
+    logging lock internally).  The handler stores counts in local
+    attributes updated only by ``emit``; reading ``metrics`` after
+    ``__exit__`` is safe.
+
+    Usage
+    -----
+    >>> with TrialLogCapture() as cap:
+    ...     run_trial_things()
+    >>> cap.metrics
+    {'trial_log_errors': 2, 'distinct_classes': ['ValueError', 'KeyError']}
+
+    Attributes
+    ----------
+    metrics:
+        ``{"trial_log_errors": int, "distinct_classes": list[str]}`` —
+        available after the context exits.
+    """
+
+    def __init__(self, *, level: int = logging.WARNING) -> None:
+        """Initialise the capture context.
+
+        Parameters
+        ----------
+        level:
+            Minimum log level to count.  Defaults to ``logging.WARNING``.
+            Records below this level are not counted.
+        """
+        self._level = level
+        self._handler: logging.Handler | None = None
+        self._count = 0
+        self._distinct: list[str] = []  # insertion-order preserved
+        self._distinct_set: set[str] = set()
+        # Loggers whose propagate flag we temporarily enabled in __enter__,
+        # keyed by logger name so __exit__ can restore them.
+        self._forced_propagate: list[str] = []
+
+    def __enter__(self) -> "TrialLogCapture":
+        """Attach the capture handler to the root logger.
+
+        Records from child loggers reach the root handler only when
+        ``logger.propagate`` is ``True``.  Some environments (e.g. ROS 2's
+        ``launch.logging`` package) install a custom ``loggerClass`` that sets
+        ``propagate = False`` on every new logger.  To remain portable, this
+        method temporarily re-enables propagation on all *existing* loggers
+        that currently have it suppressed and records which loggers it changed
+        so ``__exit__`` can restore the original state.
+
+        Returns
+        -------
+        TrialLogCapture
+            ``self`` for use in ``with ... as cap:`` syntax.
+        """
+        cap = self  # closure capture for the inner handler class
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:  # noqa: PLR0912
+                cap._count += 1
+                cls_name: str | None = None
+
+                # Prefer exc_info — direct exception class name.
+                if record.exc_info and record.exc_info[0] is not None:
+                    cls_name = record.exc_info[0].__name__
+                elif record.exc_text:
+                    # Best-effort: the last line of a formatted traceback is
+                    # usually ``ExcClass: message``.  The first line is the
+                    # ``Traceback (most recent call last):`` header.
+                    last_line = record.exc_text.splitlines()[-1] if record.exc_text else ""
+                    if ":" in last_line:
+                        cls_name = last_line.split(":", 1)[0].strip()
+
+                if cls_name and cls_name not in cap._distinct_set:
+                    cap._distinct_set.add(cls_name)
+                    cap._distinct.append(cls_name)
+
+        h = _CaptureHandler(level=self._level)
+        logging.getLogger().addHandler(h)
+        self._handler = h
+
+        # Temporarily force propagate=True on all existing loggers that have
+        # it disabled so their records reach the root handler above.
+        manager = logging.Logger.manager
+        for name, ref in list(manager.loggerDict.items()):
+            # loggerDict values may be Logger instances or PlaceHolder objects.
+            if isinstance(ref, logging.Logger) and not ref.propagate:
+                ref.propagate = True
+                self._forced_propagate.append(name)
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Remove the capture handler from the root logger and restore state.
+
+        Re-applies ``propagate = False`` to any logger that was temporarily
+        enabled in :meth:`__enter__`.  Does NOT swallow any exception raised
+        inside the ``with`` block — the exception propagates normally after
+        the handler is removed.
+
+        Parameters
+        ----------
+        exc_type:
+            Exception class, or ``None`` when no exception occurred.
+        exc_val:
+            Exception instance, or ``None``.
+        exc_tb:
+            Traceback, or ``None``.
+        """
+        if self._handler is not None:
+            logging.getLogger().removeHandler(self._handler)
+            self._handler = None
+
+        # Restore propagate=False on any loggers we temporarily changed.
+        manager = logging.Logger.manager
+        for name in self._forced_propagate:
+            ref = manager.loggerDict.get(name)
+            if isinstance(ref, logging.Logger):
+                ref.propagate = False
+        self._forced_propagate.clear()
+
+        # Return None (falsy) — exception is not swallowed.
+        return None
+
+    @property
+    def metrics(self) -> dict[str, Any]:
+        """Return the capture metrics.
+
+        Safe to call at any time; outside the ``with`` block returns the
+        final counts.
+
+        Returns
+        -------
+        dict[str, Any]
+            ``{"trial_log_errors": int, "distinct_classes": list[str]}``.
+        """
+        return {
+            "trial_log_errors": self._count,
+            "distinct_classes": list(self._distinct),
+        }

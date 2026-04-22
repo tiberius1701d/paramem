@@ -244,8 +244,25 @@ class StatusResponse(BaseModel):
     # server stays cloud-only until the holder clears it.  Surfaces the owner
     # PID + liveness so an operator can spot orphaned holds (SIGKILLed test
     # processes) and clear with ``pstatus --force-local``.  Schema:
-    #   {hold_active, owner_pid, owner_alive, age_seconds, owner_hint}
+    #   {hold_active, owner_pid, owner_alive, age_seconds}
     hold: dict = {}
+    # Operator-attention block (Slice 5a). Always present; ``items`` is empty
+    # when no alert is active. Each item is the dict form of an
+    # ``AttentionItem`` dataclass: {kind, level, summary, action_hint, age_seconds}.
+    # See ``paramem.server.attention``.
+    attention: dict = {}
+    # Migration summary block (Slice 5a). Always present; values reflect the
+    # current migration state. Sub-fields:
+    #   state          : "live" | "staging" | "trial" | "failed"
+    #   config_rev     : 8-char prefix of sha256(server.yaml at load time)
+    #   trial_started_at : ISO-8601 UTC, or None when not in TRIAL
+    #   gates          : copy of _state["migration"]["trial"]["gates"], or None
+    #   comparison     : {"rendered": bool, "flags": list[str]} or None
+    migration: dict = {}
+    # ISO-8601 UTC timestamp of when the server process started (Slice 5a Fix 2).
+    # Required so pstatus can render the "applied <YYYY-MM-DD>" part of the
+    # Migrate footer (spec L458).
+    server_started_at: str = ""
 
 
 class ConsolidateResponse(BaseModel):
@@ -2043,6 +2060,38 @@ async def status():
     except ImportError:
         pass
 
+    # Slice 5a — attention block.
+    from paramem.server.attention import collect_attention_items
+
+    _attention_items = collect_attention_items(_state, config)
+    attention_block = {"items": [it.to_dict() for it in _attention_items]}
+
+    # Slice 5a — migration summary block.
+    _mig = _state.get("migration") or {}
+    _mig_state = (_mig.get("state") or "LIVE").lower()
+    _trial = _mig.get("trial") or {}
+    _gates = _trial.get("gates") or None
+    # config_rev: first 8 hex chars of sha256(server.yaml at load time).
+    _loaded_hash = (_state.get("config_drift") or {}).get("loaded_hash", "")
+    _config_rev = _loaded_hash[:8] if _loaded_hash else ""
+    # Mirror accept-eligibility gate so /status agrees with /migration/status.
+    _comparison_block: dict | None = None
+    _ACCEPT_ELIGIBLE_MIG = frozenset({"pass", "no_new_sessions"})
+    if (
+        _mig_state == "trial"
+        and _gates is not None
+        and _gates.get("status") in _ACCEPT_ELIGIBLE_MIG
+        and _gates.get("completed_at")
+    ):
+        _comparison_block = {"rendered": True, "flags": []}
+    migration_block = {
+        "state": _mig_state,
+        "config_rev": _config_rev,
+        "trial_started_at": _trial.get("started_at") or None,
+        "gates": _gates,
+        "comparison": _comparison_block,
+    }
+
     hold_block = _get_hold_state()
 
     return StatusResponse(
@@ -2090,7 +2139,10 @@ async def status():
         adapter_health=adapter_health,
         adapter_manifest=_state.get("adapter_manifest_status", {}),
         config_drift=_state.get("config_drift", {}),
+        attention=attention_block,
+        migration=migration_block,
         hold=hold_block,
+        server_started_at=_state.get("server_started_at", ""),
     )
 
 
@@ -2849,80 +2901,94 @@ async def _run_trial_consolidation() -> None:
         summary: dict | None = None
         exc_captured: Exception | None = None
 
-        if not session_buffer_empty:
-            loop = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: _build_trial_loop(
-                    model,
-                    tokenizer,
-                    trial_config,
-                    Path(trial_adapter_dir_str) if trial_adapter_dir_str else None,
-                    Path(trial_graph_dir_str) if trial_graph_dir_str else None,
-                ),
-            )
+        from paramem.server.gates import TrialLogCapture, evaluate_gates
 
-            ha_context = _state.get("ha_context")
-            speaker_store = _state.get("speaker_store")
-
-            def _run():
-                with gpu_lock_sync():
-                    from paramem.server.consolidation import run_consolidation as _run_consol
-
-                    return _run_consol(
+        # Slice 5a — open TrialLogCapture BEFORE the consolidation executor so
+        # WARNING/ERROR/CRITICAL records from extraction, training, adapter
+        # reload, AND gate evaluation are all captured as a whole-run signal
+        # (spec L398 — "New ERROR lines in trial log").  The `with` closes
+        # after gates_payload["trial_log"] is populated but before
+        # _update_trial_gates so the snapshot is frozen when the status
+        # becomes observable.
+        with TrialLogCapture() as _trial_log_capture:
+            if not session_buffer_empty:
+                loop = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: _build_trial_loop(
                         model,
                         tokenizer,
                         trial_config,
-                        session_buffer,
-                        loop=loop,
-                        ha_context=ha_context,
-                        speaker_store=speaker_store,
-                        # Trial path: do NOT call mark_consolidated — pending sessions
-                        # stay in the buffer so /migration/rollback (3b.3) can restore
-                        # the full queue (spec L364).
-                        mark_consolidated_callback=lambda _: None,
-                    )
+                        Path(trial_adapter_dir_str) if trial_adapter_dir_str else None,
+                        Path(trial_graph_dir_str) if trial_graph_dir_str else None,
+                    ),
+                )
 
-            try:
-                summary = await asyncio.get_running_loop().run_in_executor(None, _run)
-            except Exception as _exc:  # noqa: BLE001
-                exc_captured = _exc
+                ha_context = _state.get("ha_context")
+                speaker_store = _state.get("speaker_store")
 
-        # --- Gate evaluation (Slice 4) ---
-        # live_registry_path comes from the PRE-TRIAL config (REQUIRED FIX 1).
-        live_config = _state.get("config")
-        if live_config is None:
-            raise RuntimeError(
-                "trial consolidation: _state['config'] is missing — "
-                "cannot resolve live registry path for gate 4"
+                def _run():
+                    with gpu_lock_sync():
+                        from paramem.server.consolidation import run_consolidation as _run_consol
+
+                        return _run_consol(
+                            model,
+                            tokenizer,
+                            trial_config,
+                            session_buffer,
+                            loop=loop,
+                            ha_context=ha_context,
+                            speaker_store=speaker_store,
+                            # Trial path: do NOT call mark_consolidated — pending sessions
+                            # stay in the buffer so /migration/rollback (3b.3) can restore
+                            # the full queue (spec L364).
+                            mark_consolidated_callback=lambda _: None,
+                        )
+
+                try:
+                    summary = await asyncio.get_running_loop().run_in_executor(None, _run)
+                except Exception as _exc:  # noqa: BLE001
+                    exc_captured = _exc
+
+            # --- Gate evaluation (Slice 4) ---
+            # live_registry_path comes from the PRE-TRIAL config (REQUIRED FIX 1).
+            live_config = _state.get("config")
+            if live_config is None:
+                raise RuntimeError(
+                    "trial consolidation: _state['config'] is missing — "
+                    "cannot resolve live registry path for gate 4"
+                )
+            live_registry_path: Path = live_config.registry_path
+            trial_adapter_dir = (
+                Path(trial_adapter_dir_str)
+                if trial_adapter_dir_str
+                else Path("state/trial_adapter")
             )
-        live_registry_path: Path = live_config.registry_path
-        trial_adapter_dir = (
-            Path(trial_adapter_dir_str) if trial_adapter_dir_str else Path("state/trial_adapter")
-        )
 
-        from paramem.server.gates import evaluate_gates
+            results = evaluate_gates(
+                model=model,
+                tokenizer=tokenizer,
+                trial_adapter_dir=trial_adapter_dir,
+                live_registry_path=live_registry_path,
+                session_buffer_empty=session_buffer_empty,
+                consolidation_summary=summary,
+                consolidation_exception=exc_captured,
+            )
 
-        results = evaluate_gates(
-            model=model,
-            tokenizer=tokenizer,
-            trial_adapter_dir=trial_adapter_dir,
-            live_registry_path=live_registry_path,
-            session_buffer_empty=session_buffer_empty,
-            consolidation_summary=summary,
-            consolidation_exception=exc_captured,
-        )
+            overall_status = _rollup_gate_status(results, session_buffer_empty)
+            completed_at = datetime.now(timezone.utc).isoformat()
 
-        overall_status = _rollup_gate_status(results, session_buffer_empty)
-        completed_at = datetime.now(timezone.utc).isoformat()
-
-        gates_payload: dict = {
-            "status": overall_status,
-            "completed_at": completed_at,
-            "summary": ({k: v for k, v in summary.items() if k != "loop"} if summary else {}),
-            "details": [r.to_dict() for r in results],
-        }
-        if exc_captured is not None:
-            gates_payload["exception"] = str(exc_captured)  # backward-compat with 3b.3
+            gates_payload: dict = {
+                "status": overall_status,
+                "completed_at": completed_at,
+                "summary": ({k: v for k, v in summary.items() if k != "loop"} if summary else {}),
+                "details": [r.to_dict() for r in results],
+                # Slice 5a: trial_log captured across the entire consolidation +
+                # gate run (top-level, not nested in per-gate metrics — rationale
+                # in slice5a-plan.md §4).
+                "trial_log": _trial_log_capture.metrics,
+            }
+            if exc_captured is not None:
+                gates_payload["exception"] = str(exc_captured)  # backward-compat with 3b.3
 
         _update_trial_gates(gates_payload)
         logger.info("trial consolidation complete: status=%s", overall_status)
@@ -3046,7 +3112,7 @@ async def migration_status():
     ``no_new_sessions``), and ``completed_at`` is set.  ``None`` otherwise.
     """
     from paramem.server.migration import initial_migration_state
-    from paramem.server.migration_report import build_comparison_report_placeholder
+    from paramem.server.migration_report import build_comparison_report
 
     migration = _state.get("migration") or initial_migration_state()
     ms = migration.get("state", "LIVE")
@@ -3064,7 +3130,39 @@ async def migration_status():
         and gates.get("status") in _ACCEPT_ELIGIBLE_STATUSES
         and gates.get("completed_at")
     ):
-        comparison_report = build_comparison_report_placeholder(gates["status"])
+        # Slice 5a — resolve graph paths from state.
+        # Pre-trial graph: prefer in-memory loop's merger graph (production
+        # runs with persist_graph=False, so no file exists); fall back to a
+        # config-derived path for completeness.
+        pre_trial_graph = None
+        pre_trial_graph_path: Path | None = None
+        _loop_obj = _state.get("consolidation_loop")
+        if _loop_obj is not None:
+            _merger = getattr(_loop_obj, "merger", None)
+            if _merger is not None:
+                pre_trial_graph = getattr(_merger, "graph", None)
+            _gpath = getattr(_loop_obj, "graph_path", None)
+            if _gpath is not None:
+                pre_trial_graph_path = Path(_gpath)
+        if pre_trial_graph_path is None:
+            _live_cfg = _state.get("config")
+            if _live_cfg is not None:
+                _adata = getattr(getattr(_live_cfg, "paths", None), "data", None)
+                if _adata is not None:
+                    pre_trial_graph_path = Path(_adata) / "ha" / "state" / "cumulative_graph.json"
+
+        # Trial graph: from the trial marker (always set during TRIAL).
+        trial_graph_dir_str = trial.get("trial_graph_dir") or ""
+        trial_graph_path: Path | None = (
+            Path(trial_graph_dir_str) / "cumulative_graph.json" if trial_graph_dir_str else None
+        )
+
+        comparison_report = build_comparison_report(
+            gates=gates,
+            pre_trial_graph_path=pre_trial_graph_path,
+            trial_graph_path=trial_graph_path,
+            pre_trial_graph=pre_trial_graph,
+        )
 
     return MigrationStatusResponse(
         state=ms,

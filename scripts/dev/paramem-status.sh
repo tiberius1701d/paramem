@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-PARAMEM_SERVER_PORT=8420
+: "${PARAMEM_SERVER_PORT:=8420}"
 
 # --force-local: clear the deferred-mode hold and restart into local mode.
 # Intended for operator use when auto-reclaim has flagged an orphaned hold
@@ -23,7 +23,7 @@ if [[ "${1:-}" == "--force-local" ]]; then
     if [[ -z "$resp" ]]; then
         echo "Server unreachable — clearing environment directly."
         systemctl --user unset-environment \
-            PARAMEM_EXTRA_ARGS PARAMEM_HOLD_PID PARAMEM_HOLD_STARTED_AT PARAMEM_HOLD_CMD || true
+            PARAMEM_EXTRA_ARGS PARAMEM_HOLD_PID PARAMEM_HOLD_STARTED_AT || true
         systemctl --user restart paramem-server || true
         echo "Done. Run pstatus to verify mode."
         exit 0
@@ -222,6 +222,27 @@ for adapter_id, h in health_items:
         h.get("keys_at_mark", 0),
         h.get("updated_at", ""),
     ))
+# Slice 5a — Attention block lines: ATTN<TAB>kind<TAB>level<TAB>summary<TAB>action_hint<TAB>age_seconds
+for item in (d.get("attention") or {}).get("items", []) or []:
+    print("ATTN\t{}\t{}\t{}\t{}\t{}".format(
+        item.get("kind", "?"),
+        item.get("level", "info"),
+        (item.get("summary") or "").replace("\t", " ").replace("\n", " "),
+        (item.get("action_hint") or "").replace("\t", " ").replace("\n", " "),
+        item.get("age_seconds") if item.get("age_seconds") is not None else "",
+    ))
+# Slice 5a — Migrate footer: MIGRATE<TAB>state<TAB>config_rev<TAB>applied_date
+_mig = d.get("migration") or {}
+_loaded_hash = (d.get("config_drift") or {}).get("loaded_hash", "")
+_config_rev = _mig.get("config_rev") or (_loaded_hash[:8] if _loaded_hash else "")
+# server_started_at is now on /status (Fix 2); take the YYYY-MM-DD slice.
+_started = d.get("server_started_at") or ""
+_applied_date = _started[:10] if _started else ""
+print("MIGRATE\t{}\t{}\t{}".format(
+    _mig.get("state", "live"),
+    _config_rev,
+    _applied_date,
+))
 PY
 )
 
@@ -244,6 +265,32 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
 health_lines=$(echo "$parsed" | awk '/^HLT\t/')
 adapter_spec_lines=$(echo "$parsed" | awk '/^ADPT\t/')
+# Slice 5a — attention items and migrate footer.
+attention_lines=$(echo "$parsed" | awk '/^ATTN\t/')
+migrate_line=$(echo "$parsed" | awk '/^MIGRATE\t/' | head -1)
+
+# Render a duration in seconds as a short human-readable string.
+# Used for the age tag in the Attention block.
+fmt_duration_inline() {
+    local secs="$1"
+    if [[ -z "$secs" || "$secs" == "0" ]]; then
+        echo "0s"
+        return
+    fi
+    local s=$((secs % 60))
+    local m=$((secs / 60 % 60))
+    local h=$((secs / 3600 % 24))
+    local d=$((secs / 86400))
+    if (( d > 0 )); then
+        echo "${d}d${h}h"
+    elif (( h > 0 )); then
+        echo "${h}h${m}m"
+    elif (( m > 0 )); then
+        echo "${m}m"
+    else
+        echo "${s}s"
+    fi
+}
 
 # Render a device string as a coloured tag. "cuda" and anything else
 # non-cpu map to "GPU" so the label stays hardware-agnostic — the
@@ -328,6 +375,54 @@ if [[ "$hold_active" == "True" ]]; then
     esac
 fi
 echo -e "$pid_line"
+
+# Slice 5a — Attention block. Omitted entirely when attention_lines is empty.
+if [[ -n "$attention_lines" ]]; then
+    # Determine banner color: red (✗) if any item is level="failed", else yellow (⚠).
+    banner_color="$YELLOW"
+    banner_glyph="⚠"
+    while IFS=$'\t' read -r _attn_marker _akind alevel _asummary _ahint _aage; do
+        [[ -z "$alevel" ]] && continue
+        if [[ "$alevel" == "failed" ]]; then
+            banner_color="$RED"
+            banner_glyph="✗"
+            break
+        fi
+    done <<< "$attention_lines"
+
+    echo "  ────────────────────────────────────────"
+    echo -e "  ${banner_color}${banner_glyph}  ATTENTION — USER ACTION REQUIRED${RESET}"
+    echo "  ────────────────────────────────────────"
+
+    while IFS=$'\t' read -r _attn_marker akind alevel asummary ahint aage; do
+        [[ -z "$akind" ]] && continue
+        case "$alevel" in
+            failed)          row_color="$RED"    ;;
+            action_required) row_color="$YELLOW" ;;
+            info|*)          row_color="$CYAN"   ;;
+        esac
+        # Map kind to display label.
+        case "$akind" in
+            migration_*)             label="Migration:" ;;
+            consolidation_blocked)   label="Consol:   " ;;
+            sweeper_held)            label="Sweeper:  " ;;
+            config_drift)            label="Config:   " ;;
+            adapter_fingerprint_*)   label="Adapter:  " ;;
+            *)                       label="${akind}: " ;;
+        esac
+        # Age tag (when present): " (age 42m)"
+        age_tag=""
+        if [[ -n "$aage" && "$aage" != "" ]]; then
+            age_tag=" (age $(fmt_duration_inline "$aage"))"
+        fi
+        echo -e "  ${row_color}${label}${RESET} ${asummary}${age_tag}"
+        if [[ -n "$ahint" && "$ahint" != "" ]]; then
+            echo -e "             ${DIM}→ ${ahint}${RESET}"
+        fi
+    done <<< "$attention_lines"
+    echo "  ────────────────────────────────────────"
+fi
+
 # Model line: short name + configured variant + live device tag. The device
 # tag is hardware-agnostic — cuda/rocm/mps all map to "GPU" via fmt_device.
 model_line="${CYAN}${model}${RESET}"
@@ -465,6 +560,27 @@ fi
 # Pending enrollments
 if (( pending_enrollments > 0 )); then
     echo -e "  Enroll:   ${YELLOW}${pending_enrollments} awaiting name extraction${RESET}"
+fi
+
+# Slice 5a — Migrate footer (always rendered when data is present).
+if [[ -n "$migrate_line" ]]; then
+    IFS=$'\t' read -r _mig_marker mig_state mig_rev mig_applied <<< "$migrate_line"
+    case "$mig_state" in
+        live)    state_tag="${GREEN}LIVE${RESET}"        ;;
+        staging) state_tag="${YELLOW}STAGING${RESET}"   ;;
+        trial)   state_tag="${YELLOW}TRIAL${RESET}"     ;;
+        failed)  state_tag="${RED}FAILED${RESET}"       ;;
+        *)       state_tag="${DIM}${mig_state}${RESET}" ;;
+    esac
+    rev_tag=""
+    if [[ -n "$mig_rev" ]]; then
+        rev_tag=" (config rev ${DIM}${mig_rev}${RESET}"
+        if [[ -n "$mig_applied" ]]; then
+            rev_tag+=" applied ${DIM}${mig_applied}${RESET}"
+        fi
+        rev_tag+=")"
+    fi
+    echo -e "  Migrate:  ${state_tag}${rev_tag}"
 fi
 
 # Speaker embedding backend (pyannote wespeaker on CPU by default).
