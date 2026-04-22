@@ -68,6 +68,7 @@ def _make_marker(
         },
         trial_adapter_dir=str(tmp_path / "state" / "trial_adapter"),
         trial_graph_dir=str(tmp_path / "state" / "trial_graph"),
+        config_artifact_filename="config-20260422-010000.bin",
     )
 
 

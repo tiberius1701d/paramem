@@ -70,8 +70,12 @@ def _patched_post(responses: dict):
 
 
 class TestMigrate404Fallback:
-    def test_404_message_lists_slice3b1_endpoints(self, monkeypatch, capsys):
-        """ServerUnavailable → stderr lists the four Slice 3b.1 endpoints."""
+    def test_404_message_mentions_preview_and_version_alignment(self, monkeypatch, capsys):
+        """ServerUnavailable → stderr mentions /migration/preview and version alignment.
+
+        The 404 message is evergreen (no slice labels).  It must name the
+        endpoint and instruct the operator to check version alignment.
+        """
         monkeypatch.setattr(
             http_client,
             "post_json",
@@ -81,12 +85,14 @@ class TestMigrate404Fallback:
         captured = capsys.readouterr()
         assert rc == 1
         assert "/migration/preview" in captured.err
-        assert "/cancel" in captured.err
-        assert "/status" in captured.err
-        assert "/diff" in captured.err
+        assert "--version" in captured.err or "version" in captured.err.lower()
 
-    def test_404_message_names_confirm_as_3b2_pending(self, monkeypatch, capsys):
-        """ServerUnavailable → stderr names /migration/confirm as Slice 3b.2."""
+    def test_404_message_names_accept_and_rollback_subcommands(self, monkeypatch, capsys):
+        """ServerUnavailable → stderr names migrate-accept / migrate-rollback.
+
+        The evergreen 404 message refers operators to the standalone
+        subcommands for non-interactive accept/rollback.
+        """
 
         def _raise(*a, **kw):
             raise http_client.ServerUnavailable("404")
@@ -94,8 +100,8 @@ class TestMigrate404Fallback:
         monkeypatch.setattr(http_client, "post_json", _raise)
         main(["migrate", "/abs/path.yaml"])
         captured = capsys.readouterr()
-        assert "confirm" in captured.err
-        assert "3b.2" in captured.err
+        assert "migrate-accept" in captured.err
+        assert "migrate-rollback" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +145,40 @@ class TestMigrateJsonMode:
 
 
 class TestMigrateProceedy:
-    def test_proceed_y_prints_3b2_not_implemented(self, monkeypatch, capsys):
-        """Proceed? y → prints '3b.2 not yet implemented' and exits 0."""
-        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: _BASE_PREVIEW)
-        with patch("builtins.input", return_value="y"):
+    def test_proceed_y_enters_long_poll_flow_and_defers_on_c(self, monkeypatch, capsys):
+        """Proceed? y → enters long-poll flow; 'c' (defer) exits 0.
+
+        With Slice 3b.3 shipped, 'y' on the Proceed? prompt enters the
+        long-poll flow instead of printing a stub.  This test verifies:
+        - rc == 0 (deferred)
+        - cancel is NOT posted (operator deferred voluntarily)
+        """
+        _status_staging = {"state": "STAGING", "gates": None, "comparison_report": None}
+        _status_trial_pass = {
+            "state": "TRIAL",
+            "gates": {"status": "pass", "completed_at": "2026-04-22T01:00:00+00:00"},
+            "comparison_report": None,
+        }
+        get_responses = iter([_status_staging, _status_trial_pass])
+
+        def _get(url, **kwargs):
+            return next(get_responses)
+
+        def _post(url, body=None, **kwargs):
+            if "preview" in url:
+                return _BASE_PREVIEW
+            if "confirm" in url:
+                return {"state": "TRIAL"}
+            raise AssertionError(f"Unexpected POST to {url!r}")
+
+        monkeypatch.setattr(http_client, "get_json", _get)
+        monkeypatch.setattr(http_client, "post_json", _post)
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        # Inputs: Proceed?=y, then 3-way prompt=c (defer)
+        inputs = iter(["y", "c"])
+        with patch("builtins.input", side_effect=lambda *a: next(inputs)):
             rc = main(["migrate", "/abs/path.yaml"])
-        captured = capsys.readouterr()
         assert rc == 0
-        assert "3b.2" in captured.out.lower() or "not yet implemented" in captured.out.lower()
 
     def test_proceed_y_does_not_post_cancel(self, monkeypatch, capsys):
         """Proceed? y must NOT post cancel."""
@@ -242,19 +274,42 @@ class TestSimulateNotice:
         captured = capsys.readouterr()
         assert "simulate-mode" in captured.out.lower() or "NOTICE" in captured.out
 
-    def test_simulate_notice_y_continues_to_proceed(self, monkeypatch, capsys):
-        """simulate notice y → continues to ordinary Proceed? prompt."""
+    def test_simulate_notice_y_continues_to_proceed_and_defer(self, monkeypatch, capsys):
+        """simulate notice y → continues to Proceed? prompt; defer exits 0.
+
+        With Slice 3b.3 shipped, 'y' on the Proceed? prompt enters the
+        long-poll flow.  This test uses three inputs:
+          1. simulate notice → y
+          2. Proceed? → y (enters long-poll flow)
+          3. 3-way prompt → c (deferred)
+        and verifies rc==0 and cancel not posted.
+        """
         cancel_called = []
+
+        _status_staging = {"state": "STAGING", "gates": None, "comparison_report": None}
+        _status_trial_pass = {
+            "state": "TRIAL",
+            "gates": {"status": "pass", "completed_at": "2026-04-22T01:00:00+00:00"},
+            "comparison_report": None,
+        }
+        get_responses = iter([_status_staging, _status_trial_pass])
+
+        def _get(url, **kwargs):
+            return next(get_responses)
 
         def _post(url, body=None, **kwargs):
             if "cancel" in url:
                 cancel_called.append(url)
                 return _CANCEL_RESPONSE
+            if "confirm" in url:
+                return {"state": "TRIAL"}
             return self._simulate_preview()
 
+        monkeypatch.setattr(http_client, "get_json", _get)
         monkeypatch.setattr(http_client, "post_json", _post)
-        # First input for simulate notice (y), second for Proceed? (y)
-        inputs = iter(["y", "y"])
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        # Inputs: simulate notice=y, Proceed?=y, 3-way prompt=c
+        inputs = iter(["y", "y", "c"])
         with patch("builtins.input", side_effect=lambda *a: next(inputs)):
             rc = main(["migrate", "/abs/path.yaml"])
         assert rc == 0

@@ -27,7 +27,7 @@ from pathlib import Path
 
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from pydantic import BaseModel
 
 # Migration / backup imports at module level so tests can patch them.
@@ -404,6 +404,9 @@ class MigrationStatusResponse(BaseModel):
     trial_graph_dir: str | None = None
     gates: dict | None = None
     recovery_required: list[str] = []
+    # Slice 3b.3: comparison report populated when TRIAL + gates eligible + completed.
+    # None in LIVE/STAGING or when gates are still pending/failed/running.
+    comparison_report: dict | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -456,6 +459,55 @@ class MigrationCancelResponse(BaseModel):
 
     state: str
     cleared_path: str
+
+
+class AcceptResponse(BaseModel):
+    """Response body for ``POST /migration/accept``.
+
+    Attributes
+    ----------
+    state:
+        Always ``"LIVE"`` on success (B config is now live).
+    trial_adapter_archive_path:
+        Absolute path to the trial adapter archive slot directory.
+    restart_required:
+        Always ``True`` — new configuration takes effect on server restart.
+    restart_hint:
+        Human-readable restart command string.
+    pre_migration_backup_retained:
+        Always ``True`` — the A-config backup is retained post-accept.
+    """
+
+    state: str
+    trial_adapter_archive_path: str
+    restart_required: bool
+    restart_hint: str
+    pre_migration_backup_retained: bool
+
+
+class RollbackResponse(BaseModel):
+    """Response body for ``POST /migration/rollback``.
+
+    Attributes
+    ----------
+    state:
+        Always ``"LIVE"`` on success (A config is restored).
+    trial_adapter_archive_path:
+        Absolute path to the trial adapter archive slot directory (or the
+        still-in-place state/trial_adapter/ when rotation failed — 207).
+    rollback_pre_mortem_backup_path:
+        Absolute path to the rollback pre-mortem B-config snapshot slot.
+    restart_required:
+        Always ``True`` — rollback renames server.yaml; restart to apply.
+    restart_hint:
+        Human-readable restart command string.
+    """
+
+    state: str
+    trial_adapter_archive_path: str
+    rollback_pre_mortem_backup_path: str
+    restart_required: bool
+    restart_hint: str
 
 
 # --- Adapter mount helper (Slice 3a) ---
@@ -2592,6 +2644,14 @@ async def migration_confirm(request: ConfirmRequest):
             ) from exc
 
         # --- Step 3: Write trial marker ---
+        # REQUIRED FIX 1: capture config artifact filename so the rollback
+        # handler can resolve the exact A-config file without directory listing.
+        config_artifact_filename = ""
+        for _entry in Path(config_slot).iterdir():
+            if _entry.name != "meta.json" and not _entry.name.startswith("."):
+                config_artifact_filename = _entry.name
+                break
+
         marker = TrialMarker(
             schema_version=1,
             started_at=now_iso,
@@ -2604,6 +2664,7 @@ async def migration_confirm(request: ConfirmRequest):
             },
             trial_adapter_dir=trial_adapter_dir,
             trial_graph_dir=trial_graph_dir,
+            config_artifact_filename=config_artifact_filename,
         )
         try:
             write_trial_marker(state_dir, marker)
@@ -2833,13 +2894,31 @@ async def migration_status():
     """Return the current migration state and server metadata.
 
     Never raises — returns LIVE defaults when no preview has been requested.
+
+    Populates ``comparison_report`` when the server is in TRIAL state, gates
+    have completed with an accept-eligible status (``pass`` or
+    ``no_new_sessions``), and ``completed_at`` is set.  ``None`` otherwise.
     """
     from paramem.server.migration import initial_migration_state
+    from paramem.server.migration_report import build_comparison_report_placeholder
 
     migration = _state.get("migration") or initial_migration_state()
     ms = migration.get("state", "LIVE")
 
     trial = migration.get("trial") or {}
+    gates = trial.get("gates") or {}
+
+    # Populate comparison_report when TRIAL + accept-eligible + completed.
+    # Reuses the module-level _ACCEPT_ELIGIBLE_STATUSES (defined near line 2973)
+    # for forward-compat with Slice 4's pass_with_warnings — Decision 24.
+    comparison_report: dict | None = None
+    if (
+        ms == "TRIAL"
+        and gates.get("status") in _ACCEPT_ELIGIBLE_STATUSES
+        and gates.get("completed_at")
+    ):
+        comparison_report = build_comparison_report_placeholder(gates["status"])
+
     return MigrationStatusResponse(
         state=ms,
         candidate_path=migration.get("candidate_path") or None,
@@ -2855,8 +2934,9 @@ async def migration_status():
         backup_paths=trial.get("backup_paths") or None,
         trial_adapter_dir=trial.get("trial_adapter_dir") or None,
         trial_graph_dir=trial.get("trial_graph_dir") or None,
-        gates=trial.get("gates") or None,
+        gates=gates or None,
         recovery_required=list(migration.get("recovery_required") or []),
+        comparison_report=comparison_report,
     )
 
 
@@ -2889,6 +2969,602 @@ async def migration_diff():
 
     payload = render_preview_response(migration, pre_flight_fail=None)
     return MigrationDiffResponse(**payload)
+
+
+# Accept-eligible gate statuses (set membership for forward-compat — Decision 24).
+# Slice 4 widens this set by adding "pass_with_warnings".
+_ACCEPT_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"pass", "no_new_sessions"})
+_RESTART_HINT: str = "systemctl --user restart paramem-server"
+
+
+@app.post("/migration/accept", response_model=AcceptResponse)
+async def migration_accept():
+    """Promote trial config B to live, archive the trial adapter, and clear trial state.
+
+    Only valid when the server is in TRIAL state and gates have finished with an
+    accept-eligible status (``pass`` or ``no_new_sessions``).
+
+    5-step atomic ordering (spec §L353–359, IMPROVEMENT 7 — marker cleared
+    before adapter/graph move):
+
+    1. Re-verify preconditions inside lock (state, gates).
+    2. Build rotation slot for trial adapter archive.
+    3. **Clear trial marker** (BEFORE adapter/graph move — IMPROVEMENT 7).
+    4. Move trial adapter + graph into the rotation slot.
+    5. Refresh drift state (REQUIRED FIX 3) and set restart banner.
+
+    Errors
+    ------
+    404 ``not_found``
+        No trial is active (``migration.state == "LIVE"``).
+    409 ``not_trial``
+        Server is in STAGING, not TRIAL.
+    409 ``gates_not_finished``
+        Trial gates have not finished (status pending/running or no completed_at).
+    409 ``gates_failed``
+        Trial gates failed — only rollback is valid.
+    409 ``migration_in_progress``
+        Lock already held by a concurrent operation.
+    500 ``trial_archive_failed``
+        Could not create the rotation slot for the trial adapter.
+    """
+    from fastapi import HTTPException
+
+    from paramem.server.drift import ConfigDriftState, compute_config_hash
+    from paramem.server.migration import initial_migration_state
+
+    # --- Pre-checks outside the lock (fast 4xx path) ---
+    migration = _state.get("migration") or initial_migration_state()
+    current_state = migration.get("state", "LIVE")
+
+    if current_state == "LIVE":
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": "No trial is active."},
+        )
+
+    if current_state == "STAGING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "not_trial",
+                "message": (
+                    "Cannot accept — server is in STAGING, not TRIAL. "
+                    "Run POST /migration/confirm first."
+                ),
+            },
+        )
+
+    trial = migration.get("trial") or {}
+    gates = trial.get("gates") or {}
+    gates_status = gates.get("status", "")
+
+    if not gates_status or gates_status in {"pending", "running"} or not gates.get("completed_at"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "gates_not_finished",
+                "message": "Trial gates have not finished.",
+            },
+        )
+
+    if gates_status not in _ACCEPT_ELIGIBLE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "gates_failed",
+                "message": "Trial gates failed — only POST /migration/rollback is valid.",
+            },
+        )
+
+    lock: asyncio.Lock = _state.get("migration_lock") or asyncio.Lock()
+    if lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "migration_in_progress",
+                "message": "Another migration operation in progress.",
+            },
+        )
+
+    config = _state.get("config")
+    live_config_path = (
+        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+    )
+    if config is not None:
+        state_dir = (config.paths.data / "state").resolve()
+        backups_root = (config.paths.data / "backups").resolve()
+    else:
+        state_dir = Path("data/ha/state").resolve()
+        backups_root = Path("data/ha/backups").resolve()
+
+    trial_adapters_dir = backups_root / "trial_adapters"
+
+    async with lock:
+        # --- Re-verify inside lock (state may have changed) ---
+        migration = _state.get("migration") or initial_migration_state()
+        current_state = migration.get("state", "LIVE")
+
+        if current_state != "TRIAL":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "not_trial",
+                    "message": "Server left TRIAL state while acquiring lock.",
+                },
+            )
+
+        trial = migration.get("trial") or {}
+        gates = trial.get("gates") or {}
+        gates_status = gates.get("status", "")
+
+        if gates_status not in _ACCEPT_ELIGIBLE_STATUSES or not gates.get("completed_at"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "gates_not_finished",
+                    "message": "Trial gates status changed while acquiring lock.",
+                },
+            )
+
+        trial_adapter_dir_str = trial.get("trial_adapter_dir", "")
+        trial_graph_dir_str = trial.get("trial_graph_dir", "")
+        pre_trial_config_sha256 = trial.get("pre_trial_config_sha256", "")
+        candidate_config_sha256 = trial.get("candidate_config_sha256", "")
+        trial_started_at = trial.get("started_at", "")
+
+        # --- Step 2: Build rotation slot ---
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        slot_dir = trial_adapters_dir / ts
+        pending_dir = trial_adapters_dir / ".pending" / ts
+        archive_path = str(slot_dir.resolve())
+
+        try:
+            pending_dir.mkdir(parents=True, exist_ok=False)
+            meta = {
+                "schema_version": 1,
+                "rotated_at": datetime.now(timezone.utc).isoformat(),
+                "source": "accept",
+                "pre_trial_config_sha256": pre_trial_config_sha256,
+                "candidate_config_sha256": candidate_config_sha256,
+                "gates_status": gates_status,
+                "trial_started_at": trial_started_at,
+            }
+            (pending_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            os.rename(str(pending_dir), str(slot_dir))
+            # fsync parent for rename durability
+            _dir_fd = os.open(str(trial_adapters_dir), os.O_RDONLY)
+            try:
+                os.fsync(_dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(_dir_fd)
+        except Exception as exc:
+            # Clean up pending dir on failure
+            try:
+                shutil.rmtree(pending_dir, ignore_errors=True)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "trial_archive_failed",
+                    "message": f"Failed to create trial adapter archive slot: {exc}",
+                },
+            ) from exc
+
+        # --- Step 3: Clear trial marker BEFORE adapter/graph move (IMPROVEMENT 7) ---
+        # Rationale: if marker-clear fails, nothing else has mutated yet.
+        # If rotation below fails after marker-clear, state/trial_adapter/ is still
+        # intact and state/trial.json is gone → startup recovery sees no marker +
+        # B live → clean LIVE, no stale marker pointing at an already-rotated slot.
+        try:
+            clear_trial_marker(state_dir)
+        except OSError as exc:
+            logger.error("accept: failed to clear trial marker: %s", exc)
+            # Clean up the slot we created
+            try:
+                shutil.rmtree(slot_dir, ignore_errors=True)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "marker_clear_failed",
+                    "message": f"Failed to clear trial marker: {exc}",
+                },
+            ) from exc
+
+        # --- Step 4: Move trial adapter + graph into the rotation slot ---
+        # Non-fatal: config + marker are already coherent. Rotation is cosmetic.
+        rotation_incomplete = False
+        for src_str, dest_name in [
+            (trial_adapter_dir_str, "adapter"),
+            (trial_graph_dir_str, "graph"),
+        ]:
+            if not src_str:
+                continue
+            src = Path(src_str)
+            if src.exists():
+                dest = slot_dir / dest_name
+                try:
+                    shutil.move(str(src), str(dest))
+                except Exception as mv_exc:
+                    logger.error(
+                        "accept: failed to move %s to archive slot: %s — "
+                        "ARCHIVE INCOMPLETE — trial artifact remains at %s, archive manually",
+                        src,
+                        mv_exc,
+                        src,
+                    )
+                    rotation_incomplete = True
+                    archive_path = src_str  # degraded: point at still-in-place location
+
+        # --- Step 5: Refresh drift state + set restart banner (REQUIRED FIX 3) ---
+        # Replace the full ConfigDriftState dict, not just loaded_hash.
+        if _state.get("config_path") and live_config_path.exists():
+            try:
+                new_hash = compute_config_hash(live_config_path)
+                _state["config_drift"] = ConfigDriftState(
+                    detected=False,
+                    loaded_hash=new_hash,
+                    disk_hash=new_hash,
+                    last_checked_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except OSError as exc:
+                logger.warning("accept: could not compute new config hash: %s", exc)
+
+        restart_banner = (
+            "Migration: RESTART REQUIRED — new configuration takes effect on server restart"
+        )
+        if rotation_incomplete:
+            restart_banner = (
+                "Migration: RESTART REQUIRED — new configuration takes effect on server restart; "
+                "ARCHIVE INCOMPLETE — trial adapter not fully rotated, archive manually"
+            )
+
+        # Reset migration state to LIVE, preserving recovery_required.
+        prior_recovery = list(migration.get("recovery_required") or [])
+        _state["migration"] = initial_migration_state()
+        _state["migration"]["recovery_required"] = prior_recovery + [restart_banner]
+
+        return AcceptResponse(
+            state="LIVE",
+            trial_adapter_archive_path=archive_path,
+            restart_required=True,
+            restart_hint=_RESTART_HINT,
+            pre_migration_backup_retained=True,
+        )
+
+
+@app.post("/migration/rollback")
+async def migration_rollback():
+    """Restore config A from backup, archive trial adapter, clear trial state.
+
+    Valid from TRIAL at any time (no gate-status check — spec §L208).
+
+    8-step atomic ordering (IMPROVEMENT 8 — marker cleared before rotation):
+
+    1. Re-verify inside lock (state=TRIAL).
+    2. Snapshot B into rollback_pre_mortem backup.
+    3. Resolve A config artifact from marker.
+    4. Atomic rename A artifact → live config path.
+    5. **Clear trial marker** (BEFORE rotation — IMPROVEMENT 8).
+    6. Rotate trial adapter + graph (non-fatal; triggers 207 on failure).
+    7. Append restart banner.
+    8. Reset migration state to LIVE.
+
+    Returns HTTP 200 on full success or HTTP 207 when rotation fails (config
+    restored, marker cleared, but trial adapter archive incomplete).
+
+    Errors
+    ------
+    404 ``not_found``
+        No trial is active.
+    409 ``not_trial``
+        Server is in STAGING.
+    409 ``migration_in_progress``
+        Lock already held.
+    500 ``rollback_backup_failed``
+        Step 2 snapshot failed; state=TRIAL preserved.
+    500 ``rollback_precondition_failed``
+        A config artifact missing; pre-mortem backup deleted.
+    500 ``config_restore_failed``
+        Step 4 rename failed; pre-mortem backup deleted.
+    500 ``marker_clear_failed``
+        Step 5 marker clear failed; internal inconsistency.
+    """
+    from fastapi import HTTPException
+
+    from paramem.backup.encryption import SecurityBackupsConfig
+    from paramem.backup.types import ArtifactKind
+    from paramem.server.migration import initial_migration_state
+    from paramem.server.trial_state import read_trial_marker
+
+    # --- Pre-checks outside lock ---
+    migration = _state.get("migration") or initial_migration_state()
+    current_state = migration.get("state", "LIVE")
+
+    if current_state == "LIVE":
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": "No trial is active."},
+        )
+
+    if current_state == "STAGING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "not_trial",
+                "message": (
+                    "Cannot rollback — server is in STAGING. Run POST /migration/cancel instead."
+                ),
+            },
+        )
+
+    lock: asyncio.Lock = _state.get("migration_lock") or asyncio.Lock()
+    if lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "migration_in_progress",
+                "message": "Another migration operation in progress.",
+            },
+        )
+
+    config = _state.get("config")
+    live_config_path = (
+        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+    )
+    if config is not None:
+        state_dir = (config.paths.data / "state").resolve()
+        backups_root = (config.paths.data / "backups").resolve()
+    else:
+        state_dir = Path("data/ha/state").resolve()
+        backups_root = Path("data/ha/backups").resolve()
+
+    trial_adapters_dir = backups_root / "trial_adapters"
+    sec_cfg = SecurityBackupsConfig()
+
+    async with lock:
+        # --- Step 1: Re-verify inside lock ---
+        migration = _state.get("migration") or initial_migration_state()
+        current_state = migration.get("state", "LIVE")
+
+        if current_state != "TRIAL":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "not_trial",
+                    "message": "Server left TRIAL state while acquiring lock.",
+                },
+            )
+
+        trial = migration.get("trial") or {}
+        trial_adapter_dir_str = trial.get("trial_adapter_dir", "")
+        trial_graph_dir_str = trial.get("trial_graph_dir", "")
+        pre_trial_config_sha256 = trial.get("pre_trial_config_sha256", "")
+        trial_started_at = trial.get("started_at", "")
+
+        # --- Step 2: Snapshot B into rollback_pre_mortem backup ---
+        pre_mortem_slot: Path | None = None
+        try:
+            b_bytes = live_config_path.read_bytes() if live_config_path.exists() else b""
+            pre_mortem_slot = backup_write(
+                ArtifactKind.CONFIG,
+                b_bytes,
+                meta_fields={
+                    "tier": "rollback_pre_mortem",
+                    "pre_trial_hash": pre_trial_config_sha256,
+                },
+                base_dir=backups_root / "config",
+                security_config=sec_cfg,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "rollback_backup_failed",
+                    "message": f"Failed to snapshot B config before rollback: {exc}",
+                },
+            ) from exc
+
+        rollback_pre_mortem_path = str(pre_mortem_slot.resolve())
+
+        # --- Step 3: Resolve A backup artifact ---
+        # Read marker from disk to get config_artifact_filename (REQUIRED FIX 1).
+        marker = read_trial_marker(state_dir)
+        config_artifact_filename = ""
+        config_backup_slot_str = trial.get("backup_paths", {}).get("config", "") if trial else ""
+
+        if marker is not None:
+            config_artifact_filename = marker.config_artifact_filename
+            if marker.backup_paths.get("config"):
+                config_backup_slot_str = marker.backup_paths["config"]
+
+        if not config_artifact_filename:
+            # Defensive: marker missing or written before 3b.3.
+            try:
+                shutil.rmtree(pre_mortem_slot, ignore_errors=True)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "rollback_precondition_failed",
+                    "message": (
+                        "config_artifact_filename is empty in trial marker — "
+                        "cannot locate A config backup file. "
+                        "Marker may have been written by an older server version."
+                    ),
+                },
+            )
+
+        if not config_backup_slot_str:
+            try:
+                shutil.rmtree(pre_mortem_slot, ignore_errors=True)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "rollback_precondition_failed",
+                    "message": "config backup slot path missing from trial marker.",
+                },
+            )
+
+        a_yaml_file = Path(config_backup_slot_str) / config_artifact_filename
+        if not a_yaml_file.exists():
+            try:
+                shutil.rmtree(pre_mortem_slot, ignore_errors=True)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "rollback_precondition_failed",
+                    "message": (
+                        f"A config artifact not found at {a_yaml_file}. "
+                        "Backup may have been manually deleted."
+                    ),
+                },
+            )
+
+        # --- Step 4: Atomic rename A artifact → live config path ---
+        try:
+            os.rename(str(a_yaml_file), str(live_config_path))
+            _dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(_dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(_dir_fd)
+        except Exception as exc:
+            try:
+                shutil.rmtree(pre_mortem_slot, ignore_errors=True)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "config_restore_failed",
+                    "message": f"Failed to restore A config: {exc}",
+                },
+            ) from exc
+
+        # --- Step 5: Clear trial marker BEFORE rotation (IMPROVEMENT 8) ---
+        # Rationale: if rotation fails, no stale marker misdirects recovery.
+        # Config is already restored; marker-clear failure is a consistency issue.
+        try:
+            clear_trial_marker(state_dir)
+        except OSError as exc:
+            logger.error("rollback: failed to clear trial marker: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "marker_clear_failed",
+                    "message": f"Config restored but trial marker could not be cleared: {exc}",
+                },
+            ) from exc
+
+        # --- Step 6: Rotate trial adapter + graph (non-fatal → 207) ---
+        rotation_failed = False
+        archive_path = ""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        slot_dir = trial_adapters_dir / ts
+        pending_dir = trial_adapters_dir / ".pending" / ts
+
+        try:
+            pending_dir.mkdir(parents=True, exist_ok=False)
+            meta = {
+                "schema_version": 1,
+                "rotated_at": datetime.now(timezone.utc).isoformat(),
+                "source": "rollback",
+                "pre_trial_config_sha256": pre_trial_config_sha256,
+                "trial_started_at": trial_started_at,
+            }
+            (pending_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            os.rename(str(pending_dir), str(slot_dir))
+            _dir_fd = os.open(str(trial_adapters_dir), os.O_RDONLY)
+            try:
+                os.fsync(_dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(_dir_fd)
+            archive_path = str(slot_dir.resolve())
+
+            # Move adapter + graph into the slot.
+            for src_str, dest_name in [
+                (trial_adapter_dir_str, "adapter"),
+                (trial_graph_dir_str, "graph"),
+            ]:
+                if not src_str:
+                    continue
+                src = Path(src_str)
+                if src.exists():
+                    shutil.move(str(src), str(slot_dir / dest_name))
+
+        except Exception as rot_exc:
+            logger.error(
+                "rollback: trial adapter rotation failed (non-fatal): %s — "
+                "config restored, marker cleared, adapter remains at %s",
+                rot_exc,
+                trial_adapter_dir_str,
+            )
+            rotation_failed = True
+            archive_path = trial_adapter_dir_str
+            # Clean up partial slot
+            try:
+                shutil.rmtree(pending_dir, ignore_errors=True)
+                shutil.rmtree(slot_dir, ignore_errors=True)
+            except OSError:
+                pass
+
+        # --- Step 7: Append restart banner ---
+        restart_banner = (
+            "Migration: RESTART REQUIRED — rollback renamed configs/server.yaml; "
+            "restart to clear recovery banner"
+        )
+        # NOTE: do NOT refresh config_drift — in-memory config still matches A;
+        # the drift loop stays coherent (spec: rollback handler does not refresh drift).
+
+        # --- Step 8: Reset migration state to LIVE ---
+        prior_recovery = list(migration.get("recovery_required") or [])
+        _state["migration"] = initial_migration_state()
+        _state["migration"]["recovery_required"] = prior_recovery + [restart_banner]
+
+        if rotation_failed:
+            # HTTP 207 Multi-Status: primary action succeeded, rotation failed.
+            body = {
+                "state": "LIVE",
+                "trial_adapter_archive_path": archive_path,
+                "rollback_pre_mortem_backup_path": rollback_pre_mortem_path,
+                "restart_required": True,
+                "restart_hint": _RESTART_HINT,
+                "archive_warning": {
+                    "path": archive_path,
+                    "message": (
+                        "Trial adapter rotation failed — adapter remains at the "
+                        "path above. Archive manually or accept the data loss."
+                    ),
+                },
+            }
+            return Response(
+                content=json.dumps(body),
+                status_code=207,
+                media_type="application/json",
+            )
+
+        return RollbackResponse(
+            state="LIVE",
+            trial_adapter_archive_path=archive_path,
+            rollback_pre_mortem_backup_path=rollback_pre_mortem_path,
+            restart_required=True,
+            restart_hint=_RESTART_HINT,
+        )
 
 
 def _cloud_only_route(

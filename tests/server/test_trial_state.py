@@ -42,6 +42,7 @@ _MARKER = TrialMarker(
     },
     trial_adapter_dir="/abs/data/ha/state/trial_adapter",
     trial_graph_dir="/abs/data/ha/state/trial_graph",
+    config_artifact_filename="config-20260422-010000.bin",
 )
 
 
@@ -185,6 +186,37 @@ class TestClearMarker:
 
 
 # ---------------------------------------------------------------------------
+# Backward compatibility: config_artifact_filename absent (pre-3b.3 markers)
+# ---------------------------------------------------------------------------
+
+
+class TestBackwardCompatConfigArtifactFilename:
+    def test_from_dict_missing_config_artifact_filename_defaults_to_empty(self):
+        """Pre-3b.3 markers lack config_artifact_filename; from_dict must default
+        to empty string so rollback can detect and 500 appropriately.
+
+        This exercises the ``.get("config_artifact_filename", "")`` backward-compat
+        path in ``TrialMarker.from_dict``.
+        """
+        raw = {
+            "schema_version": TRIAL_MARKER_SCHEMA_VERSION,
+            "started_at": "2026-04-22T00:00:00+00:00",
+            "pre_trial_config_sha256": "a" * 64,
+            "candidate_config_sha256": "b" * 64,
+            "backup_paths": {
+                "config": "/tmp/config",
+                "graph": "/tmp/graph",
+                "registry": "/tmp/registry",
+            },
+            "trial_adapter_dir": "/tmp/trial_adapter",
+            "trial_graph_dir": "/tmp/trial_graph",
+            # config_artifact_filename deliberately absent
+        }
+        marker = TrialMarker.from_dict(raw)
+        assert marker.config_artifact_filename == ""
+
+
+# ---------------------------------------------------------------------------
 # Absolute paths (Correction 5)
 # ---------------------------------------------------------------------------
 
@@ -226,6 +258,7 @@ class TestAbsolutePaths:
             },
             trial_adapter_dir="state/trial_adapter",
             trial_graph_dir="state/trial_graph",
+            config_artifact_filename="config-20260422-010000.bin",
         )
         write_trial_marker(state_dir, relative_marker)
         recovered = read_trial_marker(state_dir)

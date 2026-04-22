@@ -87,6 +87,12 @@ class TrialMarker:
     trial_graph_dir:
         Absolute path to the directory where the trial consolidation will
         persist the trial graph (``data/ha/state/trial_graph/``).
+    config_artifact_filename:
+        Filename of the config artifact file inside the config backup slot
+        (e.g. ``"config-20260421-040000.bin"``).  Used by the rollback handler
+        to resolve the exact A-config file without directory listing.
+        Defaults to ``""`` for backward compatibility with markers written
+        before Slice 3b.3; the rollback handler asserts non-empty.
     """
 
     schema_version: int
@@ -96,6 +102,7 @@ class TrialMarker:
     backup_paths: dict[str, str]
     trial_adapter_dir: str
     trial_graph_dir: str
+    config_artifact_filename: str
 
     def to_dict(self) -> dict:
         """Serialize the marker to a JSON-ready dict."""
@@ -107,6 +114,7 @@ class TrialMarker:
             "backup_paths": dict(self.backup_paths),
             "trial_adapter_dir": self.trial_adapter_dir,
             "trial_graph_dir": self.trial_graph_dir,
+            "config_artifact_filename": self.config_artifact_filename,
         }
 
     @classmethod
@@ -148,6 +156,9 @@ class TrialMarker:
             backup_paths=dict(d["backup_paths"]),
             trial_adapter_dir=d["trial_adapter_dir"],
             trial_graph_dir=d["trial_graph_dir"],
+            # Default to "" for backward compatibility with markers written
+            # before Slice 3b.3. The rollback handler asserts non-empty.
+            config_artifact_filename=d.get("config_artifact_filename", ""),
         )
 
 

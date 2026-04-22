@@ -20,7 +20,14 @@ from __future__ import annotations
 import argparse
 import sys
 
-from paramem.cli import backup, migrate, migrate_cancel, migrate_status
+from paramem.cli import (
+    backup,
+    migrate,
+    migrate_accept,
+    migrate_cancel,
+    migrate_rollback,
+    migrate_status,
+)
 
 CLI_VERSION = "0.1.0"
 
@@ -93,6 +100,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit raw JSON response instead of formatted output.",
     )
 
+    # --- migrate-accept ---
+    p_ma = subparsers.add_parser(
+        "migrate-accept",
+        help="Accept the active trial migration and promote config B to live.",
+        description=(
+            "POST /migration/accept. "
+            "Promotes the trial config to live, archives the trial adapter, "
+            "and returns the server to LIVE state. Ships in Slice 3b.3."
+        ),
+    )
+    p_ma.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON response instead of formatted output.",
+    )
+
+    # --- migrate-rollback ---
+    p_mr = subparsers.add_parser(
+        "migrate-rollback",
+        help="Rollback the active trial migration and restore config A.",
+        description=(
+            "POST /migration/rollback. "
+            "Restores config A from backup, archives the trial adapter, "
+            "and returns the server to LIVE state. Ships in Slice 3b.3."
+        ),
+    )
+    p_mr.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON response instead of formatted output.",
+    )
+
     # --- backup ---
     p_backup = subparsers.add_parser(
         "backup",
@@ -151,6 +190,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "migrate-cancel":
         return migrate_cancel.run(args)
+
+    if args.command == "migrate-accept":
+        return migrate_accept.run(args)
+
+    if args.command == "migrate-rollback":
+        return migrate_rollback.run(args)
 
     if args.command == "backup":
         if args.backup_command == "list":

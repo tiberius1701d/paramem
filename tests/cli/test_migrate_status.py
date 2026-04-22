@@ -233,6 +233,7 @@ class TestTrialJsonPathCorrection4:
             },
             trial_adapter_dir=str(tmp_path / "data" / "ha" / "state" / "trial_adapter"),
             trial_graph_dir=str(tmp_path / "data" / "ha" / "state" / "trial_graph"),
+            config_artifact_filename="config-20260422-010000.bin",
         )
         marker_path = tmp_path / "data" / "ha" / "state" / "trial.json"
         marker_path.parent.mkdir(parents=True, exist_ok=True)

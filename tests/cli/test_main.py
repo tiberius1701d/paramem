@@ -37,9 +37,14 @@ class TestMigrateUnreachable:
         )
 
 
-class TestMigrate404PrintsSlice3Message:
-    def test_migrate_404_prints_slice3_message_and_returns_1(self, monkeypatch, capsys):
-        """ServerUnavailable from post_json → rc=1, message mentions Slice 3."""
+class TestMigrate404PrintsVersionAlignmentMessage:
+    def test_migrate_404_prints_version_alignment_message_and_returns_1(self, monkeypatch, capsys):
+        """ServerUnavailable from post_json → rc=1, evergreen version-alignment message.
+
+        The 404 message no longer includes slice labels — it mentions
+        /migration/preview and instructs the operator to check version
+        alignment (spec §L404: evergreen 404 fallback).
+        """
 
         def _raise(*_args, **_kwargs):
             raise http_client.ServerUnavailable("404 from /migration/preview")
@@ -51,8 +56,8 @@ class TestMigrate404PrintsSlice3Message:
 
         assert rc == 1, f"Expected exit 1, got {rc}"
         assert "/migration/preview" in captured.err, "Stderr must mention the endpoint"
-        assert "Slice 3" in captured.err, (
-            "Stderr must mention Slice 3 so the operator knows when it ships"
+        assert "--version" in captured.err or "version" in captured.err.lower(), (
+            "Stderr must mention version alignment (evergreen message)"
         )
 
 
