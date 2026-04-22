@@ -70,6 +70,8 @@ class SecurityBackupsConfig:
 _cipher: Fernet | None = None
 
 
+# WP1: rename PARAMEM_SNAPSHOT_KEY → PARAMEM_MASTER_KEY per SECURITY.md §4.
+# Single env-var reference site in production code (verified via grep).
 def _get_cipher() -> Fernet:
     """Return the module-level cached Fernet cipher, building it on first call.
 

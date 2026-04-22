@@ -45,6 +45,9 @@ class PreFlightCheck:
     estimate_bytes: int
 
 
+# WP1: route the live_config_path and registry_path read_bytes() calls through
+# the decrypt layer when Security ON. The graph contribution via
+# loop.merger.save_bytes() is in-memory (already plaintext post-decrypt).
 def compute_pre_flight_check(
     *,
     server_config: "ServerConfig",

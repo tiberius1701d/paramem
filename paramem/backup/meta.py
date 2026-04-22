@@ -73,6 +73,8 @@ def _meta_path(slot_dir: Path) -> Path:
     )
 
 
+# WP1: encrypt sidecar JSON when Security ON (PARAMEM_MASTER_KEY set).
+# See .agent/security_wp_pause_inventory.md "Post-pause: Migration & Backup integration audit".
 def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
     """Serialise *meta* into ``<slot_dir>/<kind>-<timestamp>.meta.json``.
 
@@ -117,6 +119,8 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
     return sidecar_path
 
 
+# WP1: route through decrypt layer when Security ON. Single chokepoint for
+# every consumer (enumerate_backups, /backup/list, retention engine).
 def read_meta(slot_dir: Path) -> ArtifactMeta:
     """Read and validate the ``.meta.json`` sidecar in *slot_dir*.
 

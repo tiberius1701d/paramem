@@ -192,6 +192,8 @@ def _row_log_errors(gates: dict) -> dict[str, Any]:
     return row
 
 
+# WP1: route the on-disk graph read through the decrypt layer when Security ON.
+# In-memory graph branch is already plaintext post-decrypt (no change needed).
 def _summarise_graph(path: Path | None, graph: "Any | None" = None) -> str:
     """Compute a graph-shape summary string.
 

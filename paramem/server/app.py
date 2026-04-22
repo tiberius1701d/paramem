@@ -4400,6 +4400,10 @@ async def backup_create(req: BackupCreateRequest):
     )
 
 
+# SLICE7: after Security WP1 ships current_key_fingerprint() + the
+# PARAMEM_MASTER_KEY rename, add fingerprint-mismatch check between
+# the decrypt block (~L4525) and the safety-backup block (~L4548).
+# Spec migration plan L606. See .agent/migration-slice7-pickup.md.
 @app.post("/backup/restore", response_model=BackupRestoreResponse)
 async def backup_restore(req: BackupRestoreRequest):
     """Restore a **config** backup atop the live server.yaml.
