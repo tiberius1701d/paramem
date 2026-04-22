@@ -207,6 +207,18 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
     mock_summary = {"status": "no_pending", "sessions": 0}
 
     async def _run_trial_with_mocks():
+        # Slice 4: evaluate_gates is patched so this e2e test stays GPU-free.
+        # session_buffer=None → session_buffer_empty=True → all gates skipped →
+        # rollup is "no_new_sessions".
+        from paramem.server.gates import GateResult
+
+        skipped_gates = [
+            GateResult(gate=i, name=n, status="skipped", reason="no_new_sessions", metrics=None)
+            for i, n in enumerate(
+                ["extraction", "training", "adapter_reload", "live_registry_recall"], start=1
+            )
+        ]
+
         mock_loop = MagicMock()
         with patch(
             "paramem.server.consolidation.create_consolidation_loop",
@@ -226,7 +238,11 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
                         "paramem.server.consolidation.run_consolidation",
                         return_value=mock_summary,
                     ):
-                        await app_module._run_trial_consolidation()
+                        with patch(
+                            "paramem.server.gates.evaluate_gates",
+                            return_value=skipped_gates,
+                        ):
+                            await app_module._run_trial_consolidation()
 
     asyncio.run(_run_trial_with_mocks())
 

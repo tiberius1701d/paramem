@@ -2767,9 +2767,10 @@ async def _run_trial_consolidation() -> None:
     ``/migration/rollback`` (3b.3) can restore the full queue, and
     ``/migration/accept`` (3b.3) can call ``mark_consolidated`` itself.
 
-    On completion, sets ``_state["migration"]["trial"]["gates"]`` to either
-    ``{"status": "no_new_sessions", ...}`` or ``{"status": "trial_exception",
-    "exception": ...}``.  Slice 4 replaces the gate dict with real quality gates.
+    On completion, sets ``_state["migration"]["trial"]["gates"]`` to a dict
+    with ``status`` drawn from
+    ``{"pass", "no_new_sessions", "fail", "trial_exception"}`` and a
+    ``details`` list of four :class:`~paramem.server.gates.GateResult` dicts.
     """
     from paramem.server.config import load_server_config
 
@@ -2791,6 +2792,8 @@ async def _run_trial_consolidation() -> None:
         # Determine trial adapter and graph paths from the marker.
         migration = _state.get("migration", {})
         trial_data = migration.get("trial") or {}
+        # REQUIRED FIX 1 — read trial_adapter_dir directly from state; do NOT
+        # resolve via find_live_slot.
         trial_adapter_dir_str = trial_data.get("trial_adapter_dir", "")
         trial_graph_dir_str = trial_data.get("trial_graph_dir", "")
 
@@ -2805,49 +2808,90 @@ async def _run_trial_consolidation() -> None:
             _update_trial_gates({"status": "trial_exception", "exception": "model not loaded"})
             return
 
-        loop = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: _build_trial_loop(
-                model,
-                tokenizer,
-                trial_config,
-                Path(trial_adapter_dir_str) if trial_adapter_dir_str else None,
-                Path(trial_graph_dir_str) if trial_graph_dir_str else None,
-            ),
-        )
-
+        # --- Session buffer check ---
         session_buffer = _state.get("session_buffer")
-        ha_context = _state.get("ha_context")
-        speaker_store = _state.get("speaker_store")
+        session_buffer_empty = session_buffer is None or session_buffer.pending_count == 0
 
-        def _run():
-            with gpu_lock_sync():
-                from paramem.server.consolidation import run_consolidation as _run_consol
+        summary: dict | None = None
+        exc_captured: Exception | None = None
 
-                return _run_consol(
+        if not session_buffer_empty:
+            loop = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _build_trial_loop(
                     model,
                     tokenizer,
                     trial_config,
-                    session_buffer,
-                    loop=loop,
-                    ha_context=ha_context,
-                    speaker_store=speaker_store,
-                    # Trial path: do NOT call mark_consolidated — pending sessions
-                    # stay in the buffer so /migration/rollback (3b.3) can restore
-                    # the full queue (spec L364).
-                    mark_consolidated_callback=lambda _: None,
-                )
+                    Path(trial_adapter_dir_str) if trial_adapter_dir_str else None,
+                    Path(trial_graph_dir_str) if trial_graph_dir_str else None,
+                ),
+            )
 
-        summary = await asyncio.get_running_loop().run_in_executor(None, _run)
+            ha_context = _state.get("ha_context")
+            speaker_store = _state.get("speaker_store")
+
+            def _run():
+                with gpu_lock_sync():
+                    from paramem.server.consolidation import run_consolidation as _run_consol
+
+                    return _run_consol(
+                        model,
+                        tokenizer,
+                        trial_config,
+                        session_buffer,
+                        loop=loop,
+                        ha_context=ha_context,
+                        speaker_store=speaker_store,
+                        # Trial path: do NOT call mark_consolidated — pending sessions
+                        # stay in the buffer so /migration/rollback (3b.3) can restore
+                        # the full queue (spec L364).
+                        mark_consolidated_callback=lambda _: None,
+                    )
+
+            try:
+                summary = await asyncio.get_running_loop().run_in_executor(None, _run)
+            except Exception as _exc:  # noqa: BLE001
+                exc_captured = _exc
+
+        # --- Gate evaluation (Slice 4) ---
+        # live_registry_path comes from the PRE-TRIAL config (REQUIRED FIX 1).
+        live_config = _state.get("config")
+        if live_config is None:
+            raise RuntimeError(
+                "trial consolidation: _state['config'] is missing — "
+                "cannot resolve live registry path for gate 4"
+            )
+        live_registry_path: Path = live_config.registry_path
+        trial_adapter_dir = (
+            Path(trial_adapter_dir_str) if trial_adapter_dir_str else Path("state/trial_adapter")
+        )
+
+        from paramem.server.gates import evaluate_gates
+
+        results = evaluate_gates(
+            model=model,
+            tokenizer=tokenizer,
+            trial_adapter_dir=trial_adapter_dir,
+            live_registry_path=live_registry_path,
+            session_buffer_empty=session_buffer_empty,
+            consolidation_summary=summary,
+            consolidation_exception=exc_captured,
+        )
+
+        overall_status = _rollup_gate_status(results, session_buffer_empty)
         completed_at = datetime.now(timezone.utc).isoformat()
-        gates = {
-            # TODO Slice 4: replace with real gate evaluation
-            "status": "no_new_sessions",
+
+        gates_payload: dict = {
+            "status": overall_status,
             "completed_at": completed_at,
-            "summary": {k: v for k, v in summary.items() if k != "loop"},
+            "summary": ({k: v for k, v in summary.items() if k != "loop"} if summary else {}),
+            "details": [r.to_dict() for r in results],
         }
-        _update_trial_gates(gates)
-        logger.info("trial consolidation complete: status=%s", gates["status"])
+        if exc_captured is not None:
+            gates_payload["exception"] = str(exc_captured)  # backward-compat with 3b.3
+
+        _update_trial_gates(gates_payload)
+        logger.info("trial consolidation complete: status=%s", overall_status)
 
     except Exception as exc:  # noqa: BLE001
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -2855,6 +2899,65 @@ async def _run_trial_consolidation() -> None:
             {"status": "trial_exception", "exception": str(exc), "completed_at": completed_at}
         )
         logger.exception("trial consolidation failed: %s", exc)
+
+
+def _rollup_gate_status(results: list, session_buffer_empty: bool) -> str:
+    """Compute the overall trial status from a list of GateResult objects.
+
+    Decision table (spec §Slice 4 — overall status rollup):
+
+    - Any ``"fail"`` → ``"fail"``
+    - All 4 ``"skipped"`` → ``"no_new_sessions"``
+    - Gates 1/2/3 ``"skipped"`` + gate 4 ``"pass"`` → ``"no_new_sessions"``
+    - Gates 1/2/3 ``"skipped"`` + gate 4 ``"fail"`` → ``"fail"``
+    - Any subset with gate 4 ``"skipped"`` (< 20 keys) and no fails:
+      ``"pass"`` when any of gates 1–3 passed, else ``"no_new_sessions"``
+    - All 4 ``"pass"`` → ``"pass"``
+
+    Parameters
+    ----------
+    results:
+        List of four :class:`~paramem.server.gates.GateResult` objects in
+        gate order (1, 2, 3, 4).
+    session_buffer_empty:
+        Passed through for logging context; not used in the rollup logic
+        (gate statuses already encode the buffer-empty information).
+
+    Returns
+    -------
+    str
+        One of ``"pass"``, ``"no_new_sessions"``, or ``"fail"``.
+    """
+    statuses = [r.status for r in results]
+
+    if "fail" in statuses:
+        return "fail"
+
+    # All skipped → no new sessions.
+    if all(s == "skipped" for s in statuses):
+        return "no_new_sessions"
+
+    # Gates 1/2/3 all skipped but gate 4 is not → derive from gate 4.
+    early_statuses = statuses[:3]
+    gate4_status = statuses[3] if len(statuses) == 4 else "skipped"
+
+    if all(s == "skipped" for s in early_statuses):
+        if gate4_status == "pass":
+            return "no_new_sessions"
+        if gate4_status == "fail":
+            return "fail"
+        # gate 4 also skipped (<20 keys) — all 4 skipped covered above.
+        return "no_new_sessions"
+
+    # Gate 4 skipped (registry < 20 keys) — use gate 1–3 results.
+    if gate4_status == "skipped":
+        if "pass" in early_statuses:
+            return "pass"
+        # Only skipped among 1–3 (no pass, no fail).
+        return "no_new_sessions"
+
+    # Mix of pass and skipped in gates 1–3 with gate 4 pass.
+    return "pass"
 
 
 def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_graph_dir):
@@ -2889,6 +2992,15 @@ def _update_trial_gates(gates: dict) -> None:
     trial["gates"] = gates
 
 
+# Accept-eligible gate statuses (set membership for forward-compat — Decision 24).
+# Set remains {"pass", "no_new_sessions"} — Slice 4 ships real gate
+# evaluation emitting these two accept-eligible values plus "fail" and
+# "trial_exception". Cluster-variance warnings from gate 4 live in
+# `gates["details"][3]["metrics"]["warnings"]`, not as a new top-level
+# status.
+_ACCEPT_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"pass", "no_new_sessions"})
+
+
 @app.get("/migration/status", response_model=MigrationStatusResponse)
 async def migration_status():
     """Return the current migration state and server metadata.
@@ -2909,8 +3021,9 @@ async def migration_status():
     gates = trial.get("gates") or {}
 
     # Populate comparison_report when TRIAL + accept-eligible + completed.
-    # Reuses the module-level _ACCEPT_ELIGIBLE_STATUSES (defined near line 2973)
-    # for forward-compat with Slice 4's pass_with_warnings — Decision 24.
+    # _ACCEPT_ELIGIBLE_STATUSES contains {"pass", "no_new_sessions"} (Slice 4
+    # ships cluster-variance warnings in gate details, not as a separate
+    # top-level status — Decision 24 invalidated).
     comparison_report: dict | None = None
     if (
         ms == "TRIAL"
@@ -2971,9 +3084,6 @@ async def migration_diff():
     return MigrationDiffResponse(**payload)
 
 
-# Accept-eligible gate statuses (set membership for forward-compat — Decision 24).
-# Slice 4 widens this set by adding "pass_with_warnings".
-_ACCEPT_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"pass", "no_new_sessions"})
 _RESTART_HINT: str = "systemctl --user restart paramem-server"
 
 
