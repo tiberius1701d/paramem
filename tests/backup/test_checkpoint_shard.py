@@ -224,12 +224,19 @@ class TestMaterializeCheckpointToShm:
             shutil.rmtree(shm, ignore_errors=True)
 
     def test_shm_fallback_when_dev_shm_unavailable(
-        self, tmp_path: Path, monkeypatch, capfd
+        self, tmp_path: Path, monkeypatch, capfd, caplog
     ) -> None:
-        """Monkeypatched /dev/shm absence → fallback tempdir + WARN."""
+        """Monkeypatched /dev/shm absence → fallback tempdir + WARN.
+
+        Checks both ``capfd.err`` and ``caplog.records`` so the assertion is
+        robust across pytest log-capture variants (local stderr vs CI capture).
+        """
+        import logging
+
         from paramem.backup import checkpoint_shard
 
         monkeypatch.setattr(checkpoint_shard, "_SHM_ROOT", tmp_path / "nonexistent")
+        caplog.set_level(logging.WARNING)
 
         ckpt = tmp_path / "checkpoint-42"
         contents = _seed_checkpoint(ckpt)
@@ -239,8 +246,8 @@ class TestMaterializeCheckpointToShm:
         try:
             for name, body in contents.items():
                 assert (shm / name).read_bytes() == body
-            captured = capfd.readouterr()
-            assert "dev/shm unavailable" in captured.err
+            log_text = capfd.readouterr().err + "\n".join(r.getMessage() for r in caplog.records)
+            assert "dev/shm unavailable" in log_text
         finally:
             import shutil
 

@@ -623,16 +623,17 @@ class TestRestoreFingerprintMismatchWithoutForceReturns400:
 
 class TestRestoreFingerprintMismatchWithForceSucceeds:
     def test_restore_fingerprint_mismatch_with_force_succeeds(
-        self, tmp_path: Path, monkeypatch, capfd
+        self, tmp_path: Path, monkeypatch, capfd, caplog
     ) -> None:
         """Backup fingerprint ≠ current, force_rotate_key=True → 200 + WARN log.
 
         Forges ``meta.key_fingerprint`` so the check fires while decrypt still
-        succeeds under the live key. The WARN message is asserted via ``capfd``
-        because paramem's logging configuration writes directly to stderr and
-        bypasses caplog's propagation path.
+        succeeds under the live key. The WARN message is checked via both
+        ``capfd.err`` and ``caplog.records`` — pytest's log-capture routing
+        differs between local and CI environments.
         """
         import json  # noqa: PLC0415
+        import logging
         import os
 
         from cryptography.fernet import Fernet  # noqa: PLC0415
@@ -656,6 +657,7 @@ class TestRestoreFingerprintMismatchWithForceSucceeds:
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
+        caplog.set_level(logging.WARNING)
         with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": key}):
             resp = client.post(
                 "/backup/restore",
@@ -665,8 +667,8 @@ class TestRestoreFingerprintMismatchWithForceSucceeds:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert "config" in body["restored"]
-        captured = capfd.readouterr()
-        assert "fingerprint mismatch bypassed" in captured.err
+        log_text = capfd.readouterr().err + "\n".join(r.getMessage() for r in caplog.records)
+        assert "fingerprint mismatch bypassed" in log_text
 
 
 class TestRestoreFingerprintMatchProceedsSilently:

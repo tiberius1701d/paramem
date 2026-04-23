@@ -78,15 +78,18 @@ class TestEncryptCheckpointCallbackOnSave:
         assert (ckpt1 / "adapter_model.safetensors").read_bytes() == b"weights-1"
         assert not is_pmem1_envelope(ckpt1 / "adapter_model.safetensors")
 
-    def test_on_save_tolerates_encrypt_failure(self, tmp_path: Path, capfd) -> None:
+    def test_on_save_tolerates_encrypt_failure(self, tmp_path: Path, capfd, caplog) -> None:
         """An encryption exception is logged but does not propagate.
 
-        The WARN message is asserted via ``capfd`` because paramem's logging
-        configuration writes directly to stderr and bypasses caplog's
-        propagation path.
+        Checks both ``capfd.err`` and ``caplog.records`` — pytest's log-capture
+        routing differs between local and CI environments; the error message
+        lands in one stream or the other, never neither.
         """
+        import logging
+
         _seed_two_checkpoints(tmp_path)
         args = SimpleNamespace(output_dir=str(tmp_path), load_best_model_at_end=False)
+        caplog.set_level(logging.ERROR)
 
         with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
             _clear_cipher_cache()
@@ -96,8 +99,8 @@ class TestEncryptCheckpointCallbackOnSave:
             ):
                 _EncryptCheckpointCallback().on_save(args, state=None, control=None)
 
-        captured = capfd.readouterr()
-        assert "Failed to encrypt checkpoint files" in captured.err
+        log_text = capfd.readouterr().err + "\n".join(r.getMessage() for r in caplog.records)
+        assert "Failed to encrypt checkpoint files" in log_text
 
     def test_on_save_ignores_non_checkpoint_dirs(self, tmp_path: Path) -> None:
         """Only ``checkpoint-*`` subdirs are touched; siblings are left alone."""
