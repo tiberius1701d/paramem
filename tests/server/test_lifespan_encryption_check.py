@@ -1,7 +1,7 @@
 """Tests for Fix 10 — assert_encryption_feasible called during lifespan startup.
 
 Fix 10 (2026-04-23): assert_encryption_feasible is called at server startup so
-that ``encrypt_at_rest=always + no PARAMEM_SNAPSHOT_KEY`` produces an immediate
+that ``encrypt_at_rest=always + no PARAMEM_MASTER_KEY`` produces an immediate
 FatalConfigError rather than a silent runtime failure when the first backup is
 attempted.
 
@@ -33,7 +33,7 @@ class TestAssertEncryptionFeasible:
     def test_always_policy_no_key_raises_fatal(self):
         """encrypt_at_rest=ALWAYS + no key → FatalConfigError (Fix 10)."""
         cfg = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.ALWAYS)
-        with pytest.raises(FatalConfigError, match="PARAMEM_SNAPSHOT_KEY"):
+        with pytest.raises(FatalConfigError, match="PARAMEM_MASTER_KEY"):
             assert_encryption_feasible(cfg, key_loaded=False)
 
     def test_always_policy_with_key_ok(self):
@@ -97,7 +97,7 @@ class TestLifespanCallsAssertEncryptionFeasible:
         # Direct exercise of the code path from lifespan:
         # "from paramem.backup.encryption import SecurityBackupsConfig as _EncSecCfg,
         #  assert_encryption_feasible as _assert_enc"
-        # "_key_loaded = bool(os.environ.get('PARAMEM_SNAPSHOT_KEY'))"
+        # "_key_loaded = bool(os.environ.get('PARAMEM_MASTER_KEY'))"
         # "_assert_enc(_EncSecCfg(), key_loaded=_key_loaded)"
         from paramem.backup.encryption import (
             SecurityBackupsConfig as _EncSecCfg,
@@ -106,9 +106,9 @@ class TestLifespanCallsAssertEncryptionFeasible:
             assert_encryption_feasible as _assert_enc,
         )
 
-        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_SNAPSHOT_KEY"}
+        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
         with patch.dict(os.environ, env_without_key, clear=True):
-            _key_loaded = bool(os.environ.get("PARAMEM_SNAPSHOT_KEY"))
+            _key_loaded = bool(os.environ.get("PARAMEM_MASTER_KEY"))
             # Must not raise — AUTO policy with no key is acceptable.
             _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
 
@@ -138,10 +138,80 @@ class TestLifespanCallsAssertEncryptionFeasible:
                 assert_encryption_feasible as _assert_enc,
             )
 
-            _key_loaded = bool(os.environ.get("PARAMEM_SNAPSHOT_KEY"))
+            _key_loaded = bool(os.environ.get("PARAMEM_MASTER_KEY"))
             _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
 
         # This test verifies the call signature is correct (SecurityBackupsConfig,
         # key_loaded=bool) — the actual lifespan integration is covered by the
         # lifespan code itself which is exercised during server startup.
         # The test above exercises the exact same code path as the lifespan block.
+
+
+# ---------------------------------------------------------------------------
+# Lifespan security-posture contract
+# ---------------------------------------------------------------------------
+
+
+class TestLifespanSecurityPosture:
+    """Verify lifespan ships the SECURITY.md §4 posture plumbing correctly.
+
+    ``assert_mode_consistency`` is available as a tested primitive in
+    ``paramem.backup.encryption`` but is deliberately NOT yet invoked from
+    lifespan.  Two preconditions must land first: (a) core infrastructure
+    files (graph, registry, queue, speaker store, trainer resume) must
+    actually be written through ``write_infra_bytes`` so the on-disk state
+    matches the intended mode, and (b) a migration command
+    (``paramem encrypt-infra`` / ``decrypt-infra``) must exist so an
+    operator can reconcile a mismatch.  This test locks the contract so the
+    wiring is only activated when both preconditions are met — otherwise
+    a deployment with a key set alongside plaintext infra would be
+    un-restartable with no migration path.
+
+    The ``SECURITY: ON/OFF`` log line and ``_state["encryption"]`` posture
+    field ARE wired — they are pure informational output and safe to emit.
+    """
+
+    def test_primitive_is_importable(self):
+        """assert_mode_consistency must exist and be callable from encryption."""
+        from paramem.backup.encryption import assert_mode_consistency
+
+        assert callable(assert_mode_consistency)
+
+    def test_lifespan_does_not_invoke_mode_consistency_yet(self):
+        """The mode-consistency check must not be wired into lifespan until
+        the on-disk infrastructure and the migration command are both in
+        place.  Remove this assertion when both land."""
+        import inspect
+
+        from paramem.server import app as app_module
+
+        source = inspect.getsource(app_module.lifespan)
+        # The docstring/comment may mention the primitive — acceptable.
+        # What must NOT be present is an active call via the lifespan alias.
+        assert "_assert_mode(" not in source, (
+            "assert_mode_consistency must not be invoked from lifespan until "
+            "core-artifact encryption and the migration command both land"
+        )
+
+    def test_lifespan_emits_security_posture_line(self):
+        """lifespan must emit SECURITY: ON/OFF log line per SECURITY.md §4.
+
+        Pure informational — independent of the mode-consistency wiring.
+        """
+        import inspect
+
+        from paramem.server import app as app_module
+
+        source = inspect.getsource(app_module.lifespan)
+        assert "SECURITY: ON" in source
+        assert "SECURITY: OFF" in source
+
+    def test_lifespan_sets_encryption_state_field(self):
+        """lifespan must populate _state['encryption'] so a future /status
+        surface can expose the posture without touching the env again."""
+        import inspect
+
+        from paramem.server import app as app_module
+
+        source = inspect.getsource(app_module.lifespan)
+        assert '_state["encryption"]' in source

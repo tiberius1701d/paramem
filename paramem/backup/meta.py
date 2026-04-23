@@ -36,6 +36,7 @@ import json
 import logging
 from pathlib import Path
 
+from paramem.backup.encryption import read_maybe_encrypted
 from paramem.backup.hashing import content_sha256_path
 from paramem.backup.types import (
     SCHEMA_VERSION,
@@ -73,8 +74,6 @@ def _meta_path(slot_dir: Path) -> Path:
     )
 
 
-# WP1: encrypt sidecar JSON when Security ON (PARAMEM_MASTER_KEY set).
-# See .agent/security_wp_pause_inventory.md "Post-pause: Migration & Backup integration audit".
 def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
     """Serialise *meta* into ``<slot_dir>/<kind>-<timestamp>.meta.json``.
 
@@ -115,12 +114,18 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
         "pre_trial_hash": meta.pre_trial_hash,
     }
 
+    # Plaintext-by-design (SECURITY.md §4 carve-out): backup sidecars are
+    # control-plane metadata only (timestamp, content_sha256 of the already-
+    # encrypted payload, size, tier, label, key_fingerprint).  Encrypting them
+    # would turn every wrong-key restore into a silent "backup not found"
+    # instead of a clear decrypt_invalid_token error.  The user-facts live in
+    # the paired `.bin.enc` artifact, which stays encrypted.  ``read_meta``
+    # still tolerates PMEM1-wrapped sidecars so any pre-existing ciphertext
+    # sidecar remains readable.
     sidecar_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return sidecar_path
 
 
-# WP1: route through decrypt layer when Security ON. Single chokepoint for
-# every consumer (enumerate_backups, /backup/list, retention engine).
 def read_meta(slot_dir: Path) -> ArtifactMeta:
     """Read and validate the ``.meta.json`` sidecar in *slot_dir*.
 
@@ -158,12 +163,25 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
     if not meta_file.exists():
         raise FileNotFoundError(f"No .meta.json sidecar found in {slot_dir}")
 
+    # Sidecars may be PMEM1-wrapped (Security ON) or plaintext (Security OFF).
+    # read_maybe_encrypted handles both; InvalidToken surfaces as a corrupt
+    # sidecar for the caller.
+    from cryptography.fernet import InvalidToken
+
     try:
-        raw = json.loads(meta_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        plaintext = read_maybe_encrypted(meta_file)
+        raw = json.loads(plaintext.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise MetaSchemaError(f"corrupt sidecar: {meta_file} — {exc}") from exc
-    except UnicodeDecodeError as exc:
-        raise MetaSchemaError(f"corrupt sidecar: {meta_file} — {exc}") from exc
+    except InvalidToken as exc:
+        raise MetaSchemaError(
+            f"corrupt sidecar: {meta_file} — ciphertext failed authentication "
+            "(key mismatch or tampering)"
+        ) from exc
+    except RuntimeError as exc:
+        raise MetaSchemaError(
+            f"corrupt sidecar: {meta_file} — encrypted sidecar requires a master key to be set"
+        ) from exc
 
     # --- schema_version gate (NIT 2) ---
     raw_version = raw.get("schema_version")

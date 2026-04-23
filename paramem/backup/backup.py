@@ -40,15 +40,17 @@ from pathlib import Path
 from paramem.backup.atomic import rename_pending_to_slot
 from paramem.backup.atomic import sweep_orphan_pending as _sweep_pending
 from paramem.backup.encryption import (
+    MASTER_KEY_ENV_VAR,
     SecurityBackupsConfig,
+    current_key_fingerprint,
     decrypt_bytes,
     encrypt_bytes,
+    master_key_loaded,
     resolve_policy,
     should_encrypt,
 )
 from paramem.backup.hashing import (
     content_sha256_bytes,
-    fingerprint_key_bytes,
 )
 from paramem.backup.meta import read_meta, verify_fingerprint, write_meta
 from paramem.backup.types import (
@@ -226,13 +228,12 @@ def write(
 
     # --- resolve encryption policy ---
     policy = resolve_policy(kind, security_config)
-    key_env = os.environ.get("PARAMEM_SNAPSHOT_KEY")
-    key_loaded = bool(key_env)
+    key_loaded = master_key_loaded()
 
     if policy is EncryptAtRest.ALWAYS and not key_loaded:
         raise FatalConfigError(
             f"Cannot write {kind.value} artifact: encrypt_at_rest=always "
-            "but PARAMEM_SNAPSHOT_KEY is not set"
+            f"but {MASTER_KEY_ENV_VAR} is not set"
         )
 
     do_encrypt = should_encrypt(policy, key_loaded)
@@ -246,10 +247,7 @@ def write(
     hash_hex = content_sha256_bytes(on_disk_bytes)
 
     # --- key fingerprint ---
-    if do_encrypt and key_env:
-        key_fp = fingerprint_key_bytes(key_env.encode())
-    else:
-        key_fp = None
+    key_fp = current_key_fingerprint() if do_encrypt else None
 
     # --- timestamp + filenames (with collision retry) ---
     encrypted_flag = do_encrypt
@@ -383,7 +381,9 @@ def read(slot_dir: Path) -> tuple[bytes, ArtifactMeta]:
     FileNotFoundError
         If the slot directory or sidecar file is missing.
     RuntimeError
-        If the artifact is encrypted but ``PARAMEM_SNAPSHOT_KEY`` is not set.
+        If the artifact is encrypted but no master key is set in the
+        environment (``PARAMEM_MASTER_KEY`` or the legacy alias
+        ``PARAMEM_SNAPSHOT_KEY``).
     """
     slot_dir = Path(slot_dir)
 

@@ -45,9 +45,6 @@ class PreFlightCheck:
     estimate_bytes: int
 
 
-# WP1: route the live_config_path and registry_path read_bytes() calls through
-# the decrypt layer when Security ON. The graph contribution via
-# loop.merger.save_bytes() is in-memory (already plaintext post-decrypt).
 def compute_pre_flight_check(
     *,
     server_config: "ServerConfig",
@@ -112,6 +109,7 @@ def compute_pre_flight_check(
        but if graph grows or poll rate increases, wrap this helper in a 5s TTL
        cache parallel to compute_disk_usage.
     """
+    from paramem.backup.encryption import read_maybe_encrypted
     from paramem.backup.retention import compute_disk_usage
 
     # Guard: return no-pressure result when the config is not a real ServerConfig.
@@ -140,12 +138,14 @@ def compute_pre_flight_check(
     # --- Step 1: Estimate footprint ---
     estimate_bytes = 0
 
-    # Config contribution.
+    # Config contribution.  Decrypted-length is the honest input — the future
+    # pre-migration backup re-encrypts plaintext, so ciphertext length on disk
+    # would be a double-count of Fernet overhead.
     try:
         config_path = Path(live_config_path)
         if config_path.exists():
-            estimate_bytes += len(config_path.read_bytes())
-    except OSError as exc:
+            estimate_bytes += len(read_maybe_encrypted(config_path))
+    except (OSError, Exception) as exc:  # noqa: BLE001
         logger.warning("compute_pre_flight_check: could not read live config for estimate: %s", exc)
 
     # Graph contribution (loop.merger.save_bytes()).
@@ -162,13 +162,13 @@ def compute_pre_flight_check(
                 "compute_pre_flight_check: could not get graph bytes for estimate: %s", exc
             )
 
-    # Registry contribution.
+    # Registry contribution.  See note above on decrypted-length choice.
     if registry_path is not None:
         try:
             reg_path = Path(registry_path)
             if reg_path.exists():
-                estimate_bytes += len(reg_path.read_bytes())
-        except OSError as exc:
+                estimate_bytes += len(read_maybe_encrypted(reg_path))
+        except (OSError, Exception) as exc:  # noqa: BLE001
             logger.warning(
                 "compute_pre_flight_check: could not read registry for estimate: %s", exc
             )

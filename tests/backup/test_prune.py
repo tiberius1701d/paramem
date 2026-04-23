@@ -47,7 +47,7 @@ def _make_slot(base_dir: Path, kind: ArtifactKind, timestamp: str, **meta_overri
 class TestPruneRespect:
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_prune_respects_keep_counts(self, tmp_path):
         """Prune with keep=2 retains the 2 newest, deletes the rest."""
@@ -241,7 +241,7 @@ class TestPruneImmunityDays:
 
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_prune_respects_immunity_days(self, tmp_path):
         """Immune slots are exempt from the tier count; keep budget applies to the tail.
@@ -356,7 +356,7 @@ class TestPruneMissingArtifact:
 
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_prune_flags_missing_artifact_as_invalid(self, tmp_path):
         """Slot with valid sidecar but missing artifact file lands in report.invalid.
@@ -408,7 +408,7 @@ class TestPruneMaxDiskGb:
 
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def _make_sized_slot(
         self, base_dir: Path, kind: ArtifactKind, timestamp: str, size_bytes: int

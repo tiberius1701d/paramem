@@ -910,10 +910,16 @@ async def lifespan(app: FastAPI):
     config = _state["config"]
 
     from paramem.backup.encryption import (
+        MASTER_KEY_ENV_VAR,
+    )
+    from paramem.backup.encryption import (
         SecurityBackupsConfig as _EncSecCfg,
     )
     from paramem.backup.encryption import (
         assert_encryption_feasible as _assert_enc,
+    )
+    from paramem.backup.encryption import (
+        master_key_loaded as _master_key_loaded,
     )
     from paramem.server.drift import drift_poll_loop, initial_drift_state
     from paramem.server.migration import initial_migration_state
@@ -931,19 +937,27 @@ async def lifespan(app: FastAPI):
     # Create the migration lock (must be inside a running event loop).
     _state["migration_lock"] = asyncio.Lock()
 
-    # Fix 10 (2026-04-23): assert encryption feasibility at startup so that
-    # security=always + no key produces a FatalConfigError here rather than a
-    # silent runtime failure when the first backup is attempted.
-    # ``config.security.backups`` is ``ServerBackupsConfig`` (retention/schedule
-    # fields).  ``assert_encryption_feasible`` expects ``SecurityBackupsConfig``
-    # (encrypt_at_rest/per_kind fields) from the backup subsystem.  Until Security
-    # WP1 merges the two schemas, we construct a default ``SecurityBackupsConfig``
-    # (AUTO policy → the assert is a no-op unless the key is missing AND always is
-    # set, which requires WP1 schema).  The call is kept so WP1 only needs to
-    # replace the default construction with config.security.backups.enc_config.
-    # WP1: assert_encryption_feasible — keep when Security WP1 lands.
-    _key_loaded = bool(os.environ.get("PARAMEM_SNAPSHOT_KEY"))
+    # Security startup gate (SECURITY.md §4):
+    # 1) Fail fast when ``encrypt_at_rest=always`` is set without a master key.
+    # 2) Emit the canonical SECURITY: ON/OFF line so operators see posture.
+    #
+    # NOTE: ``assert_mode_consistency`` is implemented in
+    # ``paramem.backup.encryption`` and refuses startup on the four key ×
+    # on-disk mode-mismatch cases, but is intentionally NOT invoked here
+    # yet.  Two preconditions must land first: (a) core infrastructure
+    # files (graph, registry, queue, speaker store, trainer resume) must
+    # actually be written via ``write_infra_bytes``, and (b) the
+    # ``paramem encrypt-infra`` / ``decrypt-infra`` migration commands
+    # must exist so an operator can reconcile a mismatch.  Invoking the
+    # check before both are in place would brick any deployment that has
+    # a master key set alongside plaintext infra files.
+    _key_loaded = _master_key_loaded()
     _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
+    if _key_loaded:
+        logger.info("SECURITY: ON (%s set)", MASTER_KEY_ENV_VAR)
+    else:
+        logger.warning("SECURITY: OFF (no key — all infrastructure metadata is plaintext on disk)")
+    _state["encryption"] = "on" if _key_loaded else "off"
 
     # --- Crash recovery: inspect disk state BEFORE drift init ---
     # This ensures _state["migration"] reflects any partially-completed
@@ -3989,14 +4003,19 @@ async def migration_rollback():
                 shutil.rmtree(pre_mortem_slot, ignore_errors=True)
             except OSError:
                 pass
-            if not os.environ.get("PARAMEM_SNAPSHOT_KEY"):
+            from paramem.backup.encryption import (
+                MASTER_KEY_ENV_VAR as _MKE,
+            )
+            from paramem.backup.encryption import (
+                master_key_loaded as _mkl,
+            )
+
+            if not _mkl():
                 raise HTTPException(
                     status_code=500,
                     detail={
                         "error": "decrypt_no_key",
-                        "message": (
-                            "A-config backup is encrypted but PARAMEM_SNAPSHOT_KEY is not set"
-                        ),
+                        "message": (f"A-config backup is encrypted but {_MKE} is not set"),
                     },
                 ) from exc
             raise HTTPException(
@@ -4699,13 +4718,20 @@ async def backup_restore(req: BackupRestoreRequest):
     try:
         plaintext_bytes, _meta = backup_read(target_record.slot_dir)
     except RuntimeError as exc:
-        # RuntimeError from decrypt_bytes when PARAMEM_SNAPSHOT_KEY is not set.
-        if not os.environ.get("PARAMEM_SNAPSHOT_KEY"):
+        # RuntimeError from decrypt_bytes when no master key is set.
+        from paramem.backup.encryption import (
+            MASTER_KEY_ENV_VAR as _MKE,
+        )
+        from paramem.backup.encryption import (
+            master_key_loaded as _mkl,
+        )
+
+        if not _mkl():
             raise HTTPException(
                 status_code=500,
                 detail={
                     "error": "decrypt_no_key",
-                    "message": "backup is encrypted but PARAMEM_SNAPSHOT_KEY is not set",
+                    "message": f"backup is encrypted but {_MKE} is not set",
                 },
             ) from exc
         raise HTTPException(

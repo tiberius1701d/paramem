@@ -117,14 +117,18 @@ class TestAssertEncryptionFeasible:
 class TestEncryptDecrypt:
     def setup_method(self):
         _clear_cipher_cache()
+        # Defensive: ensure a clean env for every test in this class.
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
+        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
 
     def teardown_method(self):
         _clear_cipher_cache()
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
         os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
 
     def _set_key(self):
         key = _make_valid_fernet_key()
-        os.environ["PARAMEM_SNAPSHOT_KEY"] = key.decode()
+        os.environ["PARAMEM_MASTER_KEY"] = key.decode()
         return key
 
     def test_roundtrip(self):
@@ -148,14 +152,14 @@ class TestEncryptDecrypt:
         (no encryption attempted).  encrypt_bytes would raise if called without
         a key — this test verifies should_encrypt(AUTO, False) → False."""
         # No key in environment
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
         result = should_encrypt(EncryptAtRest.AUTO, key_loaded=False)
         assert result is False  # passthrough — no encryption, no key required
 
     def test_encrypt_without_key_raises_runtime_error(self):
-        """Calling encrypt_bytes without PARAMEM_SNAPSHOT_KEY set raises RuntimeError."""
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
-        with pytest.raises(RuntimeError, match="PARAMEM_SNAPSHOT_KEY"):
+        """Calling encrypt_bytes without PARAMEM_MASTER_KEY set raises RuntimeError."""
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
+        with pytest.raises(RuntimeError, match="PARAMEM_MASTER_KEY"):
             encrypt_bytes(b"data")
 
     def test_clear_cipher_cache_forces_reload(self):
@@ -170,11 +174,11 @@ class TestEncryptDecrypt:
         key_b = _make_valid_fernet_key()
         assert key_a != key_b
 
-        os.environ["PARAMEM_SNAPSHOT_KEY"] = key_a.decode()
+        os.environ["PARAMEM_MASTER_KEY"] = key_a.decode()
         ciphertext = encrypt_bytes(b"secret")
 
         _clear_cipher_cache()
-        os.environ["PARAMEM_SNAPSHOT_KEY"] = key_b.decode()
+        os.environ["PARAMEM_MASTER_KEY"] = key_b.decode()
 
         with pytest.raises(InvalidToken):
             decrypt_bytes(ciphertext)
@@ -187,7 +191,7 @@ class TestEncryptDecrypt:
         from paramem.backup import encryption as enc_module
 
         key = _make_valid_fernet_key()
-        os.environ["PARAMEM_SNAPSHOT_KEY"] = key.decode()
+        os.environ["PARAMEM_MASTER_KEY"] = key.decode()
         _clear_cipher_cache()
 
         call_count = 0
@@ -222,7 +226,7 @@ class TestEncryptDecrypt:
         _clear_cipher_cache()  # idempotent
 
     def test_invalid_fernet_key_raises_fatal_config(self):
-        """PARAMEM_SNAPSHOT_KEY set to an invalid Fernet key raises FatalConfigError.
+        """PARAMEM_MASTER_KEY set to an invalid Fernet key raises FatalConfigError.
 
         Fix #3: verifies that:
         1. FatalConfigError is raised (not ValueError or anything else).
@@ -231,7 +235,7 @@ class TestEncryptDecrypt:
            credential leakage to logs).
         """
         bad_key = "not-a-valid-key"
-        os.environ["PARAMEM_SNAPSHOT_KEY"] = bad_key
+        os.environ["PARAMEM_MASTER_KEY"] = bad_key
         _clear_cipher_cache()
 
         with pytest.raises(FatalConfigError) as exc_info:

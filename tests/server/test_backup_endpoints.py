@@ -499,7 +499,7 @@ class TestRestoreEncryptedWrongKeyReturns500:
         """Encrypted slot + missing key → 500 decrypt_no_key; no safety slot.
 
         Fix 11 (2026-04-23): error code changed from ``restore_decrypt_failed``
-        to ``decrypt_no_key`` when PARAMEM_SNAPSHOT_KEY is absent, so operators
+        to ``decrypt_no_key`` when PARAMEM_MASTER_KEY is absent, so operators
         immediately know the key is missing rather than getting a generic decrypt error.
         """
         import os
@@ -516,7 +516,7 @@ class TestRestoreEncryptedWrongKeyReturns500:
         test_key = Fernet.generate_key().decode()
 
         _clear_cipher_cache()
-        with patch.dict(os.environ, {"PARAMEM_SNAPSHOT_KEY": test_key}):
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": test_key}):
             slot_dir = backup_write(
                 ArtifactKind.CONFIG,
                 b"model: mistral\n",
@@ -531,7 +531,7 @@ class TestRestoreEncryptedWrongKeyReturns500:
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
-        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_SNAPSHOT_KEY"}
+        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
         with patch.dict(os.environ, env_without_key, clear=True):
             resp = client.post("/backup/restore", json={"backup_id": backup_id})
 
@@ -656,7 +656,7 @@ class TestRestoreDecryptErrorCodes:
     """
 
     def test_restore_no_key_returns_decrypt_no_key_error(self, tmp_path: Path, monkeypatch) -> None:
-        """Encrypted slot + no PARAMEM_SNAPSHOT_KEY → 500 decrypt_no_key."""
+        """Encrypted slot + no PARAMEM_MASTER_KEY → 500 decrypt_no_key."""
         import os
 
         from cryptography.fernet import Fernet
@@ -669,7 +669,7 @@ class TestRestoreDecryptErrorCodes:
 
         test_key = Fernet.generate_key().decode()
         _clear_cipher_cache()
-        with patch.dict(os.environ, {"PARAMEM_SNAPSHOT_KEY": test_key}):
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": test_key}):
             slot_dir = backup_write(
                 ArtifactKind.CONFIG,
                 b"model: mistral\n",
@@ -683,7 +683,7 @@ class TestRestoreDecryptErrorCodes:
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
-        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_SNAPSHOT_KEY"}
+        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
         with patch.dict(os.environ, env_without_key, clear=True):
             resp = client.post("/backup/restore", json={"backup_id": backup_id})
 
@@ -693,14 +693,14 @@ class TestRestoreDecryptErrorCodes:
             f"Expected decrypt_no_key, got: {resp.json()['detail']['error']!r}. "
             "Fix 11 regression: no-key error code reverted."
         )
-        assert "PARAMEM_SNAPSHOT_KEY" in resp.json()["detail"]["message"], (
-            "decrypt_no_key message must mention PARAMEM_SNAPSHOT_KEY"
+        assert "PARAMEM_MASTER_KEY" in resp.json()["detail"]["message"], (
+            "decrypt_no_key message must mention PARAMEM_MASTER_KEY"
         )
 
     def test_restore_wrong_key_returns_decrypt_invalid_token(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """Encrypted slot + wrong PARAMEM_SNAPSHOT_KEY → 500 decrypt_invalid_token."""
+        """Encrypted slot + wrong PARAMEM_MASTER_KEY → 500 decrypt_invalid_token."""
         import os
 
         from cryptography.fernet import Fernet
@@ -714,7 +714,7 @@ class TestRestoreDecryptErrorCodes:
         # Write with key A.
         key_a = Fernet.generate_key().decode()
         _clear_cipher_cache()
-        with patch.dict(os.environ, {"PARAMEM_SNAPSHOT_KEY": key_a}):
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": key_a}):
             slot_dir = backup_write(
                 ArtifactKind.CONFIG,
                 b"model: mistral\n",
@@ -730,7 +730,7 @@ class TestRestoreDecryptErrorCodes:
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
-        with patch.dict(os.environ, {"PARAMEM_SNAPSHOT_KEY": key_b}):
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": key_b}):
             resp = client.post("/backup/restore", json={"backup_id": backup_id})
 
         assert resp.status_code == 500, resp.text

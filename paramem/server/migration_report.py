@@ -192,8 +192,6 @@ def _row_log_errors(gates: dict) -> dict[str, Any]:
     return row
 
 
-# WP1: route the on-disk graph read through the decrypt layer when Security ON.
-# In-memory graph branch is already plaintext post-decrypt (no change needed).
 def _summarise_graph(path: Path | None, graph: "Any | None" = None) -> str:
     """Compute a graph-shape summary string.
 
@@ -227,14 +225,18 @@ def _summarise_graph(path: Path | None, graph: "Any | None" = None) -> str:
         if path is None or not path.exists():
             return "—"
         try:
-            with open(path) as fh:
-                data = json.load(fh)
+            from paramem.backup.encryption import read_maybe_encrypted
+
+            raw = read_maybe_encrypted(path)
+            data = json.loads(raw.decode("utf-8"))
             g = nx.node_link_graph(data, edges="links")
         except (OSError, json.JSONDecodeError, ValueError, KeyError):
             # Try without explicit edges key (older networkx format)
             try:
-                with open(path) as fh:
-                    data = json.load(fh)
+                from paramem.backup.encryption import read_maybe_encrypted
+
+                raw = read_maybe_encrypted(path)
+                data = json.loads(raw.decode("utf-8"))
                 g = nx.node_link_graph(data)
             except Exception:  # noqa: BLE001
                 return "—"

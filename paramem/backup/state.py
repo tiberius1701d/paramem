@@ -132,9 +132,10 @@ class BackupStateRecord:
 # ---------------------------------------------------------------------------
 
 
-# WP1: DECISION needed — encrypt backup.json or carve out as plaintext-by-design
-# (parallel to state/trial.json per spec L607: control-plane paths/hashes only,
-# no secrets). Recommend plaintext + document carve-out in SECURITY.md §4.
+# Plaintext-by-design: control-plane state only (paths, timestamps, counts —
+# no secrets). Carve-out parallels state/trial.json per SECURITY.md §4; see
+# spec.md L607. Encrypting this file would risk bricking backup recovery on
+# key loss without protecting anything sensitive.
 def write_backup_state(state_dir: Path, record: BackupStateRecord) -> Path:
     """Atomically write ``state_dir/backup.json`` via a ``.pending`` rename.
 

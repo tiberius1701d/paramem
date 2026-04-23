@@ -666,7 +666,7 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
 
 
 class TestRollbackDecryptsEncryptedArtifact:
-    """Verify that rollback decrypts the A-config artifact when ``PARAMEM_SNAPSHOT_KEY``
+    """Verify that rollback decrypts the A-config artifact when ``PARAMEM_MASTER_KEY``
     is set and the backup writer used Fernet encryption.
 
     Before the B6 fix, rollback did ``os.rename(artifact, live_config_path)``
@@ -684,7 +684,7 @@ class TestRollbackDecryptsEncryptedArtifact:
 
         Steps
         ------
-        1. Generate a real Fernet key and set ``PARAMEM_SNAPSHOT_KEY``.
+        1. Generate a real Fernet key and set ``PARAMEM_MASTER_KEY``.
         2. Write the A-config into a backup slot using the real ``backup.write()``
            path (``encrypt_at_rest=AUTO`` + key present → Fernet ciphertext on disk).
         3. Assert the artifact file on disk is ciphertext (not plaintext) so we
@@ -696,7 +696,7 @@ class TestRollbackDecryptsEncryptedArtifact:
         """
         # --- Step 1: real Fernet key in env ---
         fernet_key = Fernet.generate_key().decode()
-        monkeypatch.setenv("PARAMEM_SNAPSHOT_KEY", fernet_key)
+        monkeypatch.setenv("PARAMEM_MASTER_KEY", fernet_key)
         # Clear the module-level cipher cache so our new key is picked up.
         _clear_cipher_cache()
         # Clear cache after test — monkeypatch restores the env var, but the
@@ -728,7 +728,7 @@ class TestRollbackDecryptsEncryptedArtifact:
         )
         on_disk_bytes = artifact_file.read_bytes()
         assert on_disk_bytes != a_bytes, (
-            "Artifact on disk should be ciphertext (not plaintext) when PARAMEM_SNAPSHOT_KEY is set"
+            "Artifact on disk should be ciphertext (not plaintext) when PARAMEM_MASTER_KEY is set"
         )
 
         config_artifact_filename = artifact_file.name
@@ -828,7 +828,7 @@ class TestRollbackDecryptsEncryptedArtifact:
         # The on-disk bytes must differ from the restored plaintext.
         assert on_disk_bytes != restored, (
             "on_disk_bytes == restored: encryption did not happen, so the test "
-            "does not exercise the decrypt path.  Check PARAMEM_SNAPSHOT_KEY setup."
+            "does not exercise the decrypt path.  Check PARAMEM_MASTER_KEY setup."
         )
 
 
