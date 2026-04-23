@@ -260,6 +260,49 @@ class _PauseForInferenceCallback(TrainerCallback):
             control.should_training_stop = True
 
 
+class _EncryptCheckpointCallback(TrainerCallback):
+    """Wrap each HF-written checkpoint file in the PMEM1 envelope after save.
+
+    Fires on ``on_save`` — HF has just finished writing a ``checkpoint-<step>/``
+    directory inside ``args.output_dir``. We walk every ``checkpoint-*`` subdir
+    and encrypt any plaintext files we find, leaving already-wrapped files
+    alone. No-op when Security is OFF.
+
+    Also guards at ``on_train_begin``: ``load_best_model_at_end=True`` bypasses
+    our decrypt-to-shm resume path (HF reads the on-disk checkpoint directly
+    at end-of-training) and would fail on PMEM1-wrapped files. We refuse to
+    start under that combination rather than silently corrupt the run.
+    """
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        from paramem.backup.encryption import master_key_loaded
+
+        if getattr(args, "load_best_model_at_end", False) and master_key_loaded():
+            raise RuntimeError(
+                "load_best_model_at_end=True is incompatible with Security ON: "
+                "HF reads checkpoint files directly at end-of-training, "
+                "bypassing the decrypt-to-shm path. Either disable "
+                "load_best_model_at_end or unset PARAMEM_MASTER_KEY."
+            )
+
+    def on_save(self, args, state, control, **kwargs):
+        from paramem.backup.checkpoint_shard import encrypt_checkpoint_dir
+        from paramem.backup.encryption import master_key_loaded
+
+        if not master_key_loaded():
+            return
+        output_dir = Path(args.output_dir)
+        for ckpt in output_dir.glob("checkpoint-*"):
+            if not ckpt.is_dir():
+                continue
+            try:
+                n = encrypt_checkpoint_dir(ckpt)
+                if n > 0:
+                    logger.debug("Encrypted %d checkpoint files in %s", n, ckpt)
+            except Exception:
+                logger.exception("Failed to encrypt checkpoint files in %s", ckpt)
+
+
 class BackgroundTrainer:
     """Manages background training that yields to inference.
 
@@ -982,7 +1025,7 @@ class BackgroundTrainer:
             args=training_args,
             train_dataset=dataset,
             data_collator=default_data_collator,
-            callbacks=[_PauseForInferenceCallback(self)],
+            callbacks=[_PauseForInferenceCallback(self), _EncryptCheckpointCallback()],
         )
 
         logger.info(
@@ -993,8 +1036,26 @@ class BackgroundTrainer:
             f" (resume from epoch {self._last_completed_epoch})" if resume_checkpoint else "",
         )
 
+        # Materialize an encrypted on-disk checkpoint to a /dev/shm tempdir
+        # so HF's resume loader sees plaintext files. No-op when the
+        # checkpoint is already plaintext (Security OFF or never-encrypted).
+        shm_resume_dir: Path | None = None
+        effective_resume = resume_checkpoint
+        if resume_checkpoint is not None:
+            from paramem.backup.checkpoint_shard import materialize_checkpoint_to_shm
+            from paramem.backup.encryption import master_key_loaded
+
+            if master_key_loaded():
+                shm_resume_dir = materialize_checkpoint_to_shm(Path(resume_checkpoint))
+                effective_resume = str(shm_resume_dir)
+                logger.info(
+                    "Materialized encrypted checkpoint %s → %s for HF Trainer load",
+                    resume_checkpoint,
+                    shm_resume_dir,
+                )
+
         try:
-            trainer.train(resume_from_checkpoint=resume_checkpoint)
+            trainer.train(resume_from_checkpoint=effective_resume)
         except Exception:
             # On training failure: leave resume state and checkpoint intact
             # so the next restart picks up from the last completed epoch.
@@ -1008,6 +1069,9 @@ class BackgroundTrainer:
             except Exception:
                 logger.exception("Failed to restore model state after training error")
             raise
+        finally:
+            if shm_resume_dir is not None:
+                shutil.rmtree(shm_resume_dir, ignore_errors=True)
 
         # Commit to production first, then clean up resume artefacts.
         self._commit_staging_to_production(job.adapter_name)
