@@ -10,7 +10,7 @@ Design notes:
 - Content-hash only (WSL2 mtime is unreliable across filesystem events).
 - Routing through ``paramem.backup.hashing.content_sha256_path`` so Slice 1's
   hash primitive stays the single source of truth (Resolved Decision 29).
-- Env-var references in the yaml (e.g. ``${PARAMEM_SNAPSHOT_KEY}``) are hashed
+- Env-var references in the yaml (e.g. ``${PARAMEM_MASTER_KEY}``) are hashed
   as the literal template string, not the resolved value.  Key rotation is
   detected separately via ``.meta.json`` fingerprints, not via config drift.
 - The poll loop never raises — on ``OSError`` (missing file, permission error,

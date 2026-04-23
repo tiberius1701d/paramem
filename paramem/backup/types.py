@@ -53,8 +53,7 @@ class EncryptAtRest(str, Enum):
     """Per-artifact or global encryption policy.
 
     ``AUTO``   — follow key presence: encrypt when ``PARAMEM_MASTER_KEY``
-                 (or the legacy ``PARAMEM_SNAPSHOT_KEY`` alias) is set;
-                 plaintext otherwise.
+                 is set; plaintext otherwise.
     ``ALWAYS`` — encrypt unconditionally; fatal config error at startup when
                  no key is loaded (spec §Security invariants).
     ``NEVER``  — always plaintext; no key required.

@@ -2,8 +2,7 @@
 
 Covers:
 
-1. ``master_key_env_value`` — reads ``PARAMEM_MASTER_KEY`` with a one-shot
-   deprecation warning when only the legacy ``PARAMEM_SNAPSHOT_KEY`` is set.
+1. ``master_key_env_value`` / ``master_key_loaded`` — env probing.
 2. ``current_key_fingerprint`` — stable 16-hex string derived from the key.
 3. ``write_infra_bytes`` / ``read_maybe_encrypted`` — PMEM1 envelope.
 4. ``assert_mode_consistency`` — SECURITY.md §4 four-case startup refuse.
@@ -17,9 +16,7 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet, InvalidToken
 
-import paramem.backup.encryption as enc_module
 from paramem.backup.encryption import (
-    LEGACY_KEY_ENV_VAR,
     MASTER_KEY_ENV_VAR,
     PMEM1_MAGIC,
     _clear_cipher_cache,
@@ -40,7 +37,6 @@ def _make_key() -> str:
 
 def _clean_env() -> None:
     os.environ.pop(MASTER_KEY_ENV_VAR, None)
-    os.environ.pop(LEGACY_KEY_ENV_VAR, None)
     _clear_cipher_cache()
 
 
@@ -53,50 +49,31 @@ def _env_isolation():
 
 
 # ---------------------------------------------------------------------------
-# master_key_env_value / master_key_loaded / deprecation warning
+# master_key_env_value / master_key_loaded
 # ---------------------------------------------------------------------------
 
 
 class TestMasterKeyEnv:
-    def test_new_name_wins(self):
-        key_new = _make_key()
-        os.environ[MASTER_KEY_ENV_VAR] = key_new
-        os.environ[LEGACY_KEY_ENV_VAR] = _make_key()  # different legacy value
-        got = master_key_env_value()
-        assert got == key_new
-        # No deprecation warning flag set when the new var is present.
-        assert enc_module._deprecation_warned is False
+    def test_returns_value_when_set(self):
+        key = _make_key()
+        os.environ[MASTER_KEY_ENV_VAR] = key
+        assert master_key_env_value() == key
 
-    def test_legacy_alias_accepted_with_one_shot_warning(self, capsys):
-        """Warning is emitted exactly once per cache lifetime on legacy usage."""
-        legacy = _make_key()
-        os.environ[LEGACY_KEY_ENV_VAR] = legacy
-        first = master_key_env_value()
-        second = master_key_env_value()
-        assert first == legacy
-        assert second == legacy
-        # Module-internal flag: set after the first legacy read.
-        assert enc_module._deprecation_warned is True
-        # Second call reuses the flag — no duplicate emission.  We also verify
-        # via stderr capture that the warning text appears exactly once.
-        err = capsys.readouterr().err
-        assert err.count("deprecated") == 1, f"expected exactly one deprecation line; got: {err!r}"
-
-    def test_deprecation_flag_resets_on_cache_clear(self):
-        """Key rotation path (_clear_cipher_cache) re-arms the deprecation warning."""
-        os.environ[LEGACY_KEY_ENV_VAR] = _make_key()
-        master_key_env_value()
-        assert enc_module._deprecation_warned is True
-        _clear_cipher_cache()
-        assert enc_module._deprecation_warned is False
-
-    def test_returns_none_when_neither_set(self):
+    def test_returns_none_when_unset(self):
         assert master_key_env_value() is None
         assert master_key_loaded() is False
 
     def test_master_key_loaded_true_when_set(self):
         os.environ[MASTER_KEY_ENV_VAR] = _make_key()
         assert master_key_loaded() is True
+
+    def test_empty_value_treated_as_unset(self):
+        """Empty-string env var is indistinguishable from unset — important so
+        an operator who wipes the value in .env doesn't leave a broken cipher
+        build attempt (Fernet would crash on empty bytes)."""
+        os.environ[MASTER_KEY_ENV_VAR] = ""
+        assert master_key_env_value() is None
+        assert master_key_loaded() is False
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +100,6 @@ class TestCurrentKeyFingerprint:
         os.environ[MASTER_KEY_ENV_VAR] = _make_key()
         fp_b = current_key_fingerprint()
         assert fp_a != fp_b
-
-    def test_legacy_alias_produces_same_fingerprint_as_new_name(self):
-        key = _make_key()
-        os.environ[MASTER_KEY_ENV_VAR] = key
-        fp_new = current_key_fingerprint()
-        _clean_env()
-        os.environ[LEGACY_KEY_ENV_VAR] = key
-        fp_legacy = current_key_fingerprint()
-        assert fp_new == fp_legacy
 
 
 # ---------------------------------------------------------------------------

@@ -117,14 +117,11 @@ class TestAssertEncryptionFeasible:
 class TestEncryptDecrypt:
     def setup_method(self):
         _clear_cipher_cache()
-        # Defensive: ensure a clean env for every test in this class.
         os.environ.pop("PARAMEM_MASTER_KEY", None)
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
 
     def teardown_method(self):
         _clear_cipher_cache()
         os.environ.pop("PARAMEM_MASTER_KEY", None)
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
 
     def _set_key(self):
         key = _make_valid_fernet_key()

@@ -381,9 +381,8 @@ def read(slot_dir: Path) -> tuple[bytes, ArtifactMeta]:
     FileNotFoundError
         If the slot directory or sidecar file is missing.
     RuntimeError
-        If the artifact is encrypted but no master key is set in the
-        environment (``PARAMEM_MASTER_KEY`` or the legacy alias
-        ``PARAMEM_SNAPSHOT_KEY``).
+        If the artifact is encrypted but ``PARAMEM_MASTER_KEY`` is not set
+        in the environment.
     """
     slot_dir = Path(slot_dir)
 

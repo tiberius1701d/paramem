@@ -29,11 +29,11 @@ def _make_fernet_key() -> bytes:
 class TestWriteReadRoundtripPlain:
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def teardown_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_write_read_roundtrip_plain(self, tmp_path):
         """No key env — bytes in → slot written → read() returns identical bytes + meta."""
@@ -60,7 +60,7 @@ class TestWriteReadRoundtripPlain:
     def test_write_read_roundtrip_encrypted(self, tmp_path):
         """Key set → sidecar encrypted=True → read() decrypts and verifies."""
         key = _make_fernet_key()
-        os.environ["PARAMEM_SNAPSHOT_KEY"] = key.decode()
+        os.environ["PARAMEM_MASTER_KEY"] = key.decode()
 
         payload = b"encrypted backup data"
         config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.ALWAYS)
@@ -82,7 +82,7 @@ class TestWriteReadRoundtripPlain:
 
     def test_write_refuses_encrypt_always_without_key(self, tmp_path):
         """encrypt_at_rest=always + missing key → raises before any file is written."""
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
         config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.ALWAYS)
 
         with pytest.raises(FatalConfigError):
@@ -170,11 +170,11 @@ class TestWriteFsyncsParentDirAfterRename:
 
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def teardown_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_write_fsyncs_parent_dir_after_rename(self, tmp_path, monkeypatch):
         """write() calls os.fsync on at least one directory fd after the rename.
@@ -228,11 +228,11 @@ class TestWriteReadRoundtrip:
 
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def teardown_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_read_refuses_on_missing_artifact(self, tmp_path):
         """Slot with valid sidecar but deleted artifact raises FingerprintMismatchError.
@@ -264,11 +264,11 @@ class TestWriteConcurrency:
 
     def setup_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def teardown_method(self):
         _clear_cipher_cache()
-        os.environ.pop("PARAMEM_SNAPSHOT_KEY", None)
+        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_write_retries_on_timestamp_collision(self, tmp_path, monkeypatch):
         """Two writes with the same initial timestamp succeed and produce distinct slots.

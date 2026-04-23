@@ -15,11 +15,9 @@ Provides a thin layer over ``cryptography.fernet.Fernet`` with:
 Key source
 ----------
 The Fernet key is read from ``os.environ["PARAMEM_MASTER_KEY"]`` on first
-use.  The legacy name ``PARAMEM_SNAPSHOT_KEY`` is accepted as an alias for
-one release and emits a single deprecation ``logger.warning`` when used.
-If neither variable is set, ``encrypt_bytes`` / ``decrypt_bytes`` raise
-``RuntimeError``.  Import is always safe — the key is never read at import
-time.
+use.  If the variable is not set, ``encrypt_bytes`` / ``decrypt_bytes``
+raise ``RuntimeError``.  Import is always safe — the key is never read at
+import time.
 
 Per-artifact encryption policy
 --------------------------------
@@ -59,17 +57,13 @@ from paramem.backup.types import ArtifactKind, EncryptAtRest, FatalConfigError
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Env var names (rename with one-release alias)
+# Env var name
 # ---------------------------------------------------------------------------
 
 MASTER_KEY_ENV_VAR: str = "PARAMEM_MASTER_KEY"
-LEGACY_KEY_ENV_VAR: str = "PARAMEM_SNAPSHOT_KEY"
 
 # Envelope magic for infrastructure files written via write_infra_bytes.
 PMEM1_MAGIC: bytes = b"PMEM1\n"
-
-# One-shot deprecation warning state.
-_deprecation_warned: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -103,27 +97,9 @@ _cipher: Fernet | None = None
 
 
 def master_key_env_value() -> str | None:
-    """Return the master key from env, preferring the new name.
-
-    Reads ``PARAMEM_MASTER_KEY`` first; falls back to ``PARAMEM_SNAPSHOT_KEY``.
-    Emits a one-shot deprecation warning when only the legacy name is set.
-    Returns ``None`` when neither is set.
-    """
-    global _deprecation_warned
+    """Return the master key from the environment, or ``None`` when unset."""
     value = os.environ.get(MASTER_KEY_ENV_VAR)
-    if value:
-        return value
-    legacy = os.environ.get(LEGACY_KEY_ENV_VAR)
-    if legacy:
-        if not _deprecation_warned:
-            logger.warning(
-                "%s is deprecated — rename to %s. Alias accepted for one release.",
-                LEGACY_KEY_ENV_VAR,
-                MASTER_KEY_ENV_VAR,
-            )
-            _deprecation_warned = True
-        return legacy
-    return None
+    return value if value else None
 
 
 def master_key_loaded() -> bool:
@@ -134,9 +110,8 @@ def master_key_loaded() -> bool:
 def _get_cipher() -> Fernet:
     """Return the module-level cached Fernet cipher, building it on first call.
 
-    Reads ``PARAMEM_MASTER_KEY`` from the environment on first call
-    (or the legacy ``PARAMEM_SNAPSHOT_KEY`` alias with a deprecation warning);
-    raises ``RuntimeError`` if neither is set.
+    Reads ``PARAMEM_MASTER_KEY`` from the environment on first call;
+    raises ``RuntimeError`` if it is not set.
 
     Returns
     -------
@@ -146,8 +121,7 @@ def _get_cipher() -> Fernet:
     Raises
     ------
     RuntimeError
-        If neither ``PARAMEM_MASTER_KEY`` nor the legacy
-        ``PARAMEM_SNAPSHOT_KEY`` is set in the environment.
+        If ``PARAMEM_MASTER_KEY`` is not set in the environment.
     FatalConfigError
         If the master key is set but is not a valid Fernet key (wrong length,
         invalid base64, etc.).  The raw key value is never included in the
@@ -171,20 +145,16 @@ def _get_cipher() -> Fernet:
 def _clear_cipher_cache() -> None:
     """Invalidate the module-level cipher cache.
 
-    **Supported operational call** — Slice 7's key-rotation handler calls this
+    **Supported operational call** — the key-rotation handler calls this
     after updating ``PARAMEM_MASTER_KEY`` in the environment so the next
-    ``encrypt_bytes`` / ``decrypt_bytes`` call builds a fresh cipher with the
-    new key.
-
-    Also resets the one-shot deprecation-warning flag so a subsequent legacy
-    usage re-emits its warning.
+    ``encrypt_bytes`` / ``decrypt_bytes`` call builds a fresh cipher with
+    the new key.
 
     This function never raises; it is safe to call even when the cache is
     already empty.
     """
-    global _cipher, _deprecation_warned
+    global _cipher
     _cipher = None
-    _deprecation_warned = False
 
 
 def current_key_fingerprint() -> str | None:
