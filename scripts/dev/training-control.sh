@@ -207,9 +207,12 @@ _release_server_gpu() {
 }
 
 _find_running_test() {
-    # Returns the test number of the currently running test, or empty
+    # Returns the test number of the currently running test, or empty.
+    # Pattern requires "python" in front of the script name so stray shells
+    # with the string in a heredoc/argv (e.g. inline analysis scripts, or
+    # zombie wrappers) don't register as a running test.
     for t in 8 9 10 10b 11 13 13b; do
-        if pgrep -f "${TEST_PGREP[$t]}" >/dev/null 2>&1; then
+        if pgrep -f "python[^ ]* .*${TEST_PGREP[$t]}" >/dev/null 2>&1; then
             echo "$t"
             return
         fi
