@@ -195,6 +195,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Slot directory name to restore (e.g. 20260421-04000012).",
     )
     p_br.add_argument(
+        "--force-rotate-key",
+        action="store_true",
+        dest="force_rotate_key",
+        help=(
+            "Bypass key-fingerprint check. Use only when restoring a backup "
+            "encrypted with a prior key (which must remain available to "
+            "read the backup's cleartext)."
+        ),
+    )
+    p_br.add_argument(
         "--json",
         action="store_true",
         help="Emit raw JSON response instead of formatted output.",

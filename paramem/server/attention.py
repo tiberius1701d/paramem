@@ -563,14 +563,11 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
 
 
 def _collect_key_rotation_items(state: dict) -> list[AttentionItem]:
-    """Emit key-rotation items when snapshot key fingerprint changed.
+    """Emit key-rotation items when master-key fingerprint changed.
 
-    Stub — Slice 7 implements this populator.
-
-    Note: signature is intentionally ``(state)``-only.  Slice 7 will extend
-    this to ``(state, config)`` when it implements the populator.  Do NOT
-    unify the signature with ``_collect_backup_items`` prematurely — this
-    stub is the Slice 7 extension point.
+    Stub — not yet populated.  Signature is intentionally ``(state)``-only;
+    when this populator is wired, extend to ``(state, config)`` rather than
+    unifying with ``_collect_backup_items`` prematurely.
     """
     return []
 
@@ -578,12 +575,9 @@ def _collect_key_rotation_items(state: dict) -> list[AttentionItem]:
 def _collect_encryption_items(state: dict) -> list[AttentionItem]:
     """Emit encryption-degraded items when encrypt_at_rest=always but no key.
 
-    Stub — Slice 7 implements this populator.
-
-    Note: signature is intentionally ``(state)``-only.  Slice 7 will extend
-    this to ``(state, config)`` when it implements the populator.  Do NOT
-    unify the signature with ``_collect_backup_items`` prematurely — this
-    stub is the Slice 7 extension point.
+    Stub — not yet populated.  Signature is intentionally ``(state)``-only;
+    when this populator is wired, extend to ``(state, config)`` rather than
+    unifying with ``_collect_backup_items`` prematurely.
     """
     return []
 
@@ -693,8 +687,8 @@ def collect_attention_items(
         The server's ``_state`` dict.  Reads only — never mutated.
     config:
         Loaded ``ServerConfig`` for populators that need config-side
-        toggles (e.g. encryption mode in Slice 7).  Slice 5a populators
-        do not use this; pass ``None`` when convenient.
+        toggles (e.g. encryption mode).  Older populators do not use
+        this; pass ``None`` when convenient.
 
     Returns
     -------
@@ -706,14 +700,14 @@ def collect_attention_items(
     items.extend(_collect_migration_items(state))
     items.extend(_collect_consolidation_items(state))
     items.extend(_collect_sweeper_items(state))
-    # NOTE: _collect_backup_items and _collect_pre_flight_items take (state, config) —
-    # updated in Slice 6b.  The Slice 7 stubs _collect_key_rotation_items and
-    # _collect_encryption_items intentionally keep the (state)-only signature so they
-    # remain valid extension points; do NOT unify them here before Slice 7 fills them.
+    # NOTE: _collect_backup_items and _collect_pre_flight_items take
+    # (state, config); _collect_key_rotation_items and _collect_encryption_items
+    # are stubs that keep a (state)-only signature until they are wired — do NOT
+    # unify the signatures here before they are populated.
     items.extend(_collect_backup_items(state, config))
     items.extend(_collect_config_drift_items(state))
-    items.extend(_collect_key_rotation_items(state))  # stub — Slice 7
-    items.extend(_collect_encryption_items(state))  # stub — Slice 7
+    items.extend(_collect_key_rotation_items(state))  # stub
+    items.extend(_collect_encryption_items(state))  # stub
     items.extend(_collect_adapter_fingerprint_items(state))
     items.extend(_collect_pre_flight_items(state, config))
     return items

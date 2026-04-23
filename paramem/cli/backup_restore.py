@@ -54,12 +54,10 @@ def run(args: argparse.Namespace) -> int:
     int
         0 on success (200).  1 on 4xx / HTTP error.  2 on unreachable.
     """
-    # SLICE7: after WP1 lands, add --force-rotate-key argparse flag in
-    # paramem/cli/main.py (backup-restore subparser) and plumb into the
-    # body: `if getattr(args, "force_rotate_key", False): body["force_rotate_key"] = True`.
-    # See .agent/migration-slice7-pickup.md.
     backup_id = args.backup_id
-    body = {"backup_id": backup_id}
+    body: dict = {"backup_id": backup_id}
+    if getattr(args, "force_rotate_key", False):
+        body["force_rotate_key"] = True
 
     url = f"{args.server_url}/backup/restore"
     try:

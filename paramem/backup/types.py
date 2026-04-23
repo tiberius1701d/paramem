@@ -45,8 +45,8 @@ class ArtifactKind(str, Enum):
     CONFIG = "config"
     GRAPH = "graph"
     REGISTRY = "registry"
-    RESUME = "resume"  # BG-trainer per-file artifacts (Slice 7)
-    SNAPSHOT = "snapshot"  # session snapshot, per-file (Slice 7)
+    RESUME = "resume"  # BG-trainer per-file artifacts
+    SNAPSHOT = "snapshot"  # session snapshot, per-file
 
 
 class EncryptAtRest(str, Enum):

@@ -4330,9 +4330,14 @@ class BackupRestoreRequest(BaseModel):
     ----------
     backup_id:
         Slot directory name to restore (e.g. ``"20260421-04000012"``).
+    force_rotate_key:
+        Bypass the ``meta.key_fingerprint`` vs current-key mismatch check.
+        Required when restoring a backup encrypted under a prior master key
+        (which the operator must still hold to allow decryption).
     """
 
     backup_id: str
+    force_rotate_key: bool = False
 
 
 class BackupRestoreResponse(BaseModel):
@@ -4600,10 +4605,6 @@ async def backup_create(req: BackupCreateRequest):
     )
 
 
-# SLICE7: after Security WP1 ships current_key_fingerprint() + the
-# PARAMEM_MASTER_KEY rename, add fingerprint-mismatch check between
-# the decrypt block (~L4525) and the safety-backup block (~L4548).
-# Spec migration plan L606. See .agent/migration-slice7-pickup.md.
 @app.post("/backup/restore", response_model=BackupRestoreResponse)
 async def backup_restore(req: BackupRestoreRequest):
     """Restore a **config** backup atop the live server.yaml.
@@ -4636,6 +4637,9 @@ async def backup_restore(req: BackupRestoreRequest):
         No slot with the given ``backup_id`` exists.
     400 ``restore_kind_not_supported``
         The slot is not kind=config.
+    400 ``fingerprint_mismatch``
+        ``meta.key_fingerprint`` does not match ``current_key_fingerprint()``
+        and ``force_rotate_key`` was not set.
     500 ``restore_decrypt_failed``
         Decryption failed (wrong key, corrupted backup).
     500 ``config_restore_failed``
@@ -4719,6 +4723,41 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         )
 
+    # --- Step 3b: Fingerprint enforcement (spec L606) ---
+    # Refuse when the backup's stored ``meta.key_fingerprint`` does not match
+    # the current master key's fingerprint, unless the caller opts in via
+    # ``force_rotate_key``. Placed BEFORE decrypt so a key rotation surfaces
+    # as the actionable 400 ``fingerprint_mismatch`` instead of the generic
+    # 500 ``decrypt_invalid_token``. Backups written while Security was OFF
+    # carry ``key_fingerprint is None`` and are always allowed through.
+    from paramem.backup.encryption import current_key_fingerprint
+
+    backup_fp = target_record.meta.key_fingerprint
+    current_fp = current_key_fingerprint()
+    if backup_fp is not None and backup_fp != current_fp:
+        if not req.force_rotate_key:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "fingerprint_mismatch",
+                    "message": (
+                        f"Backup was encrypted with a different key "
+                        f"(backup={backup_fp[:12]}..., "
+                        f"current={(current_fp[:12] + '...') if current_fp else 'none'}). "
+                        "Pass force_rotate_key=true to proceed; the prior key "
+                        "must remain set so the backup's ciphertext can be decoded."
+                    ),
+                    "backup_fingerprint": backup_fp,
+                    "current_fingerprint": current_fp,
+                },
+            )
+        logger.warning(
+            "backup_restore: fingerprint mismatch bypassed via force_rotate_key "
+            "(backup=%s..., current=%s)",
+            backup_fp[:12],
+            (current_fp[:12] + "...") if current_fp else "none",
+        )
+
     # --- Step 4: Decrypt backup (BEFORE safety backup — order matters) ---
     # Fix 11 (2026-04-23): distinguish three decrypt failure modes so operators
     # know immediately whether the key is absent, wrong, or the artifact is corrupt.
@@ -4757,8 +4796,8 @@ async def backup_restore(req: BackupRestoreRequest):
                 detail={
                     "error": "decrypt_invalid_token",
                     "message": (
-                        "backup decryption failed — wrong key or corrupted ciphertext "
-                        "(Slice 7 will add per-key fingerprint to distinguish these)"
+                        "backup decryption failed — ciphertext appears corrupt "
+                        "(fingerprint-based key-rotation refuse runs earlier at step 3b)"
                     ),
                 },
             ) from exc

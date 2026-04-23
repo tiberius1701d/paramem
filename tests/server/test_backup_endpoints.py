@@ -531,9 +531,15 @@ class TestRestoreEncryptedWrongKeyReturns500:
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
+        # Fingerprint check short-circuits mismatched keys to 400 before decrypt.
+        # ``force_rotate_key=true`` bypasses that so this test still exercises
+        # the decrypt-no-key surface it was built for.
         env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
         with patch.dict(os.environ, env_without_key, clear=True):
-            resp = client.post("/backup/restore", json={"backup_id": backup_id})
+            resp = client.post(
+                "/backup/restore",
+                json={"backup_id": backup_id, "force_rotate_key": True},
+            )
 
         assert resp.status_code == 500, resp.text
         # Fix 11 (2026-04-23): missing key now surfaces as decrypt_no_key.
@@ -552,6 +558,222 @@ class TestRestoreEncryptedWrongKeyReturns500:
             else []
         )
         assert safety_slots == [], f"Safety slot should not have been created: {safety_slots}"
+
+
+# ---------------------------------------------------------------------------
+# /backup/restore fingerprint enforcement
+# ---------------------------------------------------------------------------
+
+
+def _write_encrypted_config_slot(
+    backups_root: Path, key: str, content: bytes = b"model: mistral\n"
+) -> Path:
+    """Write a config backup under *key*, returning the slot dir."""
+    import os
+
+    from paramem.backup.encryption import _clear_cipher_cache  # noqa: PLC0415
+
+    _clear_cipher_cache()
+    with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": key}):
+        slot = backup_write(
+            ArtifactKind.CONFIG,
+            content,
+            meta_fields={"tier": "daily"},
+            base_dir=backups_root / "config",
+            security_config=EncSecurityConfig(),
+        )
+    _clear_cipher_cache()
+    return slot
+
+
+class TestRestoreFingerprintMismatchWithoutForceReturns400:
+    def test_restore_fingerprint_mismatch_without_force_returns_400(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Backup key ≠ current key, no force flag → 400 fingerprint_mismatch."""
+        import os
+
+        from cryptography.fernet import Fernet  # noqa: PLC0415
+
+        from paramem.backup.encryption import _clear_cipher_cache  # noqa: PLC0415
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        backup_key = Fernet.generate_key().decode()
+        current_key = Fernet.generate_key().decode()
+        slot_dir = _write_encrypted_config_slot(backups_root, backup_key)
+
+        _clear_cipher_cache()
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": current_key}):
+            resp = client.post("/backup/restore", json={"backup_id": slot_dir.name})
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "fingerprint_mismatch"
+        assert detail["backup_fingerprint"]
+        assert detail["current_fingerprint"]
+        assert detail["backup_fingerprint"] != detail["current_fingerprint"]
+        assert "force_rotate_key" in detail["message"]
+
+
+class TestRestoreFingerprintMismatchWithForceSucceeds:
+    def test_restore_fingerprint_mismatch_with_force_succeeds(
+        self, tmp_path: Path, monkeypatch, capfd
+    ) -> None:
+        """Backup fingerprint ≠ current, force_rotate_key=True → 200 + WARN log.
+
+        Forges ``meta.key_fingerprint`` so the check fires while decrypt still
+        succeeds under the live key. The WARN message is asserted via ``capfd``
+        because paramem's logging configuration writes directly to stderr and
+        bypasses caplog's propagation path.
+        """
+        import json  # noqa: PLC0415
+        import os
+
+        from cryptography.fernet import Fernet  # noqa: PLC0415
+
+        from paramem.backup.encryption import _clear_cipher_cache  # noqa: PLC0415
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        key = Fernet.generate_key().decode()
+        slot_dir = _write_encrypted_config_slot(backups_root, key)
+
+        # Sidecar filename is ``<kind>-<timestamp>.meta.json`` (backup/meta.py).
+        (meta_path,) = list(slot_dir.glob("*.meta.json"))
+        meta_raw = json.loads(meta_path.read_text())
+        meta_raw["key_fingerprint"] = "deadbeef" * 2  # 16 hex chars
+        meta_path.write_text(json.dumps(meta_raw))
+
+        _clear_cipher_cache()
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": key}):
+            resp = client.post(
+                "/backup/restore",
+                json={"backup_id": slot_dir.name, "force_rotate_key": True},
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "config" in body["restored"]
+        captured = capfd.readouterr()
+        assert "fingerprint mismatch bypassed" in captured.err
+
+
+class TestRestoreFingerprintMatchProceedsSilently:
+    def test_restore_fingerprint_match_proceeds_silently(
+        self, tmp_path: Path, monkeypatch, capfd
+    ) -> None:
+        """Current key fingerprint == backup's → 200 with no fingerprint-mismatch warn."""
+        import os
+
+        from cryptography.fernet import Fernet  # noqa: PLC0415
+
+        from paramem.backup.encryption import _clear_cipher_cache  # noqa: PLC0415
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        key = Fernet.generate_key().decode()
+        slot_dir = _write_encrypted_config_slot(backups_root, key)
+
+        _clear_cipher_cache()
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": key}):
+            resp = client.post("/backup/restore", json={"backup_id": slot_dir.name})
+
+        assert resp.status_code == 200, resp.text
+        captured = capfd.readouterr()
+        assert "fingerprint mismatch" not in captured.err.lower()
+
+
+class TestRestoreEncryptedBackupNoCurrentKeyReturns400:
+    def test_restore_encrypted_backup_no_current_key_returns_400(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Backup has key_fingerprint, no PARAMEM_MASTER_KEY set, no force → 400.
+
+        The mismatch-message formatter's ``else 'none'`` branch renders the
+        current-fingerprint segment as ``current=none`` when the deployment
+        has no key loaded. Without this test the branch is unexercised.
+        """
+        import os
+
+        from cryptography.fernet import Fernet  # noqa: PLC0415
+
+        from paramem.backup.encryption import _clear_cipher_cache  # noqa: PLC0415
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        key = Fernet.generate_key().decode()
+        slot_dir = _write_encrypted_config_slot(backups_root, key)
+
+        _clear_cipher_cache()
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
+        with patch.dict(os.environ, env_without_key, clear=True):
+            resp = client.post("/backup/restore", json={"backup_id": slot_dir.name})
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "fingerprint_mismatch"
+        assert detail["current_fingerprint"] is None
+        assert "current=none" in detail["message"]
+
+
+class TestRestorePlaintextBackupAllowedUnderSecurityOn:
+    def test_restore_plaintext_backup_allowed_under_security_on(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Backup written while Security OFF (key_fingerprint is None) +
+        current key set → 200, no mismatch to enforce."""
+        import os
+
+        from cryptography.fernet import Fernet  # noqa: PLC0415
+
+        from paramem.backup.encryption import _clear_cipher_cache  # noqa: PLC0415
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        # Write backup with no master key (Security OFF → plaintext, no fingerprint).
+        _clear_cipher_cache()
+        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
+        with patch.dict(os.environ, env_without_key, clear=True):
+            slot_dir = backup_write(
+                ArtifactKind.CONFIG,
+                b"model: mistral\n",
+                meta_fields={"tier": "daily"},
+                base_dir=backups_root / "config",
+                security_config=EncSecurityConfig(),
+            )
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        _clear_cipher_cache()
+        current_key = Fernet.generate_key().decode()
+        with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": current_key}):
+            resp = client.post("/backup/restore", json={"backup_id": slot_dir.name})
+
+        assert resp.status_code == 200, resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -683,9 +905,14 @@ class TestRestoreDecryptErrorCodes:
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
+        # Fingerprint check short-circuits mismatched keys; pass
+        # force_rotate_key=true so this still exercises decrypt_no_key.
         env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
         with patch.dict(os.environ, env_without_key, clear=True):
-            resp = client.post("/backup/restore", json={"backup_id": backup_id})
+            resp = client.post(
+                "/backup/restore",
+                json={"backup_id": backup_id, "force_rotate_key": True},
+            )
 
         assert resp.status_code == 500, resp.text
         # Fix 11: no-key case is now decrypt_no_key, not restore_decrypt_failed
@@ -730,8 +957,14 @@ class TestRestoreDecryptErrorCodes:
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
+        # Fingerprint check short-circuits mismatched keys; pass
+        # force_rotate_key=true so decryption still gets attempted and
+        # surfaces decrypt_invalid_token.
         with patch.dict(os.environ, {"PARAMEM_MASTER_KEY": key_b}):
-            resp = client.post("/backup/restore", json={"backup_id": backup_id})
+            resp = client.post(
+                "/backup/restore",
+                json={"backup_id": backup_id, "force_rotate_key": True},
+            )
 
         assert resp.status_code == 500, resp.text
         assert resp.json()["detail"]["error"] == "decrypt_invalid_token", (

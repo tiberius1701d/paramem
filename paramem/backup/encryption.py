@@ -9,8 +9,8 @@ Provides a thin layer over ``cryptography.fernet.Fernet`` with:
 - Envelope helpers (``write_infra_bytes`` / ``read_maybe_encrypted``) for any
   on-disk infrastructure metadata — graph, registry, queue, sidecars, etc.
 - ``_clear_cipher_cache()`` — a **supported operational call** for key
-  rotation (Slice 7).  It is *not* test-only; operator code may call it
-  after rotating ``PARAMEM_MASTER_KEY`` in the environment.
+  rotation.  It is *not* test-only; operator code may call it after
+  rotating ``PARAMEM_MASTER_KEY`` in the environment.
 
 Key source
 ----------
@@ -21,17 +21,17 @@ import time.
 
 Per-artifact encryption policy
 --------------------------------
-``SecurityBackupsConfig`` is defined locally here; Slice 2 may promote it to
-``paramem.server.config.SecurityConfig``.  Callers pass a config object with:
+``SecurityBackupsConfig`` is defined locally here.  Callers pass a config
+object with:
 
 - ``encrypt_at_rest``                  — global fallback policy (``EncryptAtRest``).
 - ``per_kind``                         — optional dict mapping ``ArtifactKind``
                                          values to per-kind ``EncryptAtRest``
                                          policies; falls back to global when absent.
 
-NIT 3 (Slice 1 v3 plan): ``encrypt_bytes`` / ``decrypt_bytes`` accept single-file
-inputs only.  BG-trainer resume directory (Slice 7) iterates per-file; this
-module is unaware of directory structure.
+``encrypt_bytes`` / ``decrypt_bytes`` accept single-file inputs only.  Any
+directory-shaped artifact (e.g. the BG-trainer resume directory) iterates
+per-file; this module is unaware of directory structure.
 
 Envelope format (PMEM1)
 -----------------------
@@ -166,8 +166,9 @@ def current_key_fingerprint() -> str | None:
 
     Used by:
     - ``backup.write`` to populate ``ArtifactMeta.key_fingerprint``.
-    - Slice 7's ``/backup/restore`` fingerprint-mismatch check.
-    - Slice 7's attention populator for key-rotation detection.
+    - ``/backup/restore`` to refuse on fingerprint mismatch unless
+      ``force_rotate_key`` is set.
+    - The key-rotation attention populator (when wired).
 
     Returns
     -------
@@ -280,9 +281,9 @@ def assert_encryption_feasible(config: SecurityBackupsConfig, key_loaded: bool) 
 def encrypt_bytes(plaintext: bytes) -> bytes:
     """Encrypt *plaintext* using the cached Fernet cipher.
 
-    Operates on single-file inputs only; directory-level encryption (BG
-    trainer resume, Slice 7) iterates per-file and calls this function once
-    per file.
+    Operates on single-file inputs only; directory-level encryption (e.g.
+    the BG-trainer resume directory) iterates per-file and calls this
+    function once per file.
 
     Parameters
     ----------
