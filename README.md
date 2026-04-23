@@ -2,9 +2,10 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19502523.svg)](https://doi.org/10.5281/zenodo.19502523)
 
-**Indexed key retrieval for continual learning in personal LLM agents.**
-
+Indexed key retrieval for continual learning in personal LLM agents.
 Knowledge lives in LoRA adapter weights, not in files.
+
+**550 facts at 100% recall on a single 8GB consumer GPU. Deployed.**
 
 ## Motivation
 
