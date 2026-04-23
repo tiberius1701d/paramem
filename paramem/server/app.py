@@ -924,6 +924,9 @@ async def lifespan(app: FastAPI):
         assert_encryption_feasible as _assert_enc,
     )
     from paramem.backup.encryption import (
+        assert_mode_consistency as _assert_mode,
+    )
+    from paramem.backup.encryption import (
         master_key_loaded as _master_key_loaded,
     )
     from paramem.server.drift import drift_poll_loop, initial_drift_state
@@ -944,20 +947,15 @@ async def lifespan(app: FastAPI):
 
     # Security startup gate (SECURITY.md §4):
     # 1) Fail fast when ``encrypt_at_rest=always`` is set without a master key.
-    # 2) Emit the canonical SECURITY: ON/OFF line so operators see posture.
-    #
-    # NOTE: ``assert_mode_consistency`` is implemented in
-    # ``paramem.backup.encryption`` and refuses startup on the four key ×
-    # on-disk mode-mismatch cases, but is intentionally NOT invoked here
-    # yet.  Two preconditions must land first: (a) core infrastructure
-    # files (graph, registry, queue, speaker store, trainer resume) must
-    # actually be written via ``write_infra_bytes``, and (b) the
-    # ``paramem encrypt-infra`` / ``decrypt-infra`` migration commands
-    # must exist so an operator can reconcile a mismatch.  Invoking the
-    # check before both are in place would brick any deployment that has
-    # a master key set alongside plaintext infra files.
+    # 2) Refuse startup on any of the four key × on-disk mode-mismatch
+    #    cases (set+plaintext, unset+ciphertext, mixed).  Infra files
+    #    are written through ``write_infra_bytes`` and the operator can
+    #    reconcile a mismatch with ``paramem encrypt-infra`` /
+    #    ``paramem decrypt-infra --i-accept-plaintext``.
+    # 3) Emit the canonical SECURITY: ON/OFF line so operators see posture.
     _key_loaded = _master_key_loaded()
     _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
+    _assert_mode(config.paths.data, key_loaded=_key_loaded)
     if _key_loaded:
         logger.info("SECURITY: ON (%s set)", MASTER_KEY_ENV_VAR)
     else:
@@ -1980,8 +1978,9 @@ async def status():
 
     keys_count = 0
     if config.registry_path.exists():
-        with open(config.registry_path) as f:
-            registry = json.load(f)
+        from paramem.backup.encryption import read_maybe_encrypted as _rme
+
+        registry = json.loads(_rme(config.registry_path).decode("utf-8"))
         keys_count = len(registry)
 
     # Session buffer summary (pending counts, orphan attribution, age)

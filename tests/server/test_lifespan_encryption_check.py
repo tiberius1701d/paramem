@@ -153,22 +153,14 @@ class TestLifespanCallsAssertEncryptionFeasible:
 
 
 class TestLifespanSecurityPosture:
-    """Verify lifespan ships the SECURITY.md §4 posture plumbing correctly.
+    """Verify lifespan wires the SECURITY.md §4 posture gate correctly.
 
-    ``assert_mode_consistency`` is available as a tested primitive in
-    ``paramem.backup.encryption`` but is deliberately NOT yet invoked from
-    lifespan.  Two preconditions must land first: (a) core infrastructure
-    files (graph, registry, queue, speaker store, trainer resume) must
-    actually be written through ``write_infra_bytes`` so the on-disk state
-    matches the intended mode, and (b) a migration command
-    (``paramem encrypt-infra`` / ``decrypt-infra``) must exist so an
-    operator can reconcile a mismatch.  This test locks the contract so the
-    wiring is only activated when both preconditions are met — otherwise
-    a deployment with a key set alongside plaintext infra would be
-    un-restartable with no migration path.
-
-    The ``SECURITY: ON/OFF`` log line and ``_state["encryption"]`` posture
-    field ARE wired — they are pure informational output and safe to emit.
+    Both ``assert_encryption_feasible`` and ``assert_mode_consistency`` are
+    invoked at startup.  The former refuses the ``encrypt_at_rest=always +
+    no key`` misconfiguration; the latter refuses the four key × on-disk
+    mismatch cases (set+plaintext, unset+ciphertext, mixed) and points the
+    operator at the ``paramem encrypt-infra`` / ``paramem decrypt-infra
+    --i-accept-plaintext`` migration commands.
     """
 
     def test_primitive_is_importable(self):
@@ -177,20 +169,16 @@ class TestLifespanSecurityPosture:
 
         assert callable(assert_mode_consistency)
 
-    def test_lifespan_does_not_invoke_mode_consistency_yet(self):
-        """The mode-consistency check must not be wired into lifespan until
-        the on-disk infrastructure and the migration command are both in
-        place.  Remove this assertion when both land."""
+    def test_lifespan_invokes_mode_consistency(self):
+        """assert_mode_consistency must be called at lifespan entry."""
         import inspect
 
         from paramem.server import app as app_module
 
         source = inspect.getsource(app_module.lifespan)
-        # The docstring/comment may mention the primitive — acceptable.
-        # What must NOT be present is an active call via the lifespan alias.
-        assert "_assert_mode(" not in source, (
-            "assert_mode_consistency must not be invoked from lifespan until "
-            "core-artifact encryption and the migration command both land"
+        assert "_assert_mode(" in source, (
+            "lifespan must invoke assert_mode_consistency to enforce the "
+            "SECURITY.md §4 four-case refuse"
         )
 
     def test_lifespan_emits_security_posture_line(self):

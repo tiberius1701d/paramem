@@ -807,8 +807,9 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        with open(keyed_pairs_path) as f:
-            keyed_pairs = json.load(f)
+        from paramem.backup.encryption import read_maybe_encrypted as _rme
+
+        keyed_pairs = json.loads(_rme(keyed_pairs_path).decode("utf-8"))
         if not keyed_pairs:
             return GateResult(
                 gate=3,
@@ -940,7 +941,9 @@ def _gate_4_recall_check(
             metrics=None,
         )
 
-    registry_content = live_registry_path.read_bytes()
+    from paramem.backup.encryption import read_maybe_encrypted as _rme
+
+    registry_content = _rme(live_registry_path)
     try:
         registry_parsed = json.loads(registry_content)
     except Exception as exc:  # noqa: BLE001

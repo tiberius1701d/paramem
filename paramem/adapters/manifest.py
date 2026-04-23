@@ -584,7 +584,12 @@ def build_manifest_for(
 
     if keyed_pairs_path is not None and keyed_pairs_path.exists():
         try:
-            raw = keyed_pairs_path.read_bytes()
+            # Hash the PLAINTEXT content — envelope-wrapped keyed_pairs would
+            # produce a different hash on every re-encrypt (fresh Fernet IV).
+            # See registry_sha256 above for the same reasoning.
+            from paramem.backup.encryption import read_maybe_encrypted
+
+            raw = read_maybe_encrypted(keyed_pairs_path)
             keyed_pairs_sha256 = hashlib.sha256(raw).hexdigest()
             if key_count is None:
                 try:

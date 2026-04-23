@@ -670,8 +670,9 @@ def _load_simhash_registry(registry_path) -> dict:
     """Load SimHash values from registry for probe verification."""
     registry = {}
     if registry_path.exists():
-        with open(registry_path) as f:
-            raw = json.load(f)
+        from paramem.backup.encryption import read_maybe_encrypted
+
+        raw = json.loads(read_maybe_encrypted(registry_path).decode("utf-8"))
         for key, meta in raw.items():
             if isinstance(meta, dict):
                 registry[key] = meta.get("simhash", 0)

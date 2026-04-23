@@ -78,20 +78,18 @@ def create_consolidation_loop(
     # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.
     # Required by simulate mode so cold-start recall reads the full set;
     # harmless for train mode (train reconstructs from weights and overwrites).
+    # Transparently decrypts PMEM1-wrapped content when a master key is set.
     ep_kp_path = config.adapter_dir / "keyed_pairs.json"
     if ep_kp_path.exists():
-        with open(ep_kp_path) as f:
-            loop.seed_episodic_qa(json.load(f))
+        loop.seed_episodic_qa(json.loads(read_maybe_encrypted(ep_kp_path).decode("utf-8")))
 
     sem_kp_path = config.adapter_dir / "semantic" / "keyed_pairs.json"
     if sem_kp_path.exists():
-        with open(sem_kp_path) as f:
-            loop.seed_semantic_qa(json.load(f))
+        loop.seed_semantic_qa(json.loads(read_maybe_encrypted(sem_kp_path).decode("utf-8")))
 
     proc_kp_path = config.adapter_dir / "procedural" / "keyed_pairs.json"
     if proc_kp_path.exists():
-        with open(proc_kp_path) as f:
-            loop.seed_procedural_qa(json.load(f))
+        loop.seed_procedural_qa(json.loads(read_maybe_encrypted(proc_kp_path).decode("utf-8")))
 
     return loop
 

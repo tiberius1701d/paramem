@@ -698,7 +698,7 @@ def test_no_gpu_raises_clear_error():
 # ---------------------------------------------------------------------------
 
 
-def test_lifespan_runs_validator_before_load_base_model():
+def test_lifespan_runs_validator_before_load_base_model(tmp_path):
     """Integration guard for the startup lifecycle.
 
     Exercises the FastAPI ``lifespan`` context with ``load_base_model``,
@@ -714,6 +714,11 @@ def test_lifespan_runs_validator_before_load_base_model():
     ``enforce_live_budget`` after ``load_base_model`` would count ParaMem's
     own footprint as "external", producing a self-consistent but wrong
     budget.
+
+    Uses a fresh tmp_path for ``paths.data`` so the security startup gate
+    (``assert_mode_consistency``) does not trip on the real data directory
+    — whatever mode the operator's deployment is in, this unit test must
+    not depend on it.
     """
     import asyncio
 
@@ -752,6 +757,9 @@ def test_lifespan_runs_validator_before_load_base_model():
 
     config = ServerConfig(model_name="mistral")
     config.cloud_only = False
+    # Point the data directory at a fresh tmp so the security startup gate
+    # sees an empty (therefore consistent) store.
+    config.paths.data = tmp_path / "data"
 
     saved_state = {
         key: server_app._state.get(key) for key in ("config", "cloud_only_startup", "defer_model")

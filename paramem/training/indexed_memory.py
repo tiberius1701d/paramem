@@ -638,9 +638,10 @@ def probe_keys_from_disk(
             continue
 
         try:
-            with open(kp_path) as f:
-                pairs = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
+            from paramem.backup.encryption import read_maybe_encrypted
+
+            pairs = json.loads(read_maybe_encrypted(kp_path).decode("utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             logger.warning("Failed to read %s: %s — %d key(s) unresolved", kp_path, exc, len(keys))
             for key in keys:
                 results[key] = None

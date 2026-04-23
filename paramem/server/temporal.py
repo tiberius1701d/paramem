@@ -155,8 +155,9 @@ def filter_registry_by_date(
     if not registry_path.exists():
         return []
 
-    with open(registry_path) as f:
-        registry = json.load(f)
+    from paramem.backup.encryption import read_maybe_encrypted
+
+    registry = json.loads(read_maybe_encrypted(registry_path).decode("utf-8"))
 
     matching_keys = []
     for key, meta in registry.items():

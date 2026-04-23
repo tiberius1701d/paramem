@@ -318,14 +318,15 @@ class KeyRegistry:
         and the health map loads empty (all adapters treated as healthy
         by :meth:`is_adapter_healthy`).
         """
+        from paramem.backup.encryption import read_maybe_encrypted
+
         path = Path(path)
         registry = cls()
         if not path.exists():
             logger.info("No registry at %s, starting fresh", path)
             return registry
 
-        with open(path) as f:
-            data = json.load(f)
+        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
 
         registry._active_keys = data.get("active_keys", [])
         for key, scores in data.get("fidelity_history", {}).items():
