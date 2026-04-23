@@ -301,3 +301,68 @@ class TestBackupItemsConfigNoneReturnsEmpty:
         """config=None (unit-test shim) → []."""
         items = _collect_backup_items({}, None)
         assert items == []
+
+
+# ---------------------------------------------------------------------------
+# Test 21 — B4 regression: cap=0 + used>0 → backup_disk_pressure at failed level
+# ---------------------------------------------------------------------------
+
+
+class TestBackupItemsDiskPressureCapZeroUsedNonzero:
+    """B4 fix (2026-04-22 E2E baseline): when max_total_disk_gb=0 and disk_used>0,
+    the old guard ``usage.cap_bytes > 0`` skipped the DISK PRESSURE alert entirely.
+
+    With cap=0, any non-zero disk usage means the store is infinitely over cap.
+    The fix emits a ``backup_disk_pressure`` item at level ``"failed"``.
+    """
+
+    def test_backup_disk_pressure_emits_at_failed_level_when_cap_is_zero_and_used_nonzero(
+        self, tmp_path: Path
+    ) -> None:
+        """disk_cap_bytes=0, disk_used_bytes=57141 → backup_disk_pressure at failed level.
+
+        This is the exact condition observed in scenario 2 of the 2026-04-22 E2E
+        baseline test: max_total_disk_gb=0 configured, 2 backup slots on disk
+        totalling 57141 bytes.
+        """
+        config = _make_config(tmp_path, max_total_disk_gb=0.0)
+
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        # Seed a backup slot with ~57141 bytes so disk_used > 0.
+        slot = backups_root / "config" / "20260422-010000"
+        slot.mkdir(parents=True)
+        (slot / "config.bin").write_bytes(b"x" * 57141)
+
+        items = _collect_backup_items({}, config)
+
+        pressure_items = [i for i in items if i.kind == "backup_disk_pressure"]
+        assert len(pressure_items) == 1, (
+            f"Expected 1 backup_disk_pressure item, got {len(pressure_items)}.  "
+            "B4 bug: cap=0 + used>0 silently skipped the disk pressure alert because "
+            "the old guard 'usage.cap_bytes > 0' was false."
+        )
+        assert pressure_items[0].level == "failed", (
+            f"Expected level='failed' for cap=0+used>0, got {pressure_items[0].level!r}.  "
+            "Any non-zero usage with cap=0 means the store is over capacity."
+        )
+        assert "DISK" in pressure_items[0].summary
+
+    def test_backup_disk_pressure_not_emitted_when_cap_is_zero_and_used_is_zero(
+        self, tmp_path: Path
+    ) -> None:
+        """disk_cap_bytes=0, disk_used_bytes=0 → no disk pressure alert.
+
+        cap=0 with zero usage is the empty-store case; it should not fire.
+        """
+        config = _make_config(tmp_path, max_total_disk_gb=0.0)
+        # No backup slots on disk → disk_used=0.
+        (config.paths.data / "backups").mkdir(parents=True, exist_ok=True)
+
+        items = _collect_backup_items({}, config)
+
+        pressure_items = [i for i in items if i.kind == "backup_disk_pressure"]
+        assert pressure_items == [], (
+            "cap=0 with zero disk usage must not emit a disk pressure alert."
+        )

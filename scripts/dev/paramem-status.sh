@@ -243,15 +243,18 @@ print("MIGRATE\t{}\t{}\t{}".format(
     _config_rev,
     _applied_date,
 ))
-# Slice 6a — Backup footer: BACKUP<TAB>schedule<TAB>last_success_at<TAB>
-#   last_failure_at<TAB>last_failure_reason<TAB>next_scheduled_at<TAB>
-#   stale<TAB>disk_used_bytes<TAB>disk_cap_bytes
+# Slice 6a — Backup footer: BACKUP|schedule|last_success_at|
+#   last_failure_at|last_failure_reason|next_scheduled_at|
+#   stale|disk_used_bytes|disk_cap_bytes
+# NOTE: Uses | as separator (not \t) so IFS='|' read preserves empty fields.
+# IFS=$'\t' with consecutive empty tabs collapses them (bash whitespace rule),
+# causing wrong variable assignment when last_failure_at is None.
 _b = d.get("backup") or {}
-print("BACKUP\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}".format(
+print("BACKUP|{}|{}|{}|{}|{}|{}|{}|{}".format(
     _b.get("schedule") or "",
     _b.get("last_success_at") or "",
     _b.get("last_failure_at") or "",
-    (_b.get("last_failure_reason") or "").replace("\t", " ").replace("\n", " "),
+    (_b.get("last_failure_reason") or "").replace("|", "-").replace("\t", " ").replace("\n", " "),
     _b.get("next_scheduled_at") or "",
     "true" if _b.get("stale") else "false",
     int(_b.get("disk_used_bytes") or 0),
@@ -649,9 +652,11 @@ fi
 
 # Slice 6a — Backup footer (spec §L457). Always rendered when the line is
 # present; edge cases pick distinct messages.
-backup_line=$(echo "$parsed" | awk '/^BACKUP\t/' | head -1)
+# The BACKUP line uses | as separator (not \t) to avoid IFS whitespace
+# collapsing consecutive empty fields (bash collapses consecutive tabs).
+backup_line=$(echo "$parsed" | awk '/^BACKUP\|/' | head -1)
 if [[ -n "$backup_line" ]]; then
-    IFS=$'\t' read -r _bm \
+    IFS='|' read -r _bm \
         bk_schedule bk_last_ok bk_last_fail bk_fail_reason \
         bk_next bk_stale bk_used_bytes bk_cap_bytes \
         <<< "$backup_line"
@@ -678,8 +683,20 @@ if [[ -n "$backup_line" ]]; then
             echo -e "  Backup:   ${DIM}scheduled backups disabled${RESET}"
             ;;
         *)
+            # B5 fix (2026-04-22 E2E baseline): cap=0 (max_total_disk_gb: 0) means
+            # no disk cap is configured.  Render a plain success/never-run line so
+            # the failure-branch guard can never mis-fire with cap-related fields.
+            # Without this guard, the (cap=0) state could produce garbled output
+            # (observed as "FAILED false — 57141") when field alignment breaks.
+            if (( bk_cap_bytes == 0 )) && [[ -z "$bk_last_fail" ]]; then
+                # cap=0 + no failure → show last-ok or never-run without a disk tag.
+                if [[ -z "$bk_last_ok" ]]; then
+                    echo -e "  Backup:   ${DIM}never run${RESET}"
+                else
+                    echo -e "  Backup:   last ok ${CYAN}${bk_last_ok_disp}${RESET} (${bk_schedule}, no cap)"
+                fi
             # Failure-newer-than-success → red FAILED line.
-            if [[ -n "$bk_last_fail" && ( -z "$bk_last_ok" || "$bk_last_fail" > "$bk_last_ok" ) ]]; then
+            elif [[ -n "$bk_last_fail" && ( -z "$bk_last_ok" || "$bk_last_fail" > "$bk_last_ok" ) ]]; then
                 echo -e "  Backup:   ${RED}FAILED ${bk_last_fail_disp} — ${bk_fail_reason}${RESET}"
             elif [[ -z "$bk_last_ok" ]]; then
                 # Never run.
@@ -689,8 +706,14 @@ if [[ -n "$backup_line" ]]; then
                     echo -e "  Backup:   ${DIM}never run${RESET}"
                 fi
             elif [[ "$bk_stale" == "true" ]]; then
-                # Yellow STALE.
-                echo -e "  Backup:   ${YELLOW}STALE — last ok ${bk_last_ok_disp}, next ${bk_next_disp}${RESET}"
+                # Yellow STALE — Fix 8 (2026-04-23): append "(no cap)" hint when
+                # bk_cap_bytes == 0 so the cap-misconfig signal is visible even on
+                # the STALE branch (previously only shown on the cap=0 success branch).
+                if (( bk_cap_bytes == 0 )); then
+                    echo -e "  Backup:   ${YELLOW}STALE — last ok ${bk_last_ok_disp} (no cap), next ${bk_next_disp}${RESET}"
+                else
+                    echo -e "  Backup:   ${YELLOW}STALE — last ok ${bk_last_ok_disp}, next ${bk_next_disp}${RESET}"
+                fi
             else
                 # Normal-state: last ok (schedule), next, disk tag.
                 disk_tag=""

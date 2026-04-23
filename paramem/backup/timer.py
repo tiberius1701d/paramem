@@ -6,8 +6,9 @@ Reuses ``parse_schedule`` / ``TimerSpec`` from the consolidation timer module
 
 Unit files point at ``python -m paramem.backup --tier daily`` (oneshot service).
 
-``render_service_unit(tier)`` is parameterised now (Fix 4) so Slice 6b can
-mint weekly/monthly/yearly timer units without a backward-incompatible change.
+``render_service_unit(tier)`` is parameterised on ``tier`` so weekly /
+monthly / yearly timer units can be minted by passing ``tier="weekly"``
+etc. — no backward-incompatible change to this function needed.
 
 ``_backup_timer_interval_seconds(schedule_str)`` maps a schedule string to
 seconds so the ``/status`` populator can derive the stale threshold without
@@ -50,9 +51,8 @@ __all__ = [
 def render_service_unit(python_path: str, project_root: str, tier: str = "daily") -> str:
     """Render the systemd .service unit for the backup runner.
 
-    Parameterised on ``tier`` (Fix 4) so Slice 6b can emit weekly/monthly/
-    yearly timer units by passing ``tier="weekly"`` etc. without a
-    backward-incompatible change to this function.
+    Parameterised on ``tier`` so weekly / monthly / yearly timer units
+    can be emitted by passing ``tier="weekly"`` etc.
 
     Parameters
     ----------
@@ -62,7 +62,7 @@ def render_service_unit(python_path: str, project_root: str, tier: str = "daily"
         Absolute path to the project root (``WorkingDirectory``).
     tier:
         Backup tier — written as ``--tier <tier>`` in ``ExecStart``.
-        Defaults to ``"daily"`` in Slice 6a.
+        Defaults to ``"daily"``.
 
     Returns
     -------

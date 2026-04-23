@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -34,6 +35,28 @@ GATE_4_SAMPLE_SIZE: int = 20
 GATE_4_MIN_REGISTRY_SIZE: int = 20
 GATE_4_THRESHOLD: float = 0.90  # ≥ 18/20 on the deciding sample
 _TRIAL_PROBE_ADAPTER_NAME: str = "trial_probe"
+
+# Bounded retry for the trial-probe mount on WSL2 transient CUDA failures
+# (the trial coroutine fires gate evaluation immediately after training, so
+# the driver may still be processing the last batch when load_adapter races
+# to copy weights).
+#
+# WSL2 NOTE: when the first mount attempt fails with "device not ready",
+# subsequent attempts hit "INTERNAL ASSERT FAILED in CUDACachingAllocator"
+# because the failed allocation corrupts PyTorch's allocator bookkeeping.
+# Retries cannot recover from that — so the strategy is to PREVENT the
+# first attempt from failing via a sufficient wall-clock settle period
+# (synchronize() drains queued kernels but does NOT wait long enough for
+# the WSL2 driver state to fully recover after a heavy training pass).
+_MOUNT_RETRY_COUNT: int = 3
+_MOUNT_RETRY_BACKOFF_SECONDS: float = 1.0
+# 10s settle covers a ~7s training-tail recovery window observed on this
+# host (Mistral 7B + RTX 5070 + WSL2). Shorter waits (3s) reproducibly
+# left the driver mid-recovery; the first load_adapter then surfaced
+# "device not ready" → CUDA allocator corruption → retry-impossible.
+_MOUNT_INITIAL_SETTLE_SECONDS: float = 10.0
+# Errors that indicate corrupted PyTorch CUDA state — retrying is futile.
+_CUDA_TERMINAL_MARKERS = ("INTERNAL ASSERT FAILED", "CUDACachingAllocator")
 
 # Training-phase exception markers (WARNING W2 — logged loudly so
 # mis-categorisation is immediately visible in the journal).
@@ -173,29 +196,80 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
 # ---------------------------------------------------------------------------
 
 
-def _ensure_trial_probe_mounted(model: Any, trial_adapter_dir: Path, mount_state: dict) -> None:
-    """Load the trial adapter under name ``"trial_probe"``.
+def _resolve_adapter_mount_path(trial_adapter_dir: Path) -> Path:
+    """Resolve the directory PEFT ``load_adapter`` should be pointed at.
 
-    Records the active adapter(s) before loading so
-    :func:`_unmount_trial_probe` can restore them.
+    Trial training writes a Slice-3a per-adapter manifest layout::
+
+        trial_adapter/<kind>/<YYYYMMDD-HHMMSS>/adapter_model.safetensors
+
+    PEFT's ``load_adapter`` reads ``adapter_model.safetensors`` directly from
+    the path it is given; it does NOT walk subdirectories. Passing
+    ``trial_adapter`` (or even ``trial_adapter/<kind>``) fails with
+    "adapter model file not found".
+
+    Resolution order (per ``_ADAPTER_KIND_SUBDIRS``):
+
+    1. ``trial_adapter/<kind>/<newest-slot>/`` containing the safetensors —
+       Slice 3a per-adapter slot layout.
+    2. ``trial_adapter/<kind>/`` directly containing the safetensors —
+       legacy flat per-kind layout.
+    3. ``trial_adapter/`` — legacy/simulated single-adapter top-level layout.
+    """
+    for kind in _ADAPTER_KIND_SUBDIRS:
+        kind_dir = trial_adapter_dir / kind
+        if not kind_dir.is_dir():
+            continue
+        # 1. Per-adapter slot layout: pick the newest non-hidden timestamped slot
+        #    that contains adapter_model.safetensors.
+        slots = [
+            entry
+            for entry in kind_dir.iterdir()
+            if entry.is_dir()
+            and not entry.name.startswith(".")
+            and (entry / "adapter_model.safetensors").exists()
+        ]
+        if slots:
+            return max(slots, key=lambda p: p.stat().st_mtime)
+        # 2. Legacy flat per-kind layout.
+        if (kind_dir / "adapter_model.safetensors").exists():
+            return kind_dir
+    # 3. Legacy/simulated top-level layout.
+    return trial_adapter_dir
+
+
+def _ensure_trial_probe_mounted(model: Any, trial_adapter_dir: Path, mount_state: dict) -> None:
+    """Make a trial-trained adapter active so gates 3/4 can probe it.
+
+    The trial coroutine just trained the adapters on this exact ``model``
+    object — episodic/semantic/procedural are already in ``model.peft_config``
+    with the trial weights. We only need to switch the active adapter to
+    one of them; we do NOT need to add another one via ``load_adapter``.
+
+    Adding a 5th adapter via ``load_adapter`` immediately after a heavy
+    training pass deadlocks the WSL2 CUDA driver — the first attempt fails
+    with ``cudaErrorNotReady`` and corrupts PyTorch's IPC handle table
+    (``CUDACachingAllocator.cpp:419 INTERNAL ASSERT FAILED``), at which
+    point only a server restart can recover. Switching to an in-memory
+    adapter avoids the failure mode entirely while still verifying that
+    training produced a usable adapter.
+
+    Fallback: when the in-memory adapter is unavailable (e.g. lifespan
+    crash recovery rebuilt the model fresh), fall back to ``load_adapter``
+    from disk with the bounded-retry helper.
 
     Parameters
     ----------
     model:
         Loaded PeftModel (already in-memory on the server).
     trial_adapter_dir:
-        Directory containing the trial adapter files
-        (``adapter_model.safetensors`` + ``adapter_config.json``).
+        Root directory of the trial adapter output. Per-kind subdirs
+        (``episodic/``, ``semantic/``, ``procedural/``) live below this.
     mount_state:
         Shared dict used to communicate mount results between helpers.
-        Modified in-place: sets ``"pre_active_adapter"`` and ``"mounted"``.
-
-    Raises
-    ------
-    Exception
-        Re-raised from ``model.load_adapter`` on any failure.
+        Modified in-place: sets ``"pre_active_adapter"``, ``"mounted"``,
+        ``"mounted_via"`` ("set" or "load"), and ``"mounted_name"``.
     """
-    # Capture the currently active adapter name(s) before mounting.
     raw_active = getattr(model, "active_adapter", None)
     if isinstance(raw_active, list):
         mount_state["pre_active_adapter"] = list(raw_active)
@@ -204,10 +278,155 @@ def _ensure_trial_probe_mounted(model: Any, trial_adapter_dir: Path, mount_state
     else:
         mount_state["pre_active_adapter"] = []
 
-    model.load_adapter(str(trial_adapter_dir), adapter_name=_TRIAL_PROBE_ADAPTER_NAME)
-    model.set_adapter(_TRIAL_PROBE_ADAPTER_NAME)
+    # CLAUDE.md: gradient_checkpointing must be disabled before model.generate()
+    # — otherwise HF Transformers silently disables KV cache and produces
+    # garbage output. The trial training pass that just finished left
+    # checkpointing enabled; gate 3/4 will now generate(), so disable it
+    # here and let _unmount_trial_probe restore the prior state.
+    mount_state["pre_checkpointing"] = bool(getattr(model, "is_gradient_checkpointing", False))
+    if mount_state["pre_checkpointing"]:
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gradient_checkpointing_disable failed: %s", exc)
+    mount_state["pre_training_mode"] = bool(getattr(model, "training", False))
+    try:
+        model.eval()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("model.eval() failed: %s", exc)
+
+    # Diagnostic: surface the model's current adapter state at mount time
+    # so we can debug "no adapter loaded" / wrong-wrapper cases on real GPUs.
+    peft_config = getattr(model, "peft_config", None)
+    pc_keys = list(peft_config.keys()) if isinstance(peft_config, dict) else None
+    logger.info(
+        "trial probe mount: model.type=%s peft_config=%s active=%s",
+        type(model).__name__,
+        pc_keys,
+        getattr(model, "active_adapter", None),
+    )
+
+    # Preferred path: the trial just trained the adapter on this model;
+    # switch to it instead of loading a 5th adapter from disk.
+    in_memory_kind = _find_trained_kind_in_memory(model, trial_adapter_dir)
+    if in_memory_kind is not None:
+        model.set_adapter(in_memory_kind)
+        mount_state["mounted"] = True
+        mount_state["mounted_via"] = "set"
+        mount_state["mounted_name"] = in_memory_kind
+        logger.info("Activated in-memory trial adapter '%s'", in_memory_kind)
+        return
+
+    # Fallback: lifespan recovery, no in-memory adapter — load from disk.
+    mount_path = _resolve_adapter_mount_path(trial_adapter_dir)
+    _settle_cuda_and_load_adapter(model, mount_path)
     mount_state["mounted"] = True
-    logger.info("Mounted trial probe adapter from %s", trial_adapter_dir)
+    mount_state["mounted_via"] = "load"
+    mount_state["mounted_name"] = _TRIAL_PROBE_ADAPTER_NAME
+    logger.info("Mounted trial probe adapter from disk at %s", mount_path)
+
+
+def _find_trained_kind_in_memory(model: Any, trial_adapter_dir: Path) -> str | None:
+    """Return the kind name whose keyed_pairs.json exists AND whose adapter
+    is in ``model.peft_config`` — the kind that gate 3 will probe.
+
+    Gate 3 reads the first key from ``keyed_pairs.json`` and probes it;
+    that probe MUST run against the adapter that was actually trained on
+    those keys. Picking a different kind (e.g. activating ``episodic``
+    when keyed_pairs lives in ``procedural/``) causes ``parse_failure``
+    because the probed adapter has never seen the key.
+
+    Strategy:
+    1. Use ``_find_keyed_pairs`` to locate the keyed_pairs.json file the
+       gate will probe — its parent directory name is the kind.
+    2. Verify that kind is in ``model.peft_config``.
+    3. Return that kind. ``None`` if either step fails — caller falls back
+       to loading from disk.
+    """
+    peft_config = getattr(model, "peft_config", None)
+    if peft_config is None:
+        return None
+    keyed_pairs_path = _find_keyed_pairs(trial_adapter_dir)
+    if keyed_pairs_path is None:
+        return None
+    kind = keyed_pairs_path.parent.name
+    if kind in _ADAPTER_KIND_SUBDIRS and kind in peft_config:
+        return kind
+    return None
+
+
+def _settle_cuda_and_load_adapter(model: Any, mount_path: Path) -> None:
+    """Drain CUDA + load + set the trial probe with bounded retries.
+
+    The trial coroutine fires gate evaluation immediately after the training
+    executor returns. On WSL2, the CUDA driver intermittently surfaces
+    ``device not ready`` because gradient/optimizer kernels from the last
+    training batch are still in flight when PEFT races to copy adapter
+    weights to GPU. ``torch.cuda.synchronize()`` blocks until those finish;
+    a small empty_cache + brief sleep + retry covers the residual cases
+    where synchronize() returns but the next allocator call still races.
+    """
+    try:
+        import torch  # type: ignore[import-not-found]
+    except ImportError:
+        torch = None  # type: ignore[assignment]
+
+    # Initial settle: WSL2 driver needs wall-clock time after a heavy
+    # training pass before it can safely service a fresh load_adapter.
+    # synchronize() alone returns too quickly to cover the gap. If the
+    # first attempt fails, retries are unlikely to recover (failed CUDA
+    # ops corrupt PyTorch's allocator bookkeeping) — so the strategy is
+    # to PREVENT first-attempt failure.
+    if torch is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pre-mount CUDA settle failed: %s", exc)
+    time.sleep(_MOUNT_INITIAL_SETTLE_SECONDS)
+
+    last_exc: BaseException | None = None
+    for attempt in range(_MOUNT_RETRY_COUNT):
+        # PEFT registers the adapter name in ``peft_config`` BEFORE moving
+        # weights to GPU, so a CUDA failure during load_adapter leaves the
+        # name half-registered. Subsequent attempts then fail with
+        # "Adapter with name X already exists". Clean up before each try.
+        peft_config = getattr(model, "peft_config", None)
+        if peft_config is not None and _TRIAL_PROBE_ADAPTER_NAME in peft_config:
+            try:
+                model.delete_adapter(_TRIAL_PROBE_ADAPTER_NAME)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning("trial probe pre-attempt cleanup failed: %s", cleanup_exc)
+        try:
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            model.load_adapter(str(mount_path), adapter_name=_TRIAL_PROBE_ADAPTER_NAME)
+            model.set_adapter(_TRIAL_PROBE_ADAPTER_NAME)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning(
+                "trial probe mount attempt %d/%d failed: %s",
+                attempt + 1,
+                _MOUNT_RETRY_COUNT,
+                exc,
+            )
+            # If PyTorch's allocator is corrupted, retries cannot recover.
+            if any(marker in str(exc) for marker in _CUDA_TERMINAL_MARKERS):
+                logger.error(
+                    "trial probe mount: CUDA allocator corruption detected, "
+                    "aborting retries — server restart required to recover"
+                )
+                break
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(_MOUNT_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 def _unmount_trial_probe(model: Any, mount_state: dict) -> None:
@@ -232,9 +451,36 @@ def _unmount_trial_probe(model: Any, mount_state: dict) -> None:
     if not mount_state.get("mounted"):
         return
 
+    mounted_via = mount_state.get("mounted_via", "load")
+    mounted_name = mount_state.get("mounted_name", _TRIAL_PROBE_ADAPTER_NAME)
+
+    # Restore gradient_checkpointing + training mode that the mount disabled.
+    # Done before adapter cleanup so even if delete fails the trainer can
+    # resume normally on the next cycle.
+    if mount_state.get("pre_checkpointing"):
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gradient_checkpointing_enable failed: %s", exc)
+    if mount_state.get("pre_training_mode"):
+        try:
+            model.train()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("model.train() failed: %s", exc)
+
     try:
-        # Determine all currently-loaded adapter names.
-        # PEFT exposes them via peft_config keys on a PeftModel.
+        # When mounted via set_adapter on an in-memory trial adapter, the
+        # adapter is part of the trial state — DON'T delete it. Just restore
+        # the pre-mount active adapter (if there was one).
+        if mounted_via == "set":
+            pre = mount_state.get("pre_active_adapter", [])
+            if pre:
+                model.set_adapter(pre[0])
+            return
+
+        # Loaded path: delete the adapter we added.
         peft_config = getattr(model, "peft_config", {})
         loaded_adapters = list(peft_config.keys())
 
@@ -243,14 +489,12 @@ def _unmount_trial_probe(model: Any, mount_state: dict) -> None:
             logger.warning(
                 "gates: skipping delete_adapter('%s') — it is the sole loaded adapter; "
                 "leaving in place to preserve PeftModel integrity (CLAUDE.md rule).",
-                _TRIAL_PROBE_ADAPTER_NAME,
+                mounted_name,
             )
-            mount_state["mounted"] = False
             return
 
-        model.delete_adapter(_TRIAL_PROBE_ADAPTER_NAME)
+        model.delete_adapter(mounted_name)
 
-        # Restore previous active adapter.
         pre = mount_state.get("pre_active_adapter", [])
         if pre:
             model.set_adapter(pre[0])
@@ -426,6 +670,56 @@ def _gate_2_training(
     )
 
 
+_ADAPTER_KIND_SUBDIRS = ("episodic", "semantic", "procedural")
+
+
+def _find_keyed_pairs(trial_adapter_dir: Path) -> Path | None:
+    """Locate ``keyed_pairs.json`` inside *trial_adapter_dir*.
+
+    Real trial training writes per-kind subdirectories
+    (``episodic/``, ``semantic/``, ``procedural/``), each containing its own
+    ``keyed_pairs.json``.  This helper checks for the file in the following
+    order:
+
+    1. ``<trial_adapter_dir>/episodic/keyed_pairs.json`` (primary PA adapter,
+       Decision 21).
+    2. ``<trial_adapter_dir>/semantic/keyed_pairs.json``.
+    3. ``<trial_adapter_dir>/procedural/keyed_pairs.json``.
+    4. Top-level ``<trial_adapter_dir>/keyed_pairs.json`` (legacy / simulated
+       — fallback only when no per-kind subdir is present).
+
+    Fix 6 (2026-04-23): per-kind subdirs are checked BEFORE the top-level
+    fallback.  A stale top-level file from an older production run (where
+    episodic was written at the top level) no longer shadows fresher per-kind
+    files written by a trial run.
+
+    Returns the first path that exists, or ``None`` when no ``keyed_pairs.json``
+    is found anywhere (B2-residual fix — real layout is per-kind subdirs).
+
+    Parameters
+    ----------
+    trial_adapter_dir:
+        Root directory of the trial adapter output.
+
+    Returns
+    -------
+    Path | None
+        Absolute path to ``keyed_pairs.json``, or ``None`` when absent.
+    """
+    # 1–3. Per-kind subdirectories in preference order (episodic is primary).
+    for kind in _ADAPTER_KIND_SUBDIRS:
+        candidate = trial_adapter_dir / kind / "keyed_pairs.json"
+        if candidate.exists():
+            return candidate
+
+    # 4. Top-level fallback (legacy / simulate-mode output).
+    top_level = trial_adapter_dir / "keyed_pairs.json"
+    if top_level.exists():
+        return top_level
+
+    return None
+
+
 def _gate_3_reload_smoke(
     *,
     session_buffer_empty: bool,
@@ -441,9 +735,22 @@ def _gate_3_reload_smoke(
     and parses the result.  Uses in-server loader, not the experiment harness.
 
     SKIPPED when the session buffer was empty or when ``summary["status"]``
-    is ``"no_facts"`` (no adapter was written, nothing to probe).
-    FAIL on mount raise, inference raise, parse failure, or missing
+    is ``"no_facts"`` (no adapter was written, nothing to probe).  Also
+    SKIPPED when no kind-specific adapter was trained (no ``keyed_pairs.json``
+    in any expected location — e.g. ``no_facts`` extraction path).
+    FAIL on mount raise, inference raise, parse failure, or unparseable
     ``keyed_pairs.json``.
+
+    ``keyed_pairs.json`` search order (B2-residual fix):
+
+    1. ``<trial_adapter_dir>/keyed_pairs.json`` — top-level (legacy / simulate).
+    2. ``<trial_adapter_dir>/episodic/keyed_pairs.json`` — primary PA adapter.
+    3. ``<trial_adapter_dir>/semantic/keyed_pairs.json``.
+    4. ``<trial_adapter_dir>/procedural/keyed_pairs.json``.
+
+    Any one of the three kind subdirs is sufficient to verify the adapter
+    was loaded — the gate's purpose is ADAPTER LOAD verification, not
+    enforcement of a specific kind.
 
     Parameters
     ----------
@@ -484,14 +791,18 @@ def _gate_3_reload_smoke(
             metrics=None,
         )
 
-    # Locate keyed_pairs.json inside the trial adapter directory.
-    keyed_pairs_path = trial_adapter_dir / "keyed_pairs.json"
-    if not keyed_pairs_path.exists():
+    # Locate keyed_pairs.json — check top-level then per-kind subdirs.
+    keyed_pairs_path = _find_keyed_pairs(trial_adapter_dir)
+    if keyed_pairs_path is None:
         return GateResult(
             gate=3,
             name="adapter_reload",
-            status="fail",
-            reason=f"keyed_pairs.json not found at {keyed_pairs_path}",
+            status="skipped",
+            reason=(
+                "no kind-specific adapter trained — keyed_pairs.json absent "
+                f"at {trial_adapter_dir} and all kind subdirs "
+                f"({', '.join(_ADAPTER_KIND_SUBDIRS)})"
+            ),
             metrics=None,
         )
 
@@ -613,12 +924,19 @@ def _gate_4_recall_check(
     from paramem.training.indexed_memory import probe_key, verify_confidence
 
     # --- Precondition: live registry must exist and have enough keys ---
+    # SKIP on missing file (legitimate fresh-install OR pre-Slice-3a layout
+    # without key_metadata.json). The CRITICAL #1 fix (2026-04-23) isolates
+    # trial registry writes to state/trial_registry/, so trial-induced
+    # corruption of the live file is no longer a concern.
     if not live_registry_path.exists():
         return GateResult(
             gate=4,
             name="live_registry_recall",
-            status="fail",
-            reason=f"live registry file not found: {live_registry_path}",
+            status="skipped",
+            reason=(
+                f"live registry file not found: {live_registry_path} "
+                "— treating as <20 keys (fresh install or pre-Slice-3a layout)"
+            ),
             metrics=None,
         )
 

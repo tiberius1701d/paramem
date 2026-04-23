@@ -15,6 +15,9 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
+from paramem.backup.backup import write as backup_write
+from paramem.backup.encryption import SecurityBackupsConfig
+from paramem.backup.types import ArtifactKind
 from paramem.server.migration import TrialStash, initial_migration_state
 from paramem.server.trial_state import (
     TRIAL_MARKER_SCHEMA_VERSION,
@@ -93,11 +96,26 @@ def _seed_trial_state(state: dict, tmp_path: Path, gates_status: str = "pass") -
     trial_graph_dir = state_dir / "trial_graph"
     trial_graph_dir.mkdir(exist_ok=True)
 
-    # Create config A backup slot.
+    # Create config A backup slot using the real backup writer so the sidecar
+    # (*.meta.json) is present and backup.read() (called by rollback's decrypt
+    # step) can validate and optionally decrypt the artifact.
     backups_root = config.paths.data / "backups"
-    config_slot = backups_root / "config" / "20260422-010000"
-    config_slot.mkdir(parents=True, exist_ok=True)
-    (config_slot / "config-20260422-010000.bin").write_bytes(_LIVE_YAML)
+    sec_cfg = SecurityBackupsConfig()  # encrypt_at_rest=AUTO (no key → plaintext)
+    config_slot = backup_write(
+        ArtifactKind.CONFIG,
+        _LIVE_YAML,
+        {"tier": "pre_migration"},
+        base_dir=backups_root / "config",
+        security_config=sec_cfg,
+    )
+
+    # Derive the artifact filename from the real slot.
+    artifact_files = [e for e in config_slot.iterdir() if not e.name.endswith(".meta.json")]
+    assert len(artifact_files) == 1, (
+        f"Expected exactly 1 artifact in {config_slot}, got: "
+        f"{[e.name for e in config_slot.iterdir()]}"
+    )
+    config_artifact_filename = artifact_files[0].name
 
     trial_stash = TrialStash(
         started_at="2026-04-22T01:00:00+00:00",
@@ -133,7 +151,7 @@ def _seed_trial_state(state: dict, tmp_path: Path, gates_status: str = "pass") -
         },
         trial_adapter_dir=str(trial_adapter_dir.resolve()),
         trial_graph_dir=str(trial_graph_dir.resolve()),
-        config_artifact_filename="config-20260422-010000.bin",
+        config_artifact_filename=config_artifact_filename,
     )
     write_trial_marker(state_dir, marker)
 

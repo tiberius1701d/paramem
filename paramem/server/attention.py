@@ -503,8 +503,17 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
     except Exception:
         usage = None  # silently skip DISK PRESSURE alert on scan failure
 
-    if usage is not None and usage.cap_bytes > 0:
-        pct = usage.pct_of_cap
+    if usage is not None:
+        disk_used = usage.total_bytes
+        disk_cap = usage.cap_bytes
+        # B4 fix (2026-04-22 E2E baseline): when cap_bytes==0, compute_disk_usage
+        # returns pct_of_cap=0.0 and the old guard "usage.cap_bytes > 0" skipped
+        # the alert entirely.  cap=0 + any non-zero usage means the store is over
+        # capacity (infinite percent), so emit at level "failed".
+        if disk_cap == 0:
+            pct = float("inf") if disk_used > 0 else 0.0
+        else:
+            pct = disk_used / disk_cap
         if pct >= 0.80:
             lvl = "failed" if pct >= 1.0 else "info"
             cap_gb = backups_cfg.max_total_disk_gb
@@ -512,7 +521,10 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
                 AttentionItem(
                     kind="backup_disk_pressure",
                     level=lvl,
-                    summary=(f"Backup: DISK {int(pct * 100)}% of {cap_gb} GB cap — prune required"),
+                    summary=(
+                        f"Backup: DISK {int(min(pct, 999.0) * 100)}%"
+                        f" of {cap_gb} GB cap — prune required"
+                    ),
                     action_hint="Run paramem backup-prune.",
                     age_seconds=None,
                 )
@@ -621,7 +633,7 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
     )
 
     try:
-        registry_path = config.paths.data / "registry" / "key_metadata.json"
+        registry_path = config.paths.key_metadata
     except (AttributeError, TypeError):
         registry_path = None
 

@@ -494,17 +494,32 @@ def _load_key_metadata(path: Path) -> dict | None:
 
 
 def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Save key metadata for cross-restart persistence."""
+    """Save key metadata for cross-restart persistence.
+
+    When ``loop.trial_key_metadata_path`` is set (trial consolidation path),
+    writes to that isolated path instead of the live ``config.key_metadata_path``.
+    This ensures trial runs never touch the live ``data/ha/registry/key_metadata.json``
+    (CRITICAL Fix 1 — trial registry isolation, 2026-04-23).
+    """
     metadata = {
         "cycle_count": loop.cycle_count,
         "promoted_keys": sorted(loop.promoted_keys),
         "keys": {key: {"sessions_seen": count} for key, count in loop.key_sessions.items()},
     }
-    _atomic_json_write(metadata, config.key_metadata_path)
+    # CRITICAL Fix 1: honor loop-level override set by _build_trial_loop so the
+    # trial never writes to the live registry paths.
+    dest = getattr(loop, "trial_key_metadata_path", None) or config.key_metadata_path
+    _atomic_json_write(metadata, dest)
 
 
 def _save_registry(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Save combined SimHash registry (no personal data)."""
+    """Save combined SimHash registry (no personal data).
+
+    When ``loop.trial_registry_path`` is set (trial consolidation path),
+    writes to that isolated path instead of the live ``config.registry_path``.
+    This ensures trial runs never touch the live ``data/ha/registry.json``
+    (CRITICAL Fix 1 — trial registry isolation, 2026-04-23).
+    """
     combined = {}
     for key, simhash in loop.episodic_simhash.items():
         combined[key] = {"simhash": simhash, "adapter": "episodic"}
@@ -512,7 +527,10 @@ def _save_registry(loop: ConsolidationLoop, config: ServerConfig) -> None:
         combined[key] = {"simhash": simhash, "adapter": "semantic"}
     for key, simhash in loop.procedural_simhash.items():
         combined[key] = {"simhash": simhash, "adapter": "procedural"}
-    _atomic_json_write(combined, config.registry_path)
+    # CRITICAL Fix 1: honor loop-level override set by _build_trial_loop so the
+    # trial never writes to the live registry paths.
+    dest = getattr(loop, "trial_registry_path", None) or config.registry_path
+    _atomic_json_write(combined, dest)
 
 
 def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) -> None:

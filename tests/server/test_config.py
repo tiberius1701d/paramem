@@ -16,7 +16,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
-from paramem.server.config import load_server_config
+from paramem.server.config import PathsConfig, load_server_config
 
 
 def _write_yaml(tmp_path: Path, content: str) -> Path:
@@ -135,3 +135,76 @@ class TestSecurityOrphanSweepConfig:
         assert result.action == RecoveryAction.NORMAL_LIVE, (
             "backup outside 1h window should NOT be swept; NORMAL_LIVE expected"
         )
+
+
+class TestPathsConfigKeyMetadata:
+    """Cleanup 1 — canonical Paths.key_metadata must match the on-disk layout.
+
+    Pins the path so the multi-site hardcoded-workaround pattern cannot recur.
+    The consolidation writer uses config.key_metadata_path (→ paths.key_metadata),
+    and all read sites must use the same canonical property.
+    """
+
+    def test_paths_key_metadata_matches_consolidation_writer_layout(self):
+        """Canonical Paths.key_metadata must equal data/registry/key_metadata.json.
+
+        Matching the path the consolidation writer (server/consolidation.py) uses.
+        Prevents the multi-site hardcoded-workaround pattern from recurring.
+        """
+        cfg = PathsConfig(data=Path("/some/data"))
+        assert cfg.key_metadata == Path("/some/data/registry/key_metadata.json")
+
+    def test_paths_registry_is_distinct_from_key_metadata(self):
+        """``paths.registry`` and ``paths.key_metadata`` are TWO different files,
+        not aliases. ``registry`` carries the combined SimHash dict (read by
+        inference for hallucination detection); ``key_metadata`` carries
+        per-key metadata (read by gates / attention / restore). Aliasing them
+        would silently regress inference's SimHash reads.
+        """
+        cfg = PathsConfig(data=Path("/some/data"))
+        assert cfg.registry == Path("/some/data/registry.json")
+        assert cfg.key_metadata == Path("/some/data/registry/key_metadata.json")
+        assert cfg.registry != cfg.key_metadata
+
+    def test_paths_registry_dir_is_parent_of_key_metadata(self):
+        """paths.registry_dir must be the parent directory of paths.key_metadata."""
+        cfg = PathsConfig(data=Path("/some/data"))
+        assert cfg.registry_dir == cfg.key_metadata.parent
+
+
+# ---------------------------------------------------------------------------
+# Fix 7 — PathsConfig.data=None raises ValueError on property access
+# ---------------------------------------------------------------------------
+
+
+class TestPathsConfigNoneGuard:
+    """Fix 7 (2026-04-23): PathsConfig properties raise ValueError when data is None.
+
+    Previously they would raise TypeError from Path(None) / str with an
+    unhelpful message.  The guard provides an explicit error that names the
+    property and the missing prerequisite.
+    """
+
+    def test_key_metadata_raises_when_data_is_none(self):
+        """paths.key_metadata raises ValueError when data is None."""
+        import pytest
+
+        cfg = PathsConfig(data=None)
+        with pytest.raises(ValueError, match="paths.data must be set"):
+            _ = cfg.key_metadata
+
+    def test_registry_raises_when_data_is_none(self):
+        """paths.registry raises ValueError when data is None."""
+        import pytest
+
+        cfg = PathsConfig(data=None)
+        with pytest.raises(ValueError, match="paths.data must be set"):
+            _ = cfg.registry
+
+    def test_registry_dir_raises_when_data_is_none(self):
+        """paths.registry_dir raises ValueError when data is None."""
+        import pytest
+
+        cfg = PathsConfig(data=None)
+        with pytest.raises(ValueError, match="paths.data must be set"):
+            _ = cfg.registry_dir

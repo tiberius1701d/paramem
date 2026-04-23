@@ -324,3 +324,120 @@ class TestConfirmStepFailures:
         assert detail2.get("error") != "migration_in_progress", (
             "Lock was not released after step-4 failure (Correction 1 violated)"
         )
+
+
+# ---------------------------------------------------------------------------
+# B2 regression — trial_adapter_dir in marker uses state_dir, not state_dir.parent
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmTrialAdapterDirUnderStateDir:
+    """Verify confirm stores trial_adapter_dir under state_dir (not state_dir.parent).
+
+    B2 bug (2026-04-22 E2E baseline): the confirm handler computed
+    ``(state_dir.parent / "trial_adapter")`` which resolves to
+    ``data/ha/trial_adapter`` (missing the ``state/`` segment).  Gate 3
+    looked for keyed_pairs.json at that wrong path and emitted a false FAIL
+    on every real trial.
+
+    Fix: use ``(state_dir / "trial_adapter")`` so the path is
+    ``data/ha/state/trial_adapter``.
+    """
+
+    def test_trial_adapter_dir_under_state_dir_after_confirm(self, client, state, tmp_path):
+        """After confirm, the trial marker's trial_adapter_dir is a child of state_dir.
+
+        state_dir = config.paths.data / "state"
+        Expected: trial_adapter_dir starts with str(state_dir)
+        """
+        resp = client.post("/migration/confirm", json={})
+        assert resp.status_code == 200, resp.text
+
+        state_dir = state["config"].paths.data / "state"
+        from paramem.server.trial_state import read_trial_marker
+
+        marker = read_trial_marker(state_dir)
+        assert marker is not None
+
+        trial_adapter_dir = marker.trial_adapter_dir
+        assert trial_adapter_dir, "trial_adapter_dir must not be empty"
+
+        # Must be under state_dir, not state_dir.parent (i.e. data/ha/).
+        expected_prefix = str(state_dir.resolve())
+        assert trial_adapter_dir.startswith(expected_prefix), (
+            f"trial_adapter_dir {trial_adapter_dir!r} must be a child of "
+            f"state_dir {expected_prefix!r}.  "
+            "B2 bug: old code used state_dir.parent which put trial_adapter/ one level "
+            "up, causing gate 3 to look at the wrong path."
+        )
+
+    def test_trial_graph_dir_under_state_dir_after_confirm(self, client, state, tmp_path):
+        """After confirm, the trial marker's trial_graph_dir is also a child of state_dir."""
+        resp = client.post("/migration/confirm", json={})
+        assert resp.status_code == 200, resp.text
+
+        state_dir = state["config"].paths.data / "state"
+        from paramem.server.trial_state import read_trial_marker
+
+        marker = read_trial_marker(state_dir)
+        assert marker is not None
+
+        trial_graph_dir = marker.trial_graph_dir
+        assert trial_graph_dir, "trial_graph_dir must not be empty"
+
+        expected_prefix = str(state_dir.resolve())
+        assert trial_graph_dir.startswith(expected_prefix), (
+            f"trial_graph_dir {trial_graph_dir!r} must be a child of state_dir {expected_prefix!r}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# B1 regression — config_artifact_filename extraction uses real backup layout
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmConfigArtifactFilenameRealSlotLayout:
+    """Verify confirm extracts the artifact filename (not the sidecar) from a real
+    backup-writer slot layout (B1 fix, 2026-04-22 E2E baseline).
+
+    The backup writer names its sidecar ``<kind>-<ts>.meta.json`` (prefixed, NOT
+    the exact string ``"meta.json"``).  The old filter ``_entry.name != "meta.json"``
+    missed that sidecar, causing iterdir to return it first on some filesystems and
+    recording the sidecar filename in the marker.  At rollback time, os.rename moved
+    the sidecar JSON over the live YAML, silently corrupting configs/server.yaml.
+    """
+
+    def test_config_artifact_filename_not_sidecar_after_confirm(
+        self, client, state, tmp_path, monkeypatch
+    ):
+        """After confirm, trial marker records an artifact filename that ends with
+        ``.bin`` or ``.bin.enc`` (NOT ``.meta.json``).
+
+        Uses the real backup.write() call path so the sidecar naming convention
+        (``config-<ts>.meta.json``) is exercised — this is the layout that caused
+        the B1 bug.
+        """
+        resp = client.post("/migration/confirm", json={})
+        assert resp.status_code == 200, resp.text
+
+        # Read the trial marker written by the handler.
+        state_dir = state["config"].paths.data / "state"
+        from paramem.server.trial_state import read_trial_marker
+
+        marker = read_trial_marker(state_dir)
+        assert marker is not None, "trial marker must be written by confirm"
+
+        filename = marker.config_artifact_filename
+        assert filename, "config_artifact_filename must be non-empty"
+
+        # The artifact must NOT be the sidecar.
+        assert not filename.endswith(".meta.json"), (
+            f"config_artifact_filename is a sidecar name: {filename!r}.  "
+            "The iterdir filter must exclude all *.meta.json sidecars, not just "
+            "the exact string 'meta.json' (B1 fix, 2026-04-22 E2E baseline)."
+        )
+
+        # The artifact must be the binary blob written by backup.write().
+        assert filename.endswith(".bin") or filename.endswith(".bin.enc"), (
+            f"config_artifact_filename does not end with .bin or .bin.enc: {filename!r}"
+        )

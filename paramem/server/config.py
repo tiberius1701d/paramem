@@ -212,15 +212,64 @@ class PathsConfig:
 
     @property
     def adapters(self) -> Path:
+        """Path to the adapters directory.
+
+        Raises
+        ------
+        ValueError
+            If ``data`` is ``None``.
+        """
+        if self.data is None:
+            raise ValueError("paths.data must be set to derive adapters path")
         return self.data / "adapters"
 
     @property
-    def registry(self) -> Path:
-        return self.data / "registry.json"
+    def registry_dir(self) -> Path:
+        """Directory that holds key_metadata.json and the combined SimHash registry.
+
+        Raises
+        ------
+        ValueError
+            If ``data`` is ``None`` (Fix 7, 2026-04-23).
+        """
+        if self.data is None:
+            raise ValueError("paths.data must be set to derive registry_dir path")
+        return self.data / "registry"
 
     @property
     def key_metadata(self) -> Path:
-        return self.data / "key_metadata.json"
+        """Path to the key-level persistence file written by the consolidation loop.
+
+        Canonical on-disk location: ``<data>/registry/key_metadata.json``.
+        This matches the path that the consolidation writer uses and that the
+        production read sites (attention, app) previously hardcoded as a
+        workaround.  Use this property instead of constructing the path inline.
+
+        Raises
+        ------
+        ValueError
+            If ``data`` is ``None`` (Fix 7, 2026-04-23).
+        """
+        if self.data is None:
+            raise ValueError("paths.data must be set to derive key_metadata path")
+        return self.data / "registry" / "key_metadata.json"
+
+    @property
+    def registry(self) -> Path:
+        """Path to the combined SimHash registry written by the consolidation
+        loop's ``_save_registry`` and read by ``inference.py`` for hallucination
+        detection. **Distinct from ``key_metadata``** — different file, different
+        schema. Do NOT alias the two: ``key_metadata`` carries per-key metadata;
+        ``registry`` carries the combined SimHash dict.
+
+        Raises
+        ------
+        ValueError
+            If ``data`` is ``None`` (Fix 7, 2026-04-23).
+        """
+        if self.data is None:
+            raise ValueError("paths.data must be set to derive registry path")
+        return self.data / "registry.json"
 
 
 @dataclass

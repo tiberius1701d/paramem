@@ -496,7 +496,12 @@ class TestRestoreDuringConsolidationReturns409:
 
 class TestRestoreEncryptedWrongKeyReturns500:
     def test_restore_encrypted_wrong_key_returns_500(self, tmp_path: Path, monkeypatch) -> None:
-        """Encrypted slot + missing key → 500 restore_decrypt_failed; no safety slot."""
+        """Encrypted slot + missing key → 500 decrypt_no_key; no safety slot.
+
+        Fix 11 (2026-04-23): error code changed from ``restore_decrypt_failed``
+        to ``decrypt_no_key`` when PARAMEM_SNAPSHOT_KEY is absent, so operators
+        immediately know the key is missing rather than getting a generic decrypt error.
+        """
         import os
 
         from cryptography.fernet import Fernet  # noqa: PLC0415
@@ -531,7 +536,8 @@ class TestRestoreEncryptedWrongKeyReturns500:
             resp = client.post("/backup/restore", json={"backup_id": backup_id})
 
         assert resp.status_code == 500, resp.text
-        assert resp.json()["detail"]["error"] == "restore_decrypt_failed"
+        # Fix 11 (2026-04-23): missing key now surfaces as decrypt_no_key.
+        assert resp.json()["detail"]["error"] == "decrypt_no_key"
 
         # Safety backup was NOT created (decrypt failed before step 5).
         # Exclude the original slot and any .pending temp dirs from the check.
@@ -634,3 +640,100 @@ class TestPruneDryRun:
         assert body["deleted"] == []
         # disk_usage_after should equal before in dry-run
         assert body["disk_usage_after"]["total_bytes"] == body["disk_usage_before"]["total_bytes"]
+
+
+# ---------------------------------------------------------------------------
+# Fix 11 — decrypt error code distinction
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreDecryptErrorCodes:
+    """Fix 11 (2026-04-23): /backup/restore now returns distinct error codes
+    for three decrypt failure modes: no-key, wrong-key/corrupt, unknown.
+
+    The no-key case was previously ``restore_decrypt_failed``; Fix 11 changes
+    it to ``decrypt_no_key`` so operators can immediately see what is wrong.
+    """
+
+    def test_restore_no_key_returns_decrypt_no_key_error(self, tmp_path: Path, monkeypatch) -> None:
+        """Encrypted slot + no PARAMEM_SNAPSHOT_KEY → 500 decrypt_no_key."""
+        import os
+
+        from cryptography.fernet import Fernet
+
+        from paramem.backup.encryption import _clear_cipher_cache
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        test_key = Fernet.generate_key().decode()
+        _clear_cipher_cache()
+        with patch.dict(os.environ, {"PARAMEM_SNAPSHOT_KEY": test_key}):
+            slot_dir = backup_write(
+                ArtifactKind.CONFIG,
+                b"model: mistral\n",
+                meta_fields={"tier": "daily"},
+                base_dir=backups_root / "config",
+                security_config=EncSecurityConfig(),
+            )
+        backup_id = slot_dir.name
+
+        _clear_cipher_cache()
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_SNAPSHOT_KEY"}
+        with patch.dict(os.environ, env_without_key, clear=True):
+            resp = client.post("/backup/restore", json={"backup_id": backup_id})
+
+        assert resp.status_code == 500, resp.text
+        # Fix 11: no-key case is now decrypt_no_key, not restore_decrypt_failed
+        assert resp.json()["detail"]["error"] == "decrypt_no_key", (
+            f"Expected decrypt_no_key, got: {resp.json()['detail']['error']!r}. "
+            "Fix 11 regression: no-key error code reverted."
+        )
+        assert "PARAMEM_SNAPSHOT_KEY" in resp.json()["detail"]["message"], (
+            "decrypt_no_key message must mention PARAMEM_SNAPSHOT_KEY"
+        )
+
+    def test_restore_wrong_key_returns_decrypt_invalid_token(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Encrypted slot + wrong PARAMEM_SNAPSHOT_KEY → 500 decrypt_invalid_token."""
+        import os
+
+        from cryptography.fernet import Fernet
+
+        from paramem.backup.encryption import _clear_cipher_cache
+
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        # Write with key A.
+        key_a = Fernet.generate_key().decode()
+        _clear_cipher_cache()
+        with patch.dict(os.environ, {"PARAMEM_SNAPSHOT_KEY": key_a}):
+            slot_dir = backup_write(
+                ArtifactKind.CONFIG,
+                b"model: mistral\n",
+                meta_fields={"tier": "daily"},
+                base_dir=backups_root / "config",
+                security_config=EncSecurityConfig(),
+            )
+        backup_id = slot_dir.name
+
+        # Restore with different key B — decryption must fail with InvalidToken.
+        key_b = Fernet.generate_key().decode()
+        _clear_cipher_cache()
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        with patch.dict(os.environ, {"PARAMEM_SNAPSHOT_KEY": key_b}):
+            resp = client.post("/backup/restore", json={"backup_id": backup_id})
+
+        assert resp.status_code == 500, resp.text
+        assert resp.json()["detail"]["error"] == "decrypt_invalid_token", (
+            f"Expected decrypt_invalid_token for wrong key, got: {resp.json()['detail']['error']!r}"
+        )

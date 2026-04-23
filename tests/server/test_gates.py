@@ -13,7 +13,7 @@ Coverage targets (spec §Tests):
   - Gate 4 17/20 first, 20/20 retry → PASS + cluster-variance warning.
   - Gate 4 17/20 both samples → FAIL.
   - Gate 4 < 20 keys → SKIPPED.
-  - Gate 4 missing registry file → FAIL.
+  - Gate 4 missing registry file → SKIPPED (B3-residual fix).
   - Gate 4 metrics includes sampled_keys (GUARDRAIL G1).
   - Phase categorizer: extraction exception → gate 1 FAIL, gate 2 SKIPPED.
   - Phase categorizer: training exception → gate 1 PASS, gate 2 FAIL.
@@ -31,11 +31,15 @@ import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from paramem.server.gates import (
+    _ADAPTER_KIND_SUBDIRS,
     _TRIAL_PROBE_ADAPTER_NAME,
     GATE_4_SAMPLE_SIZE,
     GateResult,
     _ensure_trial_probe_mounted,
+    _find_keyed_pairs,
     _gate_1_extraction,
     _gate_2_training,
     _gate_3_reload_smoke,
@@ -45,6 +49,19 @@ from paramem.server.gates import (
     _unmount_trial_probe,
     evaluate_gates,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sleep_in_mount(monkeypatch):
+    """Skip the WSL2 settle sleep in unit tests.
+
+    `_settle_cuda_and_load_adapter` calls `time.sleep(_MOUNT_INITIAL_SETTLE_SECONDS)`
+    (3s) before the first mount attempt to let the WSL2 driver recover after
+    a heavy training pass. In tests with mocked GPU/model that wait is dead
+    weight — patching it cuts ~30s off the gate suite.
+    """
+    monkeypatch.setattr("paramem.server.gates.time.sleep", lambda *_a, **_k: None)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -391,12 +408,18 @@ class TestGate3AdapterReload:
         assert g.status == "skipped"
         assert "no_facts" in g.reason
 
-    def test_fail_missing_keyed_pairs(self, tmp_path):
-        """Missing keyed_pairs.json → FAIL."""
+    def test_skipped_missing_keyed_pairs_anywhere(self, tmp_path):
+        """Missing keyed_pairs.json at top-level and all kind subdirs → SKIPPED.
+
+        Before the B2-residual fix, gate 3 returned FAIL here.  The corrected
+        behaviour is SKIPPED with reason 'no kind-specific adapter trained',
+        because the adapter directory layout may simply not have produced a
+        keyed_pairs.json (e.g. an edge case in the consolidation path).
+        """
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
         (trial_dir / "adapter_config.json").write_text("{}")
-        # No keyed_pairs.json
+        # No keyed_pairs.json anywhere (no top-level, no kind subdirs).
         model = _make_mock_model()
         g = _gate_3_reload_smoke(
             session_buffer_empty=False,
@@ -406,8 +429,8 @@ class TestGate3AdapterReload:
             trial_adapter_dir=trial_dir,
             mount_state={},
         )
-        assert g.status == "fail"
-        assert "keyed_pairs.json" in g.reason
+        assert g.status == "skipped"
+        assert "no kind-specific adapter trained" in g.reason
 
     def test_fail_mount_error(self, tmp_path):
         """load_adapter raising → gate 3 FAIL."""
@@ -527,8 +550,13 @@ class TestGate4RecallCheck:
         assert g.status == "skipped"
         assert "no_new_sessions" in g.reason
 
-    def test_fail_missing_registry_file(self, tmp_path):
-        """Missing registry file → FAIL."""
+    def test_skipped_missing_registry_file(self, tmp_path):
+        """Missing registry file → SKIPPED (B3-residual fix).
+
+        Before the B3-residual fix, gate 4 returned FAIL with
+        'live registry file not found'.  Spec L381 says fresh-install hosts
+        with <20 keys (including no file at all) should be SKIPPED, not FAIL.
+        """
         trial_dir = _make_trial_adapter(tmp_path)
         model = _make_mock_model()
         g = _gate_4_recall_check(
@@ -538,8 +566,9 @@ class TestGate4RecallCheck:
             live_registry_path=tmp_path / "nonexistent.json",
             mount_state={"mounted": False, "pre_active_adapter": []},
         )
-        assert g.status == "fail"
+        assert g.status == "skipped"
         assert "not found" in g.reason
+        assert "fresh install" in g.reason
 
     def test_pass_20_of_20_no_retry(self, tmp_path):
         """20/20 first sample → PASS, no retry."""
@@ -913,3 +942,748 @@ class TestEvaluateGatesNoNewSessions:
         assert "import torch" not in top_level_src
         assert "import peft" not in top_level_src
         assert "import transformers" not in top_level_src
+
+
+# ---------------------------------------------------------------------------
+# B2-residual — gate 3 per-kind subdir layout (2026-04-22 re-test fix)
+# ---------------------------------------------------------------------------
+
+
+class TestGate3KindSubdirLayout:
+    """Gate 3 must find keyed_pairs.json under per-kind subdirs.
+
+    Real trial training writes per-kind layout:
+        <trial_adapter_dir>/episodic/keyed_pairs.json
+        <trial_adapter_dir>/semantic/keyed_pairs.json
+        <trial_adapter_dir>/procedural/keyed_pairs.json
+
+    Gate 3 must not FAIL when only the per-kind layout is present (B2-residual).
+    """
+
+    def _keyed_pairs_content(self) -> str:
+        return json.dumps([{"key": "graph1", "question": "Q1?", "answer": "A1"}])
+
+    def test_find_keyed_pairs_top_level(self, tmp_path):
+        """Top-level keyed_pairs.json is found by _find_keyed_pairs."""
+        d = tmp_path / "trial_adapter"
+        d.mkdir()
+        (d / "keyed_pairs.json").write_text(self._keyed_pairs_content())
+        result = _find_keyed_pairs(d)
+        assert result == d / "keyed_pairs.json"
+
+    def test_find_keyed_pairs_returns_none_when_absent(self, tmp_path):
+        """Empty trial_adapter_dir → _find_keyed_pairs returns None."""
+        d = tmp_path / "trial_adapter"
+        d.mkdir()
+        assert _find_keyed_pairs(d) is None
+
+    def test_gate3_finds_keyed_pairs_under_episodic_subdir(self, tmp_path):
+        """Fixture: episodic/keyed_pairs.json only (no top-level file).
+
+        Gate 3 must PASS (or at least not FAIL with 'keyed_pairs.json not found').
+        B2-residual: before the fix, gate 3 looked only at top-level and returned
+        FAIL whenever real training wrote per-kind subdirs.
+        """
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        # Adapter files at top-level (required by gate 3 mount step).
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+        # keyed_pairs.json only in episodic subdir.
+        episodic_dir = trial_dir / "episodic"
+        episodic_dir.mkdir()
+        (episodic_dir / "keyed_pairs.json").write_text(self._keyed_pairs_content())
+
+        model = _make_mock_model()
+        probe_result = {
+            "key": "graph1",
+            "question": "Q1?",
+            "answer": "A1",
+            "confidence": 0.99,
+            "raw_output": '{"key": "graph1", "question": "Q1?", "answer": "A1"}',
+        }
+        with patch("paramem.training.indexed_memory.probe_key", return_value=probe_result):
+            g = _gate_3_reload_smoke(
+                session_buffer_empty=False,
+                summary={"status": "complete"},
+                model=model,
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                mount_state={},
+            )
+
+        # Must not fail with "keyed_pairs.json not found" (B2-residual regression).
+        assert g.status != "fail" or "not found" not in (g.reason or ""), (
+            f"Gate 3 still using top-level-only lookup: {g.reason}"
+        )
+        assert g.status == "pass", f"Expected pass, got {g.status}: {g.reason}"
+
+    def test_gate3_finds_keyed_pairs_under_semantic_when_episodic_missing(self, tmp_path):
+        """Fixture: semantic/keyed_pairs.json only (no episodic, no top-level file).
+
+        Gate 3 must find the file in the semantic subdir and not FAIL with
+        'keyed_pairs.json not found'.
+        """
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+        # keyed_pairs.json only in semantic subdir.
+        semantic_dir = trial_dir / "semantic"
+        semantic_dir.mkdir()
+        (semantic_dir / "keyed_pairs.json").write_text(self._keyed_pairs_content())
+
+        model = _make_mock_model()
+        probe_result = {
+            "key": "graph1",
+            "question": "Q1?",
+            "answer": "A1",
+            "confidence": 0.99,
+            "raw_output": '{"key": "graph1", "question": "Q1?", "answer": "A1"}',
+        }
+        with patch("paramem.training.indexed_memory.probe_key", return_value=probe_result):
+            g = _gate_3_reload_smoke(
+                session_buffer_empty=False,
+                summary={"status": "complete"},
+                model=model,
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                mount_state={},
+            )
+
+        assert g.status == "pass", f"Expected pass from semantic subdir, got {g.status}: {g.reason}"
+
+    def test_gate3_skips_when_no_kind_subdir_has_keyed_pairs(self, tmp_path):
+        """Empty trial_adapter_dir (no keyed_pairs.json anywhere) → gate 3 SKIPPED.
+
+        This matches the 'no kind-specific adapter trained' case — e.g. when
+        extraction ran but produced no facts.
+        """
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        # Create kind subdirs without keyed_pairs.json.
+        for kind in _ADAPTER_KIND_SUBDIRS:
+            (trial_dir / kind).mkdir()
+
+        model = _make_mock_model()
+        g = _gate_3_reload_smoke(
+            session_buffer_empty=False,
+            summary={"status": "complete"},
+            model=model,
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            mount_state={},
+        )
+
+        assert g.status == "skipped", (
+            f"Expected skipped when no keyed_pairs.json in any location, got {g.status}: {g.reason}"
+        )
+        assert "no kind-specific adapter trained" in (g.reason or "")
+
+
+# ---------------------------------------------------------------------------
+# B3-residual — gate 4 file-not-found → SKIPPED (2026-04-22 re-test fix)
+# ---------------------------------------------------------------------------
+
+
+class TestGate4RegistryFileNotFoundSkip:
+    """Gate 4 must return SKIPPED (not FAIL) when the live registry file does
+    not exist.
+
+    Spec L381: "Skipped with — if the live registry has fewer than 20 keys
+    (fresh install)."  File-not-found is the strongest form of that condition.
+    Only corrupt / unparseable files (that *do* exist) should FAIL (B3-residual).
+    """
+
+    def test_gate4_skips_when_registry_file_does_not_exist(self, tmp_path):
+        """live_registry_path points at a non-existent file → status='skipped'.
+
+        Before the B3-residual fix, gate 4 returned FAIL with
+        'live registry file not found'.  Fresh-install hosts have no
+        production registry and must not be penalised.
+        """
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+
+        non_existent = tmp_path / "does_not_exist" / "key_metadata.json"
+        # Do not create the file — it must be genuinely absent.
+        assert not non_existent.exists()
+
+        model = _make_mock_model()
+        g = _gate_4_recall_check(
+            model=model,
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            live_registry_path=non_existent,
+            mount_state={"mounted": False, "pre_active_adapter": []},
+        )
+
+        assert g.status == "skipped", (
+            f"Gate 4 should return skipped on file-not-found, got {g.status}: {g.reason}"
+        )
+        assert "not found" in (g.reason or ""), f"Reason should mention 'not found': {g.reason!r}"
+        assert "fresh install" in (g.reason or ""), (
+            f"Reason should mention 'fresh install': {g.reason!r}"
+        )
+
+    def test_gate4_fails_when_registry_file_exists_but_unparseable(self, tmp_path):
+        """File-not-found is SKIPPED; corrupt-but-existing is still FAIL.
+
+        Pins the narrow scope of the B3-residual fix: only the missing-file
+        case was changed to SKIPPED.  A file that exists but contains invalid
+        JSON must still return FAIL so genuine data corruption is not silently
+        swallowed as a fresh-install skip.
+        """
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+
+        # Create a file that exists but contains invalid JSON.
+        registry_path = tmp_path / "key_metadata.json"
+        registry_path.write_text("not valid json {{{")
+        assert registry_path.exists()
+
+        model = _make_mock_model()
+        g = _gate_4_recall_check(
+            model=model,
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            live_registry_path=registry_path,
+            mount_state={"mounted": False, "pre_active_adapter": []},
+        )
+
+        assert g.status == "fail", (
+            f"Gate 4 should FAIL for corrupt-but-existing registry, got {g.status}: {g.reason}"
+        )
+        # Reason must not mention fresh install — this is data corruption, not a fresh deploy.
+        assert "fresh install" not in (g.reason or ""), (
+            f"Corrupt-file FAIL reason must not mention 'fresh install': {g.reason!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 — SKIP unconditionally on missing live registry file
+# ---------------------------------------------------------------------------
+
+
+class TestGate4MissingRegistrySkips:
+    """Gate 4 SKIPS on missing key_metadata.json — fresh install OR pre-Slice-3a
+    layout. The CRITICAL #1 fix isolates trial registry writes to
+    state/trial_registry/, so trial-induced corruption of the live file is no
+    longer a concern that the gate needs to police.
+    """
+
+    def test_gate4_skip_when_file_missing(self, tmp_path):
+        """Missing live registry → SKIPPED (no FAIL)."""
+        missing_path = tmp_path / "nonexistent_registry.json"
+        assert not missing_path.exists()
+
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+
+        g = _gate_4_recall_check(
+            model=_make_mock_model(),
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            live_registry_path=missing_path,
+            mount_state={"mounted": False, "pre_active_adapter": []},
+        )
+
+        assert g.status == "skipped", (
+            f"missing registry must be SKIPPED, got {g.status}: {g.reason}"
+        )
+
+    def test_evaluate_gates_skips_g4_on_missing(self, tmp_path):
+        """evaluate_gates threads the missing-file SKIP all the way through."""
+        missing_path = tmp_path / "nonexistent_registry.json"
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_config.json").write_text("{}")
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+
+        from paramem.server.gates import evaluate_gates
+
+        results = evaluate_gates(
+            model=_make_mock_model(),
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            live_registry_path=missing_path,
+            session_buffer_empty=False,
+            consolidation_summary=None,
+            consolidation_exception=None,
+        )
+        assert results[3].status == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Bug A (live test) — trial-probe mount must use per-kind subdir
+# ---------------------------------------------------------------------------
+
+
+class TestTrialProbeMountResolvesKindSubdir:
+    """PEFT ``load_adapter`` does not walk subdirs. The trial layout writes
+    adapter_model.safetensors into per-kind subdirs (episodic/, semantic/,
+    procedural/), so the mount path must resolve to the kind subdir, not the
+    trial_adapter root.
+    """
+
+    def test_resolver_picks_episodic_slot_first(self, tmp_path):
+        """Slice-3a layout: <kind>/<ts>/adapter_model.safetensors. Episodic wins
+        over semantic/procedural; newest slot wins within episodic."""
+        from paramem.server.gates import _resolve_adapter_mount_path
+
+        trial_dir = tmp_path / "trial_adapter"
+        for kind in ("episodic", "semantic", "procedural"):
+            slot = trial_dir / kind / "20260423-100000"
+            slot.mkdir(parents=True)
+            (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+        assert _resolve_adapter_mount_path(trial_dir) == trial_dir / "episodic" / "20260423-100000"
+
+    def test_resolver_picks_newest_slot(self, tmp_path):
+        """Two slots in episodic/ → mtime-newest wins."""
+        from paramem.server.gates import _resolve_adapter_mount_path
+
+        trial_dir = tmp_path / "trial_adapter"
+        old = trial_dir / "episodic" / "20260101-000000"
+        new = trial_dir / "episodic" / "20260423-100000"
+        for slot in (old, new):
+            slot.mkdir(parents=True)
+            (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+        # Force old to be older.
+        import os
+        import time
+
+        past = time.time() - 3600
+        os.utime(old / "adapter_model.safetensors", (past, past))
+        os.utime(old, (past, past))
+        assert _resolve_adapter_mount_path(trial_dir) == new
+
+    def test_resolver_skips_pending(self, tmp_path):
+        """``.pending/`` (in-progress write) must not be picked as a live slot."""
+        from paramem.server.gates import _resolve_adapter_mount_path
+
+        trial_dir = tmp_path / "trial_adapter"
+        (trial_dir / "episodic" / ".pending").mkdir(parents=True)
+        (trial_dir / "episodic" / ".pending" / "adapter_model.safetensors").write_bytes(b"\x00")
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+        assert _resolve_adapter_mount_path(trial_dir) == slot
+
+    def test_resolver_falls_back_to_flat_per_kind(self, tmp_path):
+        """Legacy flat per-kind: <kind>/adapter_model.safetensors directly."""
+        from paramem.server.gates import _resolve_adapter_mount_path
+
+        trial_dir = tmp_path / "trial_adapter"
+        (trial_dir / "semantic").mkdir(parents=True)
+        (trial_dir / "semantic" / "adapter_model.safetensors").write_bytes(b"\x00")
+        assert _resolve_adapter_mount_path(trial_dir) == trial_dir / "semantic"
+
+    def test_resolver_falls_back_to_root_for_top_level_layout(self, tmp_path):
+        """Top-level layout: trial_adapter/adapter_model.safetensors."""
+        from paramem.server.gates import _resolve_adapter_mount_path
+
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+        (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00")
+        assert _resolve_adapter_mount_path(trial_dir) == trial_dir
+
+    def test_mount_prefers_in_memory_set_adapter(self, tmp_path):
+        """When trial just trained ``episodic`` in-memory and keyed_pairs
+        lives in ``episodic/``, mount must use ``set_adapter("episodic")``
+        instead of ``load_adapter``. This avoids the WSL2 CUDA driver
+        instability that ``load_adapter`` triggers immediately after a
+        heavy training pass."""
+        from paramem.server.gates import _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+        # _find_trained_kind_in_memory matches via keyed_pairs.json location.
+        (trial_dir / "episodic" / "keyed_pairs.json").write_text(
+            json.dumps([{"key": "graph1", "question": "Q", "answer": "A"}])
+        )
+
+        model = _make_mock_model(adapter_names=["episodic"])
+        mount_state: dict = {"mounted": False, "pre_active_adapter": []}
+        _ensure_trial_probe_mounted(model, trial_dir, mount_state)
+
+        model.set_adapter.assert_called_with("episodic")
+        model.load_adapter.assert_not_called()
+        assert mount_state["mounted_via"] == "set"
+        assert mount_state["mounted_name"] == "episodic"
+
+    def test_mount_disables_gradient_checkpointing_and_unmount_restores(self, tmp_path):
+        """CLAUDE.md rule: gradient_checkpointing must be OFF during model.generate().
+        Trial training leaves it ON; mount must disable + eval(), unmount restores
+        the prior state. Without this, probe_key gets garbage output → parse_failure.
+        """
+        from paramem.server.gates import _ensure_trial_probe_mounted, _unmount_trial_probe
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+        (trial_dir / "episodic" / "keyed_pairs.json").write_text(
+            json.dumps([{"key": "graph1", "question": "Q", "answer": "A"}])
+        )
+
+        model = _make_mock_model(adapter_names=["episodic"])
+        # Trial training leaves the model in train mode + checkpointing enabled.
+        model.is_gradient_checkpointing = True
+        model.training = True
+
+        mount_state: dict = {"mounted": False, "pre_active_adapter": []}
+        _ensure_trial_probe_mounted(model, trial_dir, mount_state)
+
+        # Mount must have disabled checkpointing and called eval().
+        model.gradient_checkpointing_disable.assert_called()
+        model.eval.assert_called()
+        assert mount_state["pre_checkpointing"] is True
+        assert mount_state["pre_training_mode"] is True
+
+        # Unmount must restore the prior state.
+        _unmount_trial_probe(model, mount_state)
+        model.gradient_checkpointing_enable.assert_called()
+        model.train.assert_called()
+
+    def test_mount_picks_kind_matching_keyed_pairs_location(self, tmp_path):
+        """When keyed_pairs is in procedural/ (only proc trained), mount
+        must activate ``procedural`` — not the first kind alphabetically.
+        Activating the wrong kind produces ``parse_failure`` because the
+        probed adapter has never seen the key."""
+        from paramem.server.gates import _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        for kind in ("episodic", "semantic", "procedural"):
+            slot = trial_dir / kind / "20260423-100000"
+            slot.mkdir(parents=True)
+            (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+        (trial_dir / "procedural" / "keyed_pairs.json").write_text(
+            json.dumps([{"key": "proc1", "question": "Q", "answer": "A"}])
+        )
+
+        model = _make_mock_model(adapter_names=["episodic", "semantic", "procedural"])
+        mount_state: dict = {"mounted": False, "pre_active_adapter": []}
+        _ensure_trial_probe_mounted(model, trial_dir, mount_state)
+
+        model.set_adapter.assert_called_with("procedural")
+        assert mount_state["mounted_name"] == "procedural"
+
+    def test_mount_falls_back_to_load_when_in_memory_missing(self, tmp_path):
+        """When episodic isn't in peft_config (e.g. lifespan crash recovery
+        rebuilt the model fresh), mount falls back to load_adapter from disk
+        with the resolved per-kind slot path."""
+        from unittest.mock import patch
+
+        from paramem.server.gates import _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+
+        # Empty peft_config — no in-memory trial adapter, must fall back.
+        model = _make_mock_model(adapter_names=[])
+        mount_state: dict = {"mounted": False, "pre_active_adapter": []}
+        with patch("paramem.server.gates.time.sleep"):
+            _ensure_trial_probe_mounted(model, trial_dir, mount_state)
+
+        (called_path,) = model.load_adapter.call_args[0]
+        assert called_path == str(slot)
+        assert mount_state["mounted_via"] == "load"
+
+    def test_mount_drains_cuda_before_load(self, tmp_path):
+        """torch.cuda.synchronize() must be called before load_adapter so the
+        WSL2 driver isn't caught mid-training-batch by the mount call.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.gates import _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+
+        # Empty peft_config forces the load_adapter fallback path.
+        model = _make_mock_model(adapter_names=[])
+        call_order: list[str] = []
+        model.load_adapter.side_effect = lambda *a, **k: call_order.append("load_adapter")
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.cuda.synchronize.side_effect = lambda: call_order.append("synchronize")
+
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.server.gates.time.sleep"),
+        ):
+            _ensure_trial_probe_mounted(
+                model, trial_dir, {"mounted": False, "pre_active_adapter": []}
+            )
+
+        # synchronize fires twice (initial settle + per-attempt) before load_adapter.
+        assert call_order[0] == "synchronize", (
+            f"synchronize must precede load_adapter, got {call_order}"
+        )
+        assert "load_adapter" in call_order
+        assert call_order.index("synchronize") < call_order.index("load_adapter")
+
+    def test_mount_initial_settle_sleeps(self, tmp_path):
+        """The pre-attempt settle sleep must fire (WSL2 driver needs wall-clock
+        time after a heavy training pass; synchronize() returns too quickly).
+        Tests the load-fallback path (in-memory adapter unavailable)."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.gates import (
+            _MOUNT_INITIAL_SETTLE_SECONDS,
+            _ensure_trial_probe_mounted,
+        )
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+
+        # Force the load-fallback path.
+        model = _make_mock_model(adapter_names=[])
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.server.gates.time.sleep") as sleep_mock,
+        ):
+            _ensure_trial_probe_mounted(
+                model, trial_dir, {"mounted": False, "pre_active_adapter": []}
+            )
+
+        # First sleep call must be the initial settle.
+        assert sleep_mock.call_args_list[0][0][0] == _MOUNT_INITIAL_SETTLE_SECONDS
+
+    def test_mount_aborts_on_cuda_allocator_corruption(self, tmp_path):
+        """CUDACachingAllocator INTERNAL ASSERT means PyTorch state is corrupt.
+        Retries cannot recover — the loop must abort immediately.
+        Tests the load-fallback path."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.gates import _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+
+        model = _make_mock_model(adapter_names=[])
+        model.load_adapter.side_effect = RuntimeError(
+            'INTERNAL ASSERT FAILED at "/pytorch/c10/cuda/CUDACachingAllocator.cpp":419'
+        )
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.server.gates.time.sleep"),
+        ):
+            try:
+                _ensure_trial_probe_mounted(
+                    model, trial_dir, {"mounted": False, "pre_active_adapter": []}
+                )
+                raised = False
+            except RuntimeError:
+                raised = True
+
+        assert raised, "expected re-raise of allocator-corruption error"
+        # Only ONE attempt should fire — the loop must abort on terminal markers.
+        assert model.load_adapter.call_count == 1, (
+            f"expected 1 attempt (no retries on allocator corruption), "
+            f"got {model.load_adapter.call_count}"
+        )
+
+    def test_mount_retries_on_transient_cuda_failure(self, tmp_path):
+        """First mount fails with 'device not ready', second succeeds — the
+        retry loop must swallow the transient error and return cleanly."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.gates import _MOUNT_RETRY_COUNT, _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+
+        # Empty peft_config forces the load_adapter fallback path.
+        model = _make_mock_model(adapter_names=[])
+        attempts: list[int] = []
+
+        def _flaky_load(*_a, **_k):
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                raise RuntimeError("CUDA driver error: device not ready")
+
+        model.load_adapter.side_effect = _flaky_load
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.server.gates.time.sleep"),
+        ):
+            _ensure_trial_probe_mounted(
+                model, trial_dir, {"mounted": False, "pre_active_adapter": []}
+            )
+
+        assert len(attempts) == 2, f"expected 2 attempts (1 fail + 1 retry), got {len(attempts)}"
+        assert _MOUNT_RETRY_COUNT >= 2
+
+    def test_mount_cleans_up_half_registered_adapter_between_retries(self, tmp_path):
+        """PEFT registers the adapter name BEFORE moving weights to GPU. A
+        CUDA failure during load_adapter leaves the name in peft_config,
+        causing the retry to die with 'Adapter already exists'. The retry
+        loop must delete the half-registered adapter before each attempt.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.gates import _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+
+        # Empty peft_config forces the load_adapter fallback path.
+        model = _make_mock_model(adapter_names=[])
+        # Simulate PEFT half-registering: first call adds 'trial_probe' to
+        # peft_config and then raises (mimicking the WSL2 CUDA path).
+        attempt_count = 0
+
+        def _flaky_load(*_a, **kwargs):
+            nonlocal attempt_count
+            attempt_count += 1
+            model.peft_config["trial_probe"] = MagicMock()  # leave half-registered
+            if attempt_count == 1:
+                raise RuntimeError("CUDA driver error: device not ready")
+            # On retry, no exception — but if cleanup didn't run, PEFT would
+            # have raised "Adapter with name trial_probe already exists".
+
+        model.load_adapter.side_effect = _flaky_load
+
+        # delete_adapter must remove the half-registered entry.
+        def _delete(name):
+            model.peft_config.pop(name, None)
+
+        model.delete_adapter.side_effect = _delete
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.server.gates.time.sleep"),
+        ):
+            _ensure_trial_probe_mounted(
+                model, trial_dir, {"mounted": False, "pre_active_adapter": []}
+            )
+
+        # delete_adapter must have been called between attempts to clean up
+        # the partial registration from attempt 1.
+        assert model.delete_adapter.called, (
+            "delete_adapter must run before retry to clear half-registered name"
+        )
+        assert attempt_count == 2, f"expected 2 mount attempts, got {attempt_count}"
+
+    def test_mount_raises_when_all_retries_exhausted(self, tmp_path):
+        """If every attempt fails, the last exception is re-raised so gate 3
+        FAILs with the operator-actionable error text."""
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.gates import _MOUNT_RETRY_COUNT, _ensure_trial_probe_mounted
+
+        trial_dir = tmp_path / "trial_adapter"
+        slot = trial_dir / "episodic" / "20260423-100000"
+        slot.mkdir(parents=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"\x00")
+
+        # Empty peft_config forces the load_adapter fallback path.
+        model = _make_mock_model(adapter_names=[])
+        model.load_adapter.side_effect = RuntimeError("persistent CUDA failure")
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.server.gates.time.sleep"),
+        ):
+            try:
+                _ensure_trial_probe_mounted(
+                    model, trial_dir, {"mounted": False, "pre_active_adapter": []}
+                )
+                raised = False
+            except RuntimeError as exc:
+                raised = True
+                assert "persistent CUDA failure" in str(exc)
+
+        assert raised, "expected RuntimeError after all retries exhausted"
+        assert model.load_adapter.call_count == _MOUNT_RETRY_COUNT
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 — _find_keyed_pairs prefers per-kind subdir over stale top-level
+# ---------------------------------------------------------------------------
+
+
+class TestFindKeyedPairsPreference:
+    """Fix 6 (2026-04-23): _find_keyed_pairs must prefer per-kind subdirs over
+    the top-level fallback when both exist."""
+
+    def test_per_kind_wins_over_top_level(self, tmp_path):
+        """When both top-level and episodic/ exist, episodic/ is preferred."""
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+
+        # Write stale top-level file.
+        top_level = trial_dir / "keyed_pairs.json"
+        top_level.write_text(json.dumps([{"key": "stale", "question": "Q", "answer": "A"}]))
+
+        # Write fresh per-kind file.
+        ep_dir = trial_dir / "episodic"
+        ep_dir.mkdir()
+        per_kind = ep_dir / "keyed_pairs.json"
+        per_kind.write_text(json.dumps([{"key": "fresh", "question": "Q2", "answer": "A2"}]))
+
+        result = _find_keyed_pairs(trial_dir)
+
+        assert result is not None, "_find_keyed_pairs returned None when both files exist"
+        assert result == per_kind, (
+            f"Expected per-kind file {per_kind}, got {result}. "
+            "Fix 6 regression: stale top-level file shadows fresh per-kind file."
+        )
+
+    def test_top_level_returned_when_no_per_kind(self, tmp_path):
+        """When only the top-level file exists, it is returned (legacy fallback)."""
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+
+        top_level = trial_dir / "keyed_pairs.json"
+        top_level.write_text(json.dumps([{"key": "graph1", "question": "Q", "answer": "A"}]))
+
+        result = _find_keyed_pairs(trial_dir)
+        assert result == top_level
+
+    def test_none_returned_when_neither_exists(self, tmp_path):
+        """When no keyed_pairs.json exists anywhere, returns None."""
+        trial_dir = tmp_path / "trial_adapter"
+        trial_dir.mkdir()
+
+        result = _find_keyed_pairs(trial_dir)
+        assert result is None

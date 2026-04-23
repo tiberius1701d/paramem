@@ -180,3 +180,78 @@ class TestPreTrialHash:
         records = enumerate_backups(base, kind=ArtifactKind.CONFIG)
         assert len(records) == 1
         assert records[0].pre_trial_hash is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 9 — symlinks inside backup root are skipped
+# ---------------------------------------------------------------------------
+
+
+class TestSymlinkSkip:
+    """Fix 9 (2026-04-23): enumerate_backups must skip symlinks to prevent
+    path-traversal reads outside the backup directory tree."""
+
+    def test_enumerate_skips_symlink_slot(self, tmp_path):
+        """A symlink inside a kind directory is skipped (not returned as a record)."""
+        base = tmp_path / "backups"
+
+        # Write one real backup slot.
+        _write_slot(base, ArtifactKind.CONFIG, b"real")
+
+        # Create a directory outside the backup tree that a symlink could expose.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("sensitive data")
+
+        # Create a symlink inside the config kind directory pointing to outside/.
+        config_kind_dir = base / "config"
+        symlink_slot = config_kind_dir / "20260101-000000"
+        symlink_slot.symlink_to(outside)
+
+        records = enumerate_backups(base, kind=ArtifactKind.CONFIG)
+
+        # Only the real slot should appear.
+        assert len(records) == 1, (
+            f"Expected 1 record (real slot only), got {len(records)}. "
+            "Fix 9 regression: symlink slot was not skipped."
+        )
+        assert all(not r.slot_dir.is_symlink() for r in records), (
+            "Returned record is a symlink — Fix 9 regression"
+        )
+
+    def test_enumerate_logs_warn_for_symlink(self, tmp_path, caplog):
+        """enumerate_backups logs a WARNING when skipping a symlink slot.
+
+        Uses the pattern from test_schema_config.py: attach caplog's handler
+        directly to the named logger (since pytest's root-logger capture does
+        not always intercept records from named loggers that have their own
+        handlers or non-propagating ancestors).
+        """
+        import logging
+
+        base = tmp_path / "backups"
+        _write_slot(base, ArtifactKind.CONFIG, b"real")
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+
+        config_kind_dir = base / "config"
+        symlink_slot = config_kind_dir / "20260101-000000"
+        symlink_slot.symlink_to(outside)
+
+        named_logger = logging.getLogger("paramem.backup.enumerate")
+        orig_propagate = named_logger.propagate
+        named_logger.propagate = True
+        caplog.set_level(logging.WARNING, logger="paramem.backup.enumerate")
+        named_logger.addHandler(caplog.handler)
+        try:
+            enumerate_backups(base, kind=ArtifactKind.CONFIG)
+        finally:
+            named_logger.removeHandler(caplog.handler)
+            named_logger.propagate = orig_propagate
+
+        symlink_warnings = [r for r in caplog.records if "symlink" in r.message.lower()]
+        assert symlink_warnings, (
+            "Expected a WARNING log mentioning 'symlink' when a symlink slot is skipped. "
+            f"All caplog records: {[(r.levelname, r.message) for r in caplog.records]}"
+        )

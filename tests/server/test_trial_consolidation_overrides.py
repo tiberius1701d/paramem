@@ -28,7 +28,7 @@ def _make_state(tmp_path: Path) -> dict:
     config.paths.data.mkdir(parents=True, exist_ok=True)
     config.adapter_dir = tmp_path / "data" / "adapters"
     config.adapter_dir.mkdir(parents=True, exist_ok=True)
-    config.key_metadata_path = tmp_path / "data" / "key_metadata.json"
+    config.key_metadata_path = tmp_path / "data" / "registry" / "key_metadata.json"
 
     state_dir = tmp_path / "data" / "ha" / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -426,27 +426,71 @@ class TestUpdateTrialGates:
         state = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", state)
 
-        app_module._update_trial_gates(
-            {"status": "accepted", "completed_at": "2026-04-22T02:00:00+00:00"}
+        asyncio.run(
+            app_module._update_trial_gates(
+                {"status": "accepted", "completed_at": "2026-04-22T02:00:00+00:00"}
+            )
         )
 
         assert state["migration"]["trial"]["gates"]["status"] == "accepted"
 
     def test_update_trial_gates_noop_when_no_migration(self, monkeypatch):
         """_update_trial_gates is a no-op when _state has no migration key."""
-        monkeypatch.setattr(app_module, "_state", {"migration": None})
-        # Must not raise.
-        app_module._update_trial_gates({"status": "accepted"})
+
+        async def _run():
+            monkeypatch.setattr(
+                app_module, "_state", {"migration": None, "migration_lock": asyncio.Lock()}
+            )
+            # Must not raise.
+            await app_module._update_trial_gates({"status": "accepted"})
+
+        asyncio.run(_run())
 
     def test_update_trial_gates_noop_when_no_trial(self, monkeypatch):
         """_update_trial_gates is a no-op when migration has no trial stash."""
-        monkeypatch.setattr(
-            app_module,
-            "_state",
-            {"migration": {"state": "LIVE", "trial": None, "recovery_required": []}},
-        )
-        # Must not raise.
-        app_module._update_trial_gates({"status": "accepted"})
+
+        async def _run():
+            monkeypatch.setattr(
+                app_module,
+                "_state",
+                {
+                    "migration": {"state": "LIVE", "trial": None, "recovery_required": []},
+                    "migration_lock": asyncio.Lock(),
+                },
+            )
+            # Must not raise.
+            await app_module._update_trial_gates({"status": "accepted"})
+
+        asyncio.run(_run())
+
+    def test_update_trial_gates_blocks_on_cancel(self, tmp_path, monkeypatch):
+        """Concurrent cancel-clearing-trial cannot interleave the read-modify-write.
+
+        Holds ``migration_lock`` from a separate task while clearing
+        ``_state["migration"]["trial"]``; ``_update_trial_gates`` must wait for
+        the lock to release, then observe the cleared state and no-op.
+        """
+
+        async def _run():
+            state = _make_state(tmp_path)
+            monkeypatch.setattr(app_module, "_state", state)
+            lock = state["migration_lock"]
+
+            async def _simulate_cancel():
+                async with lock:
+                    state["migration"]["trial"] = None
+                    # Yield so the racing _update_trial_gates is scheduled
+                    # and blocks on the lock while we still hold it.
+                    await asyncio.sleep(0)
+
+            cancel_task = asyncio.create_task(_simulate_cancel())
+            await asyncio.sleep(0)  # let cancel_task acquire the lock first
+            await app_module._update_trial_gates({"status": "accepted"})
+            await cancel_task
+
+            assert state["migration"]["trial"] is None
+
+        asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -701,3 +745,92 @@ class TestRunTrialConsolidationMissingConfig:
         assert gates["status"] == "trial_exception"
         assert "exception" in gates
         assert "_state['config'] is missing" in gates["exception"]
+
+
+# ---------------------------------------------------------------------------
+# B3 regression — live_registry_path uses data/registry/key_metadata.json
+# ---------------------------------------------------------------------------
+
+
+class TestRunTrialConsolidationRegistryPath:
+    """Verify _run_trial_consolidation passes the correct registry path to evaluate_gates.
+
+    B3 bug (2026-04-22 E2E baseline): the handler derived registry path from
+    ``live_config.registry_path`` which resolves to
+    ``config.paths.data / "registry.json"`` (missing the ``registry/`` sub-
+    directory and ``key_metadata.json`` filename).  Gate 4 emitted a false FAIL
+    on every real trial because the path didn't exist.
+
+    Fix (Cleanup 1, 2026-04-22): use ``live_config.paths.key_metadata`` (canonical property).
+    """
+
+    def test_gate4_receives_canonical_registry_path(self, tmp_path, monkeypatch):
+        """evaluate_gates is called with live_registry_path == data/registry/key_metadata.json.
+
+        Captures the kwarg passed to evaluate_gates and asserts that it ends with
+        ``registry/key_metadata.json``, not the incorrect ``registry.json``.
+        """
+        from paramem.server.gates import GateResult
+
+        state = _make_state(tmp_path)
+        # Provide a real config mock so paths.data is deterministic.
+        data_dir = tmp_path / "data" / "ha"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        state["config"].paths.data = data_dir
+        # Cleanup 1 (2026-04-22): app.py uses live_config.paths.key_metadata
+        # (canonical property) to derive live_registry_path for evaluate_gates.
+        # MagicMock does not evaluate PathsConfig properties, so set explicitly.
+        state["config"].paths.key_metadata = data_dir / "registry" / "key_metadata.json"
+
+        monkeypatch.setattr(app_module, "_state", state)
+
+        captured_kwargs: dict = {}
+        skipped_gates = [
+            GateResult(gate=i, name=n, status="skipped", reason="no_new_sessions", metrics=None)
+            for i, n in enumerate(
+                ["extraction", "training", "adapter_reload", "live_registry_recall"], start=1
+            )
+        ]
+
+        def _capture_evaluate_gates(**kwargs):
+            captured_kwargs.update(kwargs)
+            return skipped_gates
+
+        async def _run():
+            with patch("paramem.server.config.load_server_config") as mock_load:
+                cfg = MagicMock()
+                cfg.consolidation.mode = "simulate"
+                # Make sure paths.data is consistent with the outer config mock.
+                cfg.paths.data = data_dir
+                # Cleanup 1 (2026-04-22): app.py now uses cfg.paths.key_metadata
+                # (canonical property) instead of paths.data / "registry" / "key_metadata.json".
+                # MagicMock does not evaluate PathsConfig properties, so set explicitly.
+                cfg.paths.key_metadata = data_dir / "registry" / "key_metadata.json"
+                mock_load.return_value = cfg
+
+                with patch(
+                    "paramem.server.gates.evaluate_gates",
+                    side_effect=_capture_evaluate_gates,
+                ):
+                    await app_module._run_trial_consolidation()
+
+        asyncio.run(_run())
+
+        assert "live_registry_path" in captured_kwargs, (
+            "evaluate_gates was not called or did not receive live_registry_path kwarg"
+        )
+        registry_path = captured_kwargs["live_registry_path"]
+        path_str = str(registry_path)
+
+        # Must end with registry/key_metadata.json (canonical path), NOT registry.json.
+        assert path_str.endswith("registry/key_metadata.json"), (
+            f"live_registry_path {path_str!r} must end with 'registry/key_metadata.json'.  "
+            "B3 bug: old code used config.registry_path which resolves to "
+            "'data/ha/registry.json' (missing the registry/ subdirectory)."
+        )
+        assert not path_str.endswith("registry.json") or path_str.endswith(
+            "registry/key_metadata.json"
+        ), (
+            f"live_registry_path {path_str!r} must NOT be the bare 'registry.json' path.  "
+            "This was the B3 bug."
+        )

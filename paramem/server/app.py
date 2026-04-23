@@ -909,6 +909,12 @@ async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
     config = _state["config"]
 
+    from paramem.backup.encryption import (
+        SecurityBackupsConfig as _EncSecCfg,
+    )
+    from paramem.backup.encryption import (
+        assert_encryption_feasible as _assert_enc,
+    )
     from paramem.server.drift import drift_poll_loop, initial_drift_state
     from paramem.server.migration import initial_migration_state
     from paramem.server.migration_recovery import (
@@ -924,6 +930,20 @@ async def lifespan(app: FastAPI):
 
     # Create the migration lock (must be inside a running event loop).
     _state["migration_lock"] = asyncio.Lock()
+
+    # Fix 10 (2026-04-23): assert encryption feasibility at startup so that
+    # security=always + no key produces a FatalConfigError here rather than a
+    # silent runtime failure when the first backup is attempted.
+    # ``config.security.backups`` is ``ServerBackupsConfig`` (retention/schedule
+    # fields).  ``assert_encryption_feasible`` expects ``SecurityBackupsConfig``
+    # (encrypt_at_rest/per_kind fields) from the backup subsystem.  Until Security
+    # WP1 merges the two schemas, we construct a default ``SecurityBackupsConfig``
+    # (AUTO policy → the assert is a no-op unless the key is missing AND always is
+    # set, which requires WP1 schema).  The call is kept so WP1 only needs to
+    # replace the default construction with config.security.backups.enc_config.
+    # WP1: assert_encryption_feasible — keep when Security WP1 lands.
+    _key_loaded = bool(os.environ.get("PARAMEM_SNAPSHOT_KEY"))
+    _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
 
     # --- Crash recovery: inspect disk state BEFORE drift init ---
     # This ensures _state["migration"] reflects any partially-completed
@@ -2598,7 +2618,7 @@ async def migration_preview(request: PreviewRequest):
         registry_path = None
         try:
             if hasattr(config, "paths") and config.paths.data is not None:
-                registry_path = config.paths.data / "registry" / "key_metadata.json"
+                registry_path = config.paths.key_metadata
         except (AttributeError, TypeError):
             registry_path = None
         if registry_path is None:
@@ -2626,7 +2646,7 @@ async def migration_preview(request: PreviewRequest):
     _registry_path_for_pf = None
     try:
         if config is not None and hasattr(config, "paths") and config.paths.data is not None:
-            _registry_path_for_pf = config.paths.data / "registry" / "key_metadata.json"
+            _registry_path_for_pf = config.paths.key_metadata
     except (AttributeError, TypeError):
         _registry_path_for_pf = None
 
@@ -2824,8 +2844,8 @@ async def migration_confirm(request: ConfirmRequest):
         state_dir = (Path("data/ha/state")).resolve()
         backups_root = (Path("data/ha/backups")).resolve()
 
-    trial_adapter_dir = str((state_dir.parent / "trial_adapter").resolve())
-    trial_graph_dir = str((state_dir.parent / "trial_graph").resolve())
+    trial_adapter_dir = str((state_dir / "trial_adapter").resolve())
+    trial_graph_dir = str((state_dir / "trial_graph").resolve())
 
     # Security config for backup.write()
     sec_cfg = SecurityBackupsConfig()
@@ -2936,9 +2956,14 @@ async def migration_confirm(request: ConfirmRequest):
         # --- Step 3: Write trial marker ---
         # REQUIRED FIX 1: capture config artifact filename so the rollback
         # handler can resolve the exact A-config file without directory listing.
+        # Filter uses endswith(".meta.json") to exclude all sidecar variants
+        # (e.g. "config-<ts>.meta.json") regardless of prefix — the old
+        # exact-match "meta.json" filter missed prefixed sidecars and caused
+        # rollback to restore the sidecar JSON instead of the config artifact
+        # (B1 bug, 2026-04-22 E2E baseline).
         config_artifact_filename = ""
         for _entry in Path(config_slot).iterdir():
-            if _entry.name != "meta.json" and not _entry.name.startswith("."):
+            if not _entry.name.endswith(".meta.json") and not _entry.name.startswith("."):
                 config_artifact_filename = _entry.name
                 break
 
@@ -3087,15 +3112,20 @@ async def _run_trial_consolidation() -> None:
         trial_adapter_dir_str = trial_data.get("trial_adapter_dir", "")
         trial_graph_dir_str = trial_data.get("trial_graph_dir", "")
 
-        if trial_adapter_dir_str:
-            trial_config.paths.data = Path(trial_adapter_dir_str).parent.parent
+        # CRITICAL Fix 1 (2026-04-23): do NOT override trial_config.paths.data here.
+        # Previously this was set to trial_adapter_dir.parent.parent (= data/ha), causing
+        # _save_registry / _save_key_metadata to resolve to the LIVE registry paths.
+        # Registry path isolation is now handled entirely inside _build_trial_loop via
+        # loop.trial_registry_path / loop.trial_key_metadata_path overrides.
 
         model = _state.get("model")
         tokenizer = _state.get("tokenizer")
 
         if model is None or tokenizer is None:
             logger.warning("trial consolidation: model not loaded (cloud-only mode?), skipping")
-            _update_trial_gates({"status": "trial_exception", "exception": "model not loaded"})
+            await _update_trial_gates(
+                {"status": "trial_exception", "exception": "model not loaded"}
+            )
             return
 
         # --- Session buffer check ---
@@ -3161,15 +3191,30 @@ async def _run_trial_consolidation() -> None:
                     "trial consolidation: _state['config'] is missing — "
                     "cannot resolve live registry path for gate 4"
                 )
-            live_registry_path: Path = live_config.registry_path
+            # Use the canonical property — config.paths.key_metadata resolves to
+            # config.paths.data / "registry" / "key_metadata.json", matching the
+            # path that the consolidation writer uses (Cleanup 1, 2026-04-22).
+            live_registry_path: Path = live_config.paths.key_metadata
             trial_adapter_dir = (
                 Path(trial_adapter_dir_str)
                 if trial_adapter_dir_str
                 else Path("state/trial_adapter")
             )
 
+            # Use loop.model (the PeftModel wrapper) instead of the raw
+            # _state["model"] (base MistralForCausalLM). The trial loop's
+            # create_adapter calls rebind self.model = PeftModel(...) — that
+            # wrapper holds the trial adapters in a form that PEFT's
+            # set_adapter / probe_key can use. The raw base model's
+            # peft_config is populated in-place but `_hf_peft_config_loaded`
+            # is False, which causes set_adapter to raise "No adapter loaded".
+            gate_model = (
+                loop.model
+                if not session_buffer_empty and "loop" in locals() and loop is not None
+                else model
+            )
             results = evaluate_gates(
-                model=model,
+                model=gate_model,
                 tokenizer=tokenizer,
                 trial_adapter_dir=trial_adapter_dir,
                 live_registry_path=live_registry_path,
@@ -3194,12 +3239,12 @@ async def _run_trial_consolidation() -> None:
             if exc_captured is not None:
                 gates_payload["exception"] = str(exc_captured)  # backward-compat with 3b.3
 
-        _update_trial_gates(gates_payload)
+        await _update_trial_gates(gates_payload)
         logger.info("trial consolidation complete: status=%s", overall_status)
 
     except Exception as exc:  # noqa: BLE001
         completed_at = datetime.now(timezone.utc).isoformat()
-        _update_trial_gates(
+        await _update_trial_gates(
             {"status": "trial_exception", "exception": str(exc), "completed_at": completed_at}
         )
         logger.exception("trial consolidation failed: %s", exc)
@@ -3265,17 +3310,36 @@ def _rollup_gate_status(results: list, session_buffer_empty: bool) -> str:
 
 
 def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_graph_dir):
-    """Build a ConsolidationLoop for the trial, overriding output paths."""
-    from paramem.server.consolidation import create_consolidation_loop
+    """Build a ConsolidationLoop for the trial, overriding output paths.
 
-    if trial_adapter_dir is not None:
-        trial_config.paths.data = trial_adapter_dir.parent.parent
+    CRITICAL Fix 1 (2026-04-23) — registry isolation:
+    ``loop.trial_registry_path`` and ``loop.trial_key_metadata_path`` are set
+    to paths inside a ``trial_registry/`` sibling of ``trial_adapter/`` so that
+    ``_save_registry`` / ``_save_key_metadata`` in consolidation.py write to
+    the trial-isolated directory instead of the live ``data/ha/registry.json``
+    / ``data/ha/registry/key_metadata.json``.
+
+    The previous pattern (``trial_config.paths.data = trial_adapter_dir.parent.parent``)
+    is removed: it pointed ``paths.data`` back to ``data/ha`` and caused both
+    registry writers to resolve to the LIVE paths.  The adapter output path is
+    now set via ``loop.output_dir`` only, leaving ``trial_config.paths.data``
+    alone so config-derived paths (sessions, debug, prompts) remain valid.
+    """
+    from paramem.server.consolidation import create_consolidation_loop
 
     loop = create_consolidation_loop(model, tokenizer, trial_config)
 
     if trial_adapter_dir is not None:
         loop.output_dir = trial_adapter_dir
         trial_adapter_dir.mkdir(parents=True, exist_ok=True)
+
+        # CRITICAL Fix 1: redirect registry writes to a trial-isolated directory
+        # (sibling of trial_adapter/, e.g. data/ha/state/trial_registry/).
+        # _save_registry / _save_key_metadata check these attributes and use them
+        # instead of config.registry_path / config.key_metadata_path.
+        trial_registry_dir = trial_adapter_dir.parent / "trial_registry"
+        loop.trial_registry_path = trial_registry_dir / "registry.json"
+        loop.trial_key_metadata_path = trial_registry_dir / "registry" / "key_metadata.json"
 
     if trial_graph_dir is not None:
         loop.persist_graph = True
@@ -3285,15 +3349,31 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
     return loop
 
 
-def _update_trial_gates(gates: dict) -> None:
-    """Update ``_state["migration"]["trial"]["gates"]`` safely."""
-    migration = _state.get("migration")
-    if migration is None:
-        return
-    trial = migration.get("trial")
-    if trial is None:
-        return
-    trial["gates"] = gates
+async def _update_trial_gates(gates: dict) -> None:
+    """Update ``_state["migration"]["trial"]["gates"]`` under ``migration_lock``.
+
+    Fix 5 (2026-04-23): the trial coroutine ``_run_trial_consolidation`` has
+    ``await`` points (run_in_executor for both build_trial_loop and the
+    consolidation executor) before this function runs, so a concurrent
+    ``/migration/cancel`` may execute and clear ``_state["migration"]["trial"]``
+    between the trial coroutine starting and this update. ``/migration/cancel``
+    holds ``migration_lock`` while clearing trial state, so this writer must
+    hold the same lock to observe a consistent view.
+
+    Without the lock, the coroutine could observe a half-cleared state — e.g.
+    ``state == "LIVE"`` but ``trial`` still set transiently — and write gates
+    into a trial dict that is about to be (or just was) detached from
+    ``_state["migration"]``.
+    """
+    lock: asyncio.Lock = _state.get("migration_lock") or asyncio.Lock()
+    async with lock:
+        migration = _state.get("migration")
+        if migration is None:
+            return
+        trial = migration.get("trial")
+        if trial is None:
+            return
+        trial["gates"] = gates
 
 
 # Accept-eligible gate statuses (set membership for forward-compat — Decision 24).
@@ -3877,9 +3957,85 @@ async def migration_rollback():
                 },
             )
 
-        # --- Step 4: Atomic rename A artifact → live config path ---
+        # --- Step 4: Decrypt A artifact and write to live config path ---
+        # Mirror backup_restore's decrypt-first ordering: read the slot via
+        # backup.read() which handles both plaintext and Fernet-encrypted
+        # artifacts, then write plaintext to a .pending temp, fsync, and
+        # atomic rename.  A raw os.rename of the artifact would write
+        # ciphertext bytes into configs/server.yaml, causing yaml.safe_load
+        # to fail on the next server start (B6 — 2026-04-22 re-test).
+        # Fix 11 (2026-04-23): distinguish three decrypt failure modes so
+        # operators know immediately whether the key is absent, wrong, or the
+        # artifact is corrupt.
         try:
-            os.rename(str(a_yaml_file), str(live_config_path))
+            from paramem.backup.backup import read as backup_read
+
+            a_slot_dir = Path(config_backup_slot_str)
+            plaintext_bytes, _a_meta = backup_read(a_slot_dir)
+        except RuntimeError as exc:
+            try:
+                shutil.rmtree(pre_mortem_slot, ignore_errors=True)
+            except OSError:
+                pass
+            if not os.environ.get("PARAMEM_SNAPSHOT_KEY"):
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "decrypt_no_key",
+                        "message": (
+                            "A-config backup is encrypted but PARAMEM_SNAPSHOT_KEY is not set"
+                        ),
+                    },
+                ) from exc
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "decrypt_unknown",
+                    "message": f"Failed to read/decrypt A config artifact: {exc}",
+                },
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            from cryptography.fernet import InvalidToken as _RbInvalidToken
+
+            try:
+                shutil.rmtree(pre_mortem_slot, ignore_errors=True)
+            except OSError:
+                pass
+            if isinstance(exc, _RbInvalidToken):
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "decrypt_invalid_token",
+                        "message": (
+                            "A-config backup decryption failed — wrong key or corrupted ciphertext"
+                        ),
+                    },
+                ) from exc
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "config_restore_failed",
+                    "message": f"Failed to read/decrypt A config artifact: {exc}",
+                },
+            ) from exc
+
+        # Fix 3 (2026-04-23): initialize before the try block so the except
+        # cleanup guard never raises UnboundLocalError if the assignment itself
+        # (e.g. datetime.now) raises before pending_restore is set.
+        pending_restore: Path | None = None
+        try:
+            _ts_suffix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            pending_restore = live_config_path.parent / f".pending-rollback-{_ts_suffix}.yaml"
+            # Fix 2 (2026-04-23): write the temp file at 0o600 to prevent a
+            # plaintext-exposure window under the default umask (0644).
+            # os.O_EXCL ensures the file is created atomically; write via fd.
+            _fd = os.open(str(pending_restore), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(_fd, plaintext_bytes)
+                os.fsync(_fd)
+            finally:
+                os.close(_fd)
+            os.rename(str(pending_restore), str(live_config_path))
             _dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
             try:
                 os.fsync(_dir_fd)
@@ -3888,6 +4044,12 @@ async def migration_rollback():
             finally:
                 os.close(_dir_fd)
         except Exception as exc:
+            # Clean up pending temp if it was created (Fix 3 guard).
+            if pending_restore is not None:
+                try:
+                    pending_restore.unlink(missing_ok=True)
+                except OSError:
+                    pass
             try:
                 shutil.rmtree(pre_mortem_slot, ignore_errors=True)
             except OSError:
@@ -4520,13 +4682,45 @@ async def backup_restore(req: BackupRestoreRequest):
         )
 
     # --- Step 4: Decrypt backup (BEFORE safety backup — order matters) ---
+    # Fix 11 (2026-04-23): distinguish three decrypt failure modes so operators
+    # know immediately whether the key is absent, wrong, or the artifact is corrupt.
     try:
         plaintext_bytes, _meta = backup_read(target_record.slot_dir)
-    except Exception as exc:
+    except RuntimeError as exc:
+        # RuntimeError from decrypt_bytes when PARAMEM_SNAPSHOT_KEY is not set.
+        if not os.environ.get("PARAMEM_SNAPSHOT_KEY"):
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "decrypt_no_key",
+                    "message": "backup is encrypted but PARAMEM_SNAPSHOT_KEY is not set",
+                },
+            ) from exc
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "restore_decrypt_failed",
+                "error": "decrypt_unknown",
+                "message": f"Failed to read/decrypt backup slot: {exc}",
+            },
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        from cryptography.fernet import InvalidToken as _InvalidToken
+
+        if isinstance(exc, _InvalidToken):
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "decrypt_invalid_token",
+                    "message": (
+                        "backup decryption failed — wrong key or corrupted ciphertext "
+                        "(Slice 7 will add per-key fingerprint to distinguish these)"
+                    ),
+                },
+            ) from exc
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "decrypt_unknown",
                 "message": f"Failed to read/decrypt backup slot: {exc}",
             },
         ) from exc
@@ -4561,10 +4755,14 @@ async def backup_restore(req: BackupRestoreRequest):
     # --- Step 6: Atomic restore ---
     restore_pending = live_config_path.with_suffix(live_config_path.suffix + ".restore-pending")
     try:
-        restore_pending.write_bytes(plaintext_bytes)
-        # fsync the temp file.
-        with open(restore_pending, "rb") as fh:
-            os.fsync(fh.fileno())
+        # Fix 2 (2026-04-23): write at 0o600 to prevent plaintext exposure under
+        # the default umask (0644) during the rename window.
+        _fd = os.open(str(restore_pending), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(_fd, plaintext_bytes)
+            os.fsync(_fd)
+        finally:
+            os.close(_fd)
         os.rename(str(restore_pending), str(live_config_path))
         # fsync parent directory for rename durability.
         _dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
