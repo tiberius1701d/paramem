@@ -25,6 +25,10 @@ from paramem.cli import (
     backup_list,
     backup_prune,
     backup_restore,
+    decrypt_infra,
+    dump,
+    encrypt_infra,
+    generate_key,
     migrate,
     migrate_accept,
     migrate_cancel,
@@ -214,6 +218,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit raw JSON response instead of formatted output.",
     )
 
+    # --- security CLI (encryption / key lifecycle) ---
+    subparsers.add_parser(
+        "generate-key",
+        help="Mint a new master-key value and print it with activation instructions.",
+        description=(
+            "Generates a Fernet key and prints it to stdout as a ready-to-paste "
+            ".env line.  Warning banner goes to stderr; the key itself is the "
+            "only line on stdout so redirection works cleanly."
+        ),
+    )
+    encrypt_infra.add_parser(subparsers)
+    decrypt_infra.add_parser(subparsers)
+    dump.add_parser(subparsers)
+
     return parser
 
 
@@ -270,6 +288,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "backup-prune":
         return backup_prune.run(args)
+
+    if args.command == "generate-key":
+        return generate_key.run(args)
+
+    if args.command == "encrypt-infra":
+        return encrypt_infra.run(args)
+
+    if args.command == "decrypt-infra":
+        return decrypt_infra.run(args)
+
+    if args.command == "dump":
+        return dump.run(args)
 
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)

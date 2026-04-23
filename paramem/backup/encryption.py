@@ -369,16 +369,48 @@ def read_maybe_encrypted(path: Path) -> bytes:
     return raw
 
 
+def _atomic_write_bytes(path: Path, body: bytes) -> None:
+    """Shared atomic-write core: ``<path>.tmp`` → fsync → rename → fsync parent.
+
+    On any failure before the rename completes, the temp file is removed so
+    no partial content is left on disk.  Callers that need to make an
+    encryption decision layer it on top of this helper.
+    """
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.rename(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    # fsync the parent directory for rename durability (power-loss safety).
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        except OSError as exc:
+            logger.warning("_atomic_write_bytes: parent dir fsync failed: %s", exc)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        logger.warning("_atomic_write_bytes: could not open parent for fsync: %s", exc)
+
+
 def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     """Atomically write *plaintext* to *path*, encrypting when a key is loaded.
 
     When a master key is present the on-disk body is the PMEM1 envelope
     (magic + Fernet ciphertext).  Otherwise the body is *plaintext* verbatim.
     The caller does not need to branch on key state.
-
-    Write sequence: ``<path>.tmp`` → fsync → ``os.rename`` → fsync parent.
-    On any failure before the rename completes, the temp file is removed so
-    no partial content is left on disk.
 
     Parameters
     ----------
@@ -392,40 +424,22 @@ def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     OSError
         On any filesystem error.
     """
-    path = Path(path)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-
     if master_key_loaded():
         body = PMEM1_MAGIC + encrypt_bytes(plaintext)
     else:
         body = plaintext
+    _atomic_write_bytes(Path(path), body)
 
-    try:
-        with open(tmp_path, "wb") as fh:
-            fh.write(body)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.rename(tmp_path, path)
-    except BaseException:
-        # Any failure before the rename completes leaves the tmp on disk.
-        # Remove it so the caller does not accumulate stale .tmp siblings.
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
 
-    # fsync the parent directory for rename durability (power-loss safety).
-    try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        except OSError as exc:
-            logger.warning("write_infra_bytes: parent dir fsync failed: %s", exc)
-        finally:
-            os.close(dir_fd)
-    except OSError as exc:
-        logger.warning("write_infra_bytes: could not open parent for fsync: %s", exc)
+def write_plaintext_atomic(path: Path, plaintext: bytes) -> None:
+    """Atomically write *plaintext* to *path*, never encrypting.
+
+    Used by ``paramem decrypt-infra`` to convert a ciphertext file to
+    plaintext regardless of whether a master key is currently loaded.
+    Normal infrastructure writers should use ``write_infra_bytes`` instead —
+    the naked plaintext variant is a migration-tool-only escape hatch.
+    """
+    _atomic_write_bytes(Path(path), plaintext)
 
 
 def is_pmem1_envelope(path: Path) -> bool:
@@ -465,21 +479,64 @@ class ModeProbe:
     plaintext_paths: list[Path] = field(default_factory=list)
 
 
+def infra_paths(data_dir: Path) -> list[Path]:
+    """Return the list of infrastructure files subject to envelope encryption.
+
+    Single source of truth for:
+    - ``_probe_data_dir`` — the startup mode-consistency scan.
+    - ``paramem encrypt-infra`` / ``paramem decrypt-infra`` — the migration
+      commands that convert between plaintext and ciphertext in bulk.
+
+    Paths that do not currently exist on disk are still returned — the
+    caller filters as needed.  This keeps the "what counts as infra
+    metadata" definition in one place regardless of whether the operator
+    has populated every path yet.
+
+    Excluded (plaintext-by-design per SECURITY.md §4 carve-out):
+    - ``state/trial.json`` and ``state/backup.json`` — control-plane only.
+    - Backup ``*.meta.json`` sidecars — operator visibility on wrong-key
+      restore trumps the marginal info hiding.
+
+    Parameters
+    ----------
+    data_dir:
+        Root of the ParaMem data directory (typically
+        ``configs/server.yaml``'s ``paths.data``).
+
+    Returns
+    -------
+    list[Path]
+        Ordered list of candidate paths.  Neither filtered by existence
+        nor classified by on-disk state.
+    """
+    data_dir = Path(data_dir)
+    paths: list[Path] = [
+        data_dir / "graph.json",
+        data_dir / "registry.json",
+        data_dir / "indexed_key_registry.json",
+        data_dir / "registry" / "key_metadata.json",
+        data_dir / "speaker_profiles.json",
+        data_dir / "adapters" / "post_session_queue.json",
+        data_dir / "adapters" / "keyed_pairs.json",
+        data_dir / "adapters" / "episodic" / "keyed_pairs.json",
+        data_dir / "adapters" / "semantic" / "keyed_pairs.json",
+        data_dir / "adapters" / "procedural" / "keyed_pairs.json",
+    ]
+    # BG-trainer resume states live under per-job in_training directories.
+    adapters_root = data_dir / "adapters"
+    if adapters_root.exists():
+        for resume in adapters_root.rglob("in_training/resume_state.json"):
+            paths.append(resume)
+    return paths
+
+
 def _probe_data_dir(data_dir: Path) -> ModeProbe:
     """Scan *data_dir* for infrastructure files and classify each as
     encrypted / plaintext.
 
-    The set of paths inspected follows SECURITY.md §4's "encrypted
-    infrastructure metadata" list — excluding the plaintext-by-design carve-
-    outs ``state/trial.json`` and ``state/backup.json`` (control-plane only,
-    no secrets).
-
-    Empty / missing files do NOT contribute either classification — they are
-    neutral.  The probe is conservative: only files that actually exist on
-    disk steer the mode verdict.
-
-    Sidecars under ``backups/`` (``*.meta.json``) are sampled because the
-    core §4 contract includes manifest sidecars.
+    Uses ``infra_paths`` as the authoritative candidate set.  Missing files
+    do NOT contribute to either classification — only files that actually
+    exist on disk steer the mode verdict.
 
     Parameters
     ----------
@@ -492,23 +549,11 @@ def _probe_data_dir(data_dir: Path) -> ModeProbe:
     ModeProbe
     """
     probe = ModeProbe()
+    data_dir = Path(data_dir)
     if not data_dir.exists():
         return probe
 
-    # Core infrastructure metadata paths.  Anchors follow current layout.
-    candidates: list[Path] = []
-    for name in ("graph.json", "registry.json", "indexed_key_registry.json"):
-        candidates.append(data_dir / name)
-    candidates.append(data_dir / "queue" / "post_session_queue.json")
-    candidates.append(data_dir / "speaker_profiles.json")
-
-    # Sidecars — any *.meta.json under backups/ (one sample per kind is enough).
-    backups_root = data_dir / "backups"
-    if backups_root.exists():
-        for sidecar in backups_root.rglob("*.meta.json"):
-            candidates.append(sidecar)
-
-    for path in candidates:
+    for path in infra_paths(data_dir):
         if not path.exists() or not path.is_file():
             continue
         if is_pmem1_envelope(path):
