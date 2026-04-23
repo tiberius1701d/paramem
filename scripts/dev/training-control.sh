@@ -591,9 +591,11 @@ _show_test_status() {
     fi
 
     # Test 13b uses fill_done.json marker and progress.json — dispatch early.
+    # Exclude _smoke/ subtree so smoke-test run dirs never appear as the prod
+    # "latest" (they sort after mistral/ in en_US.UTF-8 collation).
     if [[ "$test_num" == "13b" ]]; then
         local latest_run_dir
-        latest_run_dir=$(find "$PROJECT_DIR/$output_dir" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+        latest_run_dir=$(find "$PROJECT_DIR/$output_dir" -mindepth 2 -maxdepth 2 -type d -not -path "*/_smoke/*" 2>/dev/null | sort | tail -1)
         if [[ -z "$latest_run_dir" ]]; then
             if [[ "$running_test" == "$test_num" ]]; then
                 echo ""
