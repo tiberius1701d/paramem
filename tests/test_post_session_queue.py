@@ -182,48 +182,53 @@ class TestRemove:
 
 class TestAtomicWrite:
     def test_no_partial_write_on_io_error(self, tmp_path: Path) -> None:
-        """If the temp-file write fails, the original queue file is unchanged.
+        """If the underlying write helper fails, the original queue file is
+        unchanged.
 
-        We mock ``Path.write_text`` on the .tmp file to raise an IOError mid-write,
-        then verify the backing file is still valid.
+        Patches ``write_infra_bytes`` (the queue's atomic writer) to raise,
+        then verifies the backing file still has the content from the prior
+        successful enqueue.
         """
         path = tmp_path / "queue.json"
         q = PostSessionQueue(path)
         q.enqueue(_entry("conv-020"))
 
-        original_content = path.read_text()
+        original_content = path.read_bytes()
 
-        # Make the NEXT write_text call (which targets the .tmp file) raise.
-        real_write_text = Path.write_text
+        def _failing_write(*args, **kwargs):
+            raise IOError("simulated disk full")
 
-        def _failing_write(self, text, **kwargs):  # noqa: ANN001
-            if str(self).endswith(".tmp"):
-                raise IOError("simulated disk full")
-            return real_write_text(self, text, **kwargs)
-
-        with patch.object(Path, "write_text", _failing_write):
+        with patch("paramem.server.post_session_queue.write_infra_bytes", _failing_write):
             try:
                 q.enqueue(_entry("conv-021"))
             except Exception:
                 pass  # write failed — this is expected
 
         # Backing file must be unchanged (not partially written)
-        assert path.read_text() == original_content
+        assert path.read_bytes() == original_content
 
     def test_temp_file_removed_after_failed_write(self, tmp_path: Path) -> None:
-        """After a failed write, the .tmp sibling file is cleaned up."""
+        """After a failed write, the .tmp sibling file is cleaned up.
+
+        Simulates a failure after the temp file has been written but before
+        the rename completes, by patching ``os.rename`` inside the encryption
+        module.  ``write_infra_bytes`` must unlink the temp on any failure
+        before rename.
+        """
+        import os as _os
+
         path = tmp_path / "queue.json"
         q = PostSessionQueue(path)
         q.enqueue(_entry("conv-022"))
 
-        real_write_text = Path.write_text
+        real_rename = _os.rename
 
-        def _failing_write(self, text, **kwargs):  # noqa: ANN001
-            if str(self).endswith(".tmp"):
-                raise IOError("simulated disk full")
-            return real_write_text(self, text, **kwargs)
+        def _failing_rename(src, dst):
+            if str(src).endswith(".tmp"):
+                raise IOError("simulated rename failure")
+            return real_rename(src, dst)
 
-        with patch.object(Path, "write_text", _failing_write):
+        with patch("paramem.backup.encryption.os.rename", _failing_rename):
             try:
                 q.enqueue(_entry("conv-023"))
             except Exception:
@@ -233,13 +238,21 @@ class TestAtomicWrite:
         assert not tmp_path_sibling.exists()
 
     def test_successful_write_is_valid_json(self, tmp_path: Path) -> None:
-        """The backing file is always valid JSON after a write."""
+        """The backing file is always valid JSON after a write.
+
+        Reads through ``read_maybe_encrypted`` so the assertion holds in
+        both Security OFF (plaintext on disk) and Security ON (PMEM1-wrapped
+        ciphertext on disk) modes — the pytest session may inherit a master
+        key from a sibling test module's ``load_dotenv`` side-effect.
+        """
+        from paramem.backup.encryption import read_maybe_encrypted
+
         path = tmp_path / "queue.json"
         q = PostSessionQueue(path)
         q.enqueue(_entry("conv-024"))
         q.enqueue(_entry("conv-025"))
 
-        data = json.loads(path.read_text())
+        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
         assert isinstance(data, list)
         assert len(data) == 2
 
@@ -373,12 +386,16 @@ class TestDrainEmpty:
 
     def test_drain_empty_writes_empty_array_to_disk(self, tmp_path: Path) -> None:
         """drain() on an empty queue persists an empty JSON array."""
+        from paramem.backup.encryption import read_maybe_encrypted
+
         path = tmp_path / "queue.json"
         q = PostSessionQueue(path)
         q.enqueue(_entry("conv-050"))
         q.drain()
 
-        data = json.loads(path.read_text())
+        # Read through the envelope helper so the assertion holds regardless
+        # of the Security ON/OFF mode the pytest session happens to be in.
+        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
         assert data == []
 
 

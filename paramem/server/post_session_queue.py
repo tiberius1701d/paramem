@@ -59,10 +59,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,7 @@ class PostSessionQueue:
         if not self._path.exists():
             return []
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
+            data = json.loads(read_maybe_encrypted(self._path).decode("utf-8"))
             if not isinstance(data, list):
                 logger.warning(
                     "post_session_queue: expected JSON array in %s, got %s — starting empty",
@@ -197,19 +198,11 @@ class PostSessionQueue:
     def _save_locked(self) -> None:
         """Write current entries to disk atomically (caller must hold ``_lock``).
 
-        Writes to a ``.tmp`` sibling, then ``os.replace``-es it into place.
-        ``os.replace`` is atomic on POSIX and on NTFS (Python 3.3+), so a
-        crash at any point cannot produce a partially written file.
+        Routes through ``write_infra_bytes`` which handles the temp-file +
+        rename sequence and envelope-encrypts when a master key is set.
         """
-        tmp = self._path.with_suffix(".json.tmp")
         try:
-            payload = json.dumps(self._entries, ensure_ascii=False, indent=2)
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, self._path)
+            payload = json.dumps(self._entries, ensure_ascii=False, indent=2).encode("utf-8")
+            write_infra_bytes(self._path, payload)
         except Exception:
             logger.exception("post_session_queue: failed to write %s", self._path)
-            # Remove the temp file if it was created, to avoid stale .tmp files
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass

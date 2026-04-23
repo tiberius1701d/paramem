@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
+
 logger = logging.getLogger(__name__)
 
 _PROFILE_VERSION = 5
@@ -110,9 +112,8 @@ class SpeakerStore:
             return
 
         try:
-            with open(self.store_path) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
+            data = json.loads(read_maybe_encrypted(self.store_path).decode("utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             logger.warning("Failed to load speaker profiles: %s", e)
             return
 
@@ -262,25 +263,19 @@ class SpeakerStore:
                 self._dirty = False
 
     def _save(self) -> None:
-        """Persist profiles to disk (atomic write). Caller holds _lock."""
+        """Persist profiles to disk (atomic write, envelope-encrypted when a
+        master key is set).  Caller holds _lock."""
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.store_path.with_suffix(".tmp")
-        try:
-            with open(tmp, "w") as f:
-                json.dump(
-                    {
-                        "speakers": self._profiles,
-                        "last_greeted": self._last_greeted,
-                        "next_anon_index": self._next_anon_index,
-                        "version": _PROFILE_VERSION,
-                    },
-                    f,
-                    indent=2,
-                )
-            tmp.rename(self.store_path)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
+        payload = json.dumps(
+            {
+                "speakers": self._profiles,
+                "last_greeted": self._last_greeted,
+                "next_anon_index": self._next_anon_index,
+                "version": _PROFILE_VERSION,
+            },
+            indent=2,
+        ).encode("utf-8")
+        write_infra_bytes(self.store_path, payload)
 
     def match(self, embedding: list[float]) -> SpeakerMatch:
         """Find the closest enrolled speaker to the given embedding.

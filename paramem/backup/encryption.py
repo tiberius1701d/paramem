@@ -377,6 +377,8 @@ def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     The caller does not need to branch on key state.
 
     Write sequence: ``<path>.tmp`` → fsync → ``os.rename`` → fsync parent.
+    On any failure before the rename completes, the temp file is removed so
+    no partial content is left on disk.
 
     Parameters
     ----------
@@ -398,12 +400,20 @@ def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     else:
         body = plaintext
 
-    with open(tmp_path, "wb") as fh:
-        fh.write(body)
-        fh.flush()
-        os.fsync(fh.fileno())
-
-    os.rename(tmp_path, path)
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.rename(tmp_path, path)
+    except BaseException:
+        # Any failure before the rename completes leaves the tmp on disk.
+        # Remove it so the caller does not accumulate stale .tmp siblings.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     # fsync the parent directory for rename durability (power-loss safety).
     try:

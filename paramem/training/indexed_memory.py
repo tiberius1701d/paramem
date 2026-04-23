@@ -253,17 +253,23 @@ def get_simhash(registry: dict, key: str) -> int | None:
 
 
 def save_registry(registry: dict, path: str | Path) -> None:
-    """Save registry to a JSON file. Handles both simple and enriched formats."""
+    """Save registry to a JSON file (envelope-encrypted when a master key is
+    set, plaintext otherwise).  Handles both simple and enriched formats."""
+    from paramem.backup.encryption import write_infra_bytes
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(registry, f, indent=2)
+    payload = json.dumps(registry, indent=2).encode("utf-8")
+    write_infra_bytes(path, payload)
 
 
 def load_registry(path: str | Path) -> dict:
-    """Load registry from a JSON file. Handles both simple and enriched formats."""
-    with open(path) as f:
-        return json.load(f)
+    """Load registry from a JSON file — transparently decrypts PMEM1-wrapped
+    content when a master key is set.  Handles both simple and enriched
+    formats."""
+    from paramem.backup.encryption import read_maybe_encrypted
+
+    return json.loads(read_maybe_encrypted(Path(path)).decode("utf-8"))
 
 
 # --- Key assignment and training format ---

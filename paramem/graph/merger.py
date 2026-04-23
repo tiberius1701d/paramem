@@ -511,23 +511,30 @@ class GraphMerger:
         return json.dumps(data, indent=2).encode("utf-8")
 
     def save_graph(self, path: str | Path) -> None:
-        """Save cumulative graph to JSON."""
+        """Save cumulative graph to JSON — atomic write via the infrastructure
+        envelope.  Encrypts when a master key is set, plaintext otherwise.
+        Replaces the prior non-atomic ``open(path, "w")`` pattern; the rename
+        is fsynced for power-loss safety."""
+        from paramem.backup.encryption import write_infra_bytes
+
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = nx.node_link_data(self.graph)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        payload = json.dumps(data, indent=2).encode("utf-8")
+        write_infra_bytes(path, payload)
         logger.info("Graph saved to %s", path)
 
     def load_graph(self, path: str | Path) -> nx.MultiDiGraph:
-        """Load cumulative graph from JSON."""
+        """Load cumulative graph from JSON — transparently decrypts
+        PMEM1-wrapped content when a master key is set."""
+        from paramem.backup.encryption import read_maybe_encrypted
+
         path = Path(path)
         if not path.exists():
             logger.info("No existing graph at %s, starting fresh", path)
             return self.graph
 
-        with open(path) as f:
-            data = json.load(f)
+        data = json.loads(read_maybe_encrypted(path).decode("utf-8"))
         self.graph = nx.node_link_graph(data)
         logger.info(
             "Graph loaded from %s: %d nodes, %d edges",

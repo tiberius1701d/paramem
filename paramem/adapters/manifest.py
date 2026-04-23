@@ -558,12 +558,19 @@ def build_manifest_for(
     )
 
     # --- registry_sha256 ---
+    # Hash the PLAINTEXT content, not the on-disk bytes.  Fernet rewrites the
+    # ciphertext with a fresh IV on every encryption pass, so a ciphertext-
+    # based hash would change on every re-encrypt and break live-slot drift
+    # detection.  read_maybe_encrypted unwraps the PMEM1 envelope when
+    # present and returns the original bytes otherwise.
     if registry_sha256_override is not None:
         registry_sha256 = registry_sha256_override
     elif registry_path is not None and registry_path.exists():
         try:
-            registry_sha256 = hashlib.sha256(registry_path.read_bytes()).hexdigest()
-        except OSError as exc:
+            from paramem.backup.encryption import read_maybe_encrypted
+
+            registry_sha256 = hashlib.sha256(read_maybe_encrypted(registry_path)).hexdigest()
+        except (OSError, Exception) as exc:  # noqa: BLE001
             logger.warning(
                 "build_manifest_for: could not hash registry at %s: %s", registry_path, exc
             )

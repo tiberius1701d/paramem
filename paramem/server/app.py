@@ -621,17 +621,22 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         read_manifest,
     )
     from paramem.backup.backup import sweep_orphan_pending
-    from paramem.backup.hashing import content_sha256_path
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
 
     # Compute live registry hash once (used for all adapter kinds).
+    # Hash the plaintext content — see manifest.py::build_manifest_for for
+    # why ciphertext-based hashing breaks drift detection under Security ON.
     _registry_path = config.adapter_dir / "indexed_key_registry.json"
     live_registry_sha256 = ""
     if _registry_path.exists():
         try:
-            live_registry_sha256 = content_sha256_path(_registry_path)
-        except OSError:
+            import hashlib as _rhash
+
+            from paramem.backup.encryption import read_maybe_encrypted as _rme
+
+            live_registry_sha256 = _rhash.sha256(_rme(_registry_path)).hexdigest()
+        except Exception:  # noqa: BLE001
             live_registry_sha256 = ""
 
     def _checked_at() -> str:
@@ -2650,11 +2655,14 @@ async def migration_preview(request: PreviewRequest):
         if registry_path is None:
             registry_path = Path(str(adapter_dir)).parent / "registry" / "key_metadata.json"
         if registry_path.exists():
-            from paramem.backup.hashing import content_sha256_path
+            # Hash plaintext content — see manifest.py::build_manifest_for.
+            import hashlib as _rhash
+
+            from paramem.backup.encryption import read_maybe_encrypted as _rme
 
             try:
-                live_registry_sha256 = content_sha256_path(registry_path)
-            except OSError:
+                live_registry_sha256 = _rhash.sha256(_rme(registry_path)).hexdigest()
+            except Exception:  # noqa: BLE001
                 live_registry_sha256 = ""
 
     shape_changes = compute_shape_changes(parsed_candidate, adapter_dir, live_registry_sha256)

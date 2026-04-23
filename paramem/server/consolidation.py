@@ -11,10 +11,10 @@ the router can reload from the standard paths without any bridging.
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 
+from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 from paramem.server.config import ServerConfig
 from paramem.server.session_buffer import SessionBuffer
 from paramem.training.consolidation import ConsolidationLoop
@@ -476,12 +476,13 @@ def _promote_mature_keys(loop: ConsolidationLoop, config: ServerConfig) -> list[
 
 
 def _atomic_json_write(data: dict | list, path: Path) -> None:
-    """Write JSON atomically: write to .tmp, then os.replace()."""
+    """Write JSON atomically — envelope-encrypted when a master key is set,
+    plaintext otherwise.  Routes through ``write_infra_bytes`` so every
+    infrastructure JSON artifact respects the Security-ON/OFF contract
+    through a single chokepoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(".tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, path)
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    write_infra_bytes(path, payload)
 
 
 def _load_key_metadata(path: Path) -> dict | None:
@@ -489,8 +490,7 @@ def _load_key_metadata(path: Path) -> dict | None:
     if not path.exists():
         logger.info("No key metadata found at %s, starting fresh", path)
         return None
-    with open(path) as f:
-        return json.load(f)
+    return json.loads(read_maybe_encrypted(path).decode("utf-8"))
 
 
 def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:

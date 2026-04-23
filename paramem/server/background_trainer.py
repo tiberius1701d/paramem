@@ -10,7 +10,6 @@ just flag flips (model.eval/train, gradient checkpointing), no reload.
 import hashlib
 import json
 import logging
-import os
 import queue
 import subprocess
 import threading
@@ -126,7 +125,9 @@ def _fingerprint_training_config(
 
 
 def _write_resume_state_atomic(state_path: Path, state: dict) -> None:
-    """Write resume state to disk atomically using a temp-file + rename.
+    """Write resume state to disk atomically (envelope-encrypted when a
+    master key is set).  Routes through ``write_infra_bytes`` which handles
+    the temp-file + rename sequence.
 
     Args:
         state_path: Absolute path to the target JSON file.
@@ -135,19 +136,16 @@ def _write_resume_state_atomic(state_path: Path, state: dict) -> None:
     Raises:
         OSError: If the write or rename fails.
     """
-    tmp_path = state_path.with_suffix(f".tmp.{os.getpid()}")
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
-        tmp_path.replace(state_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    from paramem.backup.encryption import write_infra_bytes
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8")
+    write_infra_bytes(state_path, payload)
 
 
 def _read_resume_state(state_path: Path) -> dict | None:
-    """Load resume state from disk.
+    """Load resume state from disk — transparently decrypts PMEM1-wrapped
+    content when a master key is set.
 
     Returns None if the file does not exist or cannot be parsed.
 
@@ -157,11 +155,12 @@ def _read_resume_state(state_path: Path) -> dict | None:
     Returns:
         Parsed dict, or None.
     """
+    from paramem.backup.encryption import read_maybe_encrypted
+
     if not state_path.exists():
         return None
     try:
-        with open(state_path, encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(read_maybe_encrypted(state_path).decode("utf-8"))
     except Exception:
         logger.warning("Could not parse resume state at %s — discarding", state_path)
         return None
