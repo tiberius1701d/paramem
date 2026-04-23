@@ -88,8 +88,13 @@ from peft import PeftModel  # noqa: E402
 from transformers import TrainerCallback  # noqa: E402
 
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
-from experiments.utils.perltqa_loader import is_available as perltqa_available  # noqa: E402
-from experiments.utils.perltqa_loader import load_character_eval_qa  # noqa: E402
+from experiments.utils.perltqa_loader import (  # noqa: E402
+    is_available as perltqa_available,
+)
+from experiments.utils.perltqa_loader import (  # noqa: E402
+    list_characters,
+    load_character_eval_qa,
+)
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     IndexedDataset,
@@ -256,46 +261,77 @@ class RecallProbeCallback(TrainerCallback):
 
 
 def load_qa_pool(total_keys: int) -> list[dict]:
-    """Load total_keys+SWAP_KEYS QA pairs — the extras supply swap answers.
+    """Load total_keys+SWAP_KEYS unique QA pairs from PerLTQA.
 
-    Logs duplicate questions and answers within the training slice
-    (slots 1..total_keys). These are known to cause SimHash collisions
-    at recall time and establish a noise floor independent of the
-    scaffold mechanism under test (see module docstring, graph23
-    finding).
+    Deduplicates on both question and answer strings: any pair that
+    shares a question OR an answer with one already accepted is dropped
+    (the first occurrence wins). Sources CHARACTER_A first, then
+    CHARACTER_B, then remaining PerLTQA characters in deterministic
+    alphabetical order until we have `needed` unique pairs. This closes
+    the graph23↔graph26 / graph35↔graph37 / graph56↔graph58 class of
+    collisions that previously capped Phase A/C1 at N-1/N exact recall.
+
+    Note: this is experiment-local string dedup. Production's
+    ConsolidationLoop.dedup_episodic keys on (source_subject,
+    source_predicate, source_object) — a different mechanism that
+    cannot apply here because PerLTQA eval-QA has no triple fields.
+    Test 13 intentionally bypasses the extract→merge→generate_QA
+    pipeline to isolate LoRA training dynamics; harness↔production
+    alignment is tracked as an open point in project memory.
     """
     needed = total_keys + SWAP_KEYS
     if not perltqa_available():
         raise RuntimeError("PerLTQA dataset not available — required for Test 13")
-    qa = load_character_eval_qa(CHARACTER_A, max_pairs=needed)
-    if len(qa) < needed:
-        extra = load_character_eval_qa(CHARACTER_B, max_pairs=needed - len(qa))
-        qa.extend(extra)
-    if len(qa) < needed:
-        raise RuntimeError(f"Need {needed} QA pairs, got {len(qa)}")
 
-    training_slice = qa[:total_keys]
-    dup_q: dict[str, list[int]] = {}
-    dup_a: dict[str, list[int]] = {}
-    for idx, pair in enumerate(training_slice):
-        dup_q.setdefault(pair["question"], []).append(idx + 1)
-        dup_a.setdefault(pair["answer"], []).append(idx + 1)
-    for question, slots in dup_q.items():
-        if len(slots) > 1:
-            logger.warning(
-                "Data-hygiene: duplicate question at graph%s: %r",
-                "/graph".join(str(s) for s in slots),
-                question[:80],
-            )
-    for answer, slots in dup_a.items():
-        if len(slots) > 1:
-            logger.warning(
-                "Data-hygiene: duplicate answer at graph%s: %r",
-                "/graph".join(str(s) for s in slots),
-                answer[:80],
-            )
+    # Deterministic source order: primary, fallback, then the rest
+    # (alphabetical) so runs are reproducible when the pool composition
+    # shifts from adding new characters upstream.
+    primary = [CHARACTER_A, CHARACTER_B]
+    try:
+        remaining = sorted(c for c in list_characters() if c not in primary)
+    except Exception:
+        remaining = []
+    source_order = primary + remaining
 
-    return qa[:needed]
+    seen_q: set[str] = set()
+    seen_a: set[str] = set()
+    dropped_collisions = 0
+    pool: list[dict] = []
+
+    for char in source_order:
+        if len(pool) >= needed:
+            break
+        # Over-fetch so we have headroom after dedup.
+        batch = load_character_eval_qa(char, max_pairs=needed * 2)
+        for pair in batch:
+            q = pair.get("question", "").strip()
+            a = pair.get("answer", "").strip()
+            if not q or not a:
+                continue
+            if q in seen_q or a in seen_a:
+                dropped_collisions += 1
+                continue
+            seen_q.add(q)
+            seen_a.add(a)
+            pool.append(pair)
+            if len(pool) >= needed:
+                break
+
+    if len(pool) < needed:
+        raise RuntimeError(
+            f"Need {needed} unique QA pairs, got {len(pool)} after dedup "
+            f"(dropped {dropped_collisions} collisions). Widen sources."
+        )
+
+    if dropped_collisions:
+        logger.info(
+            "load_qa_pool: dropped %d colliding pairs; kept %d unique from %d sources",
+            dropped_collisions,
+            len(pool),
+            len(source_order),
+        )
+
+    return pool[:needed]
 
 
 def build_phase_A_keyed(qa_pool: list[dict]) -> list[dict]:
