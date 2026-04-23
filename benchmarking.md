@@ -2175,6 +2175,84 @@ epoch  fill   retention   note
 - **Production early-stop** as an operational win (≥50% GPU-time
   reduction on fill phases at no quality cost).
 
+#### Latent-recovery probe (2026-04-23) — headline mechanistic finding
+
+Diagnostic follow-up on the e30 13b adapter. The plateau at retention
+0.394 looks like 60% catastrophic forgetting on the unchanged keys. The
+probe tests whether those 97 failing keys still have their weight-space
+encoding and are merely mis-aligned at the decoding surface, or whether
+they have been genuinely overwritten.
+
+**Procedure.** Load the final 13b adapter
+(`outputs/test13b_retention_curve/mistral/20260423_002702/adapter/<ts>/`),
+continue training for 2 epochs at `lr=1e-5` (10× lower than fill) on
+*only* the 97 failing keys. Re-probe all 160 unchanged keys.
+
+**Result** (`recovery_probe/recovery_probe.json`):
+
+| Class | Before | After | Delta |
+|---|---:|---:|---:|
+| Failing keys recovered | 0 / 97 | 95 / 97 | **+95 (97.9%)** |
+| Passing keys kept | 63 / 63 | 62 / 63 | −1 (1.6% collateral) |
+| Unchanged-set retention | 63 / 160 (0.394) | 157 / 160 (**0.981**) | +58.7pp |
+| Mean confidence | 0.544 | 0.981 | +0.437 |
+| Wall | — | — | 229 s (3.8 min) |
+| Train loss | — | — | 0.027 |
+
+**Interpretation.** Under this regime (Mistral 7B, rank-8 LoRA, replay
+scaffold), post-hoc forgetting during fill is predominantly a
+**decoding-alignment** phenomenon, not weight-erasure. The knowledge
+is still encoded in the adapter; 2 epochs at low LR is enough to
+re-align the decoding surface with the original retrieval tokens. This
+reframes Test 13's retention deficit: what presented as a 62.5% loss
+is ≈98% recoverable at ~3% of the full-fill compute cost.
+
+**Caveats — do NOT over-claim without follow-up work:**
+- **n=1.** Single run, single fill cycle. Multi-round validation
+  (does the same recovery rate hold across 2-3 consecutive fills?)
+  is untested.
+- **Single model / single dataset.** Mistral 7B on the PerLTQA-derived
+  key set. No evidence it generalizes to other base models or
+  fact distributions.
+- **1.6% collateral** on previously-passing keys (1/63). Small but
+  non-zero; at 550-key scale this would be ~9 keys per touch-up.
+- **Recovery was done with knowledge of which keys had failed.** In
+  production this requires a SimHash-confidence-driven failure list
+  (`_run_recall_sanity_probe` already produces one).
+
+**What this unlocks (gated on multi-round validation):**
+- **Touch-up-as-self-healing extension** of `_run_recall_sanity_probe`.
+  Instead of rolling back on failure, replay the specific failing keys
+  for 2 epochs at LR=1e-5 and re-probe. Rollback only if re-probe still
+  fails. Preserves the carry-forward adapter instead of discarding work.
+- **Operational pattern: carry-forward adapter with nightly touch-up.**
+  Each consolidation's retention drift is a transient decoding offset,
+  fixable overnight at negligible compute cost.
+
+#### Weight-space analysis (corroborating evidence)
+
+Per-epoch metrics computed during the 13b prod run on the fill-LoRA
+delta (`weight_space_metrics.json`, `weight_space_curve.png`):
+
+- **`||ΔW||_F` saturates early.** 0.44 (e1) → 3.26 (e8) → 3.43 (e14) →
+  3.43 (e30). The adapter stops moving in norm by e8, 6 epochs before
+  fill converges.
+- **Effective rank is stable.** 6.28 (e1) → 6.33 (e30), on an 8-dim
+  LoRA. No subspace collapse; the scaffold does not compress capacity.
+- **Trajectory coherence flips sharply around e17.** Cosine similarity
+  between consecutive Δ-step vectors: near-zero through e13
+  (values: 0.33, 0.17, 0.07, 0.03, 0.07, −0.00, 0.01, −0.00, 0.17,
+  0.02, −0.04 — gradient-descent thrash), transitioning at e16 (0.40),
+  e17 (0.79), e18 (0.89), then locked at +0.87 to +0.94 through e30.
+  Fill `stable_perfect` was e14; coherence lock lags by ~3 epochs.
+
+Consistent with the recovery-probe reading: training past e8 is not
+adding weight-space mass, it is reorienting gradient steps into a
+coherent-direction regime that settles the decoding surface. The
+retention plateau at 0.394 sits in the epochs where ‖ΔW‖ is flat and
+coherence has locked in — further training would cost GPU without
+moving the adapter.
+
 **Still-deferred:** placeholder-variant ablation (`TBD-k` vs
 in-distribution decoy vs OOD prose vs nonsense) stays on the paper_notes
 follow-up list. Triple-level dedup ablation (fix `graph23↔graph26` etc)
