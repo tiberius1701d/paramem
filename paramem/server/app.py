@@ -1557,6 +1557,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
 
+# WP3 (docs/plan_security_hardening.md): bearer-token auth on all REST endpoints
+# when PARAMEM_API_TOKEN is set. No-op when unset (loud WARN at startup).
+from paramem.server.auth import (  # noqa: E402
+    BearerTokenMiddleware,
+    load_token_from_env,
+    log_startup_posture,
+)
+
+_api_token = load_token_from_env()
+app.add_middleware(BearerTokenMiddleware, token=_api_token)
+log_startup_posture(_api_token)
+
 
 # --- Endpoints ---
 
@@ -5818,12 +5830,26 @@ def main():
     project_root = Path(__file__).parent.parent.parent
     load_dotenv(project_root / ".env")
 
+    # WP4: per-secret file layout under ~/.config/paramem/secrets/ with strict
+    # permissions. Loaded after .env so shell env + .env take precedence.
+    # Missing directory = back-compat no-op.
+    from paramem.server.secret_store import (  # noqa: E402
+        load_secrets_from_dir,
+    )
+    from paramem.server.secret_store import (
+        log_startup_posture as log_secrets_posture,
+    )
+
+    _loaded_secrets = load_secrets_from_dir()
+
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
     )
+
+    log_secrets_posture(_loaded_secrets)
 
     config = load_server_config(args.config)
     _state["config"] = config
