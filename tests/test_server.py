@@ -230,21 +230,43 @@ class TestSessionBuffer:
         assert "Alex: I live in Amsterdam" in pending[0]["transcript"]
         assert pending[0]["speaker_id"] == "spk_abc"
 
-    def test_snapshot_save_and_restore(self, tmp_path):
-        from cryptography.fernet import Fernet
+    def _setup_daily(self, tmp_path, monkeypatch, passphrase="pw"):
+        """Install a daily age identity so the envelope-encrypt path engages."""
+        from paramem.backup.key_store import (
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
 
-        key = Fernet.generate_key().decode()
+        ident = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(ident, passphrase), key_path)
+        monkeypatch.setenv("PARAMEM_DAILY_PASSPHRASE", passphrase)
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
+        return ident
 
-        # Populate buffer and save snapshot
-        buf1 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+    def test_snapshot_save_and_restore(self, tmp_path, monkeypatch):
+        self._setup_daily(tmp_path, monkeypatch)
+
+        buf1 = SessionBuffer(tmp_path / "sessions")
         buf1.set_speaker("conv1", "spk_abc", "Alex")
         buf1.append("conv1", "user", "I live in Amsterdam")
         buf1.append("conv1", "assistant", "That's nice!")
         assert buf1.save_snapshot()
         assert (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
-        # Restore into a fresh buffer
-        buf2 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        # Snapshot body must be an age envelope (the current posture).
+        from paramem.backup.age_envelope import AGE_MAGIC
+
+        body = (tmp_path / "sessions" / "session_snapshot.enc").read_bytes()
+        assert body.startswith(AGE_MAGIC), (
+            "session snapshot must land as an age envelope under the daily posture"
+        )
+
+        # Restore into a fresh buffer.
+        buf2 = SessionBuffer(tmp_path / "sessions")
         assert buf2.load_snapshot()
         assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
@@ -254,43 +276,90 @@ class TestSessionBuffer:
         assert pending[0]["speaker_id"] == "spk_abc"
         assert buf2.get_speaker("conv1") == "Alex"
 
-    def test_snapshot_wrong_key_discards(self, tmp_path):
-        from cryptography.fernet import Fernet
+    def test_snapshot_corrupted_envelope_discarded(self, tmp_path, monkeypatch):
+        """Tampered snapshot → DecryptError caught → file unlinked, buffer empty."""
+        self._setup_daily(tmp_path, monkeypatch)
 
-        key1 = Fernet.generate_key().decode()
-        key2 = Fernet.generate_key().decode()
-
-        buf1 = SessionBuffer(tmp_path / "sessions", snapshot_key=key1)
+        buf1 = SessionBuffer(tmp_path / "sessions")
         buf1.append("conv1", "user", "Secret data")
         buf1.save_snapshot()
 
-        buf2 = SessionBuffer(tmp_path / "sessions", snapshot_key=key2)
-        assert not buf2.load_snapshot()  # decryption fails, file deleted
-        assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
+        # Tamper: zero out bytes past the age header.
+        snap_path = tmp_path / "sessions" / "session_snapshot.enc"
+        raw = snap_path.read_bytes()
+        snap_path.write_bytes(raw[:80] + bytes(len(raw) - 80))
+
+        buf2 = SessionBuffer(tmp_path / "sessions")
+        assert not buf2.load_snapshot()
+        assert not snap_path.exists(), "corrupted snapshot must be unlinked on load failure"
         assert buf2.pending_count == 0
 
-    def test_snapshot_deleted_on_restore(self, tmp_path):
-        from cryptography.fernet import Fernet
+    def test_snapshot_deleted_on_successful_restore(self, tmp_path, monkeypatch):
+        self._setup_daily(tmp_path, monkeypatch)
 
-        key = Fernet.generate_key().decode()
-
-        buf1 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        buf1 = SessionBuffer(tmp_path / "sessions")
         buf1.append("conv1", "user", "Hello")
         buf1.save_snapshot()
         assert (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
-        buf2 = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        buf2 = SessionBuffer(tmp_path / "sessions")
         buf2.load_snapshot()
         assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
-    def test_snapshot_empty_buffer_no_file(self, tmp_path):
-        from cryptography.fernet import Fernet
+    def test_snapshot_empty_buffer_no_file(self, tmp_path, monkeypatch):
+        self._setup_daily(tmp_path, monkeypatch)
 
-        key = Fernet.generate_key().decode()
-
-        buffer = SessionBuffer(tmp_path / "sessions", snapshot_key=key)
+        buffer = SessionBuffer(tmp_path / "sessions")
         assert buffer.save_snapshot()
         assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
+
+    def test_snapshot_no_op_when_no_keys_loaded(self, tmp_path, monkeypatch):
+        """Security OFF → save returns False; no snapshot file is written.
+        Operator is not silently trusting a plaintext snapshot path."""
+        # Explicitly clear any inherited env + point daily path at a missing file.
+        monkeypatch.delenv("PARAMEM_DAILY_PASSPHRASE", raising=False)
+        monkeypatch.delenv("PARAMEM_MASTER_KEY", raising=False)
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
+            tmp_path / "absent.age",
+        )
+
+        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer.append("conv1", "user", "state that would have been saved")
+        assert buffer.save_snapshot() is False
+        assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
+
+    def test_snapshot_load_preserves_file_when_keys_absent(self, tmp_path, monkeypatch, caplog):
+        """Snapshot file present but no key material loaded — must NOT unlink
+        (operator may restore the key and recover), and must log a WARN."""
+        import logging
+
+        # First, write a snapshot with keys loaded.
+        self._setup_daily(tmp_path, monkeypatch)
+        buf1 = SessionBuffer(tmp_path / "sessions")
+        buf1.append("conv1", "user", "important mid-turn state")
+        buf1.save_snapshot()
+        snap_path = tmp_path / "sessions" / "session_snapshot.enc"
+        assert snap_path.exists()
+
+        # Now simulate "operator retired the key"
+        from paramem.backup.key_store import _clear_daily_identity_cache
+
+        monkeypatch.delenv("PARAMEM_DAILY_PASSPHRASE", raising=False)
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
+            tmp_path / "absent.age",
+        )
+        _clear_daily_identity_cache()
+
+        buf2 = SessionBuffer(tmp_path / "sessions")
+        with caplog.at_level(logging.WARNING, logger="paramem.server.session_buffer"):
+            assert buf2.load_snapshot() is False
+        # File must still be there — operator's chance to recover it.
+        assert snap_path.exists(), (
+            "snapshot must NOT be unlinked when keys are absent — operator may "
+            "restore the key and recover"
+        )
 
 
 class TestKeyMetadata:

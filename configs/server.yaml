@@ -76,7 +76,6 @@ server:
 model: mistral  # mistral | gemma | qwen3b | gemma4
 
 debug: true  # cycle snapshots, verbose logging
-snapshot_key: "${PARAMEM_MASTER_KEY}"  # Fernet key for encrypted session snapshots
 
 # --- Paths (mount points) ---
 paths:

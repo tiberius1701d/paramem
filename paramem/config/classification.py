@@ -68,7 +68,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     # --- Top-level scalars ---
     "model": Tier.DESTRUCTIVE,
     "debug": Tier.PIPELINE_ALTERING,
-    "snapshot_key": Tier.DESTRUCTIVE,
     "cloud_only": Tier.DESTRUCTIVE,
     "headless_boot": Tier.OPERATIONAL,
     # --- paths ---

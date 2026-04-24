@@ -21,9 +21,27 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cryptography.fernet import Fernet
+from paramem.backup.encryption import (
+    envelope_decrypt_bytes,
+    envelope_encrypt_bytes,
+    master_key_loaded,
+)
+from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
 
 logger = logging.getLogger(__name__)
+
+
+def _snapshots_enabled() -> bool:
+    """Return True when any key material is loaded.
+
+    Snapshots need a key to encrypt with; without one, the
+    ``save_snapshot`` / ``load_snapshot`` pair no-ops. Either the Fernet
+    master key (legacy PMEM1 envelope) or the daily age identity is
+    sufficient — :func:`envelope_encrypt_bytes` picks the right format
+    based on the same posture.
+    """
+    return master_key_loaded() or daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
+
 
 # Session conversation states
 STATE_NEW = "new"
@@ -47,7 +65,6 @@ class SessionBuffer:
         session_dir: Path,
         retain_sessions: bool = True,
         debug: bool = False,
-        snapshot_key: str = "",
     ):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -58,11 +75,16 @@ class SessionBuffer:
             self.archive_dir.mkdir(exist_ok=True)
         self._snapshot_path = self.session_dir / "session_snapshot.enc"
 
-        if snapshot_key:
-            self._fernet = Fernet(snapshot_key.encode())
+        if _snapshots_enabled():
+            logger.info(
+                "Session snapshots enabled — mid-turn state will persist across "
+                "graceful restarts via envelope_encrypt_bytes"
+            )
         else:
-            self._fernet = None
-            logger.info("No snapshot_key configured — session snapshots disabled")
+            logger.info(
+                "Session snapshots disabled — no key material loaded; mid-turn "
+                "state is ephemeral across restarts"
+            )
 
         # In-memory session state: conversation_id → {speaker, speaker_id, state}
         self._sessions: dict[str, dict] = {}
@@ -397,23 +419,29 @@ class SessionBuffer:
     def save_snapshot(self) -> bool:
         """Write encrypted snapshot of in-memory state to disk.
 
-        Called on graceful shutdown (SIGUSR1, SIGTERM). Returns True on success.
+        Called on graceful shutdown (SIGUSR1, SIGTERM). Returns True on
+        success. The on-disk body carries whichever envelope format the
+        server is producing (age when the daily identity is loaded,
+        PMEM1 when only the Fernet master key is loaded). When no key
+        material is loaded, returns False without writing — snapshot
+        persistence requires at least one key so a restart on a fresh
+        host with the key restored can read it back.
         """
-        if not self._fernet:
+        if not _snapshots_enabled():
             return False
         if not self._turns and not self._sessions:
             logger.info("No session data to snapshot")
             return True
 
         payload = {
-            "turns": {k: v for k, v in self._turns.items()},
+            "turns": dict(self._turns),
             "sessions": self._sessions,
         }
         try:
             plaintext = json.dumps(payload).encode()
-            ciphertext = self._fernet.encrypt(plaintext)
+            envelope = envelope_encrypt_bytes(plaintext)
             tmp = self._snapshot_path.with_suffix(".tmp")
-            tmp.write_bytes(ciphertext)
+            tmp.write_bytes(envelope)
             tmp.rename(self._snapshot_path)
             logger.info(
                 "Session snapshot saved: %d conversations, %d turns",
@@ -426,17 +454,33 @@ class SessionBuffer:
             return False
 
     def load_snapshot(self) -> bool:
-        """Restore in-memory state from encrypted snapshot.
+        """Restore in-memory state from an encrypted snapshot.
 
-        Called on startup. Decrypts and loads, then deletes the file.
-        Returns True if a snapshot was restored.
+        Called on startup. Decrypts via :func:`envelope_decrypt_bytes`
+        (dispatches age / PMEM1 / legacy bare Fernet by magic), loads the
+        payload, then deletes the file. Returns True iff a snapshot was
+        actually restored.
+
+        When the snapshot file exists but no key material is loaded, logs
+        a warning and returns False without unlinking — the file cannot
+        be decrypted without the retired key, but the operator may want
+        to inspect / recover it manually. A deliberate ``paramem restore``
+        or a key-rotation workflow is the right way to bring it back.
         """
-        if not self._fernet or not self._snapshot_path.exists():
+        if not self._snapshot_path.exists():
+            return False
+        if not _snapshots_enabled():
+            logger.warning(
+                "Session snapshot present at %s but no key material is loaded "
+                "— leaving in place; remove it manually or restore the key to "
+                "recover its contents",
+                self._snapshot_path,
+            )
             return False
 
         try:
-            ciphertext = self._snapshot_path.read_bytes()
-            plaintext = self._fernet.decrypt(ciphertext)
+            raw = self._snapshot_path.read_bytes()
+            plaintext = envelope_decrypt_bytes(raw)
             payload = json.loads(plaintext.decode())
 
             restored_turns = payload.get("turns", {})

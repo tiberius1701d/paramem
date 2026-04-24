@@ -1142,7 +1142,6 @@ async def lifespan(app: FastAPI):
         config.session_dir,
         retain_sessions=config.consolidation.retain_sessions,
         debug=config.debug,
-        snapshot_key=config.snapshot_key,
     )
     _state["session_buffer"].load_snapshot()
 
