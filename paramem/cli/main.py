@@ -34,6 +34,7 @@ from paramem.cli import (
     migrate_cancel,
     migrate_rollback,
     migrate_status,
+    migrate_to_age,
 )
 
 CLI_VERSION = "0.1.0"
@@ -233,6 +234,7 @@ def _build_parser() -> argparse.ArgumentParser:
     encrypt_infra.add_parser(subparsers)
     decrypt_infra.add_parser(subparsers)
     dump.add_parser(subparsers)
+    migrate_to_age.add_parser(subparsers)
 
     return parser
 
@@ -302,6 +304,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "dump":
         return dump.run(args)
+
+    if args.command == "migrate-to-age":
+        return migrate_to_age.run(args)
 
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)

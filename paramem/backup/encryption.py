@@ -30,10 +30,14 @@ Services provided:
   unwrap transparently.
 
 ``encrypt_bytes`` / ``decrypt_bytes`` operate on single-file inputs only;
-directory-shaped artifacts iterate per-file externally. The current writer
-still produces PMEM1 envelopes — the writer flip to age multi-recipient
-envelopes and the ``paramem migrate-to-age`` sweep land in a follow-up
-commit.
+directory-shaped artifacts iterate per-file externally. The writer
+:func:`write_infra_bytes` routes to age when the daily identity is
+loadable (multi-recipient when ``recovery.pub`` is also present,
+single-recipient when not) and falls back to PMEM1 when only the Fernet
+master key is loaded. The ``paramem migrate-to-age`` CLI walks the
+infrastructure paths and rewrites any lingering PMEM1 envelopes as age
+multi-recipient envelopes; Fernet support is retained as a rollback
+safety net for one release and then removed.
 """
 
 from __future__ import annotations
@@ -46,7 +50,12 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-from paramem.backup.age_envelope import AGE_MAGIC, age_decrypt_bytes, is_age_envelope
+from paramem.backup.age_envelope import (
+    AGE_MAGIC,
+    age_decrypt_bytes,
+    age_encrypt_bytes,
+    is_age_envelope,
+)
 from paramem.backup.types import ArtifactKind, EncryptAtRest, FatalConfigError
 
 logger = logging.getLogger(__name__)
@@ -423,9 +432,22 @@ def _atomic_write_bytes(path: Path, body: bytes) -> None:
 def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     """Atomically write *plaintext* to *path*, encrypting when a key is loaded.
 
-    When a master key is present the on-disk body is the PMEM1 envelope
-    (magic + Fernet ciphertext).  Otherwise the body is *plaintext* verbatim.
-    The caller does not need to branch on key state.
+    Priority (highest first):
+
+    1. **age multi-recipient** ``[daily, recovery]`` — when the daily
+       identity is loadable AND the recovery public recipient is on disk.
+       This is the steady-state production write after ``paramem
+       generate-key`` + ``paramem migrate-to-age``.
+    2. **age single-recipient** ``[daily]`` — daily loadable but
+       ``recovery.pub`` missing. Degraded mode; the startup log already
+       warned the operator at this posture.
+    3. **PMEM1** (legacy Fernet envelope) — only the Fernet master key
+       is loaded. Retained for one release as the rollback safety net
+       while the age migration is in flight.
+    4. **Plaintext** — no key material loaded.
+
+    Callers do not need to branch on key state; the universal reader
+    (:func:`read_maybe_encrypted`) unwraps any of the three formats.
 
     Parameters
     ----------
@@ -439,6 +461,31 @@ def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     OSError
         On any filesystem error.
     """
+    from paramem.backup import key_store as _ks
+
+    # Late attribute lookup so tests can point DAILY_KEY_PATH_DEFAULT /
+    # RECOVERY_PUB_PATH_DEFAULT at a scratch directory without freezing
+    # the originals into this function's defaults at import time.
+    if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+        try:
+            daily = _ks.load_daily_identity_cached(_ks.DAILY_KEY_PATH_DEFAULT)
+        except Exception:  # noqa: BLE001 — graceful fallback on any unwrap failure
+            # Loadable probe passed (file + env present) but the unwrap failed.
+            # Possible causes: wrong passphrase (pyrage.DecryptError), file
+            # disappeared between probe and load (FileNotFoundError), missing
+            # env at load time (RuntimeError). Fall through to the legacy path
+            # rather than crashing the writer; the first read of an existing
+            # age file will surface the real error with operator-actionable
+            # context.
+            daily = None
+
+        if daily is not None:
+            recipients = [daily.to_public()]
+            if _ks.recovery_pub_available(_ks.RECOVERY_PUB_PATH_DEFAULT):
+                recipients.append(_ks.load_recovery_recipient(_ks.RECOVERY_PUB_PATH_DEFAULT))
+            _atomic_write_bytes(Path(path), age_encrypt_bytes(plaintext, recipients))
+            return
+
     if master_key_loaded():
         body = PMEM1_MAGIC + encrypt_bytes(plaintext)
     else:

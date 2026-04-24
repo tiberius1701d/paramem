@@ -23,13 +23,17 @@ from pathlib import Path
 import pyrage
 import pytest
 from cryptography.fernet import Fernet
+from pyrage import x25519
 
-from paramem.backup.age_envelope import age_encrypt_bytes
+from paramem.backup.age_envelope import AGE_MAGIC, age_encrypt_bytes, is_age_envelope
 from paramem.backup.encryption import (
     MASTER_KEY_ENV_VAR,
+    PMEM1_MAGIC,
     _clear_cipher_cache,
     _probe_data_dir,
     assert_mode_consistency,
+    encrypt_bytes,
+    is_pmem1_envelope,
     read_maybe_encrypted,
     write_infra_bytes,
 )
@@ -39,6 +43,7 @@ from paramem.backup.key_store import (
     mint_daily_identity,
     wrap_daily_identity,
     write_daily_key_file,
+    write_recovery_pub_file,
 )
 from paramem.backup.types import FatalConfigError
 
@@ -74,6 +79,27 @@ def _setup_daily(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passphrase: st
     monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, passphrase)
     monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
     return ident
+
+
+def _setup_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> x25519.Recipient:
+    """Mint + persist a recovery identity; point RECOVERY_PUB_PATH_DEFAULT at it."""
+    recovery = x25519.Identity.generate()
+    recovery_path = tmp_path / "recovery.pub"
+    write_recovery_pub_file(recovery.to_public(), recovery_path)
+    monkeypatch.setattr("paramem.backup.key_store.RECOVERY_PUB_PATH_DEFAULT", recovery_path)
+    return recovery.to_public()
+
+
+def _write_pmem1_bypass_dispatch(path: Path, plaintext: bytes) -> None:
+    """Write a PMEM1 envelope directly, bypassing write_infra_bytes' routing.
+
+    The production ``write_infra_bytes`` prefers age over PMEM1 when both keys
+    are loaded. Tests that need a mixed on-disk state (e.g. to verify the
+    mode-consistency classifier or a refuse case) must build the PMEM1 body
+    directly instead of relying on the smart writer.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(PMEM1_MAGIC + encrypt_bytes(plaintext))
 
 
 class TestReadDispatchPlaintext:
@@ -144,8 +170,9 @@ class TestProbeDataDirClassification:
         assert not probe_pt.encrypted_paths
         assert not probe_pt.age_paths
 
-        # Rewrite as PMEM1 (via write_infra_bytes while Fernet key loaded).
-        write_infra_bytes(pt_path, b'{"pmem1": true}')
+        # Rewrite as PMEM1 directly — write_infra_bytes would prefer age
+        # because _setup_daily loaded the daily identity in this test.
+        _write_pmem1_bypass_dispatch(pt_path, b'{"pmem1": true}')
         probe_pm = _probe_data_dir(data)
         assert len(probe_pm.encrypted_paths) == 1
         assert not probe_pm.plaintext_paths
@@ -194,8 +221,9 @@ class TestAssertModeConsistencyAge:
         data = tmp_path / "data"
         data.mkdir()
 
-        # PMEM1 file via write_infra_bytes.
-        write_infra_bytes(data / "registry.json", b"{}")
+        # PMEM1 file — write directly; write_infra_bytes would prefer age
+        # now that the daily identity is loaded alongside the Fernet key.
+        _write_pmem1_bypass_dispatch(data / "registry.json", b"{}")
         # age file directly.
         (data / "speaker_profiles.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
 
@@ -246,7 +274,7 @@ class TestAssertModeConsistencyAge:
         os.environ[MASTER_KEY_ENV_VAR] = _make_fernet_key()
         data = tmp_path / "data"
         data.mkdir()
-        write_infra_bytes(data / "registry.json", b"{}")
+        _write_pmem1_bypass_dispatch(data / "registry.json", b"{}")
         (data / "speaker_profiles.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
 
         with pytest.raises(FatalConfigError, match="daily identity is not loadable"):
@@ -260,11 +288,12 @@ class TestAssertModeConsistencyAge:
         are unreadable until the Fernet key is restored or the tail is
         re-encrypted."""
         ident = _setup_daily(tmp_path, monkeypatch)
-        # Write PMEM1 while Fernet key is loaded, then drop it.
+        # Write PMEM1 directly — write_infra_bytes would prefer age now that
+        # the daily identity is loaded.
         os.environ[MASTER_KEY_ENV_VAR] = _make_fernet_key()
         data = tmp_path / "data"
         data.mkdir()
-        write_infra_bytes(data / "registry.json", b"{}")
+        _write_pmem1_bypass_dispatch(data / "registry.json", b"{}")
         (data / "speaker_profiles.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
         os.environ.pop(MASTER_KEY_ENV_VAR, None)
         _clear_cipher_cache()
@@ -304,3 +333,167 @@ class TestAssertModeConsistencyRegression:
         data.mkdir()
         (data / "registry.json").write_bytes(b'{"plain": true}')
         assert_mode_consistency(data, key_loaded=False)
+
+
+class TestWriteInfraBytesFlip:
+    """write_infra_bytes chooses envelope format by loaded-key posture.
+
+    Priority: age-multi > age-single > PMEM1 > plaintext.
+    """
+
+    def test_writes_age_multi_recipient_when_both_keys_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_daily(tmp_path, monkeypatch)
+        _setup_recovery(tmp_path, monkeypatch)
+
+        target = tmp_path / "registry.json"
+        write_infra_bytes(target, b'{"payload": 1}')
+        assert is_age_envelope(target)
+        assert not is_pmem1_envelope(target)
+        assert read_maybe_encrypted(target) == b'{"payload": 1}'
+
+    def test_writes_age_single_recipient_when_recovery_pub_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_daily(tmp_path, monkeypatch)
+        # Deliberately do NOT set up recovery — point the default at a missing path.
+        monkeypatch.setattr(
+            "paramem.backup.key_store.RECOVERY_PUB_PATH_DEFAULT",
+            tmp_path / "nope.pub",
+        )
+
+        target = tmp_path / "registry.json"
+        write_infra_bytes(target, b'{"daily-only": true}')
+        assert is_age_envelope(target), "daily loadable → age write even without recovery"
+        assert read_maybe_encrypted(target) == b'{"daily-only": true}'
+
+    def test_writes_pmem1_when_only_fernet_loaded(self, tmp_path: Path) -> None:
+        os.environ[MASTER_KEY_ENV_VAR] = _make_fernet_key()
+
+        target = tmp_path / "registry.json"
+        write_infra_bytes(target, b'{"pmem1": 1}')
+        assert is_pmem1_envelope(target)
+        assert not is_age_envelope(target)
+        assert target.read_bytes().startswith(PMEM1_MAGIC)
+        assert read_maybe_encrypted(target) == b'{"pmem1": 1}'
+
+    def test_writes_plaintext_when_no_keys_loaded(self, tmp_path: Path) -> None:
+        target = tmp_path / "registry.json"
+        write_infra_bytes(target, b'{"plain": true}')
+        assert target.read_bytes() == b'{"plain": true}'
+        assert not is_age_envelope(target)
+        assert not is_pmem1_envelope(target)
+
+    def test_age_priority_wins_over_fernet_when_both_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Transitional state during migration — both keys loaded. New writes
+        must land as age so the migration converges."""
+        _setup_daily(tmp_path, monkeypatch)
+        _setup_recovery(tmp_path, monkeypatch)
+        os.environ[MASTER_KEY_ENV_VAR] = _make_fernet_key()
+
+        target = tmp_path / "registry.json"
+        write_infra_bytes(target, b'{"both": 1}')
+        assert is_age_envelope(target), "age takes precedence over Fernet"
+        assert not is_pmem1_envelope(target)
+
+    def test_wrong_passphrase_gracefully_falls_back_to_pmem1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Loadable probe passes (file + env present) but the env passphrase
+        is wrong → unwrap fails. Writer must not crash; fall through to the
+        next available format (PMEM1 here)."""
+        _setup_daily(tmp_path, monkeypatch, passphrase="correct")
+        # Override the env with a wrong passphrase; daily_identity_loadable still
+        # returns True because it only probes presence, not correctness.
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "wrong-passphrase")
+        _clear_daily_identity_cache()
+        os.environ[MASTER_KEY_ENV_VAR] = _make_fernet_key()
+
+        target = tmp_path / "registry.json"
+        write_infra_bytes(target, b'{"fallback": 1}')
+        assert is_pmem1_envelope(target), (
+            "failed unwrap must gracefully fall through to the Fernet path"
+        )
+
+    def test_multi_recipient_envelope_decryptable_by_either_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Operational guarantee: a file written under [daily, recovery] must
+        remain readable via the recovery identity on hardware replacement."""
+        from pyrage import x25519 as _x25519
+
+        from paramem.backup.age_envelope import age_decrypt_bytes
+
+        _setup_daily(tmp_path, monkeypatch)
+        # We need the recovery *identity*, not just the recipient, to simulate
+        # the restore-with-recovery-key flow. Generate here and wire both.
+        recovery = _x25519.Identity.generate()
+        recovery_path = tmp_path / "recovery.pub"
+        write_recovery_pub_file(recovery.to_public(), recovery_path)
+        monkeypatch.setattr("paramem.backup.key_store.RECOVERY_PUB_PATH_DEFAULT", recovery_path)
+
+        target = tmp_path / "registry.json"
+        payload = b'{"critical": "data"}'
+        write_infra_bytes(target, payload)
+
+        assert is_age_envelope(target)
+        # Daily identity decrypts (via the cached loader / universal reader).
+        assert read_maybe_encrypted(target) == payload
+        # Recovery identity decrypts the raw envelope bytes directly — this is
+        # the hardware-replacement path (no daily key on the new device).
+        assert age_decrypt_bytes(target.read_bytes(), [recovery]) == payload
+
+
+class TestWriterPriorityEdgeCases:
+    def test_env_set_but_daily_file_missing_falls_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """daily_identity_loadable probe is False when the file is missing
+        even if the env is set. Writer must skip the age branch cleanly."""
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
+            tmp_path / "absent.age",
+        )
+        os.environ[MASTER_KEY_ENV_VAR] = _make_fernet_key()
+
+        target = tmp_path / "registry.json"
+        write_infra_bytes(target, b'{"x": 1}')
+        assert is_pmem1_envelope(target)
+        assert not is_age_envelope(target)
+
+    def test_round_trip_under_every_posture(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """All four postures produce a file that round-trips through
+        read_maybe_encrypted."""
+        # 1. plaintext
+        t1 = tmp_path / "plain.json"
+        write_infra_bytes(t1, b"plain")
+        assert read_maybe_encrypted(t1) == b"plain"
+
+        # 2. PMEM1
+        os.environ[MASTER_KEY_ENV_VAR] = _make_fernet_key()
+        t2 = tmp_path / "pmem1.json"
+        write_infra_bytes(t2, b"pmem1")
+        assert read_maybe_encrypted(t2) == b"pmem1"
+
+        # 3. age single (daily only)
+        _setup_daily(tmp_path, monkeypatch)
+        t3 = tmp_path / "age-single.json"
+        write_infra_bytes(t3, b"age-single")
+        assert read_maybe_encrypted(t3) == b"age-single"
+
+        # 4. age multi
+        _setup_recovery(tmp_path, monkeypatch)
+        t4 = tmp_path / "age-multi.json"
+        write_infra_bytes(t4, b"age-multi")
+        assert read_maybe_encrypted(t4) == b"age-multi"
+
+        # Both envelopes live under the tmp_path; reader dispatches by magic.
+        assert t2.read_bytes().startswith(PMEM1_MAGIC)
+        assert t3.read_bytes().startswith(AGE_MAGIC)
+        assert t4.read_bytes().startswith(AGE_MAGIC)
