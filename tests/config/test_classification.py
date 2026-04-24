@@ -39,7 +39,6 @@ class TestDestructiveSamples:
             "paths.data",
             "adapters.episodic.rank",
             "cloud_only",
-            "snapshot_key",
             "adapters.episodic.target_modules",  # extension field
             # Condition 1: alpha has identical blast radius to rank — Destructive.
             "adapters.episodic.alpha",

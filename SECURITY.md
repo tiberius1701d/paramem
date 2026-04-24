@@ -12,7 +12,7 @@ This document describes what ParaMem defends, what it does not, the trust bounda
 | Indexed key registry | Key identifiers, SimHash fingerprints, timestamps | JSON |
 | Cumulative knowledge graph | Entities, predicates, relations | JSON (NetworkX) |
 | Session queue | Transcript + speaker binding awaiting consolidation | JSON (atomic temp-file + rename) |
-| Session snapshot | RAM state at graceful shutdown | Fernet-encrypted when a key is configured |
+| Session snapshot | RAM state at graceful shutdown | Envelope-encrypted when a key is configured (age or PMEM1) |
 | Speaker profiles | Voice embeddings + disclosed names | JSON (biometric data — see §7) |
 | Background trainer resume state | Epoch counter + checkpoint references | JSON |
 | Adapter manifest sidecars | Base-model SHA, tokenizer fingerprint, LoRA shape | JSON |
@@ -77,7 +77,7 @@ All lifecycle commands are per-file atomic + idempotent + resumable via a crash-
 - **Home Assistant ↔ ParaMem.** A thin HA custom component POSTs to the `/chat` endpoint over HTTP on the LAN. Bearer-token authentication is opt-in via the `PARAMEM_API_TOKEN` environment variable. When unset, the server accepts any LAN request — this is announced at startup as an explicit open posture, not a silent one.
 - **ParaMem → cloud.** Sanitized queries (and speaker name, as persona anchor) may be sent to a configured cloud agent for escalation or SOTA enrichment. This path is opt-in via config; nothing is sent without an active cloud configuration. Sanitization is regex-based and is documented as incomplete — see §7.
 - **Adapter files at rest.** The on-disk artifacts listed in §1 live under the configured data directory. At-rest encryption is governed by the binary switch in §4.
-- **Backup at rest.** Session snapshots are Fernet-encrypted when a master key is present. Other infrastructure metadata follows the Security-ON/OFF contract in §4.
+- **Backup at rest.** Session snapshots and every other piece of infrastructure metadata follow the Security-ON/OFF contract in §4 — encrypted via envelope dispatch (age when the daily identity is loaded, PMEM1 when only the Fernet master key is loaded) and plaintext only when no key is configured.
 
 ## 4. Security modes
 
@@ -102,6 +102,10 @@ No key material is loaded. All infrastructure metadata is plaintext on disk. Thi
 SECURITY: OFF (no key — all infrastructure metadata is plaintext on disk)
 ```
 and surfaces `encryption: off` on the `/status` endpoint. The server does not silently degrade between modes: if a key is loaded but on-disk files are plaintext (or vice versa), startup refuses until an explicit `paramem encrypt-infra` / `paramem migrate-to-age` / `paramem decrypt-infra --i-accept-plaintext` migration is performed.
+
+### Fail-loud opt-in: `security.require_encryption`
+
+The Security-OFF opt-out is the operator's choice. Deployments that want a misconfiguration to fail loud rather than silently land plaintext on disk can set `security.require_encryption: true` in `configs/server.yaml`. When set, the server refuses to start unless the age daily identity or `PARAMEM_MASTER_KEY` is loadable — a uniform startup gate covering every feature that writes to disk (snapshots, checkpoint shards, backups, infrastructure metadata). Default is `false` (the AUTO-everywhere posture described above).
 
 ### Transitional state (age migration in progress)
 
@@ -139,7 +143,7 @@ Both keys decrypt the same data. Loss of the daily key is routine (rotate it). L
 
 **Hardware replacement.** `paramem restore --recovery-key-file <path>` is the entry point after losing the original device. Given the recovery bech32 from paper, it sanity-checks against an on-disk age envelope, mints a fresh daily identity (new operator-supplied passphrase), writes `daily_key.age` + `recovery.pub` to the new machine, and re-encrypts every age file to `[daily_new, recovery]`. The recovery identity is reused on the envelopes — it is the thing that authorised the restore, and the operator's paper copy remains valid. Crash-safe via the same rotation-manifest mechanism; a typo in the bech32 aborts before any on-disk mutation. Distinct from `paramem backup-restore`, which restores a backup archive over REST.
 
-**Backup restore across key rotation.** Every encrypted backup sidecar carries the 16-hex-char fingerprint of the key it was written under. `POST /backup/restore` compares the sidecar's fingerprint against the current master key; a mismatch is refused with HTTP 400 `fingerprint_mismatch`. To restore a backup taken under a prior key, keep that key set in `PARAMEM_MASTER_KEY` and pass `force_rotate_key=true` (REST body) or `--force-rotate-key` (CLI) — the server logs a WARN and proceeds. Backups written while Security was OFF have no stored fingerprint and always restore.
+**Backup restore across key rotation.** Legacy (Fernet/PMEM1) backup sidecars carry the 16-hex-char fingerprint of the master key they were written under. `POST /backup/restore` compares this fingerprint against the currently loaded `PARAMEM_MASTER_KEY`; a mismatch is refused with HTTP 400 `fingerprint_mismatch`. To restore a backup taken under a prior key, keep that key set in `PARAMEM_MASTER_KEY` and pass `force_rotate_key=true` (REST body) or `--force-rotate-key` (CLI) — the server logs a WARN and proceeds. Age-encrypted backups record `key_fingerprint=null` by design (the Fernet-style fingerprint concept does not map onto X25519 recipient lists); a stale daily identity surfaces as a decrypt error instead, equally actionable. Backups written while Security was OFF have no fingerprint either, and always restore.
 
 Biometric unlocks (Windows Hello, fingerprint, FIDO2) are supported as *access conveniences* for the daily path only. They are not a recovery mechanism: biometrics unlock a sealed key on specific hardware; they do not regenerate the key on a new device. Any sensible deployment pairs biometric-unlocked daily access with a printed recovery artifact.
 
@@ -147,7 +151,7 @@ Biometric unlocks (Windows Hello, fingerprint, FIDO2) are supported as *access c
 
 ParaMem is a single-admin service. The operator — the person running the server — is responsible for:
 
-- Generating and storing the master key. If you set `PARAMEM_MASTER_KEY`, also save a recovery copy offline. Do not rely on a single storage location for the only copy.
+- Generating and storing key material. Run `paramem generate-key` to mint the daily identity (stored passphrase-wrapped on this host) and the recovery identity (printed once — save it offline). If you instead deploy with the legacy `PARAMEM_MASTER_KEY` Fernet path, save a recovery copy offline under the same discipline. In both cases, do not rely on a single storage location for the only copy.
 - Scoping LAN exposure. Set `PARAMEM_LISTEN_IP` to the specific host interface that should accept incoming requests, and `PARAMEM_NAS_IP` to scope the Windows Firewall rule to the Home Assistant source host. Unset values default to an open posture with a loud startup warning.
 - Setting `PARAMEM_API_TOKEN` to require bearer-token authentication on all REST endpoints. When unset, the server accepts any request from a reachable peer.
 - Managing `.env` and per-secret files under `~/.config/paramem/secrets/` with file mode `0600` and directory mode `0700`. The server refuses to start if permissions are looser.

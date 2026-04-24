@@ -374,13 +374,38 @@ tts:
       # device: cpu            # per-voice override (default: inherit from tts.device)
 
 # ============================================================================
-# SECURITY — BACKUP SETTINGS (Slice 3b.2 + Slice 6a)
+# SECURITY
 # ============================================================================
-# orphan_sweep (Slice 3b.2): max age in hours for crashed pre-migration
-# backup slots. 0 disables orphan sweep entirely. Default 24.
+# Two independent areas under `security:`:
 #
-# retention (Slice 6a): per-tier retention budget. Spec rules apply in this
-# precedence (strongest first):
+#   1. require_encryption — uniform startup gate.
+#   2. backups            — retention + schedule for backup slots.
+#
+# ----------------------------------------------------------------------------
+# require_encryption
+# ----------------------------------------------------------------------------
+# When true, the server refuses to start unless at least one key path is
+# loadable (age daily identity via PARAMEM_DAILY_PASSPHRASE + the daily-key
+# file, OR PARAMEM_MASTER_KEY for the legacy Fernet envelope). The gate
+# covers every feature that writes to disk: session snapshots, HF Trainer
+# checkpoint shards, backup artifacts, and infrastructure metadata.
+#
+# Default (false) is AUTO everywhere: encrypt when a key is loaded, plaintext
+# otherwise. Set to true when a misconfig must fail loud instead of
+# silently producing plaintext on disk.
+#
+# ----------------------------------------------------------------------------
+# backups.orphan_sweep
+# ----------------------------------------------------------------------------
+# max_age_hours bounds the look-back window for the migration-trial recovery
+# path that runs at startup. A TRIAL marker older than this is not resumed.
+# Unrelated .pending/ slots from crashed writes are always swept on startup
+# regardless of this value.
+#
+# ----------------------------------------------------------------------------
+# backups.retention
+# ----------------------------------------------------------------------------
+# Per-tier retention budget. Rules apply in this precedence (strongest first):
 #   1. max_total_disk_gb — global cap across all tiers; new backups refused
 #      when reached, DISK PRESSURE alert raised at 80% of cap.
 #   2. per-tier max_disk_gb (e.g. manual) — same behaviour scoped to tier.
@@ -390,9 +415,12 @@ tts:
 # Live A-backup slots referenced by state/trial.json are NEVER pruned while
 # TRIAL is active (immunity is unconditional — outranks every rule).
 #
-# schedule: "daily HH:MM" / "every Nh" / "every Nm" / "off". Same grammar
-# as consolidation.refresh_cadence. "off" disables the scheduled backup
-# timer entirely (manual backups via CLI still work — see Slice 6b).
+# ----------------------------------------------------------------------------
+# backups.schedule / backups.artifacts / backups.max_total_disk_gb
+# ----------------------------------------------------------------------------
+# schedule: "daily HH:MM" / "every Nh" / "every Nm" / "off". Same grammar as
+# consolidation.refresh_cadence. "off" disables the scheduled backup timer
+# (manual backups via the CLI still work).
 #
 # artifacts: subset of [config, graph, registry]. Each element becomes a
 # slot directory under data/ha/backups/<artifact>/<ts>/.
@@ -402,6 +430,7 @@ tts:
 #
 # Defaults shown below. Uncomment to override.
 # security:
+#   require_encryption: false
 #   backups:
 #     orphan_sweep:
 #       max_age_hours: 24

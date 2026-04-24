@@ -86,8 +86,9 @@ class _FilteredSessionBuffer(SessionBuffer):
             filtered_sessions: Pre-built list of session dicts in the format
                 returned by SessionBuffer.get_pending().
         """
-        # debug=False, snapshot_key="" — no disk writes, no encryption
-        super().__init__(session_dir=session_dir, debug=False, snapshot_key="")
+        # debug=False — no archived transcripts on disk; snapshot gating is
+        # handled by the shared envelope helpers (plaintext when no key loaded).
+        super().__init__(session_dir=session_dir, debug=False)
         self._filtered_sessions = filtered_sessions
 
     def get_pending(self) -> list[dict]:
@@ -267,7 +268,6 @@ def main() -> None:
         session_dir=config.session_dir,
         retain_sessions=True,
         debug=True,
-        snapshot_key="",
     )
 
     filtered_sessions = _build_filtered_sessions(real_buffer, prefixes, args.limit)

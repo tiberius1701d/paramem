@@ -100,7 +100,6 @@ def _build_buffer_and_store(tmp_dir: Path) -> tuple[SpeakerStore, SessionBuffer]
         session_dir=tmp_dir / "sessions",
         retain_sessions=False,
         debug=False,
-        snapshot_key="",
     )
     return store, buffer
 
