@@ -12,20 +12,13 @@ This module adapts the envelope to that constraint:
 - :func:`encrypt_checkpoint_dir` is called from a ``TrainerCallback.on_save``
   hook. After HF finishes writing a checkpoint directory, every plaintext
   file in the tree is rewritten atomically through
-  :func:`paramem.backup.encryption.write_infra_bytes`, so the on-disk body
-  carries whichever envelope format the server is producing (age when the
-  daily identity is loaded, PMEM1 otherwise). Idempotent and no-op when
-  Security is OFF.
+  :func:`paramem.backup.encryption.write_infra_bytes` as an age envelope.
+  Idempotent and no-op when Security is OFF.
 - :func:`materialize_checkpoint_to_shm` is called before
   ``Trainer.train(resume_from_checkpoint=...)``. It copies the on-disk
-  checkpoint into a ``/dev/shm``-backed tempdir, decrypting any PMEM1 *or*
-  age envelope via the universal reader en route. The tempdir path is
-  handed to HF; the caller owns cleanup.
-
-The sniff-and-dispatch logic uses :func:`_is_encrypted_envelope` so both
-envelope formats are recognised; this keeps the module correct across the
-transitional state between ``paramem migrate-to-age`` and the eventual
-retirement of the Fernet master key.
+  checkpoint into a ``/dev/shm``-backed tempdir, decrypting any age envelope
+  via the universal reader en route. The tempdir path is handed to HF; the
+  caller owns cleanup.
 
 ``/dev/shm`` is tmpfs (RAM-backed) so decrypted plaintext never lands on
 persistent storage during a resume. When the mount is unavailable, a loud
@@ -42,22 +35,27 @@ from pathlib import Path
 
 from paramem.backup.age_envelope import is_age_envelope
 from paramem.backup.encryption import (
-    is_pmem1_envelope,
-    master_key_loaded,
     read_maybe_encrypted,
     write_infra_bytes,
 )
-from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
 
 
 def _security_on() -> bool:
-    """Return True when any key material is loaded (Fernet Master OR age daily)."""
-    return master_key_loaded() or daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
+    """Return True when the daily age identity is loadable.
+
+    Late-binds ``key_store`` attrs (no ``from … import`` at module top) so
+    tests that monkeypatch ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT``
+    see their override — ``from`` imports would freeze a stale Path reference
+    at import time.
+    """
+    from paramem.backup import key_store as _ks
+
+    return _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
 
 
 def _is_encrypted_envelope(path: Path) -> bool:
-    """Return True when *path* carries either the PMEM1 or age v1 magic."""
-    return is_pmem1_envelope(path) or is_age_envelope(path)
+    """Return True when *path* carries the age v1 magic."""
+    return is_age_envelope(path)
 
 
 logger = logging.getLogger(__name__)
@@ -69,15 +67,15 @@ _SHM_PREFIX = "paramem-ckpt-"
 def encrypt_checkpoint_dir(checkpoint_dir: Path) -> int:
     """Encrypt every plaintext file in *checkpoint_dir* in place.
 
-    Walks the directory recursively; for each file not already PMEM1-wrapped,
-    rewrites it via :func:`write_infra_bytes` (atomic temp+rename + Fernet
+    Walks the directory recursively; for each file not already age-wrapped,
+    rewrites it via :func:`write_infra_bytes` (atomic temp+rename + age
     envelope). Idempotent. Returns the count of files encrypted on this call
     (zero when Security is OFF or every file was already wrapped).
 
     A partial failure (e.g. disk-full mid-iteration) leaves the directory in a
-    mixed state — some files PMEM1, others plaintext. The re-encrypt path is
-    idempotent, and :func:`materialize_checkpoint_to_shm` tolerates mixed state
-    on the read side.
+    mixed state — some files age-wrapped, others plaintext. The re-encrypt
+    path is idempotent, and :func:`materialize_checkpoint_to_shm` tolerates
+    mixed state on the read side.
 
     Parameters
     ----------
@@ -132,7 +130,7 @@ def materialize_checkpoint_to_shm(checkpoint_dir: Path) -> Path:
 
     For each file under the source:
 
-    - PMEM1-wrapped → decrypted via :func:`read_maybe_encrypted` and the
+    - age-wrapped → decrypted via :func:`read_maybe_encrypted` and the
       plaintext is written into the tempdir at the same relative path.
     - Plaintext → byte-for-byte copy.
 
@@ -159,7 +157,7 @@ def materialize_checkpoint_to_shm(checkpoint_dir: Path) -> Path:
             rel = src.relative_to(checkpoint_dir)
             dest = tempdir / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            # Envelope-format-agnostic dispatch: both PMEM1 and age files
+            # Envelope-format-agnostic dispatch: age files
             # need decrypting; plaintext files byte-copy. Without the age
             # check, a post-D3 age envelope would fall through to the
             # copyfile branch and HF Trainer would load ciphertext.

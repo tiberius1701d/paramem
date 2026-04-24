@@ -79,11 +79,7 @@ class ArtifactMeta:
     size_bytes : int
         Byte count of the artifact file on disk (after encryption if applied).
     encrypted : bool
-        ``True`` when the paired file is encrypted (age or PMEM1 envelope).
-    key_fingerprint : str | None
-        First 16 hex characters of ``sha256(fernet_key_bytes)``.  ``None``
-        when ``encrypted=False``.  Enables detection of key rotation without
-        decrypting the artifact.
+        ``True`` when the paired file is an age envelope.
     tier : str
         Backup tier tag — one of ``"scheduled"``, ``"pre-migration"``,
         ``"manual"``, ``"trial_adapter"``.
@@ -101,7 +97,6 @@ class ArtifactMeta:
     content_sha256: str
     size_bytes: int
     encrypted: bool
-    key_fingerprint: str | None
     tier: str
     label: str | None = None
     pre_trial_hash: str | None = None

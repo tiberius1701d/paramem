@@ -30,11 +30,8 @@ Preconditions:
 - No existing ``daily_key.age`` or ``recovery.pub`` in the config dir
   (or ``--force`` to overwrite them — destroys any lingering access via
   the pre-existing daily identity).
-- No PMEM1 files under ``data_dir`` — the Fernet master key is typically
-  lost alongside the old hardware, so those files cannot be restored by
-  this flow. Run the legacy Fernet recovery path, or accept the data is
-  unrecoverable.
-- No mixed plaintext + age files — indicates a broken mode.
+- No plaintext files under ``data_dir`` — plaintext alongside age would
+  be a broken mode.
 
 Crash-safety:
 
@@ -63,7 +60,7 @@ from paramem.backup.age_envelope import (
     identity_from_bech32,
     is_age_envelope,
 )
-from paramem.backup.encryption import infra_paths, is_pmem1_envelope
+from paramem.backup.encryption import infra_paths
 from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
 
 
@@ -165,26 +162,12 @@ def _check_preconditions(args: argparse.Namespace, data_dir: Path) -> list[str]:
                 )
 
     if data_dir.exists():
-        pmem1 = [p for p in infra_paths(data_dir) if p.exists() and is_pmem1_envelope(p)]
-        if pmem1:
-            errors.append(
-                f"{len(pmem1)} PMEM1 file(s) on disk (e.g. {pmem1[0]}). The "
-                "recovery-key flow cannot restore PMEM1 files because it "
-                "does not have the Fernet master key. Run the legacy Fernet "
-                "recovery path, or accept that those files are unrecoverable."
-            )
-
-        plaintext_like = [
-            p
-            for p in infra_paths(data_dir)
-            if p.exists() and not is_age_envelope(p) and not is_pmem1_envelope(p)
-        ]
+        plaintext_like = [p for p in infra_paths(data_dir) if p.exists() and not is_age_envelope(p)]
         if plaintext_like:
             errors.append(
                 f"{len(plaintext_like)} plaintext file(s) on disk "
                 f"(e.g. {plaintext_like[0]}). Plaintext alongside age is a "
-                "mismatch state; resolve with `paramem encrypt-infra` or "
-                "`paramem decrypt-infra --i-accept-plaintext` before restore."
+                "mismatch state; reconcile the data directory before restore."
             )
 
     return errors

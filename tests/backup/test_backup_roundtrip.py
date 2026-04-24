@@ -9,7 +9,6 @@ from datetime import datetime
 import pytest
 
 from paramem.backup.backup import read, write
-from paramem.backup.encryption import _clear_cipher_cache
 from paramem.backup.types import (
     SCHEMA_VERSION,
     ArtifactKind,
@@ -18,21 +17,7 @@ from paramem.backup.types import (
 )
 
 
-def _make_fernet_key() -> bytes:
-    from cryptography.fernet import Fernet
-
-    return Fernet.generate_key()
-
-
 class TestWriteReadRoundtripPlain:
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
-    def teardown_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
     def test_write_read_roundtrip_plain(self, tmp_path):
         """No key env — bytes in → slot written → read() returns identical bytes + meta."""
         payload = b"plain backup data"
@@ -52,52 +37,6 @@ class TestWriteReadRoundtripPlain:
         assert meta.kind == ArtifactKind.CONFIG
         assert meta.tier == "scheduled"
         assert meta.schema_version == SCHEMA_VERSION
-
-    def test_write_read_roundtrip_encrypted(self, tmp_path):
-        """Key loaded → sidecar encrypted=True → read() decrypts and verifies."""
-        key = _make_fernet_key()
-        os.environ["PARAMEM_MASTER_KEY"] = key.decode()
-
-        payload = b"encrypted backup data"
-
-        slot_dir = write(
-            ArtifactKind.GRAPH,
-            payload,
-            {"tier": "manual"},
-            base_dir=tmp_path / "backups" / "graph",
-        )
-
-        plaintext, meta = read(slot_dir)
-
-        assert plaintext == payload
-        assert meta.encrypted is True
-        assert meta.key_fingerprint is not None
-        assert len(meta.key_fingerprint) == 16
-
-    def test_encrypted_write_with_key_loaded(self, tmp_path):
-        """PARAMEM_MASTER_KEY set → write produces an encrypted artifact."""
-        key = _make_fernet_key()
-        os.environ["PARAMEM_MASTER_KEY"] = key.decode()
-
-        payload = b"secure payload"
-        slot_dir = write(
-            ArtifactKind.REGISTRY,
-            payload,
-            {"tier": "scheduled"},
-            base_dir=tmp_path / "backups" / "registry",
-        )
-
-        # The artifact must be a .bin.enc file (ciphertext on disk).
-        artifact_files = [f for f in slot_dir.iterdir() if not f.name.endswith(".meta.json")]
-        assert len(artifact_files) == 1
-        assert artifact_files[0].name.endswith(".bin.enc"), (
-            f"Expected .bin.enc artifact when key is loaded, got: {artifact_files[0].name!r}"
-        )
-
-        # Round-trip must restore plaintext.
-        recovered, meta = read(slot_dir)
-        assert recovered == payload
-        assert meta.encrypted is True
 
     def test_read_refuses_on_content_hash_drift(self, tmp_path):
         """Corrupt artifact on disk after write → read() raises FingerprintMismatchError."""
@@ -157,14 +96,6 @@ class TestWriteReadRoundtripPlain:
 class TestWriteFsyncsParentDirAfterRename:
     """Fix #4 — verify os.fsync is called on at least one directory fd after rename."""
 
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
-    def teardown_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
     def test_write_fsyncs_parent_dir_after_rename(self, tmp_path, monkeypatch):
         """write() calls os.fsync on at least one directory fd after the rename.
 
@@ -213,14 +144,6 @@ class TestWriteFsyncsParentDirAfterRename:
 class TestWriteReadRoundtrip:
     """Fix #1 — read() must raise FingerprintMismatchError for partial slots."""
 
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
-    def teardown_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
     def test_read_refuses_on_missing_artifact(self, tmp_path):
         """Slot with valid sidecar but deleted artifact raises FingerprintMismatchError.
 
@@ -246,14 +169,6 @@ class TestWriteReadRoundtrip:
 
 class TestWriteConcurrency:
     """Fix #5 — write() retries on timestamp collision and raises after max attempts."""
-
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
-    def teardown_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def test_write_retries_on_timestamp_collision(self, tmp_path, monkeypatch):
         """Two writes with the same initial timestamp succeed and produce distinct slots.

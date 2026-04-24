@@ -140,7 +140,7 @@ def compute_pre_flight_check(
 
     # Config contribution.  Decrypted-length is the honest input — the future
     # pre-migration backup re-encrypts plaintext, so ciphertext length on disk
-    # would be a double-count of Fernet overhead.
+    # would be a double-count of age envelope overhead.
     try:
         config_path = Path(live_config_path)
         if config_path.exists():

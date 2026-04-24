@@ -528,14 +528,46 @@ def test_adapter_fingerprint_manifest_missing():
 
 
 def test_stub_populators_return_empty():
-    """All stub populators return [] when config=None (forward-compat guardrail for Slices 6/7)."""
+    """Stub populators return [] when config=None (forward-compat guardrail)."""
     state = _live_state()
     # _collect_backup_items and _collect_pre_flight_items now take (state, config) after Slice 6b.
     # Passing config=None exercises the early-return guard.
     assert _collect_backup_items(state, None) == []
     assert _collect_key_rotation_items(state) == []
-    assert _collect_encryption_items(state) == []
     assert _collect_pre_flight_items(state, None) == []
+
+
+# ---------------------------------------------------------------------------
+# _collect_encryption_items
+# ---------------------------------------------------------------------------
+
+
+def test_encryption_items_empty_when_posture_on():
+    """Security: ON → no encryption attention item."""
+    state = _live_state(encryption="on")
+    assert _collect_encryption_items(state) == []
+
+
+def test_encryption_items_empty_when_posture_absent():
+    """Pre-lifespan / test shim with no encryption field → no item (not a crash)."""
+    state = _live_state()
+    assert "encryption" not in state
+    assert _collect_encryption_items(state) == []
+
+
+def test_encryption_items_fires_on_security_off():
+    """Security: OFF → one action_required item pointing at generate-key."""
+    state = _live_state(encryption="off")
+    items = _collect_encryption_items(state)
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "encryption_off"
+    assert item.level == "action_required"
+    assert "SECURITY: OFF" in item.summary
+    assert item.action_hint is not None
+    assert "generate-key" in item.action_hint
+    assert "PARAMEM_DAILY_PASSPHRASE" in item.action_hint
 
 
 # ---------------------------------------------------------------------------

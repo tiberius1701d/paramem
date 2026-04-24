@@ -17,9 +17,10 @@ Design notes
   specifying a drvfs path that happens to share ``st_dev``.  The real safety
   net is Slice 3b.2's atomic ``rename()`` — if the paths are on different
   filesystems, ``rename()`` will raise ``OSError`` (EXDEV) at that point.
-- Env-var template strings (e.g. ``${PARAMEM_MASTER_KEY}``) are preserved
-  verbatim in diffs — we use ``yaml.safe_load`` on raw bytes, NOT
-  ``load_server_config``, so no env substitution occurs (see drift.py:13–15).
+- Env-var template strings (e.g. ``${PARAMEM_DAILY_PASSPHRASE}``) are
+  preserved verbatim in diffs — we use ``yaml.safe_load`` on raw bytes,
+  NOT ``load_server_config``, so no env substitution occurs
+  (see drift.py:13–15).
 - All timestamps are ISO-8601 UTC via ``datetime.now(timezone.utc).isoformat()``.
 """
 
@@ -654,8 +655,8 @@ def _parse_candidate(candidate_bytes: bytes) -> dict:
     """Parse *candidate_bytes* as YAML and return the root dict.
 
     Uses ``yaml.safe_load`` on raw bytes so env-var template strings
-    (``${PARAMEM_MASTER_KEY}``) appear verbatim, matching drift-detection
-    semantics (see module docstring / drift.py:13–15).
+    (``${PARAMEM_DAILY_PASSPHRASE}``) appear verbatim, matching
+    drift-detection semantics (see module docstring / drift.py:13–15).
 
     Parameters
     ----------

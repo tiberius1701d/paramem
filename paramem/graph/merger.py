@@ -526,7 +526,7 @@ class GraphMerger:
 
     def load_graph(self, path: str | Path) -> nx.MultiDiGraph:
         """Load cumulative graph from JSON — transparently decrypts
-        PMEM1-wrapped content when a master key is set."""
+        age-wrapped content when the daily identity is loaded."""
         from paramem.backup.encryption import read_maybe_encrypted
 
         path = Path(path)

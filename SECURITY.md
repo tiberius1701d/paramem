@@ -12,7 +12,7 @@ This document describes what ParaMem defends, what it does not, the trust bounda
 | Indexed key registry | Key identifiers, SimHash fingerprints, timestamps | JSON |
 | Cumulative knowledge graph | Entities, predicates, relations | JSON (NetworkX) |
 | Session queue | Transcript + speaker binding awaiting consolidation | JSON (atomic temp-file + rename) |
-| Session snapshot | RAM state at graceful shutdown | Envelope-encrypted when a key is configured (age or PMEM1) |
+| Session snapshot | RAM state at graceful shutdown | age-encrypted when a key is configured |
 | Speaker profiles | Voice embeddings + disclosed names | JSON (biometric data — see §7) |
 | Background trainer resume state | Epoch counter + checkpoint references | JSON |
 | Adapter manifest sidecars | Base-model SHA, tokenizer fingerprint, LoRA shape | JSON |
@@ -33,14 +33,12 @@ paramem generate-key                 # mint daily + recovery; print recovery bec
 # Put the passphrase you chose into .env (or your systemd drop-in):
 #   PARAMEM_DAILY_PASSPHRASE=<your passphrase>
 
-paramem encrypt-infra                # wrap any existing plaintext infra files (PMEM1 envelope)
-paramem migrate-to-age               # flip PMEM1 → age multi-recipient [daily, recovery]
 systemctl --user restart paramem-server
 ```
 
 After this the startup log reads `SECURITY: ON (age daily identity loaded, recovery recipient available)` and `/status` reports `encryption: on`. If anything in the chain fails, the server refuses to start with an actionable message rather than silently degrade — see §4 for the mode-consistency rules.
 
-The two migration commands (`encrypt-infra` then `migrate-to-age`) are only needed on an existing deployment with plaintext or legacy-Fernet data on disk. A completely fresh install can skip both: just run `generate-key`, set the env var, and start the server — new writes land as age from the first consolidation onward.
+New writes land as age envelopes from the first consolidation onward. A pre-existing plaintext data directory must be reconciled manually before startup; the server refuses to mix plaintext with age envelopes on disk.
 
 Day-to-day key operations after that point:
 
@@ -77,54 +75,44 @@ All lifecycle commands are per-file atomic + idempotent + resumable via a crash-
 - **Home Assistant ↔ ParaMem.** A thin HA custom component POSTs to the `/chat` endpoint over HTTP on the LAN. Bearer-token authentication is opt-in via the `PARAMEM_API_TOKEN` environment variable. When unset, the server accepts any LAN request — this is announced at startup as an explicit open posture, not a silent one.
 - **ParaMem → cloud.** Sanitized queries (and speaker name, as persona anchor) may be sent to a configured cloud agent for escalation or SOTA enrichment. This path is opt-in via config; nothing is sent without an active cloud configuration. Sanitization is regex-based and is documented as incomplete — see §7.
 - **Adapter files at rest.** The on-disk artifacts listed in §1 live under the configured data directory. At-rest encryption is governed by the binary switch in §4.
-- **Backup at rest.** Session snapshots and every other piece of infrastructure metadata follow the Security-ON/OFF contract in §4 — encrypted via envelope dispatch (age when the daily identity is loaded, PMEM1 when only the Fernet master key is loaded) and plaintext only when no key is configured.
+- **Backup at rest.** Session snapshots and every other piece of infrastructure metadata follow the Security-ON/OFF contract in §4 — encrypted as age envelopes when the daily identity is loaded, and plaintext only when no key is configured.
 
 ## 4. Security modes
 
 ParaMem operates in one of two modes, governed by the loaded key material. There are no partial states.
 
 ### Security ON
-Any of the following combinations counts as ON:
-- `PARAMEM_MASTER_KEY` is set (Fernet base64 key, 32 bytes of entropy) — legacy PMEM1 envelope path.
-- `PARAMEM_DAILY_PASSPHRASE` is set AND `~/.config/paramem/daily_key.age` exists — age two-identity path. When `~/.config/paramem/recovery.pub` is also present, every new write is multi-recipient (daily + recovery).
+`PARAMEM_DAILY_PASSPHRASE` is set AND `~/.config/paramem/daily_key.age` exists. When `~/.config/paramem/recovery.pub` is also present, every new write is multi-recipient (daily + recovery).
 
-All infrastructure metadata — registry, graph, queue, snapshots, speaker profiles, manifest sidecars, backup artifacts — is encrypted on disk and decrypted only into process RAM on load. The universal read path sniffs the envelope magic (`age-encryption.org/v1\n` or `PMEM1\n`) and routes to the appropriate decryptor, so a mixed on-disk state during an age migration is transparent to callers. On startup the server logs one of:
+All infrastructure metadata — registry, graph, queue, snapshots, speaker profiles, manifest sidecars, backup artifacts — is age-encrypted on disk and decrypted only into process RAM on load. The universal read path sniffs the envelope magic at the start of each file (the literal bytes `age-encryption.org/v1` followed by a newline) and routes to the decryptor; plaintext is passed through verbatim. On startup the server logs one of:
 ```
 SECURITY: ON (age daily identity loaded, recovery recipient available)
 SECURITY: ON (age daily identity loaded, recovery recipient missing — run `paramem generate-key` to re-enable multi-recipient writes)
-SECURITY: ON (PARAMEM_MASTER_KEY set)
 ```
-The age posture takes precedence when both Fernet and age identities are loaded (the transitional state during a migration).
 
 ### Security OFF
 No key material is loaded. All infrastructure metadata is plaintext on disk. This is a **documented operator opt-out**, not a gap. On startup the server logs:
 ```
 SECURITY: OFF (no key — all infrastructure metadata is plaintext on disk)
 ```
-and surfaces `encryption: off` on the `/status` endpoint. The server does not silently degrade between modes: if a key is loaded but on-disk files are plaintext (or vice versa), startup refuses until an explicit `paramem encrypt-infra` / `paramem migrate-to-age` / `paramem decrypt-infra --i-accept-plaintext` migration is performed.
+and surfaces `encryption: off` on the `/status` endpoint. The server does not silently degrade between modes: if the daily identity is loaded but on-disk files are plaintext (or vice versa), startup refuses with an actionable message.
 
 ### Fail-loud opt-in: `security.require_encryption`
 
-The Security-OFF opt-out is the operator's choice. Deployments that want a misconfiguration to fail loud rather than silently land plaintext on disk can set `security.require_encryption: true` in `configs/server.yaml`. When set, the server refuses to start unless the age daily identity or `PARAMEM_MASTER_KEY` is loadable — a uniform startup gate covering every feature that writes to disk (snapshots, checkpoint shards, backups, infrastructure metadata). Default is `false` (the AUTO-everywhere posture described above).
+The Security-OFF opt-out is the operator's choice. Deployments that want a misconfiguration to fail loud rather than silently land plaintext on disk can set `security.require_encryption: true` in `configs/server.yaml`. When set, the server refuses to start unless the daily identity is loadable — a uniform startup gate covering every feature that writes to disk (snapshots, checkpoint shards, backups, infrastructure metadata). Default is `false` (the AUTO-everywhere posture described above).
 
-### Transitional state (age migration in progress)
+### Refusal cases
 
-When both `PARAMEM_MASTER_KEY` and the daily age identity are loaded and the on-disk store contains a mix of PMEM1 and age envelopes, the server accepts the state and logs a WARN naming the number of PMEM1 files still pending. New writes route through age as soon as the daily identity is loaded; PMEM1 files on disk are read via the Fernet path until the operator runs `paramem migrate-to-age` to rewrite them as age multi-recipient envelopes. The command is per-file atomic (`<path>.tmp` → fsync → rename → fsync parent) and idempotent — already-age files are skipped and re-runs are safe after a crash.
-
-After a successful `migrate-to-age` the operator can remove `PARAMEM_MASTER_KEY` from the environment one release later. Fernet support is retained until then as the rollback safety net for backups taken under the old envelope format.
-
-Refusal cases:
-- age files on disk without the daily identity loaded → unreadable.
-- PMEM1 files on disk without the Fernet master key → unreadable.
-- Plaintext files alongside any encryption magic → startup refused regardless of which keys are loaded.
-- `migrate-to-age` with `recovery.pub` missing → refused (would strip the recovery safety net). The `--allow-daily-only` flag opts out of this refusal but is strongly discouraged: losing the daily passphrase after such a run makes the data unrecoverable.
+- age files on disk without the daily identity loaded → startup refused with a clear message pointing at `PARAMEM_DAILY_PASSPHRASE` + the daily-key file path.
+- Plaintext files alongside age envelopes → startup refused; reconcile the store before restart.
+- Plaintext files while the daily identity is loaded → startup refused; migrate the store or unset the passphrase.
 
 ### Plaintext-by-design carve-outs
 
 Three control-plane metadata files are kept plaintext in both modes:
 - `data/ha/state/trial.json` — migration-trial marker (paths, hashes, timestamps).
 - `data/ha/state/backup.json` — scheduled-backup runner status (paths, timestamps, counts).
-- `data/ha/backups/<kind>/<ts>/*.meta.json` — backup artifact sidecars (timestamp, ciphertext SHA-256, key fingerprint, tier, label). The paired `*.bin.enc` payload remains encrypted.
+- `data/ha/backups/<kind>/<ts>/*.meta.json` — backup artifact sidecars (timestamp, ciphertext SHA-256, tier, label). The paired `*.bin.enc` payload remains encrypted.
 
 None of these files contain user facts. Encrypting them would either brick recovery on key loss (`trial.json`, `backup.json`) or turn a wrong-key restore into a silent "backup not found" instead of a clear decrypt-error (backup sidecars). These carve-outs are the **only** exceptions to the binary-mode contract.
 
@@ -143,7 +131,7 @@ Both keys decrypt the same data. Loss of the daily key is routine (rotate it). L
 
 **Hardware replacement.** `paramem restore --recovery-key-file <path>` is the entry point after losing the original device. Given the recovery bech32 from paper, it sanity-checks against an on-disk age envelope, mints a fresh daily identity (new operator-supplied passphrase), writes `daily_key.age` + `recovery.pub` to the new machine, and re-encrypts every age file to `[daily_new, recovery]`. The recovery identity is reused on the envelopes — it is the thing that authorised the restore, and the operator's paper copy remains valid. Crash-safe via the same rotation-manifest mechanism; a typo in the bech32 aborts before any on-disk mutation. Distinct from `paramem backup-restore`, which restores a backup archive over REST.
 
-**Backup restore across key rotation.** Legacy (Fernet/PMEM1) backup sidecars carry the 16-hex-char fingerprint of the master key they were written under. `POST /backup/restore` compares this fingerprint against the currently loaded `PARAMEM_MASTER_KEY`; a mismatch is refused with HTTP 400 `fingerprint_mismatch`. To restore a backup taken under a prior key, keep that key set in `PARAMEM_MASTER_KEY` and pass `force_rotate_key=true` (REST body) or `--force-rotate-key` (CLI) — the server logs a WARN and proceeds. Age-encrypted backups record `key_fingerprint=null` by design (the Fernet-style fingerprint concept does not map onto X25519 recipient lists); a stale daily identity surfaces as a decrypt error instead, equally actionable. Backups written while Security was OFF have no fingerprint either, and always restore.
+**Backup restore across key rotation.** Age-encrypted backups do not carry a key fingerprint in the sidecar — the fingerprint concept does not map onto X25519 recipient lists. A stale daily identity surfaces as a decrypt error on restore (HTTP 500 `decrypt_invalid_token`), which is equally actionable: the operator either re-keys the backup via `rotate-daily` / `rotate-recovery` or restores from the recovery bech32. Backups written while Security was OFF are plaintext and always restore.
 
 Biometric unlocks (Windows Hello, fingerprint, FIDO2) are supported as *access conveniences* for the daily path only. They are not a recovery mechanism: biometrics unlock a sealed key on specific hardware; they do not regenerate the key on a new device. Any sensible deployment pairs biometric-unlocked daily access with a printed recovery artifact.
 
@@ -151,7 +139,7 @@ Biometric unlocks (Windows Hello, fingerprint, FIDO2) are supported as *access c
 
 ParaMem is a single-admin service. The operator — the person running the server — is responsible for:
 
-- Generating and storing key material. Run `paramem generate-key` to mint the daily identity (stored passphrase-wrapped on this host) and the recovery identity (printed once — save it offline). If you instead deploy with the legacy `PARAMEM_MASTER_KEY` Fernet path, save a recovery copy offline under the same discipline. In both cases, do not rely on a single storage location for the only copy.
+- Generating and storing key material. Run `paramem generate-key` to mint the daily identity (stored passphrase-wrapped on this host) and the recovery identity (printed once — save it offline). Do not rely on a single storage location for the only copy of the recovery bech32.
 - Scoping LAN exposure. Set `PARAMEM_LISTEN_IP` to the specific host interface that should accept incoming requests, and `PARAMEM_NAS_IP` to scope the Windows Firewall rule to the Home Assistant source host. Unset values default to an open posture with a loud startup warning.
 - Setting `PARAMEM_API_TOKEN` to require bearer-token authentication on all REST endpoints. When unset, the server accepts any request from a reachable peer.
 - Managing `.env` and per-secret files under `~/.config/paramem/secrets/` with file mode `0600` and directory mode `0700`. The server refuses to start if permissions are looser.

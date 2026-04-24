@@ -24,9 +24,8 @@ def _isolate_paramem_security_env(monkeypatch):
     :func:`paramem.backup.encryption.write_infra_bytes` pick the age branch
     in tests that implicitly assume "no key loaded" and expect plaintext.
 
-    Pop the daily + Fernet env vars by default. Tests that need them set
+    Pop the daily passphrase env var by default. Tests that need it set
     should use ``monkeypatch.setenv`` explicitly — the auto-rollback keeps
     other tests isolated.
     """
     monkeypatch.delenv("PARAMEM_DAILY_PASSPHRASE", raising=False)
-    monkeypatch.delenv("PARAMEM_MASTER_KEY", raising=False)

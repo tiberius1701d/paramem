@@ -36,7 +36,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from cryptography.fernet import Fernet
 
 pytestmark = pytest.mark.integration
 
@@ -46,7 +45,6 @@ PARAMEM_BINARY = os.environ.get(
 )
 
 AGE_MAGIC = b"age-encryption.org/v1\n"
-PMEM1_MAGIC = b"PMEM1\n"
 RECOVERY_BECH32_RE = re.compile(r"AGE-SECRET-KEY-1[A-Z0-9]+")
 
 
@@ -110,38 +108,28 @@ def _skip_if_binary_missing():
 
 
 # ---------------------------------------------------------------------------
-# Shared setup: build a fully-migrated store from scratch
+# Shared setup: generate keys and seed age-encrypted infra files
 # ---------------------------------------------------------------------------
 
 
-def _setup_migrated_store(
+def _setup_age_store(
     scratch_home: Path,
     data_dir: Path,
     tmp_path: Path,
     passphrase: str = "integration-pw",
 ) -> tuple[dict[str, str], str, Path]:
-    """Run the full fresh-install → PMEM1 → age chain end-to-end.
+    """Run ``generate-key`` then seed age-encrypted infra files.
+
+    Builds the store the fresh-install way: mint daily + recovery identities
+    with ``paramem generate-key``, then write the infra files as age envelopes
+    in-process (using the recipients from the newly-generated key files) so
+    downstream subprocess invocations encounter the full age-encrypted state.
 
     Returns the env dict (with the daily passphrase set), the captured
     recovery bech32, and the passphrase file path so downstream scenarios
     can re-use them.
     """
-    master = Fernet.generate_key().decode()
-    env = _build_env(scratch_home, PARAMEM_MASTER_KEY=master)
-
-    # Seed plaintext infra files.
-    (data_dir / "registry.json").write_bytes(b'{"integration": 1}')
-    (data_dir / "speaker_profiles.json").write_bytes(b'{"speakers": {}, "version": 5}')
-
-    # Flip to PMEM1.
-    _run(
-        "encrypt-infra",
-        "--data-dir",
-        str(data_dir),
-        "--config",
-        "/nonexistent",
-        env=env,
-    )
+    env = _build_env(scratch_home)
 
     # Mint daily + recovery under the scratch HOME.
     pw_file = tmp_path / "integration-pw.txt"
@@ -158,15 +146,23 @@ def _setup_migrated_store(
     assert match, f"recovery bech32 not printed to stderr: {err[:400]}"
     recovery_bech32 = match.group(0)
 
-    # Flip PMEM1 → age.
+    # Set the daily passphrase in the env for subsequent subprocess calls.
     env["PARAMEM_DAILY_PASSPHRASE"] = passphrase
-    _run(
-        "migrate-to-age",
-        "--data-dir",
-        str(data_dir),
-        "--config",
-        "/nonexistent",
-        env=env,
+
+    # Seed age-encrypted infra files in-process using the generated key
+    # material so the store is ready for rotate / restore / dump commands.
+    from paramem.backup.age_envelope import age_encrypt_bytes
+    from paramem.backup.key_store import load_daily_identity, load_recovery_recipient
+
+    config_dir = scratch_home / ".config" / "paramem"
+    daily_ident = load_daily_identity(config_dir / "daily_key.age", passphrase=passphrase)
+    recovery_rec = load_recovery_recipient(config_dir / "recovery.pub")
+    recipients = [daily_ident.to_public(), recovery_rec]
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "registry.json").write_bytes(age_encrypt_bytes(b'{"integration": 1}', recipients))
+    (data_dir / "speaker_profiles.json").write_bytes(
+        age_encrypt_bytes(b'{"speakers": {}, "version": 5}', recipients)
     )
 
     return env, recovery_bech32, pw_file
@@ -194,18 +190,18 @@ def data_dir(tmp_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Scenario 1: fresh install → PMEM1 seed → migrate-to-age
+# Scenario 1: fresh install → age-encrypted store
 # ---------------------------------------------------------------------------
 
 
 class TestFreshInstallToAge:
-    def test_full_chain_flips_pmem1_to_age(self, scratch_home, data_dir, tmp_path):
-        env, recovery_bech32, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+    def test_fresh_install_produces_age_store(self, scratch_home, data_dir, tmp_path):
+        env, recovery_bech32, _ = _setup_age_store(scratch_home, data_dir, tmp_path)
 
-        # Every seeded file now carries the age magic.
+        # Every seeded file carries the age magic.
         for name in ("registry.json", "speaker_profiles.json"):
             head = (data_dir / name).read_bytes()[: len(AGE_MAGIC)]
-            assert head == AGE_MAGIC, f"{name} not flipped to age: head={head!r}"
+            assert head == AGE_MAGIC, f"{name} not age-encrypted: head={head!r}"
 
         # Recovery bech32 parses and yields a deterministic recipient string —
         # confirms generate-key's stderr output is machine-extractable.
@@ -229,19 +225,6 @@ class TestFreshInstallToAge:
             f"dump round-trip failed, got: {dumped.stdout!r}"
         )
 
-        # Re-running migrate-to-age is idempotent — already-age files skipped.
-        rerun = _run(
-            "migrate-to-age",
-            "--data-dir",
-            str(data_dir),
-            "--config",
-            "/nonexistent",
-            env=env,
-        )
-        out = rerun.stdout.decode("utf-8", errors="replace")
-        assert "0 migrated" in out
-        assert "2 already age" in out
-
 
 # ---------------------------------------------------------------------------
 # Scenario 2: rotate-daily then rotate-recovery
@@ -250,7 +233,7 @@ class TestFreshInstallToAge:
 
 class TestRotations:
     def test_rotate_daily_then_rotate_recovery(self, scratch_home, data_dir, tmp_path):
-        env, recovery_bech32_v1, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+        env, recovery_bech32_v1, _ = _setup_age_store(scratch_home, data_dir, tmp_path)
 
         # Capture the original daily + recovery recipients for comparison.
         daily_path = scratch_home / ".config" / "paramem" / "daily_key.age"
@@ -320,7 +303,7 @@ class TestRotations:
 
 class TestHardwareLossRestore:
     def test_restore_with_captured_recovery_bech32(self, scratch_home, data_dir, tmp_path):
-        env, recovery_bech32, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+        env, recovery_bech32, _ = _setup_age_store(scratch_home, data_dir, tmp_path)
 
         # Snapshot original envelope bytes for post-restore comparison.
         original_envelopes = {
@@ -340,10 +323,7 @@ class TestHardwareLossRestore:
 
         # The env must NOT carry the old PARAMEM_DAILY_PASSPHRASE — simulate a
         # true hardware-loss scenario where the operator has only paper.
-        env_for_restore = _build_env(
-            scratch_home,
-            PARAMEM_MASTER_KEY=env["PARAMEM_MASTER_KEY"],
-        )
+        env_for_restore = _build_env(scratch_home)
 
         _run(
             "restore",
@@ -392,7 +372,7 @@ class TestRotateDailyResumeFromManifest:
         remaining files. A fresh `paramem rotate-daily` invocation must
         finalise without re-minting — proof that the resume path is wired
         through the CLI entry point, not just the rotation primitive."""
-        env, _, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+        env, _, _ = _setup_age_store(scratch_home, data_dir, tmp_path)
 
         config_dir = scratch_home / ".config" / "paramem"
         daily_path = config_dir / "daily_key.age"
@@ -464,7 +444,7 @@ class TestDryRunCleanup:
         """rotate-daily --dry-run on a fresh-start must not leave a pending
         key file or a manifest behind (they would confuse a later non-dry-run
         into thinking a prior crash occurred)."""
-        env, _, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+        env, _, _ = _setup_age_store(scratch_home, data_dir, tmp_path)
 
         _run(
             "rotate-daily",
@@ -504,10 +484,7 @@ class TestCliSurface:
         combined = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
         for sub in (
             "generate-key",
-            "encrypt-infra",
-            "decrypt-infra",
             "dump",
-            "migrate-to-age",
             "rotate-daily",
             "rotate-recovery",
             "restore",
@@ -523,11 +500,11 @@ class TestCliSurface:
 
 class TestChangePassphrase:
     def test_rewrap_preserves_identity_and_data_readability(self, scratch_home, data_dir, tmp_path):
-        """Migrate to age, change the passphrase, verify that the same age
+        """Seed an age store, change the passphrase, verify that the same age
         envelopes still decrypt via the new passphrase through `paramem dump`
         — i.e. the X25519 identity survived the rewrap and existing data did
         not need re-encryption."""
-        env, _, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+        env, _, _ = _setup_age_store(scratch_home, data_dir, tmp_path)
 
         # Snapshot current daily_key.age bytes + recovery.pub.
         daily_before = (scratch_home / ".config" / "paramem" / "daily_key.age").read_bytes()
@@ -535,9 +512,7 @@ class TestChangePassphrase:
         registry_before = (data_dir / "registry.json").read_bytes()
 
         old_pw_file = tmp_path / "old-pw.txt"
-        old_pw_file.write_text(
-            "integration-pw\n", encoding="utf-8"
-        )  # matches _setup_migrated_store
+        old_pw_file.write_text("integration-pw\n", encoding="utf-8")  # matches _setup_age_store
         new_pw_file = tmp_path / "new-pw.txt"
         new_pw_file.write_text("rewrapped-pw\n", encoding="utf-8")
 
@@ -580,7 +555,7 @@ class TestChangePassphrase:
         assert fail.returncode != 0, "old passphrase must no longer unlock daily_key.age"
 
     def test_rewrap_refuses_when_old_equals_new(self, scratch_home, data_dir, tmp_path):
-        env, _, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+        env, _, _ = _setup_age_store(scratch_home, data_dir, tmp_path)
         same_pw_file = tmp_path / "same-pw.txt"
         same_pw_file.write_text("integration-pw\n", encoding="utf-8")
 

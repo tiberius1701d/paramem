@@ -144,8 +144,8 @@ def _write_resume_state_atomic(state_path: Path, state: dict) -> None:
 
 
 def _read_resume_state(state_path: Path) -> dict | None:
-    """Load resume state from disk — transparently decrypts PMEM1-wrapped
-    content when a master key is set.
+    """Load resume state from disk — transparently decrypts age-wrapped
+    content when the daily identity is loaded.
 
     Returns None if the file does not exist or cannot be parsed.
 
@@ -261,7 +261,7 @@ class _PauseForInferenceCallback(TrainerCallback):
 
 
 class _EncryptCheckpointCallback(TrainerCallback):
-    """Wrap each HF-written checkpoint file in the PMEM1 envelope after save.
+    """Wrap each HF-written checkpoint file in the age envelope after save.
 
     Fires on ``on_save`` — HF has just finished writing a ``checkpoint-<step>/``
     directory inside ``args.output_dir``. We walk every ``checkpoint-*`` subdir
@@ -270,26 +270,28 @@ class _EncryptCheckpointCallback(TrainerCallback):
 
     Also guards at ``on_train_begin``: ``load_best_model_at_end=True`` bypasses
     our decrypt-to-shm resume path (HF reads the on-disk checkpoint directly
-    at end-of-training) and would fail on PMEM1-wrapped files. We refuse to
+    at end-of-training) and would fail on age-wrapped files. We refuse to
     start under that combination rather than silently corrupt the run.
     """
 
     def on_train_begin(self, args, state, control, **kwargs):
-        from paramem.backup.encryption import master_key_loaded
+        from paramem.backup import key_store as _ks
 
-        if getattr(args, "load_best_model_at_end", False) and master_key_loaded():
+        if getattr(args, "load_best_model_at_end", False) and _ks.daily_identity_loadable(
+            _ks.DAILY_KEY_PATH_DEFAULT
+        ):
             raise RuntimeError(
                 "load_best_model_at_end=True is incompatible with Security ON: "
                 "HF reads checkpoint files directly at end-of-training, "
                 "bypassing the decrypt-to-shm path. Either disable "
-                "load_best_model_at_end or unset PARAMEM_MASTER_KEY."
+                "load_best_model_at_end or unset PARAMEM_DAILY_PASSPHRASE."
             )
 
     def on_save(self, args, state, control, **kwargs):
+        from paramem.backup import key_store as _ks
         from paramem.backup.checkpoint_shard import encrypt_checkpoint_dir
-        from paramem.backup.encryption import master_key_loaded
 
-        if not master_key_loaded():
+        if not _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
             return
         output_dir = Path(args.output_dir)
         for ckpt in output_dir.glob("checkpoint-*"):
@@ -1042,10 +1044,10 @@ class BackgroundTrainer:
         shm_resume_dir: Path | None = None
         effective_resume = resume_checkpoint
         if resume_checkpoint is not None:
+            from paramem.backup import key_store as _ks
             from paramem.backup.checkpoint_shard import materialize_checkpoint_to_shm
-            from paramem.backup.encryption import master_key_loaded
 
-            if master_key_loaded():
+            if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
                 shm_resume_dir = materialize_checkpoint_to_shm(Path(resume_checkpoint))
                 effective_resume = str(shm_resume_dir)
                 logger.info(

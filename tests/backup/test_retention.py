@@ -71,7 +71,6 @@ def _write_slot(backups_root: Path, kind: str, ts: str, tier: str, size_bytes: i
         "content_sha256": "abc",
         "size_bytes": size_bytes,
         "encrypted": False,
-        "key_fingerprint": None,
         "tier": tier,
         "label": None,
     }
@@ -155,7 +154,6 @@ class TestComputeDiskUsage:
             "content_sha256": "abc",
             "size_bytes": 50,
             "encrypted": False,
-            "key_fingerprint": None,
             # No "tier" key
             "label": None,
         }
@@ -537,7 +535,6 @@ class TestEnumeratedRecordTierInvariant:
             "content_sha256": "abc",
             "size_bytes": 50,
             "encrypted": False,
-            "key_fingerprint": None,
             # "tier" intentionally omitted
             "label": None,
         }

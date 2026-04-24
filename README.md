@@ -20,7 +20,7 @@ The core mechanism is **indexed key retrieval**: each fact gets a unique key (`g
 - **Scale:** 550/550 keys at 100% recall on Mistral 7B (rank 8, 56 consolidation cycles, 11 characters, 280 sessions). No ceiling indicator in the training signal — run paused at 550, not stopped.
 - **Live deployment:** Running as a Home Assistant conversation agent on WSL2 + RTX 5070, with local Whisper STT, pyannote speaker identification, Piper / MMS-TTS, and tri-path routing (parametric memory → HA tools → SOTA cloud).
 - **Pipeline:** 7-stage privacy-aware extraction (local extract → anonymize → SOTA enrichment with brace-binding → de-anonymize → plausibility → transcript-grounding gate), graph-level SOTA enrichment at full consolidation, anti-confabulation voice prompt, deferred identity binding with BPE-stable `Speaker{N}` placeholders.
-- **Crash safety:** epoch-level resume with SHA-256 fingerprint validation, envelope-encrypted session snapshots (age or PMEM1 under Security-ON), persistent post-session queue, systemd timer with `Persistent=true`.
+- **Crash safety:** epoch-level resume with SHA-256 fingerprint validation, age-encrypted session snapshots under Security-ON, persistent post-session queue, systemd timer with `Persistent=true`.
 
 ## Key Results
 
@@ -394,10 +394,10 @@ ParaMem includes a local voice pipeline for privacy-first operation:
 ParaMem encrypts every piece of on-disk infrastructure metadata — registry, knowledge graph, session queue, speaker profiles, backup payloads, HF-Trainer checkpoint shards — at rest. The authoritative operator document is [`SECURITY.md`](SECURITY.md); the short version:
 
 - **Two-identity age X25519 model.** A **daily** identity lives on the host, passphrase-wrapped at `~/.config/paramem/daily_key.age` (mode `0600`). A **recovery** identity is printed once at setup time and stored offline by the operator; only its public recipient (`~/.config/paramem/recovery.pub`) persists on the device. Every on-disk envelope lists both recipients so hardware loss is recoverable from the printed paper alone.
-- **Startup posture.** The server emits one of four `SECURITY:` log lines at startup and surfaces `encryption: on|off` on `/status`. Mode mismatches (plaintext alongside encrypted, or a key missing for on-disk ciphertext) refuse startup with an actionable message rather than degrade silently. Operators who want the *absence* of a key to also fail loud — not only a mismatch — can set `security.require_encryption: true` in `configs/server.yaml`; the server then refuses to start unless at least one key path is loadable.
+- **Startup posture.** The server emits one of three `SECURITY:` log lines at startup (age+recovery, age alone, OFF) and surfaces `encryption: on|off` on `/status`. Mode mismatches (plaintext alongside age envelopes, or age files with the daily identity missing) refuse startup with an actionable message rather than degrade silently. Operators who want the *absence* of a key to also fail loud — not only a mismatch — can set `security.require_encryption: true` in `configs/server.yaml`; the server then refuses to start unless the daily identity is loadable.
 - **Required env vars for Security-ON:** `PARAMEM_DAILY_PASSPHRASE` (operator-chosen; unlocks the daily age key). Optional: `PARAMEM_API_TOKEN` (bearer token on all REST endpoints; unset = open LAN posture with a loud startup warning), `PARAMEM_LISTEN_IP` / `PARAMEM_NAS_IP` (scope network exposure).
 
-Key lifecycle is driven by the `paramem generate-key` / `migrate-to-age` / `change-passphrase` / `rotate-daily` / `rotate-recovery` / `restore` commands — see [`SECURITY.md`](SECURITY.md) for the first-run walkthrough, threat model, operator responsibilities, and known limitations.
+Key lifecycle is driven by the `paramem generate-key` / `change-passphrase` / `rotate-daily` / `rotate-recovery` / `restore` / `dump` commands — see [`SECURITY.md`](SECURITY.md) for the first-run walkthrough, threat model, operator responsibilities, and known limitations.
 
 ## Data
 

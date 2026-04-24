@@ -9,18 +9,15 @@ Wrapping is performed via :func:`pyrage.passphrase.encrypt`. The outer
 envelope carries the standard age v1 magic (:data:`paramem.backup.age_envelope.AGE_MAGIC`),
 so ``is_age_envelope`` recognises it alongside recipient-keyed files.
 
-This slice ships primitives only — no production call site flips the
-Fernet/PMEM1 store over to age yet. Slice D is the operator-visible flip.
-
 Trust model
 -----------
 The passphrase lives in :data:`DAILY_PASSPHRASE_ENV_VAR`
-(``PARAMEM_DAILY_PASSPHRASE``), mirroring the pre-existing
-``PARAMEM_MASTER_KEY`` handling in :mod:`paramem.backup.encryption`. The
-research-spike findings in ``memory/project_wp2b_research_findings.md``
-rule out OS key stores (no libsecret on WSL2, DPAPI unavailable pre-login)
-for Phase 1. This module is the neutral seam a future ``KeyProtector``
-backend can slot in without touching call sites.
+(``PARAMEM_DAILY_PASSPHRASE``), loaded from the operator's shell env, a
+``.env`` file, or a per-secret file under ``~/.config/paramem/secrets/``.
+OS key stores (libsecret, DPAPI) are out of scope for this phase — no
+libsecret on WSL2 and DPAPI is unavailable pre-login. This module is the
+neutral seam a future ``KeyProtector`` backend can slot in without
+touching call sites.
 
 Atomic-write semantics
 ----------------------

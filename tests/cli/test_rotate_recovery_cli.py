@@ -17,10 +17,6 @@ import pytest
 from pyrage import x25519
 
 from paramem.backup.age_envelope import age_decrypt_bytes, age_encrypt_bytes
-from paramem.backup.encryption import (
-    MASTER_KEY_ENV_VAR,
-    _clear_cipher_cache,
-)
 from paramem.backup.key_store import (
     DAILY_PASSPHRASE_ENV_VAR,
     _clear_daily_identity_cache,
@@ -36,14 +32,10 @@ from paramem.cli import rotate_recovery
 
 @pytest.fixture(autouse=True)
 def _isolate_env_and_caches():
-    os.environ.pop(MASTER_KEY_ENV_VAR, None)
     os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
-    _clear_cipher_cache()
     _clear_daily_identity_cache()
     yield
-    os.environ.pop(MASTER_KEY_ENV_VAR, None)
     os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
-    _clear_cipher_cache()
     _clear_daily_identity_cache()
 
 

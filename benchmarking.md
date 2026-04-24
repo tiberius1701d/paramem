@@ -2831,8 +2831,8 @@ Same speaker, pyannote 512-dim embeddings:
 
 - `debug: false` in server.yaml: transcripts live only in RAM. After consolidation, knowledge is in the adapter weights — no textual traces remain on disk.
 - `debug: true` (default): transcripts written to JSONL files for inspection, archived after consolidation.
-- Encrypted session snapshots on graceful shutdown (SIGUSR1, SIGTERM): envelope-encrypted snapshot saved to disk (age when the daily identity is loaded, PMEM1 when only the Fernet master key is loaded), restored on startup, deleted immediately after restore. Unconsolidated conversations survive controlled restarts. Uncontrolled kills (SIGKILL, power loss) lose unconsolidated data — acceptable.
-- Snapshots gated on key material via the shared envelope helpers — configure `PARAMEM_DAILY_PASSPHRASE` + daily key file, or the legacy `PARAMEM_MASTER_KEY`. No key = snapshots disabled.
+- age-encrypted session snapshots on graceful shutdown (SIGUSR1, SIGTERM): snapshot saved to disk, restored on startup, deleted immediately after restore. Unconsolidated conversations survive controlled restarts. Uncontrolled kills (SIGKILL, power loss) lose unconsolidated data — acceptable.
+- Snapshots gated on the daily age identity: configure `PARAMEM_DAILY_PASSPHRASE` + `~/.config/paramem/daily_key.age`. No key = snapshots disabled.
 
 ### Resilience
 

@@ -178,7 +178,7 @@ class QueryRouter:
 
     def _load_keyed_pairs(self, adapter_name: str, path: Path) -> None:
         """Index entities from a keyed_pairs.json file.  Transparently
-        decrypts PMEM1-wrapped content when a master key is set."""
+        decrypts age-wrapped content when the daily identity is loaded."""
         from paramem.backup.encryption import read_maybe_encrypted
 
         try:
@@ -209,7 +209,7 @@ class QueryRouter:
 
     def _load_graph_entities(self) -> None:
         """Add graph node names to the entity set for matching.  Transparently
-        decrypts PMEM1-wrapped content when a master key is set."""
+        decrypts age-wrapped content when the daily identity is loaded."""
         try:
             import networkx as nx
 

@@ -13,14 +13,11 @@ Provides a narrow wrapper over ``pyrage`` that:
   stays bounded on the multi-hundred-MB HF trainer shards and queue file.
 
 The age binary envelope starts with the literal header
-``age-encryption.org/v1\\n`` (:data:`AGE_MAGIC`). The old PMEM1 Fernet envelope
-is handled by :mod:`paramem.backup.encryption`; the two formats are mutually
-exclusive on-disk and can be distinguished by their magic bytes.
+``age-encryption.org/v1\\n`` (:data:`AGE_MAGIC`). Non-magic bytes on disk are
+treated as plaintext by the universal reader.
 
-This module is the Phase-1 primitives layer for the two-identity key model in
-``docs/plan_security_hardening.md``. Higher-level concerns (daily-key file,
-passphrase wrapping, key-lifecycle CLI, rotation, migration from PMEM1) land
-in later slices and build on top of these primitives.
+Higher-level concerns (daily-key file, passphrase wrapping, key-lifecycle
+CLI, rotation) build on top of the primitives in this module.
 """
 
 from __future__ import annotations

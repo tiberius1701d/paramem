@@ -40,16 +40,12 @@ from pathlib import Path
 from paramem.backup.atomic import rename_pending_to_slot
 from paramem.backup.atomic import sweep_orphan_pending as _sweep_pending
 from paramem.backup.encryption import (
-    PMEM1_MAGIC,
-    current_key_fingerprint,
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
-    master_key_loaded,
 )
 from paramem.backup.hashing import (
     content_sha256_bytes,
 )
-from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
 from paramem.backup.meta import read_meta, verify_fingerprint, write_meta
 from paramem.backup.types import (
     SCHEMA_VERSION,
@@ -174,7 +170,7 @@ def write(
     """Write an artifact + sidecar into a new timestamped slot directory.
 
     Sequence (crash-safe):
-    1. Determine whether a key is loadable (age daily or Fernet master).
+    1. Determine whether the daily age identity is loadable.
     2. Create ``.pending/<ts>/`` inside *base_dir*.
     3. Write artifact file (ciphertext or plaintext) inside pending.
     4. Compute content hash of the on-disk bytes.
@@ -216,26 +212,18 @@ def write(
     # --- resolve payload bytes ---
     payload: bytes = source if isinstance(source, bytes) else Path(source).read_bytes()
 
-    # --- AUTO semantics: encrypt when any key path is loadable, else plaintext.
-    # envelope_encrypt_bytes dispatches the format (age when daily identity is
-    # loaded, PMEM1 otherwise, plaintext when neither). Operators who want
-    # fail-loud set security.require_encryption at startup; there is no
-    # per-write policy knob.
-    do_encrypt = master_key_loaded() or daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
+    # --- AUTO semantics: encrypt when the daily identity is loadable, else
+    # plaintext. envelope_encrypt_bytes produces an age envelope or
+    # returns the raw plaintext. Operators who want fail-loud set
+    # security.require_encryption at startup; no per-write policy knob.
+    # Late-bind key_store attrs so tests can monkeypatch the default path.
+    from paramem.backup import key_store as _ks
+
+    do_encrypt = _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
     on_disk_bytes = envelope_encrypt_bytes(payload) if do_encrypt else payload
 
     # --- compute content hash (of bytes as written — Resolved Decision 29) ---
     hash_hex = content_sha256_bytes(on_disk_bytes)
-
-    # --- key fingerprint ---
-    # Fernet-encrypted backups record the SHA-256 of the master key so the
-    # restore endpoint's mismatch-refuse can surface key-rotation as an
-    # actionable 400. Age-encrypted backups record None — the Fernet-style
-    # fingerprint concept does not apply, and a stale daily identity surfaces
-    # as a decrypt error instead (equally actionable for the operator).
-    key_fp = (
-        current_key_fingerprint() if do_encrypt and on_disk_bytes.startswith(PMEM1_MAGIC) else None
-    )
 
     # --- timestamp + filenames (with collision retry) ---
     encrypted_flag = do_encrypt
@@ -289,7 +277,6 @@ def write(
         content_sha256=hash_hex,
         size_bytes=len(on_disk_bytes),
         encrypted=encrypted_flag,
-        key_fingerprint=key_fp,
         tier=meta_fields.get("tier", "manual"),
         label=meta_fields.get("label"),
         pre_trial_hash=meta_fields.get("pre_trial_hash"),
@@ -368,8 +355,8 @@ def read(slot_dir: Path) -> tuple[bytes, ArtifactMeta]:
     FileNotFoundError
         If the slot directory or sidecar file is missing.
     RuntimeError
-        If the artifact is encrypted but ``PARAMEM_MASTER_KEY`` is not set
-        in the environment.
+        If the artifact is age-encrypted but the daily identity is not
+        loadable (``PARAMEM_DAILY_PASSPHRASE`` unset or daily key file missing).
     """
     slot_dir = Path(slot_dir)
 
@@ -390,10 +377,8 @@ def read(slot_dir: Path) -> tuple[bytes, ArtifactMeta]:
     # 4. Verify content hash against raw on-disk bytes
     verify_fingerprint(slot_dir, artifact_path)
 
-    # 5. Decrypt if needed. envelope_decrypt_bytes dispatches by magic:
-    #    age → PMEM1 → bare Fernet (legacy pre-envelope format). Meta's
-    #    ``encrypted`` flag is authoritative about whether decryption is
-    #    needed at all; the dispatch decides how.
+    # 5. Decrypt if needed. envelope_decrypt_bytes expects age-wrapped bytes;
+    #    meta.encrypted is authoritative about whether to decrypt at all.
     if meta.encrypted:
         plaintext = envelope_decrypt_bytes(raw_bytes)
     else:

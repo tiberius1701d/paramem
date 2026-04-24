@@ -9,7 +9,6 @@ import pytest
 from paramem.backup.hashing import (
     content_sha256_bytes,
     content_sha256_path,
-    fingerprint_key_bytes,
 )
 
 
@@ -64,29 +63,3 @@ class TestContentSha256Path:
         f = tmp_path / "large.bin"
         f.write_bytes(data)
         assert content_sha256_path(f) == content_sha256_bytes(data)
-
-
-class TestFingerprintKeyBytes:
-    def test_fingerprint_is_16_hex_chars(self):
-        """Fingerprint must be exactly 16 lowercase hex characters."""
-        fp = fingerprint_key_bytes(b"some-fernet-key-bytes")
-        assert len(fp) == 16
-        assert fp == fp.lower()
-        int(fp, 16)  # must be valid hex
-
-    def test_fingerprint_deterministic(self):
-        """Same key bytes always produce the same fingerprint."""
-        key = b"deterministic-key"
-        assert fingerprint_key_bytes(key) == fingerprint_key_bytes(key)
-
-    def test_fingerprint_different_keys_differ(self):
-        """Different key bytes must produce different fingerprints."""
-        fp1 = fingerprint_key_bytes(b"key-a")
-        fp2 = fingerprint_key_bytes(b"key-b")
-        assert fp1 != fp2
-
-    def test_fingerprint_matches_expected_prefix(self):
-        """Fingerprint is the first 16 hex chars of sha256(key)."""
-        key = b"test-key"
-        expected = hashlib.sha256(key).hexdigest()[:16]
-        assert fingerprint_key_bytes(key) == expected

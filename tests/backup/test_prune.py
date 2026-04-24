@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paramem.backup.backup import _parse_slot_timestamp, prune
-from paramem.backup.encryption import _clear_cipher_cache
 from paramem.backup.meta import write_meta
 from paramem.backup.types import (
     SCHEMA_VERSION,
@@ -24,7 +22,6 @@ def _make_meta(kind: ArtifactKind, timestamp: str, **overrides) -> ArtifactMeta:
         content_sha256="a" * 64,
         size_bytes=16,
         encrypted=False,
-        key_fingerprint=None,
         tier="scheduled",
         label=None,
     )
@@ -43,10 +40,6 @@ def _make_slot(base_dir: Path, kind: ArtifactKind, timestamp: str, **meta_overri
 
 
 class TestPruneRespect:
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
     def test_prune_respects_keep_counts(self, tmp_path):
         """Prune with keep=2 retains the 2 newest, deletes the rest."""
         base_dir = tmp_path / "config"
@@ -237,10 +230,6 @@ class TestParseSlotTimestamp:
 class TestPruneImmunityDays:
     """Tests that prune() honours immunity_days (Fix #1 — was silently broken)."""
 
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
     def test_prune_respects_immunity_days(self, tmp_path):
         """Immune slots are exempt from the tier count; keep budget applies to the tail.
 
@@ -352,10 +341,6 @@ class TestPruneImmunityDays:
 class TestPruneMissingArtifact:
     """Fix #1 — prune() must flag partial slots (valid sidecar, missing artifact) as invalid."""
 
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
     def test_prune_flags_missing_artifact_as_invalid(self, tmp_path):
         """Slot with valid sidecar but missing artifact file lands in report.invalid.
 
@@ -403,10 +388,6 @@ class TestPruneMissingArtifact:
 
 class TestPruneMaxDiskGb:
     """Fix #4 — prune() must enforce per-tier max_disk_gb cap."""
-
-    def setup_method(self):
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
     def _make_sized_slot(
         self, base_dir: Path, kind: ArtifactKind, timestamp: str, size_bytes: int

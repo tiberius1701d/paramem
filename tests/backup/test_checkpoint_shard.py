@@ -14,36 +14,44 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
-from cryptography.fernet import Fernet
 
+from paramem.backup.age_envelope import is_age_envelope
 from paramem.backup.checkpoint_shard import (
     encrypt_checkpoint_dir,
     materialize_checkpoint_to_shm,
 )
-from paramem.backup.encryption import (
-    MASTER_KEY_ENV_VAR,
-    _clear_cipher_cache,
-    is_pmem1_envelope,
+from paramem.backup.key_store import (
+    DAILY_PASSPHRASE_ENV_VAR,
+    _clear_daily_identity_cache,
+    mint_daily_identity,
+    wrap_daily_identity,
+    write_daily_key_file,
 )
 
 
-def _make_key() -> str:
-    return Fernet.generate_key().decode()
-
-
-def _clean_env() -> None:
-    os.environ.pop(MASTER_KEY_ENV_VAR, None)
-    _clear_cipher_cache()
-
-
 @pytest.fixture(autouse=True)
-def _env_isolation():
-    _clean_env()
+def _env_isolation(monkeypatch):
+    """Clear daily identity env + cache before/after each test."""
+    monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+    _clear_daily_identity_cache()
     yield
-    _clean_env()
+    _clear_daily_identity_cache()
+
+
+def _setup_daily_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passphrase: str = "pw"):
+    """Install a daily identity so the age writer path is active.
+
+    Returns the minted identity so tests can verify round-trip outcomes.
+    """
+    ident = mint_daily_identity()
+    key_path = tmp_path / "daily_key.age"
+    write_daily_key_file(wrap_daily_identity(ident, passphrase), key_path)
+    monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, passphrase)
+    monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+    _clear_daily_identity_cache()
+    return ident
 
 
 def _seed_checkpoint(root: Path) -> dict[str, bytes]:
@@ -69,21 +77,29 @@ def _seed_checkpoint(root: Path) -> dict[str, bytes]:
 
 
 class TestEncryptCheckpointDir:
-    def test_encrypt_wraps_every_file_when_key_set(self, tmp_path: Path) -> None:
-        """Master key set → every file gains PMEM1 magic; content round-trips."""
+    def test_encrypt_wraps_every_file_when_daily_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Daily identity loaded → every file becomes an age envelope; count returned."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         contents = _seed_checkpoint(ckpt)
 
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            n = encrypt_checkpoint_dir(ckpt)
+        n = encrypt_checkpoint_dir(ckpt)
 
         assert n == len(contents)
         for name in contents:
-            assert is_pmem1_envelope(ckpt / name), f"{name} should be PMEM1-wrapped"
+            assert is_age_envelope(ckpt / name), f"{name} should be age-wrapped"
 
-    def test_encrypt_noop_when_security_off(self, tmp_path: Path) -> None:
-        """No master key → no file is modified; return value is 0."""
+    def test_encrypt_noop_when_security_off(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No daily key → no file is modified; return value is 0."""
+        # Point the default at a missing file so daily_identity_loadable is False.
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
+            tmp_path / "absent.age",
+        )
         ckpt = tmp_path / "checkpoint-42"
         contents = _seed_checkpoint(ckpt)
 
@@ -92,72 +108,73 @@ class TestEncryptCheckpointDir:
         assert n == 0
         for name, body in contents.items():
             assert (ckpt / name).read_bytes() == body
-            assert not is_pmem1_envelope(ckpt / name)
+            assert not is_age_envelope(ckpt / name)
 
-    def test_encrypt_idempotent(self, tmp_path: Path) -> None:
+    def test_encrypt_idempotent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Second call after full encryption encrypts nothing new."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         _seed_checkpoint(ckpt)
 
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            n1 = encrypt_checkpoint_dir(ckpt)
-            n2 = encrypt_checkpoint_dir(ckpt)
+        n1 = encrypt_checkpoint_dir(ckpt)
+        n2 = encrypt_checkpoint_dir(ckpt)
 
         assert n1 > 0
         assert n2 == 0
 
-    def test_encrypt_handles_subdirectories(self, tmp_path: Path) -> None:
+    def test_encrypt_handles_subdirectories(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Files in nested subdirs are encrypted recursively."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         _seed_checkpoint(ckpt)
         subdir = ckpt / "tokenizer"
         subdir.mkdir()
         (subdir / "tokenizer.json").write_bytes(b'{"vocab_size": 32000}')
 
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            encrypt_checkpoint_dir(ckpt)
+        encrypt_checkpoint_dir(ckpt)
 
-        assert is_pmem1_envelope(subdir / "tokenizer.json")
+        assert is_age_envelope(subdir / "tokenizer.json")
 
-    def test_encrypt_skips_already_wrapped_files(self, tmp_path: Path) -> None:
+    def test_encrypt_skips_already_wrapped_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Mixed state (some wrapped, some plaintext) encrypts only the plaintext."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         _seed_checkpoint(ckpt)
 
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            # Encrypt just one file, then call encrypt_checkpoint_dir.
-            from paramem.backup.encryption import write_infra_bytes
+        # Encrypt just one file, then call encrypt_checkpoint_dir.
+        from paramem.backup.encryption import write_infra_bytes
 
-            write_infra_bytes(
-                ckpt / "adapter_model.safetensors",
-                (ckpt / "adapter_model.safetensors").read_bytes(),
-            )
-            # Re-read after the write since the filesystem state changed.
-            # One file is now wrapped, the rest remain plaintext.
-            n = encrypt_checkpoint_dir(ckpt)
+        write_infra_bytes(
+            ckpt / "adapter_model.safetensors",
+            (ckpt / "adapter_model.safetensors").read_bytes(),
+        )
+        # Re-read after the write since the filesystem state changed.
+        # One file is now wrapped, the rest remain plaintext.
+        n = encrypt_checkpoint_dir(ckpt)
 
         # 8 total files seeded, 1 already wrapped → 7 newly encrypted.
         assert n == 7
 
 
 class TestMaterializeCheckpointToShm:
-    def test_materialize_decrypts_all_files(self, tmp_path: Path) -> None:
+    def test_materialize_decrypts_all_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Fully encrypted source → tempdir carries decrypted bytes."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         contents = _seed_checkpoint(ckpt)
-
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            encrypt_checkpoint_dir(ckpt)
-            shm = materialize_checkpoint_to_shm(ckpt)
+        encrypt_checkpoint_dir(ckpt)
+        shm = materialize_checkpoint_to_shm(ckpt)
 
         try:
             for name, body in contents.items():
                 assert (shm / name).read_bytes() == body
-                assert not is_pmem1_envelope(shm / name)
+                assert not is_age_envelope(shm / name)
         finally:
             import shutil
 
@@ -178,21 +195,22 @@ class TestMaterializeCheckpointToShm:
 
             shutil.rmtree(shm, ignore_errors=True)
 
-    def test_materialize_handles_mixed_state(self, tmp_path: Path) -> None:
+    def test_materialize_handles_mixed_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Half-wrapped directory → each file decoded via the right branch."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         contents = _seed_checkpoint(ckpt)
 
         # Wrap half the files; leave the rest plaintext.
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            from paramem.backup.encryption import write_infra_bytes
+        from paramem.backup.encryption import write_infra_bytes
 
-            to_wrap = list(contents)[:4]
-            for name in to_wrap:
-                write_infra_bytes(ckpt / name, (ckpt / name).read_bytes())
+        to_wrap = list(contents)[:4]
+        for name in to_wrap:
+            write_infra_bytes(ckpt / name, (ckpt / name).read_bytes())
 
-            shm = materialize_checkpoint_to_shm(ckpt)
+        shm = materialize_checkpoint_to_shm(ckpt)
 
         try:
             for name, body in contents.items():
@@ -202,8 +220,11 @@ class TestMaterializeCheckpointToShm:
 
             shutil.rmtree(shm, ignore_errors=True)
 
-    def test_materialize_preserves_subdirectory_layout(self, tmp_path: Path) -> None:
+    def test_materialize_preserves_subdirectory_layout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Nested subdirs survive materialization at the same relative path."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         _seed_checkpoint(ckpt)
         subdir = ckpt / "tokenizer"
@@ -211,10 +232,8 @@ class TestMaterializeCheckpointToShm:
         sub_body = b'{"vocab_size": 32000}'
         (subdir / "tokenizer.json").write_bytes(sub_body)
 
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            encrypt_checkpoint_dir(ckpt)
-            shm = materialize_checkpoint_to_shm(ckpt)
+        encrypt_checkpoint_dir(ckpt)
+        shm = materialize_checkpoint_to_shm(ckpt)
 
         try:
             assert (shm / "tokenizer" / "tokenizer.json").read_bytes() == sub_body
@@ -255,15 +274,15 @@ class TestMaterializeCheckpointToShm:
 
 
 class TestEncryptMaterializeRoundTrip:
-    def test_round_trip_byte_identical(self, tmp_path: Path) -> None:
+    def test_round_trip_byte_identical(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Encrypt → materialize returns byte-for-byte identical content."""
+        _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-42"
         contents = _seed_checkpoint(ckpt)
-
-        with patch.dict(os.environ, {MASTER_KEY_ENV_VAR: _make_key()}):
-            _clear_cipher_cache()
-            encrypt_checkpoint_dir(ckpt)
-            shm = materialize_checkpoint_to_shm(ckpt)
+        encrypt_checkpoint_dir(ckpt)
+        shm = materialize_checkpoint_to_shm(ckpt)
 
         try:
             materialized = {
@@ -278,39 +297,14 @@ class TestEncryptMaterializeRoundTrip:
 
 # ---------------------------------------------------------------------------
 # Age-envelope coverage — regression tests for the writer-flip integration.
-# Without the age-aware sniff in _is_encrypted_envelope, encrypt_checkpoint_dir
-# would re-encrypt age files (double-wrap) and materialize_checkpoint_to_shm
-# would hand HF Trainer ciphertext instead of plaintext.
 # ---------------------------------------------------------------------------
-
-
-def _setup_daily_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passphrase: str = "pw"):
-    """Install a daily identity so the age writer path is active.
-
-    Returns the minted identity so tests can verify round-trip outcomes.
-    """
-    from paramem.backup.key_store import (
-        _clear_daily_identity_cache,
-        mint_daily_identity,
-        wrap_daily_identity,
-        write_daily_key_file,
-    )
-
-    ident = mint_daily_identity()
-    key_path = tmp_path / "daily_key.age"
-    write_daily_key_file(wrap_daily_identity(ident, passphrase), key_path)
-    monkeypatch.setenv("PARAMEM_DAILY_PASSPHRASE", passphrase)
-    monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
-    _clear_daily_identity_cache()
-    return ident
 
 
 class TestAgeEnvelopeCompatibility:
     def test_encrypt_with_daily_loaded_produces_age(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from paramem.backup.age_envelope import is_age_envelope
-
+        """Daily identity loaded → encrypt_checkpoint_dir produces age files."""
         _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-1"
         _seed_checkpoint(ckpt)
@@ -320,7 +314,6 @@ class TestAgeEnvelopeCompatibility:
         for entry in ckpt.iterdir():
             if entry.is_file():
                 assert is_age_envelope(entry), f"{entry.name} must be age post-encrypt"
-                assert not is_pmem1_envelope(entry)
 
     def test_encrypt_is_idempotent_on_age_files(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -346,6 +339,7 @@ class TestAgeEnvelopeCompatibility:
     def test_materialize_decrypts_age_files(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Encrypt → materialize → plaintext bytes in shm dir."""
         _setup_daily_identity(tmp_path, monkeypatch)
         ckpt = tmp_path / "checkpoint-3"
         contents = _seed_checkpoint(ckpt)
@@ -366,12 +360,9 @@ class TestAgeEnvelopeCompatibility:
     def test_gate_fires_on_daily_only(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """encrypt_checkpoint_dir must activate when ONLY the daily identity
-        is loaded (Fernet key retired), not just when PARAMEM_MASTER_KEY is
-        set. The pre-fix gate was ``master_key_loaded()`` alone — a latent
-        silent-plaintext bug post-Fernet-retirement."""
+        """encrypt_checkpoint_dir must activate when the daily identity is
+        loaded — verifies the gate is ``daily_identity_loadable``."""
         _setup_daily_identity(tmp_path, monkeypatch)
-        # Fernet key NOT set — daily identity alone should still gate on.
         ckpt = tmp_path / "checkpoint-4"
         _seed_checkpoint(ckpt)
 
@@ -381,14 +372,11 @@ class TestAgeEnvelopeCompatibility:
     def test_gate_noop_when_no_keys_loaded(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Security OFF: no Fernet, no daily. encrypt_checkpoint_dir leaves
-        every file plaintext."""
+        """Security OFF: no daily key. encrypt_checkpoint_dir leaves every file plaintext."""
         monkeypatch.setattr(
             "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", tmp_path / "absent.age"
         )
-        monkeypatch.delenv("PARAMEM_DAILY_PASSPHRASE", raising=False)
-        monkeypatch.delenv(MASTER_KEY_ENV_VAR, raising=False)
-        _clear_cipher_cache()
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
 
         ckpt = tmp_path / "checkpoint-5"
         contents = _seed_checkpoint(ckpt)
@@ -398,36 +386,3 @@ class TestAgeEnvelopeCompatibility:
         for entry in ckpt.iterdir():
             if entry.is_file():
                 assert entry.read_bytes() == contents[entry.name]
-
-    def test_materialize_handles_mixed_pmem1_age_dir(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Transitional state: a checkpoint dir may contain both PMEM1
-        (written under an older deploy) and age files (written under the
-        current deploy). Materialize must decrypt both formats."""
-        from paramem.backup.encryption import PMEM1_MAGIC, encrypt_bytes
-
-        _setup_daily_identity(tmp_path, monkeypatch)
-        monkeypatch.setenv(MASTER_KEY_ENV_VAR, _make_key())
-        _clear_cipher_cache()
-
-        ckpt = tmp_path / "checkpoint-mixed"
-        contents = _seed_checkpoint(ckpt)
-
-        # One file as PMEM1 (simulate a legacy write).
-        pmem1_name = next(iter(contents))
-        pmem1_path = ckpt / pmem1_name
-        pmem1_path.write_bytes(PMEM1_MAGIC + encrypt_bytes(contents[pmem1_name]))
-        # Everything else via the current writer → age.
-        encrypt_checkpoint_dir(ckpt)
-
-        shm = materialize_checkpoint_to_shm(ckpt)
-        try:
-            for name, original in contents.items():
-                assert (shm / name).read_bytes() == original, (
-                    f"{name}: mixed-format directory failed to round-trip"
-                )
-        finally:
-            import shutil
-
-            shutil.rmtree(shm, ignore_errors=True)

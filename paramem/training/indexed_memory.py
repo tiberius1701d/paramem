@@ -264,9 +264,9 @@ def save_registry(registry: dict, path: str | Path) -> None:
 
 
 def load_registry(path: str | Path) -> dict:
-    """Load registry from a JSON file — transparently decrypts PMEM1-wrapped
-    content when a master key is set.  Handles both simple and enriched
-    formats."""
+    """Load registry from a JSON file — transparently decrypts age-wrapped
+    content when the daily identity is loaded.  Handles both simple and
+    enriched formats."""
     from paramem.backup.encryption import read_maybe_encrypted
 
     return json.loads(read_maybe_encrypted(Path(path)).decode("utf-8"))

@@ -24,102 +24,11 @@ def _make_meta(**overrides) -> ArtifactMeta:
         content_sha256="a" * 64,
         size_bytes=128,
         encrypted=False,
-        key_fingerprint=None,
         tier="scheduled",
         label=None,
     )
     defaults.update(overrides)
     return ArtifactMeta(**defaults)
-
-
-class TestReadMetaAcceptsPmem1Envelope:
-    """Contract: read_meta tolerates PMEM1-wrapped sidecars in addition to
-    plaintext. write_meta currently writes plaintext (carve-out per
-    SECURITY.md §4), but this tolerance is the migration-forward contract —
-    an operator or future migration command that hand-wraps a sidecar must
-    still round-trip through read_meta.
-    """
-
-    def test_read_meta_accepts_pmem1_wrapped_sidecar(self, tmp_path, monkeypatch):
-        """A sidecar hand-wrapped in the PMEM1 envelope must read back correctly."""
-        import os
-
-        from cryptography.fernet import Fernet
-
-        from paramem.backup.encryption import _clear_cipher_cache, write_infra_bytes
-
-        meta = _make_meta(label="encrypted-sidecar")
-
-        key = Fernet.generate_key().decode()
-        monkeypatch.setenv("PARAMEM_MASTER_KEY", key)
-        _clear_cipher_cache()
-
-        slot_dir = tmp_path / "slot_pmem1"
-        slot_dir.mkdir()
-        sidecar_path = slot_dir / f"{meta.kind.value}-{meta.timestamp}.meta.json"
-
-        payload = json.dumps(
-            {
-                "schema_version": meta.schema_version,
-                "kind": meta.kind.value,
-                "timestamp": meta.timestamp,
-                "content_sha256": meta.content_sha256,
-                "size_bytes": meta.size_bytes,
-                "encrypted": meta.encrypted,
-                "key_fingerprint": meta.key_fingerprint,
-                "tier": meta.tier,
-                "label": meta.label,
-                "pre_trial_hash": meta.pre_trial_hash,
-            }
-        ).encode("utf-8")
-
-        write_infra_bytes(sidecar_path, payload)
-
-        # On-disk body is ciphertext-wrapped.
-        assert sidecar_path.read_bytes().startswith(b"PMEM1\n")
-
-        # read_meta transparently decrypts and returns the same dataclass.
-        recovered = read_meta(slot_dir)
-        assert recovered == meta
-
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-
-    def test_read_meta_encrypted_sidecar_wrong_key_surfaces_meta_schema_error(
-        self, tmp_path, monkeypatch
-    ):
-        """Wrong key on an encrypted sidecar must raise MetaSchemaError with a
-        clear ciphertext-authentication message — not a silent skip or a raw
-        InvalidToken leak."""
-        import os
-
-        from cryptography.fernet import Fernet
-
-        from paramem.backup.encryption import _clear_cipher_cache, write_infra_bytes
-
-        meta = _make_meta()
-
-        key_a = Fernet.generate_key().decode()
-        monkeypatch.setenv("PARAMEM_MASTER_KEY", key_a)
-        _clear_cipher_cache()
-
-        slot_dir = tmp_path / "slot_wrong_key"
-        slot_dir.mkdir()
-        sidecar_path = slot_dir / f"{meta.kind.value}-{meta.timestamp}.meta.json"
-        write_infra_bytes(
-            sidecar_path,
-            json.dumps({"schema_version": meta.schema_version}).encode("utf-8"),
-        )
-
-        # Swap to a different key.
-        _clear_cipher_cache()
-        monkeypatch.setenv("PARAMEM_MASTER_KEY", Fernet.generate_key().decode())
-
-        with pytest.raises(MetaSchemaError, match="ciphertext failed authentication"):
-            read_meta(slot_dir)
-
-        _clear_cipher_cache()
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
 
 
 class TestWriteReadMetaRoundtrip:
@@ -141,19 +50,6 @@ class TestWriteReadMetaRoundtrip:
         slot_dir.mkdir()
         write_meta(slot_dir, meta)
         assert read_meta(slot_dir).label == "pre-migration-2026-04-21"
-
-    def test_roundtrip_encrypted_with_fingerprint(self, tmp_path):
-        """Encrypted meta with key_fingerprint round-trips."""
-        meta = _make_meta(
-            encrypted=True,
-            key_fingerprint="abcdef0123456789",
-        )
-        slot_dir = tmp_path / "slot_enc"
-        slot_dir.mkdir()
-        write_meta(slot_dir, meta)
-        recovered = read_meta(slot_dir)
-        assert recovered.encrypted is True
-        assert recovered.key_fingerprint == "abcdef0123456789"
 
     def test_meta_rejects_future_schema_version(self, tmp_path):
         """Sidecar with schema_version > SCHEMA_VERSION raises MetaSchemaError. (NIT 2)"""

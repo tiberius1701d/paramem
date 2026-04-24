@@ -106,7 +106,6 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
         "content_sha256": meta.content_sha256,
         "size_bytes": meta.size_bytes,
         "encrypted": meta.encrypted,
-        "key_fingerprint": meta.key_fingerprint,
         "tier": meta.tier,
         "label": meta.label,
         "pre_trial_hash": meta.pre_trial_hash,
@@ -114,12 +113,10 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
 
     # Plaintext-by-design (SECURITY.md §4 carve-out): backup sidecars are
     # control-plane metadata only (timestamp, content_sha256 of the already-
-    # encrypted payload, size, tier, label, key_fingerprint).  Encrypting them
-    # would turn every wrong-key restore into a silent "backup not found"
-    # instead of a clear decrypt_invalid_token error.  The user-facts live in
-    # the paired `.bin.enc` artifact, which stays encrypted.  ``read_meta``
-    # still tolerates PMEM1-wrapped sidecars so any pre-existing ciphertext
-    # sidecar remains readable.
+    # encrypted payload, size, tier, label).  Encrypting them would turn
+    # every wrong-key restore into a silent "backup not found" instead of a
+    # clear decrypt error.  The user-facts live in the paired `.bin.enc`
+    # artifact, which stays encrypted.
     sidecar_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return sidecar_path
 
@@ -161,25 +158,16 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
     if not meta_file.exists():
         raise FileNotFoundError(f"No .meta.json sidecar found in {slot_dir}")
 
-    # Sidecars may be PMEM1-wrapped (Security ON) or plaintext (Security OFF).
-    # read_maybe_encrypted handles both; InvalidToken surfaces as a corrupt
-    # sidecar for the caller.
-    from cryptography.fernet import InvalidToken
-
+    # Sidecars are plaintext-by-design (SECURITY.md §4 carve-out), but the
+    # universal reader handles any legacy ciphertext transparently; RuntimeError
+    # from the reader surfaces as a clear corrupt-sidecar error for the caller.
     try:
         plaintext = read_maybe_encrypted(meta_file)
         raw = json.loads(plaintext.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise MetaSchemaError(f"corrupt sidecar: {meta_file} — {exc}") from exc
-    except InvalidToken as exc:
-        raise MetaSchemaError(
-            f"corrupt sidecar: {meta_file} — ciphertext failed authentication "
-            "(key mismatch or tampering)"
-        ) from exc
     except RuntimeError as exc:
-        raise MetaSchemaError(
-            f"corrupt sidecar: {meta_file} — encrypted sidecar requires a master key to be set"
-        ) from exc
+        raise MetaSchemaError(f"corrupt sidecar: {meta_file} — {exc}") from exc
 
     # --- schema_version gate (NIT 2) ---
     raw_version = raw.get("schema_version")
@@ -235,7 +223,6 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
         content_sha256=raw["content_sha256"],
         size_bytes=raw["size_bytes"],
         encrypted=raw["encrypted"],
-        key_fingerprint=raw.get("key_fingerprint"),
         tier=raw["tier"],
         label=raw.get("label"),
         pre_trial_hash=raw.get("pre_trial_hash"),

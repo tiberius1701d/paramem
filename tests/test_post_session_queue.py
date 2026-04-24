@@ -241,9 +241,8 @@ class TestAtomicWrite:
         """The backing file is always valid JSON after a write.
 
         Reads through ``read_maybe_encrypted`` so the assertion holds in
-        both Security OFF (plaintext on disk) and Security ON (PMEM1-wrapped
-        ciphertext on disk) modes — the pytest session may inherit a master
-        key from a sibling test module's ``load_dotenv`` side-effect.
+        both Security OFF (plaintext on disk) and Security ON (age-wrapped
+        ciphertext on disk) modes.
         """
         from paramem.backup.encryption import read_maybe_encrypted
 

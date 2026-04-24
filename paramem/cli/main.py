@@ -26,16 +26,13 @@ from paramem.cli import (
     backup_prune,
     backup_restore,
     change_passphrase,
-    decrypt_infra,
     dump,
-    encrypt_infra,
     generate_key,
     migrate,
     migrate_accept,
     migrate_cancel,
     migrate_rollback,
     migrate_status,
-    migrate_to_age,
     restore,
     rotate_daily,
     rotate_recovery,
@@ -200,16 +197,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Slot directory name to restore (e.g. 20260421-04000012).",
     )
     p_br.add_argument(
-        "--force-rotate-key",
-        action="store_true",
-        dest="force_rotate_key",
-        help=(
-            "Bypass key-fingerprint check. Use only when restoring a backup "
-            "encrypted with a prior key (which must remain available to "
-            "read the backup's cleartext)."
-        ),
-    )
-    p_br.add_argument(
         "--json",
         action="store_true",
         help="Emit raw JSON response instead of formatted output.",
@@ -235,10 +222,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # --- security CLI (encryption / key lifecycle) ---
     generate_key.add_parser(subparsers)
-    encrypt_infra.add_parser(subparsers)
-    decrypt_infra.add_parser(subparsers)
     dump.add_parser(subparsers)
-    migrate_to_age.add_parser(subparsers)
     rotate_daily.add_parser(subparsers)
     rotate_recovery.add_parser(subparsers)
     restore.add_parser(subparsers)
@@ -304,17 +288,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "generate-key":
         return generate_key.run(args)
 
-    if args.command == "encrypt-infra":
-        return encrypt_infra.run(args)
-
-    if args.command == "decrypt-infra":
-        return decrypt_infra.run(args)
-
     if args.command == "dump":
         return dump.run(args)
-
-    if args.command == "migrate-to-age":
-        return migrate_to_age.run(args)
 
     if args.command == "rotate-daily":
         return rotate_daily.run(args)

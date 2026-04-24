@@ -191,10 +191,10 @@ class SecurityConfig:
     """Top-level security configuration block.
 
     ``require_encryption`` is the single uniform knob operators use to opt into
-    a fail-loud posture: when ``True`` and neither the age daily identity nor
-    ``PARAMEM_MASTER_KEY`` is loadable at startup, the server refuses to start.
-    The default ``False`` matches AUTO semantics everywhere — encrypt when a
-    key is loaded, plaintext otherwise.
+    a fail-loud posture: when ``True`` and the daily age identity is not
+    loadable at startup, the server refuses to start. The default ``False``
+    matches AUTO semantics everywhere — encrypt when a key is loaded,
+    plaintext otherwise.
     """
 
     backups: ServerBackupsConfig = field(default_factory=ServerBackupsConfig)

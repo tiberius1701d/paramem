@@ -24,23 +24,23 @@ from pathlib import Path
 from paramem.backup.encryption import (
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
-    master_key_loaded,
 )
-from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
 
 logger = logging.getLogger(__name__)
 
 
 def _snapshots_enabled() -> bool:
-    """Return True when any key material is loaded.
+    """Return True when the daily age identity is loadable.
 
     Snapshots need a key to encrypt with; without one, the
-    ``save_snapshot`` / ``load_snapshot`` pair no-ops. Either the Fernet
-    master key (legacy PMEM1 envelope) or the daily age identity is
-    sufficient — :func:`envelope_encrypt_bytes` picks the right format
-    based on the same posture.
+    ``save_snapshot`` / ``load_snapshot`` pair no-ops.
+
+    Late-binds ``key_store`` attrs so tests that monkeypatch
+    ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT`` see their override.
     """
-    return master_key_loaded() or daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
+    from paramem.backup import key_store as _ks
+
+    return _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
 
 
 # Session conversation states
@@ -417,15 +417,12 @@ class SessionBuffer:
         return turns
 
     def save_snapshot(self) -> bool:
-        """Write encrypted snapshot of in-memory state to disk.
+        """Write age-encrypted snapshot of in-memory state to disk.
 
         Called on graceful shutdown (SIGUSR1, SIGTERM). Returns True on
-        success. The on-disk body carries whichever envelope format the
-        server is producing (age when the daily identity is loaded,
-        PMEM1 when only the Fernet master key is loaded). When no key
-        material is loaded, returns False without writing — snapshot
-        persistence requires at least one key so a restart on a fresh
-        host with the key restored can read it back.
+        success. When the daily identity is not loaded, returns False
+        without writing — snapshot persistence requires a key so a restart
+        on a fresh host with the key restored can read it back.
         """
         if not _snapshots_enabled():
             return False
@@ -454,18 +451,18 @@ class SessionBuffer:
             return False
 
     def load_snapshot(self) -> bool:
-        """Restore in-memory state from an encrypted snapshot.
+        """Restore in-memory state from an age-encrypted snapshot.
 
-        Called on startup. Decrypts via :func:`envelope_decrypt_bytes`
-        (dispatches age / PMEM1 / legacy bare Fernet by magic), loads the
-        payload, then deletes the file. Returns True iff a snapshot was
-        actually restored.
+        Called on startup. Decrypts via :func:`envelope_decrypt_bytes`,
+        loads the payload, then deletes the file. Returns True iff a
+        snapshot was actually restored.
 
-        When the snapshot file exists but no key material is loaded, logs
-        a warning and returns False without unlinking — the file cannot
-        be decrypted without the retired key, but the operator may want
-        to inspect / recover it manually. A deliberate ``paramem restore``
-        or a key-rotation workflow is the right way to bring it back.
+        When the snapshot file exists but the daily identity is not
+        loadable, logs a warning and returns False without unlinking —
+        the file cannot be decrypted without the retired identity, but
+        the operator may want to inspect / recover it manually. A
+        deliberate ``paramem restore`` workflow is the right way to bring
+        it back.
         """
         if not self._snapshot_path.exists():
             return False

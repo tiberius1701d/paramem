@@ -558,11 +558,11 @@ def build_manifest_for(
     )
 
     # --- registry_sha256 ---
-    # Hash the PLAINTEXT content, not the on-disk bytes.  Fernet rewrites the
-    # ciphertext with a fresh IV on every encryption pass, so a ciphertext-
-    # based hash would change on every re-encrypt and break live-slot drift
-    # detection.  read_maybe_encrypted unwraps the PMEM1 envelope when
-    # present and returns the original bytes otherwise.
+    # Hash the PLAINTEXT content, not the on-disk bytes. age re-encrypts with a
+    # fresh content key on every write, so a ciphertext-based hash would change
+    # on every re-encrypt and break live-slot drift detection.
+    # read_maybe_encrypted unwraps the age envelope when present and returns
+    # the original bytes otherwise.
     if registry_sha256_override is not None:
         registry_sha256 = registry_sha256_override
     elif registry_path is not None and registry_path.exists():
@@ -585,8 +585,8 @@ def build_manifest_for(
     if keyed_pairs_path is not None and keyed_pairs_path.exists():
         try:
             # Hash the PLAINTEXT content — envelope-wrapped keyed_pairs would
-            # produce a different hash on every re-encrypt (fresh Fernet IV).
-            # See registry_sha256 above for the same reasoning.
+            # produce a different hash on every re-encrypt (fresh age content
+            # key). See registry_sha256 above for the same reasoning.
             from paramem.backup.encryption import read_maybe_encrypted
 
             raw = read_maybe_encrypted(keyed_pairs_path)

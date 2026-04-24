@@ -5,13 +5,13 @@ Scope: WP4 in `docs/plan_security_hardening.md`.
 Purpose: split what used to be a single ``.env`` file into one file per secret
 under ``~/.config/paramem/secrets/`` with strict permissions. Reduces blast
 radius: a single file disclosure exposes only that secret, not the full set
-(HA token, cloud API keys, master key, etc.).
+(HA token, cloud API keys, daily passphrase, etc.).
 
 Layout:
     ~/.config/paramem/secrets/          (mode 0700, owner-only)
         HA_TOKEN                        (mode 0600)
         ANTHROPIC_API_KEY               (mode 0600)
-        PARAMEM_MASTER_KEY              (mode 0600)
+        PARAMEM_DAILY_PASSPHRASE        (mode 0600)
         ...
 
 Semantics:
@@ -23,9 +23,8 @@ Semantics:
 - Directory missing → no-op (back-compat). Directory present but loose
   permissions → refuse with clear error.
 
-This module does not handle the master key itself for decryption — that is
-WP1's concern. It just ensures secrets reach ``os.environ`` from a safer
-layout than a single shared file.
+This module does not handle key material itself — it just ensures secrets
+reach ``os.environ`` from a safer layout than a single shared file.
 """
 
 from __future__ import annotations

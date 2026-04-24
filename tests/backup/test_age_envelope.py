@@ -182,7 +182,7 @@ class TestIsAgeEnvelope:
 
     def test_false_for_arbitrary_bytes(self, tmp_path: Path) -> None:
         p = tmp_path / "random.bin"
-        p.write_bytes(b"PMEM1\n" + os.urandom(100))
+        p.write_bytes(b"OTHER\n" + os.urandom(100))
         assert is_age_envelope(p) is False
 
     def test_false_for_missing_file(self, tmp_path: Path) -> None:

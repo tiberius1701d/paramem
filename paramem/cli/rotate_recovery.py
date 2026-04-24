@@ -35,7 +35,7 @@ from pyrage import x25519
 from paramem.backup import key_store as _ks
 from paramem.backup import rotation as _rot
 from paramem.backup.age_envelope import is_age_envelope
-from paramem.backup.encryption import infra_paths, is_pmem1_envelope
+from paramem.backup.encryption import infra_paths
 from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
 from paramem.cli.generate_key import CONFIRM_PHRASE, _format_bech32_groups
 
@@ -66,13 +66,6 @@ def _check_preconditions(data_dir: Path) -> list[str]:
             f"{_ks.RECOVERY_PUB_PATH_DEFAULT}. A first-time setup should use "
             "`paramem generate-key`, not rotate-recovery."
         )
-    if data_dir.exists():
-        pmem1 = [p for p in infra_paths(data_dir) if p.exists() and is_pmem1_envelope(p)]
-        if pmem1:
-            errors.append(
-                f"{len(pmem1)} PMEM1 file(s) on disk (e.g. {pmem1[0]}). "
-                "Run `paramem migrate-to-age` first."
-            )
     return errors
 
 

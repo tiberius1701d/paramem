@@ -573,13 +573,32 @@ def _collect_key_rotation_items(state: dict) -> list[AttentionItem]:
 
 
 def _collect_encryption_items(state: dict) -> list[AttentionItem]:
-    """Emit encryption-degraded items when posture is SECURITY: OFF.
+    """Emit one ``encryption_off`` item when posture is SECURITY: OFF.
 
-    Stub — not yet populated.  Signature is intentionally ``(state)``-only;
-    when this populator is wired, extend to ``(state, config)`` rather than
-    unifying with ``_collect_backup_items`` prematurely.
+    Reads :data:`_state['encryption']` — set once at lifespan entry from
+    the posture computed by :mod:`paramem.server.security_posture`. Never
+    re-probes the environment, so a key rotated into place mid-session
+    does not silently suppress this alert until the next server restart
+    (which is also the point at which the posture itself would flip).
+
+    Silently returns ``[]`` when the field is missing (pre-lifespan call
+    during tests) or when posture is SECURITY: ON.
     """
-    return []
+    posture = state.get("encryption")
+    if posture != "off":
+        return []
+    return [
+        AttentionItem(
+            kind="encryption_off",
+            level="action_required",
+            summary=("SECURITY: OFF — all infrastructure metadata is plaintext on disk"),
+            action_hint=(
+                "paramem generate-key    # mint daily + recovery, then set "
+                "PARAMEM_DAILY_PASSPHRASE and restart the server"
+            ),
+            age_seconds=None,
+        )
+    ]
 
 
 def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:

@@ -78,7 +78,7 @@ def create_consolidation_loop(
     # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.
     # Required by simulate mode so cold-start recall reads the full set;
     # harmless for train mode (train reconstructs from weights and overwrites).
-    # Transparently decrypts PMEM1-wrapped content when a master key is set.
+    # Transparently decrypts age-wrapped content when the daily identity is loaded.
     ep_kp_path = config.adapter_dir / "keyed_pairs.json"
     if ep_kp_path.exists():
         loop.seed_episodic_qa(json.loads(read_maybe_encrypted(ep_kp_path).decode("utf-8")))

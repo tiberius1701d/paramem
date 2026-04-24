@@ -16,12 +16,6 @@ import pytest
 from pyrage import x25519
 
 from paramem.backup.age_envelope import age_decrypt_bytes, age_encrypt_bytes
-from paramem.backup.encryption import (
-    MASTER_KEY_ENV_VAR,
-    PMEM1_MAGIC,
-    _clear_cipher_cache,
-    encrypt_bytes,
-)
 from paramem.backup.key_store import (
     DAILY_PASSPHRASE_ENV_VAR,
     _clear_daily_identity_cache,
@@ -37,14 +31,10 @@ from paramem.cli import rotate_daily
 
 @pytest.fixture(autouse=True)
 def _isolate_env_and_caches():
-    os.environ.pop(MASTER_KEY_ENV_VAR, None)
     os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
-    _clear_cipher_cache()
     _clear_daily_identity_cache()
     yield
-    os.environ.pop(MASTER_KEY_ENV_VAR, None)
     os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
-    _clear_cipher_cache()
     _clear_daily_identity_cache()
 
 
@@ -201,21 +191,6 @@ class TestPreconditions:
         rc = rotate_daily.run(_default_args(data_dir))
         assert rc == 1
         assert "Recovery public recipient is missing" in capsys.readouterr().err
-
-    def test_refuses_when_pmem1_files_present(self, tmp_path, monkeypatch, capsys):
-        daily, recovery = _setup_keys(tmp_path, monkeypatch)
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
-        # Drop a PMEM1 file among the infra paths.
-        os.environ[MASTER_KEY_ENV_VAR] = (
-            __import__("cryptography.fernet", fromlist=["Fernet"]).Fernet.generate_key().decode()
-        )
-        pmem1_path = data_dir / "registry.json"
-        pmem1_path.write_bytes(PMEM1_MAGIC + encrypt_bytes(b"{}"))
-
-        rc = rotate_daily.run(_default_args(data_dir))
-        assert rc == 1
-        assert "PMEM1" in capsys.readouterr().err
 
     def test_refuses_missing_data_dir(self, tmp_path, monkeypatch, capsys):
         _setup_keys(tmp_path, monkeypatch)

@@ -1,15 +1,14 @@
 """Tests for assert_startup_posture and its lifespan wiring.
 
-Semantics (post-refactor, 2026-04-24): uniform AUTO encryption — encrypt
-when age daily OR ``PARAMEM_MASTER_KEY`` is loadable, plaintext otherwise.
-Operators opt into fail-loud via ``security.require_encryption: bool`` at
-startup via :func:`paramem.server.security_posture.assert_startup_posture`.
+Semantics: uniform AUTO encryption — encrypt when the age daily identity
+is loadable, plaintext otherwise. Operators opt into fail-loud via
+``security.require_encryption: bool`` at startup via
+:func:`paramem.server.security_posture.assert_startup_posture`.
 
 Tests verify:
 - ``require_encryption=False`` is a no-op regardless of key state.
-- ``require_encryption=True`` with a Fernet key loaded does not raise.
-- ``require_encryption=True`` with a daily identity loadable does not raise.
-- ``require_encryption=True`` with neither key raises FatalConfigError.
+- ``require_encryption=True`` with the daily identity loadable does not raise.
+- ``require_encryption=True`` without the daily identity raises FatalConfigError.
 - The lifespan source calls ``assert_startup_posture``.
 """
 
@@ -28,22 +27,13 @@ from paramem.server.security_posture import assert_startup_posture
 
 
 class TestAssertStartupPosture:
-    """Unit tests for assert_startup_posture covering the four key-state paths."""
+    """Unit tests for assert_startup_posture covering the key-state paths."""
 
     def test_require_encryption_false_is_noop(self) -> None:
         """require_encryption=False → no-op regardless of key state."""
-        # Must not raise even though neither key is loadable.
+        # Must not raise even though no key is loadable.
         assert_startup_posture(
             require_encryption=False,
-            fernet_loaded=False,
-            daily_loadable=False,
-        )
-
-    def test_require_encryption_true_with_fernet_ok(self) -> None:
-        """require_encryption=True + fernet_loaded=True → no exception."""
-        assert_startup_posture(
-            require_encryption=True,
-            fernet_loaded=True,
             daily_loadable=False,
         )
 
@@ -51,28 +41,28 @@ class TestAssertStartupPosture:
         """require_encryption=True + daily_loadable=True → no exception."""
         assert_startup_posture(
             require_encryption=True,
-            fernet_loaded=False,
             daily_loadable=True,
         )
 
-    def test_require_encryption_true_neither_raises(self) -> None:
-        """require_encryption=True, neither key loadable → FatalConfigError.
+    def test_require_encryption_true_daily_not_loadable_raises(self) -> None:
+        """require_encryption=True, daily identity not loadable → FatalConfigError.
 
-        The error message must mention both ``require_encryption`` and
-        ``PARAMEM_MASTER_KEY`` so operators know what to check.
+        The error message must mention ``require_encryption`` and the
+        daily passphrase env var so operators know what to check.
         """
+        from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR  # noqa: PLC0415
+
         with pytest.raises(FatalConfigError) as exc_info:
             assert_startup_posture(
                 require_encryption=True,
-                fernet_loaded=False,
                 daily_loadable=False,
             )
         message = str(exc_info.value)
         assert "require_encryption" in message, (
             f"FatalConfigError must mention 'require_encryption': {message!r}"
         )
-        assert "PARAMEM_MASTER_KEY" in message, (
-            f"FatalConfigError must mention 'PARAMEM_MASTER_KEY': {message!r}"
+        assert DAILY_PASSPHRASE_ENV_VAR in message, (
+            f"FatalConfigError must mention {DAILY_PASSPHRASE_ENV_VAR!r}: {message!r}"
         )
 
 
@@ -119,11 +109,10 @@ class TestLifespanSecurityPosture:
     """Verify lifespan wires the SECURITY.md §4 posture gate correctly.
 
     Both ``assert_startup_posture`` and ``assert_mode_consistency`` are
-    invoked at startup.  The former refuses the ``require_encryption=true +
-    no key`` misconfiguration; the latter refuses the four key × on-disk
-    mismatch cases (set+plaintext, unset+ciphertext, mixed) and points the
-    operator at the ``paramem encrypt-infra`` / ``paramem decrypt-infra
-    --i-accept-plaintext`` migration commands.
+    invoked at startup.  The former refuses the
+    ``require_encryption=true + daily identity not loadable`` misconfiguration;
+    the latter refuses on-disk mixed-state (plaintext alongside age) or a
+    key-present-but-store-plaintext mismatch.
     """
 
     def test_primitive_is_importable(self) -> None:
@@ -164,9 +153,27 @@ class TestLifespanSecurityPosture:
         assert "SECURITY: OFF" in posture_source
 
     def test_lifespan_sets_encryption_state_field(self) -> None:
-        """lifespan must populate _state['encryption'] so a future /status
-        surface can expose the posture without touching the env again."""
+        """lifespan must populate _state['encryption'] so /status can expose
+        the posture without re-probing the env on every request."""
         from paramem.server import app as app_module
 
         source = inspect.getsource(app_module.lifespan)
         assert '_state["encryption"]' in source
+
+    def test_status_response_surfaces_encryption(self) -> None:
+        """StatusResponse must carry an ``encryption`` field and the /status
+        handler must populate it from ``_state['encryption']`` — otherwise
+        the lifespan setter is dead code (SECURITY.md and README both
+        document that /status reports encryption: on|off)."""
+        from paramem.server import app as app_module
+
+        assert "encryption" in app_module.StatusResponse.model_fields, (
+            "StatusResponse must declare an encryption field"
+        )
+
+        handler_source = inspect.getsource(app_module.status)
+        assert (
+            '_state.get("encryption"' in handler_source or '_state["encryption"]' in handler_source
+        ), (  # noqa: E501
+            "/status handler must read _state['encryption'] into the response"
+        )

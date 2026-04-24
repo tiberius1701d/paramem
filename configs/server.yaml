@@ -384,11 +384,11 @@ tts:
 # ----------------------------------------------------------------------------
 # require_encryption
 # ----------------------------------------------------------------------------
-# When true, the server refuses to start unless at least one key path is
-# loadable (age daily identity via PARAMEM_DAILY_PASSPHRASE + the daily-key
-# file, OR PARAMEM_MASTER_KEY for the legacy Fernet envelope). The gate
-# covers every feature that writes to disk: session snapshots, HF Trainer
-# checkpoint shards, backup artifacts, and infrastructure metadata.
+# When true, the server refuses to start unless the daily age identity is
+# loadable (PARAMEM_DAILY_PASSPHRASE set + ~/.config/paramem/daily_key.age
+# present). The gate covers every feature that writes to disk: session
+# snapshots, HF Trainer checkpoint shards, backup artifacts, and
+# infrastructure metadata.
 #
 # Default (false) is AUTO everywhere: encrypt when a key is loaded, plaintext
 # otherwise. Set to true when a misconfig must fail loud instead of

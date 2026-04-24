@@ -3147,7 +3147,7 @@ class ConsolidationLoop:
         # Load backup adapters (PEFT load-or-skip idempotency: NC-2).
         # In the absence of a real encrypted backup dir we skip the load
         # and fall back to the live main adapters as the de-facto backup.
-        # Production systems should implement the Fernet backup path (Step 7d).
+        # Production systems should implement the encrypted backup path (Step 7d).
         for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
             if backup_name not in self.model.peft_config:
                 # No backup available — copy main weights into backup slot.

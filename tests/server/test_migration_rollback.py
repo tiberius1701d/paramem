@@ -15,12 +15,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
 from paramem.backup.backup import write as backup_write
-from paramem.backup.encryption import _clear_cipher_cache
 from paramem.backup.types import ArtifactKind
 from paramem.server.migration import TrialStash, initial_migration_state
 from paramem.server.trial_state import (
@@ -662,42 +660,47 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
 
 
 class TestRollbackDecryptsEncryptedArtifact:
-    """Verify that rollback decrypts the A-config artifact when ``PARAMEM_MASTER_KEY``
-    is set and the backup writer used Fernet encryption.
+    """Verify that rollback decrypts the A-config artifact when the daily
+    identity is loaded and the backup writer produced an age envelope.
 
     Before the B6 fix, rollback did ``os.rename(artifact, live_config_path)``
     which wrote ciphertext bytes verbatim.  The server then failed to start
-    because ``yaml.safe_load`` raised on binary Fernet data.
+    because ``yaml.safe_load`` raised on binary data.
 
     This test exercises the FULL encrypt → backup → rollback → decrypt round-trip
-    using a real Fernet key in the environment (key loaded → encryption happens).
-    It asserts that the post-rollback file content is the original plaintext
-    bytes, not ciphertext.
+    using a real daily identity (key loaded → age envelope on disk).  It asserts
+    that the post-rollback file content is the original plaintext bytes, not
+    ciphertext.
     """
 
-    def test_rollback_decrypts_encrypted_a_config(self, tmp_path, monkeypatch, request):
-        """Rollback with encrypted A-config slot: post-rollback file is plaintext.
+    def test_rollback_decrypts_encrypted_a_config(self, tmp_path, monkeypatch):
+        """Rollback with age-encrypted A-config slot: post-rollback file is plaintext.
 
         Steps
         ------
-        1. Generate a real Fernet key and set ``PARAMEM_MASTER_KEY``.
-        2. Write the A-config into a backup slot using the real ``backup.write()``
-           path (key loaded → Fernet ciphertext on disk).
-        3. Assert the artifact file on disk is ciphertext (not plaintext) so we
-           know encryption actually happened.
+        1. Mint + wire a daily identity so backup_write produces an age envelope.
+        2. Write the A-config into a backup slot.
+        3. Assert the artifact file is an age envelope (not plaintext).
         4. Build a TRIAL state with the encrypted slot.
         5. POST /migration/rollback.
-        6. Assert live_config_path.read_bytes() == original plaintext (decrypt verified).
-        7. Assert the artifact on disk is NOT the on-disk bytes (decryption happened).
+        6. Assert live_config_path.read_bytes() == original plaintext.
         """
-        # --- Step 1: real Fernet key in env ---
-        fernet_key = Fernet.generate_key().decode()
-        monkeypatch.setenv("PARAMEM_MASTER_KEY", fernet_key)
-        # Clear the module-level cipher cache so our new key is picked up.
-        _clear_cipher_cache()
-        # Clear cache after test — monkeypatch restores the env var, but the
-        # module-level cipher object retains the old key until cleared.
-        request.addfinalizer(_clear_cipher_cache)
+        from paramem.backup.age_envelope import is_age_envelope  # noqa: PLC0415
+        from paramem.backup.key_store import (  # noqa: PLC0415
+            DAILY_PASSPHRASE_ENV_VAR,
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
+
+        # --- Step 1: real daily identity ---
+        ident = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(ident, "rollback-pw"), key_path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "rollback-pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
 
         a_bytes = _A_YAML  # original plaintext config
 
@@ -710,19 +713,21 @@ class TestRollbackDecryptsEncryptedArtifact:
             base_dir=backups_root / "config",
         )
 
-        # --- Step 3: verify the artifact is ciphertext (encryption happened) ---
+        # --- Step 3: verify the artifact is an age envelope ---
         artifact_files = [e for e in config_slot.iterdir() if not e.name.endswith(".meta.json")]
         assert len(artifact_files) == 1, (
             f"Expected exactly 1 artifact in {config_slot}, "
             f"got: {[e.name for e in config_slot.iterdir()]}"
         )
         artifact_file = artifact_files[0]
-        assert artifact_file.name.endswith(".bin.enc"), (
-            f"Expected encrypted artifact (.bin.enc) when key is set, got: {artifact_file.name!r}"
+        assert is_age_envelope(artifact_file), (
+            f"Expected age-encrypted artifact when daily identity is loaded, "
+            f"got: {artifact_file.name!r} with magic "
+            f"{artifact_file.read_bytes()[:8]!r}"
         )
         on_disk_bytes = artifact_file.read_bytes()
         assert on_disk_bytes != a_bytes, (
-            "Artifact on disk should be ciphertext (not plaintext) when PARAMEM_MASTER_KEY is set"
+            "Artifact on disk should be ciphertext (not plaintext) when daily identity is loaded"
         )
 
         config_artifact_filename = artifact_file.name
@@ -814,15 +819,7 @@ class TestRollbackDecryptsEncryptedArtifact:
             f"B6 regression: rollback wrote wrong content.  "
             f"Expected plaintext A config ({len(a_bytes)} bytes), "
             f"got {len(restored)} bytes.  "
-            f"First 60 bytes: {restored[:60]!r}.  "
-            "If this starts with 'gAAAAA', the decrypt step was skipped."
-        )
-
-        # --- Step 7: confirm the on-disk artifact was ciphertext (decrypt was needed) ---
-        # The on-disk bytes must differ from the restored plaintext.
-        assert on_disk_bytes != restored, (
-            "on_disk_bytes == restored: encryption did not happen, so the test "
-            "does not exercise the decrypt path.  Check PARAMEM_MASTER_KEY setup."
+            f"First 60 bytes: {restored[:60]!r}."
         )
 
 

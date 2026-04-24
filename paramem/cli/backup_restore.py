@@ -56,8 +56,6 @@ def run(args: argparse.Namespace) -> int:
     """
     backup_id = args.backup_id
     body: dict = {"backup_id": backup_id}
-    if getattr(args, "force_rotate_key", False):
-        body["force_rotate_key"] = True
 
     url = f"{args.server_url}/backup/restore"
     try:

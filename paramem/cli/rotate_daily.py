@@ -9,15 +9,10 @@ Preconditions:
 
 - Server stopped (advisory check — a running server will race with the
   rename cycle; the command warns and refuses unless ``--force``).
-- ``PARAMEM_MASTER_KEY`` is NOT required; rotation is an age-only flow.
 - ``PARAMEM_DAILY_PASSPHRASE`` set + ``~/.config/paramem/daily_key.age``
   present so the OLD daily is loadable.
 - ``~/.config/paramem/recovery.pub`` present so the NEW envelopes still
   list the recovery recipient.
-- No PMEM1 files under ``data_dir`` — operator must run
-  ``paramem migrate-to-age`` first (rotating with mixed PMEM1/age in
-  play would leave the PMEM1 tail unreadable after the old daily is
-  destroyed).
 
 Crash-safety:
 
@@ -51,7 +46,7 @@ import pyrage
 from paramem.backup import key_store as _ks
 from paramem.backup import rotation as _rot
 from paramem.backup.age_envelope import is_age_envelope
-from paramem.backup.encryption import infra_paths, is_pmem1_envelope
+from paramem.backup.encryption import infra_paths
 from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
 
 
@@ -82,14 +77,6 @@ def _check_preconditions(data_dir: Path) -> list[str]:
             f"{_ks.RECOVERY_PUB_PATH_DEFAULT}. Rotation requires recovery to "
             "remain on every envelope."
         )
-    if data_dir.exists():
-        pmem1 = [p for p in infra_paths(data_dir) if p.exists() and is_pmem1_envelope(p)]
-        if pmem1:
-            errors.append(
-                f"{len(pmem1)} PMEM1 file(s) on disk (e.g. {pmem1[0]}). "
-                "Run `paramem migrate-to-age` first to avoid stranding them "
-                "when the old daily identity is destroyed."
-            )
     return errors
 
 

@@ -11,12 +11,6 @@ import pytest
 from pyrage import x25519
 
 from paramem.backup.age_envelope import age_decrypt_bytes, age_encrypt_bytes
-from paramem.backup.encryption import (
-    MASTER_KEY_ENV_VAR,
-    PMEM1_MAGIC,
-    _clear_cipher_cache,
-    encrypt_bytes,
-)
 from paramem.backup.key_store import (
     DAILY_PASSPHRASE_ENV_VAR,
     _clear_daily_identity_cache,
@@ -29,14 +23,10 @@ from paramem.cli import restore
 
 @pytest.fixture(autouse=True)
 def _isolate_env_and_caches():
-    os.environ.pop(MASTER_KEY_ENV_VAR, None)
     os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
-    _clear_cipher_cache()
     _clear_daily_identity_cache()
     yield
-    os.environ.pop(MASTER_KEY_ENV_VAR, None)
     os.environ.pop(DAILY_PASSPHRASE_ENV_VAR, None)
-    _clear_cipher_cache()
     _clear_daily_identity_cache()
 
 
@@ -282,30 +272,6 @@ class TestPreconditions:
         assert rc == 0
         # daily_key.age replaced with something that unlocks with "pw".
         load_daily_identity(tmp_path / "daily_key.age", passphrase="pw")
-
-    def test_pmem1_files_refused(self, tmp_path, monkeypatch, capsys):
-        _point_config_at(tmp_path, monkeypatch)
-        recovery = x25519.Identity.generate()
-        data_dir = tmp_path / "data"
-        _seed_age_store(data_dir, recovery)
-
-        # Inject a PMEM1 file.
-        os.environ[MASTER_KEY_ENV_VAR] = (
-            __import__("cryptography.fernet", fromlist=["Fernet"]).Fernet.generate_key().decode()
-        )
-        (data_dir / "registry.json").write_bytes(PMEM1_MAGIC + encrypt_bytes(b"{}"))
-        os.environ.pop(MASTER_KEY_ENV_VAR, None)
-        _clear_cipher_cache()
-
-        key_file = _write_file(tmp_path / "recovery.txt", str(recovery))
-        pw_file = _write_file(tmp_path / "pw.txt", "pw")
-
-        rc = restore.run(
-            _default_args(tmp_path, data_dir, recovery_key_file=key_file, passphrase_file=pw_file)
-        )
-        assert rc == 1
-        err = capsys.readouterr().err
-        assert "PMEM1" in err
 
     def test_plaintext_infra_files_refused(self, tmp_path, monkeypatch, capsys):
         _point_config_at(tmp_path, monkeypatch)

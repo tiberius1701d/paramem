@@ -318,7 +318,6 @@ class TestSessionBuffer:
         Operator is not silently trusting a plaintext snapshot path."""
         # Explicitly clear any inherited env + point daily path at a missing file.
         monkeypatch.delenv("PARAMEM_DAILY_PASSPHRASE", raising=False)
-        monkeypatch.delenv("PARAMEM_MASTER_KEY", raising=False)
         monkeypatch.setattr(
             "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
             tmp_path / "absent.age",

@@ -2,8 +2,8 @@
 
 Reads *PATH* through ``read_maybe_encrypted`` and writes the resulting
 plaintext bytes to stdout verbatim.  Files that are already plaintext are
-passed through unchanged; PMEM1-wrapped files are decrypted on the fly
-(requires ``PARAMEM_MASTER_KEY``).
+passed through unchanged; age-wrapped files are decrypted on the fly
+(requires ``PARAMEM_DAILY_PASSPHRASE`` + ``~/.config/paramem/daily_key.age``).
 
 Typical use: debugging a specific artifact without running a full server
 or writing a one-off script.  Use with care — the output is the decrypted
@@ -32,7 +32,7 @@ def run(args: argparse.Namespace) -> int:
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    except Exception as exc:  # noqa: BLE001 — Fernet errors surface here
+    except Exception as exc:  # noqa: BLE001 — surfaces any decrypt error
         print(f"ERROR: could not decrypt {path}: {exc}", file=sys.stderr)
         return 1
     sys.stdout.buffer.write(plaintext)
@@ -44,9 +44,9 @@ def add_parser(subparsers) -> None:
         "dump",
         help="Print the decrypted contents of an infrastructure file to stdout.",
         description=(
-            "Reads the file through read_maybe_encrypted.  PMEM1-wrapped files "
-            "are decrypted on the fly (requires PARAMEM_MASTER_KEY); plaintext "
-            "files are passed through."
+            "Reads the file through read_maybe_encrypted.  age-wrapped files "
+            "are decrypted on the fly (requires PARAMEM_DAILY_PASSPHRASE + "
+            "daily_key.age); plaintext files are passed through."
         ),
     )
     p.add_argument(

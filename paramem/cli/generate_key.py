@@ -303,7 +303,7 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         print(
-            "#       then run `paramem migrate-to-age` to flip existing data.",
+            "#       then start the server — new writes land as age envelopes.",
             file=sys.stderr,
         )
         print("# " + "-" * 70, file=sys.stderr)

@@ -302,6 +302,10 @@ class StatusResponse(BaseModel):
     # Backup subsystem state (Slice 6a). Always present; fields default to
     # None/0/False when no scheduled backup has run yet.
     backup: BackupBlock = BackupBlock()
+    # Startup security posture — "on" when the daily age identity loaded at
+    # lifespan entry, "off" otherwise. Mirrors the SECURITY: ON/OFF startup
+    # log line selected by security_posture.security_posture_log_line.
+    encryption: str = "off"
     # ISO-8601 UTC timestamp of when the server process started (Slice 5a Fix 2).
     # Required so pstatus can render the "applied <YYYY-MM-DD>" part of the
     # Migrate footer (spec L458).
@@ -916,9 +920,6 @@ async def lifespan(app: FastAPI):
     from paramem.backup.encryption import (
         assert_mode_consistency as _assert_mode,
     )
-    from paramem.backup.encryption import (
-        master_key_loaded as _master_key_loaded,
-    )
     from paramem.server.drift import drift_poll_loop, initial_drift_state
     from paramem.server.migration import initial_migration_state
     from paramem.server.migration_recovery import (
@@ -936,13 +937,11 @@ async def lifespan(app: FastAPI):
     _state["migration_lock"] = asyncio.Lock()
 
     # Security startup gate (SECURITY.md §4):
-    # 1) Refuse startup when security.require_encryption=true and no key path
-    #    is loadable — uniform fail-loud gate covering every feature
-    #    (snapshots, shards, backups, infra).
-    # 2) Refuse startup on any mode-mismatch case (plaintext alongside an
-    #    encryption format, or encrypted files without the corresponding
-    #    key loaded). Mixed PMEM1+age with both keys loaded is permitted
-    #    as a transitional state during the age migration.
+    # 1) Refuse startup when security.require_encryption=true and the daily
+    #    age identity is not loadable — uniform fail-loud gate covering
+    #    every feature (snapshots, shards, backups, infra).
+    # 2) Refuse startup on any mode-mismatch case (plaintext alongside age
+    #    envelopes, or age files without the daily identity loaded).
     # 3) Emit the canonical SECURITY: ON/OFF line so operators see posture.
     from paramem.backup.key_store import (
         daily_identity_loadable as _daily_loadable,
@@ -955,21 +954,17 @@ async def lifespan(app: FastAPI):
         security_posture_log_line,
     )
 
-    _key_loaded = _master_key_loaded()
     _daily_ok = _daily_loadable()
     _recovery_ok = _recovery_available()
     assert_startup_posture(
         require_encryption=config.security.require_encryption,
-        fernet_loaded=_key_loaded,
         daily_loadable=_daily_ok,
     )
     _assert_mode(
         config.paths.data,
-        key_loaded=_key_loaded,
         daily_identity_loadable=_daily_ok,
     )
     _line, _is_on = security_posture_log_line(
-        fernet_loaded=_key_loaded,
         daily_loadable=_daily_ok,
         recovery_available=_recovery_ok,
     )
@@ -2358,6 +2353,7 @@ async def status():
         migration=migration_block,
         backup=backup_block,
         hold=hold_block,
+        encryption=_state.get("encryption", "off"),
         server_started_at=_state.get("server_started_at", ""),
     )
 
@@ -3999,15 +3995,13 @@ async def migration_rollback():
 
         # --- Step 4: Decrypt A artifact and write to live config path ---
         # Mirror backup_restore's decrypt-first ordering: read the slot via
-        # backup.read() which dispatches on envelope magic (age, PMEM1, or
-        # legacy bare Fernet) and returns plaintext — then write plaintext to
-        # a .pending temp, fsync, and atomic rename.  A raw os.rename of the
-        # artifact would write ciphertext bytes into configs/server.yaml,
-        # causing yaml.safe_load to fail on the next server start
-        # (B6 — 2026-04-22 re-test).
-        # Fix 11 (2026-04-23): distinguish three decrypt failure modes so
-        # operators know immediately whether the key is absent, wrong, or the
-        # artifact is corrupt.
+        # backup.read() which dispatches on envelope magic (age or plaintext)
+        # and returns plaintext — then write plaintext to a .pending temp,
+        # fsync, and atomic rename.  A raw os.rename of the artifact would
+        # write ciphertext bytes into configs/server.yaml, causing
+        # yaml.safe_load to fail on the next server start (B6 — 2026-04-22).
+        # RuntimeError = daily identity not loaded; other exceptions surface
+        # as a generic decrypt failure with the exception message included.
         try:
             from paramem.backup.backup import read as backup_read
 
@@ -4018,45 +4012,21 @@ async def migration_rollback():
                 shutil.rmtree(pre_mortem_slot, ignore_errors=True)
             except OSError:
                 pass
-            from paramem.backup.encryption import (
-                MASTER_KEY_ENV_VAR as _MKE,
-            )
-            from paramem.backup.encryption import (
-                master_key_loaded as _mkl,
-            )
-
-            if not _mkl():
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "error": "decrypt_no_key",
-                        "message": (f"A-config backup is encrypted but {_MKE} is not set"),
-                    },
-                ) from exc
             raise HTTPException(
                 status_code=500,
                 detail={
-                    "error": "decrypt_unknown",
-                    "message": f"Failed to read/decrypt A config artifact: {exc}",
+                    "error": "decrypt_no_key",
+                    "message": (
+                        "A-config backup is age-encrypted but the daily identity "
+                        f"is not loaded: {exc}"
+                    ),
                 },
             ) from exc
         except Exception as exc:  # noqa: BLE001
-            from cryptography.fernet import InvalidToken as _RbInvalidToken
-
             try:
                 shutil.rmtree(pre_mortem_slot, ignore_errors=True)
             except OSError:
                 pass
-            if isinstance(exc, _RbInvalidToken):
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "error": "decrypt_invalid_token",
-                        "message": (
-                            "A-config backup decryption failed — wrong key or corrupted ciphertext"
-                        ),
-                    },
-                ) from exc
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -4338,14 +4308,9 @@ class BackupRestoreRequest(BaseModel):
     ----------
     backup_id:
         Slot directory name to restore (e.g. ``"20260421-04000012"``).
-    force_rotate_key:
-        Bypass the ``meta.key_fingerprint`` vs current-key mismatch check.
-        Required when restoring a backup encrypted under a prior master key
-        (which the operator must still hold to allow decryption).
     """
 
     backup_id: str
-    force_rotate_key: bool = False
 
 
 class BackupRestoreResponse(BaseModel):
@@ -4645,11 +4610,10 @@ async def backup_restore(req: BackupRestoreRequest):
         No slot with the given ``backup_id`` exists.
     400 ``restore_kind_not_supported``
         The slot is not kind=config.
-    400 ``fingerprint_mismatch``
-        ``meta.key_fingerprint`` does not match ``current_key_fingerprint()``
-        and ``force_rotate_key`` was not set.
-    500 ``restore_decrypt_failed``
-        Decryption failed (wrong key, corrupted backup).
+    500 ``decrypt_no_key``
+        The backup is age-encrypted but the daily identity is not loaded.
+    500 ``decrypt_invalid_token``
+        Decryption failed (stale daily identity or corrupted backup).
     500 ``config_restore_failed``
         Atomic rename of the restore temp file failed.
     """
@@ -4730,89 +4694,29 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         )
 
-    # --- Step 3b: Fingerprint enforcement (spec L606) ---
-    # Refuse when the backup's stored ``meta.key_fingerprint`` does not match
-    # the current master key's fingerprint, unless the caller opts in via
-    # ``force_rotate_key``. Placed BEFORE decrypt so a key rotation surfaces
-    # as the actionable 400 ``fingerprint_mismatch`` instead of the generic
-    # 500 ``decrypt_invalid_token``. Backups written while Security was OFF
-    # carry ``key_fingerprint is None`` and are always allowed through.
-    from paramem.backup.encryption import current_key_fingerprint
-
-    backup_fp = target_record.meta.key_fingerprint
-    current_fp = current_key_fingerprint()
-    if backup_fp is not None and backup_fp != current_fp:
-        if not req.force_rotate_key:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "fingerprint_mismatch",
-                    "message": (
-                        f"Backup was encrypted with a different key "
-                        f"(backup={backup_fp[:12]}..., "
-                        f"current={(current_fp[:12] + '...') if current_fp else 'none'}). "
-                        "Pass force_rotate_key=true to proceed; the prior key "
-                        "must remain set so the backup's ciphertext can be decoded."
-                    ),
-                    "backup_fingerprint": backup_fp,
-                    "current_fingerprint": current_fp,
-                },
-            )
-        logger.warning(
-            "backup_restore: fingerprint mismatch bypassed via force_rotate_key "
-            "(backup=%s..., current=%s)",
-            backup_fp[:12],
-            (current_fp[:12] + "...") if current_fp else "none",
-        )
-
     # --- Step 4: Decrypt backup (BEFORE safety backup — order matters) ---
-    # Fix 11 (2026-04-23): distinguish three decrypt failure modes so operators
-    # know immediately whether the key is absent, wrong, or the artifact is corrupt.
+    # Age-encrypted backups have no stored fingerprint; a stale daily identity
+    # surfaces here as a decrypt error (RuntimeError for "identity not loaded",
+    # other exceptions for corruption / wrong recipient list).
     try:
         plaintext_bytes, _meta = backup_read(target_record.slot_dir)
     except RuntimeError as exc:
-        # RuntimeError from decrypt_bytes when no master key is set.
-        from paramem.backup.encryption import (
-            MASTER_KEY_ENV_VAR as _MKE,
-        )
-        from paramem.backup.encryption import (
-            master_key_loaded as _mkl,
-        )
-
-        if not _mkl():
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": "decrypt_no_key",
-                    "message": f"backup is encrypted but {_MKE} is not set",
-                },
-            ) from exc
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "decrypt_unknown",
-                "message": f"Failed to read/decrypt backup slot: {exc}",
+                "error": "decrypt_no_key",
+                "message": (f"backup is age-encrypted but the daily identity is not loaded: {exc}"),
             },
         ) from exc
     except Exception as exc:  # noqa: BLE001
-        from cryptography.fernet import InvalidToken as _InvalidToken
-
-        if isinstance(exc, _InvalidToken):
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": "decrypt_invalid_token",
-                    "message": (
-                        "backup decryption failed — ciphertext appears corrupt "
-                        "(fingerprint-based key-rotation refuse runs earlier at step 3b)"
-                    ),
-                },
-            ) from exc
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "decrypt_unknown",
-                "message": f"Failed to read/decrypt backup slot: {exc}",
+                "error": "decrypt_invalid_token",
+                "message": (
+                    "backup decryption failed — ciphertext corrupt or encrypted "
+                    f"to a different recipient list (stale daily identity?): {exc}"
+                ),
             },
         ) from exc
 
