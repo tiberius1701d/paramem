@@ -70,4 +70,5 @@ pythonpath = ["."]
 markers = [
     "gpu: marks tests that require a GPU (deselect with '-m \"not gpu\"')",
     "recall: marks tests that train an adapter and probe for fact recall (~30 epochs, use --recall to run)",
+    "integration: marks subprocess-based end-to-end tests that invoke the installed paramem binary (slow; skip with '-m \"not integration\"')",
 ]
