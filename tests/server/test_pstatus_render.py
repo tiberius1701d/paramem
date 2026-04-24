@@ -89,6 +89,7 @@ _BASE_STATUS: dict = {
     },
     "server_started_at": "2026-04-22T08:00:00+00:00",
     "adapter_manifest": {},
+    "encryption": "on",
 }
 
 
@@ -322,3 +323,32 @@ class TestMigrateFooter:
         # Script must exit 0 and render something without crashing.
         assert result.returncode == 0
         assert "ParaMem Server" in result.stdout
+
+
+class TestSecurityFooter:
+    """The pstatus renderer surfaces the startup security posture."""
+
+    def test_security_on_rendered(self):
+        """encryption='on' → 'Security: ON' with the age-daily annotation."""
+        status = dict(_BASE_STATUS)
+        status["encryption"] = "on"
+        result = _run_pstatus(status)
+        assert "Security:" in result.stdout
+        assert "ON" in result.stdout
+        assert "age daily" in result.stdout
+
+    def test_security_off_rendered(self):
+        """encryption='off' → 'Security: OFF' with the plaintext warning."""
+        status = dict(_BASE_STATUS)
+        status["encryption"] = "off"
+        result = _run_pstatus(status)
+        assert "Security:" in result.stdout
+        assert "OFF" in result.stdout
+        assert "plaintext" in result.stdout
+
+    def test_security_field_absent_renders_placeholder(self):
+        """Legacy /status JSON without encryption → dim placeholder, no crash."""
+        status = {k: v for k, v in _BASE_STATUS.items() if k != "encryption"}
+        result = _run_pstatus(status)
+        assert result.returncode == 0
+        assert "Security:" in result.stdout

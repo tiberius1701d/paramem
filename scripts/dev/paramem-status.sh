@@ -173,6 +173,11 @@ fields = {
     ),
     "hold_age": fmt_duration((d.get("hold") or {}).get("age_seconds")),
     "hold_owner_hint": ((d.get("hold") or {}).get("owner_hint") or "-").replace("|", "/"),
+    # Startup security posture — "on" when the age daily identity loaded at
+    # lifespan entry; "off" otherwise. Mirrors the SECURITY: ON/OFF startup
+    # log line. Legacy responses without this field fall back to "-" so the
+    # renderer can print a dim placeholder rather than crash.
+    "encryption": d.get("encryption") or "-",
 }
 # Scalar line
 print("|".join(str(fields[k]) for k in [
@@ -193,6 +198,7 @@ print("|".join(str(fields[k]) for k in [
     "degenerated_count", "adapter_health_count",
     "hold_active", "hold_owner_pid", "hold_owner_alive", "hold_age",
     "hold_owner_hint",
+    "encryption",
 ]))
 # Per-adapter spec lines: kind<TAB>rank<TAB>alpha<TAB>lr<TAB>target_kind
 for _kind, _spec in (d.get("adapter_specs") or {}).items():
@@ -278,6 +284,7 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     degenerated_count adapter_health_count \
     hold_active hold_owner_pid hold_owner_alive hold_age \
     hold_owner_hint \
+    encryption \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
 health_lines=$(echo "$parsed" | awk '/^HLT\t/')
@@ -599,6 +606,15 @@ if [[ -n "$migrate_line" ]]; then
     fi
     echo -e "  Migrate:  ${state_tag}${rev_tag}"
 fi
+
+# Startup security posture. "on" / "off" come from /status.encryption
+# (lifespan computes it from security_posture.security_posture_log_line).
+# Legacy responses without the field render as a dim "-" placeholder.
+case "$encryption" in
+    on)  echo -e "  Security: ${GREEN}ON${RESET} (age daily identity loaded)" ;;
+    off) echo -e "  Security: ${YELLOW}OFF${RESET} — plaintext on disk" ;;
+    *)   echo -e "  Security: ${DIM}-${RESET}" ;;
+esac
 
 # Speaker embedding backend (pyannote wespeaker on CPU by default).
 # Surfaced so a disabled or failed-load backend is visible alongside
