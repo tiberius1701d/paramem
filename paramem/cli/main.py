@@ -25,6 +25,7 @@ from paramem.cli import (
     backup_list,
     backup_prune,
     backup_restore,
+    change_passphrase,
     decrypt_infra,
     dump,
     encrypt_infra,
@@ -241,6 +242,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rotate_daily.add_parser(subparsers)
     rotate_recovery.add_parser(subparsers)
     restore.add_parser(subparsers)
+    change_passphrase.add_parser(subparsers)
 
     return parser
 
@@ -322,6 +324,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "restore":
         return restore.run(args)
+
+    if args.command == "change-passphrase":
+        return change_passphrase.run(args)
 
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)

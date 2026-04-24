@@ -511,5 +511,87 @@ class TestCliSurface:
             "rotate-daily",
             "rotate-recovery",
             "restore",
+            "change-passphrase",
         ):
             assert sub in combined, f"subcommand missing from --help: {sub}"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7: change-passphrase rewraps daily_key.age without touching data
+# ---------------------------------------------------------------------------
+
+
+class TestChangePassphrase:
+    def test_rewrap_preserves_identity_and_data_readability(self, scratch_home, data_dir, tmp_path):
+        """Migrate to age, change the passphrase, verify that the same age
+        envelopes still decrypt via the new passphrase through `paramem dump`
+        — i.e. the X25519 identity survived the rewrap and existing data did
+        not need re-encryption."""
+        env, _, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+
+        # Snapshot current daily_key.age bytes + recovery.pub.
+        daily_before = (scratch_home / ".config" / "paramem" / "daily_key.age").read_bytes()
+        recovery_before = (scratch_home / ".config" / "paramem" / "recovery.pub").read_text("utf-8")
+        registry_before = (data_dir / "registry.json").read_bytes()
+
+        old_pw_file = tmp_path / "old-pw.txt"
+        old_pw_file.write_text(
+            "integration-pw\n", encoding="utf-8"
+        )  # matches _setup_migrated_store
+        new_pw_file = tmp_path / "new-pw.txt"
+        new_pw_file.write_text("rewrapped-pw\n", encoding="utf-8")
+
+        _run(
+            "change-passphrase",
+            "--old-passphrase-file",
+            str(old_pw_file),
+            "--new-passphrase-file",
+            str(new_pw_file),
+            env=env,
+        )
+
+        # daily_key.age bytes changed (new wrapping); recovery.pub and all
+        # data envelopes untouched.
+        daily_after = (scratch_home / ".config" / "paramem" / "daily_key.age").read_bytes()
+        assert daily_after != daily_before, "change-passphrase must rewrite daily_key.age"
+        assert (scratch_home / ".config" / "paramem" / "recovery.pub").read_text(
+            "utf-8"
+        ) == recovery_before, "recovery.pub must not be touched"
+        assert (data_dir / "registry.json").read_bytes() == registry_before, (
+            "data envelopes must not be touched by a passphrase rewrap"
+        )
+
+        # Old passphrase no longer works; new passphrase does.
+        env_new = dict(env)
+        env_new["PARAMEM_DAILY_PASSPHRASE"] = "rewrapped-pw"
+        dumped = _run("dump", str(data_dir / "registry.json"), env=env_new)
+        assert dumped.stdout == b'{"integration": 1}'
+
+        # Try with the OLD passphrase — must fail. The CLI's `dump` wraps the
+        # unwrap error as a non-zero exit.
+        env_stale = dict(env)
+        env_stale["PARAMEM_DAILY_PASSPHRASE"] = "integration-pw"
+        fail = _run(
+            "dump",
+            str(data_dir / "registry.json"),
+            env=env_stale,
+            check=False,
+        )
+        assert fail.returncode != 0, "old passphrase must no longer unlock daily_key.age"
+
+    def test_rewrap_refuses_when_old_equals_new(self, scratch_home, data_dir, tmp_path):
+        env, _, _ = _setup_migrated_store(scratch_home, data_dir, tmp_path)
+        same_pw_file = tmp_path / "same-pw.txt"
+        same_pw_file.write_text("integration-pw\n", encoding="utf-8")
+
+        fail = _run(
+            "change-passphrase",
+            "--old-passphrase-file",
+            str(same_pw_file),
+            "--new-passphrase-file",
+            str(same_pw_file),
+            env=env,
+            check=False,
+        )
+        assert fail.returncode == 1
+        assert b"identical" in fail.stderr

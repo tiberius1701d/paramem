@@ -46,7 +46,8 @@ Day-to-day key operations after that point:
 
 | Command | When to use |
 |---|---|
-| `paramem rotate-daily` | Periodic hygiene, or suspected compromise of the daily passphrase. Preserves the recovery identity on every envelope. |
+| `paramem change-passphrase` | Change the passphrase that wraps `daily_key.age`. Identity itself is unchanged — no re-encrypt of the data store. |
+| `paramem rotate-daily` | Periodic hygiene, or suspected compromise of the daily identity (not just the passphrase). Mints a fresh X25519 identity and re-encrypts every envelope. Recovery recipient is preserved. |
 | `paramem rotate-recovery` | Rotate the printed paper (new bech32, old one invalidated). Daily identity is unchanged. |
 | `paramem restore --recovery-key-file PATH` | Hardware replacement — given the recovery bech32 from paper, mints a fresh daily identity on the new host and re-keys every envelope. |
 | `paramem dump PATH` | Decrypt a single envelope for debugging. |
