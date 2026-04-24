@@ -50,15 +50,20 @@ class LanguageTracker:
     def _load(self):
         if not self._path.exists():
             return
+        from paramem.backup.encryption import read_maybe_encrypted
+
         try:
-            data = json.loads(self._path.read_text())
+            data = json.loads(read_maybe_encrypted(self._path).decode("utf-8"))
             self._languages = set(data.get("languages", []))
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("Could not read %s: %s — starting empty", self._path, e)
 
     def _save(self):
+        from paramem.backup.encryption import write_infra_bytes
+
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps({"languages": sorted(self._languages)}))
+        payload = json.dumps({"languages": sorted(self._languages)}).encode("utf-8")
+        write_infra_bytes(self._path, payload)
 
     @property
     def languages(self) -> list[str]:

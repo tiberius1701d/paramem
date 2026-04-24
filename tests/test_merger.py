@@ -265,6 +265,47 @@ class TestPersistence:
         graph = merger.load_graph("/nonexistent/path.json")
         assert graph.number_of_nodes() == 0
 
+    def test_save_encrypted_false_writes_plaintext_even_when_security_on(
+        self, merger, session_graph_1, tmp_path, monkeypatch
+    ):
+        """save_graph(..., encrypted=False) must bypass the envelope and emit
+        plaintext JSON, even under Security ON.  Debug-directory writers
+        depend on this so ``cat debug/cycle_*/graph.json`` is always
+        human-readable regardless of the server's posture.
+        """
+        from paramem.backup.key_store import (
+            DAILY_KEY_PATH_DEFAULT,
+            DAILY_PASSPHRASE_ENV_VAR,
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
+
+        # Set up a real daily identity so Security ON is genuinely active.
+        ident = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(ident, "pw"), key_path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
+        assert key_path != DAILY_KEY_PATH_DEFAULT  # sanity: monkeypatch took effect
+
+        merger.merge(session_graph_1)
+        out = tmp_path / "debug_graph.json"
+        merger.save_graph(out, encrypted=False)
+
+        # Plaintext check: first bytes are NOT the age envelope magic.
+        head = out.read_bytes()[:22]
+        assert not head.startswith(b"age-encryption.org/v1"), (
+            "encrypted=False must bypass the age envelope"
+        )
+        # And the file is readable as JSON directly.
+        import json
+
+        data = json.loads(out.read_text())
+        assert "nodes" in data or "directed" in data or data  # any valid JSON
+
     def test_fuzzy_tier_case_fold(self):
         """'Alexander' and 'alexander' must merge via exact-normalization tier."""
         from paramem.graph.schema import Entity, SessionGraph

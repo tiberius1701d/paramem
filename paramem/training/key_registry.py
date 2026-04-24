@@ -240,10 +240,12 @@ class KeyRegistry:
         ``adapter_health`` so every piece of per-key / per-adapter
         metadata survives a process restart.
         """
+        from paramem.backup.encryption import write_infra_bytes
+
         payload = self.save_bytes()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
+        write_infra_bytes(path, payload)
         logger.info("Key registry saved to %s (%d keys)", path, len(self._active_keys))
 
     def save_bytes(self) -> bytes:
@@ -304,9 +306,11 @@ class KeyRegistry:
                 "(_require_consolidating=True but consolidating=False).  "
                 "This is a defence-in-depth assertion — see plan §2.5."
             )
+        from paramem.backup.encryption import write_infra_bytes
+
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
+        write_infra_bytes(path, payload)
         logger.info("Key registry written from bytes to %s (%d bytes)", path, len(payload))
 
     @classmethod

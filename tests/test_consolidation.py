@@ -801,3 +801,42 @@ class TestSaveAdaptersManifest:
         assert kp_path.exists()
         kp_hash = hashlib.sha256(kp_path.read_bytes()).hexdigest()
         assert manifest.keyed_pairs_sha256 == kp_hash
+
+
+class TestAtomicJsonWriteEncryptedFlag:
+    """_atomic_json_write(..., encrypted=False) bypasses the envelope.
+
+    Debug-directory writers (simulate mode, per-cycle graph snapshots) rely
+    on this so debug output is uniformly inspectable with ``cat`` regardless
+    of the server's Security posture.
+    """
+
+    def test_encrypted_false_writes_plaintext_under_security_on(self, tmp_path, monkeypatch):
+        from paramem.backup.key_store import (
+            DAILY_PASSPHRASE_ENV_VAR,
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
+        from paramem.server.consolidation import _atomic_json_write
+
+        # Genuine Security ON: a real daily identity is loadable.
+        ident = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(ident, "pw"), key_path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
+
+        out = tmp_path / "debug.json"
+        _atomic_json_write({"debug": True, "n": 42}, out, encrypted=False)
+
+        head = out.read_bytes()[:22]
+        assert not head.startswith(b"age-encryption.org/v1"), (
+            "encrypted=False must bypass the age envelope"
+        )
+        # File is directly readable as JSON (no dump needed).
+        import json as _json
+
+        assert _json.loads(out.read_text()) == {"debug": True, "n": 42}

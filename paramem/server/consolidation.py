@@ -430,13 +430,14 @@ def _save_simulation_results(
     sim_dir = config.debug_dir / f"sim_{timestamp}"
     sim_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save cumulative graph
-    loop.merger.save_graph(sim_dir / "graph.json")
+    # Save cumulative graph (plaintext — debug output is inspection-first,
+    # uniform with sessions/*.jsonl under debug: true).
+    loop.merger.save_graph(sim_dir / "graph.json", encrypted=False)
 
-    # Save QA pairs
-    _atomic_json_write(episodic_qa, sim_dir / "episodic_qa.json")
+    # Save QA pairs (plaintext — same rationale as the graph above).
+    _atomic_json_write(episodic_qa, sim_dir / "episodic_qa.json", encrypted=False)
     if procedural_rels:
-        _atomic_json_write(procedural_rels, sim_dir / "procedural_rels.json")
+        _atomic_json_write(procedural_rels, sim_dir / "procedural_rels.json", encrypted=False)
 
     logger.info(
         "Simulation saved to %s: %d episodic QA, %d procedural rels",
@@ -473,14 +474,24 @@ def _promote_mature_keys(loop: ConsolidationLoop, config: ServerConfig) -> list[
 # --- Persistence ---
 
 
-def _atomic_json_write(data: dict | list, path: Path) -> None:
-    """Write JSON atomically — envelope-encrypted when a master key is set,
-    plaintext otherwise.  Routes through ``write_infra_bytes`` so every
-    infrastructure JSON artifact respects the Security-ON/OFF contract
-    through a single chokepoint."""
+def _atomic_json_write(data: dict | list, path: Path, *, encrypted: bool = True) -> None:
+    """Write JSON atomically.
+
+    ``encrypted=True`` (default) routes through ``write_infra_bytes`` so
+    every infrastructure JSON artifact respects the Security-ON/OFF
+    contract through a single chokepoint.  ``encrypted=False`` bypasses
+    the envelope and always writes plaintext; used by debug-directory
+    writers so ``debug/*`` output is uniformly inspectable with ``cat``
+    regardless of the server's Security posture.
+    """
+    from paramem.backup.encryption import write_plaintext_atomic
+
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, indent=2).encode("utf-8")
-    write_infra_bytes(path, payload)
+    if encrypted:
+        write_infra_bytes(path, payload)
+    else:
+        write_plaintext_atomic(path, payload)
 
 
 def _load_key_metadata(path: Path) -> dict | None:

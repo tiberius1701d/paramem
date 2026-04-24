@@ -510,18 +510,27 @@ class GraphMerger:
         data = nx.node_link_data(self.graph)
         return json.dumps(data, indent=2).encode("utf-8")
 
-    def save_graph(self, path: str | Path) -> None:
-        """Save cumulative graph to JSON — atomic write via the infrastructure
-        envelope.  Encrypts when a master key is set, plaintext otherwise.
-        Replaces the prior non-atomic ``open(path, "w")`` pattern; the rename
-        is fsynced for power-loss safety."""
-        from paramem.backup.encryption import write_infra_bytes
+    def save_graph(self, path: str | Path, *, encrypted: bool = True) -> None:
+        """Save cumulative graph to JSON — atomic write, fsynced parent for
+        power-loss safety.
+
+        ``encrypted=True`` (default) routes through the infrastructure
+        envelope — age under Security ON, plaintext under Security OFF.
+        ``encrypted=False`` bypasses the envelope and always writes
+        plaintext; used by debug-directory writers so ``debug/*`` output
+        is uniformly inspectable with ``cat``/``grep`` regardless of the
+        server's Security posture.
+        """
+        from paramem.backup.encryption import write_infra_bytes, write_plaintext_atomic
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = nx.node_link_data(self.graph)
         payload = json.dumps(data, indent=2).encode("utf-8")
-        write_infra_bytes(path, payload)
+        if encrypted:
+            write_infra_bytes(path, payload)
+        else:
+            write_plaintext_atomic(path, payload)
         logger.info("Graph saved to %s", path)
 
     def load_graph(self, path: str | Path) -> nx.MultiDiGraph:

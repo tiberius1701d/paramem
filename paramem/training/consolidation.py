@@ -580,10 +580,12 @@ class ConsolidationLoop:
         self.merger.merge(session_graph)
         self._triples_since_last_enrichment += len(session_graph.relations)
 
-        # Save graph snapshot if debug mode
+        # Save graph snapshot if debug mode — plaintext so operators can
+        # `cat debug/cycle_*/graph.json` without `paramem dump`, uniform
+        # with sessions/*.jsonl under debug: true.
         if self.save_cycle_snapshots and self.snapshot_dir:
             snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph.json"
-            self.merger.save_graph(snapshot_graph)
+            self.merger.save_graph(snapshot_graph, encrypted=False)
 
         # --- GENERATE EPISODIC QA ---
         session_relations = [
@@ -1352,11 +1354,14 @@ class ConsolidationLoop:
             self._apply_decay(classification.decay)
 
         # --- 8. SAVE ---
+        # persist_graph=True → authoritative production store → encrypted.
+        # save_cycle_snapshots (debug mode) → inspection output → plaintext,
+        # uniform with sessions/*.jsonl and the simulate-mode debug dumps.
         if self.persist_graph:
             self.merger.save_graph(self.graph_path)
         elif self.save_cycle_snapshots and self.snapshot_dir:
             snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph.json"
-            self.merger.save_graph(snapshot_graph)
+            self.merger.save_graph(snapshot_graph, encrypted=False)
         self._save_adapters()
 
         result.wall_clock_seconds = time.time() - start_time
@@ -1981,7 +1986,6 @@ class ConsolidationLoop:
         """
         import hashlib as _hashlib
         import json as _json
-        import os as _os
 
         from paramem.adapters.manifest import build_manifest_for
 
@@ -2021,13 +2025,14 @@ class ConsolidationLoop:
                     if meta_key in qa:
                         entry[meta_key] = qa[meta_key]
                 pairs.append(entry)
+            from paramem.backup.encryption import write_infra_bytes as _wi
+
             adapter_dir = self.output_dir / adapter_name
             adapter_dir.mkdir(parents=True, exist_ok=True)
-            tmp = adapter_dir / "keyed_pairs.json.tmp"
-            with open(tmp, "w") as f:
-                _json.dump(pairs, f, indent=2)
-            _os.replace(tmp, adapter_dir / "keyed_pairs.json")
-            return adapter_dir / "keyed_pairs.json"
+            payload = _json.dumps(pairs, indent=2).encode("utf-8")
+            kp_path = adapter_dir / "keyed_pairs.json"
+            _wi(kp_path, payload)
+            return kp_path
 
         def _build(name: str, kp_path: "Path | None") -> "object | None":
             try:
@@ -2532,7 +2537,6 @@ class ConsolidationLoop:
         # a new consolidation cycle.
         import hashlib as _hashlib
         import json as _json
-        import os as _os
 
         from paramem.adapters.manifest import build_manifest_for as _build_manifest_for
         from paramem.models.loader import save_adapter as _save_adapter
@@ -2551,13 +2555,12 @@ class ConsolidationLoop:
             {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
             for kp in all_interim_keyed
         ]
+        from paramem.backup.encryption import write_infra_bytes as _wi
+
         interim_dir = self.output_dir / adapter_name
         interim_dir.mkdir(parents=True, exist_ok=True)
-        _tmp = interim_dir / "keyed_pairs.json.tmp"
-        with open(_tmp, "w") as _f:
-            _json.dump(interim_pairs, _f, indent=2)
-        _os.replace(_tmp, interim_dir / "keyed_pairs.json")
         kp_path = interim_dir / "keyed_pairs.json"
+        _wi(kp_path, _json.dumps(interim_pairs, indent=2).encode("utf-8"))
 
         # Step 5: Build manifest with pre-computed registry_sha256.
         fingerprint_cache = getattr(self, "fingerprint_cache", None)

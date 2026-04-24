@@ -1,8 +1,19 @@
 # Security
 
+> ⚠️ **Work in progress — not a finished security story.** The encryption-at-rest machinery described in this document is partial by design. It raises the bar for specific *separation* scenarios (see §2) and does not attempt to defend against an attacker who gains operator-level access to the host.
+>
+> **Two operator-level paths to plaintext, both trivial:**
+>
+> 1. **The Python codebase is editable.** `paramem/` on disk is plain source. An attacker with write access to the installed package path — which the operator user has by definition — can neutralize encryption with a three-line edit to `paramem/backup/encryption.py::envelope_encrypt_bytes` and restart the server. There is no code-signing, no bytecode integrity check, no TPM-backed attestation.
+> 2. **Config-level data exfiltration via `debug: true`.** The operator can flip one line in `configs/server.yaml` and restart. From that point on, every consolidation cycle writes plaintext copies of user facts into `data/ha/sessions/*.jsonl`, `data/ha/debug/cycle_*/graph.json`, and the simulate-mode debug dumps. No code edit, no crypto break — just the legitimate debug path used against the intent of a Security-ON deployment. This is intentional behaviour for debugging (see §4 carve-outs); it is named here because an attacker with config-write access can use it as a data-extraction primitive.
+>
+> Closing either gap is outside what this project can do alone; both require host-level integrity tooling (IMA/EVM on Linux, equivalent on Windows) plus operator discipline on config-write permissions.
+>
+> Statements in this document describe the *current* implementation, not a finished target.
+
 ParaMem is a personal memory service that stores conversational and personal facts as weight deltas in a local LoRA adapter, plus a small set of on-disk metadata files (registry, knowledge graph, session queue, voice profiles). It runs on a single host under a single admin and is designed for home / edge deployment — not multi-tenant or server-farm use.
 
-This document describes what ParaMem defends, what it does not, the trust boundaries in the design, and the operator contract for running it securely. It is a living document; the security posture will tighten as work packages from the hardening plan land.
+This document describes what ParaMem defends today, what it does not, the trust boundaries in the design, and the operator contract for running it as securely as the current implementation allows. It is a living document; the security posture will tighten as work packages from the hardening plan land.
 
 ## 1. Data handled
 
@@ -54,20 +65,27 @@ All lifecycle commands are per-file atomic + idempotent + resumable via a crash-
 
 ## 2. Threat model
 
-**In scope** — we attempt to defend against:
-- Filesystem read access by a non-root process on the same host
-- Accidental backup or cloud-sync exposure of the data directory
-- Physical theft of the host while powered off
-- Careless maintainers, accidental commits, screenshots of on-disk state
-- LAN-adjacent attackers sending unauthenticated requests to the server
-- Prompt-injection attempts via voice input
+**Trust assumption.** The admin / operator of the host is a trusted authority. ParaMem does not attempt to protect data from an attacker who has the operator's OS credentials, process-memory access, or write access to the installed Python package. The operator holds the daily passphrase and the daily-key file; these travel in the same trust domain as the data they protect. A hostile process running as the operator can read the decrypted store from RAM, modify `paramem/` source (e.g. replace `envelope_encrypt_bytes` with a pass-through), or read the wrapped daily key plus passphrase and decrypt at rest. None of these are defended against.
 
-**Out of scope** — ParaMem does not defend against:
-- Attackers with live root or RAM access on the host
-- Nation-state adversaries
-- Supply-chain compromise of the Python runtime or of major pinned dependencies beyond version pinning
-- Multi-user isolation on the same host (ParaMem is a single-admin service)
-- Side-channel attacks on the CPU or GPU during inference
+**What Security ON actually buys — the narrow, honest claim.** When the data directory is separated from the key material (decoupled from the running server), the data directory alone is not decryptable. Concretely, encryption at rest narrows the blast radius in exactly these separation scenarios:
+
+- **Accidental cloud-sync of `data/ha/` alone** (OneDrive, iCloud, rsync to NAS) — data appears at the sync destination but is unreadable without the key material kept at `~/.config/paramem/` and `PARAMEM_DAILY_PASSPHRASE`.
+- **Backup exfiltration** (a backup copy of the data directory without the config dir) — same story.
+- **Filesystem read by a different OS user on the same host** (mode `0600` on `~/.config/paramem/daily_key.age` and `.env` enforced at startup).
+- **Theft of a powered-off host IF the passphrase is not co-located** (depends on operator discipline — typically a weak defense because `.env` lives on the same disk).
+
+**In scope beyond data-at-rest:**
+- LAN-adjacent attackers sending unauthenticated requests — mitigated by `PARAMEM_API_TOKEN`.
+- Prompt-injection attempts via voice input.
+- Careless maintainers, accidental commits, screenshots of on-disk state.
+
+**Out of scope — explicitly:**
+- Any attacker with operator-user OS credentials, root, or process memory access.
+- Anyone with write access to the installed Python package (can neutralize encryption in three lines of source).
+- Nation-state adversaries.
+- Supply-chain compromise of the Python runtime or pinned dependencies beyond version pinning.
+- Multi-user isolation on the same host (ParaMem is a single-admin service).
+- Side-channel attacks on the CPU or GPU during inference.
 
 ## 3. Trust boundaries
 
@@ -109,16 +127,19 @@ The Security-OFF opt-out is the operator's choice. Deployments that want a misco
 
 ### Plaintext-by-design carve-outs
 
-Three control-plane metadata files are kept plaintext in both modes:
-- `data/ha/state/trial.json` — migration-trial marker (paths, hashes, timestamps).
-- `data/ha/state/backup.json` — scheduled-backup runner status (paths, timestamps, counts).
-- `data/ha/backups/<kind>/<ts>/*.meta.json` — backup artifact sidecars (timestamp, ciphertext SHA-256, tier, label). The paired `*.bin.enc` payload remains encrypted.
+Some on-disk artifacts are intentionally kept plaintext in both modes:
 
-None of these files contain user facts. Encrypting them would either brick recovery on key loss (`trial.json`, `backup.json`) or turn a wrong-key restore into a silent "backup not found" instead of a clear decrypt-error (backup sidecars). These carve-outs are the **only** exceptions to the binary-mode contract.
+- `data/ha/state/trial.json` — migration-trial marker (paths, hashes, timestamps). Encrypting would brick recovery on key loss.
+- `data/ha/state/backup.json` — scheduled-backup runner status. Same reasoning.
+- `data/ha/backups/<kind>/<ts>/*.meta.json` — backup artifact sidecars (timestamp, ciphertext SHA-256, tier, label). Encrypting would turn a wrong-key restore into a silent "backup not found" instead of a clear decrypt error. The paired `*.bin.enc` payload remains encrypted.
+- `data/ha/sessions/*.jsonl` and `data/ha/sessions/archive/*.jsonl` — raw conversation transcripts, written only when `debug: true`. Explicit operator opt-in to plaintext persistence for inspection; the whole point of debug mode is to see the transcripts with `tail`/`cat`/`grep`.
+- `data/ha/debug/cycle_<N>/graph.json` and `data/ha/debug/sim_<ts>/*.json` — per-cycle and simulate-mode debug artifacts, written only when `debug: true`. Uniform with the session JSONLs above: debug output is inspection-first, regardless of Security posture.
+
+None of the first three carry user facts. The last two *do* carry user facts but are produced only at operator request via the `debug` flag.
 
 ## 5. Recovery model
 
-The security model follows BitLocker semantics: the master key is the only path to the data. Losing it is equivalent to losing the data. There is no backdoor, no author escrow, no cloud recovery service.
+The security model follows BitLocker semantics: the key material is the only path to the data. Losing it is equivalent to losing the data; gaining it is equivalent to gaining the data (see §2 on the admin/operator trust model). There is no backdoor, no author escrow, no cloud recovery service.
 
 The deployment uses two keys:
 
@@ -158,6 +179,8 @@ The security properties are honest, not aspirational. The following are the limi
 - **Biometrics are convenience, not security.** Biometric unlock binds to specific hardware and specific OS sessions. A new device or a TPM clear invalidates the daily path. Biometrics cannot be rotated if compromised and are not cryptographic secrets.
 - **Supply chain pinning is not auditing.** Dependency versions are pinned in `pyproject.toml`, including the CUDA-specific `bitsandbytes` development wheel required for RTX 50-series hardware. Pinning prevents silent updates but does not constitute a reviewed supply chain.
 - **Voice embeddings are biometric data.** Under GDPR Article 9 (EU) voice embeddings are special-category personal data. They are encrypted at rest under Security-ON; losing the recovery key is privacy-protective for this data, but *sharing* the key exports biometrics.
+
+> The biggest limit — that the Python package is not attested and can be trivially tampered with by an operator-level attacker — is named in the top-of-document disclaimer, not repeated here.
 
 ## 8. Vulnerability reporting
 
