@@ -11,7 +11,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paramem.backup.backup import write as backup_write
-from paramem.backup.encryption import SecurityBackupsConfig
 from paramem.backup.types import ArtifactKind
 from paramem.server.migration_recovery import (
     RecoveryAction,
@@ -22,8 +21,6 @@ from paramem.server.trial_state import (
     TrialMarker,
     write_trial_marker,
 )
-
-_SEC = SecurityBackupsConfig()
 
 
 def _sha256(b: bytes) -> str:
@@ -47,7 +44,6 @@ def _write_pre_migration_backup(
         data,
         meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
         base_dir=backups_root / "config",
-        security_config=_SEC,
     )
 
 

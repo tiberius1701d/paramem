@@ -11,7 +11,6 @@ from paramem.backup.types import (
     SCHEMA_VERSION,
     ArtifactKind,
     ArtifactMeta,
-    EncryptAtRest,
     FingerprintMismatchError,
     MetaSchemaError,
 )
@@ -25,7 +24,6 @@ def _make_meta(**overrides) -> ArtifactMeta:
         content_sha256="a" * 64,
         size_bytes=128,
         encrypted=False,
-        encrypt_at_rest=EncryptAtRest.AUTO,
         key_fingerprint=None,
         tier="scheduled",
         label=None,
@@ -68,7 +66,6 @@ class TestReadMetaAcceptsPmem1Envelope:
                 "content_sha256": meta.content_sha256,
                 "size_bytes": meta.size_bytes,
                 "encrypted": meta.encrypted,
-                "encrypt_at_rest": meta.encrypt_at_rest.value,
                 "key_fingerprint": meta.key_fingerprint,
                 "tier": meta.tier,
                 "label": meta.label,
@@ -149,7 +146,6 @@ class TestWriteReadMetaRoundtrip:
         """Encrypted meta with key_fingerprint round-trips."""
         meta = _make_meta(
             encrypted=True,
-            encrypt_at_rest=EncryptAtRest.ALWAYS,
             key_fingerprint="abcdef0123456789",
         )
         slot_dir = tmp_path / "slot_enc"

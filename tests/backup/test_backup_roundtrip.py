@@ -9,13 +9,11 @@ from datetime import datetime
 import pytest
 
 from paramem.backup.backup import read, write
-from paramem.backup.encryption import SecurityBackupsConfig, _clear_cipher_cache
+from paramem.backup.encryption import _clear_cipher_cache
 from paramem.backup.types import (
     SCHEMA_VERSION,
     ArtifactKind,
     BackupError,
-    EncryptAtRest,
-    FatalConfigError,
     FingerprintMismatchError,
 )
 
@@ -38,14 +36,12 @@ class TestWriteReadRoundtripPlain:
     def test_write_read_roundtrip_plain(self, tmp_path):
         """No key env — bytes in → slot written → read() returns identical bytes + meta."""
         payload = b"plain backup data"
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
 
         slot_dir = write(
             ArtifactKind.CONFIG,
             payload,
             {"tier": "scheduled"},
             base_dir=tmp_path / "backups" / "config",
-            security_config=config,
         )
 
         assert slot_dir.is_dir()
@@ -58,19 +54,17 @@ class TestWriteReadRoundtripPlain:
         assert meta.schema_version == SCHEMA_VERSION
 
     def test_write_read_roundtrip_encrypted(self, tmp_path):
-        """Key set → sidecar encrypted=True → read() decrypts and verifies."""
+        """Key loaded → sidecar encrypted=True → read() decrypts and verifies."""
         key = _make_fernet_key()
         os.environ["PARAMEM_MASTER_KEY"] = key.decode()
 
         payload = b"encrypted backup data"
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.ALWAYS)
 
         slot_dir = write(
             ArtifactKind.GRAPH,
             payload,
             {"tier": "manual"},
             base_dir=tmp_path / "backups" / "graph",
-            security_config=config,
         )
 
         plaintext, meta = read(slot_dir)
@@ -80,36 +74,38 @@ class TestWriteReadRoundtripPlain:
         assert meta.key_fingerprint is not None
         assert len(meta.key_fingerprint) == 16
 
-    def test_write_refuses_encrypt_always_without_key(self, tmp_path):
-        """encrypt_at_rest=always + missing key → raises before any file is written."""
-        os.environ.pop("PARAMEM_MASTER_KEY", None)
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.ALWAYS)
+    def test_encrypted_write_with_key_loaded(self, tmp_path):
+        """PARAMEM_MASTER_KEY set → write produces an encrypted artifact."""
+        key = _make_fernet_key()
+        os.environ["PARAMEM_MASTER_KEY"] = key.decode()
 
-        with pytest.raises(FatalConfigError):
-            write(
-                ArtifactKind.REGISTRY,
-                b"data",
-                {"tier": "scheduled"},
-                base_dir=tmp_path / "backups" / "registry",
-                security_config=config,
-            )
+        payload = b"secure payload"
+        slot_dir = write(
+            ArtifactKind.REGISTRY,
+            payload,
+            {"tier": "scheduled"},
+            base_dir=tmp_path / "backups" / "registry",
+        )
 
-        # No slot directory should have been created
-        slots_root = tmp_path / "backups" / "registry"
-        if slots_root.exists():
-            slots = [d for d in slots_root.iterdir() if not d.name.startswith(".")]
-            assert len(slots) == 0
+        # The artifact must be a .bin.enc file (ciphertext on disk).
+        artifact_files = [f for f in slot_dir.iterdir() if not f.name.endswith(".meta.json")]
+        assert len(artifact_files) == 1
+        assert artifact_files[0].name.endswith(".bin.enc"), (
+            f"Expected .bin.enc artifact when key is loaded, got: {artifact_files[0].name!r}"
+        )
+
+        # Round-trip must restore plaintext.
+        recovered, meta = read(slot_dir)
+        assert recovered == payload
+        assert meta.encrypted is True
 
     def test_read_refuses_on_content_hash_drift(self, tmp_path):
         """Corrupt artifact on disk after write → read() raises FingerprintMismatchError."""
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
-
         slot_dir = write(
             ArtifactKind.CONFIG,
             b"original data",
             {"tier": "scheduled"},
             base_dir=tmp_path / "backups" / "config",
-            security_config=config,
         )
 
         # Corrupt the artifact file
@@ -132,14 +128,12 @@ class TestWriteReadRoundtripPlain:
         """write() accepts a Path source as well as bytes."""
         src_file = tmp_path / "source.bin"
         src_file.write_bytes(b"from file")
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
 
         slot_dir = write(
             ArtifactKind.REGISTRY,
             src_file,
             {"tier": "manual"},
             base_dir=tmp_path / "backups" / "registry",
-            security_config=config,
         )
 
         plaintext, _ = read(slot_dir)
@@ -149,16 +143,11 @@ class TestWriteReadRoundtripPlain:
         """Two sequential write() calls produce two distinct slot directories."""
         import time
 
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
         base = tmp_path / "backups" / "config"
 
-        slot1 = write(
-            ArtifactKind.CONFIG, b"a", {"tier": "manual"}, base_dir=base, security_config=config
-        )
+        slot1 = write(ArtifactKind.CONFIG, b"a", {"tier": "manual"}, base_dir=base)
         time.sleep(0.02)  # ensure different hundredths-of-a-second timestamp
-        slot2 = write(
-            ArtifactKind.CONFIG, b"b", {"tier": "manual"}, base_dir=base, security_config=config
-        )
+        slot2 = write(ArtifactKind.CONFIG, b"b", {"tier": "manual"}, base_dir=base)
 
         assert slot1 != slot2
         assert slot1.is_dir()
@@ -202,13 +191,11 @@ class TestWriteFsyncsParentDirAfterRename:
 
         monkeypatch.setattr(backup_mod.os, "fsync", recording_fsync)
 
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
         write(
             ArtifactKind.CONFIG,
             b"durability test payload",
             {"tier": "manual"},
             base_dir=tmp_path / "backups" / "config",
-            security_config=config,
         )
 
         # Belt-and-braces count: 1 artifact + 1 sidecar + 1 pending-dir + >=1 parent-dir
@@ -240,7 +227,6 @@ class TestWriteReadRoundtrip:
         This tests the partial-slot invariant: a sidecar present without its
         paired artifact is an integrity violation, not just a missing file.
         """
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
         base = tmp_path / "backups" / "config"
 
         slot_dir = write(
@@ -248,7 +234,6 @@ class TestWriteReadRoundtrip:
             b"payload that will go missing",
             {"tier": "scheduled"},
             base_dir=base,
-            security_config=config,
         )
 
         # Delete the artifact file, leaving the sidecar intact
@@ -296,21 +281,12 @@ class TestWriteConcurrency:
 
         monkeypatch.setattr(backup_mod, "datetime", _PatchedDatetime)
 
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
         base = tmp_path / "backups" / "config"
 
-        slot1 = write(
-            ArtifactKind.CONFIG, b"first", {"tier": "manual"}, base_dir=base, security_config=config
-        )
+        slot1 = write(ArtifactKind.CONFIG, b"first", {"tier": "manual"}, base_dir=base)
         # Reset counter so second write also starts from the fixed time
         call_count[0] = 0
-        slot2 = write(
-            ArtifactKind.CONFIG,
-            b"second",
-            {"tier": "manual"},
-            base_dir=base,
-            security_config=config,
-        )
+        slot2 = write(ArtifactKind.CONFIG, b"second", {"tier": "manual"}, base_dir=base)
 
         assert slot1.is_dir()
         assert slot2.is_dir()
@@ -337,7 +313,6 @@ class TestWriteConcurrency:
 
         monkeypatch.setattr(backup_mod, "datetime", _FixedDatetime)
 
-        config = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
         base = tmp_path / "backups" / "config"
         base.mkdir(parents=True, exist_ok=True)
 
@@ -357,5 +332,4 @@ class TestWriteConcurrency:
                 b"should fail",
                 {"tier": "manual"},
                 base_dir=base,
-                security_config=config,
             )

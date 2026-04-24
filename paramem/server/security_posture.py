@@ -17,6 +17,7 @@ without a full ``lifespan_enter`` integration. Four posture buckets:
 from __future__ import annotations
 
 from paramem.backup.encryption import MASTER_KEY_ENV_VAR
+from paramem.backup.types import FatalConfigError
 
 
 def security_posture_log_line(
@@ -62,4 +63,43 @@ def security_posture_log_line(
     return (
         "SECURITY: OFF (no key — all infrastructure metadata is plaintext on disk)",
         False,
+    )
+
+
+def assert_startup_posture(
+    *,
+    require_encryption: bool,
+    fernet_loaded: bool,
+    daily_loadable: bool,
+) -> None:
+    """Refuse startup when ``require_encryption`` is set but no key is loadable.
+
+    Single uniform fail-loud gate.  Applies to every feature (snapshots,
+    shards, backups, infra): when the operator opts in, a missing key at
+    startup is a fatal configuration error rather than a silent degrade to
+    plaintext.
+
+    Parameters
+    ----------
+    require_encryption:
+        Operator-set flag from ``security.require_encryption``.  ``False``
+        makes this function a no-op (AUTO semantics — the default).
+    fernet_loaded:
+        ``PARAMEM_MASTER_KEY`` is set.
+    daily_loadable:
+        Daily identity file + passphrase env var are both present.
+
+    Raises
+    ------
+    FatalConfigError
+        When ``require_encryption=True`` and neither key path is loadable.
+    """
+    if not require_encryption:
+        return
+    if fernet_loaded or daily_loadable:
+        return
+    raise FatalConfigError(
+        "security.require_encryption=true but no key is loadable — "
+        f"set {MASTER_KEY_ENV_VAR} (legacy) or run `paramem generate-key` and "
+        "set PARAMEM_DAILY_PASSPHRASE before starting the server"
     )

@@ -14,11 +14,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from paramem.backup.backup import write as backup_write
-from paramem.backup.encryption import SecurityBackupsConfig
 from paramem.backup.enumerate import BackupRecord, enumerate_backups
 from paramem.backup.types import ArtifactKind
-
-_SEC = SecurityBackupsConfig()
 
 
 def _write_slot(
@@ -40,7 +37,6 @@ def _write_slot(
         data,
         meta_fields=meta_fields,
         base_dir=base_dir / kind.value,
-        security_config=_SEC,
     )
 
 

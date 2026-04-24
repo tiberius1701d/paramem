@@ -573,7 +573,7 @@ def _collect_key_rotation_items(state: dict) -> list[AttentionItem]:
 
 
 def _collect_encryption_items(state: dict) -> list[AttentionItem]:
-    """Emit encryption-degraded items when encrypt_at_rest=always but no key.
+    """Emit encryption-degraded items when posture is SECURITY: OFF.
 
     Stub — not yet populated.  Signature is intentionally ``(state)``-only;
     when this populator is wired, extend to ``(state, config)`` rather than

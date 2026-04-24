@@ -11,7 +11,6 @@ Types
 -----
 - ``ArtifactMeta``       — immutable sidecar schema dataclass.
 - ``ArtifactKind``       — enum: config, graph, registry, resume, snapshot.
-- ``EncryptAtRest``      — enum: auto, always, never.
 - ``PruneReport``        — result of a prune() call.
 - ``RetentionPolicy``    — dict alias for {keep, max_disk_gb, immunity_days}.
 
@@ -20,7 +19,7 @@ Errors
 - ``BackupError``              — base class.
 - ``FingerprintMismatchError`` — content hash mismatch on read.
 - ``MetaSchemaError``          — sidecar schema validation failure.
-- ``FatalConfigError``         — always + no key at startup.
+- ``FatalConfigError``         — startup refused (require_encryption / mode mismatch).
 """
 
 from paramem.backup.backup import (
@@ -34,7 +33,6 @@ from paramem.backup.types import (
     ArtifactKind,
     ArtifactMeta,
     BackupError,
-    EncryptAtRest,
     FatalConfigError,
     FingerprintMismatchError,
     MetaSchemaError,
@@ -51,7 +49,6 @@ __all__ = [
     # Types
     "ArtifactMeta",
     "ArtifactKind",
-    "EncryptAtRest",
     "PruneReport",
     "RetentionPolicy",
     "SCHEMA_VERSION",

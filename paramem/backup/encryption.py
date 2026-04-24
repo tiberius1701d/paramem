@@ -16,8 +16,11 @@ Services provided:
 - Lazy cipher construction (built on first use, cached in-module state)
   for the Fernet path; ``_clear_cipher_cache()`` is a supported operator
   call after rotating ``PARAMEM_MASTER_KEY``.
-- Per-artifact policy resolution (``auto`` / ``always`` / ``never``).
-- Startup feasibility assertion (``always`` with no key → fatal error).
+- Uniform AUTO semantics: :func:`envelope_encrypt_bytes` encrypts when a
+  key is loaded and returns plaintext otherwise; no per-artifact policy
+  knob exists.  Operators opt into a fail-loud posture via the single
+  uniform ``security.require_encryption`` flag enforced at server startup
+  by :func:`paramem.server.security_posture.assert_startup_posture`.
 - Mode-mismatch startup refuse (:func:`assert_mode_consistency`):
   classifies infrastructure files as PMEM1 / age / plaintext and refuses
   any combination that would be silently unreadable or that mixes
@@ -56,7 +59,7 @@ from paramem.backup.age_envelope import (
     age_encrypt_bytes,
     is_age_envelope,
 )
-from paramem.backup.types import ArtifactKind, EncryptAtRest, FatalConfigError
+from paramem.backup.types import FatalConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +71,6 @@ MASTER_KEY_ENV_VAR: str = "PARAMEM_MASTER_KEY"
 
 # Envelope magic for infrastructure files written via write_infra_bytes.
 PMEM1_MAGIC: bytes = b"PMEM1\n"
-
-
-# ---------------------------------------------------------------------------
-# SecurityBackupsConfig — defined locally; Slice 2 may promote to server.config
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class SecurityBackupsConfig:
-    """Encryption policy configuration for the backup subsystem.
-
-    Attributes
-    ----------
-    encrypt_at_rest : EncryptAtRest
-        Global fallback policy applied to all artifact kinds unless overridden
-        by ``per_kind``.
-    per_kind : dict[ArtifactKind, EncryptAtRest]
-        Optional per-kind overrides.  Keys are ``ArtifactKind`` enum members;
-        values are ``EncryptAtRest`` policies.
-    """
-
-    encrypt_at_rest: EncryptAtRest = EncryptAtRest.AUTO
-    per_kind: dict[ArtifactKind, EncryptAtRest] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -183,98 +163,6 @@ def current_key_fingerprint() -> str | None:
     if not key:
         return None
     return hashlib.sha256(key.encode()).hexdigest()[:16]
-
-
-# ---------------------------------------------------------------------------
-# Policy helpers
-# ---------------------------------------------------------------------------
-
-
-def resolve_policy(kind: ArtifactKind, config: SecurityBackupsConfig) -> EncryptAtRest:
-    """Return the effective ``EncryptAtRest`` policy for *kind*.
-
-    Checks ``config.per_kind`` first; falls back to ``config.encrypt_at_rest``.
-
-    Parameters
-    ----------
-    kind:
-        The artifact kind to resolve the policy for.
-    config:
-        Backup security configuration.
-
-    Returns
-    -------
-    EncryptAtRest
-        The effective policy for *kind*.
-    """
-    return config.per_kind.get(kind, config.encrypt_at_rest)
-
-
-def should_encrypt(policy: EncryptAtRest, key_loaded: bool) -> bool:
-    """Return ``True`` when an artifact should be encrypted under *policy*.
-
-    Parameters
-    ----------
-    policy:
-        The resolved ``EncryptAtRest`` policy for this artifact.
-    key_loaded:
-        Whether a master key is available in the environment.
-
-    Returns
-    -------
-    bool
-        ``True`` → write ciphertext.  ``False`` → write plaintext.
-
-    Note
-    ----
-    For ``ALWAYS`` this returns ``True`` regardless of ``key_loaded``.
-    ``assert_encryption_feasible`` is the appropriate guard to call at startup
-    to catch the misconfiguration before any artifact is written.
-    """
-    if policy is EncryptAtRest.ALWAYS:
-        return True
-    if policy is EncryptAtRest.NEVER:
-        return False
-    # AUTO: follow key presence
-    return key_loaded
-
-
-def assert_encryption_feasible(config: SecurityBackupsConfig, key_loaded: bool) -> None:
-    """Assert that all ``always`` policies have a key available.
-
-    Called at server startup.  Any ``always`` policy (global or per-kind)
-    without a key is a fatal configuration error (spec §Security invariants).
-
-    Parameters
-    ----------
-    config:
-        Backup security configuration.
-    key_loaded:
-        Whether a master key is available in the environment.
-
-    Raises
-    ------
-    FatalConfigError
-        If ``encrypt_at_rest=always`` is configured but no key is loaded.
-    """
-    if key_loaded:
-        return  # all policies are satisfiable when a key is present
-
-    # Check global policy
-    if config.encrypt_at_rest is EncryptAtRest.ALWAYS:
-        raise FatalConfigError(
-            f"encrypt_at_rest=always but {MASTER_KEY_ENV_VAR} is not set — "
-            "server startup refused (spec §Security invariants)"
-        )
-
-    # Check per-kind overrides
-    for kind, policy in config.per_kind.items():
-        if policy is EncryptAtRest.ALWAYS:
-            raise FatalConfigError(
-                f"encrypt_at_rest=always for {kind.value!r} but "
-                f"{MASTER_KEY_ENV_VAR} is not set — "
-                "server startup refused (spec §Security invariants)"
-            )
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,6 @@ from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
 from paramem.backup.backup import write as backup_write
-from paramem.backup.encryption import SecurityBackupsConfig
 from paramem.backup.types import ArtifactKind
 from paramem.server.migration import TrialStash, initial_migration_state
 from paramem.server.trial_state import (
@@ -100,13 +99,11 @@ def _seed_trial_state(state: dict, tmp_path: Path, gates_status: str = "pass") -
     # (*.meta.json) is present and backup.read() (called by rollback's decrypt
     # step) can validate and optionally decrypt the artifact.
     backups_root = config.paths.data / "backups"
-    sec_cfg = SecurityBackupsConfig()  # encrypt_at_rest=AUTO (no key → plaintext)
     config_slot = backup_write(
         ArtifactKind.CONFIG,
         _LIVE_YAML,
         {"tier": "pre_migration"},
         base_dir=backups_root / "config",
-        security_config=sec_cfg,
     )
 
     # Derive the artifact filename from the real slot.

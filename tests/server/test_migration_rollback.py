@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
 from paramem.backup.backup import write as backup_write
-from paramem.backup.encryption import SecurityBackupsConfig, _clear_cipher_cache
+from paramem.backup.encryption import _clear_cipher_cache
 from paramem.backup.types import ArtifactKind
 from paramem.server.migration import TrialStash, initial_migration_state
 from paramem.server.trial_state import (
@@ -98,13 +98,11 @@ def _make_state(
     # For the empty-filename error path (config_artifact_filename=""), we still
     # create a proper slot but record "" in the marker so the precondition gate
     # fires before backup.read() is reached.
-    sec_cfg = SecurityBackupsConfig()
     config_slot = backup_write(
         ArtifactKind.CONFIG,
         _A_YAML,
         {"tier": "pre_migration"},
         base_dir=backups_root / "config",
-        security_config=sec_cfg,
     )
 
     # Derive the artifact filename from the real slot for the marker.
@@ -551,13 +549,11 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
         # --- Write A-config into a real backup slot ---
         a_bytes = _A_YAML
         backups_root = tmp_path / "data" / "ha" / "backups"
-        sec_cfg = SecurityBackupsConfig()
         config_slot = backup_write(
             ArtifactKind.CONFIG,
             a_bytes,
             {"tier": "pre_migration"},
             base_dir=backups_root / "config",
-            security_config=sec_cfg,
         )
 
         # Identify the artifact filename (must end with .bin, not .meta.json).
@@ -674,9 +670,9 @@ class TestRollbackDecryptsEncryptedArtifact:
     because ``yaml.safe_load`` raised on binary Fernet data.
 
     This test exercises the FULL encrypt → backup → rollback → decrypt round-trip
-    using a real Fernet key in the environment (``encrypt_at_rest=AUTO``, key
-    present → encryption happens).  It asserts that the post-rollback file
-    content is the original plaintext bytes, not ciphertext.
+    using a real Fernet key in the environment (key loaded → encryption happens).
+    It asserts that the post-rollback file content is the original plaintext
+    bytes, not ciphertext.
     """
 
     def test_rollback_decrypts_encrypted_a_config(self, tmp_path, monkeypatch, request):
@@ -686,7 +682,7 @@ class TestRollbackDecryptsEncryptedArtifact:
         ------
         1. Generate a real Fernet key and set ``PARAMEM_MASTER_KEY``.
         2. Write the A-config into a backup slot using the real ``backup.write()``
-           path (``encrypt_at_rest=AUTO`` + key present → Fernet ciphertext on disk).
+           path (key loaded → Fernet ciphertext on disk).
         3. Assert the artifact file on disk is ciphertext (not plaintext) so we
            know encryption actually happened.
         4. Build a TRIAL state with the encrypted slot.
@@ -707,13 +703,11 @@ class TestRollbackDecryptsEncryptedArtifact:
 
         # --- Step 2: write encrypted slot ---
         backups_root = tmp_path / "data" / "ha" / "backups"
-        sec_cfg = SecurityBackupsConfig()  # encrypt_at_rest=AUTO, key present → encrypts
         config_slot = backup_write(
             ArtifactKind.CONFIG,
             a_bytes,
             {"tier": "pre_migration"},
             base_dir=backups_root / "config",
-            security_config=sec_cfg,
         )
 
         # --- Step 3: verify the artifact is ciphertext (encryption happened) ---

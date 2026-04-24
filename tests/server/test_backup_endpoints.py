@@ -32,7 +32,6 @@ from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
 from paramem.backup.backup import write as backup_write
-from paramem.backup.encryption import SecurityBackupsConfig as EncSecurityConfig
 from paramem.backup.types import ArtifactKind
 from paramem.server.config import (
     PathsConfig,
@@ -98,7 +97,6 @@ def _make_client(monkeypatch, state: dict):
 def _seed_config_slot(backups_root: Path, slot_name: str = "20260421-040000") -> Path:
     """Write a minimal config slot with a valid sidecar."""
     from paramem.backup.backup import write as _bwrite
-    from paramem.backup.encryption import SecurityBackupsConfig as _EncCfg
 
     config_dir = backups_root / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -107,7 +105,6 @@ def _seed_config_slot(backups_root: Path, slot_name: str = "20260421-040000") ->
         b"model: mistral\n",
         meta_fields={"tier": "daily"},
         base_dir=config_dir,
-        security_config=_EncCfg(),
     )
     return slot_dir
 
@@ -143,20 +140,17 @@ class TestListMixedKindsNewestFirst:
         backups_root = config.paths.data / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
 
-        enc_cfg = EncSecurityConfig()
         _slot1 = backup_write(
             ArtifactKind.CONFIG,
             b"config_data",
             meta_fields={"tier": "daily"},
             base_dir=backups_root / "config",
-            security_config=enc_cfg,
         )
         _slot2 = backup_write(
             ArtifactKind.REGISTRY,
             b"registry_data",
             meta_fields={"tier": "daily"},
             base_dir=backups_root / "registry",
-            security_config=enc_cfg,
         )
 
         state = _make_state(tmp_path, config)
@@ -187,20 +181,17 @@ class TestListFilteredByKind:
         backups_root = config.paths.data / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
 
-        enc_cfg = EncSecurityConfig()
         backup_write(
             ArtifactKind.CONFIG,
             b"config_data",
             meta_fields={"tier": "daily"},
             base_dir=backups_root / "config",
-            security_config=enc_cfg,
         )
         backup_write(
             ArtifactKind.REGISTRY,
             b"registry_data",
             meta_fields={"tier": "daily"},
             base_dir=backups_root / "registry",
-            security_config=enc_cfg,
         )
 
         state = _make_state(tmp_path, config)
@@ -362,7 +353,6 @@ class TestRestoreHappyPathConfig:
             backup_content,
             meta_fields={"tier": "daily"},
             base_dir=backups_root / "config",
-            security_config=EncSecurityConfig(),
         )
         backup_id = slot_dir.name
 
@@ -422,7 +412,6 @@ class TestRestoreNonConfigKindReturns400:
             b'{"nodes": []}',
             meta_fields={"tier": "daily"},
             base_dir=backups_root / "graph",
-            security_config=EncSecurityConfig(),
         )
         backup_id = slot_dir.name
 
@@ -522,7 +511,6 @@ class TestRestoreEncryptedWrongKeyReturns500:
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
                 base_dir=backups_root / "config",
-                security_config=EncSecurityConfig(),
             )
         backup_id = slot_dir.name
 
@@ -580,7 +568,6 @@ def _write_encrypted_config_slot(
             content,
             meta_fields={"tier": "daily"},
             base_dir=backups_root / "config",
-            security_config=EncSecurityConfig(),
         )
     _clear_cipher_cache()
     return slot
@@ -764,7 +751,6 @@ class TestRestorePlaintextBackupAllowedUnderSecurityOn:
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
                 base_dir=backups_root / "config",
-                security_config=EncSecurityConfig(),
             )
 
         state = _make_state(tmp_path, config)
@@ -798,7 +784,6 @@ class TestPruneHappyPath:
             daily=RetentionTierConfig(keep=1),
         )
 
-        enc_cfg = EncSecurityConfig()
         _slots = []
         for _ in range(3):
             import time
@@ -809,7 +794,6 @@ class TestPruneHappyPath:
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
                 base_dir=backups_root / "config",
-                security_config=enc_cfg,
             )
             _slots.append(s)
 
@@ -841,7 +825,6 @@ class TestPruneDryRun:
             daily=RetentionTierConfig(keep=1),
         )
 
-        enc_cfg = EncSecurityConfig()
         for _ in range(3):
             import time
 
@@ -851,7 +834,6 @@ class TestPruneDryRun:
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
                 base_dir=backups_root / "config",
-                security_config=enc_cfg,
             )
 
         state = _make_state(tmp_path, config)
@@ -899,7 +881,6 @@ class TestRestoreDecryptErrorCodes:
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
                 base_dir=backups_root / "config",
-                security_config=EncSecurityConfig(),
             )
         backup_id = slot_dir.name
 
@@ -949,7 +930,6 @@ class TestRestoreDecryptErrorCodes:
                 b"model: mistral\n",
                 meta_fields={"tier": "daily"},
                 base_dir=backups_root / "config",
-                security_config=EncSecurityConfig(),
             )
         backup_id = slot_dir.name
 

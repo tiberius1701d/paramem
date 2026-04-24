@@ -1,150 +1,113 @@
-"""Tests for Fix 10 — assert_encryption_feasible called during lifespan startup.
+"""Tests for assert_startup_posture and its lifespan wiring.
 
-Fix 10 (2026-04-23): assert_encryption_feasible is called at server startup so
-that ``encrypt_at_rest=always + no PARAMEM_MASTER_KEY`` produces an immediate
-FatalConfigError rather than a silent runtime failure when the first backup is
-attempted.
+Semantics (post-refactor, 2026-04-24): uniform AUTO encryption — encrypt
+when age daily OR ``PARAMEM_MASTER_KEY`` is loadable, plaintext otherwise.
+Operators opt into fail-loud via ``security.require_encryption: bool`` at
+startup via :func:`paramem.server.security_posture.assert_startup_posture`.
 
 Tests verify:
-- assert_encryption_feasible raises FatalConfigError for ALWAYS + no key.
-- assert_encryption_feasible is a no-op for AUTO policy (key absent is fine).
-- assert_encryption_feasible is a no-op for NEVER policy.
-- The lifespan code path calls assert_encryption_feasible (smoke).
+- ``require_encryption=False`` is a no-op regardless of key state.
+- ``require_encryption=True`` with a Fernet key loaded does not raise.
+- ``require_encryption=True`` with a daily identity loadable does not raise.
+- ``require_encryption=True`` with neither key raises FatalConfigError.
+- The lifespan source calls ``assert_startup_posture``.
 """
 
 from __future__ import annotations
 
-import os
-from unittest.mock import patch
+import inspect
 
 import pytest
 
-from paramem.backup.encryption import SecurityBackupsConfig, assert_encryption_feasible
-from paramem.backup.types import EncryptAtRest, FatalConfigError
+from paramem.backup.types import FatalConfigError
+from paramem.server.security_posture import assert_startup_posture
 
 # ---------------------------------------------------------------------------
-# Fix 10 — assert_encryption_feasible unit tests
+# assert_startup_posture unit tests
 # ---------------------------------------------------------------------------
 
 
-class TestAssertEncryptionFeasible:
-    """Unit tests for assert_encryption_feasible covering the three policy paths."""
+class TestAssertStartupPosture:
+    """Unit tests for assert_startup_posture covering the four key-state paths."""
 
-    def test_always_policy_no_key_raises_fatal(self):
-        """encrypt_at_rest=ALWAYS + no key → FatalConfigError (Fix 10)."""
-        cfg = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.ALWAYS)
-        with pytest.raises(FatalConfigError, match="PARAMEM_MASTER_KEY"):
-            assert_encryption_feasible(cfg, key_loaded=False)
-
-    def test_always_policy_with_key_ok(self):
-        """encrypt_at_rest=ALWAYS + key present → no exception."""
-        cfg = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.ALWAYS)
-        # Must not raise.
-        assert_encryption_feasible(cfg, key_loaded=True)
-
-    def test_auto_policy_no_key_is_noop(self):
-        """encrypt_at_rest=AUTO + no key → no exception (key absence is acceptable)."""
-        cfg = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.AUTO)
-        # Must not raise — AUTO backs off to plaintext when key is absent.
-        assert_encryption_feasible(cfg, key_loaded=False)
-
-    def test_never_policy_no_key_is_noop(self):
-        """encrypt_at_rest=NEVER + no key → no exception."""
-        cfg = SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.NEVER)
-        assert_encryption_feasible(cfg, key_loaded=False)
-
-    def test_per_kind_always_no_key_raises_fatal(self):
-        """Per-kind ALWAYS policy + no key → FatalConfigError."""
-        from paramem.backup.types import ArtifactKind
-
-        cfg = SecurityBackupsConfig(
-            encrypt_at_rest=EncryptAtRest.AUTO,
-            per_kind={ArtifactKind.CONFIG: EncryptAtRest.ALWAYS},
+    def test_require_encryption_false_is_noop(self) -> None:
+        """require_encryption=False → no-op regardless of key state."""
+        # Must not raise even though neither key is loadable.
+        assert_startup_posture(
+            require_encryption=False,
+            fernet_loaded=False,
+            daily_loadable=False,
         )
-        with pytest.raises(FatalConfigError):
-            assert_encryption_feasible(cfg, key_loaded=False)
 
+    def test_require_encryption_true_with_fernet_ok(self) -> None:
+        """require_encryption=True + fernet_loaded=True → no exception."""
+        assert_startup_posture(
+            require_encryption=True,
+            fernet_loaded=True,
+            daily_loadable=False,
+        )
 
-# ---------------------------------------------------------------------------
-# Fix 10 — lifespan calls assert_encryption_feasible (integration smoke)
-# ---------------------------------------------------------------------------
+    def test_require_encryption_true_with_daily_ok(self) -> None:
+        """require_encryption=True + daily_loadable=True → no exception."""
+        assert_startup_posture(
+            require_encryption=True,
+            fernet_loaded=False,
+            daily_loadable=True,
+        )
 
+    def test_require_encryption_true_neither_raises(self) -> None:
+        """require_encryption=True, neither key loadable → FatalConfigError.
 
-class TestLifespanCallsAssertEncryptionFeasible:
-    """Verify that the lifespan startup block calls assert_encryption_feasible.
-
-    Tests the lifespan code path by patching assert_encryption_feasible and
-    confirming it was called with a SecurityBackupsConfig instance.
-    """
-
-    def test_lifespan_calls_assert_encryption_feasible(self, tmp_path):
-        """assert_encryption_feasible is called during lifespan startup.
-
-        Uses a minimal lifespan invocation that exits immediately after the
-        encryption check.  The test patches assert_encryption_feasible at its
-        call site in app.py and verifies it was called with a
-        SecurityBackupsConfig argument.
+        The error message must mention both ``require_encryption`` and
+        ``PARAMEM_MASTER_KEY`` so operators know what to check.
         """
-        # We cannot easily run the full lifespan without GPU/model loading.
-        # Instead, verify that assert_encryption_feasible is imported and
-        # callable from the lifespan's call path, and that the default
-        # SecurityBackupsConfig() (AUTO policy) never raises — which is the
-        # production behaviour for hosts without explicit ALWAYS config.
-        #
-        # This is equivalent to "smoke" — the fix is structurally verified by
-        # the fact that the lifespan code exists and ruff/import checks pass.
-
-        # Direct exercise of the code path from lifespan:
-        # "from paramem.backup.encryption import SecurityBackupsConfig as _EncSecCfg,
-        #  assert_encryption_feasible as _assert_enc"
-        # "_key_loaded = bool(os.environ.get('PARAMEM_MASTER_KEY'))"
-        # "_assert_enc(_EncSecCfg(), key_loaded=_key_loaded)"
-        from paramem.backup.encryption import (
-            SecurityBackupsConfig as _EncSecCfg,
+        with pytest.raises(FatalConfigError) as exc_info:
+            assert_startup_posture(
+                require_encryption=True,
+                fernet_loaded=False,
+                daily_loadable=False,
+            )
+        message = str(exc_info.value)
+        assert "require_encryption" in message, (
+            f"FatalConfigError must mention 'require_encryption': {message!r}"
         )
-        from paramem.backup.encryption import (
-            assert_encryption_feasible as _assert_enc,
+        assert "PARAMEM_MASTER_KEY" in message, (
+            f"FatalConfigError must mention 'PARAMEM_MASTER_KEY': {message!r}"
         )
 
-        env_without_key = {k: v for k, v in os.environ.items() if k != "PARAMEM_MASTER_KEY"}
-        with patch.dict(os.environ, env_without_key, clear=True):
-            _key_loaded = bool(os.environ.get("PARAMEM_MASTER_KEY"))
-            # Must not raise — AUTO policy with no key is acceptable.
-            _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
 
-    def test_lifespan_encryption_check_intercept(self, tmp_path):
-        """Verify assert_encryption_feasible is called at lifespan entry.
+# ---------------------------------------------------------------------------
+# Lifespan source smoke tests
+# ---------------------------------------------------------------------------
 
-        Patches the function inside the app module's namespace and verifies
-        it is called when the lifespan block executes the encryption check.
+
+class TestLifespanInvokesAssertStartupPosture:
+    """Verify that the lifespan startup block calls assert_startup_posture."""
+
+    def test_lifespan_invokes_assert_startup_posture(self) -> None:
+        """assert_startup_posture must be called at lifespan entry.
+
+        Inspects the lifespan source so a refactor that removes the call
+        will fail here rather than silently. The function is imported from
+        :mod:`paramem.server.security_posture`.
         """
-        called_with: list = []
+        from paramem.server import app as app_module
 
-        def _spy_assert(cfg, *, key_loaded):
-            called_with.append((cfg, key_loaded))
+        source = inspect.getsource(app_module.lifespan)
+        assert "assert_startup_posture(" in source, (
+            "lifespan must call assert_startup_posture to enforce the "
+            "require_encryption startup gate"
+        )
 
-        # Import app module and patch the encryption check at the module level.
-        # Since it's imported as _assert_enc inside the lifespan coroutine, we
-        # patch at the source module.
-        with patch(
-            "paramem.backup.encryption.assert_encryption_feasible",
-            side_effect=_spy_assert,
-        ):
-            # Re-execute the lifespan code block that calls assert_encryption_feasible.
-            from paramem.backup.encryption import (
-                SecurityBackupsConfig as _EncSecCfg,
-            )
-            from paramem.backup.encryption import (
-                assert_encryption_feasible as _assert_enc,
-            )
+    def test_lifespan_invokes_mode_consistency(self) -> None:
+        """assert_mode_consistency must be called at lifespan entry."""
+        from paramem.server import app as app_module
 
-            _key_loaded = bool(os.environ.get("PARAMEM_MASTER_KEY"))
-            _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
-
-        # This test verifies the call signature is correct (SecurityBackupsConfig,
-        # key_loaded=bool) — the actual lifespan integration is covered by the
-        # lifespan code itself which is exercised during server startup.
-        # The test above exercises the exact same code path as the lifespan block.
+        source = inspect.getsource(app_module.lifespan)
+        assert "_assert_mode(" in source, (
+            "lifespan must invoke assert_mode_consistency to enforce the "
+            "SECURITY.md §4 four-case refuse"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -155,24 +118,22 @@ class TestLifespanCallsAssertEncryptionFeasible:
 class TestLifespanSecurityPosture:
     """Verify lifespan wires the SECURITY.md §4 posture gate correctly.
 
-    Both ``assert_encryption_feasible`` and ``assert_mode_consistency`` are
-    invoked at startup.  The former refuses the ``encrypt_at_rest=always +
+    Both ``assert_startup_posture`` and ``assert_mode_consistency`` are
+    invoked at startup.  The former refuses the ``require_encryption=true +
     no key`` misconfiguration; the latter refuses the four key × on-disk
     mismatch cases (set+plaintext, unset+ciphertext, mixed) and points the
     operator at the ``paramem encrypt-infra`` / ``paramem decrypt-infra
     --i-accept-plaintext`` migration commands.
     """
 
-    def test_primitive_is_importable(self):
+    def test_primitive_is_importable(self) -> None:
         """assert_mode_consistency must exist and be callable from encryption."""
         from paramem.backup.encryption import assert_mode_consistency
 
         assert callable(assert_mode_consistency)
 
-    def test_lifespan_invokes_mode_consistency(self):
+    def test_lifespan_invokes_mode_consistency(self) -> None:
         """assert_mode_consistency must be called at lifespan entry."""
-        import inspect
-
         from paramem.server import app as app_module
 
         source = inspect.getsource(app_module.lifespan)
@@ -181,7 +142,7 @@ class TestLifespanSecurityPosture:
             "SECURITY.md §4 four-case refuse"
         )
 
-    def test_lifespan_emits_security_posture_line(self):
+    def test_lifespan_emits_security_posture_line(self) -> None:
         """lifespan must emit the SECURITY: ON/OFF log line per SECURITY.md §4.
 
         The line content lives in :mod:`paramem.server.security_posture`
@@ -190,8 +151,6 @@ class TestLifespanSecurityPosture:
         route the result to the right log level. Pin both sides so neither
         refactor drift nor a stale inline literal sneaks through.
         """
-        import inspect
-
         from paramem.server import app as app_module
         from paramem.server import security_posture as posture_module
 
@@ -204,11 +163,9 @@ class TestLifespanSecurityPosture:
         assert "SECURITY: ON" in posture_source
         assert "SECURITY: OFF" in posture_source
 
-    def test_lifespan_sets_encryption_state_field(self):
+    def test_lifespan_sets_encryption_state_field(self) -> None:
         """lifespan must populate _state['encryption'] so a future /status
         surface can expose the posture without touching the env again."""
-        import inspect
-
         from paramem.server import app as app_module
 
         source = inspect.getsource(app_module.lifespan)

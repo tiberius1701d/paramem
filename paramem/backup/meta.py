@@ -42,7 +42,6 @@ from paramem.backup.types import (
     SCHEMA_VERSION,
     ArtifactKind,
     ArtifactMeta,
-    EncryptAtRest,
     FingerprintMismatchError,
     MetaSchemaError,
 )
@@ -107,7 +106,6 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
         "content_sha256": meta.content_sha256,
         "size_bytes": meta.size_bytes,
         "encrypted": meta.encrypted,
-        "encrypt_at_rest": meta.encrypt_at_rest.value,
         "key_fingerprint": meta.key_fingerprint,
         "tier": meta.tier,
         "label": meta.label,
@@ -214,7 +212,6 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
         "content_sha256",
         "size_bytes",
         "encrypted",
-        "encrypt_at_rest",
         "tier",
     }
     missing = required - set(raw.keys())
@@ -231,13 +228,6 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
             f"valid kinds: {[k.value for k in ArtifactKind]}"
         )
 
-    # --- encrypt_at_rest validation ---
-    raw_ear = raw["encrypt_at_rest"]
-    try:
-        encrypt_at_rest = EncryptAtRest(raw_ear)
-    except ValueError:
-        raise MetaSchemaError(f"sidecar {meta_file} has unknown encrypt_at_rest: {raw_ear!r}")
-
     return ArtifactMeta(
         schema_version=raw_version,
         kind=kind,
@@ -245,7 +235,6 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
         content_sha256=raw["content_sha256"],
         size_bytes=raw["size_bytes"],
         encrypted=raw["encrypted"],
-        encrypt_at_rest=encrypt_at_rest,
         key_fingerprint=raw.get("key_fingerprint"),
         tier=raw["tier"],
         label=raw.get("label"),

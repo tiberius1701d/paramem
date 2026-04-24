@@ -40,27 +40,22 @@ from pathlib import Path
 from paramem.backup.atomic import rename_pending_to_slot
 from paramem.backup.atomic import sweep_orphan_pending as _sweep_pending
 from paramem.backup.encryption import (
-    MASTER_KEY_ENV_VAR,
     PMEM1_MAGIC,
-    SecurityBackupsConfig,
     current_key_fingerprint,
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
     master_key_loaded,
-    resolve_policy,
-    should_encrypt,
 )
 from paramem.backup.hashing import (
     content_sha256_bytes,
 )
+from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
 from paramem.backup.meta import read_meta, verify_fingerprint, write_meta
 from paramem.backup.types import (
     SCHEMA_VERSION,
     ArtifactKind,
     ArtifactMeta,
     BackupError,
-    EncryptAtRest,
-    FatalConfigError,
     FingerprintMismatchError,
     PruneReport,
     RetentionPolicy,
@@ -175,12 +170,11 @@ def write(
     meta_fields: dict,
     *,
     base_dir: Path,
-    security_config: SecurityBackupsConfig,
 ) -> Path:
     """Write an artifact + sidecar into a new timestamped slot directory.
 
     Sequence (crash-safe):
-    1. Resolve encryption policy and determine whether to encrypt.
+    1. Determine whether a key is loadable (age daily or Fernet master).
     2. Create ``.pending/<ts>/`` inside *base_dir*.
     3. Write artifact file (ciphertext or plaintext) inside pending.
     4. Compute content hash of the on-disk bytes.
@@ -201,13 +195,10 @@ def write(
         paths are read in full; the source file is *not* deleted.
     meta_fields:
         Caller-supplied metadata.  Required keys: ``"tier"`` (str).  Optional:
-        ``"label"`` (str | None), any future kind-specific extension fields
-        (ignored by Slice 1).
+        ``"label"`` (str | None), any future kind-specific extension fields.
     base_dir:
         Per-kind backup directory (e.g. ``data/ha/backups/config/``).
         Created with parents if absent.
-    security_config:
-        Encryption policy configuration.
 
     Returns
     -------
@@ -216,8 +207,6 @@ def write(
 
     Raises
     ------
-    FatalConfigError
-        If ``encrypt_at_rest=always`` and no key is available.
     BackupError
         If a unique pending slot could not be allocated after 10 collision
         retries (pathological — frozen clock or extreme write rate).
@@ -227,27 +216,13 @@ def write(
     # --- resolve payload bytes ---
     payload: bytes = source if isinstance(source, bytes) else Path(source).read_bytes()
 
-    # --- resolve encryption policy ---
-    policy = resolve_policy(kind, security_config)
-    key_loaded = master_key_loaded()
-
-    if policy is EncryptAtRest.ALWAYS and not key_loaded:
-        raise FatalConfigError(
-            f"Cannot write {kind.value} artifact: encrypt_at_rest=always "
-            f"but {MASTER_KEY_ENV_VAR} is not set"
-        )
-
-    do_encrypt = should_encrypt(policy, key_loaded)
-
-    if do_encrypt:
-        # envelope_encrypt_bytes produces a magic-prefixed envelope (age when
-        # the daily identity is loaded, PMEM1 otherwise) — NOT the legacy bare
-        # Fernet token that this line produced pre-D3. The universal decrypt
-        # side (envelope_decrypt_bytes) dispatches on magic so pre-envelope
-        # backups continue to restore as bare Fernet.
-        on_disk_bytes = envelope_encrypt_bytes(payload)
-    else:
-        on_disk_bytes = payload
+    # --- AUTO semantics: encrypt when any key path is loadable, else plaintext.
+    # envelope_encrypt_bytes dispatches the format (age when daily identity is
+    # loaded, PMEM1 otherwise, plaintext when neither). Operators who want
+    # fail-loud set security.require_encryption at startup; there is no
+    # per-write policy knob.
+    do_encrypt = master_key_loaded() or daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
+    on_disk_bytes = envelope_encrypt_bytes(payload) if do_encrypt else payload
 
     # --- compute content hash (of bytes as written — Resolved Decision 29) ---
     hash_hex = content_sha256_bytes(on_disk_bytes)
@@ -314,7 +289,6 @@ def write(
         content_sha256=hash_hex,
         size_bytes=len(on_disk_bytes),
         encrypted=encrypted_flag,
-        encrypt_at_rest=policy,
         key_fingerprint=key_fp,
         tier=meta_fields.get("tier", "manual"),
         label=meta_fields.get("label"),

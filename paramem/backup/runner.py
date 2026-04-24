@@ -165,7 +165,6 @@ def run_scheduled_backup(
     ScheduledBackupResult
     """
     from paramem.backup.backup import write as backup_write
-    from paramem.backup.encryption import SecurityBackupsConfig as EncSecurityConfig
     from paramem.backup.retention import compute_disk_usage, prune
     from paramem.backup.types import ArtifactKind
 
@@ -234,7 +233,6 @@ def run_scheduled_backup(
         )
 
     # Step 3: Per-artifact write loop.
-    encryption_config = EncSecurityConfig()
     written_slots: dict[str, str] = {}
     skipped_artifacts: list[tuple[str, str]] = []
     first_error: str | None = None
@@ -303,7 +301,6 @@ def run_scheduled_backup(
                 artifact_bytes,
                 meta_fields={"tier": tier, "label": label},
                 base_dir=backups_root / artifact_name,
-                security_config=encryption_config,
             )
             written_slots[artifact_name] = str(slot_dir)
             logger.info("run_scheduled_backup: wrote %s slot %s", artifact_name, slot_dir)

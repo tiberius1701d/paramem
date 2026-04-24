@@ -32,7 +32,6 @@ from pydantic import BaseModel
 
 # Migration / backup imports at module level so tests can patch them.
 from paramem.backup.backup import write as backup_write
-from paramem.backup.encryption import SecurityBackupsConfig
 from paramem.backup.types import ArtifactKind
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server.cloud import get_cloud_agent
@@ -915,12 +914,6 @@ async def lifespan(app: FastAPI):
     config = _state["config"]
 
     from paramem.backup.encryption import (
-        SecurityBackupsConfig as _EncSecCfg,
-    )
-    from paramem.backup.encryption import (
-        assert_encryption_feasible as _assert_enc,
-    )
-    from paramem.backup.encryption import (
         assert_mode_consistency as _assert_mode,
     )
     from paramem.backup.encryption import (
@@ -943,7 +936,9 @@ async def lifespan(app: FastAPI):
     _state["migration_lock"] = asyncio.Lock()
 
     # Security startup gate (SECURITY.md §4):
-    # 1) Fail fast when ``encrypt_at_rest=always`` is set without a master key.
+    # 1) Refuse startup when security.require_encryption=true and no key path
+    #    is loadable — uniform fail-loud gate covering every feature
+    #    (snapshots, shards, backups, infra).
     # 2) Refuse startup on any mode-mismatch case (plaintext alongside an
     #    encryption format, or encrypted files without the corresponding
     #    key loaded). Mixed PMEM1+age with both keys loaded is permitted
@@ -955,12 +950,19 @@ async def lifespan(app: FastAPI):
     from paramem.backup.key_store import (
         recovery_pub_available as _recovery_available,
     )
-    from paramem.server.security_posture import security_posture_log_line
+    from paramem.server.security_posture import (
+        assert_startup_posture,
+        security_posture_log_line,
+    )
 
     _key_loaded = _master_key_loaded()
     _daily_ok = _daily_loadable()
     _recovery_ok = _recovery_available()
-    _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
+    assert_startup_posture(
+        require_encryption=config.security.require_encryption,
+        fernet_loaded=_key_loaded,
+        daily_loadable=_daily_ok,
+    )
     _assert_mode(
         config.paths.data,
         key_loaded=_key_loaded,
@@ -2894,9 +2896,6 @@ async def migration_confirm(request: ConfirmRequest):
     trial_adapter_dir = str((state_dir / "trial_adapter").resolve())
     trial_graph_dir = str((state_dir / "trial_graph").resolve())
 
-    # Security config for backup.write()
-    sec_cfg = SecurityBackupsConfig()
-
     async with lock:
         # Re-check inside the lock (state may have changed while waiting).
         migration = _state.get("migration") or initial_migration_state()
@@ -2948,7 +2947,6 @@ async def migration_confirm(request: ConfirmRequest):
                 config_bytes,
                 meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
                 base_dir=backups_root / "config",
-                security_config=sec_cfg,
             )
             written_slots.append(config_slot)
 
@@ -2963,7 +2961,6 @@ async def migration_confirm(request: ConfirmRequest):
                 graph_bytes,
                 meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
                 base_dir=backups_root / "graph",
-                security_config=sec_cfg,
             )
             written_slots.append(graph_slot)
 
@@ -2981,7 +2978,6 @@ async def migration_confirm(request: ConfirmRequest):
                 registry_bytes,
                 meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
                 base_dir=backups_root / "registry",
-                security_config=sec_cfg,
             )
             written_slots.append(registry_slot)
 
@@ -3850,7 +3846,6 @@ async def migration_rollback():
     """
     from fastapi import HTTPException
 
-    from paramem.backup.encryption import SecurityBackupsConfig
     from paramem.backup.types import ArtifactKind
     from paramem.server.migration import initial_migration_state
     from paramem.server.trial_state import read_trial_marker
@@ -3898,7 +3893,6 @@ async def migration_rollback():
         backups_root = Path("data/ha/backups").resolve()
 
     trial_adapters_dir = backups_root / "trial_adapters"
-    sec_cfg = SecurityBackupsConfig()
 
     async with lock:
         # --- Step 1: Re-verify inside lock ---
@@ -3932,7 +3926,6 @@ async def migration_rollback():
                     "pre_trial_hash": pre_trial_config_sha256,
                 },
                 base_dir=backups_root / "config",
-                security_config=sec_cfg,
             )
         except Exception as exc:
             raise HTTPException(
@@ -4006,11 +3999,12 @@ async def migration_rollback():
 
         # --- Step 4: Decrypt A artifact and write to live config path ---
         # Mirror backup_restore's decrypt-first ordering: read the slot via
-        # backup.read() which handles both plaintext and Fernet-encrypted
-        # artifacts, then write plaintext to a .pending temp, fsync, and
-        # atomic rename.  A raw os.rename of the artifact would write
-        # ciphertext bytes into configs/server.yaml, causing yaml.safe_load
-        # to fail on the next server start (B6 — 2026-04-22 re-test).
+        # backup.read() which dispatches on envelope magic (age, PMEM1, or
+        # legacy bare Fernet) and returns plaintext — then write plaintext to
+        # a .pending temp, fsync, and atomic rename.  A raw os.rename of the
+        # artifact would write ciphertext bytes into configs/server.yaml,
+        # causing yaml.safe_load to fail on the next server start
+        # (B6 — 2026-04-22 re-test).
         # Fix 11 (2026-04-23): distinguish three decrypt failure modes so
         # operators know immediately whether the key is absent, wrong, or the
         # artifact is corrupt.
@@ -4663,7 +4657,6 @@ async def backup_restore(req: BackupRestoreRequest):
 
     from paramem.backup.backup import read as backup_read
     from paramem.backup.backup import write as backup_write_fn
-    from paramem.backup.encryption import SecurityBackupsConfig as EncSecurityConfig
     from paramem.backup.enumerate import enumerate_backups
     from paramem.server.migration import initial_migration_state
 
@@ -4831,13 +4824,11 @@ async def backup_restore(req: BackupRestoreRequest):
     safety_slot_path: str = ""
     safety_label = f"pre_restore_safety_{req.backup_id}"
     try:
-        enc_cfg = EncSecurityConfig()
         safety_slot = backup_write_fn(
             ArtifactKind.CONFIG,
             live_config_path.read_bytes() if live_config_path.exists() else b"",
             meta_fields={"tier": "manual", "label": safety_label},
             base_dir=backups_root / "config",
-            security_config=enc_cfg,
         )
         safety_slot_path = str(safety_slot)
     except Exception as exc:

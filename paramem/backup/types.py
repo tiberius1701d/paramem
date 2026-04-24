@@ -49,21 +49,6 @@ class ArtifactKind(str, Enum):
     SNAPSHOT = "snapshot"  # session snapshot, per-file
 
 
-class EncryptAtRest(str, Enum):
-    """Per-artifact or global encryption policy.
-
-    ``AUTO``   — follow key presence: encrypt when ``PARAMEM_MASTER_KEY``
-                 is set; plaintext otherwise.
-    ``ALWAYS`` — encrypt unconditionally; fatal config error at startup when
-                 no key is loaded (spec §Security invariants).
-    ``NEVER``  — always plaintext; no key required.
-    """
-
-    AUTO = "auto"
-    ALWAYS = "always"
-    NEVER = "never"
-
-
 # ---------------------------------------------------------------------------
 # ArtifactMeta — the .meta.json sidecar schema
 # ---------------------------------------------------------------------------
@@ -94,9 +79,7 @@ class ArtifactMeta:
     size_bytes : int
         Byte count of the artifact file on disk (after encryption if applied).
     encrypted : bool
-        ``True`` when the paired file is Fernet ciphertext.
-    encrypt_at_rest : EncryptAtRest
-        The policy that produced ``encrypted``; stored for audit purposes.
+        ``True`` when the paired file is encrypted (age or PMEM1 envelope).
     key_fingerprint : str | None
         First 16 hex characters of ``sha256(fernet_key_bytes)``.  ``None``
         when ``encrypted=False``.  Enables detection of key rotation without
@@ -118,7 +101,6 @@ class ArtifactMeta:
     content_sha256: str
     size_bytes: int
     encrypted: bool
-    encrypt_at_rest: EncryptAtRest
     key_fingerprint: str | None
     tier: str
     label: str | None = None
@@ -211,7 +193,8 @@ class MetaSchemaError(BackupError):
 class FatalConfigError(BackupError):
     """A fatal configuration problem was detected.
 
-    Raised by ``encryption.assert_encryption_feasible()`` when
-    ``encrypt_at_rest: always`` is configured but no key is loaded.
-    The server should refuse to start (spec §Security invariants).
+    Raised by ``security_posture.assert_startup_posture()`` when
+    ``security.require_encryption=true`` is set but no key is loadable,
+    and by ``encryption.assert_mode_consistency()`` on key × on-disk format
+    mismatches.  The server refuses to start.
     """

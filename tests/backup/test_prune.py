@@ -13,7 +13,6 @@ from paramem.backup.types import (
     SCHEMA_VERSION,
     ArtifactKind,
     ArtifactMeta,
-    EncryptAtRest,
 )
 
 
@@ -25,7 +24,6 @@ def _make_meta(kind: ArtifactKind, timestamp: str, **overrides) -> ArtifactMeta:
         content_sha256="a" * 64,
         size_bytes=16,
         encrypted=False,
-        encrypt_at_rest=EncryptAtRest.NEVER,
         key_fingerprint=None,
         tier="scheduled",
         label=None,

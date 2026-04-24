@@ -245,9 +245,8 @@ class TestBackupWriteUsesCurrentKeyFingerprint:
         """Writing an encrypted artifact stamps the sidecar with the value
         returned by ``current_key_fingerprint()`` — not a different helper."""
         from paramem.backup.backup import write as backup_write
-        from paramem.backup.encryption import SecurityBackupsConfig
         from paramem.backup.meta import read_meta
-        from paramem.backup.types import ArtifactKind, EncryptAtRest
+        from paramem.backup.types import ArtifactKind
 
         os.environ[MASTER_KEY_ENV_VAR] = _make_key()
 
@@ -259,7 +258,6 @@ class TestBackupWriteUsesCurrentKeyFingerprint:
             b"model: mistral\n",
             meta_fields={"tier": "scheduled"},
             base_dir=tmp_path / "config",
-            security_config=SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.AUTO),
         )
         meta = read_meta(slot_dir)
 
@@ -267,18 +265,16 @@ class TestBackupWriteUsesCurrentKeyFingerprint:
         assert meta.key_fingerprint == expected_fp
 
     def test_plaintext_slot_has_no_fingerprint(self, tmp_path):
-        """No key set + AUTO policy → plaintext slot with key_fingerprint=None."""
+        """No key set → plaintext slot with key_fingerprint=None."""
         from paramem.backup.backup import write as backup_write
-        from paramem.backup.encryption import SecurityBackupsConfig
         from paramem.backup.meta import read_meta
-        from paramem.backup.types import ArtifactKind, EncryptAtRest
+        from paramem.backup.types import ArtifactKind
 
         slot_dir = backup_write(
             ArtifactKind.CONFIG,
             b"model: mistral\n",
             meta_fields={"tier": "scheduled"},
             base_dir=tmp_path / "config",
-            security_config=SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.AUTO),
         )
         meta = read_meta(slot_dir)
 
@@ -401,10 +397,10 @@ class TestBackupWritePathProducesMagicWrappedEnvelope:
     naked Fernet tokens that diverged from the rest of the infra store."""
 
     def test_fernet_posture_writes_pmem1_magic(self, tmp_path):
+        """key loaded → encrypted artifact uses PMEM1 magic envelope."""
         from paramem.backup import backup as backup_mod
-        from paramem.backup.encryption import SecurityBackupsConfig
         from paramem.backup.meta import read_meta
-        from paramem.backup.types import ArtifactKind, EncryptAtRest
+        from paramem.backup.types import ArtifactKind
 
         os.environ[MASTER_KEY_ENV_VAR] = _make_key()
 
@@ -413,7 +409,6 @@ class TestBackupWritePathProducesMagicWrappedEnvelope:
             b"payload",
             meta_fields={"tier": "manual"},
             base_dir=tmp_path / "config",
-            security_config=SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.AUTO),
         )
         meta = read_meta(slot_dir)
         artifact = next(p for p in slot_dir.iterdir() if not p.name.endswith(".meta.json"))
@@ -423,11 +418,11 @@ class TestBackupWritePathProducesMagicWrappedEnvelope:
         assert meta.key_fingerprint is not None, "Fernet backup must record fingerprint"
 
     def test_age_posture_writes_age_magic_and_null_fingerprint(self, tmp_path, monkeypatch):
+        """age daily loaded → encrypted artifact uses age magic; fingerprint is None."""
         from pyrage import x25519
 
         from paramem.backup import backup as backup_mod
         from paramem.backup.age_envelope import AGE_MAGIC
-        from paramem.backup.encryption import SecurityBackupsConfig
         from paramem.backup.key_store import (
             _clear_daily_identity_cache,
             mint_daily_identity,
@@ -436,7 +431,7 @@ class TestBackupWritePathProducesMagicWrappedEnvelope:
             write_recovery_pub_file,
         )
         from paramem.backup.meta import read_meta
-        from paramem.backup.types import ArtifactKind, EncryptAtRest
+        from paramem.backup.types import ArtifactKind
 
         # Load the age identities.
         daily = mint_daily_identity()
@@ -456,7 +451,6 @@ class TestBackupWritePathProducesMagicWrappedEnvelope:
             b"payload",
             meta_fields={"tier": "manual"},
             base_dir=tmp_path / "config",
-            security_config=SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.AUTO),
         )
         meta = read_meta(slot_dir)
         artifact = next(p for p in slot_dir.iterdir() if not p.name.endswith(".meta.json"))
@@ -481,10 +475,11 @@ class TestLegacyFernetBackupStillRestores:
     after the envelope refactor."""
 
     def test_bare_fernet_round_trip_via_read(self, tmp_path):
+        """Hand-built pre-envelope slot (bare Fernet token) still round-trips."""
         from paramem.backup import backup as backup_mod
         from paramem.backup.encryption import encrypt_bytes
         from paramem.backup.meta import ArtifactMeta, write_meta
-        from paramem.backup.types import ArtifactKind, EncryptAtRest
+        from paramem.backup.types import ArtifactKind
 
         os.environ[MASTER_KEY_ENV_VAR] = _make_key()
         slot_dir = tmp_path / "config" / "20260424-12000000"
@@ -506,7 +501,6 @@ class TestLegacyFernetBackupStillRestores:
             content_sha256=content_sha256_bytes(bare),
             size_bytes=len(bare),
             encrypted=True,
-            encrypt_at_rest=EncryptAtRest.AUTO,
             key_fingerprint=current_key_fingerprint(),
             tier="manual",
             label=None,

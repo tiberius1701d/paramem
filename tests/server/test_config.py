@@ -86,7 +86,6 @@ class TestSecurityOrphanSweepConfig:
         from datetime import datetime, timedelta, timezone
 
         from paramem.backup.backup import write as backup_write
-        from paramem.backup.encryption import SecurityBackupsConfig
         from paramem.backup.types import ArtifactKind
         from paramem.server.migration_recovery import RecoveryAction, recover_migration_state
 
@@ -97,13 +96,11 @@ class TestSecurityOrphanSweepConfig:
         live_hash = hashlib.sha256(live_content).hexdigest()
 
         backups_root = tmp_path / "backups"
-        sec = SecurityBackupsConfig()
         backup_write(
             ArtifactKind.CONFIG,
             b"config: live\n",
             meta_fields={"tier": "pre_migration", "pre_trial_hash": live_hash},
             base_dir=backups_root / "config",
-            security_config=sec,
         )
 
         # Monkeypatch datetime.now to be 2h in the future so a 1h window rejects the backup.
