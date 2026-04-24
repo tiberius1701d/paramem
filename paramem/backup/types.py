@@ -8,7 +8,7 @@ Schema version contract
 ``SCHEMA_VERSION`` is bumped on every breaking change to ``ArtifactMeta``.
 Adding an *Optional* field with a default value is non-breaking (no bump).
 Renaming a field, changing its semantics, or removing it **requires** a bump
-plus a migration helper (Slice 6 concern).
+plus a migration helper.
 
 ``read_meta`` rejects sidecars whose ``schema_version`` does not equal
 ``SCHEMA_VERSION`` — forward versions (written by a newer release) raise
@@ -121,7 +121,8 @@ class PruneReport:
 
     ``invalid`` entries are slots where the sidecar is missing, unreadable,
     or schema-mismatched.  They are *not* deleted by ``prune()`` — operator
-    visibility and remediation are Slice 5/6 responsibilities.
+    visibility and remediation are the responsibility of the operator-attention
+    layer.
 
     Fields
     ------
@@ -134,7 +135,7 @@ class PruneReport:
         ``live_slot`` parameter.  Typically zero or one entry.
     invalid : list[tuple[Path, str]]
         ``(slot_dir, reason)`` pairs for corrupt/missing/schema-mismatch
-        sidecars.  Surfaced by the operator-visibility layer in Slice 5/6.
+        sidecars.  Surfaced by the operator-attention layer.
     """
 
     kept: list[Path] = field(default_factory=list)
@@ -144,12 +145,11 @@ class PruneReport:
 
 
 # ---------------------------------------------------------------------------
-# RetentionPolicy — shape only; defaults/enforcement engine land in Slice 6
+# RetentionPolicy — typed alias for the retention policy dict
 # ---------------------------------------------------------------------------
 
 RetentionPolicy = dict  # typed alias for {keep, max_disk_gb, immunity_days}
-# Full TypedDict definition deferred to Slice 6 where server.yaml wiring lands.
-# Slice 1 callers may pass a plain dict with the keys documented below.
+# Callers may pass a plain dict with the keys documented below.
 #
 #   keep          : int | "unlimited"  — max slots to retain in the tier
 #   max_disk_gb   : float | None       — tier-level disk cap (None = no cap)

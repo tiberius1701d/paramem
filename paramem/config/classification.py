@@ -1,6 +1,6 @@
 """Authoritative dotted-path → migration tier map for ``configs/server.yaml``.
 
-Every migration tool (Slice 3+) routes through :func:`classify` as the single
+Every migration tool routes through :func:`classify` as the single
 source of truth for tier assignment.  The lookup table is a module-level dict
 literal — no file I/O, no YAML dependency — easy to audit by diff.
 
@@ -23,7 +23,7 @@ from typing import Any, Final, Iterator
 class Tier(Enum):
     """Impact tier for a ``server.yaml`` field change.
 
-    Glyph values are reused by the Slice 3 preview renderer so callers do not
+    Glyph values are reused by the preview renderer so callers do not
     need a second lookup table.
     """
 

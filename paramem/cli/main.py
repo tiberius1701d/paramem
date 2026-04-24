@@ -72,7 +72,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_migrate = subparsers.add_parser(
         "migrate",
         help="Preview a candidate server.yaml migration.",
-        description=("POST /migration/preview with a candidate config path. Ships in Slice 3."),
+        description=("POST /migration/preview with a candidate config path."),
     )
     p_migrate.add_argument(
         "path",
@@ -89,7 +89,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ms = subparsers.add_parser(
         "migrate-status",
         help="Show the current migration trial status.",
-        description=("GET /migration/status. Ships in Slice 3."),
+        description=("GET /migration/status."),
     )
     p_ms.add_argument(
         "--json",
@@ -101,7 +101,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mc = subparsers.add_parser(
         "migrate-cancel",
         help="Cancel the current staged migration candidate.",
-        description=("POST /migration/cancel. Ships in Slice 3b.1."),
+        description=("POST /migration/cancel."),
     )
     p_mc.add_argument(
         "--json",
@@ -116,7 +116,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "POST /migration/accept. "
             "Promotes the trial config to live, archives the trial adapter, "
-            "and returns the server to LIVE state. Ships in Slice 3b.3."
+            "and returns the server to LIVE state."
         ),
     )
     p_ma.add_argument(
@@ -132,7 +132,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "POST /migration/rollback. "
             "Restores config A from backup, archives the trial adapter, "
-            "and returns the server to LIVE state. Ships in Slice 3b.3."
+            "and returns the server to LIVE state."
         ),
     )
     p_mr.add_argument(

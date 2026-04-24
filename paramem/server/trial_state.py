@@ -91,8 +91,8 @@ class TrialMarker:
         Filename of the config artifact file inside the config backup slot
         (e.g. ``"config-20260421-040000.bin"``).  Used by the rollback handler
         to resolve the exact A-config file without directory listing.
-        Defaults to ``""`` for backward compatibility with markers written
-        before Slice 3b.3; the rollback handler asserts non-empty.
+        Defaults to ``""`` for backward compatibility with older markers;
+        the rollback handler asserts non-empty.
     """
 
     schema_version: int
@@ -156,8 +156,8 @@ class TrialMarker:
             backup_paths=dict(d["backup_paths"]),
             trial_adapter_dir=d["trial_adapter_dir"],
             trial_graph_dir=d["trial_graph_dir"],
-            # Default to "" for backward compatibility with markers written
-            # before Slice 3b.3. The rollback handler asserts non-empty.
+            # Default to "" for backward compatibility with older markers.
+            # The rollback handler asserts non-empty.
             config_artifact_filename=d.get("config_artifact_filename", ""),
         )
 

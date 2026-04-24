@@ -7,8 +7,8 @@ Orchestrates the full backup pipeline:
   4. Post-write pruning (best-effort).
   5. Returns a ``ScheduledBackupResult`` dataclass.
 
-The runner hard-codes ``tier="daily"`` in Slice 6a.  Weekly/monthly/yearly
-tier emission is future work (Slice 6b); the schema accepts those tier names
+The runner hard-codes ``tier="daily"``.  Weekly/monthly/yearly
+tier emission is future work; the schema accepts those tier names
 for retention budgets.
 
 No torch, peft, or transformers imports at module level.
@@ -53,7 +53,7 @@ class ScheduledBackupResult:
         ``True`` when at least one artifact was written and pruning did not
         raise.  ``False`` on disk-pressure refusal or write error.
     tier:
-        Backup tier tag — always ``"daily"`` in Slice 6a.
+        Backup tier tag — always ``"daily"`` in production.
     label:
         Optional operator-supplied annotation.
     written_slots:
@@ -152,7 +152,7 @@ def run_scheduled_backup(
     live_config_path:
         Path to the live ``server.yaml`` to back up.
     tier:
-        Backup tier tag.  Always ``"daily"`` in Slice 6a.
+        Backup tier tag.  Always ``"daily"`` in production.
     label:
         Optional operator-supplied annotation written into each slot's
         sidecar.

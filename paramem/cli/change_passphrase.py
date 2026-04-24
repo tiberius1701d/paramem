@@ -151,7 +151,7 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # Rewrap: atomic write via the Slice C primitive.
+    # Rewrap: atomic write via write_daily_key_file.
     write_daily_key_file(wrap_daily_identity(identity, new), daily_path)
     _clear_daily_identity_cache()
 

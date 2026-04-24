@@ -1,4 +1,4 @@
-"""Operator-attention block for the ParaMem server (Slice 5a).
+"""Operator-attention block for the ParaMem server.
 
 Pure-Python module — no torch, peft, or transformers imports at top level.
 Defines :class:`AttentionItem` (frozen dataclass) plus one populator function
@@ -13,7 +13,7 @@ Display order (spec §L504–513):
     Migration → Consolidation → Sweeper → Backup* → Config drift →
     Key rotation* → Encryption* → Adapter fingerprint → Pre-flight*
 
-    (* stub returns [] in Slice 5a — Slices 6/7 fill them.)
+    (* stub returns [] — future populators fill them.)
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def _age_seconds_from_iso(iso_str: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# Populators — 5 active in Slice 5a, 4 stubs for Slices 6/7
+# Populators — 5 active, 4 stubs reserved for future categories
 # ---------------------------------------------------------------------------
 
 
@@ -698,7 +698,7 @@ def collect_attention_items(
         Migration → Consolidation → Sweeper → Backup* → Config drift →
         Key rotation* → Encryption* → Adapter fingerprint → Pre-flight*
 
-        (* stub returns [] in Slice 5a — Slices 6/7 fill.)
+        (* stub returns [] — future populators fill them.)
 
     Parameters
     ----------

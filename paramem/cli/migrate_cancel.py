@@ -48,7 +48,7 @@ def run(args: argparse.Namespace) -> int:
     Special handling: a 409 ``not_staging`` response means no candidate is
     currently staged — the operator's intent is already satisfied, so the
     command prints a friendly message and exits 0 (idempotent cancel).
-    Other 409 codes (future Slice 3b.2) are reported generically and exit 1.
+    Other 409 codes are reported generically and exit 1.
 
     Parameters
     ----------
@@ -68,7 +68,7 @@ def run(args: argparse.Namespace) -> int:
         print(
             f"paramem migrate-cancel: the server at {args.server_url} returned 404 for\n"
             "/migration/cancel.\n"
-            "Slice 3b.1 ships /migration/preview, /cancel, /status, /diff.\n"
+            "Available migration endpoints: /migration/preview, /cancel, /status, /diff.\n"
             "Check `paramem --version` and server version are aligned.",
             file=sys.stderr,
         )

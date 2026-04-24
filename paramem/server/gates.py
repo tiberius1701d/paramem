@@ -1,4 +1,4 @@
-"""Trial-consolidation sanity gates (Slice 4, spec §Sanity suite L368–412).
+"""Trial-consolidation sanity gates (spec §Sanity suite L368–412).
 
 Pure-Python module — no GPU-framework imports at top level.  All model /
 tokenizer / registry objects are injected via keyword arguments typed as Any
@@ -211,7 +211,7 @@ def _resolve_adapter_mount_path(trial_adapter_dir: Path) -> Path:
     Resolution order (per ``_ADAPTER_KIND_SUBDIRS``):
 
     1. ``trial_adapter/<kind>/<newest-slot>/`` containing the safetensors —
-       Slice 3a per-adapter slot layout.
+       per-adapter slot layout.
     2. ``trial_adapter/<kind>/`` directly containing the safetensors —
        legacy flat per-kind layout.
     3. ``trial_adapter/`` — legacy/simulated single-adapter top-level layout.
@@ -901,8 +901,8 @@ def _gate_4_recall_check(
     no files (NO_NEW_SESSIONS — no trial adapter exists).
 
     GUARDRAIL G1 — the ``"sampled_keys"`` field in ``metrics`` is the deciding
-    sample list.  Slice 5 uses the same list for the comparison report so the
-    same 20 keys appear in both the hard-gate result and the report.
+    sample list.  The comparison report uses the same list so the same 20 keys
+    appear in both the hard-gate result and the report.
 
     Parameters
     ----------

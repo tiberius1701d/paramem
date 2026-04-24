@@ -1,11 +1,11 @@
 """Comparison report for the migration trial.
 
-Slice 3b.3 emitted a placeholder with verbatim spec operator line and five
-"—" rows.  Slice 5a replaces :func:`build_comparison_report_placeholder` with
-:func:`build_comparison_report` (real evaluation, additive Optional fields
-only; schema_version 1 is the stable contract).
+The initial implementation emitted a placeholder with verbatim spec operator
+line and five "—" rows.  :func:`build_comparison_report` provides real
+evaluation with additive Optional fields only; schema_version 1 is the stable
+contract.
 
-Module isolation is intentional — Slice 5a can replace the implementation by
+Module isolation is intentional — the implementation can be replaced by
 patching a single import (forward-compat guardrail 1).
 
 No ``_state`` module-level references permitted.  All helpers accept plain
@@ -36,7 +36,7 @@ COMPARISON_REPORT_SCHEMA_VERSION: int = 1
 def _row_triples_extracted(gates: dict) -> dict[str, Any]:
     """Return the deferred 'Triples extracted' row.
 
-    Slice 5a defers this row because the spec (L395) requires
+    Defers this row because the spec (L395) requires
     ``_state["last_consolidation_summary"]`` which is not yet persisted.
     Renders ``pending: True`` with an explicit reason so the row is
     never silently empty.
@@ -65,9 +65,9 @@ def _row_triples_extracted(gates: dict) -> dict[str, Any]:
 def _row_recall(gates: dict) -> dict[str, Any]:
     """Mirror the gate 4 metrics into the recall row.
 
-    Spec L404: same 20-key sample as gate 4.  Slice 4 exposes
+    Spec L404: same 20-key sample as gate 4.  Gate 4 exposes
     ``recalled`` and ``sampled`` in ``gates["details"][3]["metrics"]``
-    (Guardrail G1 — ``sampled_keys`` is also present for Slice 5b).
+    (Guardrail G1 — ``sampled_keys`` is also present for future reporting).
 
     Parameters
     ----------
@@ -187,7 +187,7 @@ def _row_log_errors(gates: dict) -> dict[str, Any]:
     }
     if n > 0 and distinct:
         # Truncate to first 5 distinct exception class names for display
-        # (full list lives in gates["trial_log"]["distinct_classes"] for Slice 5b).
+        # (full list lives in gates["trial_log"]["distinct_classes"]).
         row["sub_list"] = distinct[:5]
     return row
 
@@ -263,10 +263,10 @@ def _row_graph_shape(
 ) -> dict[str, Any]:
     """Compute the graph-shape comparison row.
 
-    Accepts an optional in-memory graph for the pre-trial side (Slice 5a
-    R1 resolution — in production, server runs with ``persist_graph=False``
-    so the live cumulative graph is transient; the in-memory fallback lets
-    the row render real data without materialising to disk).
+    Accepts an optional in-memory graph for the pre-trial side.  In
+    production the server runs with ``persist_graph=False`` so the live
+    cumulative graph is transient; the in-memory fallback lets the row render
+    real data without materialising to disk.
 
     Parameters
     ----------
@@ -316,7 +316,7 @@ def build_comparison_report(
         ``_state["migration"]["trial"]["gates"]`` dict produced by
         ``_run_trial_consolidation``.  Must contain ``status`` and
         ``details`` (list of 4 GateResult dicts).  May contain
-        ``trial_log`` (Slice 5a addition: counters from TrialLogCapture).
+        ``trial_log`` (counters from TrialLogCapture).
     pre_trial_graph_path:
         Cumulative graph from before the trial (filesystem path).
         ``None`` when no prior graph exists (fresh install).

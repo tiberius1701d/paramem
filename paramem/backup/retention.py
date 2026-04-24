@@ -19,7 +19,7 @@ Rule precedence (strongest first)
 
 Immunity is absolute: immune slots are never deleted, even under cap pressure
 (cap-overrun under immunity surfaces in ``disk_usage_after`` for operator
-visibility via Slice 6b Attention).
+visibility via the operator-attention block).
 
 Performance: ``compute_disk_usage`` has a 5-second module-level TTL cache
 keyed on ``(backups_root, max_total_disk_gb)`` so ``/status`` polling does

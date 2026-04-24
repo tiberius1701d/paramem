@@ -433,12 +433,12 @@ def prune(
 
     Slots with missing or corrupt sidecars are recorded in
     ``PruneReport.invalid`` but are *not* deleted.  Operator visibility and
-    remediation are Slice 5/6 responsibilities.
+    remediation are the responsibility of the operator-attention layer.
 
     **Idempotent** — calling ``prune`` multiple times with the same policy
     produces the same retained set.
 
-    Retention policy keys (Slice 1 honours)
+    Retention policy keys
     ----------------------------------------
     - ``keep`` — ``int`` or ``"unlimited"``.  Maximum number of slots to
       retain.  When ``"unlimited"``, no count-based pruning is performed.

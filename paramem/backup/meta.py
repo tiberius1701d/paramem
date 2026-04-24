@@ -15,7 +15,7 @@ Schema version policy (NIT 2)
 - ``schema_version < SCHEMA_VERSION`` → raises
   ``MetaSchemaError("legacy; migration required")``.  A past release wrote
   this sidecar; a migration helper is required before the artifact can be
-  used.  In practice Slice 1 starts at version 1, so this path is never
+  used.  In practice the schema starts at version 1, so this path is never
   taken by code that ships this version — it is documented here as defensive
   coverage for future bumps.
 

@@ -1,9 +1,9 @@
 """STAGING state machine and preview helpers for the ParaMem migration subsystem.
 
-This module implements the server-side STAGING state (Slice 3b.1).  It covers
-the in-memory stash of a candidate ``server.yaml``, diff computation, tier
-classification, and shape-change detection.  **No files are written** — disk
-writes, atomic swap, trial markers, and TRIAL state all ship in Slice 3b.2.
+Covers the in-memory stash of a candidate ``server.yaml``, diff computation,
+tier classification, and shape-change detection.  **No files are written** by
+the preview endpoint — disk writes, atomic swap, and trial markers are handled
+by ``/migration/confirm``.
 
 Design notes
 ------------
@@ -15,7 +15,7 @@ Design notes
   letter, so this check is **best-effort**: it catches the most common mistake
   (passing a path on a different Linux mount) but cannot prevent a user from
   specifying a drvfs path that happens to share ``st_dev``.  The real safety
-  net is Slice 3b.2's atomic ``rename()`` — if the paths are on different
+  net is the atomic ``rename()`` in ``/migration/confirm`` — if the paths are on different
   filesystems, ``rename()`` will raise ``OSError`` (EXDEV) at that point.
 - Env-var template strings (e.g. ``${PARAMEM_DAILY_PASSPHRASE}``) are
   preserved verbatim in diffs — we use ``yaml.safe_load`` on raw bytes,
@@ -59,7 +59,7 @@ class TrialSlotPaths(TypedDict):
     """Absolute paths to the three pre-migration backup slot directories.
 
     Written into the trial marker and surfaced via ``/migration/status`` for
-    the 3b.3 rollback path and Slice 6 restore-on-rollback.
+    the rollback path and restore-on-rollback.
     """
 
     config: str
@@ -76,7 +76,7 @@ class TrialStash(TypedDict):
     The ``gates`` sub-dict is initially ``{"status": "pending"}`` when the
     trial consolidation is running and updated to ``{"status": "no_new_sessions",
     "completed_at": <iso>}`` or ``{"status": "trial_exception", "exception": ...}``
-    on completion.  Slice 4 will replace this with real gate evaluation.
+    on completion.  The gate evaluation layer updates this via ``_update_trial_gates``.
     """
 
     started_at: str
@@ -239,9 +239,9 @@ def validate_candidate_path(path: str, live_config_path: Path) -> Path:
 
     **WSL2 note:** drvfs reports a single ``st_dev`` for all paths under
     ``/mnt/c/…`` regardless of Windows drive letter, so rule 5 is
-    **best-effort** on WSL2.  The real safety net is Slice 3b.2's atomic
-    ``os.rename()`` — ``EXDEV`` will fire at that point if the paths are on
-    different filesystems.
+    **best-effort** on WSL2.  The real safety net is the atomic
+    ``os.rename()`` in ``/migration/confirm`` — ``EXDEV`` will fire at that
+    point if the paths are on different filesystems.
 
     Parameters
     ----------
@@ -295,7 +295,7 @@ def validate_candidate_path(path: str, live_config_path: Path) -> Path:
                 f"candidate_path {path!r} is on a different filesystem than "
                 f"the live config directory {live_config_path.parent!s}. "
                 "The candidate must reside on the same filesystem as "
-                "configs/server.yaml for the atomic rename in Slice 3b.2 to work."
+                "configs/server.yaml for the atomic rename in /migration/confirm to work."
             )
 
     return p
@@ -615,8 +615,7 @@ def render_preview_response(
     """Return the ``PreviewResponse`` payload dict from a stash.
 
     Single source of truth for what ``/migration/preview`` and
-    ``/migration/diff`` return.  Always includes ``pre_flight_fail`` — wired
-    but dormant in Slice 3b.1 (disk-pressure pre-flight ships in Slice 3b.2).
+    ``/migration/diff`` return.  Always includes ``pre_flight_fail``.
 
     Parameters
     ----------
@@ -624,9 +623,9 @@ def render_preview_response(
         The current ``MigrationStashState`` (must be in ``"STAGING"`` state
         for a full response; callers are responsible for gating).
     pre_flight_fail:
-        ``None`` in Slice 3b.1; Slice 3b.2 passes ``"disk_pressure"`` or
-        similar when the pre-flight check fires.  Always included in the
-        returned dict so downstream consumers can always check the field.
+        ``None`` when no pre-flight check fires; ``"disk_pressure"`` or
+        similar when a pre-flight check rejects the preview.  Always included
+        in the returned dict so downstream consumers can always check the field.
 
     Returns
     -------

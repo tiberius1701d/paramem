@@ -1,6 +1,6 @@
 """Handler for ``paramem migrate <path>``.
 
-Implements the six-step interactive preview + long-poll flow (Slice 3b.3).
+Implements the six-step interactive preview + long-poll flow.
 The renderer follows the exact spec wording from plan §4 / §L243–271
 (byte-for-byte compliance is verified by
 ``tests/cli/test_migrate.py::test_render_shape_change_block_byte_for_byte_matches_spec``).
@@ -15,7 +15,7 @@ Step order
 4. Tier-classified change list grouped destructive → pipeline_altering →
    operational.
 5. Unified diff under a ``Diff (server.yaml):`` header.
-6. ``Proceed? [y/N]`` prompt — ``y`` enters the long-poll flow (Slice 3b.3);
+6. ``Proceed? [y/N]`` prompt — ``y`` enters the long-poll flow;
    ``N`` or EOF POSTs cancel and exits 1.
 
 Long-poll flow (step 6, after y):
@@ -64,7 +64,7 @@ _TERMINAL_GATE_STATUSES: frozenset[str] = frozenset(
     {"pass", "fail", "no_new_sessions", "trial_exception"}
 )
 
-# Accept-eligible gate statuses (set membership — forward-compat for Slice 4).
+# Accept-eligible gate statuses (set membership — forward-compat for future gates).
 # Keep in sync with _ACCEPT_ELIGIBLE_STATUSES in paramem/server/app.py.
 _ACCEPT_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"pass", "no_new_sessions"})
 
@@ -501,7 +501,7 @@ def render_preview(result: dict, server_url: str) -> int:
     _render_unified_diff(unified_diff)
     print()
 
-    # Slice 6b — pre-flight check short-circuit.
+    # Pre-flight check short-circuit.
     # If the server detected a pre-flight failure (e.g. disk pressure), the
     # state is still LIVE (Decision A) — no /migration/cancel POST is needed.
     pre_flight_fail = result.get("pre_flight_fail")
@@ -548,9 +548,8 @@ def run(args: argparse.Namespace) -> int:
     """Execute the ``migrate`` subcommand.
 
     Validates that ``args.path`` is an absolute path, then POSTs to
-    ``/migration/preview``.  On 404, prints a version-alignment message
-    listing the four Slice 3b.1 endpoints.  On ``ServerUnreachable``,
-    prints a troubleshooting hint and returns 2.
+    ``/migration/preview``.  On 404, prints a version-alignment message.
+    On ``ServerUnreachable``, prints a troubleshooting hint and returns 2.
 
     With ``--json``, emits the raw ``PreviewResponse`` JSON (bypasses all
     prompts; ``simulate_mode_override`` is a top-level field — Condition 8).

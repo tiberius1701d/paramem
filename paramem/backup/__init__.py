@@ -1,7 +1,7 @@
 """paramem.backup — artifact write/read/prune primitives.
 
-Public surface (Slice 1)
-------------------------
+Public surface
+--------------
 - ``write()``  — write an artifact + sidecar into a new slot directory.
 - ``read()``   — read an artifact from a slot, validate, and decrypt.
 - ``prune()``  — apply a retention policy to a kind directory.

@@ -130,7 +130,7 @@ def reconcile(
         Absolute path to the project root.
     tier:
         Backup tier written into the service unit's ``ExecStart``.  Always
-        ``"daily"`` in Slice 6a.
+        ``"daily"`` in production.
 
     Returns
     -------

@@ -4,8 +4,7 @@ Invoked by the ``paramem-backup.service`` systemd unit as:
 
     python -m paramem.backup --tier daily
 
-Also callable directly for manual backups (Slice 6b will expose ``backup-create``
-subcommand; for now, ``--tier`` is the only knob).
+Also callable directly for manual backups (``--tier`` is the only knob).
 
 Sequence:
 1. Load ``ServerConfig`` from ``--config`` (default ``configs/server.yaml``).
@@ -46,7 +45,7 @@ def _parse_args(argv=None):
         "--tier",
         default="daily",
         choices=["daily", "weekly", "monthly", "yearly"],
-        help="Backup tier (default: daily; weekly/monthly/yearly reserved for Slice 6b)",
+        help="Backup tier (default: daily)",
     )
     parser.add_argument(
         "--label",

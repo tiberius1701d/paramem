@@ -158,7 +158,7 @@ class ChatResponse(BaseModel):
 
 
 class BackupBlock(BaseModel):
-    """Backup subsystem state for /status.  Spec §L485–500 (Slice 6a).
+    """Backup subsystem state for /status.  Spec §L485–500.
 
     All fields default to ``None`` / ``0`` / ``False`` so a never-run server
     (no ``state/backup.json``) still serialises a valid block.
@@ -286,12 +286,12 @@ class StatusResponse(BaseModel):
     # processes) and clear with ``pstatus --force-local``.  Schema:
     #   {hold_active, owner_pid, owner_alive, age_seconds}
     hold: dict = {}
-    # Operator-attention block (Slice 5a). Always present; ``items`` is empty
-    # when no alert is active. Each item is the dict form of an
-    # ``AttentionItem`` dataclass: {kind, level, summary, action_hint, age_seconds}.
+    # Operator-attention block. Always present; ``items`` is empty when no
+    # alert is active. Each item is the dict form of an ``AttentionItem``
+    # dataclass: {kind, level, summary, action_hint, age_seconds}.
     # See ``paramem.server.attention``.
     attention: dict = {}
-    # Migration summary block (Slice 5a). Always present; values reflect the
+    # Migration summary block. Always present; values reflect the
     # current migration state. Sub-fields:
     #   state          : "live" | "staging" | "trial" | "failed"
     #   config_rev     : 8-char prefix of sha256(server.yaml at load time)
@@ -299,14 +299,14 @@ class StatusResponse(BaseModel):
     #   gates          : copy of _state["migration"]["trial"]["gates"], or None
     #   comparison     : {"rendered": bool, "flags": list[str]} or None
     migration: dict = {}
-    # Backup subsystem state (Slice 6a). Always present; fields default to
+    # Backup subsystem state. Always present; fields default to
     # None/0/False when no scheduled backup has run yet.
     backup: BackupBlock = BackupBlock()
     # Startup security posture — "on" when the daily age identity loaded at
     # lifespan entry, "off" otherwise. Mirrors the SECURITY: ON/OFF startup
     # log line selected by security_posture.security_posture_log_line.
     encryption: str = "off"
-    # ISO-8601 UTC timestamp of when the server process started (Slice 5a Fix 2).
+    # ISO-8601 UTC timestamp of when the server process started.
     # Required so pstatus can render the "applied <YYYY-MM-DD>" part of the
     # Migrate footer (spec L458).
     server_started_at: str = ""
@@ -316,7 +316,7 @@ class ConsolidateResponse(BaseModel):
     status: str
 
 
-# --- Migration schemas (Slice 3b.1) ---
+# --- Migration schemas ---
 
 
 class TierDiffRow(BaseModel):
@@ -400,9 +400,10 @@ class PreviewResponse(BaseModel):
     shape_changes:
         Shape-change rows for enabled adapters with on-disk meta.json.
     pre_flight_fail:
-        ``None`` in Slice 3b.1; Slice 3b.2 passes ``"disk_pressure"`` etc.
-        when pre-flight checks fire.  Always present in the response so
-        callers can check the field unconditionally (Condition 3).
+        ``None`` when no pre-flight check fires; ``"disk_pressure"`` (or
+        similar) when a pre-flight check rejects the preview.  Always present
+        in the response so callers can check the field unconditionally
+        (Condition 3).
     """
 
     state: str
@@ -477,7 +478,7 @@ class MigrationStatusResponse(BaseModel):
     trial_graph_dir: str | None = None
     gates: dict | None = None
     recovery_required: list[str] = []
-    # Slice 3b.3: comparison report populated when TRIAL + gates eligible + completed.
+    # Comparison report populated when TRIAL + gates eligible + completed.
     # None in LIVE/STAGING or when gates are still pending/failed/running.
     comparison_report: dict | None = None
 
@@ -583,7 +584,7 @@ class RollbackResponse(BaseModel):
     restart_hint: str
 
 
-# --- Adapter mount helper (Slice 3a) ---
+# --- Adapter mount helper ---
 
 
 def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
@@ -1403,7 +1404,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
 
-    # Reconcile the scheduled-backup timer (Slice 6a).
+    # Reconcile the scheduled-backup timer.
     from paramem.backup import timer as backup_timer
 
     backup_schedule = config.security.backups.schedule or ""
@@ -1585,8 +1586,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
 
-# WP3 (docs/plan_security_hardening.md): bearer-token auth on all REST endpoints
-# when PARAMEM_API_TOKEN is set. No-op when unset (loud WARN at startup).
+# Bearer-token auth on all REST endpoints when PARAMEM_API_TOKEN is set.
+# No-op when unset (loud WARN at startup).
 from paramem.server.auth import (  # noqa: E402
     BearerTokenMiddleware,
     load_token_from_env,
@@ -2181,13 +2182,13 @@ async def status():
     except ImportError:
         pass
 
-    # Slice 5a — attention block.
+    # Attention block.
     from paramem.server.attention import collect_attention_items
 
     _attention_items = collect_attention_items(_state, config)
     attention_block = {"items": [it.to_dict() for it in _attention_items]}
 
-    # Slice 5a — migration summary block.
+    # Migration summary block.
     _mig = _state.get("migration") or {}
     _mig_state = (_mig.get("state") or "LIVE").lower()
     _trial = _mig.get("trial") or {}
@@ -2215,7 +2216,7 @@ async def status():
 
     hold_block = _get_hold_state()
 
-    # Slice 6a — Backup block.  Reads state/backup.json (written by the runner),
+    # Backup block.  Reads state/backup.json (written by the runner),
     # computes current disk usage, derives next-scheduled-at and stale flag.
     # The entire block is guarded: a MagicMock config (used in unit tests) or
     # any transient I/O error must not crash /status — fall back to an empty
@@ -2526,7 +2527,7 @@ async def consolidate():
     return ConsolidateResponse(status="started")
 
 
-# --- Migration endpoints (Slice 3b.1) ---
+# --- Migration endpoints ---
 
 
 @app.post("/migration/preview", response_model=PreviewResponse)
@@ -2536,8 +2537,8 @@ async def migration_preview(request: PreviewRequest):
     Validates the candidate path, parses the YAML, computes the unified diff,
     tier-classified change list, and shape-change block, then stores the stash
     in ``_state["migration"]`` with ``state="STAGING"``.  **No files are
-    written** — disk writes, atomic swap, trial marker, and TRIAL state ship
-    in Slice 3b.2.
+    written** — disk writes, atomic swap, trial markers, and TRIAL state are
+    handled by ``/migration/confirm``.
 
     Concurrency note: ``_state["consolidating"]`` is read once at the top of
     this handler.  The flag is mutated from a mix of event-loop callbacks and
@@ -2547,9 +2548,9 @@ async def migration_preview(request: PreviewRequest):
     A single ``bool`` read under CPython's GIL is atomic, so the worst case is
     observing a stale value across the read-to-action gap — at most a few
     microseconds of mutex slack between consolidation and migration.  This is
-    acceptable for the STAGING-only preview gate.  Slice 3b.2's
-    ``/migration/confirm`` will tighten the mutex with an ``asyncio.Lock`` or
-    CAS-style transition on ``_state["migration"]["state"]``.
+    acceptable for the STAGING-only preview gate.  ``/migration/confirm``
+    tightens the mutex with a CAS-style transition on
+    ``_state["migration"]["state"]``.
 
     Errors
     ------
@@ -2562,8 +2563,7 @@ async def migration_preview(request: PreviewRequest):
     409 ``already_staging``
         The migration stash is already in ``STAGING`` state.
     409 ``trial_active``
-        A trial is in progress (unreachable in Slice 3b.1 — Slice 3b.2 wires
-        TRIAL state).
+        A trial is in progress.
     """
     from fastapi import HTTPException
 
@@ -2681,7 +2681,7 @@ async def migration_preview(request: PreviewRequest):
     # --- Detect simulate-mode ---
     simulate_mode_override = detect_simulate_mode(parsed_candidate)
 
-    # --- Pre-flight (Slice 6b): disk-pressure gate on backup store ---
+    # --- Pre-flight: disk-pressure gate on backup store ---
     # compute_pre_flight_check guards itself against MagicMock / non-real configs
     # (returns no-pressure result when max_total_disk_gb is not a real numeric).
     # No call-site guard needed here.
@@ -3176,7 +3176,7 @@ async def _run_trial_consolidation() -> None:
 
         from paramem.server.gates import TrialLogCapture, evaluate_gates
 
-        # Slice 5a — open TrialLogCapture BEFORE the consolidation executor so
+        # Open TrialLogCapture BEFORE the consolidation executor so
         # WARNING/ERROR/CRITICAL records from extraction, training, adapter
         # reload, AND gate evaluation are all captured as a whole-run signal
         # (spec L398 — "New ERROR lines in trial log").  The `with` closes
@@ -3222,7 +3222,7 @@ async def _run_trial_consolidation() -> None:
                 except Exception as _exc:  # noqa: BLE001
                     exc_captured = _exc
 
-            # --- Gate evaluation (Slice 4) ---
+            # --- Gate evaluation ---
             # live_registry_path comes from the PRE-TRIAL config (REQUIRED FIX 1).
             live_config = _state.get("config")
             if live_config is None:
@@ -3270,9 +3270,8 @@ async def _run_trial_consolidation() -> None:
                 "completed_at": completed_at,
                 "summary": ({k: v for k, v in summary.items() if k != "loop"} if summary else {}),
                 "details": [r.to_dict() for r in results],
-                # Slice 5a: trial_log captured across the entire consolidation +
-                # gate run (top-level, not nested in per-gate metrics — rationale
-                # in slice5a-plan.md §4).
+                # trial_log captured across the entire consolidation + gate run
+                # (top-level, not nested in per-gate metrics).
                 "trial_log": _trial_log_capture.metrics,
             }
             if exc_captured is not None:
@@ -3292,7 +3291,7 @@ async def _run_trial_consolidation() -> None:
 def _rollup_gate_status(results: list, session_buffer_empty: bool) -> str:
     """Compute the overall trial status from a list of GateResult objects.
 
-    Decision table (spec §Slice 4 — overall status rollup):
+    Decision table (spec §L368–412 — overall status rollup):
 
     - Any ``"fail"`` → ``"fail"``
     - All 4 ``"skipped"`` → ``"no_new_sessions"``
@@ -3416,11 +3415,10 @@ async def _update_trial_gates(gates: dict) -> None:
 
 
 # Accept-eligible gate statuses (set membership for forward-compat — Decision 24).
-# Set remains {"pass", "no_new_sessions"} — Slice 4 ships real gate
-# evaluation emitting these two accept-eligible values plus "fail" and
-# "trial_exception". Cluster-variance warnings from gate 4 live in
-# `gates["details"][3]["metrics"]["warnings"]`, not as a new top-level
-# status.
+# Accept-eligible values are "pass" and "no_new_sessions".  Gate evaluation
+# also emits "fail" and "trial_exception".  Cluster-variance warnings from
+# gate 4 live in `gates["details"][3]["metrics"]["warnings"]`, not as a new
+# top-level status.
 _ACCEPT_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"pass", "no_new_sessions"})
 
 
@@ -3444,16 +3442,16 @@ async def migration_status():
     gates = trial.get("gates") or {}
 
     # Populate comparison_report when TRIAL + accept-eligible + completed.
-    # _ACCEPT_ELIGIBLE_STATUSES contains {"pass", "no_new_sessions"} (Slice 4
-    # ships cluster-variance warnings in gate details, not as a separate
-    # top-level status — Decision 24 invalidated).
+    # _ACCEPT_ELIGIBLE_STATUSES contains {"pass", "no_new_sessions"}.
+    # Cluster-variance warnings live in gate details, not as a separate
+    # top-level status (Decision 24).
     comparison_report: dict | None = None
     if (
         ms == "TRIAL"
         and gates.get("status") in _ACCEPT_ELIGIBLE_STATUSES
         and gates.get("completed_at")
     ):
-        # Slice 5a — resolve graph paths from state.
+        # Resolve graph paths from state.
         # Pre-trial graph: prefer in-memory loop's merger graph (production
         # runs with persist_graph=False, so no file exists); fall back to a
         # config-derived path for completeness.
@@ -4192,7 +4190,7 @@ async def migration_rollback():
 
 
 # ---------------------------------------------------------------------------
-# Slice 6b — Backup REST endpoints
+# Backup REST endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -4582,9 +4580,9 @@ async def backup_create(req: BackupCreateRequest):
 async def backup_restore(req: BackupRestoreRequest):
     """Restore a **config** backup atop the live server.yaml.
 
-    Only ``kind="config"`` is supported in Slice 6b (restore-kind-restriction).
-    Graph / registry restore is deferred to a future slice that has an
-    offline-coordinator path.
+    Only ``kind="config"`` is currently supported (restore-kind-restriction).
+    Graph / registry restore requires an offline-coordinator path and is not
+    yet implemented.
 
     Atomic restore sequence (decrypt-first, then safety backup, then rename):
 
@@ -5811,7 +5809,7 @@ def main():
     project_root = Path(__file__).parent.parent.parent
     load_dotenv(project_root / ".env")
 
-    # WP4: per-secret file layout under ~/.config/paramem/secrets/ with strict
+    # Per-secret file layout under ~/.config/paramem/secrets/ with strict
     # permissions. Loaded after .env so shell env + .env take precedence.
     # Missing directory = back-compat no-op.
     from paramem.server.secret_store import (  # noqa: E402

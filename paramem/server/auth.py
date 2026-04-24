@@ -1,7 +1,5 @@
 """Bearer-token authentication middleware for the ParaMem REST server.
 
-Scope: WP3 in `docs/plan_security_hardening.md`.
-
 Opt-in via the ``PARAMEM_API_TOKEN`` environment variable.
 
 Behavior:
@@ -22,7 +20,7 @@ no-op mode). Pure ASGI is the Starlette-recommended pattern for auth.
 
 Wyoming :10300 / :10301 sockets are NOT covered here — the Wyoming protocol
 has no native auth concept. Those endpoints are protected at the network
-layer by the Windows Firewall rule scoping in WP5 (``PARAMEM_NAS_IP``).
+layer by the Windows Firewall rule scoping (``PARAMEM_NAS_IP``).
 """
 
 from __future__ import annotations
@@ -110,7 +108,7 @@ def log_startup_posture(token: str) -> None:
     else:
         logger.warning(
             "AUTH: OFF (%s unset) — all REST endpoints are reachable without credentials. "
-            "Set %s to enable. See docs/plan_security_hardening.md (WP3).",
+            "Set %s to enable. See SECURITY.md for the authentication model.",
             TOKEN_ENV_VAR,
             TOKEN_ENV_VAR,
         )

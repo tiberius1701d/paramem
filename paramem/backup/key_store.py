@@ -1,4 +1,4 @@
-"""Daily-key file primitives for the WP2b two-identity key model.
+"""Daily-key file primitives for the two-identity key model.
 
 The daily identity is an age X25519 secret key that sits on disk as a
 passphrase-wrapped envelope::

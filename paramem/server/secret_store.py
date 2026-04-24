@@ -1,7 +1,5 @@
 """Per-secret-file loader for ParaMem.
 
-Scope: WP4 in `docs/plan_security_hardening.md`.
-
 Purpose: split what used to be a single ``.env`` file into one file per secret
 under ``~/.config/paramem/secrets/`` with strict permissions. Reduces blast
 radius: a single file disclosure exposes only that secret, not the full set

@@ -1,7 +1,7 @@
 """paramem.adapters — adapter management subpackage.
 
-Public surface (Slice 3a)
---------------------------
+Public surface
+--------------
 All manifest types, functions, errors, and sentinels from
 :mod:`paramem.adapters.manifest`.
 """

@@ -135,7 +135,7 @@ class OrphanSweepConfig:
 
 @dataclass
 class RetentionTierConfig:
-    """Per-tier retention knobs (Slice 6a).
+    """Per-tier retention knobs.
 
     Attributes
     ----------
@@ -157,7 +157,7 @@ class RetentionTierConfig:
 
 @dataclass
 class RetentionConfig:
-    """Per-tier retention configuration.  Spec §L552–566 (Slice 6a)."""
+    """Per-tier retention configuration.  Spec §L552–566."""
 
     daily: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=7))
     weekly: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=4))
@@ -172,9 +172,8 @@ class RetentionConfig:
 
 @dataclass
 class ServerBackupsConfig:
-    """Sub-config for security.backups.  Slice 3b.2 introduced ``orphan_sweep``;
-    Slice 6a adds ``retention``, ``schedule``, ``artifacts``, and
-    ``max_total_disk_gb``.
+    """Sub-config for security.backups (``orphan_sweep``, ``retention``,
+    ``schedule``, ``artifacts``, ``max_total_disk_gb``).
 
     Merged into ``SecurityConfig`` chain as ``security.backups``.
     """
@@ -915,11 +914,11 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
                 config.tts.voices[lang_code] = TTSVoiceConfig(**voice_data)
 
     # Security — nested: security.backups.{orphan_sweep, retention, schedule,
-    # artifacts, max_total_disk_gb}  (Slice 3b.2 + Slice 6a)
+    # artifacts, max_total_disk_gb}
     security_raw = raw.get("security") or {}
     backups_raw = security_raw.get("backups") or {}
 
-    # orphan_sweep — preserved from Slice 3b.2
+    # orphan_sweep
     orphan_raw = backups_raw.get("orphan_sweep") or {}
     orphan_cfg = OrphanSweepConfig(**orphan_raw) if orphan_raw else OrphanSweepConfig()
 

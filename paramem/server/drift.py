@@ -2,14 +2,15 @@
 
 Hashes ``configs/server.yaml`` at startup, then re-hashes it on a background
 polling loop.  Any change to the file's raw bytes is surfaced as
-``detected=True`` in the state slot so the ``/status`` endpoint and the Slice 3
+``detected=True`` in the state slot so the ``/status`` endpoint and the
 Attention block can alert the operator.
 
 Design notes:
 
 - Content-hash only (WSL2 mtime is unreliable across filesystem events).
-- Routing through ``paramem.backup.hashing.content_sha256_path`` so Slice 1's
-  hash primitive stays the single source of truth (Resolved Decision 29).
+- Routing through ``paramem.backup.hashing.content_sha256_path`` so the
+  hash primitive in :mod:`paramem.backup.hashing` stays the single source
+  of truth (Resolved Decision 29).
 - Env-var references in the yaml (e.g. ``${PARAMEM_DAILY_PASSPHRASE}``) are
   hashed as the literal template string, not the resolved value.  Key
   rotation is handled by the lifecycle CLIs, not via config drift.
@@ -44,7 +45,7 @@ def compute_config_hash(path: Path) -> str:
     """Return the SHA-256 digest of the file at *path*.
 
     Thin wrapper over :func:`paramem.backup.hashing.content_sha256_path` so
-    Slice 1's hash primitive remains the single source of truth.
+    the hashing helpers in :mod:`paramem.backup.hashing` remain the single source of truth.
 
     Parameters
     ----------

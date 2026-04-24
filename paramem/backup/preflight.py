@@ -1,4 +1,4 @@
-"""Pre-flight check for /migration/preview disk-pressure gate (Slice 6b).
+"""Pre-flight check for /migration/preview disk-pressure gate.
 
 Thin module so the retention TTL cache and preflight math are not entangled
 with the existing 6a backup code.
