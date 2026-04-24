@@ -40,6 +40,25 @@ _NVIDIA_SMI = (
     or "nvidia-smi"
 )
 
+# Resolve lsof the same way. systemd user services can ship a minimal PATH;
+# without an explicit resolution a bare "lsof" call raises FileNotFoundError
+# and silently downgrades server classification to "unknown" — the root of
+# the misclassification incident that killed a pytest run.
+_LSOF = (
+    shutil.which("lsof")
+    or shutil.which("lsof", path="/usr/bin:/usr/sbin:/bin:/usr/local/bin")
+    or "lsof"
+)
+
+# Paramem server identity sources (in priority order):
+#   1. systemd --user MainPID for this unit (ground truth when managed by systemd).
+#   2. TCP listener on the configured port (lsof).
+#   3. /proc/<pid>/cmdline matches any of these markers (backstop: catches
+#      the server when systemd is unmanaged and the port hasn't been bound
+#      yet / transient lsof error).
+_SERVER_UNIT = "paramem-server"
+_SERVER_CMDLINE_MARKERS = ("paramem.server", "paramem/server/app")
+
 
 def _is_wsl2() -> bool:
     """Return True if running inside WSL2 (Windows Subsystem for Linux).
@@ -184,11 +203,36 @@ def _get_gpu_pids() -> list[int]:
         return []
 
 
-def _get_server_pid(port: int = DEFAULT_SERVER_PORT) -> int | None:
-    """Find the PID of the process listening on the server port."""
+def _systemd_main_pid(unit: str = _SERVER_UNIT) -> int | None:
+    """Return the MainPID reported by ``systemctl --user`` for ``unit``.
+
+    systemd prints ``0`` when the unit is not running; that case returns None.
+    Any lookup error (systemctl missing, timeout, non-integer output) also
+    returns None so callers fall through to the next detection source.
+    """
     try:
         result = subprocess.run(
-            ["lsof", "-i", f":{port}", "-t"],
+            ["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        pid = int(result.stdout.strip())
+        return pid if pid > 0 else None
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        return None
+
+
+def _listener_pid(port: int) -> int | None:
+    """Return the PID of the process *listening* on ``port``, or None.
+
+    ``-sTCP:LISTEN`` filters to listeners only; without it ``lsof -i :port``
+    also reports client-side established sockets on machines that happen to
+    have a symmetric port number, and ``pids[0]`` would be arbitrary.
+    """
+    try:
+        result = subprocess.run(
+            [_LSOF, "-i", f"TCP:{port}", "-sTCP:LISTEN", "-t"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -199,14 +243,70 @@ def _get_server_pid(port: int = DEFAULT_SERVER_PORT) -> int | None:
         return None
 
 
+def _pid_cmdline(pid: int) -> str:
+    """Return ``pid``'s command line as a space-separated string (or '')."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+
+
+def _is_paramem_server_cmdline(cmdline: str) -> bool:
+    """True if ``cmdline`` looks like the paramem server process."""
+    return any(marker in cmdline for marker in _SERVER_CMDLINE_MARKERS)
+
+
+def _get_server_pid(port: int = DEFAULT_SERVER_PORT) -> int | None:
+    """Find the paramem server PID (systemd MainPID preferred, lsof fallback)."""
+    pid = _systemd_main_pid()
+    if pid is not None:
+        return pid
+    return _listener_pid(port)
+
+
+def _identify_server_pids(external_pids: list[int], port: int) -> list[int]:
+    """Classify ``external_pids`` → sorted PIDs recognized as the paramem server.
+
+    Union of three sources:
+      1. systemd --user MainPID for ``paramem-server``.
+      2. TCP listener on ``port`` (listening socket only).
+      3. /proc/<pid>/cmdline matches against ``_SERVER_CMDLINE_MARKERS``.
+
+    The cmdline backstop catches the server whenever (1) and (2) both miss —
+    startup race before port bind, lsof missing from PATH, unmanaged systemd,
+    or a SIGUSR1 transition window where ``/status`` briefly fails.
+    """
+    candidates: set[int] = set()
+    pid = _systemd_main_pid()
+    if pid is not None:
+        candidates.add(pid)
+    pid = _listener_pid(port)
+    if pid is not None:
+        candidates.add(pid)
+    for p in external_pids:
+        if p in candidates:
+            continue
+        if _is_paramem_server_cmdline(_pid_cmdline(p)):
+            candidates.add(p)
+    return sorted(candidates & set(external_pids))
+
+
 def _server_is_cloud_only(port: int = DEFAULT_SERVER_PORT) -> bool:
-    """Check if the server is already in cloud-only mode."""
+    """Check if the server is already in cloud-only mode.
+
+    Transient unreachability (connect-error during a SIGUSR1 transition) is
+    logged at debug level and reported as False; the polling caller
+    (_wait_for_vram_clear) retries.
+    """
     try:
         import httpx
 
         resp = httpx.get(f"http://localhost:{port}/status", timeout=3)
         return resp.json().get("mode") == "cloud-only"
-    except Exception:
+    except Exception as exc:
+        logger.debug("server /status check failed: %s", exc)
         return False
 
 
@@ -264,8 +364,9 @@ def check_gpu(port: int = DEFAULT_SERVER_PORT) -> dict:
             "message": "GPU is free.",
         }
 
-    server_pid = _get_server_pid(port)
-    unknown_pids = [p for p in external_pids if p != server_pid]
+    server_pids = _identify_server_pids(external_pids, port)
+    server_pid = server_pids[0] if server_pids else None
+    unknown_pids = [p for p in external_pids if p not in server_pids]
 
     unknown_info = []
     for pid in unknown_pids:
@@ -280,7 +381,7 @@ def check_gpu(port: int = DEFAULT_SERVER_PORT) -> dict:
         except Exception:
             unknown_info.append(f"PID {pid} (unknown)")
 
-    if unknown_pids and not (server_pid and server_pid in external_pids):
+    if unknown_pids and not server_pids:
         return {
             "status": "unknown",
             "server_pid": None,
@@ -289,7 +390,7 @@ def check_gpu(port: int = DEFAULT_SERVER_PORT) -> dict:
             "message": f"GPU occupied by unknown process(es): {unknown_info}",
         }
 
-    if unknown_pids and server_pid and server_pid in external_pids:
+    if unknown_pids and server_pids:
         cloud = _server_is_cloud_only(port)
         return {
             "status": "mixed",
@@ -371,9 +472,13 @@ class _GPUGuard:
             self._sleep_inhibitor.start()
             return self
 
-        # Classify GPU processes: server vs unknown
-        server_pid = _get_server_pid(self._port)
-        unknown_pids = [p for p in external_pids if p != server_pid]
+        # Classify GPU processes: server vs unknown. Uses three detection
+        # sources (systemd MainPID, port listener, /proc cmdline) so a
+        # server that escapes port detection still routes through the
+        # defer-to-cloud path, never the kill path.
+        server_pids = _identify_server_pids(external_pids, self._port)
+        primary_server_pid = server_pids[0] if server_pids else None
+        unknown_pids = [p for p in external_pids if p not in server_pids]
 
         # Unknown processes on GPU — offer to kill them
         if unknown_pids:
@@ -393,14 +498,30 @@ class _GPUGuard:
             print("\n  GPU is occupied by unknown process(es):")
             for info in process_info:
                 print(f"    {info}")
+            if primary_server_pid:
+                print(
+                    f"  (ParaMem server PID {primary_server_pid} also on GPU — "
+                    "will be deferred to cloud-only after unknown process(es) clear.)"
+                )
 
-            if self._interactive and sys.stdin.isatty():
-                answer = input("  Kill these processes? [Y/n] ").strip().lower()
-                if answer not in ("", "y", "yes"):
-                    raise GPUAcquireError("User declined — GPU not acquired")
-            elif not self._interactive:
-                raise GPUAcquireError("GPU occupied by unknown processes (non-interactive mode)")
+            # Fail-safe: every path that kills must pass through operator approval.
+            if not self._interactive:
+                raise GPUAcquireError(
+                    "GPU occupied by unknown process(es); non-interactive mode — "
+                    f"cannot obtain approval to kill. PIDs={unknown_pids}"
+                )
+            if not sys.stdin.isatty():
+                raise GPUAcquireError(
+                    "GPU occupied by unknown process(es); cannot prompt for approval "
+                    f"(no TTY). Resolve manually. PIDs={unknown_pids}"
+                )
+            answer = input("  Kill these processes? [Y/n] ").strip().lower()
+            if answer not in ("", "y", "yes"):
+                raise GPUAcquireError("User declined — GPU not acquired")
 
+            # Approved: SIGTERM → 3s → SIGKILL escalation. Without the
+            # escalation a hung process holds the GPU until the 30 s VRAM
+            # timeout elapses and we abort.
             for pid in unknown_pids:
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -408,12 +529,36 @@ class _GPUGuard:
                 except ProcessLookupError:
                     pass
 
-            if not _wait_for_vram_clear(own_pid):
-                raise GPUAcquireError("Timeout waiting for processes to release VRAM")
-            print("  GPU cleared.")
+            time.sleep(3)
+            still_alive: list[int] = []
+            for pid in unknown_pids:
+                try:
+                    os.kill(pid, 0)
+                    still_alive.append(pid)
+                except ProcessLookupError:
+                    pass
+            for pid in still_alive:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    print(f"  Sent SIGKILL to PID {pid} (SIGTERM ignored)")
+                except ProcessLookupError:
+                    pass
 
-        # Only the server is on the GPU
-        if server_pid and server_pid in external_pids:
+            # In the mixed case fall through to the server block below —
+            # its own _wait_for_vram_clear handles the combined condition
+            # (unknown PIDs gone AND server in cloud-only) and already
+            # short-circuits on server_pid. Calling _wait_for_vram_clear
+            # here would time out because the server is still active.
+            if not primary_server_pid:
+                if not _wait_for_vram_clear(own_pid):
+                    raise GPUAcquireError("Timeout waiting for processes to release VRAM")
+                print("  GPU cleared.")
+
+        # Server on the GPU — defer to cloud-only (handles both server-only
+        # and mixed cases; external_pids was computed pre-kill but the
+        # classification of ``primary_server_pid`` stays valid).
+        if primary_server_pid:
+            server_pid = primary_server_pid
             if _server_is_cloud_only(self._port):
                 notify_ml(ML_STARTED)
                 self._sleep_inhibitor.start()
