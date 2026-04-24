@@ -41,10 +41,11 @@ from paramem.backup.atomic import rename_pending_to_slot
 from paramem.backup.atomic import sweep_orphan_pending as _sweep_pending
 from paramem.backup.encryption import (
     MASTER_KEY_ENV_VAR,
+    PMEM1_MAGIC,
     SecurityBackupsConfig,
     current_key_fingerprint,
-    decrypt_bytes,
-    encrypt_bytes,
+    envelope_decrypt_bytes,
+    envelope_encrypt_bytes,
     master_key_loaded,
     resolve_policy,
     should_encrypt,
@@ -239,7 +240,12 @@ def write(
     do_encrypt = should_encrypt(policy, key_loaded)
 
     if do_encrypt:
-        on_disk_bytes = encrypt_bytes(payload)
+        # envelope_encrypt_bytes produces a magic-prefixed envelope (age when
+        # the daily identity is loaded, PMEM1 otherwise) — NOT the legacy bare
+        # Fernet token that this line produced pre-D3. The universal decrypt
+        # side (envelope_decrypt_bytes) dispatches on magic so pre-envelope
+        # backups continue to restore as bare Fernet.
+        on_disk_bytes = envelope_encrypt_bytes(payload)
     else:
         on_disk_bytes = payload
 
@@ -247,7 +253,14 @@ def write(
     hash_hex = content_sha256_bytes(on_disk_bytes)
 
     # --- key fingerprint ---
-    key_fp = current_key_fingerprint() if do_encrypt else None
+    # Fernet-encrypted backups record the SHA-256 of the master key so the
+    # restore endpoint's mismatch-refuse can surface key-rotation as an
+    # actionable 400. Age-encrypted backups record None — the Fernet-style
+    # fingerprint concept does not apply, and a stale daily identity surfaces
+    # as a decrypt error instead (equally actionable for the operator).
+    key_fp = (
+        current_key_fingerprint() if do_encrypt and on_disk_bytes.startswith(PMEM1_MAGIC) else None
+    )
 
     # --- timestamp + filenames (with collision retry) ---
     encrypted_flag = do_encrypt
@@ -403,9 +416,12 @@ def read(slot_dir: Path) -> tuple[bytes, ArtifactMeta]:
     # 4. Verify content hash against raw on-disk bytes
     verify_fingerprint(slot_dir, artifact_path)
 
-    # 5. Decrypt if needed
+    # 5. Decrypt if needed. envelope_decrypt_bytes dispatches by magic:
+    #    age → PMEM1 → bare Fernet (legacy pre-envelope format). Meta's
+    #    ``encrypted`` flag is authoritative about whether decryption is
+    #    needed at all; the dispatch decides how.
     if meta.encrypted:
-        plaintext = decrypt_bytes(raw_bytes)
+        plaintext = envelope_decrypt_bytes(raw_bytes)
     else:
         plaintext = raw_bytes
 

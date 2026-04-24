@@ -284,3 +284,236 @@ class TestBackupWriteUsesCurrentKeyFingerprint:
 
         assert meta.encrypted is False
         assert meta.key_fingerprint is None
+
+
+class TestEnvelopeEncryptBytesHelper:
+    """``envelope_encrypt_bytes`` + ``envelope_decrypt_bytes`` are the primitives
+    that power both ``write_infra_bytes`` (on-disk writes) and the backup
+    subsystem (bytes-in-hand). Verifying them in isolation pins the format
+    selection logic independent of any atomic-write or sidecar concerns.
+    """
+
+    def test_plaintext_when_no_keys_loaded(self):
+        from paramem.backup.encryption import envelope_encrypt_bytes
+
+        result = envelope_encrypt_bytes(b"payload")
+        assert result == b"payload"
+
+    def test_pmem1_when_only_fernet_loaded(self):
+        from paramem.backup.encryption import envelope_encrypt_bytes
+
+        os.environ[MASTER_KEY_ENV_VAR] = _make_key()
+        result = envelope_encrypt_bytes(b"payload")
+        assert result.startswith(PMEM1_MAGIC)
+        assert result != b"payload"
+
+    def test_age_when_daily_loaded(self, tmp_path, monkeypatch):
+        from paramem.backup.age_envelope import AGE_MAGIC
+        from paramem.backup.encryption import envelope_encrypt_bytes
+        from paramem.backup.key_store import (
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
+
+        daily = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(daily, "pw"), key_path)
+        monkeypatch.setenv("PARAMEM_DAILY_PASSPHRASE", "pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
+
+        result = envelope_encrypt_bytes(b"payload")
+        assert result.startswith(AGE_MAGIC), f"expected age magic; got {result[:30]!r}"
+
+
+class TestEnvelopeDecryptBytesHelper:
+    def test_dispatches_age_via_loaded_daily(self, tmp_path, monkeypatch):
+        from paramem.backup.age_envelope import age_encrypt_bytes
+        from paramem.backup.encryption import envelope_decrypt_bytes
+        from paramem.backup.key_store import (
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
+
+        daily = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(daily, "pw"), key_path)
+        monkeypatch.setenv("PARAMEM_DAILY_PASSPHRASE", "pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
+
+        envelope = age_encrypt_bytes(b"payload", [daily.to_public()])
+        assert envelope_decrypt_bytes(envelope) == b"payload"
+
+    def test_dispatches_pmem1_envelope(self):
+        from paramem.backup.encryption import envelope_decrypt_bytes
+
+        os.environ[MASTER_KEY_ENV_VAR] = _make_key()
+        from paramem.backup.encryption import encrypt_bytes as _encrypt_bytes
+
+        envelope = PMEM1_MAGIC + _encrypt_bytes(b"payload")
+        assert envelope_decrypt_bytes(envelope) == b"payload"
+
+    def test_dispatches_bare_fernet_token_legacy_backup_format(self):
+        """Pre-envelope backups stored raw Fernet tokens (no PMEM1 magic).
+        ``envelope_decrypt_bytes`` recognises the non-magic case as legacy
+        bare Fernet so existing backups still restore after the D3 flip."""
+        from paramem.backup.encryption import encrypt_bytes as _encrypt_bytes
+        from paramem.backup.encryption import envelope_decrypt_bytes
+
+        os.environ[MASTER_KEY_ENV_VAR] = _make_key()
+        bare_token = _encrypt_bytes(b"legacy payload")
+        # Sanity: the token does not carry either magic.
+        assert not bare_token.startswith(PMEM1_MAGIC)
+        assert not bare_token.startswith(b"age-encryption.org")
+
+        assert envelope_decrypt_bytes(bare_token) == b"legacy payload"
+
+    def test_age_without_daily_raises_actionable_runtime_error(self, tmp_path, monkeypatch):
+        from pyrage import x25519
+
+        from paramem.backup.age_envelope import age_encrypt_bytes
+        from paramem.backup.encryption import envelope_decrypt_bytes
+        from paramem.backup.key_store import _clear_daily_identity_cache
+
+        # Point the default at a non-existent path; daily_identity_loadable
+        # will return False, and envelope_decrypt_bytes should raise with a
+        # message naming the env var + expected path.
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
+            tmp_path / "absent.age",
+        )
+        _clear_daily_identity_cache()
+
+        envelope = age_encrypt_bytes(b"x", [x25519.Identity.generate().to_public()])
+        with pytest.raises(RuntimeError, match="PARAMEM_DAILY_PASSPHRASE"):
+            envelope_decrypt_bytes(envelope)
+
+
+class TestBackupWritePathProducesMagicWrappedEnvelope:
+    """Regression guard: the backup subsystem's encrypted payload must be a
+    magic-wrapped envelope (PMEM1 or age), not a bare Fernet token. Prior to
+    the D3 fix, backup.py called ``encrypt_bytes`` directly and produced
+    naked Fernet tokens that diverged from the rest of the infra store."""
+
+    def test_fernet_posture_writes_pmem1_magic(self, tmp_path):
+        from paramem.backup import backup as backup_mod
+        from paramem.backup.encryption import SecurityBackupsConfig
+        from paramem.backup.meta import read_meta
+        from paramem.backup.types import ArtifactKind, EncryptAtRest
+
+        os.environ[MASTER_KEY_ENV_VAR] = _make_key()
+
+        slot_dir = backup_mod.write(
+            ArtifactKind.CONFIG,
+            b"payload",
+            meta_fields={"tier": "manual"},
+            base_dir=tmp_path / "config",
+            security_config=SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.AUTO),
+        )
+        meta = read_meta(slot_dir)
+        artifact = next(p for p in slot_dir.iterdir() if not p.name.endswith(".meta.json"))
+        head = artifact.read_bytes()[: len(PMEM1_MAGIC)]
+        assert head == PMEM1_MAGIC, f"expected PMEM1 magic, got {head!r}"
+        assert meta.encrypted is True
+        assert meta.key_fingerprint is not None, "Fernet backup must record fingerprint"
+
+    def test_age_posture_writes_age_magic_and_null_fingerprint(self, tmp_path, monkeypatch):
+        from pyrage import x25519
+
+        from paramem.backup import backup as backup_mod
+        from paramem.backup.age_envelope import AGE_MAGIC
+        from paramem.backup.encryption import SecurityBackupsConfig
+        from paramem.backup.key_store import (
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+            write_recovery_pub_file,
+        )
+        from paramem.backup.meta import read_meta
+        from paramem.backup.types import ArtifactKind, EncryptAtRest
+
+        # Load the age identities.
+        daily = mint_daily_identity()
+        recovery = x25519.Identity.generate()
+        key_path = tmp_path / "daily_key.age"
+        recovery_path = tmp_path / "recovery.pub"
+        write_daily_key_file(wrap_daily_identity(daily, "pw"), key_path)
+        write_recovery_pub_file(recovery.to_public(), recovery_path)
+        monkeypatch.setenv("PARAMEM_DAILY_PASSPHRASE", "pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        monkeypatch.setattr("paramem.backup.key_store.RECOVERY_PUB_PATH_DEFAULT", recovery_path)
+        _clear_daily_identity_cache()
+        os.environ[MASTER_KEY_ENV_VAR] = _make_key()  # Fernet also set (transitional)
+
+        slot_dir = backup_mod.write(
+            ArtifactKind.CONFIG,
+            b"payload",
+            meta_fields={"tier": "manual"},
+            base_dir=tmp_path / "config",
+            security_config=SecurityBackupsConfig(encrypt_at_rest=EncryptAtRest.AUTO),
+        )
+        meta = read_meta(slot_dir)
+        artifact = next(p for p in slot_dir.iterdir() if not p.name.endswith(".meta.json"))
+        head = artifact.read_bytes()[: len(AGE_MAGIC)]
+        assert head == AGE_MAGIC, f"expected age magic, got {head!r}"
+        assert meta.encrypted is True
+        assert meta.key_fingerprint is None, (
+            "age backup must record null fingerprint (Fernet-style check does not apply); "
+            "the None-path in the restore endpoint's fingerprint check is what carries the "
+            "operator through"
+        )
+
+        # Round-trip: backup_read must return the original plaintext via the
+        # age → envelope_decrypt_bytes path.
+        plaintext, _ = backup_mod.read(slot_dir)
+        assert plaintext == b"payload"
+
+
+class TestLegacyFernetBackupStillRestores:
+    """Old backups written with the pre-envelope ``encrypt_bytes`` call (bare
+    Fernet token, no magic) must continue to round-trip through backup.read
+    after the envelope refactor."""
+
+    def test_bare_fernet_round_trip_via_read(self, tmp_path):
+        from paramem.backup import backup as backup_mod
+        from paramem.backup.encryption import encrypt_bytes
+        from paramem.backup.meta import ArtifactMeta, write_meta
+        from paramem.backup.types import ArtifactKind, EncryptAtRest
+
+        os.environ[MASTER_KEY_ENV_VAR] = _make_key()
+        slot_dir = tmp_path / "config" / "20260424-12000000"
+        slot_dir.mkdir(parents=True)
+
+        # Hand-build a pre-envelope backup: bare Fernet token + sidecar.
+        payload = b"legacy payload"
+        bare = encrypt_bytes(payload)
+        artifact_path = slot_dir / "config-20260424-12000000.bin.enc"
+        artifact_path.write_bytes(bare)
+
+        from paramem.backup.encryption import current_key_fingerprint
+        from paramem.backup.hashing import content_sha256_bytes
+
+        meta = ArtifactMeta(
+            schema_version=1,
+            kind=ArtifactKind.CONFIG,
+            timestamp="20260424-12000000",
+            content_sha256=content_sha256_bytes(bare),
+            size_bytes=len(bare),
+            encrypted=True,
+            encrypt_at_rest=EncryptAtRest.AUTO,
+            key_fingerprint=current_key_fingerprint(),
+            tier="manual",
+            label=None,
+            pre_trial_hash=None,
+        )
+        write_meta(slot_dir, meta)
+
+        plaintext, meta_read = backup_mod.read(slot_dir)
+        assert plaintext == payload
+        assert meta_read.encrypted is True

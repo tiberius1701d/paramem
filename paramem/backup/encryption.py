@@ -429,25 +429,84 @@ def _atomic_write_bytes(path: Path, body: bytes) -> None:
         logger.warning("_atomic_write_bytes: could not open parent for fsync: %s", exc)
 
 
-def write_infra_bytes(path: Path, plaintext: bytes) -> None:
-    """Atomically write *plaintext* to *path*, encrypting when a key is loaded.
+def envelope_encrypt_bytes(plaintext: bytes) -> bytes:
+    """Return encrypted envelope bytes based on the loaded-key posture.
 
     Priority (highest first):
 
     1. **age multi-recipient** ``[daily, recovery]`` — when the daily
-       identity is loadable AND the recovery public recipient is on disk.
-       This is the steady-state production write after ``paramem
-       generate-key`` + ``paramem migrate-to-age``.
+       identity is loadable AND ``recovery.pub`` is on disk.
     2. **age single-recipient** ``[daily]`` — daily loadable but
-       ``recovery.pub`` missing. Degraded mode; the startup log already
-       warned the operator at this posture.
-    3. **PMEM1** (legacy Fernet envelope) — only the Fernet master key
-       is loaded. Retained for one release as the rollback safety net
-       while the age migration is in flight.
-    4. **Plaintext** — no key material loaded.
+       ``recovery.pub`` missing. Degraded mode; the startup log warns.
+    3. **PMEM1** (legacy Fernet envelope, magic + Fernet token) — only the
+       Fernet master key is loaded.
+    4. **Plaintext** — no key material loaded; caller should gate on this
+       case explicitly if they require encryption.
 
-    Callers do not need to branch on key state; the universal reader
-    (:func:`read_maybe_encrypted`) unwraps any of the three formats.
+    Unlike :func:`encrypt_bytes` (which produces a bare Fernet token),
+    this always returns a magic-prefixed envelope when encryption happens.
+    Used by both :func:`write_infra_bytes` (writes to disk) and the backup
+    subsystem (holds the bytes in hand for sidecar construction).
+    """
+    from paramem.backup import key_store as _ks
+
+    if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+        try:
+            daily = _ks.load_daily_identity_cached(_ks.DAILY_KEY_PATH_DEFAULT)
+        except Exception:  # noqa: BLE001 — graceful fallback on any unwrap failure
+            daily = None
+        if daily is not None:
+            recipients = [daily.to_public()]
+            if _ks.recovery_pub_available(_ks.RECOVERY_PUB_PATH_DEFAULT):
+                recipients.append(_ks.load_recovery_recipient(_ks.RECOVERY_PUB_PATH_DEFAULT))
+            return age_encrypt_bytes(plaintext, recipients)
+    if master_key_loaded():
+        return PMEM1_MAGIC + encrypt_bytes(plaintext)
+    return plaintext
+
+
+def envelope_decrypt_bytes(raw: bytes) -> bytes:
+    """Return plaintext from envelope-wrapped bytes, dispatching by magic.
+
+    Recognises:
+
+    - age v1 envelope (``age-encryption.org/v1\\n``) → decrypt via the cached
+      daily identity.
+    - PMEM1 envelope (``PMEM1\\n``) → strip magic + Fernet decrypt.
+    - **Bare Fernet token** (no magic, base64 body) → Fernet decrypt. This
+      is the legacy shape produced by the backup subsystem before the age
+      flip; kept so pre-envelope backups still restore.
+
+    Unlike :func:`read_maybe_encrypted`, this does NOT treat non-magic bytes
+    as plaintext — the caller is expected to know the bytes are encrypted
+    (e.g. via a sidecar ``meta.encrypted`` field). Pass-through plaintext is
+    the :func:`read_maybe_encrypted` behaviour.
+    """
+    if raw.startswith(AGE_MAGIC):
+        from paramem.backup import key_store as _ks
+
+        try:
+            identity = _ks.load_daily_identity_cached(_ks.DAILY_KEY_PATH_DEFAULT)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"age envelope encountered but the daily identity is not loaded: {exc}. "
+                f"Set {_ks.DAILY_PASSPHRASE_ENV_VAR} and ensure "
+                f"{_ks.DAILY_KEY_PATH_DEFAULT} exists."
+            ) from exc
+        return age_decrypt_bytes(raw, [identity])
+    if raw.startswith(PMEM1_MAGIC):
+        return decrypt_bytes(raw[len(PMEM1_MAGIC) :])
+    # Legacy bare Fernet token (pre-envelope backup format).
+    return decrypt_bytes(raw)
+
+
+def write_infra_bytes(path: Path, plaintext: bytes) -> None:
+    """Atomically write *plaintext* to *path*, encrypting when a key is loaded.
+
+    Delegates format selection to :func:`envelope_encrypt_bytes`. See its
+    docstring for the four-tier priority (age multi / age single / PMEM1 /
+    plaintext). Callers do not need to branch on key state; the universal
+    reader :func:`read_maybe_encrypted` unwraps any of the three formats.
 
     Parameters
     ----------
@@ -461,36 +520,7 @@ def write_infra_bytes(path: Path, plaintext: bytes) -> None:
     OSError
         On any filesystem error.
     """
-    from paramem.backup import key_store as _ks
-
-    # Late attribute lookup so tests can point DAILY_KEY_PATH_DEFAULT /
-    # RECOVERY_PUB_PATH_DEFAULT at a scratch directory without freezing
-    # the originals into this function's defaults at import time.
-    if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-        try:
-            daily = _ks.load_daily_identity_cached(_ks.DAILY_KEY_PATH_DEFAULT)
-        except Exception:  # noqa: BLE001 — graceful fallback on any unwrap failure
-            # Loadable probe passed (file + env present) but the unwrap failed.
-            # Possible causes: wrong passphrase (pyrage.DecryptError), file
-            # disappeared between probe and load (FileNotFoundError), missing
-            # env at load time (RuntimeError). Fall through to the legacy path
-            # rather than crashing the writer; the first read of an existing
-            # age file will surface the real error with operator-actionable
-            # context.
-            daily = None
-
-        if daily is not None:
-            recipients = [daily.to_public()]
-            if _ks.recovery_pub_available(_ks.RECOVERY_PUB_PATH_DEFAULT):
-                recipients.append(_ks.load_recovery_recipient(_ks.RECOVERY_PUB_PATH_DEFAULT))
-            _atomic_write_bytes(Path(path), age_encrypt_bytes(plaintext, recipients))
-            return
-
-    if master_key_loaded():
-        body = PMEM1_MAGIC + encrypt_bytes(plaintext)
-    else:
-        body = plaintext
-    _atomic_write_bytes(Path(path), body)
+    _atomic_write_bytes(Path(path), envelope_encrypt_bytes(plaintext))
 
 
 def write_plaintext_atomic(path: Path, plaintext: bytes) -> None:
