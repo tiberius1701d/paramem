@@ -40,7 +40,7 @@ from pathlib import Path
 from pyrage import passphrase as _pyrage_passphrase
 from pyrage import x25519
 
-from paramem.backup.age_envelope import identity_from_bech32
+from paramem.backup.age_envelope import identity_from_bech32, recipient_from_bech32
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,12 @@ DAILY_PASSPHRASE_ENV_VAR: str = "PARAMEM_DAILY_PASSPHRASE"
 
 # Default on-disk location for the wrapped daily identity.
 DAILY_KEY_PATH_DEFAULT: Path = Path("~/.config/paramem/daily_key.age").expanduser()
+
+# Default on-disk location for the recovery identity's public key.
+# The recovery *secret* (``AGE-SECRET-KEY-1…``) is print-once-never-on-disk;
+# only the *public recipient* (``age1…``) is persisted so the server can include
+# it in every multi-recipient envelope.
+RECOVERY_PUB_PATH_DEFAULT: Path = Path("~/.config/paramem/recovery.pub").expanduser()
 
 
 def daily_passphrase_env_value() -> str | None:
@@ -88,14 +94,14 @@ def wrap_daily_identity(identity: x25519.Identity, passphrase: str) -> bytes:
     return _pyrage_passphrase.encrypt(secret_bech32, passphrase)
 
 
-def write_daily_key_file(wrapped: bytes, path: Path = DAILY_KEY_PATH_DEFAULT) -> None:
-    """Atomically write *wrapped* daily-key envelope to *path* with mode 0600.
+def _atomic_write_with_mode(path: Path, body: bytes, mode: int) -> None:
+    """Atomically write *body* to *path* with file mode *mode*.
 
     Creates the parent directory with mode ``0o700`` when missing (``exist_ok``
     does not rewrite the mode of an existing directory). Writes to ``<path>.tmp``
-    via ``O_CREAT | O_EXCL`` so a fresh inode always carries the intended
-    mode, fsyncs the payload, ``os.rename``'s to *path* for atomicity, and
-    fsyncs the parent directory for power-loss durability.
+    via ``O_CREAT | O_EXCL`` so a fresh inode always carries *mode* exactly,
+    fsyncs the payload, ``os.rename``'s to *path* for atomicity, and fsyncs
+    the parent directory for power-loss durability.
 
     Any stale ``<path>.tmp`` from a prior crash is removed before the exclusive
     create so the mode guarantee is not sabotaged by a leftover file.
@@ -109,10 +115,10 @@ def write_daily_key_file(wrapped: bytes, path: Path = DAILY_KEY_PATH_DEFAULT) ->
     except FileNotFoundError:
         pass
 
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(wrapped)
+            fh.write(body)
             fh.flush()
             os.fsync(fh.fileno())
         os.rename(tmp, path)
@@ -126,14 +132,67 @@ def write_daily_key_file(wrapped: bytes, path: Path = DAILY_KEY_PATH_DEFAULT) ->
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
     except OSError as exc:
-        logger.warning("write_daily_key_file: could not open parent for fsync: %s", exc)
+        logger.warning("_atomic_write_with_mode: could not open parent for fsync: %s", exc)
         return
     try:
         os.fsync(dir_fd)
     except OSError as exc:
-        logger.warning("write_daily_key_file: parent dir fsync failed: %s", exc)
+        logger.warning("_atomic_write_with_mode: parent dir fsync failed: %s", exc)
     finally:
         os.close(dir_fd)
+
+
+def write_daily_key_file(wrapped: bytes, path: Path = DAILY_KEY_PATH_DEFAULT) -> None:
+    """Atomically write *wrapped* daily-key envelope to *path* with mode 0600.
+
+    Thin wrapper over :func:`_atomic_write_with_mode` that pins the mode to the
+    secret-material default.
+    """
+    _atomic_write_with_mode(Path(path), wrapped, 0o600)
+
+
+def write_recovery_pub_file(
+    recipient: x25519.Recipient,
+    path: Path = RECOVERY_PUB_PATH_DEFAULT,
+) -> None:
+    """Atomically write the recovery identity's public recipient to *path*.
+
+    The on-disk body is the bech32 ``age1…`` string plus a trailing newline,
+    at mode ``0o644`` (the ``~/.ssh/*.pub`` convention — public keys are not
+    secret). The enclosing directory is created at ``0o700`` when missing;
+    existing-directory modes are preserved.
+
+    Raises
+    ------
+    TypeError
+        If *recipient* is not an :class:`x25519.Recipient`.
+    """
+    if not isinstance(recipient, x25519.Recipient):
+        raise TypeError(f"x25519 Recipient expected, got {type(recipient).__name__}")
+    body = (str(recipient) + "\n").encode("utf-8")
+    _atomic_write_with_mode(Path(path), body, 0o644)
+
+
+def load_recovery_recipient(path: Path = RECOVERY_PUB_PATH_DEFAULT) -> x25519.Recipient:
+    """Load the recovery recipient from *path* and validate it is native X25519.
+
+    The file is expected to contain a single bech32 ``age1…`` line; leading and
+    trailing whitespace is stripped. Plugin-typed recipients are refused at the
+    :func:`paramem.backup.age_envelope.recipient_from_bech32` boundary.
+
+    Raises
+    ------
+    FileNotFoundError
+        When *path* does not exist.
+    paramem.backup.age_envelope.PluginRecipientRejected
+        On a plugin-typed or otherwise malformed recipient.
+    ValueError
+        When the file is empty or has no recognisable content.
+    """
+    text = Path(path).read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"recovery pub file at {path} is empty")
+    return recipient_from_bech32(text)
 
 
 def load_daily_identity(
@@ -170,9 +229,12 @@ def load_daily_identity(
 __all__ = [
     "DAILY_KEY_PATH_DEFAULT",
     "DAILY_PASSPHRASE_ENV_VAR",
+    "RECOVERY_PUB_PATH_DEFAULT",
     "daily_passphrase_env_value",
     "load_daily_identity",
+    "load_recovery_recipient",
     "mint_daily_identity",
     "wrap_daily_identity",
     "write_daily_key_file",
+    "write_recovery_pub_file",
 ]

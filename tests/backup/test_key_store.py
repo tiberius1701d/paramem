@@ -25,15 +25,18 @@ import pyrage
 import pytest
 from pyrage import x25519
 
-from paramem.backup.age_envelope import AGE_MAGIC, is_age_envelope
+from paramem.backup.age_envelope import AGE_MAGIC, PluginRecipientRejected, is_age_envelope
 from paramem.backup.key_store import (
     DAILY_KEY_PATH_DEFAULT,
     DAILY_PASSPHRASE_ENV_VAR,
+    RECOVERY_PUB_PATH_DEFAULT,
     daily_passphrase_env_value,
     load_daily_identity,
+    load_recovery_recipient,
     mint_daily_identity,
     wrap_daily_identity,
     write_daily_key_file,
+    write_recovery_pub_file,
 )
 
 
@@ -201,8 +204,78 @@ class TestDefaults:
         assert DAILY_KEY_PATH_DEFAULT.parts[-3:] == expected_tail.parts
         assert DAILY_KEY_PATH_DEFAULT.is_absolute()
 
+    def test_recovery_pub_default_path_under_user_config(self) -> None:
+        expected_tail = Path(".config") / "paramem" / "recovery.pub"
+        assert RECOVERY_PUB_PATH_DEFAULT.parts[-3:] == expected_tail.parts
+        assert RECOVERY_PUB_PATH_DEFAULT.is_absolute()
+
     def test_default_env_var_name(self) -> None:
         assert DAILY_PASSPHRASE_ENV_VAR == "PARAMEM_DAILY_PASSPHRASE"
+
+
+class TestRecoveryPub:
+    def test_recovery_pub_round_trip(self, tmp_path: Path) -> None:
+        ident = x25519.Identity.generate()
+        path = tmp_path / "paramem" / "recovery.pub"
+        write_recovery_pub_file(ident.to_public(), path)
+        loaded = load_recovery_recipient(path)
+        assert str(loaded) == str(ident.to_public())
+
+    def test_recovery_pub_file_mode_is_0644(self, tmp_path: Path) -> None:
+        ident = x25519.Identity.generate()
+        path = tmp_path / "paramem" / "recovery.pub"
+        write_recovery_pub_file(ident.to_public(), path)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o644, f"recovery pub file mode must be 0644, got {oct(mode)}"
+
+    def test_recovery_pub_parent_dir_created_at_0700(self, tmp_path: Path) -> None:
+        ident = x25519.Identity.generate()
+        parent = tmp_path / "fresh-config-root"
+        assert not parent.exists()
+        write_recovery_pub_file(ident.to_public(), parent / "recovery.pub")
+        assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+
+    def test_recovery_pub_body_is_bech32_plus_newline(self, tmp_path: Path) -> None:
+        ident = x25519.Identity.generate()
+        path = tmp_path / "recovery.pub"
+        write_recovery_pub_file(ident.to_public(), path)
+        body = path.read_text(encoding="utf-8")
+        assert body.endswith("\n")
+        assert body.rstrip("\n") == str(ident.to_public())
+        assert body.rstrip("\n").startswith("age1")
+
+    def test_load_recovery_missing_file_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            load_recovery_recipient(tmp_path / "does-not-exist.pub")
+
+    def test_load_recovery_empty_file_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "recovery.pub"
+        path.write_text("   \n\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="empty"):
+            load_recovery_recipient(path)
+
+    def test_load_recovery_rejects_non_age_prefix(self, tmp_path: Path) -> None:
+        path = tmp_path / "recovery.pub"
+        path.write_text("AGE-SECRET-KEY-1notapublickey\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="not an age recipient"):
+            load_recovery_recipient(path)
+
+    def test_load_recovery_rejects_garbage(self, tmp_path: Path) -> None:
+        path = tmp_path / "recovery.pub"
+        path.write_text("age1garbage-not-a-real-key\n", encoding="utf-8")
+        with pytest.raises(PluginRecipientRejected):
+            load_recovery_recipient(path)
+
+    def test_write_recovery_pub_rejects_non_x25519(self, tmp_path: Path) -> None:
+        with pytest.raises(TypeError):
+            write_recovery_pub_file(object(), tmp_path / "recovery.pub")  # type: ignore[arg-type]
+
+    def test_recovery_pub_tolerates_surrounding_whitespace(self, tmp_path: Path) -> None:
+        ident = x25519.Identity.generate()
+        path = tmp_path / "recovery.pub"
+        path.write_text(f"\n  {ident.to_public()}  \n", encoding="utf-8")
+        loaded = load_recovery_recipient(path)
+        assert str(loaded) == str(ident.to_public())
 
 
 class TestIdentityMinting:

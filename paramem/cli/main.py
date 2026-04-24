@@ -229,15 +229,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # --- security CLI (encryption / key lifecycle) ---
-    subparsers.add_parser(
-        "generate-key",
-        help="Mint a new master-key value and print it with activation instructions.",
-        description=(
-            "Generates a Fernet key and prints it to stdout as a ready-to-paste "
-            ".env line.  Warning banner goes to stderr; the key itself is the "
-            "only line on stdout so redirection works cleanly."
-        ),
-    )
+    generate_key.add_parser(subparsers)
     encrypt_infra.add_parser(subparsers)
     decrypt_infra.add_parser(subparsers)
     dump.add_parser(subparsers)

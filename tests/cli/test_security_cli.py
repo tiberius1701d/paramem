@@ -23,6 +23,11 @@ from paramem.backup.encryption import (
     read_maybe_encrypted,
     write_infra_bytes,
 )
+from paramem.backup.key_store import (
+    DAILY_PASSPHRASE_ENV_VAR,
+    load_daily_identity,
+    load_recovery_recipient,
+)
 from paramem.cli import decrypt_infra, dump, encrypt_infra, generate_key
 
 
@@ -47,30 +52,252 @@ def _env_isolation():
 # ---------------------------------------------------------------------------
 
 
+def _generate_key_args(
+    tmp_path: Path,
+    *,
+    passphrase_file: Path | None = None,
+    force: bool = False,
+    yes: bool = True,
+) -> argparse.Namespace:
+    """Namespace matching what argparse would hand to generate_key.run()."""
+    return argparse.Namespace(
+        daily_key_path=tmp_path / "config" / "paramem" / "daily_key.age",
+        recovery_pub_path=tmp_path / "config" / "paramem" / "recovery.pub",
+        passphrase_file=passphrase_file,
+        force=force,
+        yes=yes,
+    )
+
+
+def _write_passphrase_file(tmp_path: Path, passphrase: str) -> Path:
+    path = tmp_path / "passphrase.txt"
+    path.write_text(passphrase + "\n", encoding="utf-8")
+    return path
+
+
 class TestGenerateKey:
-    def test_prints_key_line_to_stdout(self, capsys):
-        rc = generate_key.run(argparse.Namespace())
+    def test_happy_path_writes_both_files_with_correct_modes(self, tmp_path, capsys):
+        import stat
+
+        pw_file = _write_passphrase_file(tmp_path, "live-test-pw")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+
+        rc = generate_key.run(args)
         assert rc == 0
-        out = capsys.readouterr()
-        assert "PARAMEM_MASTER_KEY=" in out.out
-        assert len(out.out.strip().splitlines()) == 1, "stdout must be exactly one line"
-        # Warning banner goes to stderr.
-        assert "WARNING" in out.err
-        assert "unrecoverable" in out.err
 
-    def test_generated_key_is_a_valid_fernet_key(self, capsys):
-        generate_key.run(argparse.Namespace())
-        out = capsys.readouterr().out.strip()
-        key = out.split("=", 1)[1]
-        # Must be accepted by Fernet without error.
-        Fernet(key.encode())
+        assert args.daily_key_path.exists()
+        assert args.recovery_pub_path.exists()
+        assert stat.S_IMODE(args.daily_key_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(args.recovery_pub_path.stat().st_mode) == 0o644
 
-    def test_two_calls_produce_different_keys(self, capsys):
-        generate_key.run(argparse.Namespace())
-        first = capsys.readouterr().out.strip().split("=", 1)[1]
-        generate_key.run(argparse.Namespace())
-        second = capsys.readouterr().out.strip().split("=", 1)[1]
-        assert first != second
+    def test_daily_key_unlocks_with_supplied_passphrase(self, tmp_path, capsys):
+        pw_file = _write_passphrase_file(tmp_path, "unlock-me")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        generate_key.run(args)
+
+        ident = load_daily_identity(args.daily_key_path, passphrase="unlock-me")
+        assert str(ident).startswith("AGE-SECRET-KEY-1")
+
+    def test_recovery_pub_is_valid_x25519_recipient(self, tmp_path, capsys):
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        generate_key.run(args)
+        recipient = load_recovery_recipient(args.recovery_pub_path)
+        assert str(recipient).startswith("age1")
+
+    def test_recovery_secret_printed_to_stderr(self, tmp_path, capsys):
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        rc = generate_key.run(args)
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "AGE-SECRET-KEY-1" in err, "recovery bech32 must be printed to stderr"
+        assert "WRITE THIS DOWN NOW" in err
+        assert "NEVER stored on" in err
+
+    def test_refuses_existing_files_without_force(self, tmp_path, capsys):
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        # First invocation creates the files.
+        assert generate_key.run(args) == 0
+        capsys.readouterr()  # drain
+
+        # Second invocation without --force must refuse.
+        rc = generate_key.run(args)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "already exist" in err
+        assert "--force" in err
+
+    def test_force_overwrites_existing_files(self, tmp_path, capsys):
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        generate_key.run(args)
+        first_daily = args.daily_key_path.read_bytes()
+        capsys.readouterr()
+
+        args_force = _generate_key_args(tmp_path, passphrase_file=pw_file, force=True)
+        rc = generate_key.run(args_force)
+        assert rc == 0
+        assert args_force.daily_key_path.read_bytes() != first_daily
+
+    def test_passphrase_from_env_var(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "from-env")
+        args = _generate_key_args(tmp_path)  # no passphrase_file
+        rc = generate_key.run(args)
+        assert rc == 0
+        ident = load_daily_identity(args.daily_key_path, passphrase="from-env")
+        assert str(ident).startswith("AGE-SECRET-KEY-1")
+
+    def test_refuses_no_passphrase_no_tty(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        args = _generate_key_args(tmp_path)
+        rc = generate_key.run(args)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "no passphrase supplied" in err
+        assert DAILY_PASSPHRASE_ENV_VAR in err
+        assert not args.daily_key_path.exists()
+
+    def test_refuses_missing_passphrase_file(self, tmp_path, capsys):
+        args = _generate_key_args(tmp_path, passphrase_file=tmp_path / "nope.txt")
+        rc = generate_key.run(args)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "could not read passphrase file" in err
+
+    def test_refuses_empty_passphrase_file(self, tmp_path, capsys):
+        pw_file = tmp_path / "empty.txt"
+        pw_file.write_text("", encoding="utf-8")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        rc = generate_key.run(args)
+        assert rc == 1
+        assert "passphrase file is empty" in capsys.readouterr().err
+
+    def test_refuses_non_interactive_without_yes(self, tmp_path, capsys, monkeypatch):
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file, yes=False)
+        rc = generate_key.run(args)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "non-interactively without --yes" in err
+        assert not args.daily_key_path.exists(), "nothing must be written on aborted confirm"
+
+    def test_two_runs_produce_distinct_identities(self, tmp_path, capsys):
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        # First invocation.
+        args_a = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        generate_key.run(args_a)
+        daily_a = load_daily_identity(args_a.daily_key_path, passphrase="x")
+        recovery_a = load_recovery_recipient(args_a.recovery_pub_path)
+
+        # Second invocation into a different directory.
+        tmp_b = tmp_path / "second"
+        tmp_b.mkdir()
+        args_b = _generate_key_args(tmp_b, passphrase_file=pw_file)
+        generate_key.run(args_b)
+        daily_b = load_daily_identity(args_b.daily_key_path, passphrase="x")
+        recovery_b = load_recovery_recipient(args_b.recovery_pub_path)
+
+        assert str(daily_a) != str(daily_b)
+        assert str(recovery_a) != str(recovery_b)
+
+    def test_interactive_passphrase_happy_path(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        pw_answers = iter(["interactive-pw", "interactive-pw"])
+        monkeypatch.setattr(
+            "paramem.cli.generate_key.getpass.getpass",
+            lambda prompt: next(pw_answers),
+        )
+        args = _generate_key_args(tmp_path)  # no passphrase_file, no env → interactive
+        rc = generate_key.run(args)
+        assert rc == 0
+        ident = load_daily_identity(args.daily_key_path, passphrase="interactive-pw")
+        assert str(ident).startswith("AGE-SECRET-KEY-1")
+
+    def test_interactive_passphrase_mismatch_refuses(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        pw_answers = iter(["one", "two"])
+        monkeypatch.setattr(
+            "paramem.cli.generate_key.getpass.getpass",
+            lambda prompt: next(pw_answers),
+        )
+        args = _generate_key_args(tmp_path)
+        rc = generate_key.run(args)
+        assert rc == 1
+        assert "did not match" in capsys.readouterr().err
+        assert not args.daily_key_path.exists()
+
+    def test_interactive_passphrase_empty_refuses(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("paramem.cli.generate_key.getpass.getpass", lambda prompt: "")
+        args = _generate_key_args(tmp_path)
+        rc = generate_key.run(args)
+        assert rc == 1
+        assert "non-empty" in capsys.readouterr().err
+        assert not args.daily_key_path.exists()
+
+    def test_confirmation_phrase_happy_path(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        monkeypatch.setattr("builtins.input", lambda: "I have saved the recovery key")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file, yes=False)
+        rc = generate_key.run(args)
+        assert rc == 0
+        assert args.daily_key_path.exists()
+        assert args.recovery_pub_path.exists()
+
+    def test_confirmation_phrase_mismatch_refuses(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        monkeypatch.setattr("builtins.input", lambda: "sure whatever")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file, yes=False)
+        rc = generate_key.run(args)
+        assert rc == 1
+        assert "confirmation phrase did not match" in capsys.readouterr().err
+        assert not args.daily_key_path.exists()
+        assert not args.recovery_pub_path.exists()
+
+    def test_confirmation_phrase_interrupted_refuses_cleanly(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        pw_file = _write_passphrase_file(tmp_path, "x")
+
+        def _raise_keyboard_interrupt() -> str:
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr("builtins.input", _raise_keyboard_interrupt)
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file, yes=False)
+        rc = generate_key.run(args)
+        assert rc == 1
+        assert "Aborted" in capsys.readouterr().err
+        assert not args.daily_key_path.exists()
+        assert not args.recovery_pub_path.exists()
+
+    def test_recovery_secret_is_never_written_to_disk(self, tmp_path, capsys):
+        """Regression guard: the printed recovery secret must not appear in
+        either daily_key.age (wraps the *daily* secret, not the recovery one)
+        or recovery.pub (holds only the public recipient)."""
+        import re
+
+        pw_file = _write_passphrase_file(tmp_path, "x")
+        args = _generate_key_args(tmp_path, passphrase_file=pw_file)
+        rc = generate_key.run(args)
+        assert rc == 0
+
+        match = re.search(r"AGE-SECRET-KEY-1[A-Z0-9]+", capsys.readouterr().err)
+        assert match, "recovery secret bech32 must appear in stderr"
+        recovery_secret = match.group(0)
+
+        daily_bytes = args.daily_key_path.read_bytes()
+        pub_text = args.recovery_pub_path.read_text("utf-8")
+
+        assert recovery_secret.encode() not in daily_bytes, (
+            "recovery secret must not appear in daily_key.age"
+        )
+        assert "AGE-SECRET-KEY" not in pub_text, "recovery.pub must hold only the public recipient"
+        assert recovery_secret not in pub_text
 
 
 # ---------------------------------------------------------------------------
