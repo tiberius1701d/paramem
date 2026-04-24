@@ -35,6 +35,7 @@ from paramem.cli import (
     migrate_rollback,
     migrate_status,
     migrate_to_age,
+    restore,
     rotate_daily,
     rotate_recovery,
 )
@@ -239,6 +240,7 @@ def _build_parser() -> argparse.ArgumentParser:
     migrate_to_age.add_parser(subparsers)
     rotate_daily.add_parser(subparsers)
     rotate_recovery.add_parser(subparsers)
+    restore.add_parser(subparsers)
 
     return parser
 
@@ -317,6 +319,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "rotate-recovery":
         return rotate_recovery.run(args)
+
+    if args.command == "restore":
+        return restore.run(args)
 
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)
