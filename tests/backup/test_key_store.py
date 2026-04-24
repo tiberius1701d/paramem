@@ -30,10 +30,14 @@ from paramem.backup.key_store import (
     DAILY_KEY_PATH_DEFAULT,
     DAILY_PASSPHRASE_ENV_VAR,
     RECOVERY_PUB_PATH_DEFAULT,
+    _clear_daily_identity_cache,
+    daily_identity_loadable,
     daily_passphrase_env_value,
     load_daily_identity,
+    load_daily_identity_cached,
     load_recovery_recipient,
     mint_daily_identity,
+    recovery_pub_available,
     wrap_daily_identity,
     write_daily_key_file,
     write_recovery_pub_file,
@@ -286,3 +290,117 @@ class TestIdentityMinting:
 
     def test_two_mints_yield_distinct_identities(self) -> None:
         assert str(mint_daily_identity()) != str(mint_daily_identity())
+
+
+@pytest.fixture
+def _clear_cache_between_tests():
+    """Ensure the module-level identity cache does not leak across tests."""
+    _clear_daily_identity_cache()
+    yield
+    _clear_daily_identity_cache()
+
+
+class TestLoadableProbes:
+    def test_daily_identity_loadable_true_when_env_and_file_present(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        assert daily_identity_loadable(path) is True
+
+    def test_daily_identity_loadable_false_when_env_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+        assert daily_identity_loadable(path) is False
+
+    def test_daily_identity_loadable_false_when_empty_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "")
+        assert daily_identity_loadable(path) is False
+
+    def test_daily_identity_loadable_false_when_file_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        assert daily_identity_loadable(tmp_path / "nope.age") is False
+
+    def test_recovery_pub_available_true_when_file_exists(self, tmp_path: Path) -> None:
+        path = tmp_path / "recovery.pub"
+        write_recovery_pub_file(x25519.Identity.generate().to_public(), path)
+        assert recovery_pub_available(path) is True
+
+    def test_recovery_pub_available_false_when_file_missing(self, tmp_path: Path) -> None:
+        assert recovery_pub_available(tmp_path / "nope.pub") is False
+
+
+class TestCachedIdentity:
+    def test_cached_load_returns_same_object(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _clear_cache_between_tests: None,
+    ) -> None:
+        path = tmp_path / "daily_key.age"
+        ident = mint_daily_identity()
+        write_daily_key_file(wrap_daily_identity(ident, "pw"), path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+
+        first = load_daily_identity_cached(path)
+        second = load_daily_identity_cached(path)
+        assert first is second, "second call must return the cached instance"
+        assert str(first) == str(ident)
+
+    def test_clear_cache_forces_reload(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _clear_cache_between_tests: None,
+    ) -> None:
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+
+        first = load_daily_identity_cached(path)
+        _clear_daily_identity_cache()
+        second = load_daily_identity_cached(path)
+        assert first is not second, "clearing the cache must force a fresh unwrap"
+        assert str(first) == str(second), "same underlying identity after rewrap"
+
+    def test_cached_load_raises_without_passphrase(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _clear_cache_between_tests: None,
+    ) -> None:
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+
+        with pytest.raises(RuntimeError, match=DAILY_PASSPHRASE_ENV_VAR):
+            load_daily_identity_cached(path)
+
+    def test_failed_load_does_not_poison_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _clear_cache_between_tests: None,
+    ) -> None:
+        """A failed first load must leave the cache empty so the next attempt
+        (after the operator fixes the env) succeeds cleanly."""
+        path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(mint_daily_identity(), "pw"), path)
+
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+        with pytest.raises(RuntimeError):
+            load_daily_identity_cached(path)
+
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        ident = load_daily_identity_cached(path)
+        assert str(ident).startswith("AGE-SECRET-KEY-1")

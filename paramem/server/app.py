@@ -915,9 +915,6 @@ async def lifespan(app: FastAPI):
     config = _state["config"]
 
     from paramem.backup.encryption import (
-        MASTER_KEY_ENV_VAR,
-    )
-    from paramem.backup.encryption import (
         SecurityBackupsConfig as _EncSecCfg,
     )
     from paramem.backup.encryption import (
@@ -947,20 +944,38 @@ async def lifespan(app: FastAPI):
 
     # Security startup gate (SECURITY.md §4):
     # 1) Fail fast when ``encrypt_at_rest=always`` is set without a master key.
-    # 2) Refuse startup on any of the four key × on-disk mode-mismatch
-    #    cases (set+plaintext, unset+ciphertext, mixed).  Infra files
-    #    are written through ``write_infra_bytes`` and the operator can
-    #    reconcile a mismatch with ``paramem encrypt-infra`` /
-    #    ``paramem decrypt-infra --i-accept-plaintext``.
+    # 2) Refuse startup on any mode-mismatch case (plaintext alongside an
+    #    encryption format, or encrypted files without the corresponding
+    #    key loaded). Mixed PMEM1+age with both keys loaded is permitted
+    #    as a transitional state during the age migration.
     # 3) Emit the canonical SECURITY: ON/OFF line so operators see posture.
+    from paramem.backup.key_store import (
+        daily_identity_loadable as _daily_loadable,
+    )
+    from paramem.backup.key_store import (
+        recovery_pub_available as _recovery_available,
+    )
+    from paramem.server.security_posture import security_posture_log_line
+
     _key_loaded = _master_key_loaded()
+    _daily_ok = _daily_loadable()
+    _recovery_ok = _recovery_available()
     _assert_enc(_EncSecCfg(), key_loaded=_key_loaded)
-    _assert_mode(config.paths.data, key_loaded=_key_loaded)
-    if _key_loaded:
-        logger.info("SECURITY: ON (%s set)", MASTER_KEY_ENV_VAR)
+    _assert_mode(
+        config.paths.data,
+        key_loaded=_key_loaded,
+        daily_identity_loadable=_daily_ok,
+    )
+    _line, _is_on = security_posture_log_line(
+        fernet_loaded=_key_loaded,
+        daily_loadable=_daily_ok,
+        recovery_available=_recovery_ok,
+    )
+    if _is_on:
+        logger.info(_line)
     else:
-        logger.warning("SECURITY: OFF (no key — all infrastructure metadata is plaintext on disk)")
-    _state["encryption"] = "on" if _key_loaded else "off"
+        logger.warning(_line)
+    _state["encryption"] = "on" if _is_on else "off"
 
     # --- Crash recovery: inspect disk state BEFORE drift init ---
     # This ensures _state["migration"] reflects any partially-completed

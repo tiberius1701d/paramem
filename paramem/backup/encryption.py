@@ -1,45 +1,39 @@
-"""Fernet encryption wrapper for the backup subsystem + infrastructure store.
+"""Encryption wrapper for the backup subsystem + infrastructure store.
 
-Provides a thin layer over ``cryptography.fernet.Fernet`` with:
+Mediates access to two on-disk envelope formats:
 
-- Lazy cipher construction (built on first use, cached in-module state).
+- **PMEM1** — the legacy Fernet envelope (``PMEM1\\n`` magic). Built from
+  ``PARAMEM_MASTER_KEY`` via a cached :class:`cryptography.fernet.Fernet`.
+  Retained for one release as a rollback safety net during the age
+  migration.
+- **age v1** — the two-identity envelope (``age-encryption.org/v1\\n``
+  magic). Decrypted with the cached daily identity from
+  :mod:`paramem.backup.key_store`. Primitives live in
+  :mod:`paramem.backup.age_envelope`.
+
+Services provided:
+
+- Lazy cipher construction (built on first use, cached in-module state)
+  for the Fernet path; ``_clear_cipher_cache()`` is a supported operator
+  call after rotating ``PARAMEM_MASTER_KEY``.
 - Per-artifact policy resolution (``auto`` / ``always`` / ``never``).
 - Startup feasibility assertion (``always`` with no key → fatal error).
-- 4-case mode-mismatch startup refuse (SECURITY.md §4).
-- Envelope helpers (``write_infra_bytes`` / ``read_maybe_encrypted``) for any
-  on-disk infrastructure metadata — graph, registry, queue, sidecars, etc.
-- ``_clear_cipher_cache()`` — a **supported operational call** for key
-  rotation.  It is *not* test-only; operator code may call it after
-  rotating ``PARAMEM_MASTER_KEY`` in the environment.
+- Mode-mismatch startup refuse (:func:`assert_mode_consistency`):
+  classifies infrastructure files as PMEM1 / age / plaintext and refuses
+  any combination that would be silently unreadable or that mixes
+  plaintext with an encryption format. A mixed PMEM1 + age store with
+  both keys loaded is permitted as a transitional state during the age
+  migration and logged at WARN.
+- The universal read path :func:`read_maybe_encrypted` dispatches by
+  envelope magic so callers never branch on key-loaded state — a
+  PMEM1-era file and an age-era file sitting in the same directory both
+  unwrap transparently.
 
-Key source
-----------
-The Fernet key is read from ``os.environ["PARAMEM_MASTER_KEY"]`` on first
-use.  If the variable is not set, ``encrypt_bytes`` / ``decrypt_bytes``
-raise ``RuntimeError``.  Import is always safe — the key is never read at
-import time.
-
-Per-artifact encryption policy
---------------------------------
-``SecurityBackupsConfig`` is defined locally here.  Callers pass a config
-object with:
-
-- ``encrypt_at_rest``                  — global fallback policy (``EncryptAtRest``).
-- ``per_kind``                         — optional dict mapping ``ArtifactKind``
-                                         values to per-kind ``EncryptAtRest``
-                                         policies; falls back to global when absent.
-
-``encrypt_bytes`` / ``decrypt_bytes`` accept single-file inputs only.  Any
-directory-shaped artifact (e.g. the BG-trainer resume directory) iterates
-per-file; this module is unaware of directory structure.
-
-Envelope format (PMEM1)
------------------------
-``write_infra_bytes`` / ``read_maybe_encrypted`` wrap the ciphertext with a
-6-byte magic prefix ``b"PMEM1\\n"`` so that ``assert_mode_consistency`` can
-classify an on-disk file as encrypted-or-plaintext without attempting to
-decrypt it.  Plaintext JSON starts with ``{`` or ``[``; the magic is
-unambiguous.
+``encrypt_bytes`` / ``decrypt_bytes`` operate on single-file inputs only;
+directory-shaped artifacts iterate per-file externally. The current writer
+still produces PMEM1 envelopes — the writer flip to age multi-recipient
+envelopes and the ``paramem migrate-to-age`` sweep land in a follow-up
+commit.
 """
 
 from __future__ import annotations
@@ -52,6 +46,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+from paramem.backup.age_envelope import AGE_MAGIC, age_decrypt_bytes, is_age_envelope
 from paramem.backup.types import ArtifactKind, EncryptAtRest, FatalConfigError
 
 logger = logging.getLogger(__name__)
@@ -334,37 +329,56 @@ def decrypt_bytes(ciphertext: bytes) -> bytes:
 
 
 def read_maybe_encrypted(path: Path) -> bytes:
-    """Return plaintext bytes from *path*, decrypting when PMEM1-wrapped.
+    """Return plaintext bytes from *path*, dispatching by envelope magic.
 
-    Sniffs the 6-byte ``PMEM1\\n`` magic prefix.  When present, the remainder
-    is Fernet ciphertext; decryption requires a valid master key.  When
-    absent, the file is returned verbatim (plaintext).
+    The universal read path for any infrastructure file that may have been
+    written via :func:`write_infra_bytes`. Three on-disk shapes are handled
+    transparently so callers never branch on key-loaded state:
 
-    This is the universal read path for any infrastructure file that may have
-    been written via ``write_infra_bytes``.  Callers do not need to branch on
-    key-loaded state.
-
-    Parameters
-    ----------
-    path:
-        Filesystem path to read.
-
-    Returns
-    -------
-    bytes
-        The decrypted (or verbatim) content.
+    - **age v1** envelope (``age-encryption.org/v1\\n`` magic) — decrypted
+      with the cached daily identity loaded from
+      :func:`paramem.backup.key_store.load_daily_identity_cached`. The
+      identity is unwrapped once on first read via the scrypt KDF and
+      cached module-side; rotation handlers call
+      :func:`paramem.backup.key_store._clear_daily_identity_cache`.
+    - **PMEM1** envelope (``PMEM1\\n`` magic) — Fernet ciphertext, decrypted
+      with the cached master key built from ``PARAMEM_MASTER_KEY``.
+      Retained for one release as a rollback safety net while the age
+      migration is in flight.
+    - No recognised magic — returned verbatim (plaintext pass-through).
 
     Raises
     ------
     FileNotFoundError
         If *path* does not exist.
     RuntimeError
-        If the file carries the PMEM1 magic but no master key is loaded.
+        If the file carries an encryption magic but the corresponding key /
+        identity is not loaded — actionable message names the env var the
+        operator needs to set.
     cryptography.fernet.InvalidToken
-        If the ciphertext is corrupt, tampered with, or was produced with a
+        PMEM1 ciphertext is corrupt, tampered with, or was produced with a
         different key.
+    pyrage.DecryptError
+        age ciphertext is corrupt, tampered with, or cannot be decrypted by
+        the loaded daily identity (neither daily nor recovery recipient
+        match).
     """
     raw = Path(path).read_bytes()
+    if raw.startswith(AGE_MAGIC):
+        # Late-lookup the key_store module so tests (and a future operator
+        # override) can monkeypatch DAILY_KEY_PATH_DEFAULT without having the
+        # value frozen into this function's defaults at import time.
+        from paramem.backup import key_store as _ks
+
+        try:
+            identity = _ks.load_daily_identity_cached(_ks.DAILY_KEY_PATH_DEFAULT)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{path} is an age envelope but the daily identity is not loaded: "
+                f"{exc}. Set {_ks.DAILY_PASSPHRASE_ENV_VAR} and ensure "
+                f"{_ks.DAILY_KEY_PATH_DEFAULT} exists."
+            ) from exc
+        return age_decrypt_bytes(raw, [identity])
     if raw.startswith(PMEM1_MAGIC):
         return decrypt_bytes(raw[len(PMEM1_MAGIC) :])
     return raw
@@ -469,14 +483,18 @@ class ModeProbe:
     Attributes
     ----------
     encrypted_paths:
-        Files carrying the PMEM1 envelope magic.
+        Files carrying the PMEM1 envelope magic. Legacy Fernet ciphertext.
+    age_paths:
+        Files carrying the age v1 envelope magic. Decryptable with the
+        loaded daily identity.
     plaintext_paths:
-        Files that do NOT carry the magic but fall under the §4 encrypted-
-        infrastructure list.  These are the targets of ``paramem
+        Files that carry neither encryption magic but fall under the §4
+        encrypted-infrastructure list.  These are the targets of ``paramem
         encrypt-infra`` migration.
     """
 
     encrypted_paths: list[Path] = field(default_factory=list)
+    age_paths: list[Path] = field(default_factory=list)
     plaintext_paths: list[Path] = field(default_factory=list)
 
 
@@ -559,76 +577,127 @@ def _probe_data_dir(data_dir: Path) -> ModeProbe:
             continue
         if is_pmem1_envelope(path):
             probe.encrypted_paths.append(path)
+        elif is_age_envelope(path):
+            probe.age_paths.append(path)
         else:
             probe.plaintext_paths.append(path)
 
     return probe
 
 
-def assert_mode_consistency(data_dir: Path, key_loaded: bool) -> None:
-    """Refuse startup on mode mismatch (SECURITY.md §4, 4-case matrix).
+def assert_mode_consistency(
+    data_dir: Path,
+    key_loaded: bool,
+    *,
+    daily_identity_loadable: bool = False,
+) -> None:
+    """Refuse startup on mode mismatch; permit transitional age/PMEM1 states.
 
-    Cases (``key`` × ``on-disk``):
+    Extends the original Fernet-only four-case matrix to cover the age
+    envelope format introduced by the two-identity key rollout. The
+    on-disk classifier now distinguishes three file shapes — PMEM1,
+    age, plaintext — and the refusal rules below preserve the spirit of
+    the original: Security-ON cannot cohabit with plaintext, and an
+    encryption magic the server cannot decrypt is a fatal mismatch.
 
-    - (set, encrypted)   → OK, proceed.
-    - (set, plaintext)   → refuse; operator must run ``paramem encrypt-infra``.
-    - (unset, plaintext) → OK, Security OFF mode.
-    - (unset, encrypted) → refuse; operator restores the key or runs
-      ``paramem decrypt-infra --i-accept-plaintext``.
+    Acceptable combinations:
 
-    Mixed on-disk state (some encrypted, some plaintext files present) is
-    also a refuse condition regardless of the key state.  Empty data
-    directories are treated as consistent with either mode.
+    - Empty store                               → OK regardless of keys.
+    - Plaintext only, no keys loaded            → OK (Security OFF).
+    - PMEM1 only, Fernet key loaded             → OK.
+    - age only, daily identity loadable         → OK.
+    - Mixed PMEM1 + age, both keys available    → OK, logged as
+      *transitional* while the age migration is in flight.
+
+    Refusal cases:
+
+    - Plaintext present while any key is loaded → operator must migrate
+      (``paramem encrypt-infra`` for the Fernet path; the future
+      ``paramem migrate-to-age`` for age).
+    - PMEM1 present without the Fernet key      → restore the key or
+      convert plaintext with ``--i-accept-plaintext``.
+    - age present without the daily identity    → set
+      ``PARAMEM_DAILY_PASSPHRASE`` and ensure the daily key file exists.
+    - Mixed age + plaintext, or PMEM1 + plaintext → refuse (same as the
+      legacy matrix).
 
     Parameters
     ----------
     data_dir:
         Root of the data directory.
     key_loaded:
-        Whether a master key is available in the environment.
+        Whether the Fernet master key (``PARAMEM_MASTER_KEY``) is available.
+    daily_identity_loadable:
+        Whether the daily age identity is loadable (passphrase env var set
+        + daily key file exists). Does not force an unwrap; a stale
+        passphrase surfaces on first actual read.
 
     Raises
     ------
     FatalConfigError
-        On any of the three refuse cases, with an operator-actionable
-        message naming the CLI command to use.
+        On any refusal case above, with an operator-actionable message.
     """
+    from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
+
     probe = _probe_data_dir(Path(data_dir))
 
-    has_enc = bool(probe.encrypted_paths)
+    has_pmem1 = bool(probe.encrypted_paths)
+    has_age = bool(probe.age_paths)
     has_pt = bool(probe.plaintext_paths)
 
-    # Mixed on-disk state — refuse regardless of key.
-    if has_enc and has_pt:
-        sample_enc = probe.encrypted_paths[0]
+    # Any mixing of plaintext with an encrypted format is a fatal mismatch.
+    if has_pt and (has_pmem1 or has_age):
+        sample_enc = (probe.encrypted_paths or probe.age_paths)[0]
         sample_pt = probe.plaintext_paths[0]
         raise FatalConfigError(
             "Mixed encryption state on disk: "
             f"{sample_enc} is encrypted but {sample_pt} is plaintext "
-            f"(and {len(probe.encrypted_paths) - 1} other encrypted + "
-            f"{len(probe.plaintext_paths) - 1} other plaintext files). "
+            f"({len(probe.encrypted_paths)} PMEM1, {len(probe.age_paths)} age, "
+            f"{len(probe.plaintext_paths)} plaintext in total). "
             "Run `paramem encrypt-infra` (if key set) or "
             "`paramem decrypt-infra --i-accept-plaintext` (if intentional "
             "plaintext) to reconcile the store."
         )
 
-    if key_loaded and has_pt:
+    # Plaintext files while any key is loaded → encryption enabled but the
+    # store is not migrated. Refuse before writing anything.
+    if has_pt and (key_loaded or daily_identity_loadable):
         raise FatalConfigError(
-            f"{MASTER_KEY_ENV_VAR} is set but {len(probe.plaintext_paths)} "
-            "infrastructure file(s) on disk are plaintext "
-            f"(e.g. {probe.plaintext_paths[0]}). "
+            f"A key is loaded but {len(probe.plaintext_paths)} infrastructure "
+            f"file(s) on disk are plaintext (e.g. {probe.plaintext_paths[0]}). "
             "Run `paramem encrypt-infra` to migrate the store before startup."
         )
 
-    if not key_loaded and has_enc:
+    # PMEM1 files present without the Fernet key → unreadable.
+    if has_pmem1 and not key_loaded:
         raise FatalConfigError(
             f"{MASTER_KEY_ENV_VAR} is not set but {len(probe.encrypted_paths)} "
-            "infrastructure file(s) on disk are encrypted "
+            "infrastructure file(s) on disk are PMEM1-encrypted "
             f"(e.g. {probe.encrypted_paths[0]}). "
             f"Restore the key (via {MASTER_KEY_ENV_VAR} env var) or run "
             "`paramem decrypt-infra --i-accept-plaintext` to convert the "
             "store to plaintext."
         )
 
-    # (set, encrypted) or (unset, plaintext) or empty store → OK.
+    # age files present without the daily identity → unreadable.
+    if has_age and not daily_identity_loadable:
+        raise FatalConfigError(
+            f"{len(probe.age_paths)} infrastructure file(s) on disk are age-"
+            f"encrypted (e.g. {probe.age_paths[0]}) but the daily identity "
+            f"is not loadable. Set {DAILY_PASSPHRASE_ENV_VAR} and ensure "
+            "~/.config/paramem/daily_key.age exists before startup."
+        )
+
+    # Mixed PMEM1 + age (both decryptable) is a transitional state during the
+    # age migration. Log at WARN so operators see the pending work without
+    # blocking startup.
+    if has_pmem1 and has_age:
+        logger.warning(
+            "Transitional encryption state on disk: %d PMEM1 file(s) alongside "
+            "%d age file(s). Run `paramem migrate-to-age` to complete the flip.",
+            len(probe.encrypted_paths),
+            len(probe.age_paths),
+        )
+
+    # Otherwise the store is consistent with the loaded keys — proceed.
     return

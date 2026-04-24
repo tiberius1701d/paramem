@@ -195,6 +195,67 @@ def load_recovery_recipient(path: Path = RECOVERY_PUB_PATH_DEFAULT) -> x25519.Re
     return recipient_from_bech32(text)
 
 
+_daily_identity_cache: x25519.Identity | None = None
+
+
+def _clear_daily_identity_cache() -> None:
+    """Invalidate the module-level daily-identity cache.
+
+    **Supported operational call** — the daily-key rotation handler calls
+    this after replacing the on-disk envelope or changing the passphrase
+    env var so the next read builds a fresh identity. Never raises; safe
+    to call when the cache is already empty.
+    """
+    global _daily_identity_cache
+    _daily_identity_cache = None
+
+
+def load_daily_identity_cached(
+    path: Path = DAILY_KEY_PATH_DEFAULT,
+    passphrase: str | None = None,
+) -> x25519.Identity:
+    """Return the cached daily identity, loading on first call.
+
+    Mirrors :func:`paramem.backup.encryption._get_cipher`'s lazy-cache shape
+    so the universal read path can unwrap age envelopes without paying the
+    scrypt cost on every decrypt. Subsequent calls re-use the unlocked
+    identity until :func:`_clear_daily_identity_cache` is invoked.
+
+    Raises the same exceptions as :func:`load_daily_identity` on first load;
+    a failed load does not poison the cache (next call retries).
+    """
+    global _daily_identity_cache
+    if _daily_identity_cache is None:
+        _daily_identity_cache = load_daily_identity(path=path, passphrase=passphrase)
+    return _daily_identity_cache
+
+
+def daily_identity_loadable(
+    daily_key_path: Path = DAILY_KEY_PATH_DEFAULT,
+) -> bool:
+    """Return True when the daily identity *can* be loaded without attempting it.
+
+    Probes the two preconditions — the wrapped-key file exists and the
+    passphrase env var is set — without running the scrypt unwrap. Used by
+    startup mode-consistency checks to decide posture without paying the
+    KDF cost. A stale passphrase or tampered envelope still surfaces on the
+    first actual read.
+    """
+    if not daily_passphrase_env_value():
+        return False
+    return Path(daily_key_path).is_file()
+
+
+def recovery_pub_available(path: Path = RECOVERY_PUB_PATH_DEFAULT) -> bool:
+    """Return True when the recovery public-key file exists and is readable.
+
+    Used by the startup log line to decide whether new writes will be
+    multi-recipient (``[daily, recovery]``) or daily-only.
+    """
+    p = Path(path)
+    return p.is_file() and os.access(p, os.R_OK)
+
+
 def load_daily_identity(
     path: Path = DAILY_KEY_PATH_DEFAULT,
     passphrase: str | None = None,
@@ -230,10 +291,13 @@ __all__ = [
     "DAILY_KEY_PATH_DEFAULT",
     "DAILY_PASSPHRASE_ENV_VAR",
     "RECOVERY_PUB_PATH_DEFAULT",
+    "daily_identity_loadable",
     "daily_passphrase_env_value",
     "load_daily_identity",
+    "load_daily_identity_cached",
     "load_recovery_recipient",
     "mint_daily_identity",
+    "recovery_pub_available",
     "wrap_daily_identity",
     "write_daily_key_file",
     "write_recovery_pub_file",

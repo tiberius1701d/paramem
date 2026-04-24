@@ -182,17 +182,27 @@ class TestLifespanSecurityPosture:
         )
 
     def test_lifespan_emits_security_posture_line(self):
-        """lifespan must emit SECURITY: ON/OFF log line per SECURITY.md §4.
+        """lifespan must emit the SECURITY: ON/OFF log line per SECURITY.md §4.
 
-        Pure informational — independent of the mode-consistency wiring.
+        The line content lives in :mod:`paramem.server.security_posture`
+        (factored out so the branching logic is a pure function of the three
+        key-state booleans); the lifespan's job is to invoke that helper and
+        route the result to the right log level. Pin both sides so neither
+        refactor drift nor a stale inline literal sneaks through.
         """
         import inspect
 
         from paramem.server import app as app_module
+        from paramem.server import security_posture as posture_module
 
         source = inspect.getsource(app_module.lifespan)
-        assert "SECURITY: ON" in source
-        assert "SECURITY: OFF" in source
+        assert "security_posture_log_line(" in source, (
+            "lifespan must route through security_posture.security_posture_log_line"
+        )
+
+        posture_source = inspect.getsource(posture_module)
+        assert "SECURITY: ON" in posture_source
+        assert "SECURITY: OFF" in posture_source
 
     def test_lifespan_sets_encryption_state_field(self):
         """lifespan must populate _state['encryption'] so a future /status
