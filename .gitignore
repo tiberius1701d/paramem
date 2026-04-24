@@ -48,7 +48,6 @@ prompt_experiments.md
 early_stopping.md
 test8_operations.md
 security_analysis.md
-SECURITY.md
 scripts/deploy-ha.sh
 
 # Compiled PDFs and build archives
