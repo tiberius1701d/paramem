@@ -94,3 +94,5 @@ ha_automations/
 
 # Internal design plans and follow-up specs (not for public repo)
 docs/
+f52_spec.md
+f52_architecture.md
