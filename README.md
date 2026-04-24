@@ -389,6 +389,16 @@ ParaMem includes a local voice pipeline for privacy-first operation:
 - **Multilingual TTS:** Piper voices per language with MMS-TTS fallback; language detection on the response text, speaker binding so each speaker's preferred voice persists, routed to media players via HA.
 - **Anti-confabulation voice prompt:** a separate system prompt at the voice turn tells the model not to invent facts about the speaker when the parametric memory has nothing to say, and to fall through to the SOTA path cleanly.
 
+## Security
+
+ParaMem encrypts every piece of on-disk infrastructure metadata — registry, knowledge graph, session queue, speaker profiles, backup payloads, HF-Trainer checkpoint shards — at rest. The authoritative operator document is [`SECURITY.md`](SECURITY.md); the short version:
+
+- **Two-identity age X25519 model.** A **daily** identity lives on the host, passphrase-wrapped at `~/.config/paramem/daily_key.age` (mode `0600`). A **recovery** identity is printed once at setup time and stored offline by the operator; only its public recipient (`~/.config/paramem/recovery.pub`) persists on the device. Every on-disk envelope lists both recipients so hardware loss is recoverable from the printed paper alone.
+- **Startup posture.** The server emits one of four `SECURITY:` log lines at startup and surfaces `encryption: on|off` on `/status`. Mode mismatches (plaintext alongside encrypted, or a key missing for on-disk ciphertext) refuse startup with an actionable message rather than degrade silently.
+- **Required env vars for Security-ON:** `PARAMEM_DAILY_PASSPHRASE` (operator-chosen; unlocks the daily age key). Optional: `PARAMEM_API_TOKEN` (bearer token on all REST endpoints; unset = open LAN posture with a loud startup warning), `PARAMEM_LISTEN_IP` / `PARAMEM_NAS_IP` (scope network exposure).
+
+Key lifecycle is driven by the `paramem generate-key` / `migrate-to-age` / `rotate-daily` / `rotate-recovery` / `restore` commands — see [`SECURITY.md`](SECURITY.md) for the first-run walkthrough, threat model, operator responsibilities, and known limitations.
+
 ## Data
 
 Synthetic test data (`data/synthetic/`) is included in the repository. Additional datasets used for benchmarking and probing:
