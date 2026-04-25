@@ -1644,6 +1644,10 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E1530 | 100% | 93.0% | 73.6% |  8.3% | 49.2% |  8.9% | 28.7% | 0.005 |
 | E1560 | 100% | 93.0% | 76.0% |  8.1% | 46.4% | 10.8% | 38.8% | 0.006 |
 | E1590 | 100% | 93.0% | 76.0% |  7.2% | 49.7% |  8.9% | 43.4% | 0.005 |
+| E1620 | 100% | 93.0% | 72.9% | 10.3% | 47.8% |  9.9% | 47.3% | 0.006 |
+| E1650 |  99% | 93.0% | 74.4% | 10.0% | 33.9% |  6.9% | 47.3% | 0.006 |
+| E1680 | 100% | 93.0% | 69.0% |  7.5% | 43.3% |  8.9% | 48.1% | 0.002 |
+| E1710 | 100% | 93.0% | 73.6% | 13.1% | 45.0% |  6.4% | 47.3% | 0.002 |
 
 3-hop breakdown (hub/non-hub/full-chain):
 
@@ -1683,8 +1687,28 @@ Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
 | E1530 | 30/360 |  7/35 (20%) | 23/325 (7%)  | 0 |
 | E1560 | 29/360 |  4/35 (11%) | 25/325 (8%)  | 0 |
 | E1590 | 26/360 |  6/35 (17%) | 20/325 (6%)  | 0 |
+| E1620 | 37/360 |  7/35 (20%) | 30/325 (9%)  | 0 |
+| E1650 | 36/360 |  4/35 (11%) | 32/325 (10%) | 0 |
+| E1680 | 27/360 |  6/35 (17%) | 21/325 (6%)  | 0 |
+| E1710 | 47/360 | 10/35 (29%) | 37/325 (11%) | 0 |
 
-### Key findings (E1590, 53 cycles) — 2026-04-16
+### Key findings (E1710, 57 cycles) — 2026-04-25
+
+Resume E1590→E1710 (4 additional cycles, ~120 epochs overnight) extends the
+pattern without change: no grokking signal. Rephrased oscillates in the
+69-74% band (E1620-E1710: 72.9, 74.4, 69.0, 73.6%), within the long-run
+plateau. 3-hop entity match swings 7.5-13.1% (E1620-E1710: 10.3, 10.0, 7.5,
+13.1%); the E1710 13.1% is the highest in the last 12 cycles but produces
+0/360 full chains, so it remains entity-name lookup landing on the answer
+hub by surface association, not chain reasoning. Shortcut continues to
+oscillate 34-48% and stays strictly above 3-hop at every checkpoint
+(E1620-E1710 ratio sc/3h: 4.6×, 3.4×, 5.8×, 3.4×). Full-chain count remains
+0 across all 57 cycles (cumulative 0/20,520). Keyed stable at 100% with one
+mild blip at c55/E1650 (127/129, 98.5%) that recovered next cycle; direct
+locked at 93.0%. Loss is at floor (~0.002-0.006). The compositional
+crossover has not occurred at 57× convergence.
+
+### Prior findings (E1590, 53 cycles) — superseded by E1710
 
 Resume E1410→E1590 (6 additional cycles, ~180 epochs overnight) reinforces
 the pattern: no grokking signal. Rephrased recovered into the 67-76% band
@@ -1692,9 +1716,7 @@ the pattern: no grokking signal. Rephrased recovered into the 67-76% band
 with no upward trend (E1440-E1590: 9.2, 5.3, 6.9, 8.3, 8.1, 7.2%). Shortcut
 continues to oscillate 41-52% and remains strictly above 3-hop at every
 checkpoint. Full-chain count remains 0 across all 53 cycles. Keyed/direct
-fully stable at 100%/93%. The compositional crossover has not occurred at
-53x convergence; extending further is unlikely to produce a phase transition
-at rank 8.
+fully stable at 100%/93%.
 
 ### Prior findings (E1410, 47 cycles) — superseded by E1590
 
@@ -1799,10 +1821,11 @@ regularization dynamics that drive grokking are engaging.
 
 ### Next steps
 
-1. Continue running — at 35x convergence (E1050), approaching the lower end of
-   grokking literature thresholds (100-10,000x). Target E3,000 (100x) before
-   concluding. Shortcut decline and 3-hop stagnation suggest grokking may not
-   occur at rank 8.
+1. Continue running — at 57× convergence (E1710), still below the 100×
+   threshold from the grokking literature (100-10,000×). Target E3,000 (100×)
+   before concluding. Shortcut oscillation and 3-hop stagnation suggest
+   grokking may not occur at rank 8, but the lower bound of the literature
+   threshold has not yet been reached.
 2. ~~**Test 10b**: evaluate diverse question forms~~ — COMPLETE (see below).
 3. Same-question overlap analysis: check if the same 3-hop questions succeed
    across probes to distinguish partial learning from noise.
@@ -1979,6 +2002,34 @@ base model, due to `prepare_inputs_for_generation` patching and dtype
 casting path differences in the PeftModel wrapper. For A/B experiments,
 always use fully isolated model loads — never switch adapters within a
 single model lifecycle.
+
+---
+
+## Test 12: Contradiction-Learning Probe (merged into Test 13)
+
+**Status:** RESOLVED — merged into Test 13 (2026-04-22).
+
+The originally-scoped Test 12 was a 1–3 day Mistral 7B A/B/C probe of the
+"key + Q stay, only A is replaced" hypothesis: identifier circuit already
+encoded, only the answer-producing path needs to shift, so retraining
+should converge in fewer epochs than fresh keys. Test 13 implemented the
+same A/B/C design at N=200 with an added C2 fill phase, and answered the
+contradiction-learning question directly:
+
+- **Phase B (answer-swap)** = the contradiction case. stable_perfect at
+  e18 vs Phase A's full convergence — warm-start is real on swapped keys.
+  Retention on the 160 unchanged keys collapsed to 5.6% — warm-start is
+  not a safe in-place rewrite.
+- **Phase C2 (scaffold-then-fill)** = the placeholder variant. e11 fill,
+  zero placeholder leakage, 37.5% retention.
+
+Full results in §"Test 13: Placeholder Generalization (Journal-Scaffold)"
+below; retention curve and latent-recovery follow-up in §"Test 13b". No
+separate Test 12 script was run — the question is answered.
+
+`experiments/test12_session_cohort_smoke.py` is unrelated: a multi-adapter
+session-cohort decision gate (ran 2026-04-18). Same number, different
+scope.
 
 ---
 
