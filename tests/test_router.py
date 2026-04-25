@@ -11,6 +11,7 @@ from paramem.server.router import (
     MAX_KEYS_PER_QUERY,
     QueryRouter,
     _interim_sort_key,
+    _is_declarative,
     _is_interrogative,
 )
 
@@ -114,6 +115,58 @@ class TestIsInterrogative:
 
     def test_single_word_imperative(self):
         assert _is_interrogative("Turn") is False
+
+
+class TestIsDeclarative:
+    """Pronoun- / possessive-fronted statements must NOT be classified as
+    imperatives by the no-entity-match fallback. Without this gate, the
+    introduction "I'm Alex…" was routed to HA as a device command,
+    silently blocked by the sanitizer, and ultimately answered by the
+    base model inventing a "tell me about myself" question to fit its
+    personal-assistant role.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "I'm Alex.",
+            "I am Alex.",
+            "I'm 50 years old.",
+            "I have a dog.",
+            "I've been to Berlin.",
+            "We had dinner at six.",
+            "We're going camping.",
+            "My wife is named Pat.",
+            "My favourite colour is blue.",
+            "Our daughter just started school.",
+            "She's coming home tomorrow.",
+            "He's the one who called.",
+            "It's already late.",
+            "They left after lunch.",
+            "This is fine.",
+            "That worked.",
+            "There is no time.",
+            "Your guess is as good as mine.",
+        ],
+    )
+    def test_pronoun_and_possessive_openings_are_declarative(self, text: str):
+        assert _is_declarative(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Turn on the kitchen light",
+            "Set the thermostat to 20 degrees",
+            "Play music in the living room",
+            "Lock the front door",
+            "Remind me at 8 AM",
+            "What is the temperature?",
+            "Where is my phone?",
+            "",
+        ],
+    )
+    def test_imperatives_and_questions_are_not_declarative(self, text: str):
+        assert _is_declarative(text) is False
 
 
 # ---------------------------------------------------------------------------

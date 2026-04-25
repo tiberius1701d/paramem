@@ -104,6 +104,57 @@ _INTERROGATIVE_PREFIXES = frozenset(
 )
 
 
+# Declarative openings — pronoun- or possessive-fronted statements ("I'm Alex",
+# "We had dinner", "My wife is here"). The imperative fallback below uses this
+# to avoid misclassifying personal statements as device commands. Imperative
+# English typically opens with a base-form verb ("play", "turn on", "set"),
+# never with a subject pronoun or possessive.
+_DECLARATIVE_PREFIXES = frozenset(
+    {
+        "i",
+        "i'm",
+        "i'd",
+        "i've",
+        "i'll",
+        "we",
+        "we're",
+        "we'd",
+        "we've",
+        "we'll",
+        "you",
+        "you're",
+        "you'd",
+        "you've",
+        "you'll",
+        "he",
+        "he's",
+        "he'd",
+        "she",
+        "she's",
+        "she'd",
+        "it",
+        "it's",
+        "it'd",
+        "they",
+        "they're",
+        "they'd",
+        "they've",
+        "they'll",
+        "this",
+        "that",
+        "these",
+        "those",
+        "there",
+        "my",
+        "our",
+        "your",
+        "his",
+        "her",
+        "their",
+    }
+)
+
+
 def _is_interrogative(text: str) -> bool:
     """Check if the query is a question (not an imperative command)."""
     first_word = text.strip().split()[0].lower() if text.strip() else ""
@@ -111,6 +162,12 @@ def _is_interrogative(text: str) -> bool:
     if first_word.endswith("'s"):
         first_word = first_word[:-2]
     return first_word in _INTERROGATIVE_PREFIXES
+
+
+def _is_declarative(text: str) -> bool:
+    """First-word heuristic for pronoun/possessive-fronted statements."""
+    first_word = text.strip().split()[0].lower() if text.strip() else ""
+    return first_word in _DECLARATIVE_PREFIXES
 
 
 class QueryRouter:
@@ -294,7 +351,17 @@ class QueryRouter:
         # agent can resolve the intent — it's better equipped than the routing
         # layer to handle commands that don't name a specific entity.
         # Interrogatives stay on the SOTA path (knowledge/reasoning questions).
-        if match_source == "none" and self._ha_graph is not None and not _is_interrogative(text):
+        # Pronoun- or possessive-fronted statements ("I'm Alex", "My wife
+        # is here") are declarative and stay off the HA path — without this
+        # gate they were classified as imperatives and routed to HA, which
+        # the sanitizer then blocked, leaving _base_model_answer to invent
+        # an implicit question to answer.
+        if (
+            match_source == "none"
+            and self._ha_graph is not None
+            and not _is_interrogative(text)
+            and not _is_declarative(text)
+        ):
             match_source = "ha"
             imperative = True
             logger.info("Imperative fallback: no entity match, routing to HA agent")

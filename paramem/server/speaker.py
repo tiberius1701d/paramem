@@ -535,6 +535,22 @@ class SpeakerStore:
         profile = self._profiles.get(speaker_id)
         return profile["name"] if profile else None
 
+    def is_anonymous(self, speaker_id: str | None) -> bool:
+        """True if the profile is voice-promoted but not yet name-disclosed.
+
+        Anonymous profiles carry the canonical ``Speaker{N}`` form as both ID
+        and ``name`` — it is an internal handle, not a salutation. Callers
+        constructing user-facing text (greeting prefix, system-prompt
+        ``"You are speaking with X"`` strings) consult this to suppress the
+        canonical token until self-introduction is processed.
+        """
+        if not speaker_id:
+            return False
+        profile = self._profiles.get(speaker_id)
+        if profile is None:
+            return False
+        return profile.get("enroll_method") == "anonymous_voice"
+
     def get_preferred_language(self, speaker_id: str) -> str | None:
         """Get the preferred language for a speaker, or None if not set."""
         profile = self._profiles.get(speaker_id)

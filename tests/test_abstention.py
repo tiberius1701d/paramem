@@ -92,7 +92,7 @@ class TestAbstentionShortCircuit:
             result = handle_chat(
                 text="Where do I live?",
                 conversation_id="test",
-                speaker="Tobias",
+                speaker="Alex",
                 history=None,
                 model=self._minimal_mock_model(),
                 tokenizer=MagicMock(),
@@ -137,6 +137,48 @@ class TestAbstentionShortCircuit:
         assert result.text == config.abstention.response
         mock_base_model.assert_not_called()
 
+    def test_self_introduction_falls_through_to_base_model(self):
+        """Statement-form personal content (self-introduction, fact-sharing)
+        is not a confabulation risk — the user is the source of the facts in
+        the same turn — so the abstention must NOT fire even though the
+        sanitizer blocks the cloud path. Without this, the user gets
+        ``"I don't have that information stored yet."`` in response to
+        ``"I'm Alex. I live in Kelkham."`` instead of a conversational
+        acknowledgement.
+        """
+        from paramem.server.inference import ChatResult, handle_chat
+
+        config = ServerConfig()
+
+        with (
+            patch(
+                "paramem.server.inference.sanitize_for_cloud",
+                return_value=(None, ["personal_claim", "possessive_personal"]),
+            ),
+            patch(
+                "paramem.server.inference._base_model_answer",
+                return_value=ChatResult(text="Nice to meet you, Alex."),
+            ) as mock_base_model,
+            patch(
+                "paramem.server.inference.detect_temporal_query",
+                return_value=None,
+            ),
+        ):
+            result = handle_chat(
+                text="I'm Alex. I live in Kelkham with my wife Pat.",
+                conversation_id="test",
+                speaker=None,
+                history=None,
+                model=self._minimal_mock_model(),
+                tokenizer=MagicMock(),
+                config=config,
+                router=self._make_none_match_router(),
+                speaker_id="spk-anon-1",
+            )
+
+        mock_base_model.assert_called_once()
+        assert result.text != config.abstention.response
+
     def test_disabled_falls_through_to_base_model(self):
         """With abstention.enabled=False, behavior matches pre-change:
         last-resort ``_base_model_answer`` still runs."""
@@ -162,7 +204,7 @@ class TestAbstentionShortCircuit:
             result = handle_chat(
                 text="Where do I live?",
                 conversation_id="test",
-                speaker="Tobias",
+                speaker="Alex",
                 history=None,
                 model=self._minimal_mock_model(),
                 tokenizer=MagicMock(),
@@ -199,7 +241,7 @@ class TestAbstentionShortCircuit:
             result = handle_chat(
                 text="What's the weather?",
                 conversation_id="test",
-                speaker="Tobias",
+                speaker="Alex",
                 history=None,
                 model=self._minimal_mock_model(),
                 tokenizer=MagicMock(),
@@ -242,7 +284,7 @@ class TestAbstentionShortCircuit:
             result = handle_chat(
                 text="What's the weather?",
                 conversation_id="test",
-                speaker="Tobias",
+                speaker="Alex",
                 history=None,
                 model=self._minimal_mock_model(),
                 tokenizer=MagicMock(),

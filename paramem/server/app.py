@@ -126,12 +126,10 @@ _state = {
     "latest_embedding": None,
     "latest_language_detection": None,  # {language: str, probability: float}
     "last_chat_time": None,
-    "enrollment_task": None,
     "pending_enrollments": set(),
-    # Unknown speaker groups: temp_id → {embeddings, conversations, first_seen}
-    # Thread safety: both the chat handler and enrollment loop run on the asyncio
-    # event loop (cooperative scheduling). Mutations are synchronous within each
-    # handler, so no interleaving within a single dict operation. Safe without locks.
+    # Unknown speaker groups: temp_id → {embeddings, conversations, first_seen}.
+    # Mutations happen on the asyncio event loop (cooperative scheduling).
+    # Safe without locks.
     "unknown_speakers": {},
     "migration": None,  # MigrationStashState — populated in lifespan
     "server_started_at": "",  # ISO-8601 UTC timestamp set in lifespan
@@ -1454,10 +1452,9 @@ async def lifespan(app: FastAPI):
     if cloud_only and not _state.get("cloud_only_startup", False):
         reclaim_interval = config.server.reclaim_interval_minutes
         _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
-    # Deferred enrollment: start idle loop (all state lives in RAM)
-    if not cloud_only and config.speaker.enabled:
-        idle_timeout = config.speaker.enrollment_idle_timeout
-        _state["enrollment_task"] = asyncio.create_task(_enrollment_idle_loop(idle_timeout))
+    # Speaker enrollment is utterance-driven: the chat handler invokes
+    # _run_enrollment_for_group synchronously when a self-introduction
+    # marker fires. There is no idle-driven background loop.
     if _state.get("config_path"):
         _state["config_drift_task"] = asyncio.create_task(
             drift_poll_loop(Path(_state["config_path"]), _state)
@@ -1561,8 +1558,6 @@ async def lifespan(app: FastAPI):
 
     if _state.get("reclaim_task"):
         _state["reclaim_task"].cancel()
-    if _state.get("enrollment_task"):
-        _state["enrollment_task"].cancel()
     if _state.get("config_drift_task"):
         _state["config_drift_task"].cancel()
     wyoming_server = _state.get("wyoming_server")
@@ -1740,6 +1735,29 @@ async def chat(request: ChatRequest):
     except Exception:
         logger.exception("Speaker enrollment failed — continuing without enrollment")
 
+    # Run the LLM enrollment helper on every anonymous turn that carries
+    # a voice embedding. The LLM extractor is the sole filter — it
+    # returns NONE on non-introductions, so non-intro turns have no
+    # side effect, only the extraction latency. This matches the
+    # original mechanism's "LLM as filter" principle and avoids the
+    # fragility of pattern-matching introduction phrasings. Operates on
+    # speaker_id directly so it works for both freshly-promoted voices
+    # and returning anonymous speakers (whose unknown_speakers group is
+    # gone after the server restart that allocated their Speaker{N}).
+    try:
+        if speaker_id and store and store.is_anonymous(speaker_id) and request.speaker_embedding:
+            extracted = await _run_enrollment_for_speaker(
+                speaker_id,
+                request.conversation_id,
+                request.speaker_embedding,
+                extra_turns=[{"role": "user", "text": request.text}],
+            )
+            if extracted:
+                speaker = extracted
+                follow_up = None  # already enrolled; no need to ask again
+    except Exception:
+        logger.exception("Enrollment trigger failed — re-prompt will fire on next anonymous turn")
+
     # Update speaker language preference from STT detection
     tts_config = _state["config"].tts
     if speaker_id and store and detected_language and detected_language_prob > 0:
@@ -1764,20 +1782,32 @@ async def chat(request: ChatRequest):
     # Replace detected_language with the resolved effective language
     detected_language = effective_language
 
+    # User-facing salutation: suppress the canonical "Speaker{N}" token for
+    # voice-promoted but undisclosed profiles. Internal speaker_id is kept
+    # for attribution; only the display name is dropped so the greeting
+    # prefix and the system-prompt "You are speaking with X" string skip the
+    # robotic label until the user introduces themselves.
+    display_speaker: str | None = speaker
+    if speaker_id and store and store.is_anonymous(speaker_id):
+        display_speaker = None
+
     # Check greeting before routing (applies to all paths)
     greeting_prefix = None
     greeting_interval = _state["config"].voice.greeting_interval_hours
-    if speaker and speaker_id and store and greeting_interval > 0:
+    if speaker_id and store and greeting_interval > 0:
         greeting = store.should_greet(speaker_id, greeting_interval)
         if greeting:
-            greeting_prefix = f"{greeting}, {speaker}. "
+            if display_speaker:
+                greeting_prefix = f"{greeting}, {display_speaker}. "
+            else:
+                greeting_prefix = f"{greeting}. "
             store.confirm_greeting(speaker_id)
 
     # Cloud-only mode — route via HA graph + SOTA, no local model
     if _state["mode"] == "cloud-only":
         result = _cloud_only_route(
             text=request.text,
-            speaker=speaker,
+            speaker=display_speaker,
             history=request.history,
             config=_state["config"],
             router=_state.get("router"),
@@ -1818,7 +1848,7 @@ async def chat(request: ChatRequest):
             lambda: handle_chat(
                 text=request.text,
                 conversation_id=request.conversation_id,
-                speaker=speaker,
+                speaker=display_speaker,
                 speaker_id=speaker_id,
                 history=request.history,
                 model=_state["model"],
@@ -5036,10 +5066,10 @@ def _retro_claim_orphan_sessions() -> int:
     sessions for user turns whose stored embeddings match the speaker at
     high confidence. Idempotent — already-claimed sessions are skipped.
 
-    Runs on the asyncio event loop thread (same thread as `_enrollment_idle_loop`),
-    so there is no lock contention over `SessionBuffer._turns` with the
-    enrollment path. `_extract_and_start_training` runs in an executor but is
-    dispatched only after this function returns.
+    Runs on the asyncio event loop thread, so there is no lock contention
+    over `SessionBuffer._turns` with the chat handler's enrollment trigger
+    (also event-loop-bound). `_extract_and_start_training` runs in an
+    executor but is dispatched only after this function returns.
 
     A corrupt profile or session must not take down the entire tick —
     each speaker is wrapped independently.
@@ -5349,13 +5379,16 @@ def _finalize_background_training(loop, jobs_data=None):
     logger.info("Background training complete — %d keys saved", total_keys)
 
 
-# --- Deferred speaker enrollment ---
+# --- Speaker enrollment (utterance-driven) ---
 #
 # When an unknown speaker talks, their voice embedding is stored alongside
-# each transcript turn. After an idle timeout (no /chat requests), the local
-# model extracts the speaker's self-introduced name from the transcript.
-# This replaces fragile regex-based name extraction with LLM reasoning.
-#
+# each transcript turn and a canonical Speaker{N} ID is allocated. The
+# chat handler then invokes _run_enrollment_for_group synchronously on
+# every anonymous turn so the LLM extractor and the follow-on
+# store.enroll / claim_sessions / cleanup run before the response is
+# rendered. The LLM is the sole filter — non-introduction turns return
+# NONE and have no side effect. There is no background idle loop and
+# no regex pre-filter; the user's own utterance is always the trigger.
 
 
 def _extract_name_via_llm(
@@ -5415,120 +5448,86 @@ def _extract_name_via_llm(
     return result
 
 
-async def _enrollment_idle_loop(idle_timeout_seconds: int):
-    """Background task: extract speaker names via LLM after idle timeout.
+async def _run_enrollment_for_speaker(
+    speaker_id: str,
+    conv_id: str,
+    embedding: list[float],
+    *,
+    extra_turns: list[dict] | None = None,
+) -> str | None:
+    """Extract speaker name for an anonymous profile and apply enrollment.
 
-    Only runs when mode == 'local' (GPU available). Check interval configurable.
-    Aborts the current batch if a new /chat request arrives.
-    On cancellation (shutdown), flushes any pending speaker profile writes.
+    Invoked synchronously by the chat handler on every anonymous turn.
+    The live turn is passed through ``extra_turns`` so the LLM sees it
+    without waiting for the post-handler buffer append. The LLM is the
+    sole filter — non-introduction turns return None and have no side
+    effect (no enroll, no buffer mutation, no cleanup).
+
+    Works for both freshly-promoted and returning anonymous speakers:
+    operates on the speaker_id + voice embedding directly, without
+    relying on a transient ``unknown_speakers`` group (which exists only
+    for new voices in the current server lifetime).
+
+    Returns the enrolled name on success, or ``None`` (extractor returned
+    NONE / voice already enrolled under a different profile / no turns
+    / model not loaded). On success: store profile is upgraded in place
+    (speaker_id preserved), this conversation is attributed, cross-
+    session orphan sessions are retro-claimed via voice matching, and
+    any in-memory ``unknown_speakers`` group containing this conv is
+    dropped along with its ``pending_enrollments`` entries.
     """
-    check_interval = _state["config"].speaker.enrollment_check_interval
+    buffer = _state["session_buffer"]
+    store = _state.get("speaker_store")
+    model = _state.get("model")
+    tokenizer = _state.get("tokenizer")
 
-    try:
-        await _enrollment_idle_loop_inner(idle_timeout_seconds, check_interval)
-    except asyncio.CancelledError:
-        store = _state.get("speaker_store")
-        if store:
-            store.flush()
-        raise
+    if not store or not model or not tokenizer:
+        return None
 
+    all_turns: list[dict] = list(extra_turns) if extra_turns else []
+    all_turns.extend(buffer.get_session_turns(conv_id))
 
-async def _enrollment_idle_loop_inner(idle_timeout_seconds: int, check_interval: int):
-    """Inner loop — separated so the outer wrapper can catch CancelledError."""
-    while True:
-        await asyncio.sleep(check_interval)
+    if not all_turns:
+        return None
 
-        if _state["mode"] != "local":
-            continue
-        if not _state.get("pending_enrollments"):
-            continue
-        last_chat = _state.get("last_chat_time")
-        if not last_chat:
-            continue
-        elapsed = (datetime.now(timezone.utc) - last_chat).total_seconds()
-        if elapsed < idle_timeout_seconds:
-            continue
+    from paramem.server.gpu_lock import gpu_lock
 
-        buffer = _state["session_buffer"]
-        store = _state.get("speaker_store")
-        model = _state.get("model")
-        tokenizer = _state.get("tokenizer")
+    async with gpu_lock():
+        loop = asyncio.get_running_loop()
+        extracted = await loop.run_in_executor(
+            None,
+            lambda t=all_turns: _extract_name_via_llm(t, model, tokenizer),
+        )
 
-        if not store or not model or not tokenizer:
-            continue
+    if not extracted:
+        return None
 
-        from paramem.server.gpu_lock import gpu_lock
+    new_id = store.enroll(extracted, embedding)
+    if not new_id:
+        logger.info("Enrollment skipped for %s (voice already enrolled)", speaker_id)
+        return None
+    if new_id != speaker_id:
+        # Voice matched a different (named) profile — the chat handler will
+        # see the corrected speaker on the next turn via _resolve_speaker.
+        logger.info("Enrollment redirected: voice resolved to %s (was %s)", new_id, speaker_id)
 
-        # Process each unknown speaker group
-        group_ids = list(_state["unknown_speakers"].keys())
-        for group_id in group_ids:
-            # Abort if new activity arrived
-            new_last = _state.get("last_chat_time")
-            if new_last and new_last != last_chat:
-                logger.info("Enrollment deferred: new /chat activity detected")
-                break
-
-            group = _state["unknown_speakers"].get(group_id)
-            if not group:
-                continue
-
-            # Collect all turns across this group's conversations
-            all_turns = []
-            for conv_id in group["conversations"]:
-                all_turns.extend(buffer.get_session_turns(conv_id))
-
-            if not all_turns:
-                _state["pending_enrollments"] -= group["conversations"]
-                del _state["unknown_speakers"][group_id]
-                continue
-
-            # Skip re-extraction when no new turns arrived since last attempt.
-            if len(all_turns) == group.get("last_extract_turn_count", 0):
-                continue
-            group["last_extract_turn_count"] = len(all_turns)
-
-            async with gpu_lock():
-                loop = asyncio.get_running_loop()
-                extracted = await loop.run_in_executor(
-                    None,
-                    lambda t=all_turns: _extract_name_via_llm(t, model, tokenizer),
-                )
-
-            if extracted:
-                from paramem.server.speaker import compute_centroid
-
-                ref_embedding = compute_centroid(group["embeddings"])
-                new_id = store.enroll(extracted, ref_embedding)
-                if new_id:
-                    # Attribute all grouped conversations
-                    for conv_id in group["conversations"]:
-                        buffer.set_speaker(conv_id, new_id, extracted)
-                    claimed = buffer.claim_sessions_for_speaker(new_id, extracted, store)
-                    logger.info(
-                        "Deferred enrollment: %s (id=%s, group %s), claimed %d sessions",
-                        extracted,
-                        new_id,
-                        group_id,
-                        claimed,
-                    )
-                    _state["pending_enrollments"] -= group["conversations"]
-                    del _state["unknown_speakers"][group_id]
-                else:
-                    logger.info(
-                        "Deferred enrollment skipped for group %s (voice already enrolled)",
-                        group_id,
-                    )
-                    _state["pending_enrollments"] -= group["conversations"]
-                    del _state["unknown_speakers"][group_id]
-            else:
-                # Retain group: speaker may introduce themselves in a later
-                # utterance, or retro-claim may match them to an existing
-                # profile, or an admin may attach manually. Re-prompt fires
-                # via per-group cooldown on the next utterance after interval.
-                logger.info(
-                    "No self-introduction found in group %s — retaining for re-prompt",
-                    group_id,
-                )
+    buffer.set_speaker(conv_id, new_id, extracted)
+    claimed = buffer.claim_sessions_for_speaker(new_id, extracted, store)
+    _state["pending_enrollments"].discard(conv_id)
+    for _gid, _g in list(_state["unknown_speakers"].items()):
+        if conv_id in _g["conversations"]:
+            for _cid in _g["conversations"]:
+                _state["pending_enrollments"].discard(_cid)
+            del _state["unknown_speakers"][_gid]
+            break
+    logger.info(
+        "Enrollment for conv %s: %s (id=%s, claimed %d sessions)",
+        conv_id,
+        extracted,
+        new_id,
+        claimed,
+    )
+    return extracted
 
 
 # --- GPU lifecycle ---

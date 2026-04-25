@@ -707,6 +707,38 @@ class TestRegisterAnonymous:
         assert store.get_name(anon_id) == anon_id
 
 
+class TestIsAnonymous:
+    """``is_anonymous`` lets user-facing text suppress the canonical
+    ``Speaker{N}`` token until the profile is name-disclosed."""
+
+    def test_anonymous_profile_is_anonymous(self, tmp_path, sample_embedding):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        anon_id = store.register_anonymous(sample_embedding)
+        assert store.is_anonymous(anon_id) is True
+
+    def test_named_profile_is_not_anonymous(self, tmp_path, sample_embedding):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        named_id = store.enroll("Alice", sample_embedding)
+        assert store.is_anonymous(named_id) is False
+
+    def test_upgrade_flips_anonymous_to_named(self, tmp_path, sample_embedding):
+        """After register_anonymous → enroll, the same speaker_id stops
+        being reported as anonymous. This is the path that lets the
+        greeting prefix start using the real name on the very next turn."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        anon_id = store.register_anonymous(sample_embedding)
+        assert store.is_anonymous(anon_id) is True
+        upgraded_id = store.enroll("Alice", sample_embedding)
+        assert upgraded_id == anon_id
+        assert store.is_anonymous(anon_id) is False
+
+    def test_unknown_or_none_id_is_not_anonymous(self, tmp_path):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        assert store.is_anonymous(None) is False
+        assert store.is_anonymous("") is False
+        assert store.is_anonymous("nonexistent") is False
+
+
 # ---------------------------------------------------------------------------
 # enroll() upgrade-in-place for anonymous profiles (Fix 1)
 # ---------------------------------------------------------------------------

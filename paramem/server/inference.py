@@ -305,11 +305,19 @@ def handle_chat(
     else:
         logger.info("Sanitizer blocked query: %s", sanitization_findings)
 
-    # Abstention: no local match + sanitizer blocked cloud → canned response.
+    # Abstention: self-referential query with no local match → canned response.
     # The bare base model would otherwise confabulate personal data here
     # (e.g. "Where do I live?" → "New York City" on an untrained adapter).
-    if sanitized_text is None and config.abstention.enabled:
-        logger.info("Abstention: no local match + sanitizer blocked cloud")
+    # Personal-claim / possessive findings in *statements* (introductions,
+    # fact-sharing) are not a confabulation risk — the user is the source of
+    # the facts in the same turn — so they fall through to the base model
+    # for conversational acknowledgement.
+    if (
+        sanitized_text is None
+        and config.abstention.enabled
+        and "self_referential" in sanitization_findings
+    ):
+        logger.info("Abstention: self-referential query + no local match")
         return ChatResult(text=config.abstention.response)
 
     # All cloud services failed — local base model as last resort

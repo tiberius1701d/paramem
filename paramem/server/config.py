@@ -522,9 +522,7 @@ class SpeakerConfig:
     low_confidence_threshold: float = 0.45
     store_path: str = ""  # empty = default (data/ha/speaker_profiles.json)
     enrollment_prompt: str = "By the way, I don't think we've met yet. Please introduce yourself."
-    enrollment_idle_timeout: int = 120  # seconds of /chat silence before LLM name extraction
     enrollment_reprompt_interval: int = 600  # seconds between re-prompting unknown speakers
-    enrollment_check_interval: int = 15  # seconds between idle-loop checks
     # Discard embeddings from utterances shorter than this; pyannote needs sustained voice.
     min_embedding_duration_seconds: float = 1.0
     max_embeddings_per_profile: int = 50  # cap on stored embeddings per speaker

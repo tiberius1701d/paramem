@@ -220,9 +220,14 @@ def test_personalize_prompt_with_language():
     assert "Respond in German" in result
     assert "Alice" in result
 
-    # No speaker, with language
+    # No speaker, with language — no "You are speaking with" salutation,
+    # which is what the chat handler relies on when it suppresses the
+    # canonical "Speaker{N}" token for voice-promoted but undisclosed
+    # profiles. Otherwise the LLM would echo "Speaker0" / "speaker store"
+    # in its response.
     result = _personalize_prompt(base, None, "fr")
     assert "Respond in French" in result
+    assert "You are speaking with" not in result
 
 
 # --- Speaker language preference ---
