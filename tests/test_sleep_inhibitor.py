@@ -1,11 +1,18 @@
-"""Tests for _SleepInhibitor in experiments/utils/gpu_guard.py.
+"""Tests for WSLPowerShellInhibitor (the original _SleepInhibitor).
 
+Updated to patch at gpu_guard.inhibitor after extraction from paramem.
 All PowerShell execution is mocked — no real child process is spawned.
 """
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock, patch
 
-from experiments.utils.gpu_guard import _is_wsl2, _SleepInhibitor
+from gpu_guard.inhibitor import WSLPowerShellInhibitor, _is_wsl2
+
+# Backward-compatible alias: existing callers use _SleepInhibitor.
+_SleepInhibitor = WSLPowerShellInhibitor
+
 
 # ---------------------------------------------------------------------------
 # _is_wsl2 detection
@@ -43,28 +50,24 @@ class TestIsWsl2:
 
 
 # ---------------------------------------------------------------------------
-# _SleepInhibitor
+# _SleepInhibitor (WSLPowerShellInhibitor)
 # ---------------------------------------------------------------------------
 
 
 class TestSleepInhibitor:
-    def _make_mock_proc(self):
+    def _make_mock_proc(self) -> MagicMock:
         proc = MagicMock()
         proc.pid = 12345
         proc.kill = MagicMock()
         proc.wait = MagicMock(return_value=0)
         return proc
 
-    # --- start / stop lifecycle ---
-
     def test_start_and_stop_on_wsl2(self):
         """start() spawns a process on WSL2; stop() kills and reaps it."""
         mock_proc = self._make_mock_proc()
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=True),
-            patch(
-                "experiments.utils.gpu_guard.subprocess.Popen", return_value=mock_proc
-            ) as mock_popen,
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=True),
+            patch("gpu_guard.inhibitor.subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             inhibitor = _SleepInhibitor()
             inhibitor.start()
@@ -81,8 +84,8 @@ class TestSleepInhibitor:
     def test_start_is_noop_on_non_wsl2(self):
         """start() does nothing on native Linux."""
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=False),
-            patch("experiments.utils.gpu_guard.subprocess.Popen") as mock_popen,
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=False),
+            patch("gpu_guard.inhibitor.subprocess.Popen") as mock_popen,
         ):
             inhibitor = _SleepInhibitor()
             inhibitor.start()
@@ -93,96 +96,92 @@ class TestSleepInhibitor:
     def test_stop_without_start_is_safe(self):
         """stop() can be called before start() without raising."""
         inhibitor = _SleepInhibitor()
-        inhibitor.stop()  # must not raise
-
-    # --- idempotency ---
+        inhibitor.stop()
 
     def test_start_is_idempotent(self):
         """Calling start() twice does not spawn a second process."""
         mock_proc = self._make_mock_proc()
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=True),
-            patch(
-                "experiments.utils.gpu_guard.subprocess.Popen", return_value=mock_proc
-            ) as mock_popen,
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=True),
+            patch("gpu_guard.inhibitor.subprocess.Popen", return_value=mock_proc) as mock_popen,
         ):
             inhibitor = _SleepInhibitor()
             inhibitor.start()
-            inhibitor.start()  # second call — must not spawn again
+            inhibitor.start()
 
             assert mock_popen.call_count == 1
             assert inhibitor._proc is mock_proc
 
             inhibitor.stop()
 
-    # --- atexit registration ---
-
     def test_atexit_registered_on_start(self):
-        """start() registers stop() as an atexit handler on WSL2."""
+        """start() does not register per-instance atexit (module-level handles it)."""
+        # The original test verified atexit.register was called once. The new
+        # design moves atexit registration to the module level (registered at
+        # import time via _module_atexit_stop). Per-instance registration was
+        # moved off __init__ per the design-review fix. This test now verifies
+        # no per-instance registration occurs.
         mock_proc = self._make_mock_proc()
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=True),
-            patch("experiments.utils.gpu_guard.subprocess.Popen", return_value=mock_proc),
-            patch("experiments.utils.gpu_guard.atexit.register") as mock_register,
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=True),
+            patch("gpu_guard.inhibitor.subprocess.Popen", return_value=mock_proc),
+            patch("gpu_guard.inhibitor.atexit.register") as mock_register,
         ):
             inhibitor = _SleepInhibitor()
             inhibitor.start()
 
-            mock_register.assert_called_once_with(inhibitor.stop)
+            # No per-instance handler registered after the module-level fix.
+            mock_register.assert_not_called()
             inhibitor.stop()
 
     def test_atexit_unregistered_on_stop(self):
-        """stop() unregisters the atexit handler."""
+        """stop() does not call atexit.unregister (no per-instance handler to remove)."""
         mock_proc = self._make_mock_proc()
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=True),
-            patch("experiments.utils.gpu_guard.subprocess.Popen", return_value=mock_proc),
-            patch("experiments.utils.gpu_guard.atexit.register"),
-            patch("experiments.utils.gpu_guard.atexit.unregister") as mock_unregister,
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=True),
+            patch("gpu_guard.inhibitor.subprocess.Popen", return_value=mock_proc),
+            patch("gpu_guard.inhibitor.atexit.register"),
+            patch("gpu_guard.inhibitor.atexit.unregister") as mock_unregister,
         ):
             inhibitor = _SleepInhibitor()
             inhibitor.start()
             inhibitor.stop()
 
-            mock_unregister.assert_called_once_with(inhibitor.stop)
+            mock_unregister.assert_not_called()
 
     def test_atexit_not_registered_on_non_wsl2(self):
         """No atexit registration when not WSL2."""
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=False),
-            patch("experiments.utils.gpu_guard.atexit.register") as mock_register,
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=False),
+            patch("gpu_guard.inhibitor.atexit.register") as mock_register,
         ):
             inhibitor = _SleepInhibitor()
             inhibitor.start()
 
             mock_register.assert_not_called()
 
-    # --- graceful handling when powershell is missing ---
-
     def test_start_handles_missing_powershell(self):
         """start() logs a warning and does not raise when powershell.exe is absent."""
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=True),
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=True),
             patch(
-                "experiments.utils.gpu_guard.subprocess.Popen",
+                "gpu_guard.inhibitor.subprocess.Popen",
                 side_effect=FileNotFoundError("powershell.exe not found"),
             ),
         ):
             inhibitor = _SleepInhibitor()
-            inhibitor.start()  # must not raise
+            inhibitor.start()
 
             assert inhibitor._proc is None
-
-    # --- stop tolerates already-dead process ---
 
     def test_stop_tolerates_dead_process(self):
         """stop() does not raise when the child process is already dead."""
         mock_proc = self._make_mock_proc()
         mock_proc.kill.side_effect = ProcessLookupError("no such process")
         with (
-            patch("experiments.utils.gpu_guard._is_wsl2", return_value=True),
-            patch("experiments.utils.gpu_guard.subprocess.Popen", return_value=mock_proc),
+            patch("gpu_guard.inhibitor._is_wsl2", return_value=True),
+            patch("gpu_guard.inhibitor.subprocess.Popen", return_value=mock_proc),
         ):
             inhibitor = _SleepInhibitor()
             inhibitor.start()
-            inhibitor.stop()  # must not raise
+            inhibitor.stop()
