@@ -653,13 +653,15 @@ _show_test_status() {
             return
         fi
         local is_running=""
+        local running_flag=""
         if [[ "$running_test" == "$test_num" ]]; then
             is_running=" ${GREEN}RUNNING${RESET}"
+            running_flag="1"
         fi
         echo ""
         echo -e "  ${BOLD}Test 14${RESET}${is_running}"
         echo "  ────────────────────────────────────────"
-        _show_test14_status "$latest_run_dir"
+        _show_test14_status "$latest_run_dir" "$running_flag"
         return
     fi
 
@@ -1083,8 +1085,14 @@ PYEOF
 }
 
 _show_test14_status() {
-    # Argument: path to the most recent test14 run dir.
+    # Args:
+    #   $1: path to the most recent test14 run dir
+    #   $2: optional "running" flag (any non-empty value = test14 process
+    #       active; suppresses the "Final: complete" line which is misleading
+    #       while extended/scale/multiround phases are mid-flight on top of an
+    #       already-complete phase set).
     local run_dir="$1"
+    local running_flag="${2:-}"
     local model_name=$(basename "$(dirname "$run_dir")")
     local run_name=$(basename "$run_dir")
 
@@ -1222,7 +1230,11 @@ PYEOF
         echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped after phase ${after} — tresume 14 to continue)${RESET}"
     fi
 
-    if [[ -f "$run_dir/results.json" ]]; then
+    # Only show "Final: complete" when no test14 process is running.
+    # results.json may exist (from an earlier 14a-pre completion) while a
+    # subsequent extended / scale / multiround run is mid-flight; in that
+    # case "complete" is misleading.
+    if [[ -f "$run_dir/results.json" && -z "$running_flag" ]]; then
         echo -e "  Final:      ${GREEN}complete${RESET}"
     fi
 }
