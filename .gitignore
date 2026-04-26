@@ -89,6 +89,9 @@ ha_automations/
 # Claude Code local settings
 .claude/
 
+# Operator-local document ingest staging (raw documents + extracted text)
+ingest/
+
 # Orchestrator-internal working docs (handovers, alignment plans, session logs)
 .agent/
 
