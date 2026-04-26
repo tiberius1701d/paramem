@@ -50,6 +50,7 @@ TEST_SCRIPTS["10b"]="experiments/test10b_diverse_rephrase.py"
 TEST_SCRIPTS[11]="experiments/test11_adapter_extraction.py"
 TEST_SCRIPTS[13]="experiments/test13_journal_scaffold.py"
 TEST_SCRIPTS["13b"]="experiments/test13b_retention_curve.py"
+TEST_SCRIPTS[14]="experiments/test14.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
@@ -58,6 +59,7 @@ TEST_OUTPUT_DIRS["10b"]="outputs/test10b_diverse_rephrase"
 TEST_OUTPUT_DIRS[11]="outputs/test11_adapter_extraction"
 TEST_OUTPUT_DIRS[13]="outputs/test13_journal_scaffold"
 TEST_OUTPUT_DIRS["13b"]="outputs/test13b_retention_curve"
+TEST_OUTPUT_DIRS[14]="outputs/test14_pre"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
@@ -66,6 +68,7 @@ TEST_PGREP["10b"]="test10b_diverse_rephrase"
 TEST_PGREP[11]="test11_adapter_extraction"
 TEST_PGREP[13]="test13_journal_scaffold"
 TEST_PGREP["13b"]="test13b_retention_curve"
+TEST_PGREP[14]="test14"
 
 # --- Colors (inherit from gpu-cooldown.sh, add extras) ---
 BLUE='\033[0;34m'
@@ -211,7 +214,7 @@ _find_running_test() {
     # Pattern requires "python" in front of the script name so stray shells
     # with the string in a heredoc/argv (e.g. inline analysis scripts, or
     # zombie wrappers) don't register as a running test.
-    for t in 8 9 10 10b 11 13 13b; do
+    for t in 8 9 10 10b 11 13 13b 14; do
         if pgrep -f "python[^ ]* .*${TEST_PGREP[$t]}" >/dev/null 2>&1; then
             echo "$t"
             return
@@ -384,7 +387,7 @@ training_resume() {
 
     # Validate test number
     if [[ -z "${TEST_SCRIPTS[$test_num]}" ]]; then
-        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b."
+        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14."
         return 1
     fi
 
@@ -453,6 +456,17 @@ training_resume() {
         log_file="$PROJECT_DIR/${TEST_OUTPUT_DIRS[$test_num]}/training.log"
     fi
 
+    # Test 14: detect mode from latest run_config.json so tresume 14 after a
+    # pause resumes the correct mode (pre/scale/multiround) rather than
+    # defaulting to --mode=pre regardless of where the run stopped.
+    if [[ "$test_num" == "14" ]]; then
+        local latest_dir=$(find "$PROJECT_DIR/outputs/test14_pre" "$PROJECT_DIR/outputs/test14a" "$PROJECT_DIR/outputs/test14b" -maxdepth 2 -name "run_config.json" 2>/dev/null | sort | tail -1)
+        if [[ -n "$latest_dir" ]]; then
+            local mode_flag="--mode=$(python3 -c "import json; print(json.load(open('$latest_dir')).get('mode','pre'))" 2>/dev/null)"
+            extra_flags="$mode_flag"
+        fi
+    fi
+
     # Test-specific model defaults
     local model_flag="--model mistral"
 
@@ -462,7 +476,7 @@ training_resume() {
     echo -e "  ${GREEN}Resuming test ${test_num}...${RESET}"
     cd "$PROJECT_DIR" && \
         env $(grep -v '^#' .env | xargs) \
-        nohup "$PYTHON_BIN" "$script" $model_flag $resume_flag \
+        nohup "$PYTHON_BIN" "$script" $model_flag $resume_flag $extra_flags \
         >> "$log_file" 2>&1 &
 
     local pid=$!
@@ -557,7 +571,7 @@ print(labels.get(r, r or ''))
     fi
 
     # Show status for each test (reuses $running from above)
-    for test_num in 8 9 10 10b 11 13 13b; do
+    for test_num in 8 9 10 10b 11 13 13b 14; do
         _show_test_status "$test_num" "$running"
     done
 
@@ -590,6 +604,35 @@ _show_test_status() {
         echo -e "  ${BOLD}Test 13${RESET}${is_running}"
         echo "  ────────────────────────────────────────"
         _show_test13_status "$latest_run_dir"
+        return
+    fi
+
+    # Test 14 uses per-phase *_done.json markers across multiple output dirs.
+    if [[ "$test_num" == "14" ]]; then
+        # Find most recent run across all three test14 output dirs.
+        local latest_run_dir
+        latest_run_dir=$(find \
+            "$PROJECT_DIR/outputs/test14_pre" \
+            "$PROJECT_DIR/outputs/test14a" \
+            "$PROJECT_DIR/outputs/test14b" \
+            -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+        if [[ -z "$latest_run_dir" ]]; then
+            if [[ "$running_test" == "$test_num" ]]; then
+                echo ""
+                echo -e "  ${BOLD}Test 14${RESET} ${GREEN}RUNNING${RESET}"
+                echo "  ────────────────────────────────────────"
+                echo -e "  ${DIM}Preparing run directory...${RESET}"
+            fi
+            return
+        fi
+        local is_running=""
+        if [[ "$running_test" == "$test_num" ]]; then
+            is_running=" ${GREEN}RUNNING${RESET}"
+        fi
+        echo ""
+        echo -e "  ${BOLD}Test 14${RESET}${is_running}"
+        echo "  ────────────────────────────────────────"
+        _show_test14_status "$latest_run_dir"
         return
     fi
 
@@ -1009,6 +1052,129 @@ PYEOF
         echo -e "  State:      ${DIM}starting (data prepared, training not yet begun)${RESET}"
     else
         echo -e "  State:      ${DIM}no progress yet${RESET}"
+    fi
+}
+
+_show_test14_status() {
+    # Argument: path to the most recent test14 run dir.
+    local run_dir="$1"
+    local model_name=$(basename "$(dirname "$run_dir")")
+    local run_name=$(basename "$run_dir")
+
+    echo -e "  Model:      ${CYAN}${model_name}${RESET}"
+    echo -e "  Run:        ${DIM}${run_name}${RESET}"
+
+    # Read mode from run_config.json
+    local mode="unknown"
+    if [[ -f "$run_dir/run_config.json" ]]; then
+        mode=$(python3 -c "import json; print(json.load(open('$run_dir/run_config.json')).get('mode','unknown'))" 2>/dev/null)
+        local n_keys=$(python3 -c "import json; print(json.load(open('$run_dir/run_config.json')).get('n_keys','?'))" 2>/dev/null)
+        echo -e "  Mode:       ${CYAN}${mode}${RESET}  n_keys=${n_keys}"
+    fi
+
+    if [[ "$mode" == "pre" ]]; then
+        # Show per-variant phase summary
+        python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+import json, sys, os
+run_dir = sys.argv[1]
+for variant in ("V1", "V2", "V3"):
+    v_dir = os.path.join(run_dir, variant)
+    if not os.path.isdir(v_dir):
+        continue
+    any_done = False
+    for phase in ("A", "B", "C"):
+        marker = os.path.join(v_dir, phase, f"{phase}_done.json")
+        if not os.path.exists(marker):
+            continue
+        any_done = True
+        try:
+            d = json.load(open(marker))
+        except Exception:
+            continue
+        first = d.get("first_perfect_epoch")
+        stable = d.get("stable_perfect_epoch")
+        n = d.get("n_keys")
+        wall = d.get("wall_seconds")
+        parts = [f"n={n}" if n is not None else None,
+                 f"first={first}" if first is not None else None,
+                 f"stable={stable}" if stable is not None else None,
+                 f"wall={wall:.0f}s" if isinstance(wall, (int, float)) else None]
+        summary = "  ".join(s for s in parts if s)
+        print(f"  {variant}/{phase}:    \x1b[32m✓\x1b[0m {summary}")
+    if not any_done:
+        print(f"  {variant}:      \x1b[2mnot started\x1b[0m")
+if os.path.exists(os.path.join(run_dir, "pre_decision.json")):
+    try:
+        d = json.load(open(os.path.join(run_dir, "pre_decision.json")))
+        winner = d.get("winner", "null")
+        reason = d.get("reason", "")
+        print(f"  Decision:   winner={winner} reason={reason}")
+    except Exception:
+        pass
+PYEOF
+
+    elif [[ "$mode" == "scale" ]]; then
+        python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+import json, sys, os
+run_dir = sys.argv[1]
+for phase in ("A", "B", "C"):
+    marker = os.path.join(run_dir, phase, f"{phase}_done.json")
+    if not os.path.exists(marker):
+        continue
+    try:
+        d = json.load(open(marker))
+    except Exception:
+        continue
+    first = d.get("first_perfect_epoch")
+    stable = d.get("stable_perfect_epoch")
+    n = d.get("n_keys")
+    wall = d.get("wall_seconds")
+    parts = [f"n={n}" if n is not None else None,
+             f"first={first}" if first is not None else None,
+             f"stable={stable}" if stable is not None else None,
+             f"wall={wall:.0f}s" if isinstance(wall, (int, float)) else None]
+    summary = "  ".join(s for s in parts if s)
+    print(f"  {phase}:        \x1b[32m✓\x1b[0m {summary}")
+PYEOF
+
+    elif [[ "$mode" == "multiround" ]]; then
+        python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+import json, sys, os
+run_dir = sys.argv[1]
+for phase in ("P0", "P1", "P2", "P3"):
+    marker = os.path.join(run_dir, f"{phase}_done.json")
+    if not os.path.exists(marker):
+        continue
+    try:
+        d = json.load(open(marker))
+    except Exception:
+        continue
+    if phase == "P0":
+        n = d.get("n_keys")
+        print(f"  P0:        \x1b[32m✓\x1b[0m n_keys={n}")
+    else:
+        ret_pre = d.get("retention_pre_round", {}).get("rate")
+        ret_post = d.get("retention_post_touchup", {}).get("rate")
+        resid = d.get("retention_corruption_residual")
+        stop_ep = d.get("stop_epoch")
+        parts = [f"ret_pre={ret_pre:.3f}" if ret_pre is not None else None,
+                 f"ret_post={ret_post:.3f}" if ret_post is not None else None,
+                 f"resid={resid:.3f}" if resid is not None else None,
+                 f"stop_ep={stop_ep}" if stop_ep is not None else None]
+        summary = "  ".join(s for s in parts if s)
+        print(f"  {phase}:       \x1b[32m✓\x1b[0m {summary}")
+PYEOF
+    fi
+
+    # Paused marker
+    if [[ -f "$run_dir/paused.json" ]]; then
+        local after
+        after=$(python3 -c "import json; print(json.load(open('$run_dir/paused.json')).get('stopped_after_phase','?'))" 2>/dev/null)
+        echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped after phase ${after} — tresume 14 to continue)${RESET}"
+    fi
+
+    if [[ -f "$run_dir/results.json" ]]; then
+        echo -e "  Final:      ${GREEN}complete${RESET}"
     fi
 }
 

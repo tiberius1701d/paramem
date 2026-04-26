@@ -2311,6 +2311,289 @@ also stays deferred.
 
 ---
 
+## Test 14: Content-Free Scaffold + Multi-Round Early-Stop at Scale
+
+**Script:** `experiments/test14.py`
+**Status:** 14a-pre **COMPLETE** (2026-04-26 01:29 → ~17:55, ~16.5 h wall).
+**Winner: V3** (uniform sentinel). 14a (scale V3 to N=500) and 14b
+(multi-round) pending launch — scheduled for the following overnight.
+
+### What it tests
+
+Three open questions in sequence:
+
+1. **Can a content-free scaffold pre-form (key → slot) bindings as well as
+   Test 13's real-Q scaffold?** Test 13 C1 used real PerLTQA question text
+   with `TBD-k` placeholder answers. That structure is not production-reusable
+   because the real Q text isn't known in advance — production builds the
+   scaffold once during silent hours, then fills it as actual conversations
+   arrive. The scaffold must therefore be *content-free* in some shape that
+   still pre-forms the slot binding. Three candidate shapes are tested
+   head-to-head (variants V1/V2/V3 below).
+2. **Does the winning variant scale from N=100 to N=500?** Test 13 validated
+   the scaffold-then-fill mechanism at N=200. Test 8 validated single-adapter
+   capacity to N=550. Test 14a checks that the content-free scaffold (whichever
+   variant 14a-pre selects) holds at N=500.
+3. **Does the early-stop + touch-up loop hold across multi-round writes at
+   scale?** Test 13b's latent-recovery probe established that post-fill
+   forgetting is decoding-alignment, not weight-erasure: 97.9 % of "forgotten"
+   keys recovered with 2 epochs at LR=1e-5 in 3.8 min on a 200-key adapter.
+   Test 14b stresses this primitive with three consecutive 40-key answer-swap
+   rounds on a 500-key carry-forward adapter, measuring whether the recovery
+   pattern holds at scale and across rounds.
+
+### Phases
+
+The program is staged across three test sessions, each runnable
+independently and gated on the prior result:
+
+- **14a-pre — variant selection at N=100.** Three-condition matrix V1 / V2 /
+  V3, each running the Test-13-style A→B→C cycle:
+  - *Phase A — fresh*: 100 keys, real Q+A, no scaffold. Baseline reference.
+  - *Phase B — scaffold-build*: 100 keys with the variant's placeholder
+    pattern. Convergence target: recall ≥ 0.99 at e30, no placeholder leakage.
+  - *Phase C — fill*: replace 20 of the 100 scaffolded slots with real Q+A.
+    Convergence target: `both/total ≥ 0.95`, `q_only/total ≤ 0.05` (no
+    discriminator collapse), `stable_perfect ≤ 22` (faster than warm-start
+    baseline).
+- **14a — winner scaled to N=500.** Same A→B→C structure as 14a-pre, single
+  variant. Output: 500-key filled adapter as the input artifact for 14b.
+- **14b — multi-round early-stop + touch-up validation at N=500.** Five
+  phases: P0 loads 14a's filled adapter (baseline retention probe), P1
+  re-fills all 500 keys with `EarlyStopPolicy` active and touch-up on any
+  failing keys, P2 swaps 40 disjoint keys' answers, P3 swaps another 40
+  disjoint keys' answers. Each round runs three retention probes (RP1
+  round-start, RP2 post-stop pre-touch-up, RP3 post-touch-up) so the
+  decoding-alignment vs weight-corruption split from 13b can be tracked
+  round-over-round.
+
+### Scaffold variants (14a-pre matrix)
+
+All three variants share the indexed-key training format (prompt
+`"Recall the QA pair stored under key 'graphN'."` → JSON
+`{"key", "question", "answer"}`). Only the Phase B target text differs:
+
+| Variant | Target JSON during scaffold-build | Hypothesis under test |
+|---|---|---|
+| **V1** | `{"key":"graphN", "question":"TBD-Q-N", "answer":"TBD-A-N"}` | Per-slot placeholder Q+A both indexed by N. Tests whether per-slot uniqueness in the placeholders is sufficient to pre-form the binding structure. |
+| **V2** | `{"key":"graphN", "question":"Question for slot N", "answer":"TBD-A-N"}` | Structural Q template (more committed Q-text mass) + placeholder A. Tests whether more deterministic Q-text helps the binding form, or just adds overwrite cost when the fill phase introduces real Q text. |
+| **V3** | `{"key":"graphN", "question":"pending", "answer":"pending"}` | Uniform sentinel — same content for every slot. Tests whether the **key alone** carries the routing. The cleanest production primitive *if it works*: zero per-slot information in the scaffold, fully reusable. |
+
+V1 and V2 both use the integer slot index `N` as a per-slot discriminator;
+they differ only in how much Q-text mass the fill phase has to overwrite.
+V3 forces the model to route via the key alone — no per-slot signal in the
+placeholder content at all.
+
+The variant-selection rule (14a-pre): the winner is the variant that passes
+all Phase B/C convergence gates and has the lowest stable_perfect epoch in
+Phase C. If two pass with similar stable_perfect, the variant with stricter
+production properties wins (V3 > V1 ≈ V2 — V3's content-uniformity makes
+it deployable as a single shared artifact).
+
+If all three fail any gate, 14a-pre returns null and the scaffold-for-
+production thesis is rejected. Test 14 halts at that point — no auto-pivot
+to a fresh-fill ceiling test; the next experiment is planned separately
+with the actual failure data.
+
+### Early-stop policy and touch-up primitive (used in 14b)
+
+Both fixed at the values locked in during plan review; not tuned per
+phase.
+
+`EarlyStopPolicy(probe_from_epoch=1, signal_from_epoch=10, window=3,
+probe_every_n_epochs=1)`. The full per-epoch curve is recorded for analysis
+(`probe_from_epoch=1`); the stop signal cannot fire before epoch 10
+(artifact-rejection floor). Stop fires when overall recall is 100 % for
+three consecutive probes from the floor onward. The firing epoch is
+diagnostic, not pass/fail — recall at stop is 100 % by construction. The
+only hard fail is `stop_epoch == max_epochs`, meaning the trigger never
+fired and convergence wasn't reached within the 30-epoch budget.
+
+Touch-up: 2 epochs at LR=1e-5 on the failing-key subset, save_strategy="no",
+output to a separate `touchup_adapter` directory. This is the Test 13b
+recovery primitive transplanted into the production loop — applied
+unconditionally if any key in the post-stop probe set is not 100 %, then
+re-probed (RP3).
+
+### Three-point retention probe schedule (14b only)
+
+Per round, retention on the unchanged-set is sampled at three points:
+- **RP1** (round start): baseline carrying forward from the prior round
+- **RP2** (post-stop, pre-touch-up): raw forgetting on the unchanged-set
+- **RP3** (post-touch-up): recovery ceiling
+
+Derived metrics per round: `alignment_delta = RP3 − RP2` (decoding-alignment
+recoverable component, the 13b finding); `corruption_residual = 1 − RP3`
+(genuine weight-space damage that touch-up cannot recover). Round-over-round
+trend on `corruption_residual` is the headline 14b signal — if it grows
+monotonically across rounds, the carry-forward adapter accumulates damage;
+if bounded, the production loop is sustainable.
+
+### Decision rules
+
+- **14a-pre PASS:** at least one variant passes all Phase B/C gates → name
+  winner → schedule 14a.
+- **14a-pre NULL:** no variant passes → halt; plan next experiment.
+- **14a PASS:** Phase C `both/total ≥ 0.93` at N=500, no placeholder leakage,
+  fill speed-up holds → 14a's filled adapter ships into 14b.
+- **14a FAIL:** halt; investigate scale failure separately.
+- **14b PASS:** cumulative `retention_post_touchup ≥ 0.95` after round 3 AND
+  per-round `corruption_residual ≤ 0.05` AND no monotonic growth of
+  `corruption_residual` across rounds.
+- **14b CONCERN:** `alignment_delta` round 3 > 1.5 × round 1 (touch-up doing
+  more work each round — carry-forward is degrading, not failing yet).
+- **14b FAIL:** `corruption_residual > 0.05` in any round OR
+  `retention_post_touchup < 0.90` in any round.
+
+### Results — 14a-pre (complete, 2026-04-26)
+
+Run dir: `outputs/test14_pre/mistral/20260426_012907/`.
+Mistral 7B Instruct v0.3, QLoRA NF4, rank 8, alpha 16, lr 1e-4, batch 1,
+grad-accum 2, seed 42. All three variants ran the full A→B→C cycle.
+
+**Per-variant phase walls and stop epochs:**
+
+| Variant | Phase A wall | A stop | Phase B wall | B stop | Phase C wall | **C first / stable / stop** | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| V1 | 2.88 h | e26 | 0.82 h | e10 (floor) | 1.94 h | — / — / **e24** | 5.64 h |
+| V2 | 2.71 h | e24 | 0.85 h | e10 (floor) | 1.76 h | — / — / **e22** | 5.32 h |
+| **V3** | 2.74 h | e23 | **0.65 h** | e10 (floor) | **1.63 h** | **e18 / e20 / e20** | **5.02 h** |
+
+All three phases ran with `EarlyStopPolicy(probe_from_epoch=1,
+signal_from_epoch=10, window=3, probe_every_n_epochs=1)`. A stop at e10 is
+the earliest the policy can fire (10 = signal floor with a window of three
+consecutive perfects ending at the floor). Phase A also stopped under the
+policy when fresh-fill converged before the e30 budget — V1/V2/V3 all
+converged on the indexed-key task at e23–e26, consistent across variants
+since Phase A trains on the same 100 PerLTQA pairs with a fixed seed.
+
+`results.json` records `{"mode": "pre", "winner": "V3"}`.
+
+**V3 wins on every metric:** fastest Phase B convergence (0.65 h vs 0.82 /
+0.85 h), fastest Phase C fill (e20 vs e22 / e24), shortest total wall
+(5.02 h vs 5.32 / 5.64 h). The variant-selection rule's tie-breaker did
+not need to engage — V3's fill was strictly faster.
+
+### Conclusions from 14a-pre
+
+**The "key alone routes" hypothesis is empirically supported.** V3's Phase
+B placeholder content is uniform across every slot (`"question": "pending"`,
+`"answer": "pending"` — zero per-slot information). The fact that V3
+nonetheless pre-formed (key → slot) bindings well enough for Phase C fill
+to converge faster than V1/V2 means the per-slot integer index `N` in
+V1/V2's placeholders was **not** the load-bearing discriminator. The
+binding circuit forms from the input prompt's `'graphN'` key plus the
+JSON-output framing alone; placeholder content adds nothing routing-wise
+and only costs epochs at fill when the model has to overwrite it.
+
+**Production implication.** V3 is the cleanest deployable scaffold artifact
+yet validated on this task: a single 500-key adapter trained on uniform
+`"pending"` placeholders, content-uniform across all slots, with no
+dataset-specific text baked in. The same scaffold serves any downstream
+fill of real Q+A.
+
+**Caveats.** All three content-free variants converge their fill phase
+slower than Test 13's real-Q scaffold did at N=200 (C2 fired at
+stable_perfect = 11). V3's e20 fill at N=100 is ~2× slower. The
+content-free scaffold pre-forms bindings, but less efficiently than a
+real-Q scaffold does — content-free production reuse trades off fill speed
+for deployment simplicity. Whether the gap holds at N=500 is what 14a
+tests next.
+
+**Per-field Q/A split** at fill convergence was clean across all three
+variants — `both/total = 1.00`, `q_only/total = 0.00`, no discriminator
+collapse. Placeholder leakage at fill was zero for all three (no `TBD-*-N`
+or `pending` tokens emitted after Phase C).
+
+### Implementation notes (post-run)
+
+- **Phase A was not shared across variants.** The plan locked in a
+  single shared Phase A (one fresh-fill reference adapter, all three
+  variants compared against it) but the implementation ran one Phase A
+  per variant. Cost was ~5.5 h of redundant compute (V1+V2+V3 = 8.3 h vs
+  the ~2.8 h a single shared Phase A would have taken). Phase A serves
+  only as a baseline reference, so the redundancy did not bias the V1/V2/
+  V3 ranking — the three Phase A walls came out within ±0.1 h and the
+  fresh-fill stop epochs landed within ±2 epochs (e23–e26). Future
+  scale-up tests should honor the shared-Phase-A design intent.
+- **Implementation deviation tracked separately.** Promotion of
+  `EarlyStopPolicy` / `RecallEarlyStopCallback` / scaffold builder from
+  `experiments/utils/` into `paramem/training/` remains an open downstream
+  task gated on 14b PASS.
+- **Per-phase artifacts** persist under
+  `outputs/test14_pre/mistral/20260426_012907/<variant>/<phase>_done.json`
+  and `epoch_log.json` for replay or finer-grained analysis.
+
+### Planned extension: 14a-pre extended (V3_extended / V4 / V5)
+
+Before committing to 14a's ~45 h scale-up of V3, three additional
+variants are run on the same N=100 budget to test whether the ~9-epoch gap
+to Test 13's real-Q baseline (V3 fired at e20; real-Q C2 at e11) can be
+closed. The extension reuses `outputs/test14_pre/mistral/20260426_012907/`
+(no new run dir) and `V3/A/adapter` as the Phase A baseline (variant-
+independent; Phase A walls were within ±0.1 h across V1/V2/V3, so reusing
+saves ~8 h of redundant compute).
+
+| Cell | Phase B target / approach | Hypothesis under test |
+|---|---|---|
+| **V3_extended** | Resume `V3/B/adapter`, train +30 more scaffold epochs (effective e10 → e40), then fill 20 | Was V3's Phase B at e10 (the floor) too shallow? Deeper scaffold pre-training may pre-form (key → slot) bindings strongly enough that fill converges faster than V3's e20. EarlyStop on this Phase B is hard-disabled — the deepening goal would otherwise be silently defeated by stop firing at e10 again. |
+| **V4** — empty Q/A | `{"key":"graphN", "question":"", "answer":""}` (fresh, 30 ep) | The minimum-content scaffold: Q/A fields preserved (so the JSON framing and downstream consumers are unchanged) but no per-slot information. Tests whether the Q/A *content* in V1/V2/V3 was load-bearing or just structural padding. If V4 fills as fast as V3, content adds nothing routing-wise. |
+| **V5** — random-byte placeholder | `{"key":"graphN", "question":"<sha256(V5-Q-N)[:16]>", "answer":"<sha256(V5-A-N)[:16]>"}` per-slot deterministic (fresh, 30 ep) | Maximal per-slot uniqueness — opposite end of the V3 uniform-sentinel axis. Tests whether high-entropy per-slot content routes better than no per-slot content. |
+
+**Decision rule for the extended run:** the new winner replaces V3 only if
+a new variant fires Phase C at `stop_epoch ≤ 14` (halves the V3-to-real-Q
+gap from 9 epochs to ~3). Otherwise V3 stays as winner and 14a launches
+unchanged. Marginal speedups (V3 → e16 or e18) are not worth re-running
+14a-pre with a new winner — sticking with V3 buys consistency.
+
+**Wall estimate:** ~7.5-8 h. Single overnight. Per-cell ~2.5 h
+(Phase B 0.65-0.85 h + Phase C 1.6-2 h, no Phase A). V3_extended's full
+30 deepening epochs add ~2 h on top of V3's existing Phase B wall.
+
+**Implementation deviations now resolved (caught at code review,
+fixed before launch):**
+- V4 was originally implemented as `{"key": "graphN"}` only (no Q/A
+  fields). This crashed downstream consumers (`build_registry`,
+  `format_indexed_training`, `validate_recall`, `_write_phase_done`)
+  immediately at Phase B start. Fixed: V4 now emits empty Q/A strings
+  preserving the JSON framing while staying content-free.
+- V3_extended Phase B was being silently truncated to 10 epochs because
+  the EarlyStopPolicy fired at the floor on V3's already-converged
+  adapter. Fixed: early-stop is now hard-disabled for V3_extended
+  Phase B (the only sensible behavior — there is no use case for
+  EarlyStop on a deepening run).
+
+### Next: 14a launch (winning variant scaled to N=500)
+
+```
+python experiments/test14.py --mode=scale --variant=<winner>
+```
+
+`<winner>` resolves from the extended-run `results.json` — V3 by default,
+overridden only if a V3_extended/V4/V5 cell beats the e ≤ 14 decision
+threshold.
+
+Same A→B→C structure as 14a-pre, single variant. Phase A wall expected
+~17 h, Phase B (scaffold-build) ~17 h, Phase C (fill 100 on 500-key
+scaffold) ~9 h. Total 14a wall ~45 h compute, runnable across two-to-three
+overnights with thermal cooldowns. Output: 500-key filled adapter as the
+input artifact for 14b.
+
+### Provenance
+
+- **Parent pattern:** Test 13 (Phase A/B/C1/C2 structure, `assign_keys`,
+  `load_qa_pool` with PerLTQA Q+A string-dedup + auto-fill from the 8316-pair
+  full-roster pool).
+- **Touch-up primitive:** Test 13b latent-recovery probe (97.9 % recovery
+  with 2 epochs at LR=1e-5 in 3.8 min for 97 keys on a 200-key adapter).
+- **Single-adapter capacity:** Test 8 (Mistral 7B reached 550/550 at cycle
+  56 with no ceiling found at the tested scale).
+- **Self-contained:** results stand alone; no Test 13 saved adapter is
+  loaded as input. Test 14 builds its scaffold from scratch via PerLTQA at
+  every launch.
+
+---
+
 ## 6-Model Extraction Comparison (2026-04-14)
 
 **Script:** `scripts/dev/compare_extraction.py`
