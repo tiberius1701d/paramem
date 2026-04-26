@@ -210,6 +210,7 @@ def run_consolidation(
             plausibility_judge=config.consolidation.extraction_plausibility_judge,
             plausibility_stage=config.consolidation.extraction_plausibility_stage,
             verify_anonymization=config.consolidation.extraction_verify_anonymization,
+            source_type=session.get("source_type", "transcript"),
         )
 
         # Increment key session counts while last_seen is still correct

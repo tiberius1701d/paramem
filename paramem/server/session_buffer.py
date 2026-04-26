@@ -134,11 +134,24 @@ class SessionBuffer:
         role: str,
         text: str,
         embedding: list[float] | None = None,
+        metadata: dict | None = None,
     ) -> None:
         """Append a turn to the conversation transcript.
 
         For user turns from voice, embedding is the voice fingerprint
         from that utterance. Stored for retroactive speaker attribution.
+
+        Args:
+            conversation_id: Unique session identifier.
+            role: Turn role (``"user"`` or ``"assistant"``).
+            text: Turn text content.
+            embedding: Optional voice fingerprint for speaker matching.
+            metadata: Optional dict attached to the entry as ``"metadata"``.
+                Used by the document ingest path to carry
+                ``{"source_type": "document", "doc_title": str,
+                "chunk_index": int, "source_path": str}``.
+                Existing transcript turns without metadata stay
+                schema-compatible — the field is simply absent.
         """
         speaker = self.get_speaker(conversation_id)
         speaker_id = self.get_speaker_id(conversation_id)
@@ -151,6 +164,8 @@ class SessionBuffer:
         }
         if embedding and role == "user":
             entry["embedding"] = embedding
+        if metadata is not None:
+            entry["metadata"] = metadata
 
         self._turns[conversation_id].append(entry)
 
@@ -243,10 +258,20 @@ class SessionBuffer:
     def get_pending(self) -> list[dict]:
         """Return all pending (non-archived) session transcripts.
 
-        Returns list of {"session_id", "transcript", "speaker_id"} dicts.
-        The transcript is formatted as a readable conversation with
-        speaker names prefixed for user turns. speaker_id is the most
-        frequent speaker_id across turns (None if no speaker identified).
+        Returns list of dicts with keys:
+        - ``"session_id"`` — unique session identifier.
+        - ``"transcript"`` — formatted conversation text.
+        - ``"speaker_id"`` — dominant speaker id (None if none identified).
+        - ``"source_type"`` — ``"transcript"`` or ``"document"``, read from
+          the first turn's ``metadata`` dict.  Defaults to ``"transcript"``
+          for existing turns without metadata.
+        - ``"doc_title"`` — document title from the first turn's ``metadata``
+          dict, or ``None`` for transcript sessions.
+
+        ``_format_turns`` return shape is unchanged.  ``source_type`` and
+        ``doc_title`` are read directly from the first turn's ``metadata``
+        after the ``_format_turns`` call — they are not threaded through
+        the tuple.
         """
         pending = []
         seen_ids = set()
@@ -256,11 +281,14 @@ class SessionBuffer:
             seen_ids.add(conv_id)
             formatted, session_speaker_id = self._format_turns(turns)
             if formatted:
+                first_meta = turns[0].get("metadata", {}) if turns else {}
                 pending.append(
                     {
                         "session_id": conv_id,
                         "transcript": "\n".join(formatted),
                         "speaker_id": session_speaker_id,
+                        "source_type": first_meta.get("source_type", "transcript"),
+                        "doc_title": first_meta.get("doc_title"),
                     }
                 )
 
@@ -273,11 +301,14 @@ class SessionBuffer:
                 turns = self._read_jsonl(path)
                 formatted, session_speaker_id = self._format_turns(turns)
                 if formatted:
+                    first_meta = turns[0].get("metadata", {}) if turns else {}
                     pending.append(
                         {
                             "session_id": conv_id,
                             "transcript": "\n".join(formatted),
                             "speaker_id": session_speaker_id,
+                            "source_type": first_meta.get("source_type", "transcript"),
+                            "doc_title": first_meta.get("doc_title"),
                         }
                     )
 
@@ -302,6 +333,31 @@ class SessionBuffer:
                         source.unlink()
                         logger.info("Deleted session transcript: %s", session_id)
 
+    def discard_sessions(self, session_ids: list[str]) -> None:
+        """Drop named sessions from the in-memory queue and disk state.
+
+        Unlike :meth:`mark_consolidated`, this method does NOT archive
+        sessions — the JSONL file is deleted outright when ``debug=True``.
+        Designed for the cancel path (``POST /ingest-sessions/cancel``),
+        where the operator wants to remove queued document chunks without
+        running consolidation.
+
+        Silent no-op for unknown session ids (mirrors
+        :meth:`mark_consolidated`'s tolerance).
+
+        Args:
+            session_ids: Session identifiers to discard.
+        """
+        for session_id in session_ids:
+            self._turns.pop(session_id, None)
+            self._sessions.pop(session_id, None)
+
+            if self.debug:
+                path = self.session_dir / f"{session_id}.jsonl"
+                if path.exists():
+                    path.unlink()
+                    logger.info("Discarded session file: %s", session_id)
+
     def get_session_turns(self, conversation_id: str) -> list[dict]:
         """Read all turns from a session."""
         # In-memory first
@@ -325,11 +381,16 @@ class SessionBuffer:
                 "orphaned": int,                        # pending with no speaker_id
                 "oldest_age_seconds": int | None,       # age of oldest pending session
                 "per_speaker": {speaker_id: count},     # matched pending per speaker
+                "per_source_type": {source_type: count}, # sessions by source type
             }
+
+        ``per_source_type`` counts sessions (not turns) by their
+        ``source_type`` value.  Keys are ``"transcript"`` and ``"document"``.
         """
         from datetime import datetime, timezone
 
         per_speaker: dict[str, int] = {}
+        per_source_type: dict[str, int] = {}
         orphaned = 0
         total = 0
         oldest_ts = None
@@ -341,6 +402,8 @@ class SessionBuffer:
                 per_speaker[sid] = per_speaker.get(sid, 0) + 1
             else:
                 orphaned += 1
+            st = session.get("source_type", "transcript")
+            per_source_type[st] = per_source_type.get(st, 0) + 1
 
         # Oldest pending: first-turn timestamp across in-memory sessions
         for turns in self._turns.values():
@@ -366,6 +429,7 @@ class SessionBuffer:
             "orphaned": orphaned,
             "oldest_age_seconds": oldest_age,
             "per_speaker": per_speaker,
+            "per_source_type": per_source_type,
         }
 
     @property

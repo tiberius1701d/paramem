@@ -15,6 +15,7 @@ import hashlib as _hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -24,10 +25,12 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # Migration / backup imports at module level so tests can patch them.
@@ -308,10 +311,116 @@ class StatusResponse(BaseModel):
     # Required so pstatus can render the "applied <YYYY-MM-DD>" part of the
     # Migrate footer (spec L458).
     server_started_at: str = ""
+    # Document-ingest state (Phase 2+).
+    # preview: true while a POST /consolidate?preview=true call is mid-flight.
+    # Phase 2 always returns False; Phase 3 will toggle it.
+    preview: bool = False
+    # Pending session counts split by source type. Populated from
+    # session_buffer.get_summary()["per_source_type"].
+    pending_documents: int = 0
+    pending_transcripts: int = 0
 
 
 class ConsolidateResponse(BaseModel):
     status: str
+
+
+# --- Document ingest schemas ---
+
+
+class IngestChunk(BaseModel):
+    """One pre-chunked document segment posted by the ingest CLI.
+
+    Attributes
+    ----------
+    source:
+        Original file path — display-only; the server never re-reads it.
+    chunk:
+        The text content of this chunk.
+    chunk_index:
+        Zero-based position of this chunk within the source file.
+    source_type:
+        Fixed to ``"document"`` for all ingest-CLI payloads.
+    doc_title:
+        Human-readable document title (filename stem); used for registry
+        traceability and ``GET /status`` attribution.
+    """
+
+    source: str
+    chunk: str
+    chunk_index: int
+    source_type: Literal["document"]
+    doc_title: str
+
+
+class IngestSessionsRequest(BaseModel):
+    """Request body for ``POST /ingest-sessions``.
+
+    Attributes
+    ----------
+    speaker_id:
+        Known speaker identifier from ``SpeakerStore``.  Must be non-empty
+        and must match an enrolled profile; the endpoint returns 400 / 404
+        otherwise.
+    sessions:
+        List of pre-chunked document segments to enqueue.
+    """
+
+    speaker_id: str
+    sessions: list[IngestChunk]
+
+
+class IngestSessionsResponse(BaseModel):
+    """Response body for ``POST /ingest-sessions``.
+
+    Attributes
+    ----------
+    queued:
+        Session IDs appended to the ``SessionBuffer`` (form ``doc-<hex8>``).
+    total_chunks:
+        Always equals ``len(request.sessions)`` — the raw count before
+        idempotency filtering.
+    registry_skipped:
+        Chunks whose hash was already recorded in the registry; they were
+        not re-queued.
+    rejected_unknown_speaker:
+        ``True`` when the speaker_id is not in ``SpeakerStore``.
+    rejected_no_speaker_id:
+        ``True`` when ``speaker_id`` is an empty string.
+    """
+
+    queued: list[str]
+    total_chunks: int
+    registry_skipped: int
+    rejected_unknown_speaker: bool = False
+    rejected_no_speaker_id: bool = False
+
+
+class IngestCancelRequest(BaseModel):
+    """Request body for ``POST /ingest-sessions/cancel``.
+
+    Attributes
+    ----------
+    session_ids:
+        Session IDs to remove from the ``SessionBuffer``.
+    """
+
+    session_ids: list[str]
+
+
+class IngestCancelResponse(BaseModel):
+    """Response body for ``POST /ingest-sessions/cancel``.
+
+    Attributes
+    ----------
+    cancelled:
+        Session IDs that were present and successfully discarded.
+    not_found:
+        Session IDs that were not found in the buffer (no-op).
+    """
+
+    cancelled: list[str]
+    not_found: list[str]
 
 
 # --- Migration schemas ---
@@ -2030,8 +2139,17 @@ async def status():
     summary = (
         buf.get_summary()
         if buf
-        else {"total": 0, "orphaned": 0, "oldest_age_seconds": None, "per_speaker": {}}
+        else {
+            "total": 0,
+            "orphaned": 0,
+            "oldest_age_seconds": None,
+            "per_speaker": {},
+            "per_source_type": {},
+        }
     )
+    _per_source_type: dict = summary.get("per_source_type") or {}
+    pending_documents: int = _per_source_type.get("document", 0)
+    pending_transcripts: int = _per_source_type.get("transcript", 0)
 
     # Per-speaker profile snapshot enriched with pending-session counts
     store = _state.get("speaker_store")
@@ -2386,6 +2504,9 @@ async def status():
         hold=hold_block,
         encryption=_state.get("encryption", "off"),
         server_started_at=_state.get("server_started_at", ""),
+        preview=bool(_state.get("preview", False)),
+        pending_documents=pending_documents,
+        pending_transcripts=pending_transcripts,
     )
 
 
@@ -2555,6 +2676,184 @@ async def consolidate():
     future.add_done_callback(_consolidation_done_callback)
 
     return ConsolidateResponse(status="started")
+
+
+# --- Document ingest endpoints ---
+
+
+@app.post("/ingest-sessions", response_model=IngestSessionsResponse)
+async def ingest_sessions(request: IngestSessionsRequest):
+    """Queue pre-chunked document segments for consolidation.
+
+    Each chunk becomes a separate session in the ``SessionBuffer`` with
+    ``source_type="document"``.  The endpoint is idempotent: chunks whose
+    SHA-256 fingerprint is already in the ingest registry are silently
+    skipped (``registry_skipped`` counter).
+
+    Errors
+    ------
+    400
+        ``speaker_id`` is an empty string.
+    404
+        ``speaker_id`` not found in ``SpeakerStore``.
+    409
+        A migration TRIAL is in progress.
+
+    Args:
+        request: Payload containing ``speaker_id`` and a list of
+            :class:`IngestChunk` items.
+
+    Returns:
+        :class:`IngestSessionsResponse` with session IDs enqueued,
+        skip counts, and rejection flags.
+    """
+    from paramem.server.document_ingest import IngestRegistry, _now_iso8601, normalize_chunk_text
+
+    total_chunks = len(request.sessions)
+
+    # Gate 1: empty speaker_id
+    if not request.speaker_id:
+        return JSONResponse(
+            status_code=400,
+            content=IngestSessionsResponse(
+                queued=[],
+                total_chunks=total_chunks,
+                registry_skipped=0,
+                rejected_no_speaker_id=True,
+            ).model_dump(),
+        )
+
+    # Gate 2: unknown speaker
+    store = _state.get("speaker_store")
+    speaker_name: str | None = None
+    if store is not None:
+        profiles = store.list_profiles()
+        matched = next((p for p in profiles if p["id"] == request.speaker_id), None)
+        if matched is None:
+            return JSONResponse(
+                status_code=404,
+                content=IngestSessionsResponse(
+                    queued=[],
+                    total_chunks=total_chunks,
+                    registry_skipped=0,
+                    rejected_unknown_speaker=True,
+                ).model_dump(),
+            )
+        speaker_name = matched.get("name", "")
+    else:
+        # No speaker store — treat as unknown
+        return JSONResponse(
+            status_code=404,
+            content=IngestSessionsResponse(
+                queued=[],
+                total_chunks=total_chunks,
+                registry_skipped=0,
+                rejected_unknown_speaker=True,
+            ).model_dump(),
+        )
+
+    # Gate 3: migration TRIAL in progress
+    migration = _state.get("migration") or {}
+    if migration.get("state") == "TRIAL":
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "trial_active",
+                "message": (
+                    "A migration TRIAL is active — ingest is blocked. "
+                    "Use POST /migration/accept or POST /migration/rollback to proceed."
+                ),
+            },
+        )
+
+    config = _state["config"]
+    buffer: SessionBuffer = _state["session_buffer"]
+
+    registry_path = Path(config.paths.sessions) / ".ingest_registry.json"
+    registry = IngestRegistry(registry_path)
+
+    queued: list[str] = []
+    registry_skipped = 0
+
+    for chunk in request.sessions:
+        normalized = normalize_chunk_text(chunk.chunk)
+        chunk_hash = registry.chunk_hash(
+            speaker_id=request.speaker_id,
+            source_path=chunk.source,
+            chunk_index=chunk.chunk_index,
+            normalized_text=normalized,
+            source_type=chunk.source_type,
+        )
+        if registry.is_known(chunk_hash):
+            registry_skipped += 1
+            continue
+
+        session_id = "doc-" + secrets.token_hex(4)
+
+        # set_speaker must precede append so get_pending finds speaker_id
+        buffer.set_speaker(session_id, request.speaker_id, speaker_name or "")
+        buffer.append(
+            session_id,
+            "user",
+            chunk.chunk,
+            embedding=None,
+            metadata={
+                "source_type": "document",
+                "doc_title": chunk.doc_title,
+                "chunk_index": chunk.chunk_index,
+                "source_path": chunk.source,
+            },
+        )
+
+        registry.record(
+            chunk_hash,
+            session_id=session_id,
+            speaker_id=request.speaker_id,
+            source_path=chunk.source,
+            chunk_index=chunk.chunk_index,
+            source_type="document",
+            doc_title=chunk.doc_title,
+            ingested_at=_now_iso8601(),
+        )
+        queued.append(session_id)
+
+    registry.flush()
+
+    return IngestSessionsResponse(
+        queued=queued,
+        total_chunks=total_chunks,
+        registry_skipped=registry_skipped,
+    )
+
+
+@app.post("/ingest-sessions/cancel", response_model=IngestCancelResponse)
+async def ingest_sessions_cancel(request: IngestCancelRequest):
+    """Discard queued ingest sessions without running consolidation.
+
+    Calls :meth:`SessionBuffer.discard_sessions` (not ``mark_consolidated``)
+    so the operator can cleanly remove document chunks they no longer want
+    to ingest, without any implication that consolidation occurred.
+
+    Args:
+        request: Payload with a list of session IDs to cancel.
+
+    Returns:
+        :class:`IngestCancelResponse` splitting the requested IDs into
+        ``cancelled`` (found and removed) and ``not_found`` (unknown).
+    """
+    buffer: SessionBuffer = _state["session_buffer"]
+
+    # Snapshot before so we can classify each id as found or not-found
+    before: set[str] = set(buffer._turns.keys())
+
+    buffer.discard_sessions(request.session_ids)
+
+    cancelled = [sid for sid in request.session_ids if sid in before]
+    not_found = [sid for sid in request.session_ids if sid not in before]
+
+    return IngestCancelResponse(cancelled=cancelled, not_found=not_found)
 
 
 # --- Migration endpoints ---
@@ -5197,6 +5496,7 @@ def _extract_and_start_training():
                 plausibility_judge=config.consolidation.extraction_plausibility_judge,
                 plausibility_stage=config.consolidation.extraction_plausibility_stage,
                 verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                source_type=session.get("source_type", "transcript"),
             )
             _increment_key_sessions(loop, session_id)
 
