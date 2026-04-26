@@ -170,7 +170,7 @@ adapters:
 consolidation:
   refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
-  mode: simulate               # "train" = full pipeline, "simulate" = extract only (saves graphs + QA to debug dir)
+  mode: train                  # "train" = full pipeline, "simulate" = extract only (saves graphs + QA to debug dir)
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
