@@ -666,7 +666,7 @@ class ServerConfig:
     consolidation: ConsolidationScheduleConfig = field(default_factory=ConsolidationScheduleConfig)
     sota_agent: CloudAgentConfig = field(default_factory=CloudAgentConfig)
     sota_providers: dict[str, CloudAgentConfig] = field(default_factory=dict)
-    ha_agent_id: str = "conversation.groq"  # HA conversation agent for escalation
+    ha_agent_id: str = ""  # HA conversation agent for escalation; empty disables HA escalation
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
     abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
@@ -851,7 +851,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
 
     agents_raw = raw.get("agents", {})
-    config.ha_agent_id = agents_raw.get("ha_agent_id", "conversation.groq")
+    config.ha_agent_id = agents_raw.get("ha_agent_id", "")
 
     # SOTA agent — high-capability model for reasoning queries
     sota_raw = agents_raw.get("sota", {})

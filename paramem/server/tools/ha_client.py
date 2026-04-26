@@ -287,7 +287,7 @@ class HAClient:
     def conversation_process(
         self,
         text: str,
-        agent_id: str = "conversation.groq",
+        agent_id: str = "",
         timeout: float | None = None,
         language: str | None = None,
         supported_languages: list[str] | None = None,
@@ -300,7 +300,14 @@ class HAClient:
 
         If language is provided but not in supported_languages, it is
         omitted so HA uses its configured default.
+
+        ``agent_id`` is required (no operator-specific default). Pass an
+        empty string to signal "HA escalation not configured" — returns
+        None without calling HA.
         """
+        if not agent_id:
+            logger.debug("conversation_process: empty agent_id — HA escalation not configured")
+            return None
         # Only pass language if HA's agent supports it
         if language and supported_languages and language not in supported_languages:
             logger.info("Language '%s' not in HA supported languages, using HA default", language)
