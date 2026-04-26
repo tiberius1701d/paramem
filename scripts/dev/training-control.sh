@@ -459,11 +459,27 @@ training_resume() {
     # Test 14: detect mode from latest run_config.json so tresume 14 after a
     # pause resumes the correct mode (pre/scale/multiround) rather than
     # defaulting to --mode=pre regardless of where the run stopped.
+    #
+    # Also auto-detect Phase A reuse: when --mode=pre and the run dir
+    # contains V1/V2/V3 done markers, the same dir is the source for the
+    # extended-run variants (V3_extended/V4/V5).  Without this, V4/V5
+    # would fresh-train Phase A on resume because their phase_a_reused.json
+    # markers haven't been written yet — costs ~3 h per variant.
     if [[ "$test_num" == "14" ]]; then
-        local latest_dir=$(find "$PROJECT_DIR/outputs/test14_pre" "$PROJECT_DIR/outputs/test14a" "$PROJECT_DIR/outputs/test14b" -maxdepth 2 -name "run_config.json" 2>/dev/null | sort | tail -1)
+        # run_config.json sits at <output_base>/<model>/<ts>/run_config.json
+        # → depth 3 from each output_base.  Earlier -maxdepth 2 silently
+        # missed everything.
+        local latest_dir=$(find "$PROJECT_DIR/outputs/test14_pre" "$PROJECT_DIR/outputs/test14a" "$PROJECT_DIR/outputs/test14b" -maxdepth 3 -name "run_config.json" 2>/dev/null | sort | tail -1)
         if [[ -n "$latest_dir" ]]; then
-            local mode_flag="--mode=$(python3 -c "import json; print(json.load(open('$latest_dir')).get('mode','pre'))" 2>/dev/null)"
-            extra_flags="$mode_flag"
+            local run_dir=$(dirname "$latest_dir")
+            local mode_value=$(python3 -c "import json; print(json.load(open('$latest_dir')).get('mode','pre'))" 2>/dev/null)
+            extra_flags="--mode=$mode_value"
+            # Phase A reuse pass-through: --mode=pre + V3 baseline already
+            # in this run dir = extended-run pattern.  Pass the run dir
+            # back through --reuse-phase-a-from so V4/V5 skip Phase A.
+            if [[ "$mode_value" == "pre" && -f "$run_dir/V3/A/A_done.json" ]]; then
+                extra_flags="$extra_flags --reuse-phase-a-from $run_dir"
+            fi
         fi
     fi
 
