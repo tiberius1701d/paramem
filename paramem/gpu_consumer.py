@@ -1,247 +1,97 @@
-"""ParaMem-specific GPU consumer for the gpu_guard arbitration layer.
+"""ParaMem GPU consumer adapter for the gpu_guard arbitration layer.
 
-Owns ALL paramem-specific GPU negotiation logic:
+Post-V2.5: all detection / release / idle / describe logic for the
+paramem-server process lives in ``~/.config/gpu-guard/config.toml`` under
+``[consumers.paramem-server]`` and is handled by the config-driven
+``ConfigConsumer`` that gpu_guard auto-loads at startup.
 
-- Identifying the server process via systemd MainPID, TCP listener, or
-  /proc cmdline markers.
-- POSTing /gpu/release to switch the server to cloud-only mode in-process.
-- Polling /status to detect when the server is idle (cloud-only shortcut).
-- Stamping / clearing PARAMEM_HOLD_* systemd env vars so pstatus and
-  auto-reclaim can track the active ML hold.
-- Human-readable prompt strings for the interactive approval flow.
+This module only owns the paramem-internal contract for systemd env vars:
+stamping ``PARAMEM_HOLD_*`` on GPU acquire, and clearing them on release.
 
-The ``httpx`` import is here, not in ``gpu_guard`` core.  The core is
-paramem-agnostic; keeping httpx out of it avoids pulling the server stack
-into unrelated GPU consumers.
-
-Module-level ``consumer = ParamemServerConsumer(port=8420)`` is the
-pre-instantiated object used by the paramem shim and by ``with-gpu
---consumer paramem.gpu_consumer:consumer``.
+Module-level ``consumer = adapter`` is kept as a backward-compatible alias so
+any caller still using ``--consumer paramem.gpu_consumer:consumer`` continues
+to get the env-stamp adapter (which is the correct behaviour — detection and
+release are now handled by the auto-loaded ConfigConsumer).
 """
 
 from __future__ import annotations
 
-import logging
-import shutil
 import subprocess
 import time
 
-logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level constants (mirrors original gpu_guard.py)
-# ---------------------------------------------------------------------------
+class ParamemEnvStampAdapter:
+    """Adapter that adds PARAMEM_HOLD_* env stamping to the config-driven
+    paramem-server consumer.
 
-_SERVER_UNIT = "paramem-server"
-_SERVER_CMDLINE_MARKERS = ("paramem.server", "paramem/server/app")
+    All detection / release / idle / describe behavior is delegated to the
+    ``ConfigConsumer`` loaded from ``~/.config/gpu-guard/config.toml``.  This
+    class only owns the paramem-internal contract for systemd env vars.
 
-_LSOF = (
-    shutil.which("lsof")
-    or shutil.which("lsof", path="/usr/bin:/usr/sbin:/bin:/usr/local/bin")
-    or "lsof"
-)
+    Registered as a Consumer so its ``on_acquired`` / ``on_released`` hooks
+    fire alongside the config-driven consumer.  ``find_pids`` returns ``[]``
+    so it never classifies a PID — the config consumer claims the server
+    first.
 
-VRAM_CLEAR_TIMEOUT = 30
-VRAM_POLL_INTERVAL = 2
-
-
-# ---------------------------------------------------------------------------
-# Detection helpers (paramem-specific; re-exported for test patching)
-# ---------------------------------------------------------------------------
-
-
-def _systemd_main_pid(unit: str = _SERVER_UNIT) -> int | None:
-    """Return the MainPID reported by ``systemctl --user`` for ``unit``.
-
-    Returns None when the unit is stopped, when systemctl is unavailable,
-    or when the output cannot be parsed.
-    """
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        pid = int(result.stdout.strip())
-        return pid if pid > 0 else None
-    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
-        return None
-
-
-def _listener_pid(port: int) -> int | None:
-    """Return the PID listening on ``port`` (TCP LISTEN only), or None.
-
-    ``-sTCP:LISTEN`` filters established client-side sockets from the result.
-    """
-    try:
-        result = subprocess.run(
-            [_LSOF, "-i", f"TCP:{port}", "-sTCP:LISTEN", "-t"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        pids = [int(p.strip()) for p in result.stdout.strip().split("\n") if p.strip()]
-        return pids[0] if pids else None
-    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
-        return None
-
-
-def _pid_cmdline(pid: int) -> str:
-    """Return the command line of ``pid`` as a space-separated string, or ''."""
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        return ""
-    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
-
-
-def _is_paramem_server_cmdline(cmdline: str) -> bool:
-    """Return True if ``cmdline`` matches any paramem server marker."""
-    return any(marker in cmdline for marker in _SERVER_CMDLINE_MARKERS)
-
-
-def _identify_server_pids(external_pids: list[int], port: int) -> list[int]:
-    """Classify ``external_pids`` → sorted PIDs recognised as the paramem server.
-
-    Union of three sources (priority order):
-      1. systemd --user MainPID for ``paramem-server``.
-      2. TCP listener on ``port`` (listening socket only, via lsof).
-      3. /proc/<pid>/cmdline matches any of ``_SERVER_CMDLINE_MARKERS``.
-
-    The cmdline backstop catches the server whenever (1) and (2) both miss —
-    startup race before port bind, lsof missing from PATH, unmanaged systemd,
-    or a /gpu/release transition window.
-
-    Returns only PIDs that are in ``external_pids``.
-    """
-    candidates: set[int] = set()
-    pid = _systemd_main_pid()
-    if pid is not None:
-        candidates.add(pid)
-    pid = _listener_pid(port)
-    if pid is not None:
-        candidates.add(pid)
-    for p in external_pids:
-        if p in candidates:
-            continue
-        if _is_paramem_server_cmdline(_pid_cmdline(p)):
-            candidates.add(p)
-    return sorted(candidates & set(external_pids))
-
-
-def _server_is_cloud_only(port: int) -> bool:
-    """Return True if the server /status reports mode=='cloud-only'.
-
-    Transient unreachability (e.g. during a /gpu/release transition) is logged at
-    debug level and returns False; the polling caller retries.
-    """
-    try:
-        import httpx
-
-        resp = httpx.get(f"http://localhost:{port}/status", timeout=3)
-        return resp.json().get("mode") == "cloud-only"
-    except Exception as exc:
-        logger.debug("server /status check failed: %s", exc)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Consumer implementation
-# ---------------------------------------------------------------------------
-
-
-class ParamemServerConsumer:
-    """Consumer adaptor for the ParaMem server process.
-
-    Implements the ``gpu_guard.Consumer`` protocol so the gpu_guard arbitrator
-    can negotiate with the server without knowing any paramem internals.
-
-    Detection uses three sources in priority order (systemd MainPID, TCP
-    listener, /proc cmdline) so classification is robust across start-up
-    races and unmanaged deployments.
-
-    Args:
-        port: The TCP port the server listens on (default 8420).
+    Attributes:
+        name: Consumer name used for registration.
+        default_priority: Lower = stronger; kept at 5 to match the TOML entry.
+        non_evictable_without_confirm: False — eviction does not require
+            operator confirmation (the server can always switch to cloud-only).
     """
 
-    name: str = "paramem-server"
-    default_priority: int = 5
-    non_evictable_without_confirm: bool = False
-
-    def __init__(self, port: int = 8420) -> None:
-        self._port = port
+    name = "paramem-env-stamp"
+    default_priority = 5
+    non_evictable_without_confirm = False
 
     def find_pids(self, candidate_pids: list[int]) -> list[int]:
-        """Return candidate PIDs that belong to the ParaMem server.
+        """Return empty list — PID classification is delegated to ConfigConsumer.
 
         Args:
             candidate_pids: PIDs currently using the GPU.
 
         Returns:
-            Sorted list of PIDs recognised as the server.
+            Always an empty list.
         """
-        return _identify_server_pids(candidate_pids, self._port)
+        return []
 
     def is_idle(self) -> bool:
-        """Return True if the server is already in cloud-only mode."""
-        return _server_is_cloud_only(self._port)
-
-    def request_release(self, pid: int) -> None:
-        """POST /gpu/release; the server unloads the model and switches to
-        cloud-only mode in-process. Synchronous: when the POST returns 200,
-        the server is already cloud-only.
-
-        Args:
-            pid: Unused — the HTTP endpoint determines the target. Kept for
-                Consumer-protocol compatibility with signal-based releasers.
-        """
-        import httpx
-
-        url = f"http://localhost:{self._port}/gpu/release"
-        logger.debug("POST %s", url)
-        try:
-            with httpx.Client(timeout=5) as client:
-                resp = client.post(url)
-            if resp.status_code == 503:
-                logger.debug("ParaMem release deferred: server is consolidating")
-            elif not resp.is_success:
-                logger.warning("ParaMem release POST returned HTTP %d", resp.status_code)
-        except (httpx.HTTPError, OSError) as exc:
-            logger.debug("ParaMem release POST to %s failed: %s", url, exc)
-
-    def wait_for_idle(self, pid: int, timeout: int) -> bool:
-        """Poll /status until cloud-only or timeout.
-
-        A server that has unloaded its model keeps a CUDA context in
-        nvidia-smi --query-compute-apps but uses no real VRAM.  Checking
-        /status mode=='cloud-only' is the authoritative idle signal.
-
-        Args:
-            pid: The server's primary PID (unused; idle check is via HTTP).
-            timeout: Maximum seconds to wait.
+        """Return True — idle check is delegated to ConfigConsumer.
 
         Returns:
-            True if the server became cloud-only within ``timeout``.
+            Always True.
         """
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            if _server_is_cloud_only(self._port):
-                return True
-            time.sleep(VRAM_POLL_INTERVAL)
-        return False
+        return True
 
-    def describe(self, pid: int) -> str:
-        """Return a human-readable prompt string for the server process.
+    def request_release(self, pid: int) -> None:
+        """No-op — release is delegated to ConfigConsumer.
 
         Args:
-            pid: The server's primary PID.
+            pid: Unused.
         """
-        return (
-            f"ParaMem server (PID {pid}) is using the GPU."
-            "\n  It will switch to cloud-only mode during this workload."
-        )
+
+    def wait_for_idle(self, pid: int, timeout: int) -> bool:
+        """Return True — wait-for-idle is delegated to ConfigConsumer.
+
+        Args:
+            pid: Unused.
+            timeout: Unused.
+
+        Returns:
+            Always True.
+        """
+        return True
+
+    def describe(self, pid: int) -> str:
+        """Return empty string — describe is delegated to ConfigConsumer.
+
+        Args:
+            pid: Unused.
+
+        Returns:
+            Always an empty string.
+        """
+        return ""
 
     def on_acquired(self, own_pid: int, argv: list[str]) -> None:
         """Stamp PARAMEM_HOLD_* systemd env vars so pstatus and auto-reclaim work.
@@ -297,5 +147,8 @@ class ParamemServerConsumer:
             pass
 
 
-# Module-level pre-instantiated consumer for ``with-gpu --consumer`` and the shim.
-consumer = ParamemServerConsumer(port=8420)
+# Module-level pre-instantiated adapter.
+adapter = ParamemEnvStampAdapter()
+
+# Backward-compatible alias for ``--consumer paramem.gpu_consumer:consumer``.
+consumer = adapter

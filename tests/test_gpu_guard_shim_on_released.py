@@ -34,9 +34,9 @@ class TestParamemHoldEnvVarClearedOnRelease:
             m.returncode = 0
             return m
 
-        from paramem.gpu_consumer import ParamemServerConsumer
+        from paramem.gpu_consumer import ParamemEnvStampAdapter
 
-        consumer = ParamemServerConsumer(port=8420)
+        consumer = ParamemEnvStampAdapter()
 
         with (
             patch.object(_core_module, "_get_gpu_pids", return_value=[]),
@@ -83,9 +83,9 @@ class TestParamemHoldEnvVarClearedOnRelease:
             m.returncode = 0
             return m
 
-        from paramem.gpu_consumer import ParamemServerConsumer
+        from paramem.gpu_consumer import ParamemEnvStampAdapter
 
-        consumer = ParamemServerConsumer(port=8420)
+        consumer = ParamemEnvStampAdapter()
 
         with (
             patch.object(_core_module, "_get_gpu_pids", return_value=[]),

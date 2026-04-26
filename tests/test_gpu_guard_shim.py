@@ -11,12 +11,12 @@ from gpu_guard._core import _default_consumers, _default_notifier
 
 class TestShimRegistration:
     def test_paramem_consumer_registered_as_default(self):
-        """Importing the shim registers ParamemServerConsumer as a default consumer."""
-        # Import the shim; its module-level code registers the consumer.
+        """Importing the shim registers ParamemEnvStampAdapter as a default consumer."""
+        # Import the shim; its module-level code registers the adapter.
         import experiments.utils.gpu_guard  # noqa: F401
 
         consumer_names = [c.name for c in _default_consumers]
-        assert "paramem-server" in consumer_names
+        assert "paramem-env-stamp" in consumer_names
 
     def test_paramem_notifier_registered_as_default(self):
         """Importing the shim installs _ParamemNotifier as the default notifier."""
@@ -61,3 +61,34 @@ class TestShimPublicAPI:
         from experiments.utils.gpu_guard import notify_resumed
 
         assert callable(notify_resumed)
+
+    def test_release_server_gpu_propagates_config_missing(self):
+        """release_server_gpu() raises GPUConfigMissing when config lacks paramem-server entry."""
+        import os
+        from unittest.mock import patch
+
+        from gpu_guard import GPUConfigMissing
+        from gpu_guard._core import _reset_autoload_for_tests, clear_default_consumers
+
+        from experiments.utils.gpu_guard import release_server_gpu
+
+        clear_default_consumers()
+        _reset_autoload_for_tests()
+        try:
+            with (
+                patch.dict(os.environ, {"GPU_GUARD_NO_AUTOLOAD": "1"}),
+                patch.dict(os.environ, {"GPU_GUARD_CONFIG": "/nonexistent/path/config.toml"}),
+            ):
+                import pytest
+
+                with pytest.raises(GPUConfigMissing):
+                    release_server_gpu()
+        finally:
+            # Re-register the adapter so other tests that depend on module-level
+            # state are not disturbed.
+            from gpu_guard import add_default_consumer
+
+            from paramem.gpu_consumer import adapter
+
+            add_default_consumer(adapter)
+            _reset_autoload_for_tests()
