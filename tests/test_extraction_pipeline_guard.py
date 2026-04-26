@@ -12,6 +12,7 @@ outside the whitelist. Pair with the parity tests in test_consolidation.py.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 from pathlib import Path
 
@@ -116,6 +117,11 @@ def _extraction_kwargs_namespace():
         extraction_plausibility_judge="auto",
         extraction_plausibility_stage="deanon",
         extraction_verify_anonymization=True,
+        # Per-session debug-dump gate read by _dump_session_graph (called
+        # from both extraction chokepoints).  Wrappers short-circuit when
+        # either attr is falsy, keeping these tests file-system-free.
+        save_cycle_snapshots=False,
+        snapshot_dir=None,
     )
 
 
@@ -183,6 +189,10 @@ def _loop_ns_with_model(model, tokenizer=None):
     ns._disable_gradient_checkpointing = lambda: None
     # _run_extract_graph calls self._extraction_kwargs(...) — bind it.
     ns._extraction_kwargs = types.MethodType(ConsolidationLoop._extraction_kwargs, ns)
+    # _run_extract_graph also calls self._dump_session_graph(...); bind it
+    # so the wrapper can resolve the attr — short-circuits via the namespace's
+    # save_cycle_snapshots=False / snapshot_dir=None gate.
+    ns._dump_session_graph = types.MethodType(ConsolidationLoop._dump_session_graph, ns)
     return ns
 
 
@@ -641,12 +651,18 @@ def test_extraction_document_prompt_present():
 
 def _loop_ns_for_procedural():
     """Namespace usable as `self` for bound-call tests of _run_extract_procedural_graph."""
+    import types
     from unittest.mock import MagicMock
+
+    from paramem.training.consolidation import ConsolidationLoop
 
     ns = _extraction_kwargs_namespace()
     ns.model = MagicMock()
     ns.tokenizer = MagicMock()
     ns._disable_gradient_checkpointing = lambda: None
+    # Bind _dump_session_graph so the wrapper resolves the attr; short-circuits
+    # on the namespace's save_cycle_snapshots=False / snapshot_dir=None gate.
+    ns._dump_session_graph = types.MethodType(ConsolidationLoop._dump_session_graph, ns)
     return ns
 
 
@@ -730,3 +746,112 @@ def test_run_extract_procedural_graph_threads_source_type_transcript(monkeypatch
         f"Expected user_prompt_filename={DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME!r}, "
         f"got {got_user!r}"
     )
+
+
+def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypatch, tmp_path):
+    """Both extraction chokepoints must persist the per-session SessionGraph
+    (with diagnostics intact) under debug mode, before downstream merging
+    flattens it into the cumulative graph.
+
+    Verifies the architectural seam: extraction is upstream of adapter
+    allocation, so the dump fires from ``_run_extract_graph`` and
+    ``_run_extract_procedural_graph`` (the single-topology chokepoints),
+    not from any orchestrator.  ``kind`` reflects which extractor produced
+    the graph — never an adapter name (allocation is downstream).
+
+    Regression guard for the debug-mode persistence gap discovered when
+    diagnosing the first end-to-end document-ingest cycle.
+    """
+    from unittest.mock import MagicMock
+
+    from paramem.graph.schema import Entity, Relation, SessionGraph
+    from paramem.training.consolidation import ConsolidationLoop
+
+    def _fake_session_graph(session_id: str):
+        return SessionGraph(
+            session_id=session_id,
+            timestamp="2026-04-26T22:30:00Z",
+            entities=[Entity(name="Alice", entity_type="person", attributes={})],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="works_at",
+                    object="Acme",
+                    relation_type="factual",
+                    confidence=1.0,
+                )
+            ],
+            summary="Alice works at Acme.",
+            diagnostics={
+                "sota_raw_response": "{'malformed': json}",
+                "fallback_path": "all_dropped",
+                "residual_dropped_facts": [{"subject": "Person_1"}],
+            },
+        )
+
+    # --- Episodic chokepoint ---
+    ns_main = _loop_ns_with_model(MagicMock())
+    ns_main.save_cycle_snapshots = True
+    ns_main.snapshot_dir = tmp_path
+    ns_main.cycle_count = 7
+    monkeypatch.setattr(
+        "paramem.training.consolidation.extract_graph",
+        lambda *a, **kw: _fake_session_graph("sess-A"),
+    )
+    ConsolidationLoop._run_extract_graph(ns_main, "transcript text", "sess-A")
+
+    main_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "graph.json"
+    assert main_path.exists(), f"episodic dump missing at {main_path}"
+    main_dump = json.loads(main_path.read_text())
+    assert main_dump["diagnostics"]["fallback_path"] == "all_dropped"
+    assert main_dump["diagnostics"]["sota_raw_response"] == "{'malformed': json}"
+    assert main_dump["relations"][0]["predicate"] == "works_at"
+
+    # --- Procedural chokepoint ---
+    ns_proc = _loop_ns_for_procedural()
+    ns_proc.save_cycle_snapshots = True
+    ns_proc.snapshot_dir = tmp_path
+    ns_proc.cycle_count = 7
+    monkeypatch.setattr(
+        "paramem.training.consolidation.extract_procedural_graph",
+        lambda *a, **kw: _fake_session_graph("sess-A"),
+    )
+    ConsolidationLoop._run_extract_procedural_graph(ns_proc, "transcript text", "sess-A")
+
+    proc_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "procedural_graph.json"
+    assert proc_path.exists(), f"procedural dump missing at {proc_path}"
+    proc_dump = json.loads(proc_path.read_text())
+    assert proc_dump["diagnostics"]["fallback_path"] == "all_dropped"
+
+    # Same session, two distinct dumps — operator can compare both extractors
+    # for one session by `cat sessions/<session_id>/*.json`.
+    assert main_path.parent == proc_path.parent
+    assert main_path.name != proc_path.name
+
+
+def test_dump_session_graph_short_circuits_when_debug_off(monkeypatch, tmp_path):
+    """The dump gate must short-circuit when either save_cycle_snapshots is
+    False or snapshot_dir is None.  Production runs without debug mode must
+    not pay any disk cost from this debug-only diagnostic.
+    """
+    from unittest.mock import MagicMock
+
+    from paramem.training.consolidation import ConsolidationLoop
+
+    monkeypatch.setattr(
+        "paramem.training.consolidation.extract_graph",
+        lambda *a, **kw: MagicMock(model_dump_json=lambda **kw: "{}"),
+    )
+
+    # save_cycle_snapshots=False — default in _loop_ns_with_model.
+    ns = _loop_ns_with_model(MagicMock())
+    ns.snapshot_dir = tmp_path  # set, but gate is on save_cycle_snapshots
+    ConsolidationLoop._run_extract_graph(ns, "t", "s001")
+    assert not (tmp_path / "cycle_0").exists(), "dump fired despite save_cycle_snapshots=False"
+
+    # snapshot_dir=None — equally short-circuits.
+    ns2 = _loop_ns_with_model(MagicMock())
+    ns2.save_cycle_snapshots = True
+    ns2.snapshot_dir = None
+    # Would raise AttributeError on `None / "cycle_X"` if the gate didn't fire.
+    ConsolidationLoop._run_extract_graph(ns2, "t", "s002")

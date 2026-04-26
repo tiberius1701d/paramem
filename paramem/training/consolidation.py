@@ -32,6 +32,7 @@ from paramem.graph.qa_generator import (
     generate_qa_from_relations,
     partition_relations,
 )
+from paramem.graph.schema import SessionGraph
 from paramem.graph.scoring import (
     PromotionScorer,
     get_relations_for_nodes,
@@ -507,6 +508,35 @@ class ConsolidationLoop:
             user_prompt_filename=user_prompt_filename,
         )
 
+    def _dump_session_graph(self, graph: SessionGraph, session_id: str, kind: str) -> None:
+        """Persist a per-session SessionGraph (with diagnostics) under debug mode.
+
+        Called from both extraction chokepoints (``_run_extract_graph`` and
+        ``_run_extract_procedural_graph``) so every extractor output is
+        captured before downstream merging strips per-session diagnostics
+        (``sota_raw_response``, ``residual_dropped_facts``,
+        ``sota_updated_transcript``, ``fallback_path``).
+
+        Same debug-mode gate as the cumulative graph snapshot.  Adapter
+        allocation (episodic / semantic / procedural / interim) is downstream
+        of extraction and intentionally not reflected here — ``kind`` names
+        the extractor that produced the graph, not the adapter the relations
+        eventually flow into.
+
+        Path: ``<snapshot_dir>/cycle_<N>/sessions/<session_id>/<kind>.json``.
+        """
+        if not (self.save_cycle_snapshots and self.snapshot_dir):
+            return
+        out_path = (
+            self.snapshot_dir
+            / f"cycle_{self.cycle_count}"
+            / "sessions"
+            / session_id
+            / f"{kind}.json"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(graph.model_dump_json(indent=2))
+
     def _run_extract_graph(
         self,
         session_transcript: str,
@@ -535,10 +565,15 @@ class ConsolidationLoop:
         )
         if isinstance(self.model, _PeftModel):
             with self.model.disable_adapter():
-                return extract_graph(
+                graph = extract_graph(
                     self.model, self.tokenizer, session_transcript, session_id, **kwargs
                 )
-        return extract_graph(self.model, self.tokenizer, session_transcript, session_id, **kwargs)
+        else:
+            graph = extract_graph(
+                self.model, self.tokenizer, session_transcript, session_id, **kwargs
+            )
+        self._dump_session_graph(graph, session_id, "graph")
+        return graph
 
     def _run_extract_procedural_graph(
         self,
@@ -578,12 +613,15 @@ class ConsolidationLoop:
         )
         if isinstance(self.model, _PeftModel):
             with self.model.disable_adapter():
-                return extract_procedural_graph(
+                graph = extract_procedural_graph(
                     self.model, self.tokenizer, session_transcript, session_id, **call_kwargs
                 )
-        return extract_procedural_graph(
-            self.model, self.tokenizer, session_transcript, session_id, **call_kwargs
-        )
+        else:
+            graph = extract_procedural_graph(
+                self.model, self.tokenizer, session_transcript, session_id, **call_kwargs
+            )
+        self._dump_session_graph(graph, session_id, "procedural_graph")
+        return graph
 
     def extract_session(
         self,
