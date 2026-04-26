@@ -70,7 +70,12 @@ class TestSanitizerPrecondition:
         ],
     )
     def test_real_sanitizer_blocks_self_referential(self, query):
-        sanitized, findings = sanitize_for_cloud(query, mode="block")
+        # Self-referential resolution requires an identified speaker — the
+        # sanitizer's whole point is "personal data is graph-truth", and
+        # there is no resolution target for "I" / "my" without a
+        # speaker_id.  Production callers always have one when the
+        # speaker is enrolled (which is when self-referential matters).
+        sanitized, findings = sanitize_for_cloud(query, mode="block", speaker_id="Speaker0")
         assert sanitized is None, f"sanitizer should block {query!r}"
         assert findings, "sanitizer must explain why the query was blocked"
 
@@ -82,7 +87,7 @@ class TestSanitizerPrecondition:
         ],
     )
     def test_real_sanitizer_allows_non_personal(self, query):
-        sanitized, findings = sanitize_for_cloud(query, mode="block")
+        sanitized, findings = sanitize_for_cloud(query, mode="block", speaker_id="Speaker0")
         assert sanitized is not None, f"sanitizer should not block {query!r}"
 
 

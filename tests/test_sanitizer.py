@@ -1,93 +1,180 @@
-"""Unit tests for PII sanitizer."""
+"""Unit tests for the graph-anchored sanitizer.
+
+The sanitizer detects personal content using ground truth that already
+exists in the running system:
+
+* ``known_entities`` — caller-supplied set of entity / speaker names
+  (typically ``router._all_entities | speaker_store.speaker_names()``).
+  Reuses the extraction pipeline's ``_anonymize_transcript`` primitive to
+  decide whether the query references any of them.
+* ``speaker_id`` + first-person pronouns from a fixed token set — covers
+  cold-start before the graph has facts.
+
+There are no static keyword lists, no regex patterns.  A query like
+"What time does my dentist's office open?" is not personal unless the
+speaker actually has a "dentist" entity.  A query like "Did Pat call?"
+is personal once Pat is enrolled or graphed.
+"""
 
 from paramem.server.sanitizer import check_personal_content, sanitize_for_cloud
 
+# ---------------------------------------------------------------------------
+# Graph-anchored personal-entity detection
+# ---------------------------------------------------------------------------
 
-class TestPersonalContentDetection:
-    def test_clean_query(self):
-        assert check_personal_content("What's the weather in Berlin?") == []
 
-    def test_clean_general_question(self):
-        assert check_personal_content("How tall is the Eiffel Tower?") == []
+class TestPersonalEntityDetection:
+    """``personal_entity`` fires when the query mentions a known entity."""
 
-    def test_possessive_wife(self):
-        findings = check_personal_content("What should I get my wife for her birthday?")
-        assert "possessive_personal" in findings
+    def test_named_entity_in_known_set_flags_personal(self):
+        findings = check_personal_content(
+            "Did Pat call?",
+            known_entities={"pat"},
+        )
+        assert "personal_entity" in findings
 
-    def test_possessive_dog(self):
-        findings = check_personal_content("Where is the nearest vet for my dog?")
-        assert "possessive_personal" in findings
+    def test_named_entity_not_in_known_set_is_clean(self):
+        # Without graph state, a generic name is not personal.
+        findings = check_personal_content(
+            "Did Pat call?",
+            known_entities=set(),
+        )
+        assert findings == []
 
-    def test_possessive_favorite(self):
-        findings = check_personal_content("Book a table at my favorite restaurant")
-        assert "possessive_personal" in findings
+    def test_relationship_noun_alone_is_not_personal(self):
+        # The old regex blocked anything mentioning "wife" / "dentist" /
+        # "house" / "favourite". Graph-anchored: only blocked if the
+        # speaker actually has such an entity in their graph.
+        findings = check_personal_content(
+            "What time does my dentist's office open?",
+            known_entities={"dr_smith"},  # the dentist isn't a known entity
+            speaker_id="Speaker0",
+        )
+        assert "personal_entity" not in findings
+        # First-person + speaker_id + interrogative — the self_referential
+        # arm fires (which is correct: it's about the speaker).
+        assert "self_referential" in findings
 
-    def test_possessive_house(self):
-        findings = check_personal_content("How far is the airport from my house?")
-        assert "possessive_personal" in findings
+    def test_word_boundary_prevents_substring_false_positives(self):
+        # "Pat" must not match inside "patron" — _anonymize_transcript
+        # uses \b...\b boundaries.
+        findings = check_personal_content(
+            "Where is the nearest patron saint?",
+            known_entities={"pat"},
+        )
+        assert findings == []
 
-    def test_self_referential_where(self):
+    def test_no_known_entities_supplied_returns_clean(self):
+        # Back-compat: callers that don't yet pass known_entities and
+        # also don't pass speaker_id get an empty findings list.  The
+        # primary protection is then entity-based routing upstream.
+        findings = check_personal_content("Did Pat call?")
+        assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# First-person + speaker_id resolution
+# ---------------------------------------------------------------------------
+
+
+class TestSelfReference:
+    """First-person pronouns resolve against the identified speaker."""
+
+    def test_self_referential_question_with_speaker(self):
+        findings = check_personal_content(
+            "Where do I live?",
+            speaker_id="Speaker0",
+        )
+        assert "self_referential" in findings
+
+    def test_personal_claim_statement_with_speaker(self):
+        findings = check_personal_content(
+            "I live in Kelkham.",
+            speaker_id="Speaker0",
+        )
+        assert "personal_claim" in findings
+        assert "self_referential" not in findings
+
+    def test_first_person_without_speaker_is_clean(self):
+        # No identified speaker → no resolution target for "I" → clean.
         findings = check_personal_content("Where do I live?")
-        assert "self_referential" in findings
+        assert findings == []
 
-    def test_self_referential_what(self):
-        findings = check_personal_content("What's my name?")
-        assert "self_referential" in findings
+    def test_no_first_person_no_finding(self):
+        findings = check_personal_content(
+            "What's the capital of France?",
+            speaker_id="Speaker0",
+        )
+        assert findings == []
 
-    def test_self_referential_work(self):
-        findings = check_personal_content("What do I do for work?")
-        assert "self_referential" in findings
+    def test_first_person_anywhere_in_text_matches(self):
+        # "my" appears mid-sentence, not first word.
+        findings = check_personal_content(
+            "Tell me what's on my schedule today.",
+            speaker_id="Speaker0",
+        )
+        assert "self_referential" in findings or "personal_claim" in findings
 
-    def test_personal_claim_live(self):
-        findings = check_personal_content("I live in a small town near Frankfurt")
-        assert "personal_claim" in findings
 
-    def test_personal_claim_married(self):
-        findings = check_personal_content("I'm married and have two kids")
-        assert "personal_claim" in findings
-
-    def test_device_control_clean(self):
-        """Device control queries should pass through."""
-        assert check_personal_content("Turn on the living room lights") == []
-
-    def test_music_clean(self):
-        assert check_personal_content("Play Queen on the office speaker") == []
-
-    def test_weather_clean(self):
-        assert check_personal_content("What's the weather today?") == []
-
-    def test_our_home(self):
-        findings = check_personal_content("How warm is our house right now?")
-        assert "possessive_personal" in findings
-
-    def test_my_children(self):
-        findings = check_personal_content("Find activities for my children")
-        assert "possessive_personal" in findings
+# ---------------------------------------------------------------------------
+# sanitize_for_cloud — mode behaviour and contract preservation
+# ---------------------------------------------------------------------------
 
 
 class TestSanitizeForCloud:
     def test_mode_off_passes_everything(self):
-        query, findings = sanitize_for_cloud("Where do I live?", mode="off")
+        query, findings = sanitize_for_cloud(
+            "Where do I live?",
+            mode="off",
+            speaker_id="Speaker0",
+        )
         assert query == "Where do I live?"
         assert findings == []
 
     def test_mode_warn_passes_with_findings(self):
-        query, findings = sanitize_for_cloud("What should I get my wife?", mode="warn")
-        assert query == "What should I get my wife?"
-        assert len(findings) > 0
+        query, findings = sanitize_for_cloud(
+            "Where do I live?",
+            mode="warn",
+            speaker_id="Speaker0",
+        )
+        assert query == "Where do I live?"
+        assert "self_referential" in findings
 
-    def test_mode_block_returns_none(self):
-        query, findings = sanitize_for_cloud("What should I get my wife?", mode="block")
+    def test_mode_block_returns_none_on_self_reference(self):
+        query, findings = sanitize_for_cloud(
+            "Where do I live?",
+            mode="block",
+            speaker_id="Speaker0",
+        )
         assert query is None
-        assert len(findings) > 0
+        assert "self_referential" in findings
+
+    def test_mode_block_returns_none_on_known_entity(self):
+        query, findings = sanitize_for_cloud(
+            "Did Pat call?",
+            mode="block",
+            known_entities={"pat"},
+        )
+        assert query is None
+        assert "personal_entity" in findings
+
+    def test_mode_block_passes_clean_query(self):
+        query, findings = sanitize_for_cloud(
+            "What's the weather today?",
+            mode="block",
+            speaker_id="Speaker0",
+            known_entities={"pat"},
+        )
+        assert query == "What's the weather today?"
+        assert findings == []
 
     def test_clean_query_passes_all_modes(self):
         for mode in ("off", "warn", "block"):
-            query, findings = sanitize_for_cloud("What's the weather?", mode=mode)
-            assert query == "What's the weather?"
+            query, findings = sanitize_for_cloud(
+                "Turn on the kitchen light",
+                mode=mode,
+                speaker_id="Speaker0",
+                known_entities={"pat"},
+            )
+            assert query == "Turn on the kitchen light"
             assert findings == []
-
-    def test_mode_block_clean_query_passes(self):
-        query, findings = sanitize_for_cloud("Turn on the lights", mode="block")
-        assert query == "Turn on the lights"
-        assert findings == []

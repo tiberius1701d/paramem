@@ -1,76 +1,129 @@
-"""Query sanitizer — detects personal context before cloud escalation.
+"""Query sanitizer — graph-anchored personal-content gate before cloud escalation.
 
-Catches queries that bypass entity matching but still contain implicit
-personal information: possessive pronouns + relationship terms, self-
-referential questions, location/workplace references.
+Anchored on runtime ground truth, not lexical patterns:
 
-Three modes:
-  - "off": no sanitization (cloud sees everything)
-  - "warn": log a warning but send to cloud anyway
-  - "block": fall back to local model instead of sending to cloud
+* The speaker's **known entities** (the router's entity index plus the speaker
+  store's enrolled names) are the source of truth for what counts as personal.
+  Detection reuses ``_anonymize_transcript`` from the extraction pipeline —
+  the same primitive that produces SOTA-safe transcripts.  Anonymization
+  replacing anything means the text contained a personal reference.
+* **First-person pronouns** plus an identified speaker are treated as a
+  self-reference even when no known entity is named (covers cold-start before
+  the graph has facts to anchor on).  The token set is explicit; there is no
+  pattern matching.
 
-This is defense-in-depth. The primary protection is entity-based routing
-(queries with known entities never reach cloud). The sanitizer catches
-what entity matching misses.
+The contract ``(sanitized_text_or_None, findings)`` is unchanged so callers
+in ``inference.py`` and ``test_abstention.py`` keep working.  Findings:
+
+* ``personal_entity`` — query mentions an entity in the speaker's graph or
+  an enrolled name.
+* ``self_referential`` — first-person pronoun + identified speaker +
+  interrogative shape (consumed by the abstention short-circuit).
+* ``personal_claim`` — first-person pronoun + identified speaker +
+  declarative shape.
+
+Modes: ``off`` / ``warn`` / ``block``.  Same semantics as before.
 """
 
 import logging
-import re
+
+from paramem.graph.extractor import _anonymize_transcript
+from paramem.server.router import _is_interrogative
 
 logger = logging.getLogger(__name__)
 
-# Possessive + relationship: "my wife", "our house", "my sister's"
-_POSSESSIVE_PERSONAL = re.compile(
-    r"\b(?:my|our|mine)\s+"
-    r"(?:wife|husband|partner|spouse|girlfriend|boyfriend|"
-    r"son|daughter|child|children|kids|baby|"
-    r"mother|father|mom|dad|mum|parent|parents|"
-    r"brother|sister|sibling|"
-    r"family|uncle|aunt|cousin|grandma|grandmother|grandpa|grandfather|"
-    r"friend|best friend|neighbor|colleague|boss|"
-    r"dog|cat|pet|"
-    r"house|home|apartment|flat|place|"
-    r"car|job|work|office|company|school|doctor|dentist|"
-    r"birthday|anniversary|wedding|"
-    r"favorite|favourite)\b",
-    re.IGNORECASE,
+
+# Token-set lookup, not a pattern.  Explicit list of first-person openings
+# the chat handler resolves to the identified speaker.  Includes
+# contractions because chat input is unmodified text.
+_FIRST_PERSON_TOKENS = frozenset(
+    {
+        "i",
+        "i'm",
+        "i'd",
+        "i've",
+        "i'll",
+        "me",
+        "my",
+        "mine",
+        "myself",
+        "we",
+        "we're",
+        "we'd",
+        "we've",
+        "we'll",
+        "us",
+        "our",
+        "ours",
+        "ourselves",
+    }
 )
 
-# Self-referential: "where do I live", "what's my name", "when is my"
-_SELF_REFERENTIAL = re.compile(
-    r"\b(?:where\s+(?:do|did|was)\s+I|what(?:'s| is)\s+my|when\s+(?:is|was)\s+my|"
-    r"who\s+(?:is|are)\s+my|how\s+old\s+am\s+I|"
-    r"what\s+do\s+I\s+(?:do|like|prefer|work)|"
-    r"tell\s+me\s+about\s+(?:my|me)|"
-    r"do\s+I\s+(?:have|own|like|know))\b",
-    re.IGNORECASE,
-)
-
-# Direct personal claims: "I live in", "I work at", "I'm married"
-_PERSONAL_CLAIMS = re.compile(
-    r"\bI\s+(?:live|work|study|go to|attend|moved|grew up)\s+(?:in|at|to)\b|"
-    r"\bI(?:'m| am)\s+(?:married|engaged|divorced|single|pregnant)\b|"
-    r"\bI\s+(?:have|own)\s+(?:a |an |two |three )?"
-    r"(?:dog|cat|pet|car|house|kid|child|daughter|son)\b",
-    re.IGNORECASE,
-)
+# Punctuation stripped before token comparison so "I'm." or "me," still match.
+_PUNCT = ".,!?;:'\"()[]{}"
 
 
-def check_personal_content(text: str) -> list[str]:
-    """Check if text contains personal context patterns.
+def _contains_first_person(text: str) -> bool:
+    """Token-level scan for first-person pronouns.  No regex."""
+    for raw in text.split():
+        token = raw.strip(_PUNCT).lower()
+        if token in _FIRST_PERSON_TOKENS:
+            return True
+    return False
 
-    Returns a list of matched pattern descriptions. Empty list means clean.
+
+def _build_known_entity_mapping(known_entities: set[str] | None) -> dict[str, str]:
+    """Build a name → opaque-placeholder mapping for ``_anonymize_transcript``.
+
+    Placeholders are unique per known entity so the comparison
+    ``anonymized != original`` reliably detects matches.  The actual
+    placeholder strings are not surfaced — callers only see the
+    ``personal_entity`` finding.
+
+    Empty input yields an empty dict; ``_anonymize_transcript`` is a no-op
+    on an empty mapping, which preserves back-compat for callers that
+    don't yet supply ``known_entities``.
     """
-    findings = []
+    if not known_entities:
+        return {}
+    return {name: f"__PERSONAL_{i}__" for i, name in enumerate(known_entities) if name}
 
-    if _POSSESSIVE_PERSONAL.search(text):
-        findings.append("possessive_personal")
 
-    if _SELF_REFERENTIAL.search(text):
-        findings.append("self_referential")
+def check_personal_content(
+    text: str,
+    *,
+    speaker_id: str | None = None,
+    known_entities: set[str] | None = None,
+) -> list[str]:
+    """Return findings explaining why the text is personal.  Empty = clean.
 
-    if _PERSONAL_CLAIMS.search(text):
-        findings.append("personal_claim")
+    Back-compat: if neither ``speaker_id`` nor ``known_entities`` is supplied
+    the function can still detect first-person without speaker context only as
+    informational; without an identified speaker it returns ``[]`` because
+    there is no resolution target for "I" / "my".  This matches the project's
+    "personal data is graph-truth" principle: a pronoun in a vacuum is not
+    personal until it resolves to someone we know.
+    """
+    findings: list[str] = []
+
+    mapping = _build_known_entity_mapping(known_entities)
+    if mapping:
+        # Case-insensitive comparison: production stores lowercased entity
+        # names (router._all_entities, speaker_names lowercased by the
+        # caller), but the user's query is mixed-case.  Lowercase both
+        # sides and run _anonymize_transcript with the same word-boundary
+        # substitution the extraction path uses; the original text is
+        # preserved for the return value.
+        text_lower = text.lower()
+        anonymized = _anonymize_transcript(text_lower, mapping)
+        if anonymized != text_lower:
+            findings.append("personal_entity")
+
+    if speaker_id and _contains_first_person(text):
+        if _is_interrogative(text):
+            findings.append("self_referential")
+        else:
+            findings.append("personal_claim")
 
     return findings
 
@@ -78,41 +131,42 @@ def check_personal_content(text: str) -> list[str]:
 def sanitize_for_cloud(
     text: str,
     mode: str = "warn",
+    *,
+    speaker_id: str | None = None,
+    known_entities: set[str] | None = None,
 ) -> tuple[str | None, list[str]]:
-    """Check query before sending to cloud. Returns (query, findings).
+    """Check query before sending to cloud.  Returns ``(query, findings)``.
 
     Args:
-        text: The query to check.
-        mode: "off" (skip), "warn" (log + pass through), "block" (return None).
+        text: query to check.
+        mode: ``off`` (skip), ``warn`` (log + pass through),
+            ``block`` (return ``None`` instead of the text when personal
+            content is found).
+        speaker_id: identifier of the resolved speaker, or ``None`` if the
+            speaker has not been resolved.  Used to gate first-person
+            interpretation — without an identified speaker there is no one
+            for "I" / "my" to refer to.
+        known_entities: lowercased set of entity / speaker names that count
+            as personal references.  Typically assembled by the chat handler
+            from ``router._all_entities`` plus enrolled
+            ``SpeakerStore.speaker_names()``.
 
     Returns:
-        (sanitized_query, findings). If mode="block" and personal content
-        found, sanitized_query is None (caller should fall back to local).
+        ``(sanitized_query, findings)``.  When ``mode="block"`` and personal
+        content is found, ``sanitized_query`` is ``None`` and the caller
+        should fall back to the local model.
     """
     if mode == "off":
         return text, []
 
-    findings = check_personal_content(text)
-
+    findings = check_personal_content(text, speaker_id=speaker_id, known_entities=known_entities)
     if not findings:
         return text, []
 
     if mode == "warn":
-        logger.warning(
-            "Personal content detected in cloud-bound query: %s — %s",
-            findings,
-            text[:80],
-        )
+        logger.warning("Personal content detected (mode=warn): %s — %s", findings, text[:100])
         return text, findings
 
-    if mode == "block":
-        logger.info(
-            "Blocked cloud escalation due to personal content: %s — %s",
-            findings,
-            text[:80],
-        )
-        return None, findings
-
-    # Unknown mode — fail closed
-    logger.warning("Unknown sanitization mode '%s', treating as 'block'", mode)
+    # mode == "block"
+    logger.info("Blocked cloud escalation due to personal content: %s — %s", findings, text[:100])
     return None, findings

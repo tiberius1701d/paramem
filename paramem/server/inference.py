@@ -191,6 +191,7 @@ def handle_chat(
     ha_client: HAClient | None = None,
     speaker_id: str | None = None,
     language: str | None = None,
+    known_entities: set[str] | None = None,
 ) -> ChatResult:
     """Process a chat message via tri-path routing.
 
@@ -229,8 +230,19 @@ def handle_chat(
     if plan is None and router is not None:
         plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
 
-    # Pre-compute sanitization once for all cloud escalation paths
-    sanitized_text, sanitization_findings = sanitize_for_cloud(text, mode=config.sanitization.mode)
+    # Pre-compute sanitization once for all cloud escalation paths.
+    # Personal-content detection is anchored on the router's entity index
+    # (the graph's ground truth) plus a first-person token-set + the
+    # resolved speaker_id — the same ground truth the extraction-path
+    # anonymizer uses, no static keyword list.
+    if known_entities is None and router is not None and hasattr(router, "_all_entities"):
+        known_entities = router._all_entities
+    sanitized_text, sanitization_findings = sanitize_for_cloud(
+        text,
+        mode=config.sanitization.mode,
+        speaker_id=speaker_id,
+        known_entities=known_entities,
+    )
 
     # Path 2a: Imperative + HA entity → HA agent directly (action command)
     if plan and plan.imperative and plan.match_source in ("ha", "both"):
