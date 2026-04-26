@@ -1104,15 +1104,31 @@ _show_test14_status() {
         python3 - "$run_dir" <<'PYEOF' 2>/dev/null
 import json, sys, os
 run_dir = sys.argv[1]
-for variant in ("V1", "V2", "V3"):
+# Render in deterministic order; include extended-run variants
+# (V3_extended / V4 / V5) when their dirs exist.  Phase A may be
+# either a fresh A_done.json or a phase_a_reused.json marker.
+for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5"):
     v_dir = os.path.join(run_dir, variant)
     if not os.path.isdir(v_dir):
         continue
     any_done = False
     for phase in ("A", "B", "C"):
-        marker = os.path.join(v_dir, phase, f"{phase}_done.json")
-        if not os.path.exists(marker):
-            continue
+        if phase == "A":
+            done_marker = os.path.join(v_dir, "A", "A_done.json")
+            reuse_marker = os.path.join(v_dir, "A", "phase_a_reused.json")
+            if os.path.exists(done_marker):
+                marker = done_marker
+                tag = ""
+            elif os.path.exists(reuse_marker):
+                marker = reuse_marker
+                tag = " (reused)"
+            else:
+                continue
+        else:
+            marker = os.path.join(v_dir, phase, f"{phase}_done.json")
+            if not os.path.exists(marker):
+                continue
+            tag = ""
         any_done = True
         try:
             d = json.load(open(marker))
@@ -1127,7 +1143,7 @@ for variant in ("V1", "V2", "V3"):
                  f"stable={stable}" if stable is not None else None,
                  f"wall={wall:.0f}s" if isinstance(wall, (int, float)) else None]
         summary = "  ".join(s for s in parts if s)
-        print(f"  {variant}/{phase}:    \x1b[32m✓\x1b[0m {summary}")
+        print(f"  {variant}/{phase}:    \x1b[32m✓\x1b[0m {summary}{tag}")
     if not any_done:
         print(f"  {variant}:      \x1b[2mnot started\x1b[0m")
 if os.path.exists(os.path.join(run_dir, "pre_decision.json")):
@@ -1168,8 +1184,14 @@ PYEOF
         python3 - "$run_dir" <<'PYEOF' 2>/dev/null
 import json, sys, os
 run_dir = sys.argv[1]
+# P0 marker is at run_dir top level; P1/P2/P3 markers live under
+# their per-round subdirs.  Earlier code searched all four at the
+# top level — P1/P2/P3 always rendered as not started.
 for phase in ("P0", "P1", "P2", "P3"):
-    marker = os.path.join(run_dir, f"{phase}_done.json")
+    if phase == "P0":
+        marker = os.path.join(run_dir, "P0_done.json")
+    else:
+        marker = os.path.join(run_dir, phase, f"{phase}_done.json")
     if not os.path.exists(marker):
         continue
     try:
