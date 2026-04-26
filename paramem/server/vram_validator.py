@@ -543,37 +543,84 @@ def format_tier_table(assessment: TopologyAssessment) -> str:
 # ── Live-budget enforcement ─────────────────────────────────────────────────
 
 
+def _query_device_memory_used_bytes() -> int | None:
+    """Return device-wide GPU memory in use (bytes), via ``nvidia-smi``.
+
+    Cross-process — sees memory held by every consumer on the device,
+    including this process AND orphaned dxgkrnl-cached allocations on WSL2
+    that have no owning compute process. Returns ``None`` on failure
+    (binary missing, timeout, parse error); the caller decides the
+    fallback policy.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=True,
+        )
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.debug("nvidia-smi memory query failed: %s", exc)
+        return None
+    body = (result.stdout or "").strip()
+    try:
+        return int(body.splitlines()[0]) * 2**20
+    except (ValueError, IndexError) as exc:
+        logger.debug("nvidia-smi memory query unparseable (output=%r): %s", body, exc)
+        return None
+
+
 def measure_external_vram(
     *,
     total_memory_bytes_override: int | None = None,
 ) -> tuple[int, int]:
-    """Snapshot VRAM held by non-ParaMem consumers at process entry.
+    """Snapshot device-wide GPU memory occupancy at process entry.
 
-    Must be called BEFORE :func:`paramem.models.loader.load_base_model` so
-    ``torch.cuda.memory_allocated`` reflects external consumers only. The
-    fundamental constraint is that on server (re)start ParaMem's own
-    footprint is wiped — the CUDA context begins empty for this process.
-    Anything the allocator reports at entry is therefore held by *other*
-    processes sharing the GPU (Windows desktop compositor, WSL driver
-    overhead, another model server, etc.) and must be subtracted from the
-    hardware ceiling before the topology math compares to capacity.
+    Called BEFORE :func:`paramem.models.loader.load_base_model` so the
+    measurement reflects external consumers' VRAM usage on this device.
+    Uses ``nvidia-smi --query-gpu=memory.used`` for a true device-wide
+    read — sees the Windows desktop compositor, other model servers, AND
+    orphaned dxgkrnl-cached allocations on WSL2 that linger after the
+    owning process exits.
 
-    Re-measured on every lifespan entry — cheap (microseconds) and ensures
-    restarts see the current external occupancy, not a stale snapshot.
+    Falls back to :func:`torch.cuda.memory_allocated` (per-process only)
+    when ``nvidia-smi`` is unavailable, with a WARNING log calling out
+    the blind spot. The fallback path matches the prior implementation,
+    which silently under-reported external occupancy.
+
+    Re-measured on every lifespan entry — cheap (sub-100 ms subprocess)
+    and ensures restarts see current occupancy, not a stale snapshot.
 
     Args:
-        total_memory_bytes_override: Test-only override. When set, skips the
-            CUDA hardware read and returns this value as total_memory.
+        total_memory_bytes_override: Test-only override. When set, skips
+            the CUDA hardware read for ``total_memory_bytes``.
 
     Returns:
-        ``(total_memory_bytes, external_bytes)`` — the device's hardware cap
-        and the bytes held by non-ParaMem consumers at this moment.
+        ``(total_memory_bytes, external_bytes)`` — the device's hardware
+        cap and bytes currently held by all consumers on the device. The
+        small fraction held by this process pre-load (CUDA context only)
+        is included in ``external_bytes``; conservative in the safe
+        direction.
     """
     if total_memory_bytes_override is not None:
         total_memory_bytes = total_memory_bytes_override
     else:
         total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
-    external_bytes = torch.cuda.memory_allocated(0)
+
+    external_bytes = _query_device_memory_used_bytes()
+    if external_bytes is None:
+        logger.warning(
+            "nvidia-smi unavailable; falling back to torch.cuda.memory_allocated. "
+            "External VRAM held by other processes (and orphaned dxgkrnl cache "
+            "on WSL2) will be invisible — live-budget check may admit an "
+            "unfittable topology."
+        )
+        external_bytes = torch.cuda.memory_allocated(0)
     logger.info(
         "VRAM snapshot at entry: total=%.2f GiB, external consumers=%.2f GiB",
         total_memory_bytes / 2**30,

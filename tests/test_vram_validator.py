@@ -16,6 +16,7 @@ No GPU required — all CUDA calls are mocked. Tests cover:
 from __future__ import annotations
 
 import logging
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -1063,3 +1064,112 @@ def test_validate_breakdown_omits_stt_tts_lines_when_zero(caplog):
     assert "VRAM check passed" in logged
     assert "STT (Whisper)" not in logged
     assert "TTS voices on GPU" not in logged
+
+
+# ---------------------------------------------------------------------------
+# measure_external_vram — device-wide measurement via nvidia-smi
+# ---------------------------------------------------------------------------
+
+
+def test_measure_external_vram_uses_nvidia_smi():
+    """``measure_external_vram`` must read device-wide memory via nvidia-smi,
+    not per-process via ``torch.cuda.memory_allocated``. Regression for the
+    blind spot that triggered the 2026-04-26 WSL crash: a process holding
+    ~4.5 GiB on the GPU was invisible to ``torch.cuda.memory_allocated``
+    (which only sees the calling process's allocations)."""
+    from paramem.server.vram_validator import measure_external_vram
+
+    completed = subprocess.CompletedProcess(
+        args=["nvidia-smi"],
+        returncode=0,
+        stdout="4608\n",  # 4608 MiB ≈ 4.5 GiB
+        stderr="",
+    )
+    with (
+        patch("paramem.server.vram_validator.torch") as mock_torch,
+        patch("paramem.server.vram_validator.subprocess.run", return_value=completed) as mock_run,
+    ):
+        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
+        # If the implementation falls back, it would call this — must NOT.
+        mock_torch.cuda.memory_allocated.return_value = 0
+
+        total, external = measure_external_vram()
+
+    assert total == _TOTAL_VRAM_BYTES
+    assert external == 4608 * 2**20
+    # nvidia-smi was the source of truth; torch.cuda.memory_allocated was not consulted.
+    mock_run.assert_called_once()
+    mock_torch.cuda.memory_allocated.assert_not_called()
+
+
+def test_measure_external_vram_falls_back_when_nvidia_smi_missing(caplog):
+    """When ``nvidia-smi`` is unavailable, ``measure_external_vram`` falls back
+    to ``torch.cuda.memory_allocated`` and logs a WARNING. The fallback path
+    matches the prior (buggy) behavior; the warning makes the blind spot
+    visible to the operator instead of letting it silently admit an
+    unfittable topology."""
+    import logging
+
+    from paramem.server.vram_validator import measure_external_vram
+
+    named = logging.getLogger("paramem.server.vram_validator")
+    orig_propagate = named.propagate
+    named.propagate = True
+    caplog.set_level(logging.WARNING, logger="paramem.server.vram_validator")
+    named.addHandler(caplog.handler)
+
+    try:
+        with (
+            patch("paramem.server.vram_validator.torch") as mock_torch,
+            patch(
+                "paramem.server.vram_validator.subprocess.run",
+                side_effect=FileNotFoundError("nvidia-smi"),
+            ),
+        ):
+            mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
+            mock_torch.cuda.memory_allocated.return_value = 1_000_000_000
+
+            total, external = measure_external_vram()
+    finally:
+        named.removeHandler(caplog.handler)
+        named.propagate = orig_propagate
+
+    assert total == _TOTAL_VRAM_BYTES
+    assert external == 1_000_000_000
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "nvidia-smi unavailable" in logged
+    assert "blind spot" in logged or "invisible" in logged
+
+
+def test_enforce_live_budget_rejects_when_external_consumes_majority():
+    """Regression for the 2026-04-26 crash: with 4.5 GiB external and 7.5 GiB
+    required on an 8 GiB device, live budget = 8 − 4.5 = 3.5 GiB < 7.5 GiB
+    required, and ``enforce_live_budget`` must raise. Pre-fix, the bug
+    silently passed because ``torch.cuda.memory_allocated`` reported 0 for
+    a foreign process and live budget = 8 − 0 = 8 GiB > 7.5 GiB."""
+    from paramem.server.vram_validator import (
+        TopologyAssessment,
+        enforce_live_budget,
+    )
+
+    total_memory = 8 * _GiB
+    external = int(4.5 * _GiB)
+    required = int(7.5 * _GiB)
+
+    # Minimal TopologyAssessment fixture — enforce_live_budget reads
+    # required_bytes and breakdown for the error message.
+    assessment = TopologyAssessment(
+        required_bytes=required,
+        adapter_bytes=int(0.05 * _GiB),
+        base_bytes=int(3.8 * _GiB),
+        per_tier_fit={8: (False, total_memory - required), 12: (True, 12 * _GiB - required)},
+        breakdown="(test fixture)",
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        enforce_live_budget(assessment, total_memory, external)
+
+    msg = str(exc_info.value)
+    assert "VRAM live budget insufficient" in msg
+    assert "External occupancy" in msg
+    assert "Deficit" in msg
