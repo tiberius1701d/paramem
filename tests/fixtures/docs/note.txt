@@ -1,0 +1,9 @@
+I work as a software engineer at Acme Corp in Berlin.
+
+My main responsibilities include designing distributed systems and mentoring junior engineers.
+
+I graduated from TU Berlin with a degree in Computer Science in 2015.
+
+In my spare time I enjoy hiking and playing chess.
+
+I speak German and English fluently.

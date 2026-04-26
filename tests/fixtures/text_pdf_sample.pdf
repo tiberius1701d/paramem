@@ -1,0 +1,61 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 7 0 R] /Count 2 >>
+endobj
+4 0 obj
+<< /Length 361 >>
+stream
+BT
+/F1 12 Tf
+50 750 Td
+(Page One: Career History) Tj
+0 -14 Td (I worked at Acme Corp from 2015 to 2020 as a software engineer.) Tj
+0 -14 Td (My responsibilities included designing distributed systems.) Tj
+0 -14 Td (I led a team of five engineers on the data platform project.) Tj
+0 -14 Td (We delivered a new pipeline that reduced latency by 40 percent.) Tj
+ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>
+endobj
+6 0 obj
+<< /Length 317 >>
+stream
+BT
+/F1 12 Tf
+50 750 Td
+(Page Two: Education and Skills) Tj
+0 -14 Td (I graduated from TU Berlin in 2015 with a degree in Computer Science.) Tj
+0 -14 Td (I am proficient in Python, Go, and Rust.) Tj
+0 -14 Td (I speak German and English fluently.) Tj
+0 -14 Td (In my spare time I enjoy hiking and playing chess.) Tj
+ET
+
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 3 0 R >> >> >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000009 00000 n 
+0000000155 00000 n 
+0000000058 00000 n 
+0000000218 00000 n 
+0000000630 00000 n 
+0000000756 00000 n 
+0000001124 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+1250
+%%EOF
