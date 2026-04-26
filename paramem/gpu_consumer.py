@@ -4,7 +4,7 @@ Owns ALL paramem-specific GPU negotiation logic:
 
 - Identifying the server process via systemd MainPID, TCP listener, or
   /proc cmdline markers.
-- Sending SIGUSR1 to switch the server to cloud-only mode.
+- POSTing /gpu/release to switch the server to cloud-only mode in-process.
 - Polling /status to detect when the server is idle (cloud-only shortcut).
 - Stamping / clearing PARAMEM_HOLD_* systemd env vars so pstatus and
   auto-reclaim can track the active ML hold.
@@ -22,9 +22,7 @@ pre-instantiated object used by the paramem shim and by ``with-gpu
 from __future__ import annotations
 
 import logging
-import os
 import shutil
-import signal
 import subprocess
 import time
 
@@ -114,7 +112,7 @@ def _identify_server_pids(external_pids: list[int], port: int) -> list[int]:
 
     The cmdline backstop catches the server whenever (1) and (2) both miss —
     startup race before port bind, lsof missing from PATH, unmanaged systemd,
-    or a SIGUSR1 transition window.
+    or a /gpu/release transition window.
 
     Returns only PIDs that are in ``external_pids``.
     """
@@ -136,7 +134,7 @@ def _identify_server_pids(external_pids: list[int], port: int) -> list[int]:
 def _server_is_cloud_only(port: int) -> bool:
     """Return True if the server /status reports mode=='cloud-only'.
 
-    Transient unreachability (e.g. during a SIGUSR1 transition) is logged at
+    Transient unreachability (e.g. during a /gpu/release transition) is logged at
     debug level and returns False; the polling caller retries.
     """
     try:
@@ -191,16 +189,27 @@ class ParamemServerConsumer:
         return _server_is_cloud_only(self._port)
 
     def request_release(self, pid: int) -> None:
-        """Send SIGUSR1 to the server, asking it to unload the model.
+        """POST /gpu/release; the server unloads the model and switches to
+        cloud-only mode in-process. Synchronous: when the POST returns 200,
+        the server is already cloud-only.
 
         Args:
-            pid: The server's primary process PID.
+            pid: Unused — the HTTP endpoint determines the target. Kept for
+                Consumer-protocol compatibility with signal-based releasers.
         """
-        logger.debug("Sending SIGUSR1 to ParaMem server (PID %d)", pid)
+        import httpx
+
+        url = f"http://localhost:{self._port}/gpu/release"
+        logger.debug("POST %s", url)
         try:
-            os.kill(pid, signal.SIGUSR1)
-        except ProcessLookupError:
-            logger.debug("Server PID %d already gone when sending SIGUSR1", pid)
+            with httpx.Client(timeout=5) as client:
+                resp = client.post(url)
+            if resp.status_code == 503:
+                logger.debug("ParaMem release deferred: server is consolidating")
+            elif not resp.is_success:
+                logger.warning("ParaMem release POST returned HTTP %d", resp.status_code)
+        except (httpx.HTTPError, OSError) as exc:
+            logger.debug("ParaMem release POST to %s failed: %s", url, exc)
 
     def wait_for_idle(self, pid: int, timeout: int) -> bool:
         """Poll /status until cloud-only or timeout.

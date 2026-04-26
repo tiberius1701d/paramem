@@ -2535,6 +2535,70 @@ async def gpu_force_local():
     }
 
 
+@app.post("/gpu/release")
+async def gpu_release():
+    """Release the GPU model in-process; switch to cloud-only mode.
+
+    External GPU consumers (gpu_guard ConfigConsumer, lerobot, etc.) call
+    this endpoint to ask paramem to step aside without exiting. Idempotent:
+    a server already in cloud-only returns 200 immediately.
+
+    During an in-flight consolidation cycle the server returns 503; the
+    caller may retry. Mid-cycle release would corrupt extraction state
+    (the cycle re-extracts on next start, but losing partial-cycle work
+    is wasteful and exits via SIGUSR1 had the same flaw).
+
+    On success the response is synchronous — by the time the POST returns,
+    the model is unloaded and ``_state["mode"]`` is ``"cloud-only"``. The
+    auto-reclaim loop is started so paramem will reclaim the GPU once the
+    external consumer goes away (cloud-only → local via service restart,
+    same code path as ``--defer-model``).
+
+    Returns:
+        200 ``{"mode": "cloud-only", "released": bool, "reason": str}``.
+            ``released=False`` when the server was already cloud-only.
+        503 ``{"error": "consolidating", ...}`` when a cycle is in flight.
+    """
+    if _state["mode"] == "cloud-only":
+        return {
+            "mode": "cloud-only",
+            "released": False,
+            "reason": _state.get("cloud_only_reason"),
+        }
+
+    if _state.get("consolidating", False):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "consolidating",
+                "detail": (
+                    "GPU release refused: a consolidation cycle is in flight. "
+                    "Retry once /status reports consolidating=false."
+                ),
+            },
+        )
+
+    logger.info("Release requested via /gpu/release — unloading model and switching to cloud-only.")
+
+    if _state.get("model") is not None:
+        try:
+            unload_model(_state["model"], _state.get("tokenizer"))
+        except Exception:
+            logger.exception("Error unloading model during /gpu/release")
+        _state["model"] = None
+        _state["tokenizer"] = None
+
+    _state["mode"] = "cloud-only"
+    _state["cloud_only_reason"] = "released"
+
+    reclaim_task = _state.get("reclaim_task")
+    if reclaim_task is None or reclaim_task.done():
+        reclaim_interval = _state["config"].server.reclaim_interval_minutes
+        _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
+
+    return {"mode": "cloud-only", "released": True, "reason": "released"}
+
+
 @app.post("/refresh-ha")
 async def refresh_ha():
     """Rebuild the HA entity graph from the HA API.
