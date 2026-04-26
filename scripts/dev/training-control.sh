@@ -480,6 +480,17 @@ training_resume() {
             if [[ "$mode_value" == "pre" && -f "$run_dir/V3/A/A_done.json" ]]; then
                 extra_flags="$extra_flags --reuse-phase-a-from $run_dir"
             fi
+            # 14b multiround binds to a specific 14a (scale) run via
+            # scale_run.  The path is persisted in run_config.json on
+            # first launch.  Pass it back through --scale-run so resume
+            # binds to the same 14a instance even when later 14a runs
+            # exist (find_latest_run_dir would otherwise pick the newest).
+            if [[ "$mode_value" == "multiround" ]]; then
+                local scale_run=$(python3 -c "import json; v=json.load(open('$latest_dir')).get('scale_run',''); print(v if v else '')" 2>/dev/null)
+                if [[ -n "$scale_run" ]]; then
+                    extra_flags="$extra_flags --scale-run $scale_run"
+                fi
+            fi
         fi
     fi
 
