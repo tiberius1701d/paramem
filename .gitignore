@@ -53,6 +53,8 @@ scripts/deploy-ha.sh
 # Compiled PDFs and build archives
 *.pdf
 *.tar.gz
+# Allowlist: small anonymized test fixtures that exercise the PDF chunker.
+!tests/fixtures/*.pdf
 
 # LaTeX build artifacts
 paper/*.aux
@@ -97,5 +99,7 @@ ingest/
 
 # Internal design plans and follow-up specs (not for public repo)
 docs/
+# Allowlist: anonymized text/markdown fixtures used by chunker + CLI tests.
+!tests/fixtures/docs/
 f52_spec.md
 f52_architecture.md
