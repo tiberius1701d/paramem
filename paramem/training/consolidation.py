@@ -16,6 +16,12 @@ from typing import Optional
 from torch.utils.data import Dataset
 
 from paramem.graph.extractor import (
+    DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
+    DEFAULT_SYSTEM_PROMPT_FILENAME,
+    DEFAULT_USER_PROMPT_FILENAME,
+    DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME,
+    DOCUMENT_SYSTEM_PROMPT_FILENAME,
+    DOCUMENT_USER_PROMPT_FILENAME,
     PROVIDER_KEY_ENV,
     _graph_enrich_with_sota,
     extract_graph,
@@ -447,16 +453,37 @@ class ConsolidationLoop:
             out.append(rel)
         return out
 
-    def _extraction_kwargs(self, **overrides) -> dict:
-        """Build the full kwarg set passed to extract_graph / extract_procedural_graph.
+    def _extraction_kwargs(self, *, source_type: str = "transcript", **overrides) -> dict:
+        """Build the full kwarg set passed to ``extract_graph``.
 
         Resolves each flag to the per-call override if given (not None), else
-        the loop-level default. Single source of truth for every extraction path.
+        the loop-level default.  Single source of truth for every extraction
+        path.
+
+        ``source_type`` selects both prompt filenames:
+
+        * ``"transcript"`` (default) — dialogue system prompt
+          (:data:`~paramem.graph.extractor.DEFAULT_SYSTEM_PROMPT_FILENAME`)
+          and user template
+          (:data:`~paramem.graph.extractor.DEFAULT_USER_PROMPT_FILENAME`).
+        * ``"document"`` — document system prompt
+          (:data:`~paramem.graph.extractor.DOCUMENT_SYSTEM_PROMPT_FILENAME`)
+          and user template
+          (:data:`~paramem.graph.extractor.DOCUMENT_USER_PROMPT_FILENAME`).
+          Narrator binding is handled by the ``{speaker_context}`` slot in
+          ``extraction_document.txt`` — no extra context string is needed.
         """
 
         def pick(name: str, fallback):
             val = overrides.get(name, None)
             return fallback if val is None else val
+
+        if source_type == "document":
+            system_prompt_filename = DOCUMENT_SYSTEM_PROMPT_FILENAME
+            user_prompt_filename = DOCUMENT_USER_PROMPT_FILENAME
+        else:
+            system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
+            user_prompt_filename = DEFAULT_USER_PROMPT_FILENAME
 
         return dict(
             temperature=self.extraction_temperature,
@@ -476,23 +503,36 @@ class ConsolidationLoop:
             plausibility_judge=pick("plausibility_judge", self.extraction_plausibility_judge),
             plausibility_stage=pick("plausibility_stage", self.extraction_plausibility_stage),
             verify_anonymization=pick("verify_anonymization", self.extraction_verify_anonymization),
+            system_prompt_filename=system_prompt_filename,
+            user_prompt_filename=user_prompt_filename,
         )
 
     def _run_extract_graph(
         self,
         session_transcript: str,
         session_id: str,
+        *,
+        source_type: str = "transcript",
         **overrides,
     ):
-        """Single entry-point to extract_graph with unified flags + adapter guard.
+        """Single entry-point to ``extract_graph`` with unified flags + adapter guard.
 
-        Every orchestrator (extract_session, run_cycle, future callers) goes
-        through this helper so the pipeline cannot diverge by accident.
+        Every orchestrator (``extract_session``, ``run_cycle``, future callers)
+        goes through this helper so the pipeline cannot diverge by accident.
+
+        ``source_type`` selects both the system prompt and the user template:
+        ``"transcript"`` (default) uses the dialogue prompts;
+        ``"document"`` uses the written-document prompts.  Narrator binding is
+        handled by the ``{speaker_context}`` slot in the user template — no
+        separate context string is required.
         """
         from peft import PeftModel as _PeftModel
 
         self._disable_gradient_checkpointing()
-        kwargs = self._extraction_kwargs(**overrides)
+        kwargs = self._extraction_kwargs(
+            source_type=source_type,
+            **overrides,
+        )
         if isinstance(self.model, _PeftModel):
             with self.model.disable_adapter():
                 return extract_graph(
@@ -506,17 +546,35 @@ class ConsolidationLoop:
         session_id: str,
         speaker_name: str | None = None,
         stt_correction: bool | None = None,
+        source_type: str = "transcript",
     ):
-        """Single entry-point to extract_procedural_graph with adapter guard."""
+        """Single entry-point to ``extract_procedural_graph`` with adapter guard.
+
+        ``source_type`` mirrors the same parameter on ``_run_extract_graph``:
+        ``"document"`` selects the written-document system prompt so the
+        procedural extractor is not primed with dialogue-style few-shots.
+        """
         from peft import PeftModel as _PeftModel
 
         self._disable_gradient_checkpointing()
         stt = self.extraction_stt_correction if stt_correction is None else stt_correction
+        system_prompt_filename = (
+            DOCUMENT_SYSTEM_PROMPT_FILENAME
+            if source_type == "document"
+            else DEFAULT_SYSTEM_PROMPT_FILENAME
+        )
+        user_prompt_filename = (
+            DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME
+            if source_type == "document"
+            else DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME
+        )
         call_kwargs = dict(
             max_tokens=self.extraction_max_tokens,
             prompts_dir=self.prompts_dir,
             stt_correction=stt,
             speaker_name=speaker_name,
+            system_prompt_filename=system_prompt_filename,
+            user_prompt_filename=user_prompt_filename,
         )
         if isinstance(self.model, _PeftModel):
             with self.model.disable_adapter():
@@ -544,11 +602,26 @@ class ConsolidationLoop:
         plausibility_judge: str | None = None,
         plausibility_stage: str | None = None,
         verify_anonymization: bool | None = None,
+        source_type: str = "transcript",
     ) -> tuple[list[dict], list[dict]]:
         """Extract and generate QA pairs from a session without training.
 
-        Returns (episodic_qa, procedural_relations) for deferred training.
+        Returns ``(episodic_qa, procedural_relations)`` for deferred training.
         Merges the session graph into the cumulative graph.
+
+        Args:
+            session_transcript: Raw session text (conversation transcript or
+                document chunk).
+            session_id: Unique identifier for this session.
+            speaker_id: Speaker identifier for preference scoping.
+            speaker_name: Real speaker name injected via ``{speaker_context}``
+                in the user template for narrator binding.
+            source_type: ``"transcript"`` (default) for voice/chat sessions;
+                ``"document"`` for written documents fed through the ingest
+                pipeline.  Selects both the system prompt and the user
+                template.  Narrator binding for document sources uses the
+                same ``build_speaker_context`` mechanism as transcripts — no
+                separate ``doc_title`` or context string is needed.
         """
         logger.info("=== Extraction (session=%s) ===", session_id)
 
@@ -556,6 +629,7 @@ class ConsolidationLoop:
         session_graph = self._run_extract_graph(
             session_transcript,
             session_id,
+            source_type=source_type,
             ha_context=ha_context,
             stt_correction=stt_correction,
             ha_validation=ha_validation,
@@ -612,6 +686,7 @@ class ConsolidationLoop:
                 session_id,
                 speaker_name=speaker_name,
                 stt_correction=stt_correction,
+                source_type=source_type,
             )
             procedural_rels.extend(
                 {
@@ -1156,6 +1231,7 @@ class ConsolidationLoop:
         session_id: str,
         speaker_id: str = "",
         speaker_name: str | None = None,
+        source_type: str = "transcript",
     ) -> CycleResult:
         """Run one consolidation cycle for a new session.
 
@@ -1170,6 +1246,8 @@ class ConsolidationLoop:
             session_transcript: The raw session transcript text.
             session_id: Unique identifier for this session.
             speaker_id: Speaker identifier for preference scoping.
+            source_type: ``"transcript"`` (default) or ``"document"``. Passed
+                through to the extractor to select the appropriate system prompt.
 
         Returns:
             CycleResult with metrics and timing.
@@ -1194,6 +1272,7 @@ class ConsolidationLoop:
         session_graph = self._run_extract_graph(
             session_transcript,
             session_id,
+            source_type=source_type,
             speaker_name=speaker_name,
         )
 
@@ -1245,6 +1324,7 @@ class ConsolidationLoop:
                 session_transcript,
                 session_id,
                 speaker_name=speaker_name,
+                source_type=source_type,
             )
             procedural_rels.extend(
                 {

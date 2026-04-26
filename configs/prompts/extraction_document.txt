@@ -1,0 +1,73 @@
+Extract PERSONAL FACTS about the author from this written document.{speaker_context}
+
+Only extract facts that would still be true tomorrow — identity, relationships,
+location, preferences, work, education.
+
+Rules:
+- INTENT MATTERS: Only extract declarative statements the author makes about themselves.
+  Rhetorical questions, hypotheticals, and topic headings are NOT facts.
+- The subject of every relation must be a NAMED person, never "User", "Author", or "I"
+- Discard extractions where the object is a placeholder ("Unknown", "None"),
+  a system identifier (containing dots like "media_player.sonos_office"), or
+  not a meaningful personal fact
+- PLAUSIBILITY: If an extracted name sounds wrong in context, discard it rather than
+  store a wrong fact
+- Entity types: {entity_types}
+- IMPORTANT: Never label a named person, place, or organization as "concept". Use "concept" only for abstract things with no fit (e.g. a field of study like "quantum computing").
+- Relation types: {relation_types}
+- Tag preferences correctly: if the author uses or prefers something (music
+  service, food, hobby), set relation_type to "preference", not "factual"
+- predicate: snake_case verb phrase — consistent, reusable across sessions
+- confidence: 1.0 for explicit facts, 0.7 for implied/inferred
+- Resolve implied relationships from possessives and kinship terms:
+  "my wife/husband X" = married_to, "my son/daughter X" = parent_of,
+  "my brother/sister X" = sibling_of, "my/our dog/cat X" = has_pet
+
+Predicate examples (use these exact forms when they apply):
+{predicate_examples}
+- If none fit, create a new snake_case predicate (e.g. "competed_in")
+
+POSITIVE example — document text: "I work at Acme Corp in the engineering department."
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Acme Corp", "entity_type": "organization", "attributes": {{}}}}],
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "works_at", "object": "Acme Corp", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} works at Acme Corp in engineering."}}
+
+POSITIVE example — document text: "## Hobbies\n- Cycling\n- Photography\n- Amateur radio"
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Cycling", "entity_type": "preference", "attributes": {{}}}},
+ {{"name": "Photography", "entity_type": "preference", "attributes": {{}}}},
+ {{"name": "Amateur Radio", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Cycling", "relation_type": "preference", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Photography", "relation_type": "preference", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Amateur Radio", "relation_type": "preference", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} enjoys cycling, photography, and amateur radio."}}
+
+POSITIVE example — document text: "Born and raised in Millfield, I moved to Westport after university."
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Millfield", "entity_type": "place", "attributes": {{}}}},
+ {{"name": "Westport", "entity_type": "place", "attributes": {{}}}}],
+ "relations": [
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "born_in", "object": "Millfield", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "lives_in", "object": "Westport", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} was born in Millfield and now lives in Westport."}}
+
+Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
+author's real identifier (e.g. "Alice", "Speaker7") via the directive above.
+Never emit the literal strings "{{SPEAKER_NAME}}", "SPEAKER_NAME", or
+"Speaker_Name" in your output.
+
+NEGATIVE example — document text: "## Table of Contents\n1. Introduction\n2. Background"
+Extract: NONE — table-of-contents entries are structural noise, not personal facts.
+
+NEGATIVE example — document text: "Page 4 of 12"
+Extract: NONE — page numbers are structural noise.
+
+NEGATIVE example — document text: "What would happen if quantum computing became mainstream?"
+Extract: NONE — rhetorical questions and hypotheticals are not personal facts.
+
+Document:
+{transcript}
+
+Extract personal facts as JSON. If no personal facts are present, return {{"entities": [], "relations": [], "summary": "No personal facts found."}}.

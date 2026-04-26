@@ -15,6 +15,8 @@ import inspect
 import re
 from pathlib import Path
 
+import pytest
+
 # Files allowed to call the extractors directly:
 # - extractor.py: the module defining them.
 # - consolidation.py: the only orchestrator that wraps them.
@@ -117,23 +119,26 @@ def _extraction_kwargs_namespace():
     )
 
 
-def test_extraction_kwargs_match_extract_graph_signature():
+@pytest.mark.parametrize("source_type", ["transcript", "document"])
+def test_extraction_kwargs_match_extract_graph_signature(source_type):
     """Every kwarg the helper passes must exist on extract_graph.
 
     Catches rename drift: if the helper grows a new flag but the extractor
     hasn't caught up (or vice versa), production crashes with TypeError.
-    This test fails first.
+    This test fails first.  Parametrized over both source_type values so
+    both the transcript and document kwarg sets are validated.
     """
     from paramem.graph.extractor import extract_graph
     from paramem.training.consolidation import ConsolidationLoop
 
     ns = _extraction_kwargs_namespace()
-    helper_keys = set(ConsolidationLoop._extraction_kwargs(ns).keys())
+    helper_keys = set(ConsolidationLoop._extraction_kwargs(ns, source_type=source_type).keys())
     extractor_params = set(inspect.signature(extract_graph).parameters) - _EXTRACTOR_POSITIONAL
 
     unknown = helper_keys - extractor_params
     assert not unknown, (
-        f"_extraction_kwargs passes kwargs extract_graph does not accept: {sorted(unknown)}. "
+        f"_extraction_kwargs(source_type={source_type!r}) passes kwargs extract_graph does "
+        f"not accept: {sorted(unknown)}. "
         "Either rename the helper key to match the extractor signature, or add the "
         "parameter to extract_graph."
     )
@@ -146,7 +151,14 @@ def test_procedural_kwargs_match_extract_procedural_graph_signature():
 
     # Mirror the inline kwargs shape inside _run_extract_procedural_graph.
     # If that helper ever diverges, update this set alongside.
-    procedural_keys = {"max_tokens", "prompts_dir", "stt_correction", "speaker_name"}
+    procedural_keys = {
+        "max_tokens",
+        "prompts_dir",
+        "stt_correction",
+        "speaker_name",
+        "system_prompt_filename",
+        "user_prompt_filename",
+    }
     extractor_params = (
         set(inspect.signature(extract_procedural_graph).parameters) - _EXTRACTOR_POSITIONAL
     )
@@ -397,6 +409,10 @@ def test_server_extract_session_kwargs_map_to_consolidation_config():
         "speaker_id",
         "speaker_name",
         "ha_context",
+        # Session-metadata-derived; no extraction_<kwarg> field in
+        # ConsolidationScheduleConfig because it is resolved per call,
+        # not stored as a loop-level default.
+        "source_type",
     }
     config_fields = {f for f in vars(ConsolidationScheduleConfig()).keys()}
 
@@ -549,3 +565,168 @@ def test_run_extract_procedural_graph_threads_positional_args(monkeypatch):
     assert captured["kwargs"]["speaker_name"] == "Tobias"
     assert captured["kwargs"]["stt_correction"] is False
     assert captured["kwargs"]["prompts_dir"] == "/custom/prompts"
+
+
+def test_extraction_system_document_prompt_present():
+    """Verify extraction_system_document.txt exists under configs/prompts/.
+
+    The document extraction path resolves this filename at runtime via
+    load_extraction_prompts; a missing file causes a silent fallback to the
+    hardcoded default system prompt, which has no narrator-binding directives.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    doc_prompt = repo_root / "configs" / "prompts" / "extraction_system_document.txt"
+    assert doc_prompt.exists(), (
+        "configs/prompts/extraction_system_document.txt is missing. "
+        "The document extraction path will silently fall back to the dialogue "
+        "system prompt, losing narrator binding."
+    )
+
+
+def test_run_extract_graph_threads_source_type(monkeypatch):
+    """When called with source_type='document', _run_extract_graph must resolve
+    BOTH system_prompt_filename to DOCUMENT_SYSTEM_PROMPT_FILENAME and
+    user_prompt_filename to DOCUMENT_USER_PROMPT_FILENAME.
+
+    Regression guard: if _extraction_kwargs ever stops routing source_type to
+    the correct filenames, document extraction silently uses the dialogue prompts.
+    """
+    from unittest.mock import MagicMock
+
+    from paramem.graph.extractor import (
+        DOCUMENT_SYSTEM_PROMPT_FILENAME,
+        DOCUMENT_USER_PROMPT_FILENAME,
+    )
+    from paramem.training.consolidation import ConsolidationLoop
+
+    captured = {}
+
+    def spy(model, tokenizer, transcript, session_id, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr("paramem.training.consolidation.extract_graph", spy)
+
+    ns = _loop_ns_with_model(MagicMock())
+    ConsolidationLoop._run_extract_graph(
+        ns, "some document text", "doc-001", source_type="document"
+    )
+
+    got_system = captured["kwargs"].get("system_prompt_filename")
+    assert got_system == DOCUMENT_SYSTEM_PROMPT_FILENAME, (
+        f"Expected system_prompt_filename={DOCUMENT_SYSTEM_PROMPT_FILENAME!r}, got {got_system!r}"
+    )
+    got_user = captured["kwargs"].get("user_prompt_filename")
+    assert got_user == DOCUMENT_USER_PROMPT_FILENAME, (
+        f"Expected user_prompt_filename={DOCUMENT_USER_PROMPT_FILENAME!r}, got {got_user!r}"
+    )
+
+
+def test_extraction_document_prompt_present():
+    """Verify extraction_document.txt exists under configs/prompts/.
+
+    The document extraction path resolves this filename at runtime via
+    load_extraction_prompts; a missing file causes a silent fallback to the
+    hardcoded default user template, which has dialogue-shaped few-shots
+    incompatible with document extraction.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    doc_prompt = repo_root / "configs" / "prompts" / "extraction_document.txt"
+    assert doc_prompt.exists(), (
+        "configs/prompts/extraction_document.txt is missing. "
+        "The document extraction path will silently fall back to the dialogue "
+        "user template, producing dialogue-shaped few-shots for document input."
+    )
+
+
+def _loop_ns_for_procedural():
+    """Namespace usable as `self` for bound-call tests of _run_extract_procedural_graph."""
+    from unittest.mock import MagicMock
+
+    ns = _extraction_kwargs_namespace()
+    ns.model = MagicMock()
+    ns.tokenizer = MagicMock()
+    ns._disable_gradient_checkpointing = lambda: None
+    return ns
+
+
+def test_run_extract_procedural_graph_threads_source_type_document(monkeypatch):
+    """When called with source_type='document', _run_extract_procedural_graph must
+    resolve BOTH system_prompt_filename to DOCUMENT_SYSTEM_PROMPT_FILENAME AND
+    user_prompt_filename to DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME.
+
+    Symmetric to test_run_extract_graph_threads_source_type for the episodic rail.
+    Regression guard: if _run_extract_procedural_graph ever stops routing
+    source_type to the correct procedural filenames, document procedural
+    extraction silently receives dialogue-shaped few-shots that reference a
+    non-existent assistant response.
+    """
+    from unittest.mock import MagicMock
+
+    from paramem.graph.extractor import (
+        DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME,
+        DOCUMENT_SYSTEM_PROMPT_FILENAME,
+    )
+    from paramem.training.consolidation import ConsolidationLoop
+
+    captured = {}
+
+    def spy(model, tokenizer, transcript, session_id, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr("paramem.training.consolidation.extract_procedural_graph", spy)
+
+    ns = _loop_ns_for_procedural()
+    ConsolidationLoop._run_extract_procedural_graph(
+        ns, "some document text", "doc-001", source_type="document"
+    )
+
+    got_system = captured["kwargs"].get("system_prompt_filename")
+    assert got_system == DOCUMENT_SYSTEM_PROMPT_FILENAME, (
+        f"Expected system_prompt_filename={DOCUMENT_SYSTEM_PROMPT_FILENAME!r}, got {got_system!r}"
+    )
+    got_user = captured["kwargs"].get("user_prompt_filename")
+    assert got_user == DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME, (
+        f"Expected user_prompt_filename={DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME!r}, "
+        f"got {got_user!r}"
+    )
+
+
+def test_run_extract_procedural_graph_threads_source_type_transcript(monkeypatch):
+    """When called with source_type='transcript' (default), _run_extract_procedural_graph
+    must use DEFAULT_SYSTEM_PROMPT_FILENAME and DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME.
+
+    Ensures the transcript path continues to use dialogue prompts after the
+    document-path plumbing was added.
+    """
+    from unittest.mock import MagicMock
+
+    from paramem.graph.extractor import (
+        DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
+        DEFAULT_SYSTEM_PROMPT_FILENAME,
+    )
+    from paramem.training.consolidation import ConsolidationLoop
+
+    captured = {}
+
+    def spy(model, tokenizer, transcript, session_id, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr("paramem.training.consolidation.extract_procedural_graph", spy)
+
+    ns = _loop_ns_for_procedural()
+    ConsolidationLoop._run_extract_procedural_graph(
+        ns, "some transcript text", "s001", source_type="transcript"
+    )
+
+    got_system = captured["kwargs"].get("system_prompt_filename")
+    assert got_system == DEFAULT_SYSTEM_PROMPT_FILENAME, (
+        f"Expected system_prompt_filename={DEFAULT_SYSTEM_PROMPT_FILENAME!r}, got {got_system!r}"
+    )
+    got_user = captured["kwargs"].get("user_prompt_filename")
+    assert got_user == DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME, (
+        f"Expected user_prompt_filename={DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME!r}, "
+        f"got {got_user!r}"
+    )

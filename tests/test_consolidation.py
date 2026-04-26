@@ -250,14 +250,15 @@ class TestExtractionPathParity:
             **loop_kwargs,
         )
 
-    def _run_extract_session(self, loop):
+    def _run_extract_session(self, loop, source_type: str = "transcript"):
         return loop.extract_session(
             session_transcript="Alex lives in Millfield. He prefers Acme Radio.",
             session_id="s001",
             speaker_id="spk",
+            source_type=source_type,
         )
 
-    def _run_cycle_and_capture(self, monkeypatch, loop):
+    def _run_cycle_and_capture(self, monkeypatch, loop, source_type: str = "transcript"):
         captured: dict[str, list[dict]] = {"episodic_qa": [], "procedural_rels": []}
 
         def _capture_episodic(self_, episodic_qa, new_promotions):
@@ -287,6 +288,7 @@ class TestExtractionPathParity:
             session_transcript="Alex lives in Millfield. He prefers Acme Radio.",
             session_id="s001",
             speaker_id="spk",
+            source_type=source_type,
         )
         return captured["episodic_qa"], captured["procedural_rels"]
 
@@ -312,6 +314,7 @@ class TestExtractionPathParity:
         assert all(qa["source_predicate"] != "prefers" for qa in episodic_a)
         assert {rel["predicate"] for rel in procedural_a} == {"prefers", "listens_to"}
 
+    @pytest.mark.parametrize("source_type", ["transcript", "document"])
     @pytest.mark.parametrize(
         "procedural_enabled,loop_overrides",
         [
@@ -337,12 +340,13 @@ class TestExtractionPathParity:
         ],
     )
     def test_parity_kwargs_identical(
-        self, monkeypatch, tmp_path, procedural_enabled, loop_overrides
+        self, monkeypatch, tmp_path, procedural_enabled, loop_overrides, source_type
     ):
         """Both orchestrator paths must pass IDENTICAL kwargs to the extractors.
 
         Any new flag added to one path but not the other will fail here — the
-        helper + _extraction_kwargs are the only source of truth.
+        helper + _extraction_kwargs are the only source of truth. Parametrized
+        over source_type so both transcript and document variants are covered.
         """
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
@@ -384,7 +388,7 @@ class TestExtractionPathParity:
             extract_procedural_spy=_spy(captured_a["procedural"], procedural_graph),
             **loop_overrides,
         )
-        self._run_extract_session(loop_a)
+        self._run_extract_session(loop_a, source_type=source_type)
 
         loop_b = self._build_loop(
             monkeypatch,
@@ -394,7 +398,7 @@ class TestExtractionPathParity:
             extract_procedural_spy=_spy(captured_b["procedural"], procedural_graph),
             **loop_overrides,
         )
-        self._run_cycle_and_capture(monkeypatch, loop_b)
+        self._run_cycle_and_capture(monkeypatch, loop_b, source_type=source_type)
 
         # Each path calls extract_graph exactly once with the same kwargs.
         assert len(captured_a["graph"]) == 1

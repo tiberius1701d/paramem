@@ -1,0 +1,57 @@
+Extract PREFERENCES, HABITS, and ROUTINES of the author from this written document.{speaker_context}
+
+Only extract behavioral patterns — what the author likes, uses, prefers, avoids,
+or does regularly. These are things that reflect how the author lives, not
+factual information about who they are.
+
+Rules:
+- The subject of every relation must be a NAMED person, never "User", "Author", or "I"
+- All relations must have relation_type "preference"
+- Rely on the document's own spelling for entity names — there is no spoken form to correct
+- Discard implausible names and system identifiers (media_player.sonos_office)
+- A single mention of an activity is a weak signal — repeated patterns are stronger evidence
+- INTENT MATTERS: only extract genuine preferences and habits, not rhetorical questions,
+  hypotheticals, or topic headings
+- Entity types: {entity_types}
+- predicate: snake_case verb phrase — use these when they apply:
+{predicate_examples}
+
+POSITIVE example — document text: "I usually walk my dog before breakfast every morning."
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Dog Walking", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "does_regularly", "object": "Dog Walking", "relation_type": "preference", "confidence": 0.9}}],
+ "summary": "{{SPEAKER_NAME}} walks their dog every morning before breakfast."}}
+
+POSITIVE example — document text: "I prefer my coffee without sugar and usually drink two cups before noon."
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Coffee", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "prefers", "object": "Coffee", "relation_type": "preference", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} prefers coffee without sugar, drinks two cups before noon."}}
+
+POSITIVE example — document text: "## Weekend Routines\n- Cycling on Saturday mornings\n- Baking bread on Sundays"
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Cycling", "entity_type": "preference", "attributes": {{}}}},
+ {{"name": "Baking Bread", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "does_regularly", "object": "Cycling", "relation_type": "preference", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "does_regularly", "object": "Baking Bread", "relation_type": "preference", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} cycles on Saturday mornings and bakes bread on Sundays."}}
+
+Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
+author's real identifier (e.g. "Alice", "Speaker7") via the directive above.
+Never emit the literal strings "{{SPEAKER_NAME}}", "SPEAKER_NAME", or
+"Speaker_Name" in your output.
+
+NEGATIVE example — document text: "## Table of Contents\n1. Introduction\n2. Background"
+Extract: NONE — structural navigation, not a preference or habit.
+
+NEGATIVE example — document text: "What would happen if I switched to a plant-based diet?"
+Extract: NONE — rhetorical question, not a stated preference.
+
+NEGATIVE example — document text: "Every person should exercise regularly."
+Extract: NONE — generic advice, not a personal preference of the author.
+
+Document:
+{transcript}
+
+Extract preferences as JSON. If no preferences are present, return {{"entities": [], "relations": [], "summary": "No preferences found."}}.

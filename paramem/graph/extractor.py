@@ -27,6 +27,14 @@ _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "configs" 
 
 _DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Output valid JSON only."
 
+# Prompt filename constants — one definition site; imported by consolidation.py.
+DEFAULT_SYSTEM_PROMPT_FILENAME = "extraction_system.txt"
+DEFAULT_USER_PROMPT_FILENAME = "extraction.txt"
+DOCUMENT_SYSTEM_PROMPT_FILENAME = "extraction_system_document.txt"
+DOCUMENT_USER_PROMPT_FILENAME = "extraction_document.txt"
+DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME = "extraction_procedural.txt"
+DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME = "extraction_procedural_document.txt"
+
 
 def build_speaker_context(speaker_name: str | None) -> str:
     """Single source of truth for the extraction-prompt speaker directive.
@@ -74,20 +82,34 @@ def _load_prompt(filename: str, default: str, prompts_dir: Path | None = None) -
 
 def load_extraction_prompts(
     prompts_dir: str | Path | None = None,
+    *,
+    system_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
+    user_filename: str = DEFAULT_USER_PROMPT_FILENAME,
 ) -> tuple[str, str]:
     """Load extraction prompts from a directory, with hardcoded fallbacks.
 
     Args:
-        prompts_dir: Directory containing extraction_system.txt and extraction.txt.
-                     Falls back to configs/prompts/ in the project root, then to
+        prompts_dir: Directory containing the prompt files.  Falls back to
+                     ``configs/prompts/`` in the project root, then to
                      hardcoded defaults.
+        system_filename: Filename of the system prompt.  Defaults to
+                         :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
+                         (``"extraction_system.txt"``); pass
+                         :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME`
+                         (``"extraction_system_document.txt"``) for the
+                         written-document extraction variant.
+        user_filename: Filename of the user-turn prompt template.  Defaults to
+                       :data:`DEFAULT_USER_PROMPT_FILENAME`
+                       (``"extraction.txt"``); pass
+                       :data:`DOCUMENT_USER_PROMPT_FILENAME`
+                       (``"extraction_document.txt"``) for the document variant.
 
     Returns:
-        (system_prompt, extraction_prompt) tuple.
+        ``(system_prompt, extraction_prompt)`` tuple.
     """
     pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt("extraction_system.txt", _DEFAULT_EXTRACTION_SYSTEM, pd)
-    prompt = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT, pd)
+    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd)
+    prompt = _load_prompt(user_filename, _DEFAULT_EXTRACTION_PROMPT, pd)
     return system, prompt
 
 
@@ -110,11 +132,33 @@ Return JSON with entities, relations, summary.
 
 def load_procedural_prompt(
     prompts_dir: str | Path | None = None,
+    *,
+    system_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
+    user_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
 ) -> tuple[str, str]:
-    """Load procedural extraction prompts."""
+    """Load procedural extraction prompts.
+
+    Args:
+        prompts_dir: Directory containing the prompt files.  Falls back to
+                     ``configs/prompts/`` in the project root.
+        system_filename: Filename of the system prompt.  Defaults to
+                         :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`; pass
+                         :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME` when
+                         extracting procedural facts from a written document
+                         so the model is not primed with dialogue-style
+                         few-shots.
+        user_filename: Filename of the user-turn prompt template.  Defaults to
+                       :data:`DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME`
+                       (``"extraction_procedural.txt"``); pass
+                       :data:`DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME`
+                       (``"extraction_procedural_document.txt"``) for written
+                       documents so the model is not primed with
+                       dialogue-shaped few-shots that reference a non-existent
+                       assistant response.
+    """
     pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt("extraction_system.txt", _DEFAULT_EXTRACTION_SYSTEM, pd)
-    prompt = _load_prompt("extraction_procedural.txt", _DEFAULT_PROCEDURAL_PROMPT, pd)
+    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd)
+    prompt = _load_prompt(user_filename, _DEFAULT_PROCEDURAL_PROMPT, pd)
     return system, prompt
 
 
@@ -128,6 +172,8 @@ def extract_procedural_graph(
     prompts_dir: str | Path | None = None,
     stt_correction: bool = True,
     speaker_name: str | None = None,
+    system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
+    user_prompt_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
 ) -> SessionGraph:
     """Extract preferences/habits from a session transcript.
 
@@ -140,11 +186,33 @@ def extract_procedural_graph(
             so the model uses the real name as the subject of every extracted
             preference instead of the ``SPEAKER_NAME`` slot. Mirrors
             the same parameter on ``extract_graph``.
+        stt_correction: Correct entity names from the assistant response turn.
+            This is a no-op when
+            ``user_prompt_filename=DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME``
+            because the document path has no assistant response to
+            cross-reference; passing ``stt_correction=True`` with a document
+            source is harmless but produces no correction.
+        system_prompt_filename: Filename of the system prompt within the prompts
+            directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
+            (dialogue variant); pass :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME`
+            when the source is a written document so the model is not
+            instructed to cross-reference a non-existent assistant turn.
+        user_prompt_filename: Filename of the user-turn prompt template.
+            Defaults to :data:`DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME`
+            (``"extraction_procedural.txt"``); pass
+            :data:`DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME`
+            (``"extraction_procedural_document.txt"``) for written-document
+            sources so the model receives document-shaped few-shots instead of
+            dialogue-shaped ones.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
-    system, prompt = load_procedural_prompt(prompts_dir)
+    system, prompt = load_procedural_prompt(
+        prompts_dir,
+        system_filename=system_prompt_filename,
+        user_filename=user_prompt_filename,
+    )
     speaker_context = build_speaker_context(speaker_name)
     messages = [
         {"role": "system", "content": system},
@@ -216,6 +284,8 @@ def extract_graph(
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
+    system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
+    user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -235,6 +305,11 @@ def extract_graph(
             their own flags (stt_correction, ha_validation).
         ha_context: HA home config for location validation (from get_home_context).
         stt_correction: Correct entity names from assistant responses.
+            This is a no-op when
+            ``user_prompt_filename=DOCUMENT_USER_PROMPT_FILENAME`` because the
+            document path has no assistant response to cross-reference; passing
+            ``stt_correction=True`` with a document source is harmless but
+            produces no correction.
         ha_validation: Validate locations against HA home context.
         noise_filter: SOTA provider for noise filtering ("" = disabled).
         ner_check: Enable spaCy NER cross-check for PII detection (default False).
@@ -244,9 +319,26 @@ def extract_graph(
         plausibility_stage: When to run plausibility ("deanon"=after de-anon,
             "anon"=on anonymized data with SOTA judge).
         verify_anonymization: Run forward-path privacy guard before SOTA (default True).
+        system_prompt_filename: Filename of the system prompt within the prompts
+            directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
+            (``"extraction_system.txt"``); pass
+            :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME`
+            (``"extraction_system_document.txt"``) for written-document sources.
+        user_prompt_filename: Filename of the user-turn prompt template.  Defaults
+            to :data:`DEFAULT_USER_PROMPT_FILENAME` (``"extraction.txt"``); pass
+            :data:`DOCUMENT_USER_PROMPT_FILENAME`
+            (``"extraction_document.txt"``) for written-document sources.
     """
     raw_output = _generate_extraction(
-        model, tokenizer, transcript, temperature, max_tokens, prompts_dir, speaker_name
+        model,
+        tokenizer,
+        transcript,
+        temperature,
+        max_tokens,
+        prompts_dir,
+        speaker_name,
+        system_prompt_filename=system_prompt_filename,
+        user_prompt_filename=user_prompt_filename,
     )
     logger.debug("Raw extraction output: %s", raw_output[:500])
 
@@ -301,30 +393,44 @@ def _generate_extraction(
     max_tokens: int,
     prompts_dir: str | Path | None = None,
     speaker_name: str | None = None,
+    *,
+    system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
+    user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
 ) -> str:
     """Generate graph extraction output from the model. Called once.
 
-    When `speaker_name` is provided (e.g. from voice enrollment in production,
-    or from session metadata in the test harness), inject it into the prompt
-    so the model uses the real name as subject instead of guessing or emitting
-    the ``SPEAKER_NAME`` slot from the few-shots.
+    When ``speaker_name`` is provided (e.g. from voice enrollment in
+    production, or from session metadata in the test harness), inject it
+    into the prompt so the model uses the real name as subject instead of
+    guessing or emitting the ``SPEAKER_NAME`` slot from the few-shots.
+
+    The system prompt is passed verbatim — no slot substitution is performed
+    on it.  Narrator binding is achieved via the ``{speaker_context}``
+    placeholder in the **user** template (both ``extraction.txt`` and
+    ``extraction_document.txt`` carry this slot), populated by
+    :func:`build_speaker_context`.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
-    system, prompt = load_extraction_prompts(prompts_dir)
+    system, prompt = load_extraction_prompts(
+        prompts_dir,
+        system_filename=system_prompt_filename,
+        user_filename=user_prompt_filename,
+    )
     speaker_context = build_speaker_context(speaker_name)
+    format_kwargs = dict(
+        transcript=transcript,
+        speaker_context=speaker_context,
+        entity_types=format_entity_types(),
+        predicate_examples=format_predicate_examples(),
+        relation_types=format_relation_types(),
+    )
     messages = [
         {"role": "system", "content": system},
         {
             "role": "user",
-            "content": prompt.format(
-                transcript=transcript,
-                speaker_context=speaker_context,
-                entity_types=format_entity_types(),
-                predicate_examples=format_predicate_examples(),
-                relation_types=format_relation_types(),
-            ),
+            "content": prompt.format(**format_kwargs),
         },
     ]
     formatted = tokenizer.apply_chat_template(
