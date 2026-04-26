@@ -36,10 +36,11 @@ OnBootSec + OnUnitActiveSec; missed ticks are silently dropped in that case.
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from paramem.server.schedule_grammar import parse_schedule_atom
 
 logger = logging.getLogger(__name__)
 
@@ -120,25 +121,18 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     Returns TimerSpec(kind="off") for an explicit off setting.
     Returns None on malformed input (caller logs + falls back to off).
     """
-    s = (schedule or "").strip().lower()
-    if s in ("", "off", "disabled", "none"):
+    atom = parse_schedule_atom(schedule)
+    if atom is None:
+        return None
+    if atom.kind == "off":
         return TimerSpec(kind="off")
-
-    if s == "weekly":
+    if atom.kind == "weekly":
         return TimerSpec(kind="calendar", on_calendar="Mon *-*-* 00:00:00")
-
-    if s == "daily":
+    if atom.kind == "daily":
         return TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
-
-    # Accept both the canonical "every Nh/Nm" and the bare "Nh"/"Nm" shorthand.
-    # The shorthand lets refresh_cadence be written compactly in yaml; the
-    # canonical form is what the derived-period property emits for systemd.
-    m = re.fullmatch(r"(?:every\s+)?(\d+)\s*([hm])", s)
-    if m:
-        n, unit = int(m.group(1)), m.group(2)
-        if n <= 0:
-            return None
-        if unit == "h":
+    if atom.kind == "interval":
+        n = atom.count
+        if atom.unit == "h":
             cal = _hours_to_calendar(n)
             if cal is not None:
                 return TimerSpec(kind="calendar", on_calendar=cal)
@@ -149,13 +143,11 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
                 return TimerSpec(kind="calendar", on_calendar=cal)
             sec = f"{n}min"
         return TimerSpec(kind="interval", on_boot_sec=sec, on_unit_active_sec=sec)
-
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
-    if m:
-        hh, mm = int(m.group(1)), int(m.group(2))
-        if 0 <= hh < 24 and 0 <= mm < 60:
-            return TimerSpec(kind="daily", on_calendar=f"*-*-* {hh:02d}:{mm:02d}:00")
-
+    if atom.kind == "hhmm":
+        return TimerSpec(
+            kind="daily",
+            on_calendar=f"*-*-* {atom.hh:02d}:{atom.mm:02d}:00",
+        )
     return None
 
 

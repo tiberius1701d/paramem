@@ -31,7 +31,6 @@ are present in model.peft_config.
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,25 +38,17 @@ from pathlib import Path
 from peft import PeftModel
 
 from paramem.models.loader import create_adapter
+from paramem.server.schedule_grammar import parse_schedule_atom
 from paramem.utils.config import AdapterConfig
 
 logger = logging.getLogger(__name__)
-
-# Shared grammar — same as systemd_timer.parse_schedule so there is one
-# source of truth for schedule string syntax.  The ``every``-prefix is
-# canonical (emitted by the derived-period property so systemd_timer sees
-# the exact string it expects); the bare ``Nh`` / ``Nm`` shorthand is
-# accepted as user-facing input for ``refresh_cadence`` (lets operators
-# write ``12h`` instead of ``every 12h``).
-_INTERVAL_RE = re.compile(r"^(?:every\s+)?(\d+)\s*([hm])$", re.IGNORECASE)
-_DAILY_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
-_OFF_VALUES = frozenset(("", "off", "disabled", "none"))
 
 
 def compute_schedule_period_seconds(schedule: str) -> int | None:
     """Return the full consolidation period in seconds for a schedule string.
 
-    Accepted formats (same grammar as ``systemd_timer.parse_schedule``):
+    Grammar is shared with ``systemd_timer.parse_schedule`` via
+    :func:`paramem.server.schedule_grammar.parse_schedule_atom`.
 
     - ``"weekly"``                → 604800 seconds (7 days)
     - ``"daily"``                 → 86400 seconds (1 day)
@@ -72,34 +63,23 @@ def compute_schedule_period_seconds(schedule: str) -> int | None:
     Raises:
         ValueError: if *schedule* is not ``None`` / off / a valid period string.
     """
-    s = (schedule or "").strip()
-    if s.lower() in _OFF_VALUES:
+    atom = parse_schedule_atom(schedule)
+    if atom is None:
+        raise ValueError(
+            f"Unrecognised schedule string: {schedule!r}. Expected '', 'off', "
+            "'weekly', 'daily', 'HH:MM', 'Nh'/'Nm', or 'every Nh'/'every Nm'."
+        )
+    if atom.kind == "off":
         return None
-
-    if s.lower() == "weekly":
+    if atom.kind == "weekly":
         return 604800
-
-    if s.lower() == "daily":
+    if atom.kind == "daily":
         return 86400
-
-    m = _INTERVAL_RE.match(s)
-    if m:
-        n, unit = int(m.group(1)), m.group(2).lower()
-        if n <= 0:
-            raise ValueError(f"Invalid schedule period: {schedule!r}")
-        return n * 3600 if unit == "h" else n * 60
-
-    m = _DAILY_RE.match(s)
-    if m:
-        hh, mm = int(m.group(1)), int(m.group(2))
-        if 0 <= hh < 24 and 0 <= mm < 60:
-            return 86400
-        raise ValueError(f"Invalid HH:MM schedule: {schedule!r}")
-
-    raise ValueError(
-        f"Unrecognised schedule string: {schedule!r}. Expected '', 'off', "
-        "'weekly', 'daily', 'HH:MM', 'Nh'/'Nm', or 'every Nh'/'every Nm'."
-    )
+    if atom.kind == "interval":
+        return atom.count * 3600 if atom.unit == "h" else atom.count * 60
+    if atom.kind == "hhmm":
+        return 86400
+    raise ValueError(f"Unhandled schedule kind: {atom.kind!r}")
 
 
 def current_interim_stamp(
