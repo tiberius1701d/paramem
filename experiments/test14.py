@@ -94,6 +94,7 @@ from paramem.training.indexed_memory import (  # noqa: E402
     assign_keys,
     build_registry,
     format_indexed_training,
+    load_registry,
     save_registry,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
@@ -1654,10 +1655,14 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     dest_variant_dir=v_dir,
                 )
                 # keyed_a / registry_a come from V3's Phase A artefacts.
+                # simhash_registry.json is encrypted (via save_registry →
+                # write_infra_bytes) when the daily age identity is loaded;
+                # use load_registry which transparently handles both age and
+                # plaintext envelopes.  keyed_pairs.json is plaintext.
                 v3_a_keyed_path = reuse_phase_a_from / V3 / "A" / "keyed_pairs.json"
                 v3_a_reg_path = reuse_phase_a_from / V3 / "A" / "simhash_registry.json"
                 keyed_a = json.loads(v3_a_keyed_path.read_text())
-                registry_a = {k: int(vv) for k, vv in json.loads(v3_a_reg_path.read_text()).items()}
+                registry_a = {k: int(vv) for k, vv in load_registry(v3_a_reg_path).items()}
                 adapter_name_a = f"episodic_{V3.lower()}"
             else:
                 # Standard fresh Phase A.
@@ -1726,15 +1731,13 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 v3_a_keyed_path = reuse_phase_a_from / V3 / "A" / "keyed_pairs.json"
                 v3_a_reg_path = reuse_phase_a_from / V3 / "A" / "simhash_registry.json"
                 keyed_a = json.loads(v3_a_keyed_path.read_text())
-                registry_a = {k: int(vv) for k, vv in json.loads(v3_a_reg_path.read_text()).items()}
+                registry_a = {k: int(vv) for k, vv in load_registry(v3_a_reg_path).items()}
                 adapter_name_a = f"episodic_{V3.lower()}"
             else:
                 keyed_a = json.loads((v_dir / "A" / "keyed_pairs.json").read_text())
                 registry_a = {
                     k: int(vv)
-                    for k, vv in json.loads(
-                        (v_dir / "A" / "simhash_registry.json").read_text()
-                    ).items()
+                    for k, vv in load_registry(v_dir / "A" / "simhash_registry.json").items()
                 }
                 adapter_name_a = f"episodic_{variant.lower()}"
 
@@ -1862,8 +1865,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
             logger.info("Variant %s Phase B: already done", variant)
             scaffold_keyed = json.loads((v_dir / "B" / "keyed_pairs.json").read_text())
             scaffold_registry = {
-                k: int(vv)
-                for k, vv in json.loads((v_dir / "B" / "simhash_registry.json").read_text()).items()
+                k: int(vv) for k, vv in load_registry(v_dir / "B" / "simhash_registry.json").items()
             }
 
         _check_pause(f"after B, variant {variant}", run_dir)
@@ -2048,8 +2050,7 @@ def run_mode_scale(
         logger.info("Phase A: already done")
         keyed_a = json.loads((run_dir / "A" / "keyed_pairs.json").read_text())
         registry_a = {
-            k: int(v)
-            for k, v in json.loads((run_dir / "A" / "simhash_registry.json").read_text()).items()
+            k: int(v) for k, v in load_registry(run_dir / "A" / "simhash_registry.json").items()
         }
 
     _check_pause("after Phase A (scale)", run_dir)
@@ -2101,8 +2102,7 @@ def run_mode_scale(
         logger.info("Phase B: already done")
         scaffold_keyed = json.loads((run_dir / "B" / "keyed_pairs.json").read_text())
         scaffold_registry = {
-            k: int(v)
-            for k, v in json.loads((run_dir / "B" / "simhash_registry.json").read_text()).items()
+            k: int(v) for k, v in load_registry(run_dir / "B" / "simhash_registry.json").items()
         }
 
     _check_pause("after Phase B (scale)", run_dir)
@@ -2771,8 +2771,7 @@ def run_smoke(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None
     if not (smoke_dir / "C" / "C_done.json").exists():
         scaffold_keyed = json.loads((smoke_dir / "B" / "keyed_pairs.json").read_text())
         scaffold_registry = {
-            k: int(v)
-            for k, v in json.loads((smoke_dir / "B" / "simhash_registry.json").read_text()).items()
+            k: int(v) for k, v in load_registry(smoke_dir / "B" / "simhash_registry.json").items()
         }
 
         switch_adapter(model, "journal")
