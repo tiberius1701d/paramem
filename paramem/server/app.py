@@ -2223,10 +2223,11 @@ async def status():
     _key_reg_path = config.adapter_dir / "indexed_key_registry.json"
     if _key_reg_path.exists():
         try:
-            with open(_key_reg_path) as f:
-                _key_reg_json = json.load(f)
+            from paramem.backup.encryption import read_maybe_encrypted
+
+            _key_reg_json = json.loads(read_maybe_encrypted(_key_reg_path).decode("utf-8"))
             adapter_health = _key_reg_json.get("adapter_health", {}) or {}
-        except (OSError, json.JSONDecodeError):
+        except Exception:
             adapter_health = {}
 
     # TTS inventory: which languages are loaded and on which device. When
