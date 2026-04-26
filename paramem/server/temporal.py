@@ -2,34 +2,39 @@
 
 Detects time references in user queries ("yesterday", "last week", etc.)
 and resolves them to absolute date ranges for registry-based key lookup.
+
+Detection is structural — explicit phrase tables scanned with ``in`` /
+``str.split()`` lookups, no regex. Misses are bounded by the phrase
+table; adding a new phrase is one dict entry. The same approach as the
+sanitizer's first-person token-set: every recognised case is a literal
+in source.
 """
 
 import json
 import logging
-import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-def _day_before_yesterday(today):
+def _day_before_yesterday(today, _n=None):
     d = today - timedelta(days=2)
     return (d, d)
 
 
-def _yesterday(today):
+def _yesterday(today, _n=None):
     d = today - timedelta(days=1)
     return (d, d)
 
 
-def _last_week(today):
+def _last_week(today, _n=None):
     start = today - timedelta(days=today.weekday() + 7)
     end = today - timedelta(days=today.weekday() + 1)
     return (start, end)
 
 
-def _this_week(today):
+def _this_week(today, _n=None):
     return (today - timedelta(days=today.weekday()), today)
 
 
@@ -54,11 +59,11 @@ def _last_of_last_month(today: date) -> date:
     return today.replace(day=1) - timedelta(days=1)
 
 
-def _last_month(today):
+def _last_month(today, _n=None):
     return (_first_of_last_month(today), _last_of_last_month(today))
 
 
-def _this_month(today):
+def _this_month(today, _n=None):
     return (today.replace(day=1), today)
 
 
@@ -70,53 +75,81 @@ def _last_weekday(today: date, target_weekday: int) -> tuple[date, date]:
     return (d, d)
 
 
-def _same_day(today):
+def _same_day(today, _n=None):
     return (today, today)
 
 
-def _recently(today):
+def _recently(today, _n=None):
     return (today - timedelta(days=7), today)
 
 
-def _the_other_day(today):
+def _the_other_day(today, _n=None):
     return (today - timedelta(days=3), today - timedelta(days=1))
 
 
-# Patterns ordered from most specific to least specific
-_TEMPORAL_PATTERNS = [
-    # Relative days — longer phrases first
-    (r"\bthe day before yesterday\b", _day_before_yesterday),
-    (r"\byesterday\b", _yesterday),
-    (r"\btoday\b", _same_day),
-    # Relative weeks
-    (r"\blast week\b", _last_week),
-    (r"\bthis week\b", _this_week),
-    # Relative months
-    (r"\blast month\b", _last_month),
-    (r"\bthis month\b", _this_month),
-    # N days/weeks ago
-    (r"\b(\d+)\s+days?\s+ago\b", _n_days_ago),
-    (r"\b(\d+)\s+weeks?\s+ago\b", _n_weeks_ago),
-    # Day names (interpret as most recent occurrence)
-    (r"\b(?:on\s+|last\s+)?(monday)\b", lambda t: _last_weekday(t, 0)),
-    (r"\b(?:on\s+|last\s+)?(tuesday)\b", lambda t: _last_weekday(t, 1)),
-    (r"\b(?:on\s+|last\s+)?(wednesday)\b", lambda t: _last_weekday(t, 2)),
-    (r"\b(?:on\s+|last\s+)?(thursday)\b", lambda t: _last_weekday(t, 3)),
-    (r"\b(?:on\s+|last\s+)?(friday)\b", lambda t: _last_weekday(t, 4)),
-    (r"\b(?:on\s+|last\s+)?(saturday)\b", lambda t: _last_weekday(t, 5)),
-    (r"\b(?:on\s+|last\s+)?(sunday)\b", lambda t: _last_weekday(t, 6)),
-    # Time of day (same day)
-    (r"\bthis morning\b", _same_day),
-    (r"\btonight\b", _same_day),
-    (r"\bthis afternoon\b", _same_day),
-    (r"\bthis evening\b", _same_day),
-    # Recent past
-    (r"\brecently\b", _recently),
-    (r"\bthe other day\b", _the_other_day),
-]
+# Multi-word phrase → resolver. Order matters: longer phrases must be
+# tested before shorter ones that are a substring (e.g. "the day before
+# yesterday" before "yesterday"). Iteration order is insertion order
+# (Python 3.7+).
+_TEMPORAL_PHRASES: dict[str, callable] = {
+    # Longer phrases first — substring containment is checked in order.
+    "the day before yesterday": _day_before_yesterday,
+    "the other day": _the_other_day,
+    "this morning": _same_day,
+    "this afternoon": _same_day,
+    "this evening": _same_day,
+    "last week": _last_week,
+    "this week": _this_week,
+    "last month": _last_month,
+    "this month": _this_month,
+    "yesterday": _yesterday,
+    "tonight": _same_day,
+    "today": _same_day,
+    "recently": _recently,
+}
 
-# Compile patterns once
-_COMPILED_PATTERNS = [(re.compile(p, re.IGNORECASE), fn) for p, fn in _TEMPORAL_PATTERNS]
+# Day name → weekday index. Matched as a standalone token (split on
+# whitespace, strip punctuation) so "Monday." / "Monday?" still match.
+_WEEKDAYS: dict[str, int] = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+# Trailing punctuation stripped before token comparison.
+_TOKEN_PUNCT = ".,!?;:'\"()[]{}"
+
+
+def _normalize_tokens(text: str) -> list[str]:
+    """Lowercase + whitespace-split + per-token punctuation strip. No regex."""
+    return [tok.strip(_TOKEN_PUNCT).lower() for tok in text.split()]
+
+
+def _detect_n_unit_ago(tokens: list[str], today: date) -> tuple[date, date] | None:
+    """Token scan for ``<digit> day(s)/week(s) ago`` patterns."""
+    for i in range(len(tokens) - 2):
+        n_tok = tokens[i]
+        unit = tokens[i + 1]
+        ago = tokens[i + 2]
+        if not n_tok.isdigit() or ago != "ago":
+            continue
+        if unit in ("day", "days"):
+            return _n_days_ago(today, int(n_tok))
+        if unit in ("week", "weeks"):
+            return _n_weeks_ago(today, int(n_tok))
+    return None
+
+
+def _detect_weekday(tokens: list[str], today: date) -> tuple[date, date] | None:
+    """Token scan for a day name (optionally preceded by ``on`` / ``last``)."""
+    for tok in tokens:
+        if tok in _WEEKDAYS:
+            return _last_weekday(today, _WEEKDAYS[tok])
+    return None
 
 
 def detect_temporal_query(
@@ -126,21 +159,31 @@ def detect_temporal_query(
 
     Returns (start_date, end_date) inclusive, or None if no temporal
     reference is found.
+
+    Detection order:
+    1. Multi-word phrases from ``_TEMPORAL_PHRASES`` (longest-first by
+       insertion order). ``str.__contains__`` against the lowercased
+       query — substring match, not pattern match.
+    2. Numeric "<n> day(s)/week(s) ago" via token scan.
+    3. Standalone day names via token scan.
     """
     today = reference_date or date.today()
     text_lower = text.lower()
 
-    for pattern, resolver in _COMPILED_PATTERNS:
-        match = pattern.search(text_lower)
-        if match:
-            groups = match.groups()
-            if groups and groups[0].isdigit():
-                result = resolver(today, groups[0])
-            else:
-                result = resolver(today)
-            return result
+    # 1. Phrase containment in declared order (longest first).
+    for phrase, resolver in _TEMPORAL_PHRASES.items():
+        if phrase in text_lower:
+            return resolver(today)
 
-    return None
+    tokens = _normalize_tokens(text_lower)
+
+    # 2. "<n> days/weeks ago"
+    result = _detect_n_unit_ago(tokens, today)
+    if result is not None:
+        return result
+
+    # 3. Standalone day name
+    return _detect_weekday(tokens, today)
 
 
 def filter_registry_by_date(

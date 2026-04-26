@@ -7,7 +7,6 @@ reconstruction.
 """
 
 import logging
-import re
 
 from paramem.graph.merger import _normalize_predicate
 
@@ -115,33 +114,119 @@ def measure_all_fidelity(
     }
 
 
-# Verb→predicate mappings for profile parsing (reverse of sentence templates)
-_VERB_PATTERNS = [
-    (r"lives in (.+)", "lives_in"),
-    (r"works at (.+)", "works_at"),
-    (r"works as (.+)", "works_as"),
-    (r"has a pet: (.+)", "has_pet"),
-    (r"prefers (.+)", "prefers"),
-    (r"studied at (.+)", "studies_at"),
-    (r"speaks (.+)", "speaks"),
-    (r"knows (.+)", "knows"),
-    (r"enjoys (.+)", "has_hobby"),
-    (r"manages (.+)", "manages"),
-    (r"is (\d+.+)", "has_age"),
-    (r"uses (.+)", "uses"),
-    (r"likes (.+)", "likes"),
-    (r"visited (.+)", "visited"),
-    (r"read (.+)", "read"),
-    (r"fixed (.+)", "fixed"),
-    (r"attended (.+)", "attended"),
-    (r"bought (.+)", "bought"),
-    (r"watched (.+)", "watched"),
-    (r"cooked (.+)", "cooked"),
-    (r"debugged (.+)", "debugged"),
-    (r"presented (.+)", "presented"),
-    (r"started (.+)", "started"),
-    (r"collaborates with (.+)", "collaborates_with"),
-]
+# Verb prefix → predicate mapping for profile parsing (reverse of sentence
+# templates).  Each key is a literal lowercase prefix that the sentence
+# remainder (after the entity name) must start with, followed by a space;
+# the rest of the remainder becomes the object.  Order is irrelevant —
+# match dispatch sorts by length so longer prefixes ("works as" before
+# "works at" before just "works") are tried first.
+_VERB_PREFIX_TO_PREDICATE: dict[str, str] = {
+    "lives in": "lives_in",
+    "works at": "works_at",
+    "works as": "works_as",
+    "has a pet:": "has_pet",
+    "prefers": "prefers",
+    "studied at": "studies_at",
+    "speaks": "speaks",
+    "knows": "knows",
+    "enjoys": "has_hobby",
+    "manages": "manages",
+    "uses": "uses",
+    "likes": "likes",
+    "visited": "visited",
+    "read": "read",
+    "fixed": "fixed",
+    "attended": "attended",
+    "bought": "bought",
+    "watched": "watched",
+    "cooked": "cooked",
+    "debugged": "debugged",
+    "presented": "presented",
+    "started": "started",
+    "collaborates with": "collaborates_with",
+}
+
+# "is N…" → has_age is handled separately because the original regex
+# pinned the object to start with a digit; replicated below in
+# _parse_age_remainder so a literal-prefix table stays homogeneous.
+
+# Sentence-terminating punctuation used by ``_split_sentences``.
+_SENTENCE_TERMINATORS = ".!?"
+
+# Temporal prefixes stripped from the start of a sentence (each is followed
+# by some date/period text + a comma + optional whitespace).  Replicates
+# the previous ``re.sub(r"^(As of |In |On )[^,]+,\s*", "", sentence)``.
+_TEMPORAL_PREFIXES = ("As of ", "In ", "On ")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split on sentence-terminating punctuation followed by whitespace.
+
+    Mirrors the previous ``re.split(r"(?<=[.!?])\\s+", …)`` behaviour:
+    the terminator stays attached to the preceding sentence.
+    """
+    if not text:
+        return []
+    sentences: list[str] = []
+    current: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        current.append(ch)
+        if ch in _SENTENCE_TERMINATORS and i + 1 < n and text[i + 1].isspace():
+            sentences.append("".join(current))
+            current = []
+            i += 1
+            while i < n and text[i].isspace():
+                i += 1
+            continue
+        i += 1
+    if current:
+        sentences.append("".join(current))
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def _strip_temporal_prefix(sentence: str) -> str:
+    """Strip ``As of <…>,`` / ``In <…>,`` / ``On <…>,`` from sentence start."""
+    for prefix in _TEMPORAL_PREFIXES:
+        if sentence.startswith(prefix):
+            comma_idx = sentence.find(",", len(prefix))
+            if comma_idx >= 0:
+                return sentence[comma_idx + 1 :].lstrip()
+    return sentence
+
+
+def _parse_age_remainder(remainder: str) -> str | None:
+    """If remainder is ``is N…``, return the object ``N…``; else None.
+
+    Replicates the previous ``r"is (\\d+.+)"`` pattern.
+    """
+    if not remainder.lower().startswith("is "):
+        return None
+    after_is = remainder[3:]
+    if not after_is or not after_is[0].isdigit():
+        return None
+    return after_is.strip().rstrip(".") or None
+
+
+def _match_verb_prefix(remainder: str) -> tuple[str, str] | None:
+    """Find the longest verb prefix that matches the start of remainder.
+
+    Returns ``(predicate, object)`` on success or ``None``.  Case-
+    insensitive match on the prefix; the object preserves the original
+    casing.  Replicates the previous ``re.match(pattern, remainder,
+    re.IGNORECASE)`` loop with a deterministic longest-prefix-first
+    dispatch.
+    """
+    remainder_lower = remainder.lower()
+    for prefix in sorted(_VERB_PREFIX_TO_PREDICATE, key=len, reverse=True):
+        prefix_with_space = prefix + " "
+        if remainder_lower.startswith(prefix_with_space):
+            obj = remainder[len(prefix_with_space) :].strip().rstrip(".")
+            if obj:
+                return _VERB_PREFIX_TO_PREDICATE[prefix], obj
+    return None
 
 
 def parse_profile_to_triples(
@@ -172,40 +257,42 @@ def parse_profile_to_triples(
     triples = []
     entity_lower = entity_name.lower()
 
-    # Split profile into sentences
-    sentences = re.split(r"(?<=[.!?])\s+", profile_text.strip())
+    sentences = _split_sentences(profile_text.strip())
 
-    for sentence in sentences:
-        sentence = sentence.strip().rstrip(".")
+    for raw_sentence in sentences:
+        sentence = raw_sentence.strip().rstrip(".")
         if not sentence:
             continue
 
-        # Strip temporal prefixes
-        sentence = re.sub(r"^(As of |In |On )[^,]+,\s*", "", sentence)
+        sentence = _strip_temporal_prefix(sentence)
 
-        # Check if sentence starts with the entity name
         sentence_lower = sentence.lower()
         if not sentence_lower.startswith(entity_lower):
             continue
 
         remainder = sentence[len(entity_name) :].strip()
 
-        # Try to match against known verb patterns
         matched = False
-        for pattern, predicate in _VERB_PATTERNS:
-            match = re.match(pattern, remainder, re.IGNORECASE)
-            if match:
-                obj = match.group(1).strip().rstrip(".")
-                if obj:
-                    triples.append(
-                        {
-                            "subject": entity_name,
-                            "predicate": predicate,
-                            "object": obj,
-                        }
-                    )
-                    matched = True
-                    break
+        verb_match = _match_verb_prefix(remainder)
+        if verb_match is not None:
+            predicate, obj = verb_match
+            triples.append(
+                {
+                    "subject": entity_name,
+                    "predicate": predicate,
+                    "object": obj,
+                }
+            )
+            matched = True
+        elif (age_obj := _parse_age_remainder(remainder)) is not None:
+            triples.append(
+                {
+                    "subject": entity_name,
+                    "predicate": "has_age",
+                    "object": age_obj,
+                }
+            )
+            matched = True
 
         # Fallback: extract generic "verb object" pattern
         if not matched and remainder:
