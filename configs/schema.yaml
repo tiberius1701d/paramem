@@ -25,6 +25,8 @@ preferred_predicates:
     items: [works_at, studies_at, manages]
   - label: Preferences/habits
     items: [prefers, likes, dislikes, drinks, eats, listens_to, uses, avoids]
+  - label: Possessions
+    items: [owns, has]
 
 # Narrow subset used by the procedural (preferences-only) extraction prompt.
 procedural_entity_types: [person, preference]

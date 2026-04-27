@@ -4,10 +4,16 @@ Only extract facts that would still be true tomorrow — identity, relationships
 location, preferences, work, education.
 
 Rules:
-- INTENT MATTERS: Only extract from statements the speaker makes about themselves.
-  Questions out of curiosity are NOT facts. "What's the weather in Bahamas?" does
-  not mean the speaker lives in or plans to travel to the Bahamas. "What's the
-  nearest airport?" is a question, not a statement about location.
+- INTENT MATTERS: Extract personal facts the speaker states about themselves —
+  whether the turn is a statement OR a question that contains an embedded
+  factual claim. Standalone curiosity questions ("What's the weather in
+  Bahamas?", "What's the nearest airport?") are NOT facts — they reveal
+  nothing the speaker is claiming about themselves. But a question turn
+  that ALSO contains a self-claim ("My car is a Volvo V70. How often
+  should I change the tires?", "I have a dog. What food do you recommend?")
+  carries an embedded fact — extract it. The shape to look for is
+  "I/my/our/we + concrete attribute" anywhere in the turn, regardless of
+  whether the turn ends in a question mark.
 - USE THE ASSISTANT'S RESPONSE to correct entity names. If the speaker says
   "Frankford" but the assistant responds with "Frankfurt", use "Frankfurt" — the
   assistant has access to correct spellings.
@@ -58,6 +64,18 @@ POSITIVE example — transcript: "[user] Our wedding anniversary is on June 14th
  {{"name": "Wedding Anniversary", "entity_type": "event", "attributes": {{"date": "June 14"}}}}],
  "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "celebrates", "object": "Wedding Anniversary", "relation_type": "temporal", "confidence": 1.0}}],
  "summary": "{{SPEAKER_NAME}}'s wedding anniversary is June 14."}}
+
+POSITIVE example — transcript: "[user] How often do I have to change my tires for my car? My car is a Volvo V70."
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Volvo V70", "entity_type": "concept", "attributes": {{}}}}],
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "owns", "object": "Volvo V70", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} owns a Volvo V70. Tire-change-frequency question is curiosity, not a fact."}}
+
+POSITIVE example — transcript: "[user] I have a dog named Rex. What food do you recommend?"
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Rex", "entity_type": "concept", "attributes": {{}}}}],
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "has_pet", "object": "Rex", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} has a dog named Rex. Food-recommendation request is not a fact."}}
 
 Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
 speaker's real identifier (e.g. "Alice", "Speaker7") via the directive above.
