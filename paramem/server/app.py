@@ -2706,7 +2706,17 @@ async def scheduled_tick():
 
 @app.post("/consolidate", response_model=ConsolidateResponse)
 async def consolidate():
-    """Trigger consolidation manually.
+    """Trigger consolidation manually — alias for the scheduled tick.
+
+    Manual ``/consolidate`` and the systemd-driven ``/scheduled-tick`` share
+    the same dispatcher: the gate decides between full-cycle (collapse
+    interim slots into main) and interim-cycle (extract pending sessions
+    into a new ``episodic_interim_<stamp>`` slot) based on the
+    ``window_stamp`` recorded on the lex-max main episodic slot. There is
+    no separate "force-full" semantic — operators that genuinely need to
+    re-trigger a full cycle can clear the latest main slot's window_stamp
+    and call this endpoint, but in normal operation the gate already
+    decides correctly.
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
@@ -2726,21 +2736,8 @@ async def consolidate():
             },
         )
 
-    if _state["mode"] == "cloud-only":
-        return ConsolidateResponse(status="rejected_cloud_only")
-    if _state["consolidating"]:
-        return ConsolidateResponse(status="already_running")
-
-    bg_trainer = _state.get("background_trainer")
-    if bg_trainer is not None and bg_trainer.is_training:
-        return ConsolidateResponse(status="training_active")
-
-    _state["consolidating"] = True
-    loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(None, _run_consolidation_sync)
-    future.add_done_callback(_consolidation_done_callback)
-
-    return ConsolidateResponse(status="started")
+    status = _maybe_trigger_scheduled_consolidation()
+    return ConsolidateResponse(status=status)
 
 
 # --- Document ingest endpoints ---
