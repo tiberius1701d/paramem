@@ -1175,6 +1175,7 @@ async def lifespan(app: FastAPI):
     _assert_mode(
         config.paths.data,
         daily_identity_loadable=_daily_ok,
+        simulate_dir=config.paths.simulate,
     )
     _line, _is_on = security_posture_log_line(
         daily_loadable=_daily_ok,

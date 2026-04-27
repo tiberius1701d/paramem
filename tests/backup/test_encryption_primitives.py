@@ -261,6 +261,65 @@ class TestAssertModeConsistency:
         # Must not raise — the carve-out files are not in the probed set.
         assert_mode_consistency(data, daily_identity_loadable=True)
 
+    def test_simulate_dir_plaintext_with_daily_refuses(self, tmp_path, monkeypatch):
+        """Plaintext under paths.simulate while daily is loaded → refuse.
+
+        Pre-canonicalization the simulate store sat outside ``infra_paths``
+        and stale plaintext there silently slipped past startup. With the
+        simulate root now in the probed set, a mixed state is detected.
+        """
+        ident = _setup_daily(tmp_path, monkeypatch)
+        data = tmp_path / "data"
+        data.mkdir()
+        from paramem.backup.age_envelope import age_encrypt_bytes
+
+        (data / "registry.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
+
+        simulate = tmp_path / "simulate"
+        (simulate / "episodic").mkdir(parents=True)
+        (simulate / "episodic" / "keyed_pairs.json").write_bytes(b"[]")  # plaintext
+
+        with pytest.raises(FatalConfigError, match="Mixed encryption state"):
+            assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=simulate)
+
+    def test_simulate_dir_age_envelope_passes(self, tmp_path, monkeypatch):
+        """age envelopes under paths.simulate alongside age in data → OK with daily loaded."""
+        from paramem.backup.age_envelope import age_encrypt_bytes
+
+        ident = _setup_daily(tmp_path, monkeypatch)
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "registry.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
+
+        simulate = tmp_path / "simulate"
+        (simulate / "semantic").mkdir(parents=True)
+        (simulate / "semantic" / "keyed_pairs.json").write_bytes(
+            age_encrypt_bytes(b"[]", [ident.to_public()])
+        )
+
+        # Must not raise — both stores age-encrypted, daily identity available.
+        assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=simulate)
+
+    def test_simulate_dir_none_falls_back_to_data_only(self, tmp_path, monkeypatch):
+        """Callers without a simulate config (legacy path) get the historical
+        behaviour: only data_dir is scanned. No regression on the existing
+        contract."""
+        ident = _setup_daily(tmp_path, monkeypatch)
+        data = tmp_path / "data"
+        data.mkdir()
+        from paramem.backup.age_envelope import age_encrypt_bytes
+
+        (data / "registry.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
+
+        # A plaintext file under what WOULD be the simulate dir, if probed —
+        # but the caller passes simulate_dir=None, so it must NOT be probed.
+        rogue = tmp_path / "would-be-simulate"
+        (rogue / "episodic").mkdir(parents=True)
+        (rogue / "episodic" / "keyed_pairs.json").write_bytes(b"[]")
+
+        # Must not raise — simulate_dir=None means rogue is invisible.
+        assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=None)
+
 
 # ---------------------------------------------------------------------------
 # Integration: backup.write produces age envelope when daily is loaded

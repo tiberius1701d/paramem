@@ -40,6 +40,23 @@ from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
 from paramem.cli.generate_key import CONFIRM_PHRASE, _format_bech32_groups
 
 
+def _resolve_simulate_dir(args: argparse.Namespace) -> Path | None:
+    """Resolve the simulate-mode peer-storage root.
+
+    Returns ``None`` when neither the explicit override nor the config
+    yields a path — callers treat that as "no simulate store to consider".
+    """
+    if getattr(args, "simulate_dir", None):
+        return Path(args.simulate_dir).expanduser().resolve()
+    from paramem.server.config import load_server_config
+
+    config_path = Path(args.config).expanduser().resolve()
+    if not config_path.exists():
+        return None
+    cfg = load_server_config(str(config_path))
+    return cfg.paths.simulate
+
+
 def _resolve_data_dir(args: argparse.Namespace) -> Path | None:
     if args.data_dir:
         return Path(args.data_dir).expanduser().resolve()
@@ -184,7 +201,12 @@ def run(args: argparse.Namespace) -> int:
     # Persist the new recovery pub to the pending path BEFORE walking files.
     _ks.write_recovery_pub_file(new_recovery.to_public(), pending_path)
 
-    files = [p for p in infra_paths(data_dir) if p.exists() and is_age_envelope(p)]
+    simulate_dir = _resolve_simulate_dir(args)
+    files = [
+        p
+        for p in infra_paths(data_dir, simulate_dir=simulate_dir)
+        if p.exists() and is_age_envelope(p)
+    ]
     manifest = _rot.RotationManifest.fresh(
         operation="rotate-recovery",
         files=files,
@@ -263,6 +285,17 @@ def add_parser(subparsers) -> None:
         default=None,
         metavar="PATH",
         help="Override the data directory. Defaults to the server config's paths.data.",
+    )
+    p.add_argument(
+        "--simulate-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Override the simulate-mode peer-storage directory. Defaults to "
+            "the server config's paths.simulate. Pass when --data-dir is "
+            "overridden too; rotation re-encrypts simulate keyed_pairs alongside "
+            "the train-mode store."
+        ),
     )
     p.add_argument(
         "--config",

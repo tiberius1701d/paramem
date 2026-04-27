@@ -77,6 +77,23 @@ def _resolve_data_dir(args: argparse.Namespace) -> Path | None:
     return cfg.paths.data
 
 
+def _resolve_simulate_dir(args: argparse.Namespace) -> Path | None:
+    """Resolve the simulate-mode peer-storage root.
+
+    Returns ``None`` when neither the explicit override nor the config
+    yields a path — callers treat that as "no simulate store to consider".
+    """
+    if getattr(args, "simulate_dir", None):
+        return Path(args.simulate_dir).expanduser().resolve()
+    from paramem.server.config import load_server_config
+
+    config_path = Path(args.config).expanduser().resolve()
+    if not config_path.exists():
+        return None
+    cfg = load_server_config(str(config_path))
+    return cfg.paths.simulate
+
+
 def _resolve_recovery_bech32(args: argparse.Namespace) -> str | None:
     """Read the recovery bech32 from a file (priority) or interactive stdin.
 
@@ -161,8 +178,13 @@ def _check_preconditions(args: argparse.Namespace, data_dir: Path) -> list[str]:
                     "aside before running this command."
                 )
 
+    simulate_dir = _resolve_simulate_dir(args)
     if data_dir.exists():
-        plaintext_like = [p for p in infra_paths(data_dir) if p.exists() and not is_age_envelope(p)]
+        plaintext_like = [
+            p
+            for p in infra_paths(data_dir, simulate_dir=simulate_dir)
+            if p.exists() and not is_age_envelope(p)
+        ]
         if plaintext_like:
             errors.append(
                 f"{len(plaintext_like)} plaintext file(s) on disk "
@@ -208,7 +230,12 @@ def run(args: argparse.Namespace) -> int:
 
     # Sanity-check the recovery bech32 against at least one age envelope so
     # an operator typo fails NOW, before any on-disk mutation.
-    age_files = [p for p in infra_paths(data_dir) if p.exists() and is_age_envelope(p)]
+    simulate_dir = _resolve_simulate_dir(args)
+    age_files = [
+        p
+        for p in infra_paths(data_dir, simulate_dir=simulate_dir)
+        if p.exists() and is_age_envelope(p)
+    ]
     if age_files:
         try:
             age_decrypt_bytes(age_files[0].read_bytes(), [recovery_identity])
@@ -360,6 +387,17 @@ def add_parser(subparsers) -> None:
         default=None,
         metavar="PATH",
         help="Override the data directory. Defaults to the server config's paths.data.",
+    )
+    p.add_argument(
+        "--simulate-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Override the simulate-mode peer-storage directory. Defaults to "
+            "the server config's paths.simulate. Pass when --data-dir is "
+            "overridden too; restore re-encrypts simulate keyed_pairs alongside "
+            "the train-mode store."
+        ),
     )
     p.add_argument(
         "--config",

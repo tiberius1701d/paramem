@@ -297,6 +297,44 @@ class TestProbeKeysFromDisk:
         assert raw["question"] == "Q?"
         assert raw["answer"] == "A."
 
+    def test_reads_age_envelope_via_read_maybe_encrypted(self, tmp_path, monkeypatch):
+        """Encryption-contract guard: age-encrypted keyed_pairs decrypt on read.
+
+        The other tests in this class write plaintext; they would pass even if
+        ``probe_keys_from_disk`` switched to a bare ``Path.read_bytes``. This
+        test sets up a real daily identity, writes the keyed_pairs through the
+        production encrypted helper, and asserts the disk-read returns the
+        plaintext content. A regression that drops ``read_maybe_encrypted``
+        from the read path fails this test.
+        """
+        from paramem.backup.key_store import (
+            DAILY_PASSPHRASE_ENV_VAR,
+            _clear_daily_identity_cache,
+            mint_daily_identity,
+            wrap_daily_identity,
+            write_daily_key_file,
+        )
+        from paramem.server.consolidation import _atomic_json_write
+
+        ident = mint_daily_identity()
+        key_path = tmp_path / "daily_key.age"
+        write_daily_key_file(wrap_daily_identity(ident, "pw"), key_path)
+        monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, "pw")
+        monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+        _clear_daily_identity_cache()
+
+        kp_path = tmp_path / "episodic" / "keyed_pairs.json"
+        _atomic_json_write(
+            [{"key": "graph7", "question": "Q7?", "answer": "A7."}],
+            kp_path,
+        )
+        # Confirm the on-disk file is an age envelope, not plaintext.
+        assert kp_path.read_bytes()[:22].startswith(b"age-encryption.org/v1")
+
+        results = probe_keys_from_disk(tmp_path, {"episodic": ["graph7"]})
+        assert results["graph7"]["question"] == "Q7?"
+        assert results["graph7"]["answer"] == "A7."
+
 
 class TestSeedHelpers:
     """seed_episodic_qa / seed_semantic_qa rebuild indexed_key_qa from disk pairs."""

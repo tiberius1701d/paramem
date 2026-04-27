@@ -63,6 +63,24 @@ def _resolve_data_dir(args: argparse.Namespace) -> Path | None:
     return cfg.paths.data
 
 
+def _resolve_simulate_dir(args: argparse.Namespace) -> Path | None:
+    """Resolve the simulate-mode peer-storage root.
+
+    Symmetric to ``_resolve_data_dir``. Returns ``None`` when neither the
+    explicit override nor the config yields a path — callers treat that as
+    "no simulate store to consider".
+    """
+    if getattr(args, "simulate_dir", None):
+        return Path(args.simulate_dir).expanduser().resolve()
+    from paramem.server.config import load_server_config
+
+    config_path = Path(args.config).expanduser().resolve()
+    if not config_path.exists():
+        return None
+    cfg = load_server_config(str(config_path))
+    return cfg.paths.simulate
+
+
 def _check_preconditions(data_dir: Path) -> list[str]:
     errors: list[str] = []
     if not _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
@@ -97,6 +115,7 @@ def run(args: argparse.Namespace) -> int:
     data_dir = _resolve_data_dir(args)
     if data_dir is None:
         return 1
+    simulate_dir = _resolve_simulate_dir(args)
     if not data_dir.exists():
         print(f"ERROR: data directory does not exist: {data_dir}", file=sys.stderr)
         return 1
@@ -131,7 +150,11 @@ def run(args: argparse.Namespace) -> int:
     manifest = _rot.read_manifest(manifest_path)
     was_fresh_start = manifest is None
     if manifest is None:
-        files = [p for p in infra_paths(data_dir) if p.exists() and is_age_envelope(p)]
+        files = [
+            p
+            for p in infra_paths(data_dir, simulate_dir=simulate_dir)
+            if p.exists() and is_age_envelope(p)
+        ]
         manifest = _rot.RotationManifest.fresh(
             operation="rotate-daily",
             files=files,
@@ -230,6 +253,17 @@ def add_parser(subparsers) -> None:
         default=None,
         metavar="PATH",
         help="Override the data directory. Defaults to the server config's paths.data.",
+    )
+    p.add_argument(
+        "--simulate-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Override the simulate-mode peer-storage directory. Defaults to "
+            "the server config's paths.simulate. Pass when --data-dir is "
+            "overridden too; rotation re-encrypts simulate keyed_pairs alongside "
+            "the train-mode store."
+        ),
     )
     p.add_argument(
         "--config",

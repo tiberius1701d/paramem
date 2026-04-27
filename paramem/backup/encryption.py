@@ -253,7 +253,7 @@ class ModeProbe:
     plaintext_paths: list[Path] = field(default_factory=list)
 
 
-def infra_paths(data_dir: Path) -> list[Path]:
+def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
     """Return the list of infrastructure files subject to envelope encryption.
 
     Single source of truth for the startup mode-consistency scan
@@ -274,6 +274,14 @@ def infra_paths(data_dir: Path) -> list[Path]:
     data_dir:
         Root of the ParaMem data directory (typically
         ``configs/server.yaml``'s ``paths.data``).
+    simulate_dir:
+        Optional path to the simulate-mode peer-storage root
+        (``configs/server.yaml``'s ``paths.simulate``). When provided,
+        the per-tier ``keyed_pairs.json`` files under it are appended
+        to the candidate set so rotation, restore, and the startup
+        mode-consistency scan all cover the simulate store. Callers
+        that do not have a config (e.g. legacy callers) may pass
+        ``None`` to keep the historical data-dir-only behaviour.
 
     Returns
     -------
@@ -299,12 +307,25 @@ def infra_paths(data_dir: Path) -> list[Path]:
     if adapters_root.exists():
         for resume in adapters_root.rglob("in_training/resume_state.json"):
             paths.append(resume)
+    # Simulate-mode peer-storage keyed_pairs (canonical per-tier layout).
+    # Encryption posture matches train: respects the master switch via the
+    # same encrypted helpers. Inclusion here ensures rotation/restore/scan
+    # cover the simulate store as a first-class production artifact.
+    if simulate_dir is not None:
+        simulate_dir = Path(simulate_dir)
+        paths.extend(
+            [
+                simulate_dir / "episodic" / "keyed_pairs.json",
+                simulate_dir / "semantic" / "keyed_pairs.json",
+                simulate_dir / "procedural" / "keyed_pairs.json",
+            ]
+        )
     return paths
 
 
-def _probe_data_dir(data_dir: Path) -> ModeProbe:
-    """Scan *data_dir* for infrastructure files and classify each as
-    age / plaintext.
+def _probe_data_dir(data_dir: Path, simulate_dir: Path | None = None) -> ModeProbe:
+    """Scan *data_dir* (and *simulate_dir* if provided) for infrastructure
+    files and classify each as age / plaintext.
 
     Uses ``infra_paths`` as the authoritative candidate set.  Missing files
     do NOT contribute to either classification — only files that actually
@@ -312,10 +333,13 @@ def _probe_data_dir(data_dir: Path) -> ModeProbe:
     """
     probe = ModeProbe()
     data_dir = Path(data_dir)
-    if not data_dir.exists():
+    # data_dir is the primary root; simulate_dir is optionally a sibling root.
+    # Either may be missing on first start; that's fine — the candidate set
+    # is filtered by existence below.
+    if not data_dir.exists() and (simulate_dir is None or not Path(simulate_dir).exists()):
         return probe
 
-    for path in infra_paths(data_dir):
+    for path in infra_paths(data_dir, simulate_dir=simulate_dir):
         if not path.exists() or not path.is_file():
             continue
         if is_age_envelope(path):
@@ -330,6 +354,7 @@ def assert_mode_consistency(
     data_dir: Path,
     *,
     daily_identity_loadable: bool = False,
+    simulate_dir: Path | None = None,
 ) -> None:
     """Refuse startup when on-disk encryption state conflicts with the loaded keys.
 
@@ -363,7 +388,7 @@ def assert_mode_consistency(
     """
     from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
 
-    probe = _probe_data_dir(Path(data_dir))
+    probe = _probe_data_dir(Path(data_dir), simulate_dir=simulate_dir)
 
     has_age = bool(probe.age_paths)
     has_pt = bool(probe.plaintext_paths)
