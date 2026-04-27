@@ -25,9 +25,8 @@ from paramem.models.loader import adapt_messages
 from paramem.server.cloud.base import CloudAgent
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
-from paramem.server.router import RoutingPlan, RoutingStep
+from paramem.server.router import RoutingPlan
 from paramem.server.sanitizer import sanitize_for_cloud
-from paramem.server.temporal import detect_temporal_query, filter_registry_by_date
 from paramem.server.tools.ha_client import HAClient
 
 logger = logging.getLogger(__name__)
@@ -223,29 +222,14 @@ def handle_chat(
         model.gradient_checkpointing_disable()
 
         plan = None
-        allowed_keys = None
-        if speaker_id and router is not None:
-            allowed_keys = router._speaker_key_index.get(speaker_id, set())
 
-        # Path 1: Temporal query — filter keys by date range
-        date_range = detect_temporal_query(text)
-        if date_range:
-            start_date, end_date = date_range
-            logger.info("Temporal query detected: %s to %s", start_date, end_date)
-            temporal_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
-            if allowed_keys is not None:
-                temporal_keys = [k for k in temporal_keys if k in allowed_keys]
-            if temporal_keys:
-                plan = RoutingPlan(
-                    steps=[RoutingStep(adapter_name="episodic", keys_to_probe=temporal_keys)],
-                    strategy="temporal",
-                    match_source="pa",
-                )
-                routing_diags["paths_attempted"].append("temporal")
-                logger.info("Found %d keys for date range", len(temporal_keys))
-
-        # Path 2: Dual-graph entity routing
-        if plan is None and router is not None:
+        # Dual-graph entity routing.  The temporal-query branch (filter
+        # keys by date range) was retired in Plan A.3 — its data source
+        # (combined registry with last_seen_at / status fields) was never
+        # populated by production paths, so the filter always returned an
+        # empty list and the branch was inert.  If we re-introduce
+        # temporal queries, the writer side needs to be designed first.
+        if router is not None:
             plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
         if plan is not None:
             routing_diags["match_source"] = plan.match_source

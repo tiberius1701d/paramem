@@ -131,10 +131,6 @@ class TestAbstentionShortCircuit:
                 return_value=(None, ["self_referential"]),
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
         ):
             result = handle_chat(
                 text="Where do I live?",
@@ -165,10 +161,6 @@ class TestAbstentionShortCircuit:
                 return_value=(None, ["self_referential"]),
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
         ):
             result = handle_chat(
                 text="What's my birthday?",
@@ -202,10 +194,6 @@ class TestAbstentionShortCircuit:
                 return_value=(None, ["self_referential"]),
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
         ):
             result = handle_chat(
                 text="What do you know about me?",
@@ -245,10 +233,6 @@ class TestAbstentionShortCircuit:
                 "paramem.server.inference._base_model_answer",
                 return_value=ChatResult(text="Nice to meet you, Alex."),
             ) as mock_base_model,
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
         ):
             result = handle_chat(
                 text="I'm Alex. I live in Kelkham with my wife Pat.",
@@ -282,10 +266,6 @@ class TestAbstentionShortCircuit:
                 "paramem.server.inference._base_model_answer",
                 return_value=ChatResult(text="base model answer"),
             ) as mock_base_model,
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
         ):
             result = handle_chat(
                 text="Where do I live?",
@@ -319,10 +299,6 @@ class TestAbstentionShortCircuit:
                 return_value=ChatResult(text="cloud handled it", escalated=True),
             ) as mock_ha,
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
         ):
             result = handle_chat(
                 text="What's the weather?",
@@ -362,10 +338,6 @@ class TestAbstentionShortCircuit:
                 "paramem.server.inference._base_model_answer",
                 return_value=ChatResult(text="base fallback"),
             ) as mock_base_model,
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
         ):
             result = handle_chat(
                 text="What's the weather?",
