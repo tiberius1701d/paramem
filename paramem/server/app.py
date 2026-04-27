@@ -690,7 +690,221 @@ class RollbackResponse(BaseModel):
     restart_hint: str
 
 
-# --- Adapter mount helper ---
+# --- Adapter manifest validation + mount helpers ---
+#
+# The boot-time validator (_mount_adapters_from_slots) and the post-full-cycle
+# revalidator (_revalidate_main_adapter_manifests) share the same per-tier
+# decision logic — extracted into _validate_main_adapter_slot below so there
+# is a single source of truth for "what does this slot's manifest say about
+# its health, and should it be mounted?"
+
+
+def _compute_live_registry_sha256(config) -> str:
+    """SHA-256 of the on-disk indexed_key_registry.json plaintext bytes.
+
+    Hashes plaintext (after read_maybe_encrypted decrypt) — see
+    manifest.py::build_manifest_for for why ciphertext-based hashing breaks
+    drift detection under Security ON.  Empty string when the registry file
+    does not exist or cannot be read.
+    """
+    registry_path = config.adapter_dir / "indexed_key_registry.json"
+    if not registry_path.exists():
+        return ""
+    try:
+        import hashlib as _rhash
+
+        from paramem.backup.encryption import read_maybe_encrypted as _rme
+
+        return _rhash.sha256(_rme(registry_path)).hexdigest()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_primary_adapter(name: str) -> bool:
+    """Episodic is primary (red on mismatch); semantic / procedural are
+    secondary (yellow).  Drives severity in adapter_manifest_status rows."""
+    return name == "episodic"
+
+
+def _record_manifest_row(
+    manifest_status: dict,
+    name: str,
+    status: str,
+    reason: str,
+    severity: str,
+    slot_path: "Path | None" = None,
+    field: "str | None" = None,
+) -> None:
+    """Write one validation row into ``state['adapter_manifest_status']``."""
+    manifest_status[name] = {
+        "status": status,
+        "reason": reason,
+        "field": field,
+        "severity": severity,
+        "slot_path": str(slot_path.name) if slot_path else None,
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _validate_main_adapter_slot(
+    name: str,
+    adapter_cfg,
+    model,
+    tokenizer,
+    config,
+    live_registry_sha256: str,
+    manifest_status: dict,
+) -> "tuple[Path | None, object | None, bool]":
+    """Validate one main adapter's live slot.
+
+    Single source of truth for the per-tier validation decision.  Updates
+    ``manifest_status[name]`` with a row for unhealthy outcomes; pops any
+    prior row for healthy outcomes (so post-cycle revalidation clears the
+    stale boot-time snapshot).
+
+    Returns ``(slot, manifest, should_mount)``:
+      * ``slot``: resolved live slot Path, or ``None`` when no matching slot.
+      * ``manifest``: parsed AdapterManifest when read succeeded, else ``None``.
+      * ``should_mount``: True when the boot caller should mount this slot.
+        False for "no slot," "unreadable manifest," or "fingerprint mismatch."
+
+    Used by:
+      * :func:`_mount_adapters_from_slots` (boot path) — uses the return
+        triple to decide what to mount.
+      * :func:`_revalidate_main_adapter_manifests` (post-full-cycle) — only
+        the side-effect on ``manifest_status`` matters; return value is
+        discarded.
+    """
+    from paramem.adapters.manifest import (
+        ManifestNotFoundError,
+        ManifestSchemaError,
+        find_live_slot,
+        read_manifest,
+    )
+    from paramem.backup.backup import sweep_orphan_pending
+
+    severity = "red" if _is_primary_adapter(name) else "yellow"
+
+    kind_dir = config.adapter_dir / name
+    if kind_dir.exists():
+        sweep_orphan_pending(kind_dir)
+
+    slot = find_live_slot(kind_dir, live_registry_sha256) if kind_dir.exists() else None
+
+    if slot is None:
+        has_slots = kind_dir.exists() and any(
+            e for e in kind_dir.iterdir() if not e.name.startswith(".") and e.is_dir()
+        )
+        if has_slots:
+            _record_manifest_row(
+                manifest_status, name, "no_matching_slot", "no_matching_slot", severity
+            )
+            logger.warning("Adapter %s: no slot matching registry hash — skipping mount", name)
+        else:
+            manifest_status.pop(name, None)
+            logger.info("Adapter %s: no slots found — fresh install", name)
+        return None, None, False
+
+    try:
+        manifest = read_manifest(slot)
+    except ManifestNotFoundError:
+        _record_manifest_row(
+            manifest_status, name, "manifest_missing", "manifest_missing", severity, slot
+        )
+        # Still mount — weights are present even without manifest.
+        return slot, None, True
+    except ManifestSchemaError as exc:
+        _record_manifest_row(
+            manifest_status, name, "mismatch", "manifest_unreadable", severity, slot
+        )
+        logger.warning("Adapter %s: corrupt meta.json (%s) — skipping mount", name, exc)
+        return slot, None, False
+
+    mismatch_field = _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg)
+    if mismatch_field is not None:
+        _record_manifest_row(
+            manifest_status,
+            name,
+            "mismatch",
+            "fingerprint_mismatch",
+            severity,
+            slot,
+            mismatch_field,
+        )
+        logger.warning(
+            "Adapter %s: fingerprint mismatch on field '%s' — skipping mount",
+            name,
+            mismatch_field,
+        )
+        return slot, manifest, False
+
+    unknown_field = _first_unknown_field(manifest)
+    if unknown_field is not None:
+        unknown_severity = "yellow" if manifest.synthesized else "red"
+        _record_manifest_row(
+            manifest_status,
+            name,
+            "migrated_unverified",
+            "unknown_fields_in_manifest",
+            unknown_severity,
+            slot,
+            unknown_field,
+        )
+        logger.info(
+            "Adapter %s: UNKNOWN field '%s' in manifest (synthesized=%s) — mounting with warning",
+            name,
+            unknown_field,
+            manifest.synthesized,
+        )
+        return slot, manifest, True
+
+    # Healthy — clear any prior row so post-cycle revalidation removes
+    # stale boot-time entries.
+    manifest_status.pop(name, None)
+    return slot, manifest, True
+
+
+def _revalidate_main_adapter_manifests(state: dict) -> None:
+    """Re-run the main-adapter manifest validator and refresh
+    ``state['adapter_manifest_status']``.
+
+    Boot's :func:`_mount_adapters_from_slots` snapshots adapter health from
+    the on-disk state at startup.  After a full cycle re-saves main slots
+    with a fresh registry hash, that snapshot is stale — operators see
+    ``FINGERPRINT MISMATCH … PA routing DISABLED`` on /status / pstatus
+    even though main is healthy.  Calling this from ``_finalize_full``
+    clears those stale rows.
+
+    Pure validation: model + tokenizer come from state but are never
+    mutated.  Healthy main adapters have their row removed; unhealthy
+    ones get a fresh row stamped with the current ``checked_at``.
+    """
+    config = state.get("config")
+    model = state.get("model")
+    tokenizer = state.get("tokenizer")
+    if config is None or model is None or tokenizer is None:
+        return
+
+    manifest_status = state.setdefault("adapter_manifest_status", {})
+    live_registry_sha256 = _compute_live_registry_sha256(config)
+
+    for name, adapter_cfg in (
+        ("episodic", config.adapters.episodic),
+        ("semantic", config.adapters.semantic),
+        ("procedural", config.adapters.procedural),
+    ):
+        if not adapter_cfg.enabled:
+            manifest_status.pop(name, None)
+            continue
+        _validate_main_adapter_slot(
+            name,
+            adapter_cfg,
+            model,
+            tokenizer,
+            config,
+            live_registry_sha256,
+            manifest_status,
+        )
 
 
 def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
@@ -720,57 +934,20 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         The updated model (PeftModel when any adapter was loaded, otherwise
         the original base model).
     """
-    from datetime import datetime, timezone
-
     from peft import PeftModel
 
-    from paramem.adapters.manifest import (
-        ManifestNotFoundError,
-        ManifestSchemaError,
-        find_live_slot,
-        read_manifest,
-    )
+    from paramem.adapters.manifest import find_live_slot
     from paramem.backup.backup import sweep_orphan_pending
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
-
-    # Compute live registry hash once (used for all adapter kinds).
-    # Hash the plaintext content — see manifest.py::build_manifest_for for
-    # why ciphertext-based hashing breaks drift detection under Security ON.
+    live_registry_sha256 = _compute_live_registry_sha256(config)
     _registry_path = config.adapter_dir / "indexed_key_registry.json"
-    live_registry_sha256 = ""
-    if _registry_path.exists():
-        try:
-            import hashlib as _rhash
-
-            from paramem.backup.encryption import read_maybe_encrypted as _rme
-
-            live_registry_sha256 = _rhash.sha256(_rme(_registry_path)).hexdigest()
-        except Exception:  # noqa: BLE001
-            live_registry_sha256 = ""
-
-    def _checked_at() -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    def _is_primary(name: str) -> bool:
-        """Episodic is primary (red on mismatch); others are secondary (yellow)."""
-        return name == "episodic"
-
-    def _record_row(name: str, status: str, reason: str, severity: str, slot_path=None, field=None):
-        manifest_status[name] = {
-            "status": status,
-            "reason": reason,
-            "field": field,
-            "severity": severity,
-            "slot_path": str(slot_path.name) if slot_path else None,
-            "checked_at": _checked_at(),
-        }
 
     def _load_one(name: str, slot: Path):
         """Mount a single adapter from *slot* onto *model* (mutates nonlocal model).
 
-        Does not overwrite an existing manifest status row — caller may have already
-        recorded a manifest_missing or migrated_unverified row before calling this.
+        Does not overwrite an existing manifest status row — the validator may
+        have already recorded a manifest_missing or migrated_unverified row.
         """
         nonlocal model
         try:
@@ -781,109 +958,37 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             logger.info("Mounted adapter %s from slot %s", name, slot.name)
         except Exception as exc:
             logger.error("Failed to load adapter %s from %s: %s", name, slot, exc)
-            # Only record load_failed if there is no prior manifest row
             if name not in manifest_status:
-                _record_row(
+                _record_manifest_row(
+                    manifest_status,
                     name,
                     "manifest_missing",
                     "load_failed",
-                    "red" if _is_primary(name) else "yellow",
+                    "red" if _is_primary_adapter(name) else "yellow",
                     slot,
                 )
 
     # ---- Main adapter kinds ----
-    main_adapters = [
+    # Per-tier validation is delegated to _validate_main_adapter_slot so the
+    # boot path and post-full-cycle revalidation share one decision tree.
+    for name, adapter_cfg in (
         ("episodic", config.adapters.episodic),
         ("semantic", config.adapters.semantic),
         ("procedural", config.adapters.procedural),
-    ]
-
-    for name, adapter_cfg in main_adapters:
+    ):
         if not adapter_cfg.enabled:
             continue
-
-        kind_dir = config.adapter_dir / name
-        # Sweep stale pending slots before scanning
-        if kind_dir.exists():
-            sweep_orphan_pending(kind_dir)
-
-        slot = find_live_slot(kind_dir, live_registry_sha256)
-
-        if slot is None:
-            # Check whether any slots exist at all (distinguishes fresh install from mismatch)
-            has_slots = (
-                kind_dir.exists()
-                and any(e for e in kind_dir.iterdir() if not e.name.startswith(".") and e.is_dir())
-                if kind_dir.exists()
-                else False
-            )
-            if has_slots:
-                severity = "red" if _is_primary(name) else "yellow"
-                _record_row(name, "no_matching_slot", "no_matching_slot", severity)
-                logger.warning("Adapter %s: no slot matching registry hash — skipping mount", name)
-            else:
-                logger.info("Adapter %s: no slots found — fresh install", name)
-            continue
-
-        # Read and verify manifest
-        try:
-            manifest = read_manifest(slot)
-        except ManifestNotFoundError:
-            severity = "red" if _is_primary(name) else "yellow"
-            _record_row(name, "manifest_missing", "manifest_missing", severity, slot)
-            # Still mount — weights are present even without manifest
+        slot, _manifest, should_mount = _validate_main_adapter_slot(
+            name,
+            adapter_cfg,
+            model,
+            tokenizer,
+            config,
+            live_registry_sha256,
+            manifest_status,
+        )
+        if should_mount and slot is not None:
             _load_one(name, slot)
-            continue
-        except ManifestSchemaError as exc:
-            severity = "red" if _is_primary(name) else "yellow"
-            _record_row(name, "mismatch", "manifest_unreadable", severity, slot)
-            logger.warning("Adapter %s: corrupt meta.json (%s) — skipping mount", name, exc)
-            continue
-
-        # Fingerprint comparison
-        mismatch_field = _check_manifest_fingerprints(manifest, model, tokenizer, adapter_cfg)
-        if mismatch_field is not None:
-            severity = "red" if _is_primary(name) else "yellow"
-            _record_row(name, "mismatch", "fingerprint_mismatch", severity, slot, mismatch_field)
-            logger.warning(
-                "Adapter %s: fingerprint mismatch on field '%s' — skipping mount",
-                name,
-                mismatch_field,
-            )
-            continue
-
-        # Check for UNKNOWN fields
-        unknown_field = _first_unknown_field(manifest)
-        if unknown_field is not None:
-            if manifest.synthesized:
-                # synthesized + UNKNOWN → yellow (acceptable transient state)
-                _record_row(
-                    name,
-                    "migrated_unverified",
-                    "unknown_fields_in_manifest",
-                    "yellow",
-                    slot,
-                    unknown_field,
-                )
-            else:
-                # fresh-built + UNKNOWN → red (build_manifest_for failed silently)
-                _record_row(
-                    name,
-                    "migrated_unverified",
-                    "unknown_fields_in_manifest",
-                    "red",
-                    slot,
-                    unknown_field,
-                )
-            logger.info(
-                "Adapter %s: UNKNOWN field '%s' in manifest (synthesized=%s)"
-                " — mounting with warning",
-                name,
-                unknown_field,
-                manifest.synthesized,
-            )
-
-        _load_one(name, slot)
 
     # ---- Interim adapters ----
     for _interim_path in sorted(config.adapter_dir.glob("episodic_interim_*")):
@@ -5888,6 +5993,12 @@ def _run_full_consolidation_sync() -> None:
             loop.model.eval()
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
+            # Re-run the per-tier manifest validator now that main slots have
+            # been re-saved with a fresh registry hash + window_stamp. Without
+            # this, /status and pstatus keep showing the boot-time snapshot —
+            # operators see "FINGERPRINT MISMATCH … PA routing DISABLED" red
+            # rows even though main is healthy.
+            _revalidate_main_adapter_manifests(_state)
             total_keys = (
                 len(loop.indexed_key_registry) if loop.indexed_key_registry is not None else 0
             )

@@ -424,3 +424,98 @@ class TestAdapterHealthUntouched:
             "_mount_adapters_from_slots must not touch adapter_health "
             "(it is sourced from KeyRegistry JSON separately)"
         )
+
+
+class TestRevalidateMainAdapterManifests:
+    """Post-cycle revalidation shares the same per-tier decision tree as the
+    boot validator (_validate_main_adapter_slot). These tests exercise
+    _revalidate_main_adapter_manifests directly to verify two key behaviours:
+
+    1. Stale RED rows from the boot snapshot are CLEARED when on-disk slots
+       are now healthy (the bug this function exists to fix).
+    2. Slots that genuinely became unhealthy after boot get a fresh row
+       written, with current ``checked_at``.
+    """
+
+    def _state_from_config(self, config, model=None, tokenizer=None):
+        return {
+            "config": config,
+            "model": model if model is not None else _make_model(),
+            "tokenizer": tokenizer if tokenizer is not None else _make_tokenizer(),
+            "adapter_manifest_status": {},
+            "base_model_hash_cache": {},
+        }
+
+    def test_clears_stale_red_row_when_slot_now_healthy(self, tmp_path: Path) -> None:
+        """A boot-time row exists for episodic; on-disk state is healthy.
+        Revalidation removes the row.
+        """
+        from paramem.server.app import _revalidate_main_adapter_manifests
+
+        config = _make_config(tmp_path)
+        # Healthy slot on disk with empty registry hash (matches "no registry").
+        episodic_dir = config.adapter_dir / "episodic"
+        _write_slot(episodic_dir, ts="20260427-105338", registry_sha256="")
+
+        state = self._state_from_config(config)
+        # Inject a stale boot-time RED row.
+        state["adapter_manifest_status"]["episodic"] = {
+            "status": "no_matching_slot",
+            "reason": "no_matching_slot",
+            "field": None,
+            "severity": "red",
+            "slot_path": None,
+            "checked_at": "2026-04-27T11:43:44Z",
+        }
+
+        _revalidate_main_adapter_manifests(state)
+
+        assert "episodic" not in state["adapter_manifest_status"], (
+            "Stale RED row must be cleared once slot is healthy"
+        )
+
+    def test_writes_red_row_when_no_matching_slot(self, tmp_path: Path) -> None:
+        """No matching slot on disk → revalidation writes a no_matching_slot row."""
+        from paramem.server.app import _revalidate_main_adapter_manifests
+
+        config = _make_config(tmp_path)
+        # Slot with a non-empty registry hash that won't match the live "" hash.
+        episodic_dir = config.adapter_dir / "episodic"
+        _write_slot(episodic_dir, ts="20260427-105338", registry_sha256="stale_hash_123")
+
+        state = self._state_from_config(config)
+        # Start with no row (post-boot default for a healthy slot).
+        _revalidate_main_adapter_manifests(state)
+
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None, "Mismatch must produce a row"
+        assert row["status"] == "no_matching_slot"
+        assert row["severity"] == "red"  # episodic is primary
+
+    def test_disabled_adapter_pops_any_existing_row(self, tmp_path: Path) -> None:
+        """If a tier is disabled in config, its row is removed regardless of state."""
+        from paramem.server.app import _revalidate_main_adapter_manifests
+
+        config = _make_config(tmp_path, enabled_names=())  # all tiers disabled
+        state = self._state_from_config(config)
+        state["adapter_manifest_status"]["episodic"] = {
+            "status": "mismatch",
+            "severity": "red",
+            "reason": "fingerprint_mismatch",
+            "field": None,
+            "slot_path": None,
+            "checked_at": "2026-04-27T11:00:00Z",
+        }
+
+        _revalidate_main_adapter_manifests(state)
+
+        assert "episodic" not in state["adapter_manifest_status"]
+
+    def test_noop_when_state_missing_model(self, tmp_path: Path) -> None:
+        """Defensive: missing model in state → silently no-op (no exception)."""
+        from paramem.server.app import _revalidate_main_adapter_manifests
+
+        config = _make_config(tmp_path)
+        state = {"config": config, "tokenizer": _make_tokenizer()}  # no "model" key
+        _revalidate_main_adapter_manifests(state)  # must not raise
+        assert state.get("adapter_manifest_status", {}) == {}
