@@ -501,9 +501,9 @@ class SessionBuffer:
         try:
             plaintext = json.dumps(payload).encode()
             envelope = envelope_encrypt_bytes(plaintext)
-            tmp = self._snapshot_path.with_suffix(".tmp")
-            tmp.write_bytes(envelope)
-            tmp.rename(self._snapshot_path)
+            from paramem.backup.encryption import _atomic_write_bytes
+
+            _atomic_write_bytes(self._snapshot_path, envelope)
             logger.info(
                 "Session snapshot saved: %d conversations, %d turns",
                 len(self._turns),
