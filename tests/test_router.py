@@ -824,3 +824,99 @@ class TestInterimAdapterRouting:
             assert names.index("episodic_interim_20260418T0000") < names.index("episodic"), (
                 f"Interim must be probed before main for the same key (freshness wins), got {names}"
             )
+
+
+class TestRouteIntentField:
+    """G4 wiring: route() populates RoutingPlan.intent via classify_intent.
+
+    These tests pin the contract between router state and the intent
+    classifier without exercising the encoder — they cover the state-first
+    tiers (PA hit → PERSONAL, HA hit → COMMAND) and the no-state degraded
+    path (returns UNKNOWN when no IntentConfig is supplied)."""
+
+    def test_pa_match_yields_personal_intent(self):
+        from paramem.server.router import Intent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("alex_loc", "Alex", "Berlin", speaker_id="alex")],
+                subdir="episodic",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            plan = router.route("Where does Alex live?", speaker_id="alex")
+
+            assert plan.match_source == "pa"
+            assert plan.intent == Intent.PERSONAL
+
+    def test_ha_only_match_yields_command_intent(self):
+        from paramem.server.router import Intent
+
+        ha = _make_ha_graph(_make_ha_match(entities=["light.kitchen"], domains=["light"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            plan = router.route("Turn on the kitchen light")
+
+            assert plan.match_source == "ha"
+            assert plan.intent == Intent.COMMAND
+
+    def test_both_pa_and_ha_match_personal_wins(self):
+        # Privacy-first: PA + HA overlap routes to PERSONAL so cloud
+        # escalation stays gated on graph match.
+        from paramem.server.router import Intent
+
+        ha = _make_ha_graph(_make_ha_match(entities=["light.bedroom"], domains=["light"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("alex_room", "Alex", "bedroom", speaker_id="alex")],
+                subdir="episodic",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            plan = router.route("Is Alex's bedroom light on?", speaker_id="alex")
+
+            assert plan.match_source == "both"
+            assert plan.intent == Intent.PERSONAL
+
+    def test_no_state_no_config_returns_unknown(self):
+        # No PA, no HA, no IntentConfig — encoder isn't loaded so the
+        # classifier degrades to UNKNOWN rather than raising.
+        from paramem.server.router import Intent
+
+        ha = _make_ha_graph(None)  # HA configured but no match
+        with tempfile.TemporaryDirectory() as tmp:
+            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            plan = router.route("What is the capital of France?")
+
+            # match_source is "ha" because of imperative-fallback heuristic
+            # (interrogative-aware), but intent classifier sees clean state
+            # signals (has_pa=False, has_ha=False) and returns UNKNOWN
+            # without an IntentConfig.
+            assert plan.intent == Intent.UNKNOWN
+
+    def test_no_state_with_config_returns_fail_closed(self):
+        # No PA, no HA, IntentConfig present but encoder/exemplars unloaded
+        # → fail-closed default (PERSONAL).  Encoder isn't loaded in unit
+        # tests so this exercises the degraded path.
+        from paramem.server.config import IntentConfig
+        from paramem.server.router import Intent
+
+        ha = _make_ha_graph(None)
+        cfg = IntentConfig()  # fail_closed_intent="personal"
+        with tempfile.TemporaryDirectory() as tmp:
+            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha, intent_config=cfg)
+            plan = router.route("What is the capital of France?")
+
+            assert plan.intent == Intent.PERSONAL
+
+    def test_no_state_with_general_fail_closed(self):
+        from paramem.server.config import IntentConfig
+        from paramem.server.router import Intent
+
+        ha = _make_ha_graph(None)
+        cfg = IntentConfig(fail_closed_intent="general")
+        with tempfile.TemporaryDirectory() as tmp:
+            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha, intent_config=cfg)
+            plan = router.route("What is the capital of France?")
+
+            assert plan.intent == Intent.GENERAL

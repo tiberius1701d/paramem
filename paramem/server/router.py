@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 from rapidfuzz import fuzz
 
 if TYPE_CHECKING:
+    from paramem.server.config import IntentConfig
     from paramem.server.ha_graph import HAEntityGraph, HAMatchResult
 
 logger = logging.getLogger(__name__)
@@ -212,10 +213,16 @@ class QueryRouter:
         adapter_dir: Path,
         graph_path: Path | None = None,
         ha_graph: HAEntityGraph | None = None,
+        intent_config: IntentConfig | None = None,
     ):
         self.adapter_dir = Path(adapter_dir)
         self.graph_path = Path(graph_path) if graph_path else None
         self._ha_graph = ha_graph
+        # IntentConfig flows through to classify_intent() so the residual
+        # tier (encoder + exemplar bank) gets its margin threshold and
+        # fail-closed default.  None means callers receive Intent.UNKNOWN
+        # when state signals don't fire — fine for tests that don't care.
+        self._intent_config = intent_config
 
         # adapter_name -> {entity_lower -> set[key]}
         self._entity_key_index: dict[str, dict[str, set[str]]] = {}
@@ -451,10 +458,29 @@ class QueryRouter:
 
         ha_domains = ha_match.domains if ha_match else []
 
+        # --- Intent classification ---
+        # State-first dispatch: has_pa → PERSONAL, has_ha → COMMAND.  When
+        # neither fires, classify_intent falls through to the encoder
+        # residual (cosine vs exemplars + margin gate) or fail-closed.
+        # Uses the *raw* state signals (has_pa / has_ha) — not the
+        # post-imperative-fallback match_source, since the fallback is a
+        # heuristic and the intent classifier expects clean state.  The
+        # call is local-cheap when state hits and a single matrix-vector
+        # dot product otherwise; failure modes are non-raising.
+        from paramem.server.intent import classify_intent  # lazy: breaks router↔intent cycle
+
+        intent = classify_intent(
+            text,
+            has_graph_match=has_pa,
+            has_ha_match=has_ha,
+            config=self._intent_config,
+        )
+
         if match_source != "none":
             logger.info(
-                "Routed query: source=%s, pa_entities=%s, ha=%s, imperative=%s",
+                "Routed query: source=%s, intent=%s, pa_entities=%s, ha=%s, imperative=%s",
                 match_source,
+                intent.value,
                 pa_entities if has_pa else [],
                 ha_domains if has_ha else [],
                 imperative,
@@ -467,6 +493,7 @@ class QueryRouter:
             match_source=match_source,
             imperative=imperative,
             ha_domains=ha_domains,
+            intent=intent,
         )
 
     def _extract_entities(self, text: str) -> list[str]:
