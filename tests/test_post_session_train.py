@@ -469,32 +469,7 @@ class TestMaxInterimCountZeroQueues:
 
 
 # ---------------------------------------------------------------------------
-# Test 7 — Queued facts shape (Step 7 skeleton)
-# ---------------------------------------------------------------------------
-
-
-class TestQueuedFactsConsumedByNextConsolidate:
-    @pytest.mark.skip(reason="TODO(Step 7): consumed by consolidate_interim_adapters")
-    def test_queued_facts_consumed_by_next_consolidate(self, tmp_path: Path) -> None:
-        """Pending triples are drained when consolidate_interim_adapters runs.
-
-        This test is a skeleton for Step 7.  The consolidate path must pop
-        pending_interim_triples at the start of the rebuild phase, fold them into
-        the cumulative graph, and clear the queue.  The actual consume logic lives
-        in consolidate_interim_adapters (Step 7 implementation).
-        """
-        loop = _make_mock_loop(tmp_path)
-
-        # Populate the queue.
-        loop.pending_interim_triples = _fake_qa(3)
-
-        # Call consolidate_interim_adapters (not yet implemented in Step 6).
-        # loop.consolidate_interim_adapters()
-        # assert loop.pending_interim_triples == []
-
-
-# ---------------------------------------------------------------------------
-# Test 8 — Registry update happens AFTER training, not before
+# Registry update happens AFTER training, not before
 # ---------------------------------------------------------------------------
 
 
