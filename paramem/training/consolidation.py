@@ -2324,13 +2324,6 @@ class ConsolidationLoop:
                     "error": str | None,
                 }
         """
-        from paramem.server.interim_adapter import create_interim_adapter
-        from paramem.training.indexed_memory import (
-            assign_keys,
-            build_registry,
-            format_indexed_training,
-        )
-
         # --- 1. Extract ---
         episodic_qa, procedural_rels = self.extract_session(
             session_transcript,
@@ -2340,12 +2333,80 @@ class ConsolidationLoop:
             ha_context=ha_context,
         )
 
-        triples_extracted = len(episodic_qa)
         logger.info(
             "post_session_train: session=%s extracted %d episodic QA pairs",
             session_id,
-            triples_extracted,
+            len(episodic_qa),
         )
+
+        return self._train_extracted_into_interim(
+            episodic_qa,
+            procedural_rels,
+            run_label=session_id,
+            speaker_id=speaker_id,
+            schedule=schedule,
+            max_interim_count=max_interim_count,
+            stamp=stamp,
+            recall_sanity_threshold=recall_sanity_threshold,
+        )
+
+    def _train_extracted_into_interim(
+        self,
+        episodic_qa: list[dict],
+        procedural_rels: list[dict],
+        *,
+        run_label: str,
+        speaker_id: str = "",
+        schedule: str = "",
+        max_interim_count: int = 7,
+        stamp: str | None = None,
+        recall_sanity_threshold: float = 0.95,
+    ) -> dict:
+        """Train pre-extracted QA + procedural relations into the interim adapter.
+
+        Shared by :meth:`post_session_train` (single session) and the
+        scheduled-tick batch path (a window of pending sessions extracted
+        together under one GPU lock then fed in here as a batch).
+
+        Behaviour is preserved verbatim from the original post_session_train
+        phases 2-final, including I5 atomic registry-write ordering, the
+        cap-reached-absorb retrain with recall-sanity rollback, and the
+        ``triples_extracted / new_keys / adapter_name / mode / error`` return
+        shape.
+
+        Args:
+            episodic_qa: Pre-extracted episodic QA pairs.  Each pair MAY
+                already carry ``speaker_id``; pairs missing it are tagged
+                with the *speaker_id* parameter below.
+            procedural_rels: Pre-extracted procedural relations (trained onto
+                the stable ``procedural`` main adapter — no interim tier).
+            run_label: Tag woven into the wandb ``run_name`` for traceability.
+                Pass ``session_id`` for per-session calls, or
+                ``"tick-<stamp>"`` for batch calls from the scheduled tick.
+            speaker_id: Default speaker tag for QA pairs missing one; also
+                passed through to ``_run_indexed_key_procedural`` for
+                contradiction scoping.
+            schedule: Consolidation refresh-cadence string (used to compute
+                the sub-interval stamp when *stamp* is not provided).
+            max_interim_count: Cap on concurrent interim adapters in VRAM.
+                ``0`` → queue-only branch (no interim adapter created).
+            stamp: Override the computed sub-interval stamp (test injection).
+            recall_sanity_threshold: Minimum recall to accept a cap-reached
+                retrain; below this the retrain is rolled back to the
+                snapshot and the adapter is marked ``degenerated``.
+
+        Returns:
+            Result dict: ``{"triples_extracted", "new_keys", "adapter_name",
+            "mode", "error"}``.
+        """
+        from paramem.server.interim_adapter import create_interim_adapter
+        from paramem.training.indexed_memory import (
+            assign_keys,
+            build_registry,
+            format_indexed_training,
+        )
+
+        triples_extracted = len(episodic_qa)
 
         # --- 2. Noop: no facts extracted ---
         if triples_extracted == 0:
@@ -2547,7 +2608,7 @@ class ConsolidationLoop:
             # same sub-interval do NOT share a directory, and different stamps
             # always produce distinct directories.
             output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
-            run_name=f"interim-{adapter_name}-{session_id}",
+            run_name=f"interim-{adapter_name}-{run_label}",
             callbacks_extra=self._shutdown_callbacks,
         )
 
