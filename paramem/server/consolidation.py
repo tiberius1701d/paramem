@@ -70,6 +70,15 @@ def create_consolidation_loop(
         state_provider=state_provider,
     )
 
+    # Wire the base-model weight-hash cache from server _state into the loop so
+    # build_manifest_for memoizes the SHA-256 across consolidations within one
+    # process lifetime. Without this, every cycle re-hashes the full base model
+    # (~2 min for Mistral 7B). Cache is keyed by id(model); resets on restart.
+    if state_provider is not None:
+        state = state_provider()
+        if state is not None:
+            loop.fingerprint_cache = state.setdefault("base_model_hash_cache", {})
+
     # Seed key metadata from disk (survives restarts)
     metadata = _load_key_metadata(config.key_metadata_path)
     if metadata:

@@ -844,3 +844,131 @@ class TestAtomicJsonWriteEncryptedFlag:
         import json as _json
 
         assert _json.loads(out.read_text()) == {"debug": True, "n": 42}
+
+
+class TestCreateConsolidationLoopFingerprintCacheWiring:
+    """create_consolidation_loop wires _state["base_model_hash_cache"] into loop.
+
+    Without this wire, build_manifest_for re-hashes the full base model on
+    every consolidation cycle (~2 min for Mistral 7B). The cache is keyed by
+    id(model) so it survives across cycles within one process lifetime.
+    """
+
+    def _patch_loop(self, monkeypatch):
+        """Stub ConsolidationLoop so the test doesn't need a real model."""
+        from paramem.server import consolidation as server_consolidation
+
+        captured = {}
+
+        def _fake_loop(**kwargs):
+            instance = MagicMock()
+            instance.fingerprint_cache = None  # default; production code must overwrite
+            instance._kwargs = kwargs
+            captured["instance"] = instance
+            return instance
+
+        monkeypatch.setattr(server_consolidation, "ConsolidationLoop", _fake_loop)
+        return captured
+
+    def _make_config(self, tmp_path):
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path / "adapters"
+        cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+        cfg.key_metadata_path = tmp_path / "key_metadata.json"
+        cfg.adapters.procedural.enabled = True
+        cfg.consolidation.extraction_max_tokens = 256
+        cfg.consolidation.graph_enrichment_enabled = False
+        cfg.consolidation.graph_enrichment_neighborhood_hops = 1
+        cfg.consolidation.graph_enrichment_max_entities_per_pass = 5
+        cfg.consolidation.graph_enrichment_interim_enabled = False
+        cfg.consolidation.graph_enrichment_min_triples_floor = 0
+        cfg.debug = False
+        cfg.debug_dir = None
+        cfg.prompts_dir = None
+        return cfg
+
+    def test_state_provider_supplies_cache_to_loop(self, tmp_path, monkeypatch):
+        """When state_provider returns a state dict, loop.fingerprint_cache
+        is the SAME dict object as state["base_model_hash_cache"].
+        """
+        from paramem.server.consolidation import create_consolidation_loop
+
+        captured = self._patch_loop(monkeypatch)
+        cfg = self._make_config(tmp_path)
+        state = {"base_model_hash_cache": {}}
+
+        loop = create_consolidation_loop(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=cfg,
+            state_provider=lambda: state,
+        )
+
+        assert loop is captured["instance"]
+        assert loop.fingerprint_cache is state["base_model_hash_cache"], (
+            "fingerprint_cache must be the same dict instance as the server's "
+            "state cache so build_manifest_for writes/reads through it."
+        )
+
+    def test_state_provider_creates_cache_when_missing(self, tmp_path, monkeypatch):
+        """If state has no base_model_hash_cache key, loop wiring sets it via setdefault."""
+        from paramem.server.consolidation import create_consolidation_loop
+
+        self._patch_loop(monkeypatch)
+        cfg = self._make_config(tmp_path)
+        state: dict = {}
+
+        loop = create_consolidation_loop(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=cfg,
+            state_provider=lambda: state,
+        )
+
+        assert "base_model_hash_cache" in state
+        assert loop.fingerprint_cache is state["base_model_hash_cache"]
+
+    def test_no_state_provider_leaves_cache_unset(self, tmp_path, monkeypatch):
+        """Experiment scripts pass state_provider=None; loop.fingerprint_cache
+        stays at its default (None) and build_manifest_for skips the cache.
+        """
+        from paramem.server.consolidation import create_consolidation_loop
+
+        self._patch_loop(monkeypatch)
+        cfg = self._make_config(tmp_path)
+
+        loop = create_consolidation_loop(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=cfg,
+            state_provider=None,
+        )
+
+        assert loop.fingerprint_cache is None
+
+    def test_cache_persists_across_two_loop_constructions(self, tmp_path, monkeypatch):
+        """Two consecutive create_consolidation_loop calls with the same state
+        share the same cache dict — i.e. the second loop sees entries from the
+        first. This is the persistence guarantee the cache exists for.
+        """
+        from paramem.server.consolidation import create_consolidation_loop
+
+        self._patch_loop(monkeypatch)
+        cfg = self._make_config(tmp_path)
+        state: dict = {}
+
+        loop_a = create_consolidation_loop(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=cfg,
+            state_provider=lambda: state,
+        )
+        loop_a.fingerprint_cache["sentinel"] = "computed-by-cycle-1"
+
+        loop_b = create_consolidation_loop(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=cfg,
+            state_provider=lambda: state,
+        )
+        assert loop_b.fingerprint_cache.get("sentinel") == "computed-by-cycle-1"
