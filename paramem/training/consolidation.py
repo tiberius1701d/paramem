@@ -2106,9 +2106,12 @@ class ConsolidationLoop:
         import json as _json
 
         from paramem.adapters.manifest import build_manifest_for
+        from paramem.server.interim_adapter import current_full_consolidation_stamp
 
         registry_path = self.output_dir / "indexed_key_registry.json"
         fingerprint_cache = getattr(self, "fingerprint_cache", None)
+        full_period = getattr(self, "full_consolidation_period_string", "")
+        full_window_stamp = current_full_consolidation_stamp(full_period)
 
         # I5 Step 1+2: Serialise registry to bytes and hash them — no disk I/O.
         payload: "bytes | None" = None
@@ -2163,6 +2166,7 @@ class ConsolidationLoop:
                     key_count=len(self.indexed_key_registry) if self.indexed_key_registry else None,
                     base_model_hash_cache=fingerprint_cache,
                     registry_sha256_override=registry_sha256,
+                    window_stamp=full_window_stamp,
                 )
             except Exception:  # noqa: BLE001
                 return None
@@ -2741,7 +2745,10 @@ class ConsolidationLoop:
         kp_path = interim_dir / "keyed_pairs.json"
         _wi(kp_path, _json.dumps(interim_pairs, indent=2).encode("utf-8"))
 
-        # Step 5: Build manifest with pre-computed registry_sha256.
+        # Step 5: Build manifest with pre-computed registry_sha256.  The
+        # interim slot's window IS the cadence boundary stamp — same value
+        # already encoded in the adapter name suffix.  Recording it on the
+        # manifest gives the slot a self-describing window identity.
         fingerprint_cache = getattr(self, "fingerprint_cache", None)
         try:
             manifest = _build_manifest_for(
@@ -2753,6 +2760,7 @@ class ConsolidationLoop:
                 key_count=len(self.indexed_key_registry) if self.indexed_key_registry else None,
                 base_model_hash_cache=fingerprint_cache,
                 registry_sha256_override=registry_sha256,
+                window_stamp=stamp,
             )
         except Exception:
             logger.warning("post_session_train: manifest build failed — saving without manifest")

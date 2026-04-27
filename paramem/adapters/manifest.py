@@ -1,9 +1,21 @@
 """Per-adapter meta.json schema and live-slot resolver.
 
-Schema version: MANIFEST_SCHEMA_VERSION = 1.
-Future schema mutations require a version bump and a migration helper.
-Forward-compat: ``synthesized`` defaults to False when absent from on-disk
-JSON so pre-``synthesized`` manifests are treated as fresh-built.
+Schema version: MANIFEST_SCHEMA_VERSION = 2.
+
+Schema history:
+  * v1: original schema (no ``window_stamp``).
+  * v2: adds ``window_stamp`` — the cadence-window the slot represents.
+    Set at write time by the producer (interim or full-cycle path) and
+    used by the Phase 4 full-cycle gate to decide "have we already
+    consolidated the current window?" via stamp identity comparison.
+
+Forward-compat / auto-upgrade: ``_dict_to_manifest`` accepts v1 manifests
+on read and treats absent ``window_stamp`` as the empty string. Empty
+``window_stamp`` on the canonical main ``episodic`` slot is interpreted
+by the gate as "unknown window — first full cycle is due", so v1 slots
+naturally trigger a re-consolidation that overwrites them with v2 on
+first run. ``synthesized`` retains the same forward-compat default of
+``False`` when absent.
 
 On-disk layout
 --------------
@@ -44,7 +56,7 @@ from typing import Final
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_SCHEMA_VERSION: int = 1
+MANIFEST_SCHEMA_VERSION: int = 2
 UNKNOWN: Final[str] = "unknown"
 
 _MANIFEST_FILENAME = "meta.json"
@@ -111,9 +123,18 @@ class AdapterManifest:
     """Immutable per-adapter manifest written alongside every saved adapter.
 
     Attributes:
-        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (currently 1).
+        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (currently 2).
         name: Adapter name string (e.g. ``"episodic"``).
         trained_at: ISO-8601 UTC timestamp (``"YYYY-MM-DDTHH:MM:SSZ"``).
+        window_stamp: ``"YYYYMMDDTHHMM"`` cadence-window this slot represents.
+            For interim slots (``episodic_interim_<X>``) it is the
+            refresh-cadence boundary stamp (same value as the adapter-name
+            suffix). For main full-cycle slots it is the full-consolidation
+            boundary stamp. The slot's training represents this window: two
+            slots with the same ``window_stamp`` were produced by cycles in
+            the same cadence boundary. Empty string for legacy v1 manifests
+            (auto-upgraded on read) and synthesized fallbacks where the
+            window is unknown.
         base_model: Base model fingerprint.
         tokenizer: Tokenizer fingerprint.
         lora: LoRA shape.
@@ -138,6 +159,7 @@ class AdapterManifest:
     keyed_pairs_sha256: str
     key_count: int | str  # int or UNKNOWN
     synthesized: bool = False
+    window_stamp: str = ""  # cadence-window stamp; "" = legacy / unknown
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +209,17 @@ def _manifest_to_dict(manifest: AdapterManifest) -> dict:
 def _dict_to_manifest(d: dict) -> AdapterManifest:
     """Parse a raw dict from JSON into an AdapterManifest.
 
-    Raises ManifestSchemaError for missing required fields.
+    Schema-version handling:
+      * v1 (legacy): auto-upgraded in-memory by defaulting ``window_stamp``
+        to ``""``. The on-disk file is left untouched until the next save,
+        which writes v2.  Empty ``window_stamp`` is interpreted by the
+        Phase 4 gate as "unknown window — first full cycle is due".
+      * v2 (current): ``window_stamp`` required.
+      * Newer-than-current: rejected with ManifestSchemaError so callers
+        do not silently downgrade.
+
+    Raises ManifestSchemaError for missing required fields or unsupported
+    schema versions.
     """
     required_top = [
         "schema_version",
@@ -203,6 +235,15 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
     for field in required_top:
         if field not in d:
             raise ManifestSchemaError(f"Missing required field: {field!r}")
+
+    schema = d["schema_version"]
+    if not isinstance(schema, int):
+        raise ManifestSchemaError(f"schema_version must be int, got {type(schema)!r}")
+    if schema > MANIFEST_SCHEMA_VERSION:
+        raise ManifestSchemaError(
+            f"schema_version={schema} is newer than supported "
+            f"({MANIFEST_SCHEMA_VERSION}); refusing to downgrade silently."
+        )
 
     bm = d["base_model"]
     for f in ("repo", "sha", "hash"):
@@ -231,10 +272,16 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
         target_modules=tuple(lo["target_modules"]),
     )
 
+    # v1 → v2 auto-upgrade: window_stamp absent in v1; default to "".
+    window_stamp = d.get("window_stamp", "")
+    if not isinstance(window_stamp, str):
+        raise ManifestSchemaError(f"window_stamp must be str, got {type(window_stamp)!r}")
+
     return AdapterManifest(
         schema_version=d["schema_version"],
         name=d["name"],
         trained_at=d["trained_at"],
+        window_stamp=window_stamp,
         base_model=base_model,
         tokenizer=tokenizer,
         lora=lora,
@@ -418,6 +465,7 @@ def build_manifest_for(
     key_count: "int | None" = None,
     base_model_hash_cache: "dict | None" = None,
     registry_sha256_override: "str | None" = None,
+    window_stamp: str = "",
 ) -> AdapterManifest:
     """Build an :class:`AdapterManifest` for a live model/tokenizer.
 
@@ -447,6 +495,12 @@ def build_manifest_for(
             ``registry_sha256`` instead of reading *registry_path*.  Used
             by the I5 reorder path (§2.5) where the payload bytes have
             already been hashed before writing to disk.
+        window_stamp: ``"YYYYMMDDTHHMM"`` cadence-window the slot represents
+            (see ``AdapterManifest.window_stamp``).  Empty string when the
+            caller cannot determine the window — e.g. ad-hoc experiment
+            paths.  Production writers pass the floored cadence boundary:
+            ``current_interim_stamp(refresh_cadence)`` for interim slots,
+            ``current_full_consolidation_stamp(period)`` for main slots.
 
     Returns:
         A fully-populated :class:`AdapterManifest` with ``synthesized=False``.
@@ -616,6 +670,7 @@ def build_manifest_for(
         schema_version=MANIFEST_SCHEMA_VERSION,
         name=adapter_name,
         trained_at=trained_at,
+        window_stamp=window_stamp,
         base_model=base_model_fp,
         tokenizer=tokenizer_fp,
         lora=lora,

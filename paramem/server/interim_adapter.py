@@ -134,6 +134,36 @@ def current_interim_stamp(
     return floored_dt.strftime("%Y%m%dT%H%M")
 
 
+def current_full_consolidation_stamp(
+    consolidation_period: str = "",
+    *,
+    _now: datetime | None = None,
+) -> str:
+    """Return the current full-consolidation window's ``YYYYMMDDTHHMM`` stamp.
+
+    Companion to :func:`current_interim_stamp`.  Identical flooring logic
+    (anchored to local midnight) but applied to the FULL consolidation
+    period (``refresh_cadence × max_interim_count``) instead of the interim
+    cadence.  The stamp identifies which full-cycle window we are currently
+    in: two calls within the same window return the same stamp, which is
+    how the Phase-4 gate decides whether the current window has already
+    been consolidated (compared against the latest main slot's
+    ``meta.json.window_stamp``).
+
+    Args:
+        consolidation_period: Full-cycle period string from
+            ``ConsolidationConfig.consolidation_period_string``.  Empty
+            string disables the gate (manual-only).
+
+    Returns:
+        ``"YYYYMMDDTHHMM"`` for the floored window boundary, or empty
+        string when *consolidation_period* is empty/disabled.
+    """
+    if not consolidation_period:
+        return ""
+    return current_interim_stamp(consolidation_period, _now=_now)
+
+
 def create_interim_adapter(
     model: PeftModel,
     adapter_config: AdapterConfig,

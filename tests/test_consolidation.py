@@ -972,3 +972,113 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             state_provider=lambda: state,
         )
         assert loop_b.fingerprint_cache.get("sentinel") == "computed-by-cycle-1"
+
+
+class TestFullCycleGateHelpers:
+    """Helpers that decide whether the scheduled tick should run a full cycle.
+
+    The gate compares the manifest-recorded ``window_stamp`` on the most
+    recent main episodic slot against ``current_full_consolidation_stamp()``.
+    Both values are produced by the same flooring primitive, so identity
+    comparison is exact and idempotent within a window.
+    """
+
+    def _write_meta(self, slot_dir, *, window_stamp="", trained_at="2026-04-27T07:29:40Z"):
+        import json as _json
+
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"trained_at": trained_at, "window_stamp": window_stamp}
+        (slot_dir / "meta.json").write_text(_json.dumps(payload))
+
+    def test_last_full_consolidation_window_returns_none_when_no_episodic_dir(self, tmp_path):
+        from paramem.server.app import _last_full_consolidation_window
+
+        assert _last_full_consolidation_window(tmp_path) is None
+
+    def test_last_full_consolidation_window_returns_none_when_no_slots(self, tmp_path):
+        from paramem.server.app import _last_full_consolidation_window
+
+        (tmp_path / "episodic").mkdir()
+        assert _last_full_consolidation_window(tmp_path) is None
+
+    def test_last_full_consolidation_window_returns_none_on_corrupt_meta(self, tmp_path):
+        from paramem.server.app import _last_full_consolidation_window
+
+        slot = tmp_path / "episodic" / "20260427-072940"
+        slot.mkdir(parents=True)
+        (slot / "meta.json").write_text("not valid json {")
+        assert _last_full_consolidation_window(tmp_path) is None
+
+    def test_last_full_consolidation_window_returns_none_on_empty_window_stamp(self, tmp_path):
+        """Legacy v1 manifest (no window_stamp / empty) → None → 'unknown'."""
+        from paramem.server.app import _last_full_consolidation_window
+
+        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="")
+        assert _last_full_consolidation_window(tmp_path) is None
+
+    def test_last_full_consolidation_window_picks_lex_max_slot(self, tmp_path):
+        """Multiple slots → take the lex-max (latest timestamp dir name)."""
+        from paramem.server.app import _last_full_consolidation_window
+
+        self._write_meta(tmp_path / "episodic" / "20260420-120000", window_stamp="20260420T0000")
+        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="20260427T0000")
+        self._write_meta(tmp_path / "episodic" / "20260425-080000", window_stamp="20260424T0000")
+
+        assert _last_full_consolidation_window(tmp_path) == "20260427T0000"
+
+    def test_last_full_consolidation_window_skips_pending_dir(self, tmp_path):
+        """The .pending side-slot must not be picked even if it sorts last."""
+        from paramem.server.app import _last_full_consolidation_window
+
+        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="20260427T0000")
+        (tmp_path / "episodic" / ".pending").mkdir()  # no meta.json
+
+        assert _last_full_consolidation_window(tmp_path) == "20260427T0000"
+
+    def _make_config(self, period_string, adapter_dir):
+        cfg = MagicMock()
+        cfg.adapter_dir = adapter_dir
+        cfg.consolidation.consolidation_period_string = period_string
+        return cfg
+
+    def test_is_full_cycle_due_disabled_cadence_returns_false(self, tmp_path):
+        """When refresh_cadence is ""/"off", period_string is empty → never auto-due."""
+        from paramem.server.app import _is_full_cycle_due
+
+        cfg = self._make_config("", tmp_path)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_is_full_cycle_due_no_prior_full_returns_true(self, tmp_path):
+        """Fresh install (no prior window_stamp) → first full is due."""
+        from paramem.server.app import _is_full_cycle_due
+
+        cfg = self._make_config("every 84h", tmp_path)
+        assert _is_full_cycle_due(cfg) is True
+
+    def test_is_full_cycle_due_legacy_v1_treated_as_unknown(self, tmp_path):
+        """A v1 manifest (empty window_stamp) is treated as unknown → due."""
+        from paramem.server.app import _is_full_cycle_due
+
+        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="")
+        cfg = self._make_config("every 84h", tmp_path)
+        assert _is_full_cycle_due(cfg) is True
+
+    def test_is_full_cycle_due_same_window_returns_false(self, tmp_path):
+        """Last full's window_stamp matches current → already consolidated."""
+        from paramem.server.app import _is_full_cycle_due
+        from paramem.server.interim_adapter import current_full_consolidation_stamp
+
+        period = "every 84h"
+        current_stamp = current_full_consolidation_stamp(period)
+        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp=current_stamp)
+        cfg = self._make_config(period, tmp_path)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_is_full_cycle_due_different_window_returns_true(self, tmp_path):
+        """Last full's window_stamp differs from current → due."""
+        from paramem.server.app import _is_full_cycle_due
+
+        # A stamp from a clearly prior window — distant past.
+        self._write_meta(tmp_path / "episodic" / "20260420-000000", window_stamp="20260101T0000")
+        cfg = self._make_config("every 84h", tmp_path)
+        assert _is_full_cycle_due(cfg) is True

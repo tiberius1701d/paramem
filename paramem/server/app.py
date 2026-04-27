@@ -5376,12 +5376,92 @@ def _consolidation_done_callback(future):
         logger.exception("Consolidation failed: %s", exc)
 
 
-def _maybe_trigger_scheduled_consolidation() -> str:
-    """Gate + dispatch the scheduled extract + BG-train run.
+def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":
+    """Return the window_stamp recorded on the most recent main episodic slot.
 
-    Returns a short status string. GPU-busy states return 'deferred_*' so the
-    caller can distinguish a missed-but-rescheduled tick from a true no-op.
-    The systemd timer will fire again on its next wall-clock tick and retry.
+    The canonical main ``episodic`` adapter is only written by full
+    consolidation paths (``_save_adapters`` and
+    ``consolidate_interim_adapters``); both stamp ``window_stamp`` with the
+    full-consolidation cadence boundary that was active at save time. So the
+    lex-max slot's ``meta.json.window_stamp`` is the canonical record of
+    "which window did the last full cycle consolidate?"
+
+    Returns ``None`` when:
+      * There is no main episodic slot yet (fresh install).
+      * ``meta.json`` is missing or unreadable.
+      * The recorded ``window_stamp`` is empty (legacy v1 manifest, or a
+        synthesized fallback that did not know its window).
+
+    Callers treat ``None`` as "unknown — first full cycle is due" so fresh
+    installs and post-migration states bootstrap correctly.
+    """
+    episodic_dir = adapter_dir / "episodic"
+    if not episodic_dir.is_dir():
+        return None
+    slots = sorted(d for d in episodic_dir.iterdir() if d.is_dir() and not d.name.startswith("."))
+    if not slots:
+        return None
+    meta_path = slots[-1] / "meta.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+        ws = meta.get("window_stamp", "")
+        return ws if ws else None
+    except Exception:
+        return None
+
+
+def _is_full_cycle_due(config) -> bool:
+    """Window-stamp gate: has the current full-consolidation window already
+    been consolidated?
+
+    Compares two stamps produced by the same flooring primitive
+    (``current_full_consolidation_stamp``):
+      * ``current``: ``floor(now, full_cycle_period)``.
+      * ``last``: the ``window_stamp`` recorded on the lex-max main
+        ``episodic/<ts>/meta.json`` at save time.
+
+    Identity check — no wall-clock-elapsed math, no derived-at-read flooring.
+    Two ticks inside the same window agree on ``current`` so re-firing is
+    idempotent. The first tick of a new window returns ``current != last``
+    and dispatches the full cycle.
+
+    Returns ``False`` when ``refresh_cadence`` is disabled (period string is
+    empty → manual-only operation).
+    """
+    from paramem.server.interim_adapter import current_full_consolidation_stamp
+
+    period = config.consolidation.consolidation_period_string
+    if not period:
+        return False
+    current = current_full_consolidation_stamp(period)
+    if not current:
+        return False
+    last = _last_full_consolidation_window(config.adapter_dir)
+    if last is None:
+        return True
+    return current != last
+
+
+def _maybe_trigger_scheduled_consolidation() -> str:
+    """Gate + dispatch the scheduled tick.
+
+    Two production routes share this entry:
+
+    1. **Full cycle** (every ``refresh_cadence × max_interim_count``): collapse
+       all ``episodic_interim_*`` slots into the main episodic / semantic /
+       procedural adapters via ``loop.consolidate_interim_adapters``. Re-saves
+       main slot manifests in lockstep with the latest registry, restoring
+       boot-time mount-ability that interim cycles otherwise drift away from.
+    2. **Interim cycle** (every other tick): extract any pending sessions and
+       train them into ``episodic_interim_<stamp>`` via
+       ``_extract_and_start_training``. Main adapters are not touched.
+
+    Returns a short status string. GPU-busy states return ``deferred_*`` so
+    the caller can distinguish a missed-but-rescheduled tick from a true
+    no-op. The systemd timer fires again on its next wall-clock tick and
+    retries.
     """
     if _state["consolidating"]:
         logger.info("Scheduler tick: consolidation already running — deferred")
@@ -5398,12 +5478,25 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         logger.info("Scheduler tick: background training active — deferred")
         return "deferred_bg_training"
 
+    config = _state["config"]
     buffer = _state["session_buffer"]
 
     # Retroactive voice-match claim: scan orphan sessions against every
     # enrolled speaker. Attributes sessions whose embeddings match an
     # existing profile at high confidence. Cheap — centroids are cached.
     _retro_claim_orphan_sessions()
+
+    # Full-cycle gate: when the period has elapsed, route to full
+    # consolidation regardless of whether sessions are pending. Pending
+    # sessions wait one tick (~refresh_cadence) for their interim write —
+    # acceptable given the period is much longer than the cadence.
+    if _is_full_cycle_due(config):
+        logger.info("Scheduler tick: full cycle due — running consolidate_interim_adapters")
+        _state["consolidating"] = True
+        event_loop = asyncio.get_running_loop()
+        future = event_loop.run_in_executor(None, _run_full_consolidation_sync)
+        future.add_done_callback(_scheduled_extract_done_callback)
+        return "started_full"
 
     pending = buffer.get_pending()
     if not pending:
@@ -5752,6 +5845,132 @@ def _extract_and_start_training():
         "Extraction done — interim-training job submitted to BG trainer (%d sessions)",
         len(session_ids),
     )
+
+
+def _run_full_consolidation_sync() -> None:
+    """Submit a full-cycle consolidation: collapse interims into main.
+
+    Runs ``loop.consolidate_interim_adapters`` on the BG trainer so the GPU
+    lock is held for the entire per-tier rebuild (the helper's docstring
+    requires this — calling without the lock raises). The function deletes
+    each main adapter, recreates it, trains on the cumulative keyed-pair
+    set derived from every interim slot's keys, and on success unloads the
+    interim adapters and reloads the router. On a failed recall-sanity
+    check it rolls back to the snapshot and aborts that tier.
+
+    After a successful merge the main adapter manifests are stamped with
+    the current registry hash, restoring boot-time mount-ability that
+    interim cycles otherwise drift away from.
+    """
+    from paramem.server.background_trainer import BackgroundTrainer
+    from paramem.server.consolidation import (
+        _save_key_metadata,
+        create_consolidation_loop,
+    )
+
+    config = _state["config"]
+    session_buffer = _state.get("session_buffer")
+
+    loop = _state.get("consolidation_loop")
+    if loop is None:
+        loop = create_consolidation_loop(
+            _state["model"],
+            _state["tokenizer"],
+            config,
+            state_provider=lambda: _state,
+        )
+        _state["consolidation_loop"] = loop
+        _state["model"] = loop.model
+
+    bt = BackgroundTrainer(
+        model=_state["model"],
+        tokenizer=_state["tokenizer"],
+        training_config=config.training_config,
+        output_dir=config.adapter_dir,
+        temp_limit=config.consolidation.training_temp_limit,
+        temp_check_interval=config.consolidation.training_temp_check_interval,
+        quiet_hours_mode=config.consolidation.quiet_hours_mode,
+        quiet_hours_start=config.consolidation.quiet_hours_start,
+        quiet_hours_end=config.consolidation.quiet_hours_end,
+    )
+    _state["background_trainer"] = bt
+
+    def _run_full_cycle() -> None:
+        """Run on the BG trainer worker thread under the GPU lock."""
+        try:
+            result = loop.consolidate_interim_adapters(
+                trainer=bt,
+                router=_state.get("router"),
+            )
+        except Exception:
+            logger.exception("Full consolidation failed")
+            _state["last_consolidation_result"] = {"status": "error"}
+            _state["consolidating"] = False
+            return
+
+        # Pick up any PeftModel wrapper rebinding done by the per-tier
+        # delete_adapter / create_adapter cycles inside consolidate_interim_adapters.
+        _state["model"] = loop.model
+
+        logger.info(
+            "Full cycle complete — tiers_rebuilt=%s, drift=%d, rolled_back=%s",
+            result.get("tiers_rebuilt"),
+            result.get("graph_drift_count", 0),
+            result.get("rolled_back"),
+        )
+
+        # Persist the rebuilt main slots to disk via the I5 atomic save path.
+        # consolidate_interim_adapters rebuilt tiers in PEFT memory + rewrote
+        # the registry but does not itself write new main slot dirs. Without
+        # this call, the on-disk main meta.json files stay frozen at their
+        # pre-rebuild content (no fresh window_stamp, registry_sha256 still
+        # stale), the gate stays "due" forever, and main slots remain skip-
+        # mounted on next restart. _save_adapters re-writes adapter weights
+        # + manifest (with the current full-consolidation window_stamp via
+        # loop.full_consolidation_period_string) + simhash + registry-last,
+        # restoring boot-time mount-ability.
+        try:
+            loop._save_adapters()
+        except Exception:
+            logger.exception("Full-cycle main-slot persistence failed — main on-disk state stale")
+
+        # Persist key metadata and mark any pending sessions consolidated —
+        # the merge folded their facts into main, so they should not be
+        # re-extracted on the next tick.
+        try:
+            _save_key_metadata(loop, config)
+            if session_buffer is not None:
+                pending_ids = [s["session_id"] for s in session_buffer.get_pending()]
+                if pending_ids:
+                    session_buffer.mark_consolidated(pending_ids)
+        except Exception:
+            logger.exception("Post-full-cycle bookkeeping failed (non-fatal)")
+
+        def _finalize_full() -> None:
+            loop.model.eval()
+            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+            _state["router"].reload()
+            total_keys = (
+                len(loop.indexed_key_registry) if loop.indexed_key_registry is not None else 0
+            )
+            _state["last_consolidation_result"] = {
+                "status": "rolled_back" if result.get("rolled_back") else "full_trained",
+                "tiers_rebuilt": result.get("tiers_rebuilt", []),
+                "rollback_tier": result.get("rollback_tier"),
+                "graph_drift_count": result.get("graph_drift_count", 0),
+                "total_keys": total_keys,
+            }
+            _state["consolidating"] = False
+            logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
+
+        aio_loop = _state.get("event_loop")
+        if aio_loop is not None and aio_loop.is_running():
+            aio_loop.call_soon_threadsafe(_finalize_full)
+        else:
+            _finalize_full()
+
+    bt.submit(_run_full_cycle, inference_fallback_adapter="episodic")
+    logger.info("Full consolidation submitted to BG trainer")
 
 
 # --- Speaker enrollment (utterance-driven) ---

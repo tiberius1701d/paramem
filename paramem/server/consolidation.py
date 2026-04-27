@@ -79,16 +79,29 @@ def create_consolidation_loop(
         if state is not None:
             loop.fingerprint_cache = state.setdefault("base_model_hash_cache", {})
 
+    # Wire the full-consolidation period string so _save_adapters can stamp
+    # main slots with the current full-cycle window. Empty string in
+    # experiment paths (state_provider=None) → window_stamp="" → Phase 4
+    # gate treats those slots as unknown-window and forces a first full
+    # cycle on adoption.
+    loop.full_consolidation_period_string = config.consolidation.consolidation_period_string
+
     # Seed key metadata from disk (survives restarts)
     metadata = _load_key_metadata(config.key_metadata_path)
     if metadata:
         loop.seed_key_metadata(metadata)
 
-    # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.
-    # Required by simulate mode so cold-start recall reads the full set;
-    # harmless for train mode (train reconstructs from weights and overwrites).
-    # Transparently decrypts age-wrapped content when the daily identity is loaded.
-    ep_kp_path = config.adapter_dir / "keyed_pairs.json"
+    # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.  This
+    # populates the loop's in-memory QA store across restarts so
+    # consolidate_interim_adapters has the question/answer text it needs to
+    # re-derive each active key's tier from the cumulative graph.  Without
+    # the seed, a full cycle that runs before any in-process training has
+    # populated indexed_key_qa would log "no QA metadata for key X" for
+    # every active key and skip every per-tier rebuild — observably the
+    # gate fires forever because the rebuild never advances main slots'
+    # window_stamp.  Transparently decrypts age-wrapped content when the
+    # daily identity is loaded.
+    ep_kp_path = config.adapter_dir / "episodic" / "keyed_pairs.json"
     if ep_kp_path.exists():
         loop.seed_episodic_qa(json.loads(read_maybe_encrypted(ep_kp_path).decode("utf-8")))
 
@@ -99,6 +112,25 @@ def create_consolidation_loop(
     proc_kp_path = config.adapter_dir / "procedural" / "keyed_pairs.json"
     if proc_kp_path.exists():
         loop.seed_procedural_qa(json.loads(read_maybe_encrypted(proc_kp_path).decode("utf-8")))
+
+    # Interim slots also persist keyed_pairs.json (one per
+    # ``episodic_interim_<stamp>`` directory).  Seed those into the same
+    # episodic store so consolidate_interim_adapters can read them when
+    # rebuilding main on the full-cycle boundary.  seed_episodic_qa is
+    # additive — repeated calls accumulate keys rather than overwriting.
+    for interim_dir in sorted(config.adapter_dir.glob("episodic_interim_*")):
+        if not interim_dir.is_dir():
+            continue
+        kp = interim_dir / "keyed_pairs.json"
+        if not kp.exists():
+            continue
+        try:
+            loop.seed_episodic_qa(json.loads(read_maybe_encrypted(kp).decode("utf-8")))
+        except Exception:
+            logger.exception(
+                "Failed to seed indexed_key_qa from interim slot %s — skipping",
+                interim_dir.name,
+            )
 
     return loop
 
