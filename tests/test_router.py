@@ -641,7 +641,12 @@ class TestInterimAdapterRouting:
     """
 
     def test_route_groups_keys_by_adapter_directory(self):
-        """Entity in both episodic (main) and an interim adapter → two steps, main first."""
+        """Entity in both episodic (main) and an interim adapter → two steps, interim first.
+
+        Freshness-wins: a user correction lands in the newest interim slot ahead
+        of the next full-cycle merge into main, so probing interim before main
+        ensures the latest answer wins.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             _write_keyed_pairs(
                 Path(tmp),
@@ -659,12 +664,12 @@ class TestInterimAdapterRouting:
             names = [s.adapter_name for s in plan.steps]
             assert "episodic" in names, "main episodic step missing"
             assert "episodic_interim_20260417T0000" in names, "interim step missing"
-            assert names.index("episodic") < names.index("episodic_interim_20260417T0000"), (
-                "main must precede interim"
+            assert names.index("episodic_interim_20260417T0000") < names.index("episodic"), (
+                "interim must precede main (freshness wins)"
             )
 
     def test_route_interim_adapter_ordering(self):
-        """Multiple interim adapters: mains first, interims newest-first."""
+        """Multiple interim adapters: newest-first, all before main episodic."""
         with tempfile.TemporaryDirectory() as tmp:
             _write_keyed_pairs(
                 Path(tmp),
@@ -681,13 +686,16 @@ class TestInterimAdapterRouting:
             plan = router.route("Alice", speaker_id="alice")
 
             names = [s.adapter_name for s in plan.steps]
-            assert names[0] == "episodic", "episodic main must be first"
             interim_names = [n for n in names if n.startswith("episodic_interim_")]
             assert interim_names == [
                 "episodic_interim_20260417T0000",
                 "episodic_interim_20260416T0000",
                 "episodic_interim_20260415T0000",
             ], f"Expected newest-first, got {interim_names}"
+            # All interim slots must precede main episodic (freshness wins).
+            assert names.index(interim_names[-1]) < names.index("episodic"), (
+                f"Interim slots must precede main episodic, got {names}"
+            )
 
     def test_route_speaker_scoping_applies_to_interim_keys(self):
         """Interim key tagged with 'alice' is invisible to speaker_id='bob'."""
@@ -756,10 +764,12 @@ class TestInterimAdapterRouting:
             assert plan.match_source == "pa"
 
     def test_route_three_mains_correct_order(self):
-        """All three mains + one interim: order must be procedural, episodic, semantic, interim.
+        """All three mains + one interim: order must be procedural, interim, episodic, semantic.
 
-        CLAUDE.md inference assembly order: procedural (preferences) → episodic (recent)
-        → semantic (consolidated). Interim adapters follow all mains, newest-first.
+        Probe order: procedural (preferences shape style; load-bearing per
+        feedback_router_procedural_first.md) → interim newest-first (freshest
+        factual state) → main episodic (baseline factual snapshot) → semantic
+        (durable corroboration).
         """
         with tempfile.TemporaryDirectory() as tmp:
             for adapter in ("episodic", "semantic", "procedural"):
@@ -778,8 +788,39 @@ class TestInterimAdapterRouting:
 
             names = [s.adapter_name for s in plan.steps]
             assert names[0] == "procedural", f"First step must be procedural, got {names}"
-            assert names[1] == "episodic", f"Second step must be episodic, got {names}"
-            assert names[2] == "semantic", f"Third step must be semantic, got {names}"
-            assert names[3] == "episodic_interim_20260418T0000", (
-                f"Fourth step must be the interim adapter, got {names}"
+            assert names[1] == "episodic_interim_20260418T0000", (
+                f"Second step must be the interim adapter, got {names}"
+            )
+            assert names[2] == "episodic", f"Third step must be episodic, got {names}"
+            assert names[3] == "semantic", f"Fourth step must be semantic, got {names}"
+
+    def test_route_freshness_wins_interim_before_main_for_same_key(self):
+        """A key registered to BOTH interim and main is probed in interim first.
+
+        This is the load-bearing freshness-wins guarantee: a user contradiction
+        (move, rename, change of mind) lands in the newest interim slot before
+        the next full-cycle merge collapses it into main. If the router probed
+        main first, it would return the stale pre-update answer.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            # Both adapters claim to know about Alice — main says Berlin, interim
+            # says Prague. Same entity name → same key resolution path.
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("alice_loc", "Alice", "Berlin", speaker_id="alice")],
+                subdir="episodic",
+            )
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("alice_loc", "Alice", "Prague", speaker_id="alice")],
+                subdir="episodic_interim_20260418T0000",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            plan = router.route("Alice", speaker_id="alice")
+
+            names = [s.adapter_name for s in plan.steps]
+            assert "episodic_interim_20260418T0000" in names
+            assert "episodic" in names
+            assert names.index("episodic_interim_20260418T0000") < names.index("episodic"), (
+                f"Interim must be probed before main for the same key (freshness wins), got {names}"
             )

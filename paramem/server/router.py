@@ -371,40 +371,46 @@ class QueryRouter:
         if has_pa:
             adapter_keys = self._resolve_keys(pa_entities, allowed_keys)
 
-            # 1. Main adapters in CLAUDE.md inference assembly order:
-            #    procedural (preferences) → episodic (recent) → semantic (consolidated).
-            #    Procedural-first is load-bearing: behavioral preferences must surface
-            #    before any episodic/semantic context for the PA to feel personalized.
-            #    See feedback_router_procedural_first.md.
-            _MAIN_ORDER = ["procedural", "episodic", "semantic"]
-            for adapter_name in _MAIN_ORDER:
-                if adapter_name in adapter_keys:
-                    keys = list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY]
+            # Probe order: procedural → interim newest-first → episodic → semantic → others.
+            #
+            # 1. procedural first preserves the load-bearing "preferences shape style"
+            #    rule (feedback_router_procedural_first.md): behavioral preferences must
+            #    surface before any factual context for the PA to feel personalized.
+            # 2. interim adapters next because they hold the freshest factual state —
+            #    a user correction (move, rename, change of mind) lands in the newest
+            #    episodic_interim_<stamp> slot ahead of the next full-cycle merge into
+            #    main. Probing interim before main ensures the latest answer wins
+            #    instead of returning the stale pre-merge baseline.
+            # 3. main episodic: baseline factual snapshot from the last full cycle.
+            # 4. semantic: durable but most lossy/abstract — corroboration fallback.
+            # 5. others: forward-compat for adapter forms not yet enumerated.
+            interim_names_sorted = sorted(
+                (n for n in adapter_keys if _interim_sort_key(n) is not None),
+                key=lambda n: _interim_sort_key(n) or "",
+                reverse=True,
+            )
+
+            placed: set[str] = set()
+            ordered: list[str] = [
+                "procedural",
+                *interim_names_sorted,
+                "episodic",
+                "semantic",
+            ]
+            for adapter_name in ordered:
+                if adapter_name in adapter_keys and adapter_name not in placed:
                     steps.append(
                         RoutingStep(
                             adapter_name=adapter_name,
-                            keys_to_probe=keys,
+                            keys_to_probe=list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY],
                         )
                     )
+                    placed.add(adapter_name)
 
-            # 2. Interim adapters (episodic_interim_YYYYMMDDTHHMM) newest-first, then
-            #    any other non-main adapters in arbitrary order.  Separating the two
-            #    groups ensures the stamp-descending sort only touches interim names.
-            known = set(_MAIN_ORDER)
-            interims: list[tuple[str, set[str]]] = []
-            others: list[tuple[str, set[str]]] = []
+            # Forward-compat: any adapter name we haven't placed (unknown future forms).
             for adapter_name, keys in adapter_keys.items():
-                if adapter_name not in known:
-                    if _interim_sort_key(adapter_name) is not None:
-                        interims.append((adapter_name, keys))
-                    else:
-                        others.append((adapter_name, keys))
-
-            # Newest stamp first — YYYYMMDDTHHMM sorts lexicographically so
-            # descending string order gives the most recently created interim first.
-            interims.sort(key=lambda item: _interim_sort_key(item[0]) or "", reverse=True)
-
-            for adapter_name, keys in interims + others:
+                if adapter_name in placed:
+                    continue
                 steps.append(
                     RoutingStep(
                         adapter_name=adapter_name,
