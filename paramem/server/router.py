@@ -28,6 +28,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -42,6 +43,30 @@ logger = logging.getLogger(__name__)
 FUZZY_THRESHOLD = 80
 # Maximum keys to probe per query (bounds latency)
 MAX_KEYS_PER_QUERY = 10
+
+
+class Intent(str, Enum):
+    """Single explicit routing axis for queries.
+
+    Populated on :class:`RoutingPlan` by future commits; today this enum
+    exists so consumers can start preparing to read it.  Default on
+    :class:`RoutingPlan` is :attr:`UNKNOWN` — the field is informational
+    until the residual classifier is wired in.
+
+    * ``PERSONAL`` — query references the speaker's life or graph; never
+      escalates to cloud.
+    * ``COMMAND`` — imperative or device query; routed to the HA agent.
+    * ``GENERAL`` — general knowledge / real-time data; full
+      PA→HA→SOTA→base-model escalation chain available.
+    * ``UNKNOWN`` — classifier unavailable or ambiguous; treated
+      conservatively by callers (typically same as ``GENERAL`` with an
+      explicit log).
+    """
+
+    PERSONAL = "personal"
+    COMMAND = "command"
+    GENERAL = "general"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -65,6 +90,10 @@ class RoutingPlan:
     imperative: bool = False
     # HA domains of matched entities/verbs
     ha_domains: list[str] = field(default_factory=list)
+    # Single explicit routing axis.  Default UNKNOWN until populated by
+    # the residual-classifier work; consumers that read this should
+    # treat UNKNOWN as conservative (same as GENERAL).
+    intent: Intent = Intent.UNKNOWN
 
 
 _INTERIM_PREFIX = "episodic_interim_"

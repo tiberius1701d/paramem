@@ -154,6 +154,15 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "abstention.cold_start_response_file": Tier.OPERATIONAL,
     "abstention.response_override": Tier.PIPELINE_ALTERING,
     "abstention.cold_start_response_override": Tier.PIPELINE_ALTERING,
+    # --- intent (residual classifier) ---
+    "intent.enabled": Tier.PIPELINE_ALTERING,
+    "intent.encoder_model": Tier.PIPELINE_ALTERING,
+    "intent.encoder_device": Tier.OPERATIONAL,
+    "intent.encoder_dtype": Tier.OPERATIONAL,
+    "intent.encoder_query_prefix": Tier.PIPELINE_ALTERING,
+    "intent.exemplars_dir": Tier.PIPELINE_ALTERING,
+    "intent.confidence_margin": Tier.PIPELINE_ALTERING,
+    "intent.fail_closed_intent": Tier.PIPELINE_ALTERING,
     # --- voice ---
     "voice.prompt_file": Tier.OPERATIONAL,
     "voice.greeting_interval_hours": Tier.OPERATIONAL,

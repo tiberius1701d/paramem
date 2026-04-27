@@ -384,6 +384,43 @@ class AbstentionConfig:
 
 
 @dataclass
+class IntentConfig:
+    """Residual intent classifier — config surface only at this commit.
+
+    The classifier itself is not wired in yet; this dataclass establishes
+    the YAML contract so the encoder + exemplar work in subsequent
+    commits has a place to plug in without further config churn.
+
+    Defaults reflect the locked design:
+
+    * Encoder: ``intfloat/multilingual-e5-small`` (MIT, 118M params,
+      384-dim multilingual sentence encoder).
+    * Device: ``auto`` — prefer cuda when available, fall back to cpu.
+    * Dtype: ``float16`` on cuda, ``float32`` on cpu.
+    * E5 family requires the literal ``"query: "`` prefix on inputs.
+    * Exemplar files live under ``configs/intents/`` as
+      ``<class>.<lang>.txt`` (one query per line).
+    * Confidence is the margin between the top-1 and top-2 cosine
+      similarity scores against the exemplar set; below threshold
+      classification falls back to ``fail_closed_intent``.
+    * ``fail_closed_intent: personal`` keeps privacy-preserving defaults
+      under uncertainty — a misclassified personal query never escalates.
+
+    All fields can be overridden in ``configs/server.yaml`` so operators
+    can swap encoders, exemplar sets, thresholds without code changes.
+    """
+
+    enabled: bool = True
+    encoder_model: str = "intfloat/multilingual-e5-small"
+    encoder_device: str = "auto"  # auto | cuda | cpu
+    encoder_dtype: str = "float16"  # float16 | float32
+    encoder_query_prefix: str = "query: "  # E5 family requires this; empty for others
+    exemplars_dir: str = "configs/intents"
+    confidence_margin: float = 0.05
+    fail_closed_intent: str = "personal"  # personal | command | general | unknown
+
+
+@dataclass
 class VoiceConfig:
     prompt_file: str = "configs/prompts/ha_voice.txt"
     system_prompt: str = ""
@@ -717,6 +754,7 @@ class ServerConfig:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
     abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
+    intent: IntentConfig = field(default_factory=IntentConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
@@ -937,6 +975,11 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     abstention_raw = raw.get("abstention", {})
     if abstention_raw:
         config.abstention = AbstentionConfig(**abstention_raw)
+
+    # Intent classifier (residual classifier for routing decisions)
+    intent_raw = raw.get("intent", {})
+    if intent_raw:
+        config.intent = IntentConfig(**intent_raw)
 
     voice_raw = raw.get("voice", {})
     if voice_raw:

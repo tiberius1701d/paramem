@@ -327,6 +327,23 @@ abstention:
   # response_override: "..."             # uncomment to pin inline
   # cold_start_response_override: "..."  # uncomment to pin inline
 
+# Intent classifier — residual classifier for routing decisions.  State
+# signals (graph match, HA match) decide cleanly when present; the
+# encoder-backed cosine router resolves the residual.  Every knob is an
+# operator-tunable: encoder model, device, exemplars directory,
+# confidence threshold, and the fail-closed default intent.  Whatever
+# encoder/dataset is best today may be outdated tomorrow — operators
+# can swap without code changes.
+intent:
+  enabled: true
+  encoder_model: intfloat/multilingual-e5-small  # any sentence-transformers-compatible HF model
+  encoder_device: auto                            # auto | cuda | cpu
+  encoder_dtype: float16                          # float16 | float32
+  encoder_query_prefix: "query: "                 # E5 family requires this; empty for other models
+  exemplars_dir: configs/intents
+  confidence_margin: 0.05                         # min top1-top2 margin; below → fail_closed_intent
+  fail_closed_intent: personal                    # privacy-preserving default on uncertainty
+
 voice:
   prompt_file: configs/prompts/ha_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)
