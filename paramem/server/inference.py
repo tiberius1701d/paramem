@@ -202,57 +202,144 @@ def handle_chat(
     4. HA match (non-imperative) → HA agent (device query)
     5. No match → HA first (tools, real-time data), SOTA fallback (reasoning)
     6. All cloud failed → local base model
+
+    When ``config.debug`` is True a per-request routing-decision diagnostic
+    is emitted via ``logging.info(extra={"routing": …})`` at function exit.
+    The dict captures which paths were attempted, which one returned, and
+    whether the request was a "residual" (no graph match, no HA match) —
+    the metric the residual classifier work is gated on.  Off when
+    ``config.debug`` is False to keep production logs lean.
     """
-    model.gradient_checkpointing_disable()
+    routing_diags: dict = {
+        "conversation_id": conversation_id,
+        "match_source": "none",
+        "imperative": False,
+        "paths_attempted": [],
+        "fallthrough_reason": None,
+        "exit_via": None,
+        "is_residual": False,
+    }
+    try:
+        model.gradient_checkpointing_disable()
 
-    plan = None
-    allowed_keys = None
-    if speaker_id and router is not None:
-        allowed_keys = router._speaker_key_index.get(speaker_id, set())
+        plan = None
+        allowed_keys = None
+        if speaker_id and router is not None:
+            allowed_keys = router._speaker_key_index.get(speaker_id, set())
 
-    # Path 1: Temporal query — filter keys by date range
-    date_range = detect_temporal_query(text)
-    if date_range:
-        start_date, end_date = date_range
-        logger.info("Temporal query detected: %s to %s", start_date, end_date)
-        temporal_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
-        if allowed_keys is not None:
-            temporal_keys = [k for k in temporal_keys if k in allowed_keys]
-        if temporal_keys:
-            plan = RoutingPlan(
-                steps=[RoutingStep(adapter_name="episodic", keys_to_probe=temporal_keys)],
-                strategy="temporal",
-                match_source="pa",
+        # Path 1: Temporal query — filter keys by date range
+        date_range = detect_temporal_query(text)
+        if date_range:
+            start_date, end_date = date_range
+            logger.info("Temporal query detected: %s to %s", start_date, end_date)
+            temporal_keys = filter_registry_by_date(config.registry_path, start_date, end_date)
+            if allowed_keys is not None:
+                temporal_keys = [k for k in temporal_keys if k in allowed_keys]
+            if temporal_keys:
+                plan = RoutingPlan(
+                    steps=[RoutingStep(adapter_name="episodic", keys_to_probe=temporal_keys)],
+                    strategy="temporal",
+                    match_source="pa",
+                )
+                routing_diags["paths_attempted"].append("temporal")
+                logger.info("Found %d keys for date range", len(temporal_keys))
+
+        # Path 2: Dual-graph entity routing
+        if plan is None and router is not None:
+            plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
+        if plan is not None:
+            routing_diags["match_source"] = plan.match_source
+            routing_diags["imperative"] = plan.imperative
+
+        # Pre-compute sanitization once for all cloud escalation paths.
+        # Personal-content detection is anchored on the router's entity index
+        # (the graph's ground truth) plus a first-person token-set + the
+        # resolved speaker_id — the same ground truth the extraction-path
+        # anonymizer uses, no static keyword list.
+        if known_entities is None and router is not None and hasattr(router, "_all_entities"):
+            known_entities = router._all_entities
+        sanitized_text, sanitization_findings = sanitize_for_cloud(
+            text,
+            mode=config.sanitization.mode,
+            speaker_id=speaker_id,
+            known_entities=known_entities,
+        )
+
+        # Path 2a: Imperative + HA entity → HA agent directly (action command)
+        if plan and plan.imperative and plan.match_source in ("ha", "both"):
+            routing_diags["paths_attempted"].append("2a")
+            logger.info("Imperative HA command: domains=%s", plan.ha_domains)
+            if sanitized_text is not None:
+                result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
+                if result is not None:
+                    routing_diags["exit_via"] = "2a_ha"
+                    return result
+                # Only fall to SOTA when there is no PA match to probe in path 2b
+                if sota_agent is not None and plan.match_source == "ha":
+                    routing_diags["exit_via"] = "2a_sota"
+                    return _escalate_to_sota(
+                        sanitized_text,
+                        sota_agent,
+                        config,
+                        speaker=speaker,
+                        history=history,
+                        language=language,
+                    )
+            else:
+                routing_diags["fallthrough_reason"] = "sanitizer_blocked_2a"
+                logger.info("Sanitizer blocked imperative HA command: %s", sanitization_findings)
+
+        # Path 2b: PA match → probe adapters and reason locally
+        if plan and plan.steps and plan.match_source in ("pa", "both"):
+            routing_diags["paths_attempted"].append("2b")
+            routing_diags["exit_via"] = "2b_pa_probe"
+            return _probe_and_reason(
+                text,
+                plan,
+                history,
+                model,
+                tokenizer,
+                config,
+                sota_agent=sota_agent,
+                ha_client=ha_client,
+                speaker=speaker,
+                language=language,
             )
-            logger.info("Found %d keys for date range", len(temporal_keys))
 
-    # Path 2: Dual-graph entity routing
-    if plan is None and router is not None:
-        plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
+        # Path 2c: HA-only match (non-imperative) → HA agent
+        if plan and plan.match_source == "ha":
+            routing_diags["paths_attempted"].append("2c")
+            logger.info("HA entity query (non-imperative): domains=%s", plan.ha_domains)
+            if sanitized_text is not None:
+                result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
+                if result is not None:
+                    routing_diags["exit_via"] = "2c_ha"
+                    return result
+                if sota_agent is not None:
+                    routing_diags["exit_via"] = "2c_sota"
+                    return _escalate_to_sota(
+                        sanitized_text,
+                        sota_agent,
+                        config,
+                        speaker=speaker,
+                        history=history,
+                        language=language,
+                    )
+            else:
+                routing_diags["fallthrough_reason"] = "sanitizer_blocked_2c"
+                logger.info("Sanitizer blocked HA query: %s", sanitization_findings)
 
-    # Pre-compute sanitization once for all cloud escalation paths.
-    # Personal-content detection is anchored on the router's entity index
-    # (the graph's ground truth) plus a first-person token-set + the
-    # resolved speaker_id — the same ground truth the extraction-path
-    # anonymizer uses, no static keyword list.
-    if known_entities is None and router is not None and hasattr(router, "_all_entities"):
-        known_entities = router._all_entities
-    sanitized_text, sanitization_findings = sanitize_for_cloud(
-        text,
-        mode=config.sanitization.mode,
-        speaker_id=speaker_id,
-        known_entities=known_entities,
-    )
-
-    # Path 2a: Imperative + HA entity → HA agent directly (action command)
-    if plan and plan.imperative and plan.match_source in ("ha", "both"):
-        logger.info("Imperative HA command: domains=%s", plan.ha_domains)
+        # Path 3: No match → HA first (has tools for real-time data), SOTA fallback
         if sanitized_text is not None:
+            routing_diags["paths_attempted"].append("3")
+            logger.info("No graph match, trying HA agent (tools)")
             result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
             if result is not None:
+                routing_diags["exit_via"] = "3_ha"
                 return result
-            # Only fall to SOTA when there is no PA match to probe in path 2b
-            if sota_agent is not None and plan.match_source == "ha":
+            if sota_agent is not None:
+                routing_diags["exit_via"] = "3_sota"
+                logger.info("HA failed, routing to SOTA agent")
                 return _escalate_to_sota(
                     sanitized_text,
                     sota_agent,
@@ -262,13 +349,54 @@ def handle_chat(
                     language=language,
                 )
         else:
-            logger.info("Sanitizer blocked imperative HA command: %s", sanitization_findings)
+            routing_diags["fallthrough_reason"] = "sanitizer_blocked_3"
+            logger.info("Sanitizer blocked query: %s", sanitization_findings)
 
-    # Path 2b: PA match → probe adapters and reason locally
-    if plan and plan.steps and plan.match_source in ("pa", "both"):
-        return _probe_and_reason(
+        # Abstention: self-referential query with no local match → canned response.
+        # The bare base model would otherwise confabulate personal data here
+        # (e.g. "Where do I live?" → "New York City" on an untrained adapter).
+        # Personal-claim / possessive findings in *statements* (introductions,
+        # fact-sharing) are not a confabulation risk — the user is the source of
+        # the facts in the same turn — so they fall through to the base model
+        # for conversational acknowledgement.
+        #
+        # Two response variants distinguish the two states:
+        #
+        # * Cold start — speaker is identified but the router has no keys for
+        #   them yet (typical between enrollment and the next consolidation).
+        #   The canned "I don't have that information stored yet" reads as
+        #   confused in that state because the system *can't* have facts about
+        #   a freshly enrolled speaker. Use ``cold_start_response`` instead.
+        # * Coverage gap — speaker has parametric facts but this query missed.
+        #   The standard ``response`` is appropriate.
+        if (
+            sanitized_text is None
+            and config.abstention.enabled
+            and "self_referential" in sanitization_findings
+        ):
+            is_cold_start = bool(speaker_id) and (
+                router is None or not router._speaker_key_index.get(speaker_id)
+            )
+            response_text = (
+                config.abstention.load_cold_start_response()
+                if is_cold_start
+                else config.abstention.load_response()
+            )
+            routing_diags["paths_attempted"].append("abstention")
+            routing_diags["exit_via"] = (
+                "abstention_cold_start" if is_cold_start else "abstention_canned"
+            )
+            logger.info(
+                "Abstention: self-referential query + no local match (cold_start=%s)",
+                is_cold_start,
+            )
+            return ChatResult(text=response_text)
+
+        # All cloud services failed — local base model as last resort
+        routing_diags["paths_attempted"].append("base")
+        routing_diags["exit_via"] = "base_model"
+        return _base_model_answer(
             text,
-            plan,
             history,
             model,
             tokenizer,
@@ -278,93 +406,10 @@ def handle_chat(
             speaker=speaker,
             language=language,
         )
-
-    # Path 2c: HA-only match (non-imperative) → HA agent
-    if plan and plan.match_source == "ha":
-        logger.info("HA entity query (non-imperative): domains=%s", plan.ha_domains)
-        if sanitized_text is not None:
-            result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
-            if result is not None:
-                return result
-            if sota_agent is not None:
-                return _escalate_to_sota(
-                    sanitized_text,
-                    sota_agent,
-                    config,
-                    speaker=speaker,
-                    history=history,
-                    language=language,
-                )
-        else:
-            logger.info("Sanitizer blocked HA query: %s", sanitization_findings)
-
-    # Path 3: No match → HA first (has tools for real-time data), SOTA fallback
-    if sanitized_text is not None:
-        logger.info("No graph match, trying HA agent (tools)")
-        result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
-        if result is not None:
-            return result
-        if sota_agent is not None:
-            logger.info("HA failed, routing to SOTA agent")
-            return _escalate_to_sota(
-                sanitized_text,
-                sota_agent,
-                config,
-                speaker=speaker,
-                history=history,
-                language=language,
-            )
-    else:
-        logger.info("Sanitizer blocked query: %s", sanitization_findings)
-
-    # Abstention: self-referential query with no local match → canned response.
-    # The bare base model would otherwise confabulate personal data here
-    # (e.g. "Where do I live?" → "New York City" on an untrained adapter).
-    # Personal-claim / possessive findings in *statements* (introductions,
-    # fact-sharing) are not a confabulation risk — the user is the source of
-    # the facts in the same turn — so they fall through to the base model
-    # for conversational acknowledgement.
-    #
-    # Two response variants distinguish the two states:
-    #
-    # * Cold start — speaker is identified but the router has no keys for
-    #   them yet (typical between enrollment and the next consolidation).
-    #   The canned "I don't have that information stored yet" reads as
-    #   confused in that state because the system *can't* have facts about
-    #   a freshly enrolled speaker. Use ``cold_start_response`` instead.
-    # * Coverage gap — speaker has parametric facts but this query missed.
-    #   The standard ``response`` is appropriate.
-    if (
-        sanitized_text is None
-        and config.abstention.enabled
-        and "self_referential" in sanitization_findings
-    ):
-        is_cold_start = bool(speaker_id) and (
-            router is None or not router._speaker_key_index.get(speaker_id)
-        )
-        response_text = (
-            config.abstention.load_cold_start_response()
-            if is_cold_start
-            else config.abstention.load_response()
-        )
-        logger.info(
-            "Abstention: self-referential query + no local match (cold_start=%s)",
-            is_cold_start,
-        )
-        return ChatResult(text=response_text)
-
-    # All cloud services failed — local base model as last resort
-    return _base_model_answer(
-        text,
-        history,
-        model,
-        tokenizer,
-        config,
-        sota_agent=sota_agent,
-        ha_client=ha_client,
-        speaker=speaker,
-        language=language,
-    )
+    finally:
+        if getattr(config, "debug", False):
+            routing_diags["is_residual"] = routing_diags["match_source"] == "none"
+            logger.info("routing decision", extra={"routing": routing_diags})
 
 
 def _escalate_to_ha_agent(
