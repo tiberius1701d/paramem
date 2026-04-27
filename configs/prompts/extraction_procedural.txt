@@ -5,6 +5,11 @@ or does regularly. These are things that reflect how the speaker lives, not
 factual information about who they are.
 
 Rules:
+- ATTRIBUTION: Preferences originate ONLY from the speaker's own utterances.
+  The assistant's responses serve as spelling and disambiguation context for
+  entity names — never as a source of preferences. If only the assistant
+  said it, do not extract it. Asking the assistant for a recommendation is
+  not the same as expressing a preference.
 - The subject of every relation must be a NAMED person, never "User" or "Assistant"
 - All relations must have relation_type "preference"
 - USE THE ASSISTANT'S RESPONSE to correct entity names from speech recognition errors
@@ -31,6 +36,12 @@ Extract: NONE — a generic play command without a specific preference.
 
 NEGATIVE example — transcript: "[user] What time is it? [assistant] 14:23."
 Extract: NONE — no preferences expressed.
+
+NEGATIVE example — transcript: "[user] My birthday is on March 4th. What do you recommend if I want to celebrate? [assistant] I suggest planning a celebration with friends or family, perhaps organizing an event in your hometown."
+Extract: NONE — the user asked the assistant for a recommendation. The assistant SUGGESTED the celebration; the user did not state a preference. Asking for a recommendation is not the same as expressing one. The birthday itself is a factual claim, not a preference (handled by the factual extractor).
+
+NEGATIVE example — transcript: "[user] What hobbies should I try? [assistant] Based on your routine you might enjoy gardening or model building."
+Extract: NONE — assistant suggestions in response to advice queries are not preferences. A preference requires the user to express it themselves (e.g. "I love gardening", "I do woodworking every Sunday").
 
 Transcript:
 {transcript}
