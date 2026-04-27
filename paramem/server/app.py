@@ -5630,7 +5630,6 @@ def _extract_and_start_training():
         _promote_mature_keys,
         _save_key_metadata,
         _save_keyed_pairs_for_router,
-        _save_registry,
         _save_simulation_results,
         create_consolidation_loop,
     )
@@ -5742,7 +5741,13 @@ def _extract_and_start_training():
             )
             newly_promoted = _promote_mature_keys(loop, config)
             _save_keyed_pairs_for_router(loop, config)
-            _save_registry(loop, config)
+            # _save_registry retired (Plan A): the combined SimHash registry at
+            # config.registry_path was not maintained by interim or full-cycle
+            # production paths post-Phase-3+5, and the temporal-query reader
+            # (filter_registry_by_date) needed fields the writer never emitted.
+            # Per-adapter simhash_registry_<adapter>.json files are the canonical
+            # source of truth; inference._load_simhash_registry will combine
+            # them at read time.
             _save_key_metadata(loop, config)
             if config.debug:
                 _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
