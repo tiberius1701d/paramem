@@ -37,7 +37,7 @@ from paramem.graph.scoring import (
     PromotionScorer,
     get_relations_for_nodes,
 )
-from paramem.models.loader import save_adapter, switch_adapter
+from paramem.models.loader import atomic_save_adapter, save_adapter, switch_adapter
 from paramem.training.curriculum import CurriculumSampler
 from paramem.training.indexed_memory import (
     assign_keys,
@@ -48,7 +48,7 @@ from paramem.training.indexed_memory import (
     probe_key,
     save_registry,
 )
-from paramem.training.key_registry import ADAPTER_HEALTH_DEGENERATED, KeyRegistry
+from paramem.training.key_registry import KeyRegistry
 from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
 from paramem.training.trainer import GracefulShutdownCallback, train_adapter
 from paramem.utils.config import (
@@ -2079,7 +2079,11 @@ class ConsolidationLoop:
             seed=self.training_config.seed,
         )
 
-    def _save_adapters(self) -> None:
+    def _save_adapters(
+        self,
+        *,
+        recall_sanity_threshold: float = 0.95,
+    ) -> None:
         """Save adapters and registries to disk using the I5 reorder (§2.5).
 
         Saves to two locations:
@@ -2095,6 +2099,11 @@ class ConsolidationLoop:
           4. Build manifest with ``registry_sha256_override=hash`` +
              ``keyed_pairs_path`` for each adapter.
           5. Save adapter weights + manifest into the new slot.
+          5a. Post-save disk-integrity verify: reload the slot into an isolated
+              verify adapter and probe recall.  Raises ``RuntimeError`` when the
+              on-disk artifact is corrupted (partial write / dirty-page flush
+              race).  The exception propagates to the caller's try/except, which
+              then skips ``mark_consolidated`` so sessions remain pending.
           6. Per-cycle snapshots (no manifest).
           7. SimHash registries.
           8. ``save_from_bytes`` — flush the identical registry bytes; this
@@ -2104,6 +2113,14 @@ class ConsolidationLoop:
         new slot present with a manifest stamping the new registry hash,
         while the on-disk registry still carries the old hash.
         ``find_live_slot`` won't match → slot is latent, harmless.
+
+        Args:
+            recall_sanity_threshold: Minimum recall rate that the post-save
+                disk-integrity probe must achieve.  Forwarded verbatim to
+                :meth:`_verify_saved_adapter_from_disk`.  Defaults to 0.95 to
+                match the in-RAM recall gates in
+                :meth:`consolidate_interim_adapters` and
+                :meth:`post_session_train`.
         """
         import hashlib as _hashlib
         import json as _json
@@ -2174,30 +2191,88 @@ class ConsolidationLoop:
             except Exception:  # noqa: BLE001
                 return None
 
+        def _keyed_pairs_for_tier(simhash_registry: dict) -> list[dict]:
+            """Return the keyed-pairs list for one adapter tier.
+
+            Mirrors the filtering logic in ``_write_kp`` without writing to disk
+            so that ``_verify_saved_adapter_from_disk`` receives the same set of
+            pairs that were encoded into the saved weights.
+            """
+            pairs: list[dict] = []
+            for key in simhash_registry:
+                qa = self.indexed_key_qa.get(key) if self.indexed_key_qa else None
+                if qa is None:
+                    continue
+                pairs.append(
+                    {
+                        "key": key,
+                        "question": qa["question"],
+                        "answer": qa["answer"],
+                    }
+                )
+            return pairs
+
+        def _save_and_verify(
+            adapter_name: str,
+            simhash: dict,
+            kp: "Path | None",
+        ) -> None:
+            """Save adapter, probe disk artifact, clean up slot on probe failure.
+
+            Wraps ``atomic_save_adapter`` + ``_verify_saved_adapter_from_disk``
+            so that a failed disk-integrity probe deletes the bad slot before
+            re-raising.  This prevents a latent corrupted slot from surviving
+            until the next rotation or operator inspection.
+
+            Args:
+                adapter_name: PEFT adapter name (e.g. ``"episodic"``).
+                simhash: Per-tier SimHash registry dict used to filter pairs.
+                kp: Path to the tier's ``keyed_pairs.json`` file (may be None).
+            """
+            import shutil as _shutil
+
+            slot = atomic_save_adapter(
+                self.model,
+                self.output_dir / adapter_name,
+                adapter_name,
+                manifest=_build(adapter_name, kp),
+            )
+            try:
+                self._verify_saved_adapter_from_disk(
+                    adapter_name,
+                    slot,
+                    _keyed_pairs_for_tier(simhash),
+                    threshold=recall_sanity_threshold,
+                )
+            except Exception:
+                # Delete the bad slot so a latent corrupted artifact is not
+                # left on disk; re-raise so the caller skips mark_consolidated.
+                try:
+                    _shutil.rmtree(slot, ignore_errors=True)
+                    logger.warning(
+                        "_save_adapters: deleted bad slot %s after failed disk-verify",
+                        slot,
+                    )
+                except Exception as _cleanup_exc:  # noqa: BLE001
+                    logger.warning(
+                        "_save_adapters: could not remove bad slot %s: %s",
+                        slot,
+                        _cleanup_exc,
+                    )
+                raise
+
         # I5 Steps 3–5 per adapter: keyed_pairs → manifest → slot save.
+        # Step 5a follows each slot save: reload from disk and probe recall to
+        # catch silent partial writes before ``mark_consolidated`` fires.
+        # On probe failure the bad slot is deleted and RuntimeError propagates.
         ep_kp = _write_kp("episodic", self.episodic_simhash)
-        save_adapter(
-            self.model,
-            self.output_dir / "episodic",
-            "episodic",
-            manifest=_build("episodic", ep_kp),
-        )
+        _save_and_verify("episodic", self.episodic_simhash, ep_kp)
         if "semantic" in self.model.peft_config:
             sem_kp = _write_kp("semantic", self.semantic_simhash)
-            save_adapter(
-                self.model,
-                self.output_dir / "semantic",
-                "semantic",
-                manifest=_build("semantic", sem_kp),
-            )
+            _save_and_verify("semantic", self.semantic_simhash, sem_kp)
         if "procedural" in self.model.peft_config:
             proc_kp = _write_kp("procedural", self.procedural_simhash)
-            save_adapter(
-                self.model,
-                self.output_dir / "procedural",
-                "procedural",
-                manifest=_build("procedural", proc_kp),
-            )
+            _save_and_verify("procedural", self.procedural_simhash, proc_kp)
 
         # I5 Step 6: Per-cycle snapshots (debug/analysis only — no manifest).
         if self.save_cycle_snapshots:
@@ -2376,10 +2451,11 @@ class ConsolidationLoop:
         together under one GPU lock then fed in here as a batch).
 
         Behaviour is preserved verbatim from the original post_session_train
-        phases 2-final, including I5 atomic registry-write ordering, the
-        cap-reached-absorb retrain with recall-sanity rollback, and the
+        phases 2-final, including I5 atomic registry-write ordering and the
         ``triples_extracted / new_keys / adapter_name / mode / error`` return
-        shape.
+        shape.  The pre-save in-RAM recall sanity probe has been removed;
+        disk-integrity is gated post-save by ``_save_adapters`` (via
+        ``_verify_saved_adapter_from_disk``).
 
         Args:
             episodic_qa: Pre-extracted episodic QA pairs.  Each pair MAY
@@ -2398,9 +2474,9 @@ class ConsolidationLoop:
             max_interim_count: Cap on concurrent interim adapters in VRAM.
                 ``0`` → queue-only branch (no interim adapter created).
             stamp: Override the computed sub-interval stamp (test injection).
-            recall_sanity_threshold: Minimum recall to accept a cap-reached
-                retrain; below this the retrain is rolled back to the
-                snapshot and the adapter is marked ``degenerated``.
+            recall_sanity_threshold: Forwarded to ``_save_adapters`` for the
+                post-save disk-integrity probe threshold.  The pre-save
+                in-RAM cap-reached-retrain probe has been removed.
 
         Returns:
             Result dict: ``{"triples_extracted", "new_keys", "adapter_name",
@@ -2578,21 +2654,21 @@ class ConsolidationLoop:
         # --- 6. Train episodic interim adapter ---
         # On failure, let the exception propagate; caller logs and returns error.
         # The registry is written AFTER both training passes succeed (I5 atomicity).
-        from paramem.models.loader import copy_adapter_weights, create_adapter, switch_adapter
+        from paramem.models.loader import create_adapter, switch_adapter
 
-        # Cap-reached retrain: snapshot the target adapter, then fresh-init its
-        # weights so the retrain starts from LoRA zeros rather than warm-starting
-        # from accumulated interference.  Snapshot is kept in a side slot and
-        # either discarded (success) or copied back (sanity fail).
-        snapshot_name: str | None = None
+        # Cap-reached retrain: fresh-init the target adapter so the retrain
+        # starts from LoRA zeros rather than warm-starting from accumulated
+        # interference.  A side-slot snapshot is no longer kept for in-RAM
+        # rollback; disk-integrity is gated post-save by _save_adapters
+        # (via _verify_saved_adapter_from_disk on the saved slot).
         if cap_reached_absorb:
-            snapshot_name = f"{adapter_name}_retrain_snapshot"
-            if snapshot_name in self.model.peft_config:
-                self.model.delete_adapter(snapshot_name)
-            self.model = create_adapter(self.model, self.episodic_config, snapshot_name)
-            copy_adapter_weights(self.model, src=adapter_name, dst=snapshot_name)
+            # Reset adapter to LoRA zeros without keeping a snapshot.
             self.model.delete_adapter(adapter_name)
             self.model = create_adapter(self.model, self.episodic_config, adapter_name)
+            logger.info(
+                "post_session_train: cap-reached — reset %s to LoRA zeros for retrain",
+                adapter_name,
+            )
 
         switch_adapter(self.model, adapter_name)
         self._disable_gradient_checkpointing()
@@ -2618,55 +2694,6 @@ class ConsolidationLoop:
             run_name=f"interim-{adapter_name}-{run_label}",
             callbacks_extra=self._shutdown_callbacks,
         )
-
-        # --- 6a. Recall sanity probe (cap-reached retrain only) ---
-        # The normal append-to-existing path warm-starts from weights that
-        # already encode the earlier keys, so incremental degradation is
-        # rare.  The cap-reached retrain reinitialises and trains on every
-        # key the adapter has ever seen plus the new ones; if capacity is
-        # exhausted the probe is the only thing that catches it before the
-        # registry is mutated.
-        if cap_reached_absorb:
-            recall_rate = self._run_recall_sanity_probe(adapter_name, all_interim_keyed)
-            if recall_rate < recall_sanity_threshold:
-                # Rollback: restore snapshot weights, mark the adapter
-                # degenerated, skip procedural + registration, persist the
-                # registry so the flag survives a restart.
-                copy_adapter_weights(self.model, src=snapshot_name, dst=adapter_name)
-                self.model.delete_adapter(snapshot_name)
-                self.indexed_key_registry.set_adapter_health(
-                    adapter_name,
-                    ADAPTER_HEALTH_DEGENERATED,
-                    reason=(
-                        f"recall {recall_rate:.3f} < {recall_sanity_threshold:.2f} "
-                        f"after cap-reached retrain on {len(all_interim_keyed)} keys"
-                    ),
-                )
-                self.indexed_key_registry.save(self.output_dir / "indexed_key_registry.json")
-                logger.warning(
-                    "post_session_train: cap-reached retrain failed sanity "
-                    "(recall=%.3f < %.2f) on %s — rolled back, marked degenerated",
-                    recall_rate,
-                    recall_sanity_threshold,
-                    adapter_name,
-                )
-                if "episodic" in self.model.peft_config:
-                    switch_adapter(self.model, "episodic")
-                return {
-                    "triples_extracted": triples_extracted,
-                    "new_keys": [],
-                    "adapter_name": adapter_name,
-                    "mode": "degenerated",
-                    "error": f"recall_sanity_failed:{recall_rate:.3f}",
-                }
-            # Success — drop the snapshot slot and continue.
-            self.model.delete_adapter(snapshot_name)
-            snapshot_name = None
-            logger.info(
-                "post_session_train: cap-reached retrain passed sanity (recall=%.3f) on %s",
-                recall_rate,
-                adapter_name,
-            )
 
         # --- 6b. Train procedural main adapter (I1) ---
         # Procedural relations always go to the stable 'procedural' main adapter —
@@ -3126,8 +3153,10 @@ class ConsolidationLoop:
                 lock via submit()).  Required for per-tier B2 re-arm pattern.
             router: Router instance whose reload() is called at the end of the
                 atomic finalize sequence.  Optional — skipped when None.
-            recall_sanity_threshold: Minimum recall rate to accept a rebuilt tier
-                (default 0.95).  Tiers below this trigger rollback and abort.
+            recall_sanity_threshold: Minimum recall rate for the post-save
+                disk-integrity probe in ``_save_adapters`` (forwarded verbatim).
+                In-RAM pre-save probes have been removed; the gate fires
+                post-save via ``_verify_saved_adapter_from_disk``.
             refresh_epochs: Number of training epochs for the full per-tier
                 rebuild (default 30; matches the per-key baseline from Tests 1-7b).
 
@@ -3359,7 +3388,6 @@ class ConsolidationLoop:
 
         tiers_rebuilt: list[str] = []
         recall_per_tier: dict[str, float] = {}
-        rollback_tier: str | None = None
 
         for tier in ("episodic", "semantic", "procedural"):
             backup_name = f"{tier}_backup"
@@ -3445,56 +3473,12 @@ class ConsolidationLoop:
                     trainer._set_is_training(False)
                     trainer._current_job = prior_job
 
-            # e. Recall-sanity check (Step 7d) — shared helper with cap-reached retrain.
-            recall_rate = self._run_recall_sanity_probe(tier, job.keyed_pairs)
-
-            recall_per_tier[tier] = recall_rate
-            logger.info(
-                "consolidate_interim_adapters: recall check tier=%s rate=%.3f threshold=%.3f",
-                tier,
-                recall_rate,
-                recall_sanity_threshold,
-            )
-
-            if recall_rate < recall_sanity_threshold:
-                # Capacity ceiling hit — rollback and abort.
-                rollback_tier = tier
-                logger.error(
-                    "consolidate_interim_adapters: recall %.3f < threshold %.3f for tier %s "
-                    "— rolling back and aborting finalize",
-                    recall_rate,
-                    recall_sanity_threshold,
-                    tier,
-                )
-                self._append_capacity_ceiling_log(
-                    tier=tier,
-                    n_keys_pre=len(job.keyed_pairs),
-                    n_keys_post=len(job.keyed_pairs),
-                    recall_pre=1.0,  # assume pre-refresh was at threshold
-                    recall_post=recall_rate,
-                )
-                # Restore from backup: copy backup weights back into the main tier.
-                if backup_name in self.model.peft_config:
-                    from paramem.models.loader import copy_adapter_weights
-
-                    _sw(self.model, backup_name)
-                    if tier not in self.model.peft_config:
-                        self.model = create_adapter(self.model, self.episodic_config, tier)
-                    copy_adapter_weights(self.model, src=backup_name, dst=tier)
-                    logger.info(
-                        "consolidate_interim_adapters: restored %s from %s after ceiling trip",
-                        tier,
-                        backup_name,
-                    )
-                return {
-                    "tiers_rebuilt": tiers_rebuilt,
-                    "graph_drift_count": graph_drift_count,
-                    "keys_per_tier": {t: len(v) for t, v in tier_keyed.items()},
-                    "recall_per_tier": recall_per_tier,
-                    "rolled_back": True,
-                    "rollback_tier": rollback_tier,
-                }
-
+            # Disk-integrity for this tier is gated post-save by _save_adapters
+            # (via _verify_saved_adapter_from_disk on each saved slot).  The
+            # pre-save in-RAM recall probe has been removed; a post-save failure
+            # propagates as RuntimeError from _save_adapters so the caller
+            # (app.py _run_full_cycle) skips mark_consolidated and sessions stay
+            # pending for the next cycle.
             tiers_rebuilt.append(tier)
 
         # flip off _is_training at finalize entry (belt-and-braces).
@@ -3567,12 +3551,12 @@ class ConsolidationLoop:
     ) -> float:
         """Probe up to *max_probe* keyed pairs against *adapter_name* and return the recall rate.
 
-        Shared by :meth:`consolidate_interim_adapters` (Step 7) and the
-        cap-reached retrain path in :meth:`post_session_train`.  Keeping
-        the logic in one place makes the sanity contract identical
-        everywhere: same sample size, same probe harness, same failure
-        semantics (probe exception → ``0.0`` so callers treat it as a
-        rollback trigger rather than a mysterious skip).
+        Used by :meth:`_verify_saved_adapter_from_disk` to check the recall
+        of an adapter reloaded from disk.  Keeping the logic in one place
+        makes the sanity contract identical everywhere: same sample size,
+        same probe harness, same failure semantics (probe exception → ``0.0``
+        so callers treat it as a rollback trigger rather than a mysterious
+        skip).
 
         The caller is responsible for deciding what to do with the
         returned rate (threshold compare, rollback, health update).
@@ -3624,6 +3608,153 @@ class ConsolidationLoop:
                 adapter_name,
             )
             return 0.0
+
+    def _verify_saved_adapter_from_disk(
+        self,
+        adapter_name: str,
+        slot_path: Path,
+        keyed_pairs: list[dict],
+        *,
+        threshold: float = 0.95,
+        max_probe: int = 100,
+    ) -> float:
+        """Reload an adapter from its on-disk slot and probe recall integrity.
+
+        Closes the silent-partial-write gap: the in-RAM recall probe in
+        :meth:`_run_recall_sanity_probe` runs on the trained weights still in
+        memory.  This method loads the *saved* artifact back from disk into an
+        isolated verify slot, probes it with the same harness, then drops the
+        slot.  A corrupt or truncated ``adapter_model.safetensors`` (e.g. dirty
+        pages not flushed before a kernel crash) will either fail to parse —
+        triggering a ``recall=0.0`` → gate trip — or produce degraded recall
+        that falls below *threshold*.
+
+        The verify slot is named ``f"{adapter_name}_verify"`` so it cannot
+        collide with any production adapter name (``episodic``, ``semantic``,
+        ``procedural``, or any ``episodic_interim_*`` slot).  The original
+        adapter remains active throughout; after the probe the verify slot is
+        dropped and the original adapter is re-activated so the model is left
+        in the same state as on entry.
+
+        PEFT pitfall avoidance:
+        - Uses ``model.load_adapter(slot_path, adapter_name=verify_name)``
+          (same as ``_mount_adapters_from_slots``) rather than
+          ``PeftModel.from_pretrained`` to avoid nested tensor name prefixes.
+        - Patches ``peft_config[verify_name].base_model_name_or_path`` when
+          PEFT sets it to ``None`` (happens for second-and-later adapters).
+        - Uses ``try/finally`` so the verify slot is always dropped even if
+          the probe raises.  Does NOT call ``add_adapter`` or ``get_peft_model``
+          after ``delete_adapter`` (CLAUDE.md PEFT rule).
+
+        Args:
+            adapter_name: Production adapter that was just saved.  Used as the
+                active adapter to restore after the probe.
+            slot_path: Absolute path to the slot directory written by
+                :func:`~paramem.models.loader.atomic_save_adapter`.  The
+                adapter files (``adapter_model.safetensors``,
+                ``adapter_config.json``) sit directly inside this directory
+                (post-flatten step of ``atomic_save_adapter``).
+            keyed_pairs: QA pairs encoded into the adapter.  Sampled down to
+                *max_probe* if longer.  An empty list returns ``1.0`` (no keys
+                to verify → healthy by default).
+            threshold: Minimum recall the disk artifact must achieve.  Defaults
+                to ``0.95`` matching the production recall gates.
+            max_probe: Maximum number of pairs to probe.  Passed through to
+                :meth:`_run_recall_sanity_probe`.
+
+        Returns:
+            Recall rate from the disk-loaded adapter in ``[0.0, 1.0]``.
+
+        Raises:
+            RuntimeError: When ``recall < threshold``, signalling that the
+                on-disk artifact is corrupt or degraded.  The caller's
+                try/except in ``run_consolidation`` will then skip
+                ``mark_consolidated``, leaving sessions pending for the next
+                cycle to retry.
+        """
+        from peft import PeftModel
+
+        if not keyed_pairs:
+            logger.debug(
+                "_verify_saved_adapter_from_disk: no keyed pairs for %s — skipping",
+                adapter_name,
+            )
+            return 1.0
+
+        verify_name = f"{adapter_name}_verify"
+        logger.info(
+            "_verify_saved_adapter_from_disk: loading slot %s as '%s' for integrity check",
+            slot_path,
+            verify_name,
+        )
+
+        recall_rate: float = 0.0
+        try:
+            # Load the saved slot into an isolated verify adapter.
+            # Use the same pattern as _mount_adapters_from_slots (app.py L955):
+            # model.load_adapter(str(slot), adapter_name=name) for PeftModel.
+            if isinstance(self.model, PeftModel):
+                self.model.load_adapter(str(slot_path), adapter_name=verify_name)
+            else:
+                # Base model — cannot load a second adapter without wrapping.
+                # This branch should not occur in production (the model is always
+                # a PeftModel by the time _save_adapters is called), but guard
+                # defensively to avoid a silent skip.
+                logger.warning(
+                    "_verify_saved_adapter_from_disk: model is not a PeftModel "
+                    "— skipping disk verify for %s",
+                    adapter_name,
+                )
+                return 1.0
+
+            # Patch base_model_name_or_path when PEFT sets it to None for
+            # second-and-later adapters (same pattern as create_adapter in loader.py).
+            if self.model.peft_config[verify_name].base_model_name_or_path is None:
+                base_name = getattr(self.model.get_base_model().config, "_name_or_path", None)
+                if base_name:
+                    self.model.peft_config[verify_name].base_model_name_or_path = base_name
+
+            # Activate verify slot, probe, then restore original.
+            switch_adapter(self.model, verify_name)
+            recall_rate = self._run_recall_sanity_probe(
+                verify_name,
+                keyed_pairs,
+                max_probe=max_probe,
+            )
+            switch_adapter(self.model, adapter_name)
+
+            logger.info(
+                "_verify_saved_adapter_from_disk: %s slot=%s recall=%.3f threshold=%.3f",
+                adapter_name,
+                slot_path.name,
+                recall_rate,
+                threshold,
+            )
+        finally:
+            # Always drop the verify slot — even if the probe raised.
+            # Re-activate the original adapter so the model is left in the
+            # same state as on entry regardless of which branch was taken.
+            if verify_name in self.model.peft_config:
+                try:
+                    switch_adapter(self.model, adapter_name)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.model.delete_adapter(verify_name)
+                logger.debug(
+                    "_verify_saved_adapter_from_disk: verify slot '%s' dropped",
+                    verify_name,
+                )
+
+        if recall_rate < threshold:
+            raise RuntimeError(
+                f"Post-save disk-integrity probe failed for adapter '{adapter_name}': "
+                f"recall {recall_rate:.3f} < threshold {threshold:.2f} "
+                f"(slot: {slot_path}). "
+                "The on-disk artifact may be corrupt. "
+                "Sessions will remain pending for retry on the next cycle."
+            )
+
+        return recall_rate
 
     def _append_capacity_ceiling_log(
         self,

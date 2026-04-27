@@ -663,10 +663,20 @@ class TestPerTierInferenceFallbackAdapter:
 
 
 class TestCapacityCeilingRollback:
-    """When recall < threshold, the method returns rolled_back=True and skips finalize."""
+    """The pre-save in-RAM recall probe has been removed.
 
-    def test_rollback_triggered_when_recall_below_threshold(self, tmp_path: Path) -> None:
-        """consolidate_interim_adapters returns rolled_back=True when recall is low."""
+    consolidate_interim_adapters always returns rolled_back=False now.
+    Disk-integrity is gated post-save by _save_adapters via
+    _verify_saved_adapter_from_disk.
+    """
+
+    def test_no_rollback_even_when_recall_probe_returns_low(self, tmp_path: Path) -> None:
+        """consolidate_interim_adapters returns rolled_back=False regardless of probe.
+
+        The pre-save in-RAM recall probe has been removed; _run_recall_sanity_probe
+        is no longer called here.  Even if the experiment harness would have
+        returned a low rate, no rollback occurs in this path.
+        """
         from paramem.server.gpu_lock import _gpu_thread_lock
 
         model = _make_stub_model(
@@ -705,7 +715,9 @@ class TestCapacityCeilingRollback:
                 ),
                 patch("paramem.training.trainer.train_adapter"),
                 patch("paramem.training.indexed_memory.build_registry", return_value={"graph1": 0}),
-                # Recall probe returns 0.5 — below the default threshold of 0.95.
+                # The pre-save in-RAM probe is gone; evaluate_indexed_recall
+                # is only called via _verify_saved_adapter_from_disk (post-save).
+                # Patch it here to prevent any accidental call from surfacing.
                 patch(
                     "experiments.utils.test_harness.evaluate_indexed_recall",
                     return_value={
@@ -716,18 +728,17 @@ class TestCapacityCeilingRollback:
                         "per_key": [],
                     },
                 ),
+                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
-                patch.object(loop, "_append_capacity_ceiling_log") as mock_log,
             ):
                 result = loop.consolidate_interim_adapters(recall_sanity_threshold=0.95)
         finally:
             _gpu_thread_lock.release()
 
-        assert result["rolled_back"] is True
-        assert result["rollback_tier"] == "episodic"
-        # The ceiling log helper must have been called.
-        mock_log.assert_called_once()
+        # Pre-save rollback has been removed — result is always rolled_back=False.
+        assert result["rolled_back"] is False
+        assert result["rollback_tier"] is None
 
     def test_no_rollback_when_recall_at_threshold(self, tmp_path: Path) -> None:
         """When recall == threshold, no rollback fires."""
