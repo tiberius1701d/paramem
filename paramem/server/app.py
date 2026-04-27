@@ -1582,6 +1582,15 @@ async def lifespan(app: FastAPI):
         ha_graph=ha_graph,
     )
 
+    # Residual intent classifier — load the sentence-encoder once so the
+    # routing path doesn't pay model-load cost per query.  Failure is
+    # non-fatal: the classifier returns Intent.UNKNOWN / fail-closed and
+    # routing degrades to the existing structural rules.
+    if not cloud_only:
+        from paramem.server.intent import load_encoder
+
+        load_encoder(config.intent)
+
     # Global observed-language tracker — records STT-detected languages with
     # high confidence, publishes to HA as input_text.voice_observed_languages
     # so the conversation agent can use it as context when interpreting
@@ -2231,12 +2240,18 @@ async def status():
         else:
             active_adapter = raw_active
 
+    # Source of truth for active key count is data/ha/adapters/indexed_key_registry.json
+    # (KeyRegistry).  The legacy combined SimHash registry at config.registry_path was
+    # retired in Plan A; do not read it here.
     keys_count = 0
-    if config.registry_path.exists():
-        from paramem.backup.encryption import read_maybe_encrypted as _rme
+    indexed_registry_path = config.adapter_dir / "indexed_key_registry.json"
+    if indexed_registry_path.exists():
+        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
 
-        registry = json.loads(_rme(config.registry_path).decode("utf-8"))
-        keys_count = len(registry)
+        try:
+            keys_count = len(_KeyRegistry.load(indexed_registry_path))
+        except Exception:  # noqa: BLE001
+            keys_count = 0
 
     # Session buffer summary (pending counts, orphan attribution, age)
     buf = _state.get("session_buffer")

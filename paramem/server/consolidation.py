@@ -324,7 +324,6 @@ def run_consolidation(
             newly_promoted = _promote_mature_keys(loop, config)
 
             _save_keyed_pairs_for_router(loop, config)
-            _save_registry(loop, config)
             _save_key_metadata(loop, config)
 
             if config.debug:
@@ -389,7 +388,6 @@ def run_consolidation(
 
         # --- Phase 3: Save adapters (writes keyed_pairs.json per adapter internally) ---
         loop._save_adapters()
-        _save_registry(loop, config)
         _save_key_metadata(loop, config)
     except Exception:
         logger.exception(
@@ -561,27 +559,6 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     # trial never writes to the live registry paths.
     dest = getattr(loop, "trial_key_metadata_path", None) or config.key_metadata_path
     _atomic_json_write(metadata, dest)
-
-
-def _save_registry(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Save combined SimHash registry (no personal data).
-
-    When ``loop.trial_registry_path`` is set (trial consolidation path),
-    writes to that isolated path instead of the live ``config.registry_path``.
-    This ensures trial runs never touch the live ``data/ha/registry.json``
-    (CRITICAL Fix 1 — trial registry isolation, 2026-04-23).
-    """
-    combined = {}
-    for key, simhash in loop.episodic_simhash.items():
-        combined[key] = {"simhash": simhash, "adapter": "episodic"}
-    for key, simhash in loop.semantic_simhash.items():
-        combined[key] = {"simhash": simhash, "adapter": "semantic"}
-    for key, simhash in loop.procedural_simhash.items():
-        combined[key] = {"simhash": simhash, "adapter": "procedural"}
-    # CRITICAL Fix 1: honor loop-level override set by _build_trial_loop so the
-    # trial never writes to the live registry paths.
-    dest = getattr(loop, "trial_registry_path", None) or config.registry_path
-    _atomic_json_write(combined, dest)
 
 
 def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) -> None:
