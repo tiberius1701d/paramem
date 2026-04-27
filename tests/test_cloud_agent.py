@@ -233,8 +233,14 @@ class TestPrivacyRouting:
         return agent
 
     def _make_mock_router(self, known_entities=None):
-        """Create a mock router with configurable entity matching."""
-        from paramem.server.router import RoutingPlan, RoutingStep
+        """Create a mock router with configurable entity matching.
+
+        Mirrors production classify_intent: PA hit → PERSONAL, no hit → UNKNOWN
+        (residual would normally be GENERAL with config; UNKNOWN is the
+        no-config default and produces identical dispatch behaviour to
+        GENERAL).
+        """
+        from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
         router = MagicMock()
         known = {e.lower() for e in (known_entities or [])}
@@ -255,15 +261,19 @@ class TestPrivacyRouting:
                     strategy="entity",
                     matched_entities=matched,
                     match_source="pa",
+                    intent=Intent.PERSONAL,
                 )
-            return RoutingPlan(strategy="direct", match_source="none")
+            return RoutingPlan(strategy="direct", match_source="none", intent=Intent.UNKNOWN)
 
         router.route = route
         return router
 
     def _make_ha_only_router(self, imperative=False):
-        """Create a mock router returning an HA-only match (no PA steps)."""
-        from paramem.server.router import RoutingPlan
+        """Create a mock router returning an HA-only match (no PA steps).
+
+        HA hit without PA → COMMAND under classify_intent's state-first dispatch.
+        """
+        from paramem.server.router import Intent, RoutingPlan
 
         router = MagicMock()
 
@@ -275,14 +285,20 @@ class TestPrivacyRouting:
                 match_source="ha",
                 imperative=imperative,
                 ha_domains=["light"],
+                intent=Intent.COMMAND,
             )
 
         router.route = route
         return router
 
     def _make_both_match_router(self):
-        """Create a router returning a 'both' match (PA steps + HA entity)."""
-        from paramem.server.router import RoutingPlan, RoutingStep
+        """Create a router returning a 'both' match (PA steps + HA entity).
+
+        PA hit + HA hit → PERSONAL (PA wins under classify_intent), so the
+        privacy invariant applies: SOTA must never be reached for queries
+        from this router.
+        """
+        from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
         router = MagicMock()
 
@@ -294,6 +310,7 @@ class TestPrivacyRouting:
                 match_source="both",
                 imperative=True,
                 ha_domains=["light"],
+                intent=Intent.PERSONAL,
             )
 
         router.route = route
@@ -515,8 +532,14 @@ class TestPrivacyRouting:
         assert result.escalated is True
         assert result.text == "cloud answer"
 
-    def test_imperative_both_match_ha_fails_routes_to_pa(self):
-        """B1 fix: match_source=both + imperative: HA fails → PA probe, NOT SOTA."""
+    def test_personal_both_match_uses_pa_probe_no_pre_flight_ha(self):
+        """match_source=both + intent=PERSONAL: PA probe runs directly.
+
+        Under intent-keyed dispatch, intent=PERSONAL routes straight to the
+        local PA probe.  The pre-flight HA call from the legacy cascade is
+        gone — HA is reachable only via [ESCALATE] from the local model.
+        SOTA stays blocked by the privacy invariant.
+        """
         from paramem.server.inference import handle_chat
 
         cloud_agent = self._make_mock_cloud_agent()
@@ -534,7 +557,7 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
 
         ha_client = MagicMock()
-        ha_client.conversation_process.return_value = None  # HA fails
+        ha_client.conversation_process.return_value = None  # HA would fail if called
 
         with (
             patch(
@@ -563,7 +586,74 @@ class TestPrivacyRouting:
                 sota_agent=cloud_agent,
             )
 
-        # HA tried once (path 2a), SOTA must NOT be called (match_source=both → path 2b)
-        ha_client.conversation_process.assert_called_once()
+        # HA was NOT pre-flighted (intent=PERSONAL → PA probe direct).
+        ha_client.conversation_process.assert_not_called()
+        # SOTA blocked by privacy invariant regardless of HA outcome.
         cloud_agent.call.assert_not_called()
         assert result.escalated is False
+
+    def test_personal_intent_blocks_sota_via_escalate(self):
+        """Privacy invariant: PERSONAL + local [ESCALATE] + HA failure → no SOTA.
+
+        The local model emits [ESCALATE] (a real production path when the
+        local answer is unsure).  HA is reachable as a tool fallback but
+        returns None.  Without the privacy invariant the next step would be
+        SOTA — the invariant must block that for personal-class queries.
+        """
+        from paramem.server.inference import handle_chat
+
+        cloud_agent = self._make_mock_cloud_agent()
+        router = self._make_mock_router(known_entities=["Jordan"])
+
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        model.peft_config = {"episodic": MagicMock()}
+        tokenizer = MagicMock()
+
+        config = MagicMock()
+        config.registry_path = MagicMock()
+        config.registry_path.exists.return_value = False
+        config.sanitization.mode = "off"
+        config.voice.load_prompt.return_value = "You are a helper."
+
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = None  # HA fallback fails
+
+        with (
+            patch(
+                "paramem.training.indexed_memory.probe_key",
+                return_value={"answer": "Jordan lives somewhere"},
+            ),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.server.inference.generate_answer",
+                return_value="I'm not sure. [ESCALATE] Where does Jordan live?",
+            ),
+            # Local model decides to escalate.
+            patch(
+                "paramem.server.inference.detect_escalation",
+                return_value=(True, "Where does Jordan live?"),
+            ),
+            patch("paramem.server.inference.adapt_messages", side_effect=lambda msgs, tok: msgs),
+            patch.object(tokenizer, "apply_chat_template", return_value="prompt"),
+        ):
+            result = handle_chat(
+                text="Where does Jordan live?",
+                conversation_id="test",
+                speaker=None,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                router=router,
+                ha_client=ha_client,
+                sota_agent=cloud_agent,
+            )
+
+        # HA was tried as a tool fallback (allowed for PERSONAL).
+        ha_client.conversation_process.assert_called_once()
+        # SOTA blocked by the privacy invariant — this is the new guarantee.
+        cloud_agent.call.assert_not_called()
+        # Pre-[ESCALATE] portion of local response is returned when both
+        # HA and SOTA are unavailable.
+        assert "I'm not sure" in result.text

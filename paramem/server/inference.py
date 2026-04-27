@@ -192,27 +192,35 @@ def handle_chat(
     language: str | None = None,
     known_entities: set[str] | None = None,
 ) -> ChatResult:
-    """Process a chat message via tri-path routing.
+    """Process a chat message via intent-keyed dispatch.
 
-    Routing (dual-graph):
-    1. Temporal query → filter keys by date → probe → reason
-    2. Imperative + HA entity → HA agent directly (action command)
-    3. PA match → probe matched keys → reason
-    4. HA match (non-imperative) → HA agent (device query)
-    5. No match → HA first (tools, real-time data), SOTA fallback (reasoning)
-    6. All cloud failed → local base model
+    Routing reads ``RoutingPlan.intent`` populated by the router's
+    classify_intent() pass:
 
-    When ``config.debug`` is True a per-request routing-decision diagnostic
-    is emitted via ``logging.info(extra={"routing": …})`` at function exit.
-    The dict captures which paths were attempted, which one returned, and
-    whether the request was a "residual" (no graph match, no HA match) —
-    the metric the residual classifier work is gated on.  Off when
-    ``config.debug`` is False to keep production logs lean.
+    * ``PERSONAL`` → local PA probe + reason.  HA is reachable from the
+      local model via ``[ESCALATE]`` and from the no-layers branch as a
+      tool fallback.  **SOTA is never reached** — personal-class queries
+      stay off the cloud (privacy invariant, threaded as ``is_personal``
+      through the call tree).
+    * ``COMMAND`` / ``GENERAL`` / ``UNKNOWN`` → HA first (tools, live
+      state), SOTA fallback (reasoning).
+
+    The ``is_residual`` diagnostic still tracks "did any graph signal
+    fire?" for the routing-quality metric independent of the intent
+    decision; ``match_source`` and ``imperative`` remain in the diag
+    dict for observability but no longer drive control flow.
+
+    When ``config.debug`` is True a per-request routing-decision
+    diagnostic is emitted via ``logging.info(extra={"routing": …})`` at
+    function exit.
     """
+    from paramem.server.router import Intent
+
     routing_diags: dict = {
         "conversation_id": conversation_id,
         "match_source": "none",
         "imperative": False,
+        "intent": Intent.UNKNOWN.value,
         "paths_attempted": [],
         "fallthrough_reason": None,
         "exit_via": None,
@@ -236,6 +244,9 @@ def handle_chat(
             routing_diags["imperative"] = plan.imperative
             routing_diags["intent"] = plan.intent.value
 
+        intent = plan.intent if plan is not None else Intent.UNKNOWN
+        is_personal = intent == Intent.PERSONAL
+
         # Pre-compute sanitization once for all cloud escalation paths.
         # Personal-content detection is anchored on the router's entity index
         # (the graph's ground truth) plus a first-person token-set + the
@@ -250,34 +261,13 @@ def handle_chat(
             known_entities=known_entities,
         )
 
-        # Path 2a: Imperative + HA entity → HA agent directly (action command)
-        if plan and plan.imperative and plan.match_source in ("ha", "both"):
-            routing_diags["paths_attempted"].append("2a")
-            logger.info("Imperative HA command: domains=%s", plan.ha_domains)
-            if sanitized_text is not None:
-                result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
-                if result is not None:
-                    routing_diags["exit_via"] = "2a_ha"
-                    return result
-                # Only fall to SOTA when there is no PA match to probe in path 2b
-                if sota_agent is not None and plan.match_source == "ha":
-                    routing_diags["exit_via"] = "2a_sota"
-                    return _escalate_to_sota(
-                        sanitized_text,
-                        sota_agent,
-                        config,
-                        speaker=speaker,
-                        history=history,
-                        language=language,
-                    )
-            else:
-                routing_diags["fallthrough_reason"] = "sanitizer_blocked_2a"
-                logger.info("Sanitizer blocked imperative HA command: %s", sanitization_findings)
-
-        # Path 2b: PA match → probe adapters and reason locally
-        if plan and plan.steps and plan.match_source in ("pa", "both"):
-            routing_diags["paths_attempted"].append("2b")
-            routing_diags["exit_via"] = "2b_pa_probe"
+        # PERSONAL → local PA probe + reason.  No SOTA anywhere on this
+        # path: is_personal=True suppresses every internal _escalate_to_sota
+        # call (no-layers branch, post-reason [ESCALATE], base-model
+        # fallthrough).  HA stays reachable as a tool fallback.
+        if is_personal and plan is not None and plan.steps:
+            routing_diags["paths_attempted"].append("personal")
+            routing_diags["exit_via"] = "personal_probe"
             return _probe_and_reason(
                 text,
                 plan,
@@ -289,41 +279,22 @@ def handle_chat(
                 ha_client=ha_client,
                 speaker=speaker,
                 language=language,
+                is_personal=True,
             )
 
-        # Path 2c: HA-only match (non-imperative) → HA agent
-        if plan and plan.match_source == "ha":
-            routing_diags["paths_attempted"].append("2c")
-            logger.info("HA entity query (non-imperative): domains=%s", plan.ha_domains)
-            if sanitized_text is not None:
-                result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
-                if result is not None:
-                    routing_diags["exit_via"] = "2c_ha"
-                    return result
-                if sota_agent is not None:
-                    routing_diags["exit_via"] = "2c_sota"
-                    return _escalate_to_sota(
-                        sanitized_text,
-                        sota_agent,
-                        config,
-                        speaker=speaker,
-                        history=history,
-                        language=language,
-                    )
-            else:
-                routing_diags["fallthrough_reason"] = "sanitizer_blocked_2c"
-                logger.info("Sanitizer blocked HA query: %s", sanitization_findings)
-
-        # Path 3: No match → HA first (has tools for real-time data), SOTA fallback
+        # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
+        # steps path) → HA first, SOTA fallback.  is_personal still gates
+        # SOTA so a defensive PERSONAL request never reaches the cloud.
+        intent_label = intent.value
         if sanitized_text is not None:
-            routing_diags["paths_attempted"].append("3")
-            logger.info("No graph match, trying HA agent (tools)")
+            routing_diags["paths_attempted"].append(intent_label)
+            logger.info("Intent dispatch: %s → HA first", intent_label)
             result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
             if result is not None:
-                routing_diags["exit_via"] = "3_ha"
+                routing_diags["exit_via"] = f"{intent_label}_ha"
                 return result
-            if sota_agent is not None:
-                routing_diags["exit_via"] = "3_sota"
+            if sota_agent is not None and not is_personal:
+                routing_diags["exit_via"] = f"{intent_label}_sota"
                 logger.info("HA failed, routing to SOTA agent")
                 return _escalate_to_sota(
                     sanitized_text,
@@ -334,7 +305,7 @@ def handle_chat(
                     language=language,
                 )
         else:
-            routing_diags["fallthrough_reason"] = "sanitizer_blocked_3"
+            routing_diags["fallthrough_reason"] = "sanitizer_blocked"
             logger.info("Sanitizer blocked query: %s", sanitization_findings)
 
         # Abstention: self-referential query with no local match → canned response.
@@ -390,6 +361,7 @@ def handle_chat(
             ha_client=ha_client,
             speaker=speaker,
             language=language,
+            is_personal=is_personal,
         )
     finally:
         if getattr(config, "debug", False):
@@ -504,6 +476,7 @@ def _probe_and_reason(
     ha_client: HAClient | None = None,
     speaker: str | None = None,
     language: str | None = None,
+    is_personal: bool = False,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -517,6 +490,10 @@ def _probe_and_reason(
     query starts from a predictable state. The reasoning phase uses
     ``model.disable_adapter()`` so the active adapter during generation does
     not matter — only the post-return state (restored here) does.
+
+    Privacy gate: ``is_personal`` flows through to every internal SOTA
+    fallback site (no-layers branch, base-model fallthrough, post-reason
+    [ESCALATE]).  Personal-class queries never reach the cloud.
     """
     from peft import PeftModel
 
@@ -587,8 +564,9 @@ def _probe_and_reason(
 
     if not layers:
         logger.info(
-            "All %d probed key(s) failed, escalating via HA → SOTA (source=%s)",
+            "All %d probed key(s) failed, escalating via HA%s (source=%s)",
             sum(len(s.keys_to_probe) for s in plan.steps),
+            "" if is_personal else " → SOTA",
             plan.match_source,
         )
         sanitized, _ = sanitize_for_cloud(text, mode=config.sanitization.mode)
@@ -596,7 +574,7 @@ def _probe_and_reason(
             result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
             if result is not None:
                 return result
-            if sota_agent is not None:
+            if sota_agent is not None and not is_personal:
                 return _escalate_to_sota(
                     sanitized,
                     sota_agent,
@@ -615,6 +593,7 @@ def _probe_and_reason(
             ha_client=ha_client,
             speaker=speaker,
             language=language,
+            is_personal=is_personal,
         )
 
     total_facts = sum(len(f) for f in layers.values())
@@ -654,6 +633,7 @@ def _probe_and_reason(
         speaker=speaker,
         history=history,
         language=language,
+        is_personal=is_personal,
     )
 
 
@@ -667,8 +647,14 @@ def _base_model_answer(
     ha_client: HAClient | None = None,
     speaker: str | None = None,
     language: str | None = None,
+    is_personal: bool = False,
 ) -> ChatResult:
-    """Answer from base model without context — escalation candidate."""
+    """Answer from base model without context — escalation candidate.
+
+    ``is_personal`` propagates the privacy gate to ``_maybe_escalate`` so
+    a base-model [ESCALATE] from a personal-class query cannot reach
+    SOTA.
+    """
     from peft import PeftModel
 
     system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
@@ -691,6 +677,7 @@ def _base_model_answer(
         speaker=speaker,
         history=history,
         language=language,
+        is_personal=is_personal,
     )
 
 
@@ -704,6 +691,7 @@ def _maybe_escalate(
     speaker: str | None = None,
     history: list[dict] | None = None,
     language: str | None = None,
+    is_personal: bool = False,
 ) -> ChatResult:
     """Check for [ESCALATE] tag and route HA → SOTA.
 
@@ -711,6 +699,13 @@ def _maybe_escalate(
     gets first shot. SOTA handles queries that need pure reasoning.
     When all escalation paths fail, the pre-escalation portion of the
     local response is returned (text before the [ESCALATE] marker).
+
+    Privacy invariant: when ``is_personal`` is True the SOTA fallback is
+    suppressed regardless of the agent being available.  Personal-class
+    queries never reach the cloud — even after a local-model
+    [ESCALATE] — to keep the speaker's parametric context off
+    third-party services.  HA stays in play because HA holds tools the
+    user already trusts.
     """
     should_escalate, forwarded_query = detect_escalation(response)
 
@@ -723,7 +718,7 @@ def _maybe_escalate(
         result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
         if result is not None:
             return result
-        if sota_agent is not None:
+        if sota_agent is not None and not is_personal:
             logger.info("[ESCALATE] → SOTA fallback (source=%s): %s", match_source, sanitized[:100])
             return _escalate_to_sota(
                 sanitized,

@@ -45,7 +45,7 @@ import pytest
 
 from paramem.server.config import PathsConfig, load_server_config
 from paramem.server.inference import ChatResult, handle_chat
-from paramem.server.router import RoutingPlan, RoutingStep
+from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -121,6 +121,7 @@ def _pa_router_stub(adapter_name: str, keys: list[str]) -> MagicMock:
         strategy="direct",
         match_source="pa",
         steps=[RoutingStep(adapter_name=adapter_name, keys_to_probe=keys)],
+        intent=Intent.PERSONAL,
     )
     router = MagicMock()
     router.route = lambda text, speaker=None, speaker_id=None: plan
@@ -266,25 +267,33 @@ class TestSimulateInferenceEndToEnd:
     # T2
     # ------------------------------------------------------------------
 
-    def test_pa_match_kp_missing_falls_through_to_ha_then_sota(self, tmp_path):
-        """No keyed_pairs.json → fallback chain HA → SOTA → SOTA returns answer.
+    def test_pa_match_kp_missing_falls_through_to_ha_then_base(self, tmp_path):
+        """No keyed_pairs.json → fallback chain HA → base-model.
+
+        Under the intent-keyed dispatch, ``intent=PERSONAL`` (set by the
+        ``_pa_router_stub``) blocks SOTA at every internal escalation site.
+        When PA disk-recall fails for a personal-class query the chain is:
+
+            HA tool fallback (tools may help even for personal queries)
+            ↓ (returns None)
+            SOTA blocked by privacy invariant (would have run pre-Phase-2)
+            ↓
+            base-model fallthrough
 
         Setup:
         - ``paths.simulate`` exists but is empty (no keyed_pairs).
         - HA returns ``None``.
-        - SOTA returns ``ChatResult(text="<from sota>", escalated=True)``.
-        - ``sanitize_for_cloud`` patched to allow escalation (returns original
-          text so the cloud branch is reached).
+        - SOTA mock present but must NOT be invoked.
+        - ``_base_model_answer`` patched to return the terminal answer.
 
         Assertions:
-        - ``result.text == "<from sota>"`` and ``result.escalated is True``.
-        - ``_escalate_to_ha_agent`` called before ``_escalate_to_sota``.
-        - ``model.generate`` never called (HA → SOTA returned first).
+        - HA was tried once (tool fallback allowed for PERSONAL).
+        - SOTA was NOT called (privacy invariant for PERSONAL).
+        - ``_base_model_answer`` was reached as the terminal step.
 
-        Why this catches a regression: the disk-recall failure path in
-        ``_probe_and_reason`` must walk the same fallback chain as a
-        weight-probe failure.  If the ``if not layers`` branch is incorrectly
-        gated, this test fails.
+        Why this catches a regression: any future change that re-enables
+        the SOTA fallback for PERSONAL queries on disk-recall failure
+        breaks this test.
         """
         config = _simulate_config(tmp_path)
         # Create the simulate_dir but write no keyed_pairs.json.
@@ -294,7 +303,7 @@ class TestSimulateInferenceEndToEnd:
         model = _stub_model()
         tokenizer = MagicMock()
 
-        sota_result = ChatResult(text="<from sota>", escalated=True)
+        base_result = ChatResult(text="<base>")
 
         with (
             patch(
@@ -307,8 +316,12 @@ class TestSimulateInferenceEndToEnd:
             ) as mock_ha,
             patch(
                 "paramem.server.inference._escalate_to_sota",
-                return_value=sota_result,
+                return_value=ChatResult(text="<from sota>", escalated=True),
             ) as mock_sota,
+            patch(
+                "paramem.server.inference._base_model_answer",
+                return_value=base_result,
+            ) as mock_base,
         ):
             result = handle_chat(
                 text="Where does Alex live?",
@@ -319,16 +332,15 @@ class TestSimulateInferenceEndToEnd:
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
-                sota_agent=MagicMock(),  # non-None so SOTA branch is attempted
+                sota_agent=MagicMock(),  # non-None to prove invariant gates it
                 ha_client=MagicMock(),
                 speaker_id="spk-test",
             )
 
-        assert result.text == "<from sota>"
-        assert result.escalated is True
-
+        assert result.text == "<base>"
         mock_ha.assert_called_once()
-        mock_sota.assert_called_once()
+        mock_sota.assert_not_called()
+        mock_base.assert_called_once()
         model.generate.assert_not_called()
 
     # ------------------------------------------------------------------
