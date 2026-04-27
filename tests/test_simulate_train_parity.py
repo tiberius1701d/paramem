@@ -225,15 +225,27 @@ class TestProbeKeysFromDisk:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(pairs))
 
-    def test_reads_episodic_at_top_level(self, tmp_path):
+    def test_reads_episodic_from_subdir(self, tmp_path):
+        """Canonical layout: episodic keyed_pairs lives under episodic/ subdir."""
         self._write_pairs(
-            tmp_path / "keyed_pairs.json",
+            tmp_path / "episodic" / "keyed_pairs.json",
             [{"key": "graph1", "question": "Q1?", "answer": "A1."}],
         )
         results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1"]})
         assert results["graph1"]["question"] == "Q1?"
         assert results["graph1"]["answer"] == "A1."
         assert results["graph1"]["confidence"] == 1.0
+
+    def test_reads_episodic_legacy_top_level_fallback(self, tmp_path):
+        """Legacy fallback: reads top-level keyed_pairs.json when canonical path is absent."""
+        self._write_pairs(
+            tmp_path / "keyed_pairs.json",
+            [{"key": "graph1", "question": "Q1?", "answer": "A1."}],
+        )
+        # Canonical path does NOT exist — fallback must activate.
+        assert not (tmp_path / "episodic" / "keyed_pairs.json").exists()
+        results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1"]})
+        assert results["graph1"]["answer"] == "A1."
 
     def test_reads_semantic_from_subdir(self, tmp_path):
         self._write_pairs(
@@ -257,7 +269,7 @@ class TestProbeKeysFromDisk:
 
     def test_missing_key_returns_none(self, tmp_path):
         self._write_pairs(
-            tmp_path / "keyed_pairs.json",
+            tmp_path / "episodic" / "keyed_pairs.json",
             [{"key": "graph1", "question": "Q1?", "answer": "A1."}],
         )
         results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1", "graph999"]})
@@ -265,7 +277,8 @@ class TestProbeKeysFromDisk:
         assert results["graph999"] is None
 
     def test_malformed_json_returns_none(self, tmp_path):
-        (tmp_path / "keyed_pairs.json").write_text("{not json")
+        (tmp_path / "episodic").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "episodic" / "keyed_pairs.json").write_text("{not json")
         results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1"]})
         assert results == {"graph1": None}
 
@@ -275,7 +288,7 @@ class TestProbeKeysFromDisk:
 
     def test_raw_output_is_json_with_fields(self, tmp_path):
         self._write_pairs(
-            tmp_path / "keyed_pairs.json",
+            tmp_path / "episodic" / "keyed_pairs.json",
             [{"key": "graph1", "question": "Q?", "answer": "A."}],
         )
         results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1"]})

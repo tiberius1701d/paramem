@@ -14,8 +14,8 @@ Usage (stop the server first to free VRAM, then run in background)::
     python scripts/dev/verify_pr1_extraction.py [--session-prefixes 01KNW,01KP0] \\
         [--limit 10] [--no-cloud-noise-filter]
 
-The script writes a cycle_<N>/ directory under data/ha/simulate/ (encrypted
-peer-storage output) and a corresponding cycle_<N>/ directory under
+The script writes per-tier keyed_pairs.json files under data/ha/simulate/
+(encrypted peer-storage output) and a cycle_<N>/ directory under
 data/ha/debug/ (plaintext debug snapshots, _snapshot postfix). It prints the
 simulate-store path to stdout on exit so the caller can inspect results.
 
@@ -239,7 +239,9 @@ def main() -> None:
     # --- Load and override config ---
     config = load_server_config(CONFIG_PATH)
 
-    # Force simulate + debug so _save_simulate_store + _save_debug_artifacts run
+    # Force simulate + debug so _save_keyed_pairs_for_router (simulate-mode
+    # peer-storage writer) + _save_debug_artifacts (plaintext debug snapshot)
+    # run.
     config.consolidation.mode = "simulate"
     config.debug = True
 
@@ -301,8 +303,9 @@ def main() -> None:
     # --- Run consolidation in simulate mode ---
     # run_consolidation calls filtered_buffer.get_pending() internally and
     # filtered_buffer.mark_consolidated() (which is a no-op here).
-    # With mode="simulate" + debug=True it calls _save_simulate_store +
-    # _save_debug_artifacts, writing to config.simulate_dir and config.debug_dir.
+    # With mode="simulate" + debug=True it writes per-tier keyed_pairs.json
+    # under config.simulate_dir (via _save_keyed_pairs_for_router) and
+    # plaintext snapshots under config.debug_dir (via _save_debug_artifacts).
     logger.info("Starting simulate-mode consolidation")
     result = run_consolidation(
         model=model,
@@ -321,19 +324,20 @@ def main() -> None:
         logger.error("Unexpected consolidation status: %s", status)
         sys.exit(1)
 
-    # Locate the simulate store dir that was just written. _save_simulate_store
-    # uses cycle_<N> naming under config.simulate_dir.
+    # Locate the simulate-mode peer-storage output. Post-canonicalization, the simulate
+    # store layout is <simulate_dir>/<tier>/keyed_pairs.json with no per-cycle
+    # subdirectory.
     sim_root = config.simulate_dir
-    cycle_dirs = sorted(
-        sim_root.glob("cycle_*"),
-        key=lambda p: int(p.name.split("_")[1]),
-    )
-    if cycle_dirs:
-        latest = cycle_dirs[-1]
-        print(str(latest))
-        logger.info("Simulation output: %s", latest)
+    ep_kp = sim_root / "episodic" / "keyed_pairs.json"
+    if ep_kp.exists():
+        print(str(ep_kp))
+        logger.info("Simulation episodic output: %s", ep_kp)
+        for tier in ("semantic", "procedural"):
+            tier_kp = sim_root / tier / "keyed_pairs.json"
+            if tier_kp.exists():
+                logger.info("Simulation %s output: %s", tier, tier_kp)
     else:
-        logger.warning("No cycle_* directory found under %s", sim_root)
+        logger.warning("No keyed_pairs.json found under %s", sim_root)
         print(str(sim_root))
 
 

@@ -1578,7 +1578,9 @@ async def lifespan(app: FastAPI):
 
     _state["ha_graph"] = ha_graph
     _state["router"] = QueryRouter(
-        adapter_dir=config.adapter_dir,
+        adapter_dir=(
+            config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
+        ),
         ha_graph=ha_graph,
         intent_config=config.intent,
     )
@@ -2745,7 +2747,11 @@ async def refresh_ha():
         # Rebuild router with new graph
         config = _state["config"]
         _state["router"] = QueryRouter(
-            adapter_dir=config.adapter_dir,
+            adapter_dir=(
+                config.simulate_dir
+                if config.consolidation.mode == "simulate"
+                else config.adapter_dir
+            ),
             ha_graph=ha_graph,
             intent_config=config.intent,
         )
@@ -5652,7 +5658,6 @@ def _extract_and_start_training():
         _save_debug_artifacts,
         _save_key_metadata,
         _save_keyed_pairs_for_router,
-        _save_simulate_store,
         create_consolidation_loop,
     )
 
@@ -5782,7 +5787,9 @@ def _extract_and_start_training():
             # canonical source of truth; inference._load_simhash_registry combines
             # them at read time.
             _save_key_metadata(loop, config)
-            _save_simulate_store(loop, config, all_episodic_qa, all_procedural_rels)
+            # _save_simulate_store retired with the canonicalization — the per-tier
+            # keyed_pairs.json written by _save_keyed_pairs_for_router is the
+            # only simulate-mode persistence (cycle_<N>/ snapshots dropped).
 
         # Simulate is peer storage — retire pending sessions like train.
         session_buffer.mark_consolidated(session_ids)

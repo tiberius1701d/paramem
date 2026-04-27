@@ -1041,46 +1041,7 @@ class TestCollectSemanticKeys:
         assert stub._collect_semantic_keys() == []
 
 
-# --- Simulate-store and debug-artifact writers ---
-
-
-class TestSimulateStore:
-    def test_save_simulate_store_writes_cycle_dir(self, tmp_path):
-        from paramem.server.consolidation import _save_simulate_store
-
-        loop = MagicMock()
-        loop.merger.save_graph = MagicMock()
-        loop.cycle_count = 7
-
-        config = MagicMock()
-        config.simulate_dir = tmp_path
-
-        episodic_qa = [{"question": "Q", "answer": "A"}]
-        procedural_rels = [{"subject": "S", "predicate": "P", "object": "O"}]
-
-        _save_simulate_store(loop, config, episodic_qa, procedural_rels)
-
-        out = tmp_path / "cycle_7"
-        assert (out / "episodic_qa.json").exists()
-        assert (out / "procedural_rels.json").exists()
-        # graph.json is the merger's responsibility — the test verifies it was called
-        loop.merger.save_graph.assert_called_once_with(out / "graph.json")
-
-    def test_save_simulate_store_omits_procedural_when_empty(self, tmp_path):
-        from paramem.server.consolidation import _save_simulate_store
-
-        loop = MagicMock()
-        loop.merger.save_graph = MagicMock()
-        loop.cycle_count = 3
-
-        config = MagicMock()
-        config.simulate_dir = tmp_path
-
-        _save_simulate_store(loop, config, [{"q": "Q", "a": "A"}], [])
-
-        out = tmp_path / "cycle_3"
-        assert (out / "episodic_qa.json").exists()
-        assert not (out / "procedural_rels.json").exists()
+# --- Debug-artifact writers ---
 
 
 class TestDebugArtifacts:

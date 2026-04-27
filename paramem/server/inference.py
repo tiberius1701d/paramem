@@ -544,8 +544,10 @@ def _probe_and_reason(
 
     # Simulate mode: recall from disk-persisted keyed_pairs.json instead of
     # probing adapter weights. Blackbox-equivalent under perfect recall.
+    # Reads from paths.simulate (locked decision #2 — simulate-mode reads/writes
+    # use paths.simulate, not paths.adapters).
     if config.consolidation.mode == "simulate":
-        probe_results = probe_keys_from_disk(config.adapter_dir, keys_by_adapter)
+        probe_results = probe_keys_from_disk(config.simulate_dir, keys_by_adapter)
     else:
         # One switch_adapter call per adapter group.
         probe_results = probe_keys_grouped_by_adapter(

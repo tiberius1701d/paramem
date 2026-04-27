@@ -603,8 +603,12 @@ def probe_keys_from_disk(
     perfect-recall train run would produce — same shape, same content.
 
     On-disk layout (produced by ``_save_keyed_pairs_for_router``):
-      * episodic: ``adapter_dir/keyed_pairs.json``
-      * other:    ``adapter_dir/<adapter_name>/keyed_pairs.json``
+      * canonical: ``adapter_dir/<adapter_name>/keyed_pairs.json`` for all tiers.
+
+    A backwards-compat fallback reads the legacy top-level path
+    ``adapter_dir/keyed_pairs.json`` for episodic when the canonical path
+    is missing AND a top-level file exists. This fallback may be removed
+    after operators have run one consolidation cycle on the new layout.
 
     Missing files, missing keys, and malformed JSON all map to ``None`` —
     matches the per-key failure shape of ``probe_keys_grouped_by_adapter``.
@@ -621,10 +625,21 @@ def probe_keys_from_disk(
         if not keys:
             continue
 
-        if adapter_name == "episodic":
-            kp_path = adapter_dir / "keyed_pairs.json"
-        else:
-            kp_path = adapter_dir / adapter_name / "keyed_pairs.json"
+        kp_path = adapter_dir / adapter_name / "keyed_pairs.json"
+        # Backwards-compat: legacy production wrote episodic keyed_pairs at the
+        # top of adapter_dir before the layout canonicalization. Fall back when
+        # the canonical path is missing AND a top-level file exists. Drop after
+        # operators have run one consolidation cycle on the new layout.
+        if adapter_name == "episodic" and not kp_path.exists():
+            legacy = adapter_dir / "keyed_pairs.json"
+            if legacy.exists():
+                logger.warning(
+                    "keyed_pairs.json for episodic found at legacy top-level path %s; "
+                    "expected canonical %s. Run one consolidation cycle to rewrite.",
+                    legacy,
+                    kp_path,
+                )
+                kp_path = legacy
 
         if not kp_path.exists():
             logger.warning(

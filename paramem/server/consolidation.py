@@ -101,23 +101,30 @@ def create_consolidation_loop(
     # gate fires forever because the rebuild never advances main slots'
     # window_stamp.  Transparently decrypts age-wrapped content when the
     # daily identity is loaded.
-    ep_kp_path = config.adapter_dir / "episodic" / "keyed_pairs.json"
+    #
+    # Seed reads from the canonical store for the active mode (locked
+    # decision #2). Train mode reads from paths.adapters (where _save_adapters
+    # wrote canonical bytes); simulate mode reads from paths.simulate (where
+    # _save_keyed_pairs_for_router writes canonical bytes).
+    store_dir = (
+        config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
+    )
+
+    ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
     if ep_kp_path.exists():
         loop.seed_episodic_qa(json.loads(read_maybe_encrypted(ep_kp_path).decode("utf-8")))
 
-    sem_kp_path = config.adapter_dir / "semantic" / "keyed_pairs.json"
+    sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
     if sem_kp_path.exists():
         loop.seed_semantic_qa(json.loads(read_maybe_encrypted(sem_kp_path).decode("utf-8")))
 
-    proc_kp_path = config.adapter_dir / "procedural" / "keyed_pairs.json"
+    proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
     if proc_kp_path.exists():
         loop.seed_procedural_qa(json.loads(read_maybe_encrypted(proc_kp_path).decode("utf-8")))
 
-    # Interim slots also persist keyed_pairs.json (one per
-    # ``episodic_interim_<stamp>`` directory).  Seed those into the same
-    # episodic store so consolidate_interim_adapters can read them when
-    # rebuilding main on the full-cycle boundary.  seed_episodic_qa is
-    # additive — repeated calls accumulate keys rather than overwriting.
+    # Interim slots are training-only (locked decision #3) — always under
+    # paths.adapters regardless of mode. The simulate store has no interim
+    # concept by design.
     for interim_dir in sorted(config.adapter_dir.glob("episodic_interim_*")):
         if not interim_dir.is_dir():
             continue
@@ -130,6 +137,24 @@ def create_consolidation_loop(
             logger.exception(
                 "Failed to seed indexed_key_qa from interim slot %s — skipping",
                 interim_dir.name,
+            )
+
+    # One-time startup WARN when the non-active store has stale keyed_pairs
+    # from a previous mode. The startup path runs once per process so this
+    # does not spam logs.
+    inactive_dir = (
+        config.adapter_dir if config.consolidation.mode == "simulate" else config.simulate_dir
+    )
+    if inactive_dir.exists():
+        stale = list(inactive_dir.rglob("keyed_pairs.json"))
+        if stale:
+            logger.warning(
+                "Found %d stale keyed_pairs.json under %s (active mode is %r). "
+                "Inference reads only the active store; remove the inactive "
+                "store or re-run consolidation in the matching mode to clear.",
+                len(stale),
+                inactive_dir,
+                config.consolidation.mode,
             )
 
     return loop
@@ -338,7 +363,9 @@ def run_consolidation(
 
             _save_keyed_pairs_for_router(loop, config)
             _save_key_metadata(loop, config)
-            _save_simulate_store(loop, config, all_episodic_qa, all_procedural_rels)
+            # _save_simulate_store retired with the canonicalization — the per-tier
+            # keyed_pairs.json written by _save_keyed_pairs_for_router is the
+            # only simulate-mode persistence (cycle_<N>/ snapshots dropped).
         except Exception:
             logger.exception(
                 "Simulated consolidation failed — leaving %d sessions pending",
@@ -468,47 +495,6 @@ _dedup_episodic = ConsolidationLoop.dedup_episodic
 _dedup_procedural = ConsolidationLoop.dedup_procedural
 
 
-def _save_simulate_store(
-    loop: ConsolidationLoop,
-    config: ServerConfig,
-    episodic_qa: list[dict],
-    procedural_rels: list[dict],
-) -> None:
-    """Write encrypted simulate-mode output to ``config.simulate_dir/cycle_<N>/``.
-
-    Peer of ``_save_adapters`` for the simulate branch: writes the graph,
-    episodic QA pairs, and procedural relations as encrypted JSON under the
-    simulate store root.  All filenames carry no postfix — these are production
-    artifacts (simulate is peer storage to train, not a debug preview).
-
-    Parameters
-    ----------
-    loop:
-        Active ``ConsolidationLoop`` (provides ``merger`` and ``cycle_count``).
-    config:
-        Server configuration (provides ``simulate_dir``).
-    episodic_qa:
-        Episodic QA pairs produced by the consolidation pipeline.
-    procedural_rels:
-        Procedural relation triples produced by the consolidation pipeline.
-    """
-    out_dir = config.simulate_dir / f"cycle_{loop.cycle_count}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Encrypted by default — simulate is a production persistence venue.
-    loop.merger.save_graph(out_dir / "graph.json")
-    _atomic_json_write(episodic_qa, out_dir / "episodic_qa.json")
-    if procedural_rels:
-        _atomic_json_write(procedural_rels, out_dir / "procedural_rels.json")
-
-    logger.info(
-        "Simulate store written to %s: %d episodic QA, %d procedural rels",
-        out_dir,
-        len(episodic_qa),
-        len(procedural_rels),
-    )
-
-
 def _save_debug_artifacts(
     loop: ConsolidationLoop,
     config: ServerConfig,
@@ -632,19 +618,39 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
 
 
 def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Save keyed_pairs.json per adapter for router entity indexing."""
-    config.adapter_dir.mkdir(parents=True, exist_ok=True)
+    """Save keyed_pairs.json per adapter for router entity indexing.
 
-    # Episodic keyed_pairs at the top level
-    _write_keyed_pairs(
-        loop.indexed_key_qa,
-        loop.episodic_simhash,
-        config.adapter_dir / "keyed_pairs.json",
+    Mode-aware: in simulate mode the canonical store is ``paths.simulate``;
+    in train mode the canonical store is ``paths.adapters``. Layout is
+    identical in both stores: ``<store_dir>/<tier>/keyed_pairs.json`` for
+    all three tiers.
+
+    Note: in train mode this helper is no longer the primary writer —
+    ``ConsolidationLoop._save_adapters`` writes canonical keyed_pairs
+    bytes-identically as part of the I5 reorder before the manifest is
+    built (paramem/training/consolidation.py:2154-2158). This helper
+    runs only on the simulate path today (see run_consolidation L386-393).
+    Post-canonicalization: this is the **only** simulate-mode persistence —
+    the cycle_<N>/ snapshot writer (``_save_simulate_store``) is retired
+    because it produced no load-bearing artifacts.
+    """
+    store_dir = (
+        config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
     )
+    store_dir.mkdir(parents=True, exist_ok=True)
 
-    # Semantic keyed_pairs in the semantic adapter directory
+    # Episodic keyed_pairs in the canonical episodic subdirectory.
+    if loop.episodic_simhash:
+        ep_dir = store_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_keyed_pairs(
+            loop.indexed_key_qa,
+            loop.episodic_simhash,
+            ep_dir / "keyed_pairs.json",
+        )
+
     if loop.semantic_simhash:
-        sem_dir = config.adapter_dir / "semantic"
+        sem_dir = store_dir / "semantic"
         sem_dir.mkdir(parents=True, exist_ok=True)
         _write_keyed_pairs(
             loop.indexed_key_qa,
@@ -652,9 +658,8 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
             sem_dir / "keyed_pairs.json",
         )
 
-    # Procedural keyed_pairs in the procedural adapter directory
     if loop.procedural_simhash:
-        proc_dir = config.adapter_dir / "procedural"
+        proc_dir = store_dir / "procedural"
         proc_dir.mkdir(parents=True, exist_ok=True)
         _write_keyed_pairs(
             loop.indexed_key_qa,

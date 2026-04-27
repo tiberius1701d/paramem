@@ -50,8 +50,10 @@ class TestRouterDoesNotMountTrialAdapter:
             encoding="utf-8",
         )
 
-        # Also write a live key in config.adapter_dir.
-        live_kp = adapter_dir / "keyed_pairs.json"
+        # Also write a live key in config.adapter_dir using the canonical layout.
+        live_ep_dir = adapter_dir / "episodic"
+        live_ep_dir.mkdir(parents=True, exist_ok=True)
+        live_kp = live_ep_dir / "keyed_pairs.json"
         live_kp.write_text(
             json.dumps(
                 [
@@ -81,11 +83,14 @@ class TestRouterDoesNotMountTrialAdapter:
         )
 
     def test_router_mounts_live_adapter_keys(self, tmp_path):
-        """Router does index keyed_pairs.json from config.adapter_dir."""
+        """Router does index keyed_pairs.json from config.adapter_dir (canonical layout)."""
         adapter_dir = tmp_path / "adapters"
         adapter_dir.mkdir(parents=True)
 
-        live_kp = adapter_dir / "keyed_pairs.json"
+        # Canonical layout: episodic keyed_pairs lives under episodic/ subdir.
+        ep_dir = adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        live_kp = ep_dir / "keyed_pairs.json"
         live_kp.write_text(
             json.dumps(
                 [
