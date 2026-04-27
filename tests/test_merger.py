@@ -270,7 +270,7 @@ class TestPersistence:
     ):
         """save_graph(..., encrypted=False) must bypass the envelope and emit
         plaintext JSON, even under Security ON.  Debug-directory writers
-        depend on this so ``cat debug/cycle_*/graph.json`` is always
+        depend on this so ``cat debug/cycle_*/graph_snapshot.json`` is always
         human-readable regardless of the server's posture.
         """
         from paramem.backup.key_store import (

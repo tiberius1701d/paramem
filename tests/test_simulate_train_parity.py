@@ -1,9 +1,9 @@
 """Parity tests: simulate mode is blackbox-equivalent to train mode.
 
 Simulate runs the full extraction + key-assignment + SimHash pipeline but
-skips the LoRA weight update and does not mark sessions consolidated.
-Under perfect recall, on-disk state (keyed_pairs + SimHash registries)
-is identical to what train mode would produce.
+skips the LoRA weight update.  Under perfect recall, on-disk state
+(keyed_pairs + SimHash registries) is identical to what train mode would
+produce.
 """
 
 from __future__ import annotations

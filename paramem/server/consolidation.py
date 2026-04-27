@@ -305,14 +305,27 @@ def run_consolidation(
             len(all_procedural_rels),
         )
 
-    # --- Simulate mode: full pipeline minus weight update, minus archival ---
-    # Blackbox-equivalent to train: same key assignment, same contradiction
-    # handling, same SimHash registry, same on-disk keyed_pairs + registry.
-    # Deltas (intentional):
-    #   * no LoRA weight update  → recall at inference reads disk
-    #   * no mark_consolidated   → sessions keep feeding extraction until a real
-    #                              train cycle consolidates them (the merger is
-    #                              idempotent on (subject, predicate, object))
+    # --- Simulate mode: peer storage backend ---
+    # Same upstream pipeline as train (extraction → dedup → key assignment →
+    # contradiction handling → SimHash registry); the persistence venue is
+    # an encrypted JSON store under paths.simulate instead of LoRA weight
+    # updates. mark_consolidated runs in both branches — sessions retire
+    # when their work has been persisted, regardless of medium. Inference
+    # reads from the JSON store at retrieval time (Task #7 follow-up).
+
+    # Symmetric debug dump — runs in BOTH simulate and train branches when
+    # debug is on. Plaintext, inspection-first; closes the asymmetry that
+    # previously gated debug output on simulate mode only.
+    #
+    # Best-effort: a debug-write failure (disk full, permission, etc.) MUST
+    # NOT abort consolidation. The call has its own log-and-continue envelope
+    # so a debug failure does not regress train-branch error handling.
+    if config.debug:
+        try:
+            _save_debug_artifacts(loop, config, all_episodic_qa, all_procedural_rels)
+        except Exception:
+            logger.exception("debug-artifact write failed; continuing consolidation")
+
     simulate = config.consolidation.mode == "simulate"
     if simulate:
         primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
@@ -325,9 +338,7 @@ def run_consolidation(
 
             _save_keyed_pairs_for_router(loop, config)
             _save_key_metadata(loop, config)
-
-            if config.debug:
-                _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
+            _save_simulate_store(loop, config, all_episodic_qa, all_procedural_rels)
         except Exception:
             logger.exception(
                 "Simulated consolidation failed — leaving %d sessions pending",
@@ -335,8 +346,11 @@ def run_consolidation(
             )
             raise
 
-        # NOTE: sessions intentionally NOT marked consolidated — simulate never
-        # retires pending work. A later train cycle will consolidate them.
+        # Simulate is peer storage — sessions retire here just like train.
+        # The simulate JSON store IS the persistence venue; the merger is
+        # still idempotent on (subject, predicate, object) so a re-run of
+        # those sessions would be a no-op anyway.
+        _do_mark_consolidated(session_buffer, session_ids, mark_consolidated_callback)
         elapsed = time.time() - start_time
         summary = {
             "status": "simulated",
@@ -454,34 +468,90 @@ _dedup_episodic = ConsolidationLoop.dedup_episodic
 _dedup_procedural = ConsolidationLoop.dedup_procedural
 
 
-def _save_simulation_results(
-    episodic_qa: list[dict],
-    procedural_rels: list[dict],
+def _save_simulate_store(
     loop: ConsolidationLoop,
     config: ServerConfig,
+    episodic_qa: list[dict],
+    procedural_rels: list[dict],
 ) -> None:
-    """Save extraction results to debug dir without training.
+    """Write encrypted simulate-mode output to ``config.simulate_dir/cycle_<N>/``.
 
-    Writes timestamped graph snapshot and QA pairs for review.
+    Peer of ``_save_adapters`` for the simulate branch: writes the graph,
+    episodic QA pairs, and procedural relations as encrypted JSON under the
+    simulate store root.  All filenames carry no postfix — these are production
+    artifacts (simulate is peer storage to train, not a debug preview).
+
+    Parameters
+    ----------
+    loop:
+        Active ``ConsolidationLoop`` (provides ``merger`` and ``cycle_count``).
+    config:
+        Server configuration (provides ``simulate_dir``).
+    episodic_qa:
+        Episodic QA pairs produced by the consolidation pipeline.
+    procedural_rels:
+        Procedural relation triples produced by the consolidation pipeline.
     """
-    from datetime import datetime
+    out_dir = config.simulate_dir / f"cycle_{loop.cycle_count}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sim_dir = config.debug_dir / f"sim_{timestamp}"
-    sim_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save cumulative graph (plaintext — debug output is inspection-first,
-    # uniform with sessions/*.jsonl under debug: true).
-    loop.merger.save_graph(sim_dir / "graph.json", encrypted=False)
-
-    # Save QA pairs (plaintext — same rationale as the graph above).
-    _atomic_json_write(episodic_qa, sim_dir / "episodic_qa.json", encrypted=False)
+    # Encrypted by default — simulate is a production persistence venue.
+    loop.merger.save_graph(out_dir / "graph.json")
+    _atomic_json_write(episodic_qa, out_dir / "episodic_qa.json")
     if procedural_rels:
-        _atomic_json_write(procedural_rels, sim_dir / "procedural_rels.json", encrypted=False)
+        _atomic_json_write(procedural_rels, out_dir / "procedural_rels.json")
 
     logger.info(
-        "Simulation saved to %s: %d episodic QA, %d procedural rels",
-        sim_dir,
+        "Simulate store written to %s: %d episodic QA, %d procedural rels",
+        out_dir,
+        len(episodic_qa),
+        len(procedural_rels),
+    )
+
+
+def _save_debug_artifacts(
+    loop: ConsolidationLoop,
+    config: ServerConfig,
+    episodic_qa: list[dict],
+    procedural_rels: list[dict],
+) -> None:
+    """Write plaintext debug artifacts to ``config.debug_dir/cycle_<N>/``.
+
+    Called in BOTH simulate and train branches when ``config.debug`` is true,
+    so per-cycle debug dumps are symmetric regardless of mode.  All filenames
+    carry the ``_snapshot`` postfix (locked decision #7) so every file under
+    ``config.debug_dir`` is trivially distinguishable from production output
+    by name alone.
+
+    Always plaintext (``encrypted=False``), regardless of the server's Security
+    posture — debug output is inspection-first; operators must be able to read
+    it with ``cat`` / ``grep`` without any decrypt step.
+
+    Parameters
+    ----------
+    loop:
+        Active ``ConsolidationLoop`` (provides ``merger`` and ``cycle_count``).
+    config:
+        Server configuration (provides ``debug_dir``).
+    episodic_qa:
+        Episodic QA pairs produced by the consolidation pipeline.
+    procedural_rels:
+        Procedural relation triples produced by the consolidation pipeline.
+    """
+    out_dir = config.debug_dir / f"cycle_{loop.cycle_count}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Plaintext — debug output is inspection-first, regardless of Security posture.
+    loop.merger.save_graph(out_dir / "graph_snapshot.json", encrypted=False)
+    _atomic_json_write(episodic_qa, out_dir / "episodic_qa_snapshot.json", encrypted=False)
+    if procedural_rels:
+        _atomic_json_write(
+            procedural_rels, out_dir / "procedural_rels_snapshot.json", encrypted=False
+        )
+
+    logger.info(
+        "Debug artifacts written to %s: %d episodic QA, %d procedural rels",
+        out_dir,
         len(episodic_qa),
         len(procedural_rels),
     )

@@ -210,11 +210,12 @@ class ServerNetConfig:
 
 @dataclass
 class PathsConfig:
-    """Mount points for persistent data, sessions, and debug output."""
+    """Mount points for persistent data, sessions, simulate-store, debug output, and prompts."""
 
     data: Path = Path("data/ha")
     sessions: Path = Path("data/ha/sessions")
     debug: Path = Path("data/ha/debug")
+    simulate: Path = Path("data/ha/simulate")
     prompts: Path = Path("configs/prompts")
 
     @property
@@ -782,6 +783,10 @@ class ServerConfig:
         return self.paths.debug
 
     @property
+    def simulate_dir(self) -> Path:
+        return self.paths.simulate
+
+    @property
     def prompts_dir(self) -> Path:
         return self.paths.prompts
 
@@ -886,10 +891,11 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             data=Path(paths_raw.get("data", config.paths.data)),
             sessions=Path(paths_raw.get("sessions", config.paths.sessions)),
             debug=Path(paths_raw.get("debug", config.paths.debug)),
+            simulate=Path(paths_raw.get("simulate", config.paths.simulate)),
             prompts=Path(paths_raw.get("prompts", config.paths.prompts)),
         )
     # Make relative paths absolute (anchored to project root)
-    for path_field in ("data", "sessions", "debug", "prompts"):
+    for path_field in ("data", "sessions", "debug", "simulate", "prompts"):
         p = getattr(config.paths, path_field)
         if not p.is_absolute():
             setattr(config.paths, path_field, config_dir / p)

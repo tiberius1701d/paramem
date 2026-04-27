@@ -1580,6 +1580,7 @@ async def lifespan(app: FastAPI):
     _state["router"] = QueryRouter(
         adapter_dir=config.adapter_dir,
         ha_graph=ha_graph,
+        intent_config=config.intent,
     )
 
     # Residual intent classifier — load the sentence-encoder once so the
@@ -2746,6 +2747,7 @@ async def refresh_ha():
         _state["router"] = QueryRouter(
             adapter_dir=config.adapter_dir,
             ha_graph=ha_graph,
+            intent_config=config.intent,
         )
 
     return {

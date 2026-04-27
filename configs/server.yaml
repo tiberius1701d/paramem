@@ -81,6 +81,7 @@ debug: true  # cycle snapshots, verbose logging
 paths:
   data: data/ha                 # persistent artifacts (adapters, registry, key_metadata)
   sessions: data/ha/sessions    # conversation transcripts pending consolidation
+  simulate: data/ha/simulate    # encrypted JSON-store outputs when consolidation.mode = simulate
   debug: data/ha/debug          # cycle snapshots, diagnostic output (only when debug=true)
   prompts: configs/prompts      # extraction and voice prompt templates
 
@@ -170,7 +171,7 @@ adapters:
 consolidation:
   refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
-  mode: train                  # "train" = full pipeline, "simulate" = extract only (saves graphs + QA to debug dir)
+  mode: train                  # "train" persists to LoRA weights; "simulate" persists encrypted JSON store under paths.simulate
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism

@@ -1041,15 +1041,55 @@ class TestCollectSemanticKeys:
         assert stub._collect_semantic_keys() == []
 
 
-# --- Simulation mode ---
+# --- Simulate-store and debug-artifact writers ---
 
 
-class TestSimulationMode:
-    def test_save_simulation_results(self, tmp_path):
-        from paramem.server.consolidation import _save_simulation_results
+class TestSimulateStore:
+    def test_save_simulate_store_writes_cycle_dir(self, tmp_path):
+        from paramem.server.consolidation import _save_simulate_store
 
         loop = MagicMock()
         loop.merger.save_graph = MagicMock()
+        loop.cycle_count = 7
+
+        config = MagicMock()
+        config.simulate_dir = tmp_path
+
+        episodic_qa = [{"question": "Q", "answer": "A"}]
+        procedural_rels = [{"subject": "S", "predicate": "P", "object": "O"}]
+
+        _save_simulate_store(loop, config, episodic_qa, procedural_rels)
+
+        out = tmp_path / "cycle_7"
+        assert (out / "episodic_qa.json").exists()
+        assert (out / "procedural_rels.json").exists()
+        # graph.json is the merger's responsibility — the test verifies it was called
+        loop.merger.save_graph.assert_called_once_with(out / "graph.json")
+
+    def test_save_simulate_store_omits_procedural_when_empty(self, tmp_path):
+        from paramem.server.consolidation import _save_simulate_store
+
+        loop = MagicMock()
+        loop.merger.save_graph = MagicMock()
+        loop.cycle_count = 3
+
+        config = MagicMock()
+        config.simulate_dir = tmp_path
+
+        _save_simulate_store(loop, config, [{"q": "Q", "a": "A"}], [])
+
+        out = tmp_path / "cycle_3"
+        assert (out / "episodic_qa.json").exists()
+        assert not (out / "procedural_rels.json").exists()
+
+
+class TestDebugArtifacts:
+    def test_save_debug_artifacts_writes_plaintext(self, tmp_path):
+        from paramem.server.consolidation import _save_debug_artifacts
+
+        loop = MagicMock()
+        loop.merger.save_graph = MagicMock()
+        loop.cycle_count = 4
 
         config = MagicMock()
         config.debug_dir = tmp_path
@@ -1057,19 +1097,33 @@ class TestSimulationMode:
         episodic_qa = [{"question": "Q", "answer": "A"}]
         procedural_rels = [{"subject": "S", "predicate": "P", "object": "O"}]
 
-        _save_simulation_results(episodic_qa, procedural_rels, loop, config)
+        _save_debug_artifacts(loop, config, episodic_qa, procedural_rels)
 
-        # Check files were created
-        sim_dirs = list(tmp_path.glob("sim_*"))
-        assert len(sim_dirs) == 1
-        sim_dir = sim_dirs[0]
-        assert (sim_dir / "episodic_qa.json").exists()
-        assert (sim_dir / "procedural_rels.json").exists()
+        out = tmp_path / "cycle_4"
+        # All debug filenames carry the _snapshot postfix (locked decision #7)
+        assert (out / "episodic_qa_snapshot.json").exists()
+        assert (out / "procedural_rels_snapshot.json").exists()
+        loop.merger.save_graph.assert_called_once_with(out / "graph_snapshot.json", encrypted=False)
 
-        with open(sim_dir / "episodic_qa.json") as f:
-            saved = json.load(f)
-        assert len(saved) == 1
-        assert saved[0]["question"] == "Q"
+        with open(out / "episodic_qa_snapshot.json") as f:
+            saved = json.load(f)  # plaintext json — readable without decrypt
+        assert saved == episodic_qa
+
+    def test_save_debug_artifacts_omits_procedural_when_empty(self, tmp_path):
+        from paramem.server.consolidation import _save_debug_artifacts
+
+        loop = MagicMock()
+        loop.merger.save_graph = MagicMock()
+        loop.cycle_count = 2
+
+        config = MagicMock()
+        config.debug_dir = tmp_path
+
+        _save_debug_artifacts(loop, config, [{"question": "Q", "answer": "A"}], [])
+
+        out = tmp_path / "cycle_2"
+        assert (out / "episodic_qa_snapshot.json").exists()
+        assert not (out / "procedural_rels_snapshot.json").exists()
 
 
 # ---------------------------------------------------------------------------

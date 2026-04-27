@@ -234,6 +234,7 @@ def handle_chat(
         if plan is not None:
             routing_diags["match_source"] = plan.match_source
             routing_diags["imperative"] = plan.imperative
+            routing_diags["intent"] = plan.intent.value
 
         # Pre-compute sanitization once for all cloud escalation paths.
         # Personal-content detection is anchored on the router's entity index

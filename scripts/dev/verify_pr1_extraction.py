@@ -14,8 +14,10 @@ Usage (stop the server first to free VRAM, then run in background)::
     python scripts/dev/verify_pr1_extraction.py [--session-prefixes 01KNW,01KP0] \\
         [--limit 10] [--no-cloud-noise-filter]
 
-The script writes a timestamped sim_<ts>/ directory under data/ha/debug/ and
-prints the path to stdout on exit so the caller can inspect results.
+The script writes a cycle_<N>/ directory under data/ha/simulate/ (encrypted
+peer-storage output) and a corresponding cycle_<N>/ directory under
+data/ha/debug/ (plaintext debug snapshots, _snapshot postfix). It prints the
+simulate-store path to stdout on exit so the caller can inspect results.
 
 Notes
 -----
@@ -24,7 +26,8 @@ Notes
 * HF_DEACTIVATE_ASYNC_LOAD=1 must be set in the environment (loaded from
   .env via the export idiom above).
 * Never mutates session state on disk — the real SessionBuffer's
-  mark_consolidated() is never called.
+  mark_consolidated() is invoked against a no-op filter wrapper; pending-session
+  state in the production buffer is unaffected.
 * No server start/stop, no HTTP calls.
 """
 
@@ -236,7 +239,7 @@ def main() -> None:
     # --- Load and override config ---
     config = load_server_config(CONFIG_PATH)
 
-    # Force simulate + debug so _save_simulation_results runs
+    # Force simulate + debug so _save_simulate_store + _save_debug_artifacts run
     config.consolidation.mode = "simulate"
     config.debug = True
 
@@ -298,8 +301,8 @@ def main() -> None:
     # --- Run consolidation in simulate mode ---
     # run_consolidation calls filtered_buffer.get_pending() internally and
     # filtered_buffer.mark_consolidated() (which is a no-op here).
-    # With mode="simulate" + debug=True it calls _save_simulation_results,
-    # which writes the timestamped sim_<ts>/ directory under config.debug_dir.
+    # With mode="simulate" + debug=True it calls _save_simulate_store +
+    # _save_debug_artifacts, writing to config.simulate_dir and config.debug_dir.
     logger.info("Starting simulate-mode consolidation")
     result = run_consolidation(
         model=model,
@@ -318,17 +321,20 @@ def main() -> None:
         logger.error("Unexpected consolidation status: %s", status)
         sys.exit(1)
 
-    # Locate the debug dir that was just written. _save_simulation_results uses
-    # a timestamp suffix — find the newest sim_* directory.
-    debug_dir = config.debug_dir
-    sim_dirs = sorted(debug_dir.glob("sim_*"), key=lambda p: p.name)
-    if sim_dirs:
-        latest_sim = sim_dirs[-1]
-        print(str(latest_sim))
-        logger.info("Simulation output: %s", latest_sim)
+    # Locate the simulate store dir that was just written. _save_simulate_store
+    # uses cycle_<N> naming under config.simulate_dir.
+    sim_root = config.simulate_dir
+    cycle_dirs = sorted(
+        sim_root.glob("cycle_*"),
+        key=lambda p: int(p.name.split("_")[1]),
+    )
+    if cycle_dirs:
+        latest = cycle_dirs[-1]
+        print(str(latest))
+        logger.info("Simulation output: %s", latest)
     else:
-        logger.warning("No sim_* directory found under %s", debug_dir)
-        print(str(debug_dir))
+        logger.warning("No cycle_* directory found under %s", sim_root)
+        print(str(sim_root))
 
 
 if __name__ == "__main__":

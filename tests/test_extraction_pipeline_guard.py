@@ -800,7 +800,7 @@ def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypa
     )
     ConsolidationLoop._run_extract_graph(ns_main, "transcript text", "sess-A")
 
-    main_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "graph.json"
+    main_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "graph_snapshot.json"
     assert main_path.exists(), f"episodic dump missing at {main_path}"
     main_dump = json.loads(main_path.read_text())
     assert main_dump["diagnostics"]["fallback_path"] == "all_dropped"
@@ -818,13 +818,13 @@ def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypa
     )
     ConsolidationLoop._run_extract_procedural_graph(ns_proc, "transcript text", "sess-A")
 
-    proc_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "procedural_graph.json"
+    proc_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
     assert proc_path.exists(), f"procedural dump missing at {proc_path}"
     proc_dump = json.loads(proc_path.read_text())
     assert proc_dump["diagnostics"]["fallback_path"] == "all_dropped"
 
     # Same session, two distinct dumps — operator can compare both extractors
-    # for one session by `cat sessions/<session_id>/*.json`.
+    # for one session by `cat sessions/<session_id>/*_snapshot.json`.
     assert main_path.parent == proc_path.parent
     assert main_path.name != proc_path.name
 

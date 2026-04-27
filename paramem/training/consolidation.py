@@ -532,7 +532,7 @@ class ConsolidationLoop:
             / f"cycle_{self.cycle_count}"
             / "sessions"
             / session_id
-            / f"{kind}.json"
+            / f"{kind}_snapshot.json"
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(graph.model_dump_json(indent=2))
@@ -693,10 +693,10 @@ class ConsolidationLoop:
         self._triples_since_last_enrichment += len(session_graph.relations)
 
         # Save graph snapshot if debug mode — plaintext so operators can
-        # `cat debug/cycle_*/graph.json` without `paramem dump`, uniform
-        # with sessions/*.jsonl under debug: true.
+        # `cat debug/cycle_*/graph_snapshot.json` without `paramem dump`,
+        # uniform with sessions/*.jsonl under debug: true.
         if self.save_cycle_snapshots and self.snapshot_dir:
-            snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph.json"
+            snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph_snapshot.json"
             self.merger.save_graph(snapshot_graph, encrypted=False)
 
         # --- GENERATE EPISODIC QA ---
@@ -859,8 +859,10 @@ class ConsolidationLoop:
         disk-seeded indexed_key_qa instead of probing adapter weights — under
         perfect recall, probe_key would return identical content.
 
-        Caller is responsible for NOT marking sessions consolidated and for
-        skipping the adapter save / key-metadata persist.
+        Caller is responsible for the persistence venue (encrypted JSON store
+        in simulate mode vs. LoRA weights in train mode) and for the
+        bookkeeping that the consolidation outer layer normally performs
+        (key-metadata persist, registry persist, session retirement).
         """
         self.cycle_count += 1
         result: dict = {"simulated": True}
@@ -1474,11 +1476,12 @@ class ConsolidationLoop:
         # --- 8. SAVE ---
         # persist_graph=True → authoritative production store → encrypted.
         # save_cycle_snapshots (debug mode) → inspection output → plaintext,
-        # uniform with sessions/*.jsonl and the simulate-mode debug dumps.
+        # uniform with sessions/*.jsonl and the debug-mode artifacts written by
+        # _save_debug_artifacts (both gated on debug: true, both plaintext).
         if self.persist_graph:
             self.merger.save_graph(self.graph_path)
         elif self.save_cycle_snapshots and self.snapshot_dir:
-            snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph.json"
+            snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph_snapshot.json"
             self.merger.save_graph(snapshot_graph, encrypted=False)
         self._save_adapters()
 
