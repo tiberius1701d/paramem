@@ -317,7 +317,15 @@ sanitization:
 # ============================================================================
 abstention:
   enabled: true
-  response: "I don't have that information stored yet."
+  # Messages live in dedicated prompt files so they can be tuned without
+  # code changes — same pattern as voice.prompt_file. The *_override
+  # fields take precedence when set; an empty override falls back to the
+  # file, and a missing file falls back to a module-level constant in
+  # paramem/server/config.py.
+  response_file: configs/prompts/abstention_response.txt
+  cold_start_response_file: configs/prompts/abstention_cold_start.txt
+  # response_override: "..."             # uncomment to pin inline
+  # cold_start_response_override: "..."  # uncomment to pin inline
 
 voice:
   prompt_file: configs/prompts/ha_voice.txt

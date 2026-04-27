@@ -324,13 +324,34 @@ def handle_chat(
     # fact-sharing) are not a confabulation risk — the user is the source of
     # the facts in the same turn — so they fall through to the base model
     # for conversational acknowledgement.
+    #
+    # Two response variants distinguish the two states:
+    #
+    # * Cold start — speaker is identified but the router has no keys for
+    #   them yet (typical between enrollment and the next consolidation).
+    #   The canned "I don't have that information stored yet" reads as
+    #   confused in that state because the system *can't* have facts about
+    #   a freshly enrolled speaker. Use ``cold_start_response`` instead.
+    # * Coverage gap — speaker has parametric facts but this query missed.
+    #   The standard ``response`` is appropriate.
     if (
         sanitized_text is None
         and config.abstention.enabled
         and "self_referential" in sanitization_findings
     ):
-        logger.info("Abstention: self-referential query + no local match")
-        return ChatResult(text=config.abstention.response)
+        is_cold_start = bool(speaker_id) and (
+            router is None or not router._speaker_key_index.get(speaker_id)
+        )
+        response_text = (
+            config.abstention.load_cold_start_response()
+            if is_cold_start
+            else config.abstention.load_response()
+        )
+        logger.info(
+            "Abstention: self-referential query + no local match (cold_start=%s)",
+            is_cold_start,
+        )
+        return ChatResult(text=response_text)
 
     # All cloud services failed — local base model as last resort
     return _base_model_answer(

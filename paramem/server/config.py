@@ -322,6 +322,12 @@ class SanitizationConfig:
             raise ValueError(f"Invalid sanitization mode '{self.mode}'. Must be one of: {valid}")
 
 
+_ABSTENTION_RESPONSE_FALLBACK = "I don't have that information stored yet."
+_ABSTENTION_COLD_START_FALLBACK = (
+    "I'm still getting to know you, but I don't have that information yet."
+)
+
+
 @dataclass
 class AbstentionConfig:
     """Last-resort confabulation guard.
@@ -329,11 +335,52 @@ class AbstentionConfig:
     When no local parametric-memory match exists AND the sanitizer blocked
     cloud escalation (personal / self-referential query), ``handle_chat``
     would otherwise fall through to the bare base model with no context and
-    confabulate. When ``enabled``, ``response`` is returned verbatim instead.
+    confabulate. When ``enabled``, the appropriate canned message is
+    returned verbatim instead.
+
+    Two messages distinguish the two states a self-referential query can hit:
+
+    * ``response`` — fired when the speaker has parametric facts but this
+      particular query missed (a known limitation in coverage).
+    * ``cold_start_response`` — fired when the speaker is identified but
+      has no parametric facts yet (cold start before consolidation has
+      absorbed their introduction). The canned ``response`` reads as
+      confused in this state because the system *can't* know anything
+      about a freshly enrolled speaker.
+
+    Both messages are externalised to files under ``configs/prompts/`` so
+    they can be tuned without code changes — same pattern as
+    :class:`VoiceConfig`. ``*_override`` fields let an operator pin a
+    specific string in the YAML when the file path is not desired; an empty
+    override falls back to the file, and a missing file falls back to the
+    module-level constant.
     """
 
     enabled: bool = True
-    response: str = "I don't have that information stored yet."
+    response_file: str = "configs/prompts/abstention_response.txt"
+    cold_start_response_file: str = "configs/prompts/abstention_cold_start.txt"
+    response_override: str = ""
+    cold_start_response_override: str = ""
+
+    def load_response(self) -> str:
+        """Resolve the standard abstention message: override → file → fallback."""
+        if self.response_override:
+            return self.response_override
+        if self.response_file:
+            path = Path(self.response_file)
+            if path.exists():
+                return path.read_text().strip()
+        return _ABSTENTION_RESPONSE_FALLBACK
+
+    def load_cold_start_response(self) -> str:
+        """Resolve the cold-start message: override → file → fallback."""
+        if self.cold_start_response_override:
+            return self.cold_start_response_override
+        if self.cold_start_response_file:
+            path = Path(self.cold_start_response_file)
+            if path.exists():
+                return path.read_text().strip()
+        return _ABSTENTION_COLD_START_FALLBACK
 
 
 @dataclass

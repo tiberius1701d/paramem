@@ -56,6 +56,12 @@ EXTENSION_FIELDS: frozenset[str] = frozenset(
         # Planned pipeline flag — not in the shipped server.yaml yet but
         # documented in the consolidation block for future SOTA provider routing.
         "consolidation.extraction_noise_filter_endpoint",
+        # Optional inline overrides for the abstention messages — opt-in,
+        # commented out in shipped server.yaml so the file-based default
+        # is used.  Classified because they ARE valid config keys when an
+        # operator pins a string.
+        "abstention.response_override",
+        "abstention.cold_start_response_override",
     }
 )
 
@@ -144,7 +150,10 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "sanitization.mode": Tier.OPERATIONAL,
     # --- abstention ---
     "abstention.enabled": Tier.PIPELINE_ALTERING,
-    "abstention.response": Tier.PIPELINE_ALTERING,
+    "abstention.response_file": Tier.OPERATIONAL,
+    "abstention.cold_start_response_file": Tier.OPERATIONAL,
+    "abstention.response_override": Tier.PIPELINE_ALTERING,
+    "abstention.cold_start_response_override": Tier.PIPELINE_ALTERING,
     # --- voice ---
     "voice.prompt_file": Tier.OPERATIONAL,
     "voice.greeting_interval_hours": Tier.OPERATIONAL,

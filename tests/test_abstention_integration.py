@@ -97,11 +97,14 @@ class TestAbstentionEndToEnd:
     ):
         """Reproduces the exact bug: untrained adapter + self-referential
         query. Before the fix: Mistral confabulated "New York City".
-        After the fix: canned abstention response, model never invoked."""
+        After the fix: canned abstention response, model never invoked.
+        ``empty_adapter_router`` has no keys for this speaker, so the
+        cold-start variant fires (rather than the standard ``response``).
+        """
         result = handle_chat(
             text="Where do I live?",
             conversation_id="abstention-integration-test",
-            speaker="Tobias",
+            speaker="Alex",
             history=None,
             model=exploding_model,
             tokenizer=MagicMock(),
@@ -110,7 +113,7 @@ class TestAbstentionEndToEnd:
             speaker_id="spk-integration-test",
         )
 
-        assert result.text == server_config.abstention.response
+        assert result.text == server_config.abstention.load_cold_start_response()
         assert not result.escalated
         exploding_model.generate.assert_not_called()
 
@@ -120,7 +123,7 @@ class TestAbstentionEndToEnd:
         """Per the deferred-identity-binding design: speaker_id (anonymous
         grouping identifier) is sufficient for attribution. The
         short-circuit must fire even when the real speaker name has not
-        yet been disclosed."""
+        yet been disclosed.  Empty router → cold-start response."""
         result = handle_chat(
             text="What is my birthday?",
             conversation_id="abstention-anon-test",
@@ -133,7 +136,7 @@ class TestAbstentionEndToEnd:
             speaker_id="spk-anon-77",
         )
 
-        assert result.text == server_config.abstention.response
+        assert result.text == server_config.abstention.load_cold_start_response()
         exploding_model.generate.assert_not_called()
 
     def test_non_personal_query_still_uses_base_model(self, server_config, empty_adapter_router):
@@ -160,7 +163,7 @@ class TestAbstentionEndToEnd:
             result = handle_chat(
                 text="What is the capital of France?",
                 conversation_id="non-personal-test",
-                speaker="Tobias",
+                speaker="Alex",
                 history=None,
                 model=model,
                 tokenizer=tokenizer,
@@ -172,4 +175,4 @@ class TestAbstentionEndToEnd:
             )
 
         mock_base_model.assert_called_once()
-        assert result.text != server_config.abstention.response
+        assert result.text != server_config.abstention.load_response()
