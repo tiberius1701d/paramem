@@ -5721,10 +5721,12 @@ def _extract_and_start_training():
             loop.model.eval()
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
+            # Count via the indexed_key_registry — it tracks every active key
+            # regardless of which adapter (main or interim) currently holds it.
+            # The previous main-tier-simhash sum under-reported by the count of
+            # keys living in episodic_interim_<stamp> slots between full cycles.
             total_keys = (
-                len(loop.episodic_simhash)
-                + len(loop.semantic_simhash)
-                + len(loop.procedural_simhash)
+                len(loop.indexed_key_registry) if loop.indexed_key_registry is not None else 0
             )
             _state["last_consolidation_result"] = {
                 "status": result.get("mode", "trained"),
@@ -5750,40 +5752,6 @@ def _extract_and_start_training():
         "Extraction done — interim-training job submitted to BG trainer (%d sessions)",
         len(session_ids),
     )
-
-
-def _finalize_background_training(loop, jobs_data=None):
-    """Update shared server state after background training.
-
-    Must run on the event loop thread to avoid racing with /chat.
-    SimHash updates happen here (not in the training thread) for thread safety.
-    """
-    from paramem.training.indexed_memory import build_registry
-
-    # Update SimHash registries on the event loop thread
-    if jobs_data is not None:
-        for adapter_name, keyed_pairs in jobs_data:
-            new_registry = build_registry(keyed_pairs)
-            if adapter_name == "episodic":
-                loop.episodic_simhash.update(new_registry)
-            elif adapter_name == "semantic":
-                loop.semantic_simhash.update(new_registry)
-            elif adapter_name == "procedural":
-                loop.procedural_simhash.update(new_registry)
-
-    loop.model.eval()
-    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-    _state["router"].reload()
-    total_keys = (
-        len(loop.episodic_simhash) + len(loop.semantic_simhash) + len(loop.procedural_simhash)
-    )
-    _state["last_consolidation_result"] = {
-        "status": "trained",
-        "total_keys": total_keys,
-        "jobs": [job[0] for job in (jobs_data or [])],
-    }
-    _state["consolidating"] = False
-    logger.info("Background training complete — %d keys saved", total_keys)
 
 
 # --- Speaker enrollment (utterance-driven) ---
