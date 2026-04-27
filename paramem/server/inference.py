@@ -541,7 +541,7 @@ def _probe_and_reason(
         probe_keys_grouped_by_adapter,
     )
 
-    registry = _load_simhash_registry(config.registry_path)
+    registry = _load_simhash_registry(config.adapter_dir)
 
     LAYER_LABELS = {
         "procedural": "Behavioral preferences",
@@ -752,16 +752,49 @@ def _maybe_escalate(
     return ChatResult(text=local_text or "I'm not sure about that.", probed_keys=probed_keys or [])
 
 
-def _load_simhash_registry(registry_path) -> dict:
-    """Load SimHash values from registry for probe verification."""
-    registry = {}
-    if registry_path.exists():
-        from paramem.backup.encryption import read_maybe_encrypted
+def _load_simhash_registry(adapter_dir) -> dict:
+    """Load combined SimHash dict by merging per-adapter simhash registries.
 
-        raw = json.loads(read_maybe_encrypted(registry_path).decode("utf-8"))
-        for key, meta in raw.items():
-            if isinstance(meta, dict):
-                registry[key] = meta.get("simhash", 0)
+    Returns ``{key: simhash}`` across all main and interim adapter slots.
+    Reads ``simhash_registry_<adapter>.json`` files at the top of
+    ``adapter_dir`` (one per main tier and one per interim slot — same
+    naming convention used by the writers in
+    ``training/consolidation.py:_save_adapters`` and
+    ``_train_extracted_into_interim``).
+
+    Plan A retired the legacy combined ``data/ha/registry.json`` file in
+    favour of these per-adapter files as the single source of truth.
+    Production paths never write a combined registry; reads merge at
+    runtime instead.
+
+    Each per-adapter file is a flat ``{key: simhash}`` mapping.  When a
+    key appears in multiple files (a transient state during promotion or
+    when an interim adapter holds the same key as main), the later read
+    wins — but the simhash content is the same regardless of which
+    adapter holds the key.
+    """
+    registry: dict = {}
+    if not adapter_dir.exists():
+        return registry
+
+    from paramem.backup.encryption import read_maybe_encrypted
+
+    for kp_path in sorted(adapter_dir.glob("simhash_registry_*.json")):
+        try:
+            raw = json.loads(read_maybe_encrypted(kp_path).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to read simhash registry %s — skipping", kp_path.name)
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for key, simhash in raw.items():
+            # Per-adapter format: flat {key: simhash}.  Defensive: also
+            # accept the legacy enriched-meta dict form ({simhash: ...})
+            # in case any caller is mid-migration.
+            if isinstance(simhash, dict):
+                registry[key] = simhash.get("simhash", 0)
+            else:
+                registry[key] = simhash
     return registry
 
 
