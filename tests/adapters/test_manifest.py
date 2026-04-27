@@ -680,3 +680,81 @@ class TestResolveAdapterSlot:
         base.mkdir()
         result = resolve_adapter_slot(base, "episodic", "missinghash")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# 7. write_manifest atomic write semantics
+# ---------------------------------------------------------------------------
+
+
+class TestWriteManifestAtomicWrite:
+    """write_manifest must route through _atomic_write_bytes for fsync safety."""
+
+    def test_uses_atomic_helper(self, tmp_path: Path) -> None:
+        """_atomic_write_bytes is called exactly once with the meta.json path."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = _minimal_manifest()
+
+        recorded: list[tuple] = []
+
+        def _fake_atomic(path, body: bytes) -> None:
+            recorded.append((path, body))
+
+        with patch(
+            "paramem.backup.encryption._atomic_write_bytes",
+            side_effect=_fake_atomic,
+        ):
+            write_manifest(slot, m)
+
+        assert len(recorded) == 1, "_atomic_write_bytes must be called exactly once"
+        assert recorded[0][0] == slot / "meta.json", f"Wrong path: {recorded[0][0]!r}"
+        # Bytes must be valid UTF-8 JSON
+        import json as _json
+
+        parsed = _json.loads(recorded[0][1].decode("utf-8"))
+        assert parsed["name"] == m.name
+
+    def test_no_partial_file_on_write_failure(self, tmp_path: Path) -> None:
+        """When _atomic_write_bytes raises, OSError propagates and meta.json is absent."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = _minimal_manifest()
+
+        with patch(
+            "paramem.backup.encryption._atomic_write_bytes",
+            side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                write_manifest(slot, m)
+
+        # The helper guarantees no partial .tmp on OSError, and canonical path absent.
+        assert not (slot / "meta.json").exists(), "meta.json must not exist after write failure"
+
+    def test_overwrites_atomically(self, tmp_path: Path) -> None:
+        """Writing manifest B after manifest A leaves only manifest B on disk."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m_a = _minimal_manifest(name="episodic")
+        m_b = _minimal_manifest(name="semantic")
+
+        write_manifest(slot, m_a)
+        write_manifest(slot, m_b)
+
+        m_disk = read_manifest(slot)
+        assert m_disk.name == "semantic", (
+            f"Expected 'semantic' after overwrite but got '{m_disk.name}'"
+        )
+
+    def test_no_tmp_left_behind(self, tmp_path: Path) -> None:
+        """After a successful write_manifest, no .tmp files remain in the slot."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = _minimal_manifest()
+
+        write_manifest(slot, m)
+
+        tmp_files = list(slot.glob("*.tmp"))
+        assert not tmp_files, (
+            f"Leftover .tmp files after write_manifest: {[str(p) for p in tmp_files]}"
+        )

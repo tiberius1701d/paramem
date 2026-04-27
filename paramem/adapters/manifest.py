@@ -313,8 +313,10 @@ def write_manifest(slot: Path, manifest: AdapterManifest) -> Path:
     if not slot.exists():
         raise OSError(f"Slot directory does not exist: {slot}")
     dest = slot / _MANIFEST_FILENAME
-    payload = json.dumps(_manifest_to_dict(manifest), indent=2, sort_keys=True)
-    dest.write_text(payload, encoding="utf-8")
+    payload = json.dumps(_manifest_to_dict(manifest), indent=2, sort_keys=True).encode("utf-8")
+    from paramem.backup.encryption import _atomic_write_bytes
+
+    _atomic_write_bytes(dest, payload)
     return dest
 
 
