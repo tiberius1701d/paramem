@@ -18,8 +18,13 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 source .env 2>/dev/null || true
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-export HF_DEACTIVATE_ASYNC_LOAD=${HF_DEACTIVATE_ASYNC_LOAD:-1}
+# Machine-level GPU env (PYTORCH_CUDA_ALLOC_CONF, HF_DEACTIVATE_ASYNC_LOAD,
+# …) lives in ~/.config/gpu-guard/config.toml [env].  Soft fallback when
+# gpu-guard is not installed; the systemd path is the production deployment
+# and uses the [env] file directly via ExecStartPre + EnvironmentFile.
+if command -v gpu-guard >/dev/null 2>&1; then
+    eval "$(gpu-guard env --export)"
+fi
 
 PYTHON=${PARAMEM_PYTHON:-python}
 CONFIG=${PARAMEM_CONFIG:-configs/server.yaml}

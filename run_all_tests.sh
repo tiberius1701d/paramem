@@ -9,8 +9,13 @@ set -o pipefail
 cd "$(dirname "$0")"
 
 source .env 2>/dev/null
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_DEACTIVATE_ASYNC_LOAD=1
+# Machine-level GPU env (PYTORCH_CUDA_ALLOC_CONF, HF_DEACTIVATE_ASYNC_LOAD,
+# …) lives in ~/.config/gpu-guard/config.toml [env].  Soft fallback when
+# gpu-guard is not installed — this script may run on hosts without
+# lab-tools (the live training-control.sh path fails loud instead).
+if command -v gpu-guard >/dev/null 2>&1; then
+    eval "$(gpu-guard env --export)"
+fi
 
 PYTHON=${PARAMEM_PYTHON:-python}
 LOG_DIR="outputs/run_$(date +%Y%m%d_%H%M%S)"

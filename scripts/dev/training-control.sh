@@ -499,10 +499,28 @@ training_resume() {
 
     mkdir -p "$(dirname "$log_file")"
 
-    # Load .env and launch in background
+    # Machine-level GPU env (PYTORCH_CUDA_ALLOC_CONF, HF_DEACTIVATE_ASYNC_LOAD,
+    # …) comes from `gpu-guard env` so test scripts inherit the same allocator
+    # contract as the server.  Fail loud here — this is the controlled lab
+    # launch path; silently dropping the contract is exactly the failure mode
+    # that produced the V4 BSOD on 2026-04-27.  bashrc keeps a soft fallback
+    # so a fresh shell on a host without lab-tools still works.
+    if ! command -v gpu-guard >/dev/null 2>&1; then
+        echo -e "  ${RED:-}ERROR: gpu-guard not on PATH — install lab-tools first${RESET:-}" >&2
+        echo -e "  See: ~/projects/lab-tools/gpu_guard/README.md" >&2
+        return 1
+    fi
+    # Capture gpu-guard env vars as KEY=value lines.  Injected as `env` args
+    # AFTER the .env injection so the machine GPU contract wins on conflict
+    # — `env` processes its args left-to-right and later assignments override
+    # earlier ones, so any future drift in paramem's .env can't silently
+    # clobber the contract.
+    local gpu_guard_env
+    gpu_guard_env=$(gpu-guard env)
+
     echo -e "  ${GREEN}Resuming test ${test_num}...${RESET}"
     cd "$PROJECT_DIR" && \
-        env $(grep -v '^#' .env | xargs) \
+        env $(grep -v '^#' .env | xargs) $gpu_guard_env \
         nohup "$PYTHON_BIN" "$script" $model_flag $resume_flag $extra_flags \
         >> "$log_file" 2>&1 &
 

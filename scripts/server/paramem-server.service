@@ -23,8 +23,14 @@ User=YOUR_USERNAME
 WorkingDirectory=/path/to/paramem
 ExecStart=/path/to/python -m paramem.server.app --config configs/server.yaml
 # --- END USER CONFIG ---
-Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-Environment=HF_DEACTIVATE_ASYNC_LOAD=1
+# Machine-level GPU env (PYTORCH_CUDA_ALLOC_CONF, HF_DEACTIVATE_ASYNC_LOAD,
+# …) is owned by gpu-guard.  Single source of truth: ~/.config/gpu-guard/
+# config.toml [env] (lab-tools/gpu_guard).  Render to runtime tmpdir before
+# ExecStart so the unit inherits whatever the [env] table currently holds.
+# `gpu-guard` must be on PATH; install lab-tools and symlink to ~/.local/bin
+# (see lab-tools/gpu_guard/README.md).
+ExecStartPre=/bin/sh -c 'gpu-guard env > %t/paramem-gpu.env'
+EnvironmentFile=-%t/paramem-gpu.env
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=120
