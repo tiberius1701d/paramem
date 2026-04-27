@@ -351,6 +351,54 @@ class TestBuildManifestFor:
         )
         assert m.key_count == 42
 
+    def test_bfloat16_state_dict_hashes_without_fallback(self, tmp_path: Path) -> None:
+        """Regression: numpy lacks bfloat16; build_manifest_for must still hash the weights.
+
+        Pre-fix path returned UNKNOWN with a warning, leaving manifests that the
+        startup validator flagged as unknown_fields_in_manifest → PA routing disabled.
+        """
+        import torch
+
+        model = self._make_model()
+        state = {
+            "layer.0.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+            "layer.0.bias": torch.zeros(4, dtype=torch.bfloat16),
+        }
+        model.base_model.model.state_dict.return_value = state
+
+        m = build_manifest_for(
+            model,
+            self._make_tokenizer(),
+            "episodic",
+            registry_path=None,
+            keyed_pairs_path=None,
+        )
+        assert m.base_model.hash != UNKNOWN
+        assert m.base_model.hash.startswith("sha256:")
+        assert len(m.base_model.hash) == len("sha256:") + 64
+
+    def test_bfloat16_hash_is_deterministic(self, tmp_path: Path) -> None:
+        """Identical bfloat16 state dicts must produce identical hashes across calls."""
+        import torch
+
+        torch.manual_seed(0)
+        weight = torch.randn(8, 8, dtype=torch.bfloat16)
+        state = {"layer.0.weight": weight}
+
+        model_a = self._make_model()
+        model_a.base_model.model.state_dict.return_value = state
+        model_b = self._make_model()
+        model_b.base_model.model.state_dict.return_value = state
+
+        m_a = build_manifest_for(
+            model_a, self._make_tokenizer(), "episodic", registry_path=None, keyed_pairs_path=None
+        )
+        m_b = build_manifest_for(
+            model_b, self._make_tokenizer(), "episodic", registry_path=None, keyed_pairs_path=None
+        )
+        assert m_a.base_model.hash == m_b.base_model.hash
+        assert m_a.base_model.hash != UNKNOWN
+
 
 # ---------------------------------------------------------------------------
 # 4. atomic_save_adapter

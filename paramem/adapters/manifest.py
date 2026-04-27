@@ -480,7 +480,14 @@ def build_manifest_for(
             for name in sorted(state.keys()):
                 tensor = state[name]
                 if hasattr(tensor, "cpu"):
-                    h.update(tensor.cpu().numpy().tobytes())
+                    t = tensor.detach().cpu() if hasattr(tensor, "detach") else tensor.cpu()
+                    try:
+                        h.update(t.numpy().tobytes())
+                    except (TypeError, RuntimeError):
+                        # numpy lacks bfloat16/fp8 dtypes — hash raw storage bytes.
+                        # clone() guarantees offset=0 and storage size == nelement * itemsize.
+                        t = t.contiguous().clone() if hasattr(t, "clone") else t
+                        h.update(bytes(t.untyped_storage()))
                 else:
                     h.update(bytes(tensor))
             base_hash = "sha256:" + h.hexdigest()
