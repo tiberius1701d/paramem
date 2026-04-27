@@ -5467,8 +5467,9 @@ def _retro_claim_orphan_sessions() -> int:
 def _scheduled_extract_done_callback(future):
     """Clear the consolidating flag only if the extraction phase failed.
 
-    On success, _extract_and_start_training has handed off to the background
-    trainer and the flag will be cleared by _finalize_background_training.
+    On success, _extract_and_start_training has submitted the interim
+    training job to the BG trainer and the flag will be cleared by the
+    job's _finalize_interim closure when the worker thread completes.
     """
     exc = future.exception()
     if exc:
@@ -5477,13 +5478,17 @@ def _scheduled_extract_done_callback(future):
 
 
 def _extract_and_start_training():
-    """Extract sessions, prepare training data, start background trainer.
+    """Extract pending sessions and submit a single interim-training job.
 
-    Runs in executor thread. Extraction holds the GPU lock (LLM inference).
-    Training runs in a background thread and acquires/releases the GPU lock
-    per training step via the BackgroundTrainer pause/resume mechanism.
+    Runs in executor thread.  Phase 1 (extraction) holds the GPU lock and
+    produces the per-batch (episodic_qa, procedural_rels) tuple.  Phase 2
+    submits one callable to ``BackgroundTrainer`` that mints a fresh
+    ``episodic_interim_<stamp>`` slot (or absorbs into the newest existing
+    when the cap is hit) and trains the batch into it.  Main adapters are
+    only updated by the full-cycle path that calls
+    ``consolidate_interim_adapters``.
     """
-    from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
+    from paramem.server.background_trainer import BackgroundTrainer
     from paramem.server.consolidation import (
         _increment_key_sessions,
         _promote_mature_keys,
@@ -5624,7 +5629,15 @@ def _extract_and_start_training():
         )
         return
 
-    # --- Phase 2: Prepare training data (key assignment, reconstruction) ---
+    # --- Phase 2 + 3: Train into a fresh interim slot via the BG trainer ---
+    # The scheduled tick mints a new ``episodic_interim_<stamp>`` adapter and
+    # trains the batch into it (or absorbs into the newest existing slot when
+    # the cap is reached).  Main adapters are NOT touched here — they only
+    # change at the full-cycle boundary, where consolidate_interim_adapters()
+    # collapses the accumulated interim slots into episodic / semantic /
+    # procedural.  See feedback_router_procedural_first.md and the freshness-
+    # wins router order: probing the newest interim before main means recently
+    # learned facts surface ahead of the stale main snapshot.
     if not loop.config.indexed_key_replay_enabled:
         logger.warning("Indexed key replay disabled — skipping training")
         session_buffer.mark_consolidated(session_ids)
@@ -5632,55 +5645,13 @@ def _extract_and_start_training():
         return
 
     primary_speaker = speaker_ids[-1] if speaker_ids else ""
-    jobs_data = loop.prepare_training_data(
-        all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
-    )
+    schedule = config.consolidation.refresh_cadence
+    max_interim_count = config.consolidation.max_interim_count
 
-    if not jobs_data:
-        logger.info("No training jobs prepared — skipping")
-        session_buffer.mark_consolidated(session_ids)
-        _state["consolidating"] = False
-        return
-
-    # Build TrainingJob objects
-    adapter_configs = {
-        "episodic": config.episodic_adapter_config,
-        "semantic": config.semantic_adapter_config,
-        "procedural": config.procedural_adapter_config,
-    }
-    training_jobs = [
-        TrainingJob(
-            keyed_pairs=keyed_pairs,
-            adapter_name=adapter_name,
-            adapter_config=adapter_configs[adapter_name],
-        )
-        for adapter_name, keyed_pairs in jobs_data
-    ]
-
-    # --- Phase 3: Start background training ---
-    def _on_training_complete():
-        """Called from training thread when all jobs finish.
-
-        Disk I/O is safe from any thread. SimHash updates and state
-        mutations are posted to the event loop via call_soon_threadsafe
-        to avoid race conditions with inference reads.
-        """
-        # Disk I/O — safe from any thread
-        loop.finalize_training()
-        _promote_mature_keys(loop, config)
-        _save_keyed_pairs_for_router(loop, config)
-        _save_registry(loop, config)
-        _save_key_metadata(loop, config)
-        session_buffer.mark_consolidated(session_ids)
-
-        # SimHash updates + state mutations + router reload — all on event loop
-        aio_loop = _state.get("event_loop")
-        if aio_loop is not None and aio_loop.is_running():
-            aio_loop.call_soon_threadsafe(_finalize_background_training, loop, jobs_data)
-        else:
-            _finalize_background_training(loop, jobs_data)
-
-    # Build TrainingJob objects and start background trainer
+    # The BG-trainer worker thread holds the GPU lock for the duration of the
+    # callable so concurrent STT/TTS inference yields via pause/resume.  A new
+    # BackgroundTrainer is constructed per cycle to match the historical
+    # pattern; the previous instance (if any) is replaced on _state.
     bt = BackgroundTrainer(
         model=_state["model"],
         tokenizer=_state["tokenizer"],
@@ -5692,21 +5663,92 @@ def _extract_and_start_training():
         quiet_hours_start=config.consolidation.quiet_hours_start,
         quiet_hours_end=config.consolidation.quiet_hours_end,
     )
-
-    def _on_training_error():
-        loop.rollback_preparation()
-        _state["consolidating"] = False
-        logger.error("Background training failed — state rolled back")
-
     _state["background_trainer"] = bt
-    bt.start_jobs(
-        training_jobs,
-        on_complete=_on_training_complete,
-        on_error=_on_training_error,
-    )
+
+    def _run_interim_training() -> None:
+        """Execute the interim training pass + post-train bookkeeping.
+
+        Runs on the BG trainer worker thread under the GPU lock.  The helper
+        does its own atomic I5 save of the interim slot + registry; we then
+        run the cross-cycle bookkeeping (promotion check, key-metadata save,
+        session marking, router reload, state updates) that was previously
+        bound to BackgroundTrainer.start_jobs's on_complete callback.
+        """
+        try:
+            result = loop._train_extracted_into_interim(
+                all_episodic_qa,
+                all_procedural_rels,
+                run_label=f"tick-{primary_speaker or 'anon'}",
+                speaker_id=primary_speaker,
+                schedule=schedule,
+                max_interim_count=max_interim_count,
+            )
+        except Exception:
+            logger.exception(
+                "Scheduled-tick interim training failed — leaving %d sessions pending",
+                len(session_ids),
+            )
+            _state["last_consolidation_result"] = {
+                "status": "error",
+                "sessions": len(session_ids),
+            }
+            _state["consolidating"] = False
+            return
+
+        # Pick up any PeftModel handle rebinding from create_interim_adapter.
+        _state["model"] = loop.model
+
+        logger.info(
+            "Scheduled-tick interim training: mode=%s, adapter=%s, new_keys=%d",
+            result.get("mode"),
+            result.get("adapter_name"),
+            len(result.get("new_keys", [])),
+        )
+
+        # Disk I/O — safe from any thread.  Promotion + key-metadata persistence
+        # mirror the previous main-write callback; the interim helper already
+        # handled the registry / keyed_pairs / simhash writes atomically.
+        try:
+            _promote_mature_keys(loop, config)
+            _save_key_metadata(loop, config)
+            session_buffer.mark_consolidated(session_ids)
+        except Exception:
+            logger.exception("Post-interim bookkeeping failed (non-fatal)")
+
+        # State mutations + router reload — post to the event loop so the
+        # router cache and inference path see the new slot atomically.
+        def _finalize_interim() -> None:
+            loop.model.eval()
+            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+            _state["router"].reload()
+            total_keys = (
+                len(loop.episodic_simhash)
+                + len(loop.semantic_simhash)
+                + len(loop.procedural_simhash)
+            )
+            _state["last_consolidation_result"] = {
+                "status": result.get("mode", "trained"),
+                "sessions": len(session_ids),
+                "total_keys": total_keys,
+                "adapter": result.get("adapter_name"),
+            }
+            _state["consolidating"] = False
+            logger.info(
+                "Scheduled-tick complete — adapter=%s, %d total keys",
+                result.get("adapter_name"),
+                total_keys,
+            )
+
+        aio_loop = _state.get("event_loop")
+        if aio_loop is not None and aio_loop.is_running():
+            aio_loop.call_soon_threadsafe(_finalize_interim)
+        else:
+            _finalize_interim()
+
+    bt.submit(_run_interim_training, inference_fallback_adapter="episodic")
     logger.info(
-        "Extraction done — %d training jobs started in background",
-        len(training_jobs),
+        "Extraction done — interim-training job submitted to BG trainer (%d sessions)",
+        len(session_ids),
     )
 
 
