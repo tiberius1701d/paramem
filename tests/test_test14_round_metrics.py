@@ -21,6 +21,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# gpu_guard is provided by lab-tools (separate repo, not on PyPI).  CI does
+# not install it; skip the whole module rather than erroring at collection.
+# experiments.test14 imports gpu_guard transitively via experiments.utils.gpu_guard.
+pytest.importorskip("gpu_guard")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
