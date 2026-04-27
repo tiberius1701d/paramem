@@ -2314,9 +2314,12 @@ also stays deferred.
 ## Test 14: Content-Free Scaffold + Multi-Round Early-Stop at Scale
 
 **Script:** `experiments/test14.py`
-**Status:** 14a-pre **COMPLETE** (2026-04-26 01:29 → ~17:55, ~16.5 h wall).
-**Winner: V3** (uniform sentinel). 14a (scale V3 to N=500) and 14b
-(multi-round) pending launch — scheduled for the following overnight.
+**Status:** 14a-pre core **COMPLETE** (2026-04-26 01:29 → ~17:55, ~16.5 h
+wall). **Winner so far: V3** (uniform sentinel). Extended-cell run
+**partial**: V3_extended complete and **rejected** (e25 fill, slower than
+V3); V4 (empty Q/A) **unprobed**; V5 (per-slot SHA placeholders)
+deprioritized. 14a (scale to N=500) and 14b (multi-round) pending — gated
+on V4.
 
 ### What it tests
 
@@ -2563,6 +2566,67 @@ fixed before launch):**
   Phase B (the only sensible behavior — there is no use case for
   EarlyStop on a deepening run).
 
+### Results — extended cells (partial, 2026-04-27)
+
+Run dir: `outputs/test14_pre/mistral/20260426_012907/V3_extended/`.
+
+**V3_extended — REJECTED.** Resumed `V3/B/adapter` for +30 scaffold epochs
+(effective e10 → e40), then filled 20 keys.
+
+| Phase | Wall | First perfect | Stable perfect | Stop epoch | Notes |
+|---|---:|---:|---:|---:|---|
+| B (deepen) | 1.92 h | e1 (probe) | e3 (probe) | n/a (ES disabled) | 100 / 100 at every probe; train loss 2.1e-08 |
+| C (fill 20) | 1.99 h | **e23** | e25 | **e25** | both/total = 1.00, q_only = 0, leakage 0 |
+
+vs V3 plain (B at e10 floor, C stop at **e20**): V3_extended fills **5
+epochs slower**. The decision-rule bar (`stop_epoch ≤ 14`) is missed by
+11 epochs.
+
+The "shallow Phase B may be undertrained" hypothesis is empirically
+falsified. V3's Phase B was already saturated at the floor — every probe
+across the 30 added epochs scored 100 / 100, train loss collapsed to ~2e-8.
+There was no undertraining to fix. Deepening only sharpened the model's
+commitment to `"pending"`, which the fill phase then had to overwrite —
+costing more epochs, not fewer. This confirms (rather than overturns) the
+V3 conclusion already on file: *placeholder content adds nothing routing-
+wise and only costs epochs at fill when the model has to overwrite it.*
+
+Retention on the 80 unfilled placeholder slots was 0 / 80 throughout
+Phase C, identical to V3 plain — this is the standard V3 fill behavior on
+uniform sentinel placeholders, not a V3_extended regression.
+
+**V4 — UNPROBED.** V4 is the *low-content* end of the placeholder-mass
+axis (`{"key":"graphN", "question":"", "answer":""}`). It is the only
+remaining cell that can still move the winner — see "Consequences" below.
+
+**V5 — DEPRIORITIZED.** Per-slot SHA placeholders are *high* per-slot
+content mass. V3_extended's result establishes the direction of the
+content-mass axis: more commitment → slower fill. V5 sits at the opposite
+end from V4 along that axis, so the directional prior runs against V5
+beating V3, let alone clearing e ≤ 14. V5 is not worth its ~2.5 h slot
+unless V4 produces a surprise that re-opens the axis question.
+
+### Consequences for next trials
+
+1. **V4 is the next run.** V3_extended is *positive* directional evidence
+   for V4: stronger placeholder commitment slowed fill, so weaker
+   placeholder commitment is the credible path to faster fill. Whether
+   the gap is enough to clear e ≤ 14 is genuinely open and only V4 can
+   answer it.
+2. **V5 is dropped.** Re-add only if V4 produces a non-monotonic result
+   on the content-mass axis (e.g. V4 fills slower than V3, suggesting
+   some content mass is load-bearing after all).
+3. **14a remains gated on V4.** V3 stays as provisional winner. If V4
+   clears e ≤ 14, V4 replaces V3 as 14a's variant; if V4 fails the bar,
+   14a launches with V3 unchanged.
+4. **No design changes to 14a or 14b.** The A → B → C structure, decision
+   rules, three-point retention probe, and touch-up primitive are
+   unchanged regardless of which variant ships into 14a. Variant choice
+   only swaps Phase B's placeholder text.
+
+**Next-trial wall estimate:** V4 ~2.5 h, no Phase A (reuses
+`V3/A/adapter`).
+
 ### Next: 14a launch (winning variant scaled to N=500)
 
 ```
@@ -2570,8 +2634,8 @@ python experiments/test14.py --mode=scale --variant=<winner>
 ```
 
 `<winner>` resolves from the extended-run `results.json` — V3 by default,
-overridden only if a V3_extended/V4/V5 cell beats the e ≤ 14 decision
-threshold.
+overridden only if V4 (the only remaining unprobed cell) beats the e ≤ 14
+decision threshold. V3_extended is rejected (e25); V5 is deprioritized.
 
 Same A→B→C structure as 14a-pre, single variant. Phase A wall expected
 ~17 h, Phase B (scaffold-build) ~17 h, Phase C (fill 100 on 500-key
