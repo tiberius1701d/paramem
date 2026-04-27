@@ -17,7 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from experiments.dataset_probe import (
+# experiments.dataset_probe imports gpu_guard transitively (via
+# experiments.utils.gpu_guard).  gpu_guard ships from lab-tools (separate
+# repo, not on PyPI); CI does not install it.  Skip the file rather than
+# erroring at collection — these unit tests don't exercise the acquire path.
+pytest.importorskip("gpu_guard")
+
+from experiments.dataset_probe import (  # noqa: E402
     _find_resume_dir,
     _validate_no_train_resume,
     _validate_resume_accumulator,

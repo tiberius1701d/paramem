@@ -14,8 +14,17 @@ No GPU, no model load, no network access.
 
 from pathlib import Path
 
-from experiments.dataset_probe import _commit_session
-from experiments.utils.dataset_types import DatasetSession
+import pytest
+
+# experiments.dataset_probe imports gpu_guard transitively (via
+# experiments.utils.gpu_guard).  gpu_guard ships from lab-tools (separate
+# repo, not on PyPI); CI does not install it.  Skip the file rather than
+# erroring at collection — these unit tests don't actually exercise the
+# acquire/release path.
+pytest.importorskip("gpu_guard")
+
+from experiments.dataset_probe import _commit_session  # noqa: E402
+from experiments.utils.dataset_types import DatasetSession  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers

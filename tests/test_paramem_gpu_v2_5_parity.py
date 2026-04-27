@@ -24,6 +24,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# gpu_guard ships from lab-tools (separate repo, not on PyPI).  CI does not
+# install it; skip the whole module rather than erroring at runtime.
+pytest.importorskip("gpu_guard")
+
 # ---------------------------------------------------------------------------
 # Path to the example config (source of truth for the TOML shape)
 # ---------------------------------------------------------------------------

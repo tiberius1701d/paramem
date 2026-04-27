@@ -6,7 +6,13 @@ No GPU or real processes are used — purely structural / registration checks.
 
 from __future__ import annotations
 
-from gpu_guard._core import _default_consumers, _default_notifier
+import pytest
+
+# gpu_guard is provided by lab-tools (separate repo, not on PyPI).  CI does
+# not install it; skip the whole module rather than erroring at collection.
+pytest.importorskip("gpu_guard")
+
+from gpu_guard._core import _default_consumers, _default_notifier  # noqa: E402
 
 
 class TestShimRegistration:
