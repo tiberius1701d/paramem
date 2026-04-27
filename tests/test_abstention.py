@@ -90,12 +90,22 @@ class TestAbstentionShortCircuit:
     ``handle_chat`` and does not perturb paths that shouldn't be affected.
     """
 
-    def _make_none_match_router(self):
-        from paramem.server.router import RoutingPlan
+    def _make_none_match_router(self, intent=None):
+        """Router stub returning match_source=none.
+
+        ``intent`` defaults to PERSONAL because every abstention test in
+        this class deals with personal-class queries — that is the
+        signal that drives abstention now.  Pass ``Intent.UNKNOWN`` /
+        ``Intent.GENERAL`` when testing non-personal paths.
+        """
+        from paramem.server.router import Intent, RoutingPlan
+
+        if intent is None:
+            intent = Intent.PERSONAL
 
         router = MagicMock()
         router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
-            strategy="direct", match_source="none"
+            strategy="direct", match_source="none", intent=intent
         )
         router._speaker_key_index = {}
         return router
@@ -105,13 +115,16 @@ class TestAbstentionShortCircuit:
         model.gradient_checkpointing_disable = MagicMock()
         return model
 
-    def _make_router_with_facts(self, speaker_id: str):
+    def _make_router_with_facts(self, speaker_id: str, intent=None):
         """Router whose _speaker_key_index has at least one key for ``speaker_id``."""
-        from paramem.server.router import RoutingPlan
+        from paramem.server.router import Intent, RoutingPlan
+
+        if intent is None:
+            intent = Intent.PERSONAL
 
         router = MagicMock()
         router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
-            strategy="direct", match_source="none"
+            strategy="direct", match_source="none", intent=intent
         )
         router._speaker_key_index = {speaker_id: {"graph0001"}}
         return router
@@ -286,6 +299,7 @@ class TestAbstentionShortCircuit:
         """Non-personal query (sanitizer allowed) + no local match →
         cloud escalation path runs; abstention does not fire."""
         from paramem.server.inference import ChatResult, handle_chat
+        from paramem.server.router import Intent
 
         config = ServerConfig()
 
@@ -308,7 +322,7 @@ class TestAbstentionShortCircuit:
                 model=self._minimal_mock_model(),
                 tokenizer=MagicMock(),
                 config=config,
-                router=self._make_none_match_router(),
+                router=self._make_none_match_router(intent=Intent.GENERAL),
                 speaker_id="spk-abc123",
             )
 
@@ -319,9 +333,10 @@ class TestAbstentionShortCircuit:
     def test_skipped_when_cloud_fails_on_non_personal_query(self):
         """Sanitizer allowed the query (non-personal) but cloud is
         unavailable → base model fallback, NOT abstention. The short-circuit
-        is scoped to the sanitizer-blocked case; cloud-outage on general
-        queries still uses base-model general knowledge."""
+        is scoped to the personal-interrogative case; cloud-outage on
+        general queries still uses base-model general knowledge."""
         from paramem.server.inference import ChatResult, handle_chat
+        from paramem.server.router import Intent
 
         config = ServerConfig()
 
@@ -347,7 +362,7 @@ class TestAbstentionShortCircuit:
                 model=self._minimal_mock_model(),
                 tokenizer=MagicMock(),
                 config=config,
-                router=self._make_none_match_router(),
+                router=self._make_none_match_router(intent=Intent.GENERAL),
                 sota_agent=None,  # no SOTA available either
                 speaker_id="spk-abc123",
             )

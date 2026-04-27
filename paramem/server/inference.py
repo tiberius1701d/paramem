@@ -308,13 +308,23 @@ def handle_chat(
             routing_diags["fallthrough_reason"] = "sanitizer_blocked"
             logger.info("Sanitizer blocked query: %s", sanitization_findings)
 
-        # Abstention: self-referential query with no local match → canned response.
+        # Abstention: personal interrogative with no local match → canned response.
         # The bare base model would otherwise confabulate personal data here
         # (e.g. "Where do I live?" → "New York City" on an untrained adapter).
-        # Personal-claim / possessive findings in *statements* (introductions,
-        # fact-sharing) are not a confabulation risk — the user is the source of
-        # the facts in the same turn — so they fall through to the base model
-        # for conversational acknowledgement.
+        # Declarative personal turns (introductions, fact-sharing) are not a
+        # confabulation risk — the user is the source of the facts in the same
+        # turn — so they fall through to the base model for conversational
+        # acknowledgement.  The interrogative gate distinguishes the two.
+        #
+        # Gate uses the router's intent decision rather than the sanitizer's
+        # ``self_referential`` finding: the intent classifier draws on PA
+        # state and the encoder residual, which generalizes beyond first-
+        # person pronouns (e.g. "Where does Alex live?" classified as
+        # PERSONAL via PA match would also benefit from abstention if PA
+        # probe couldn't satisfy it; though in practice PERSONAL with steps
+        # is terminal-returned from _probe_and_reason and never reaches
+        # this branch).  ``self_referential`` is still emitted by the
+        # sanitizer for diagnostics but no longer drives routing.
         #
         # Two response variants distinguish the two states:
         #
@@ -325,10 +335,13 @@ def handle_chat(
         #   a freshly enrolled speaker. Use ``cold_start_response`` instead.
         # * Coverage gap — speaker has parametric facts but this query missed.
         #   The standard ``response`` is appropriate.
+        from paramem.server.router import _is_interrogative
+
         if (
             sanitized_text is None
             and config.abstention.enabled
-            and "self_referential" in sanitization_findings
+            and is_personal
+            and _is_interrogative(text)
         ):
             is_cold_start = bool(speaker_id) and (
                 router is None or not router._speaker_key_index.get(speaker_id)

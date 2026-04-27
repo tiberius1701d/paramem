@@ -32,11 +32,29 @@ def server_config():
 def empty_adapter_router():
     """Router stub mimicking an untrained/empty adapter: no entities,
     no keys, ``match_source="none"`` for every query. Matches the
-    exact failure state observed in the bug report."""
+    exact failure state observed in the bug report.
+
+    Sets ``intent=PERSONAL`` because the production router with the
+    cosine residual classifies the test queries ("Where do I live?"
+    etc.) as PERSONAL via the encoder + exemplars even when no PA
+    state matches.  Without an intent the new abstention gate would
+    not fire and the regression test would silently pass on the wrong
+    path.
+    """
+    from paramem.server.router import Intent
+
     router = MagicMock()
-    router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
-        strategy="direct", match_source="none"
-    )
+
+    def route(text, speaker=None, speaker_id=None):
+        # Non-personal probes ("What is the capital of France?") get
+        # GENERAL so the abstention gate does not fire on them.
+        if any(tok.lower() in {"i", "my", "me"} for tok in text.split()):
+            intent = Intent.PERSONAL
+        else:
+            intent = Intent.GENERAL
+        return RoutingPlan(strategy="direct", match_source="none", intent=intent)
+
+    router.route = route
     router._speaker_key_index = {}
     return router
 
