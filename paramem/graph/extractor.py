@@ -27,6 +27,180 @@ _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "configs" 
 
 _DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Output valid JSON only."
 
+
+# ---------------------------------------------------------------------------
+# Word-boundary substitution / matching helpers — replace fragile
+# ``re.sub(rf"\b{re.escape(name)}\b", ...)`` patterns on user-content text
+# with structural token walks.  The bounded internal placeholder grammars
+# (``_PLACEHOLDER_TOKEN_RE`` / ``_BRACED_PLACEHOLDER_RE`` etc.) keep their
+# regex form because they match strings we mint ourselves; these helpers
+# replace the regex sites that operate on free-form user transcripts /
+# LLM output, where the project rule rejects regex.
+# ---------------------------------------------------------------------------
+
+
+def _is_word_char(c: str) -> bool:
+    """Match Python regex ``\\w`` semantics: alphanumeric (Unicode-aware) or underscore."""
+    return c.isalnum() or c == "_"
+
+
+def _substitute_whole_words(
+    text: str,
+    mapping: dict[str, str],
+    *,
+    case_insensitive: bool = False,
+) -> str:
+    """Replace whole-word occurrences of mapping keys with their values.
+
+    Mirrors the previous ``for k, v in mapping: text = re.sub(rf"\\b{re.escape(k)}\\b", v, text)``
+    pattern in a single token-walk pass.  Boundaries follow the ``\\b``
+    semantics: word-character/non-word-character transitions, where word-
+    character means ``c.isalnum() or c == "_"`` (Unicode-aware).
+
+    Longest keys are tried first at each position so multi-word keys
+    preempt single-word prefixes (``"Person_2"`` before ``"Person"``).
+    Empty / non-string keys are skipped defensively — local extractors
+    occasionally emit ``null`` mapping entries.
+    """
+    if not mapping or not text:
+        return text
+    if case_insensitive:
+        normalized = {k.lower(): v for k, v in mapping.items() if isinstance(k, str)}
+    else:
+        normalized = {k: v for k, v in mapping.items() if isinstance(k, str)}
+    keys_sorted = sorted((k for k in normalized if k), key=len, reverse=True)
+    if not keys_sorted:
+        return text
+
+    parts: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        if not _is_word_char(text[pos]):
+            parts.append(text[pos])
+            pos += 1
+            continue
+        matched = False
+        for key in keys_sorted:
+            klen = len(key)
+            end = pos + klen
+            if end > n:
+                continue
+            slice_ = text[pos:end]
+            if case_insensitive:
+                if slice_.lower() != key:
+                    continue
+            elif slice_ != key:
+                continue
+            if end < n and _is_word_char(text[end]):
+                continue
+            replacement = normalized[key]
+            if not isinstance(replacement, str):
+                continue
+            parts.append(replacement)
+            pos = end
+            matched = True
+            break
+        if not matched:
+            j = pos + 1
+            while j < n and _is_word_char(text[j]):
+                j += 1
+            parts.append(text[pos:j])
+            pos = j
+    return "".join(parts)
+
+
+def _contains_whole_word(text: str, word: str, *, case_insensitive: bool = False) -> bool:
+    """True iff ``word`` appears as a whole word in ``text``.
+
+    Mirrors ``bool(re.search(rf"\\b{re.escape(word)}\\b", text))`` (with
+    ``re.IGNORECASE`` when ``case_insensitive=True``).  Same boundary
+    definition as :func:`_substitute_whole_words`.
+    """
+    if not word or not text or len(word) > len(text):
+        return False
+    haystack = text.lower() if case_insensitive else text
+    needle = word.lower() if case_insensitive else word
+    pos = 0
+    while True:
+        idx = haystack.find(needle, pos)
+        if idx < 0:
+            return False
+        if idx > 0 and _is_word_char(haystack[idx - 1]):
+            pos = idx + 1
+            continue
+        end = idx + len(needle)
+        if end < len(haystack) and _is_word_char(haystack[end]):
+            pos = idx + 1
+            continue
+        return True
+
+
+def _extract_alpha_tokens(text: str, *, min_len: int = 1) -> list[str]:
+    """Split text into runs of alphabetic characters.
+
+    Mirrors ``re.findall(r"[a-z]+", text)`` semantics on lowercased input.
+    ASCII-only matches the previous behaviour — Unicode handling is a
+    separate decision the original code didn't take.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    for c in text:
+        if "a" <= c <= "z":
+            current.append(c)
+            continue
+        if current:
+            tok = "".join(current)
+            if len(tok) >= min_len:
+                tokens.append(tok)
+            current = []
+    if current:
+        tok = "".join(current)
+        if len(tok) >= min_len:
+            tokens.append(tok)
+    return tokens
+
+
+_NER_APOSTROPHES = ("'", "’")
+
+
+def _strip_ner_dialogue_tail(text: str) -> str:
+    """Strip a ``:<whitespace><word-char>...$`` dialogue tail.
+
+    Mirrors ``re.sub(r":\\s*\\w+.*$", "", text)``: a colon followed by
+    optional whitespace, then a word character, then anything to end of
+    string is removed (along with the colon itself).  Returns ``text``
+    unchanged when no such suffix is present.
+    """
+    if ":" not in text:
+        return text
+    pos = 0
+    while True:
+        colon = text.find(":", pos)
+        if colon < 0:
+            return text
+        scan = colon + 1
+        while scan < len(text) and text[scan].isspace():
+            scan += 1
+        if scan < len(text) and _is_word_char(text[scan]):
+            return text[:colon]
+        pos = colon + 1
+
+
+def _strip_ner_possessive(text: str) -> str:
+    """Strip a trailing possessive (``'`` / ``'s`` / ``’`` / ``’s``).
+
+    Mirrors ``re.sub(r"['’]s?$", "", text)``.
+    """
+    if not text:
+        return text
+    if text.endswith("s") and len(text) > 1 and text[-2] in _NER_APOSTROPHES:
+        return text[:-2]
+    if text[-1] in _NER_APOSTROPHES:
+        return text[:-1]
+    return text
+
+
 # Prompt filename constants — one definition site; imported by consolidation.py.
 DEFAULT_SYSTEM_PROMPT_FILENAME = "extraction_system.txt"
 DEFAULT_USER_PROMPT_FILENAME = "extraction.txt"
@@ -1257,20 +1431,17 @@ def _sota_pipeline(
     reverse_mapping = {v: k for k, v in mapping.items()}
     from paramem.graph.schema import Entity, Relation
 
-    # Substring replacement mirrors _anonymize_transcript(): word-boundary
-    # anchored, longest-placeholder-first to prevent partial matches.
-    # Handles composite strings like "Person_2's cousin" → "David's cousin".
-    _reverse_sorted = sorted(reverse_mapping.items(), key=lambda kv: -len(kv[0]))
+    # Substring replacement via _substitute_whole_words: word-boundary
+    # anchored, longest-placeholder-first internally to prevent partial
+    # matches.  Handles composite strings like "Person_2's cousin" →
+    # "David's cousin" — the apostrophe is not a word character so the
+    # placeholder match terminates correctly at "Person_2".
+    _reverse_mapping = {
+        k: v for k, v in reverse_mapping.items() if isinstance(k, str) and isinstance(v, str) and k
+    }
 
     def _deanonymize_field(value: str) -> str:
-        result = value
-        for placeholder, real_name in _reverse_sorted:
-            if not isinstance(placeholder, str) or not isinstance(real_name, str):
-                continue
-            if not placeholder:
-                continue
-            result = re.sub(rf"\b{re.escape(placeholder)}\b", real_name, result)
-        return result
+        return _substitute_whole_words(value, _reverse_mapping)
 
     deanon_facts = []
     for fact in enriched_anon:
@@ -1467,9 +1638,7 @@ def _repair_anonymization_leaks(
     for name in leaked:
         if not name:
             continue
-        in_transcript = bool(
-            re.search(rf"\b{re.escape(name)}\b", original_transcript or "", re.IGNORECASE)
-        )
+        in_transcript = _contains_whole_word(original_transcript or "", name, case_insensitive=True)
         if not in_transcript:
             hallucinated.add(name)
             continue
@@ -1505,20 +1674,17 @@ def _repair_anonymization_leaks(
     # transcript re-anonymization with the extended mapping.
     missed_names = {n for n in leaked if n not in hallucinated}
     if missed_names:
-        # Substring replacement — longest-first to prevent partial matches.
-        # Mirrors _anonymize_transcript() approach.
-        sorted_missed = sorted(missed_names, key=len, reverse=True)
+        # Build a focused mapping for just the missed names; reuse the
+        # shared _substitute_whole_words helper (longest-first internally,
+        # word-boundary anchored — same primitive _anonymize_transcript uses).
+        missed_mapping = {name: new_mapping[name] for name in missed_names}
         for f in facts:
             s = f.get("subject", "")
             o = f.get("object", "")
             if isinstance(s, str):
-                for name in sorted_missed:
-                    s = re.sub(rf"\b{re.escape(name)}\b", new_mapping[name], s)
-                f["subject"] = s
+                f["subject"] = _substitute_whole_words(s, missed_mapping)
             if isinstance(o, str):
-                for name in sorted_missed:
-                    o = re.sub(rf"\b{re.escape(name)}\b", new_mapping[name], o)
-                f["object"] = o
+                f["object"] = _substitute_whole_words(o, missed_mapping)
         anon_transcript = _anonymize_transcript(original_transcript, new_mapping)
 
     return facts, new_mapping, anon_transcript, status
@@ -1554,17 +1720,17 @@ def _entity_is_grounded(entity: str, transcript_norm: str, known_names: set[str]
     norm = _normalize_for_grounding(entity).strip()
     if not norm:
         return False
-    tokens = [t for t in re.findall(r"[a-z]+", norm) if len(t) > 2]
+    tokens = _extract_alpha_tokens(norm, min_len=3)
     if not tokens:
         # Too-short entity (e.g. initials, CJK short names like "Li Na").
         # Whole-phrase word-boundary match prevents "Li" from matching
         # inside "Libya".
-        return bool(re.search(rf"\b{re.escape(norm)}\b", transcript_norm))
+        return _contains_whole_word(transcript_norm, norm)
     # Strict "all significant tokens must appear" is intentional: partial
     # matches would let SOTA world-knowledge inferences slip through (entity
     # "Munich Airport" against transcript saying only "Munich"). We favour
     # precision (drop plausibly-enriched entities) over recall.
-    return all(re.search(rf"\b{re.escape(t)}\b", transcript_norm) for t in tokens)
+    return all(_contains_whole_word(transcript_norm, t) for t in tokens)
 
 
 def _drop_ungrounded_facts(
@@ -1712,19 +1878,21 @@ _SPACY_PII_LABELS = {"PERSON": "person", "GPE": "place", "LOC": "place"}
 # Cached per-(lang) spaCy pipelines so we don't reload on every call.
 _SPACY_MODELS: dict[str, object] = {}
 
-# Cleanup patterns for noisy NER spans: dialogue-format transcripts often
-# cause spaCy to extend PERSON spans into the following response token.
-# E.g. "Li Ming: True" or "Li Yu: Indeed" — the person is "Li Ming", the
-# rest is dialogue cruft that would inflate false "missing mapping" flags.
-_NER_DIALOGUE_TAIL_RE = re.compile(r":\s*\w+.*$")
-_NER_POSSESSIVE_RE = re.compile(r"['\u2019]s?$")
-
 
 def _clean_ner_span(text: str) -> str:
-    """Normalize a raw spaCy NER span — strip dialogue tails, possessives."""
+    """Normalize a raw spaCy NER span — strip dialogue tails, possessives.
+
+    Dialogue-format transcripts often cause spaCy to extend PERSON spans
+    into the following response token (e.g. ``"Li Ming: True"`` — person
+    is ``"Li Ming"``, the rest is dialogue cruft that would inflate
+    false "missing mapping" flags).  ``_strip_ner_dialogue_tail`` and
+    ``_strip_ner_possessive`` apply the same shape as the previous
+    ``_NER_DIALOGUE_TAIL_RE`` / ``_NER_POSSESSIVE_RE`` patterns without
+    regex on user-content text.
+    """
     cleaned = text.strip()
-    cleaned = _NER_DIALOGUE_TAIL_RE.sub("", cleaned)
-    cleaned = _NER_POSSESSIVE_RE.sub("", cleaned)
+    cleaned = _strip_ner_dialogue_tail(cleaned)
+    cleaned = _strip_ner_possessive(cleaned)
     cleaned = cleaned.rstrip(":,.;!? ")
     return cleaned.strip()
 
@@ -1823,8 +1991,8 @@ def verify_anonymization_completeness(
     for name in real_names:
         # Case 1: Leak — real name still appears in anon outputs.
         # Word-boundary, case-insensitive match against the transcript.
-        leaked_in_transcript = anon_transcript and re.search(
-            rf"\b{re.escape(name)}\b", anon_transcript, re.IGNORECASE
+        leaked_in_transcript = bool(anon_transcript) and _contains_whole_word(
+            anon_transcript, name, case_insensitive=True
         )
         if leaked_in_transcript:
             problems.append(name)
@@ -1854,22 +2022,25 @@ def _anonymize_transcript(transcript: str, mapping: dict) -> str:
 
     Replaces all mapped entity names with their anonymized placeholders
     so SOTA can see the conversation context without identifying info.
-    Longer names are replaced first to avoid partial matches.
+    Word-boundary anchored — prevents "Li" from eating the "Li" prefix
+    of "Li Ming" or the "Li" substring of "Beijing".  Longer keys are
+    tried first internally so multi-word names preempt single-word
+    prefixes.
 
-    Defensive: local models occasionally emit `null` placeholders; we skip
-    those entries rather than crashing on `str.replace(x, None)`.
+    Defensive: local models occasionally emit ``null`` mapping entries
+    (non-string keys/values); :func:`_substitute_whole_words` skips
+    those rather than crashing.
     """
-    result = transcript
-    for original, placeholder in sorted(mapping.items(), key=lambda kv: -len(kv[0])):
-        if not isinstance(original, str) or not isinstance(placeholder, str):
-            logger.warning("Skipping invalid anonymization entry: %r → %r", original, placeholder)
-            continue
-        if not original:
-            continue
-        # Word-boundary anchored replacement — prevents "Li" from eating the
-        # "Li" prefix of "Li Ming" or the "Li" substring of "Beijing".
-        result = re.sub(rf"\b{re.escape(original)}\b", placeholder, result)
-    return result
+    if not mapping:
+        return transcript
+    invalid = [
+        (k, v)
+        for k, v in mapping.items()
+        if not isinstance(k, str) or not isinstance(v, str) or not k
+    ]
+    for k, v in invalid:
+        logger.warning("Skipping invalid anonymization entry: %r → %r", k, v)
+    return _substitute_whole_words(transcript, mapping)
 
 
 _DEFAULT_ANONYMIZER_MAX_TOKENS = 2048
