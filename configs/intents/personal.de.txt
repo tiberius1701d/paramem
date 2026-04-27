@@ -1,0 +1,16 @@
+# Intent class: PERSONAL — siehe personal.en.txt für Details.
+Was ist meine Adresse?
+Wo wohne ich?
+Wie ist meine Telefonnummer?
+Wann habe ich Geburtstag?
+Wer ist meine Partnerin?
+Was ist mein Beruf?
+Welche Hobbys habe ich?
+Wie alt bin ich?
+Wo arbeite ich?
+Was ist mein Lieblingsrestaurant?
+Habe ich heute meine Tabletten genommen?
+Wann habe ich zuletzt mit meinem Arzt gesprochen?
+Wer ist mein engster Freund?
+Was hatte ich gestern zum Abendessen?
+Was weisst du über mich?

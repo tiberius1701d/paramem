@@ -1,0 +1,20 @@
+# Intent class: GENERAL — general knowledge, real-time data, world Q&A
+# that does not depend on the speaker's identity.  Safe to escalate to
+# cloud (no private content).
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+What is the capital of France?
+How tall is the Eiffel Tower?
+When is Christmas this year?
+Who wrote Romeo and Juliet?
+What is the speed of light?
+Convert 100 dollars to euros
+What's the weather forecast for tomorrow?
+How many planets are in the solar system?
+Who painted the Mona Lisa?
+What time zone is Tokyo in?
+How do I make sourdough bread?
+What does HTTP stand for?
+When was the moon landing?
+Translate "good morning" to Italian
+What is photosynthesis?

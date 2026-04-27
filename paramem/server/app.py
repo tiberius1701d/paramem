@@ -1583,13 +1583,17 @@ async def lifespan(app: FastAPI):
     )
 
     # Residual intent classifier — load the sentence-encoder once so the
-    # routing path doesn't pay model-load cost per query.  Failure is
+    # routing path doesn't pay model-load cost per query, and embed the
+    # per-class exemplars at startup so cosine routing at query time is
+    # a single matrix-vector dot product.  Failure at any step is
     # non-fatal: the classifier returns Intent.UNKNOWN / fail-closed and
     # routing degrades to the existing structural rules.
     if not cloud_only:
-        from paramem.server.intent import load_encoder
+        from paramem.server.intent import load_encoder, load_exemplars
 
-        load_encoder(config.intent)
+        encoder_handle = load_encoder(config.intent)
+        if encoder_handle is not None:
+            load_exemplars(config.intent, encoder_handle)
 
     # Global observed-language tracker — records STT-detected languages with
     # high confidence, publishes to HA as input_text.voice_observed_languages
@@ -5643,9 +5647,10 @@ def _extract_and_start_training():
     from paramem.server.consolidation import (
         _increment_key_sessions,
         _promote_mature_keys,
+        _save_debug_artifacts,
         _save_key_metadata,
         _save_keyed_pairs_for_router,
-        _save_simulation_results,
+        _save_simulate_store,
         create_consolidation_loop,
     )
 
@@ -5742,12 +5747,22 @@ def _extract_and_start_training():
         _state["consolidating"] = False
         return
 
-    # --- Simulate mode: full pipeline minus weight update, minus archival ---
-    # Blackbox-equivalent to train: same key assignment, contradiction handling,
-    # SimHash registry, on-disk keyed_pairs + registry. Intentional deltas:
-    #   * no LoRA weight update  → inference recalls from disk
-    #   * no mark_consolidated   → pending sessions keep feeding extraction
-    #                              (merger is idempotent on s/p/o)
+    # --- Simulate mode: peer storage backend ---
+    # Same upstream pipeline as train (extraction → dedup → key assignment →
+    # contradiction handling → SimHash registry); the persistence venue is
+    # an encrypted JSON store under paths.simulate instead of LoRA weight
+    # updates. mark_consolidated runs in both branches — sessions retire
+    # when their work has been persisted, regardless of medium. Inference
+    # reads from the JSON store at retrieval time (Task #7 follow-up).
+
+    # Symmetric debug dump (both branches) — moved before mode split.
+    # Best-effort: a debug-write failure must NOT abort consolidation.
+    if config.debug:
+        try:
+            _save_debug_artifacts(loop, config, all_episodic_qa, all_procedural_rels)
+        except Exception:
+            logger.exception("debug-artifact write failed; continuing consolidation")
+
     if config.consolidation.mode == "simulate":
         primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
         with gpu_lock_sync():
@@ -5756,16 +5771,19 @@ def _extract_and_start_training():
             )
             newly_promoted = _promote_mature_keys(loop, config)
             _save_keyed_pairs_for_router(loop, config)
-            # _save_registry retired (Plan A): the combined SimHash registry at
-            # config.registry_path was not maintained by interim or full-cycle
-            # production paths post-Phase-3+5, and the temporal-query reader
-            # (filter_registry_by_date) needed fields the writer never emitted.
-            # Per-adapter simhash_registry_<adapter>.json files are the canonical
-            # source of truth; inference._load_simhash_registry will combine
+            # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
+            # the combined SimHash registry at config.registry_path was not
+            # maintained by interim or full-cycle production paths post-Phase-3+5,
+            # and the temporal-query reader (filter_registry_by_date) — itself
+            # retired in Plan A.3 — needed fields the writer never emitted.
+            # Per-adapter simhash_registry_<adapter>.json files are now the
+            # canonical source of truth; inference._load_simhash_registry combines
             # them at read time.
             _save_key_metadata(loop, config)
-            if config.debug:
-                _save_simulation_results(all_episodic_qa, all_procedural_rels, loop, config)
+            _save_simulate_store(loop, config, all_episodic_qa, all_procedural_rels)
+
+        # Simulate is peer storage — retire pending sessions like train.
+        session_buffer.mark_consolidated(session_ids)
 
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
         _state["last_consolidation_result"] = {

@@ -1,0 +1,20 @@
+# Intent class: COMMAND — imperatives directed at the home / device fleet.
+# Routing rule: HA conversation agent first; SOTA only if HA unavailable
+# AND the query is content-free.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+Turn on the kitchen lights
+Turn off the bedroom lamp
+Set the thermostat to 22 degrees
+Play music in the living room
+Pause the music
+Lock the front door
+Unlock the back door
+Open the garage door
+Start the dishwasher
+Increase the volume
+Decrease the volume
+Mute the speaker
+Set a timer for 10 minutes
+Cancel the timer
+Add milk to the shopping list

@@ -1,0 +1,22 @@
+# Intent class: PERSONAL — queries the speaker asks about themselves or
+# their world (their facts, family, schedule, possessions, history).
+# Routing rule: never escalates to cloud.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+# Operators can replace this file at the path given by intent.exemplars_dir
+# in server.yaml; the runtime reloads on next server restart.
+What is my address?
+Where do I live?
+What's my phone number?
+When is my birthday?
+Who is my partner?
+What is my job?
+What hobbies do I have?
+How old am I?
+Where do I work?
+What's my favourite restaurant?
+Did I take my medication today?
+When did I last call my doctor?
+Who is my closest friend?
+What did I have for dinner last night?
+What do you know about me?

@@ -1,0 +1,16 @@
+# Intent class: COMMAND — siehe command.en.txt für Details.
+Mache das Licht in der Küche an
+Schalte die Lampe im Schlafzimmer aus
+Stelle die Heizung auf 22 Grad
+Spiele Musik im Wohnzimmer
+Pausiere die Musik
+Schliesse die Haustür ab
+Entriegele die Hintertür
+Öffne das Garagentor
+Starte die Spülmaschine
+Erhöhe die Lautstärke
+Verringere die Lautstärke
+Schalte den Lautsprecher stumm
+Stelle einen Timer auf 10 Minuten
+Brich den Timer ab
+Setze Milch auf die Einkaufsliste

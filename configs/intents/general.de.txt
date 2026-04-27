@@ -1,0 +1,16 @@
+# Intent class: GENERAL — siehe general.en.txt für Details.
+Was ist die Hauptstadt von Frankreich?
+Wie hoch ist der Eiffelturm?
+Wann ist Weihnachten dieses Jahr?
+Wer hat Romeo und Julia geschrieben?
+Wie schnell ist Licht?
+Wandle 100 Dollar in Euro um
+Wie ist die Wettervorhersage für morgen?
+Wie viele Planeten gibt es im Sonnensystem?
+Wer hat die Mona Lisa gemalt?
+In welcher Zeitzone liegt Tokio?
+Wie backt man Sauerteigbrot?
+Wofür steht die Abkürzung HTTP?
+Wann war die Mondlandung?
+Übersetze "guten Morgen" ins Italienische?
+Was ist Photosynthese?
