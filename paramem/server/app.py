@@ -39,7 +39,6 @@ from paramem.backup.types import ArtifactKind
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import TTSConfig, load_server_config
-from paramem.server.consolidation import run_consolidation
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.inference import (
     ChatResult,
@@ -5313,64 +5312,6 @@ def _cloud_only_route(
 
 
 # --- Internal ---
-
-
-def _run_consolidation_sync():
-    """Run consolidation in a background thread.
-
-    The consolidating flag is set by the caller before submitting to
-    the executor, and cleared by _consolidation_done_callback after
-    completion. Holds the GPU lock for the entire consolidation to
-    prevent concurrent CUDA access from STT/TTS/inference.
-    """
-    from paramem.server.gpu_lock import gpu_lock_sync
-
-    with gpu_lock_sync():
-        _run_consolidation_inner()
-
-
-def _run_consolidation_inner():
-    """Consolidation logic — must be called with GPU lock held."""
-    # Read HA home context for location validation
-    ha_context = None
-    ha_client = _state.get("ha_client")
-    if ha_client is not None:
-        ha_context = ha_client.get_home_context()
-
-    result = run_consolidation(
-        model=_state["model"],
-        tokenizer=_state["tokenizer"],
-        config=_state["config"],
-        session_buffer=_state["session_buffer"],
-        loop=_state["consolidation_loop"],
-        ha_context=ha_context,
-    )
-    # Store loop for reuse across runs (preserves graph, registries, cycle count)
-    if "loop" in result:
-        loop = result.pop("loop")
-        _state["consolidation_loop"] = loop
-        # Update model reference — ConsolidationLoop wraps the base model
-        # in PeftModel with adapters during training
-        _state["model"] = loop.model
-    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-    _state["last_consolidation_result"] = {k: v for k, v in result.items() if k != "loop"}
-    _state["router"].reload()
-    # Refresh HA entity graph if available
-    ha_graph = _state.get("ha_graph")
-    ha_client = _state.get("ha_client")
-    if ha_graph is not None and ha_client is not None:
-        ha_client.load_entity_map()
-        ha_services = ha_client.get_services()
-        ha_graph.refresh(ha_client._raw_states, ha_services)
-    logger.info("Consolidation result: %s", result)
-
-
-def _consolidation_done_callback(future):
-    """Called when consolidation completes or fails."""
-    _state["consolidating"] = False
-    exc = future.exception()
-    if exc:
-        logger.exception("Consolidation failed: %s", exc)
 
 
 def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":

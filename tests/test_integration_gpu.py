@@ -259,28 +259,6 @@ class TestTrainingSchedulerBehavior:
         yield
         _state["consolidating"] = saved if saved is not None else False
 
-    def test_consolidation_done_callback_clears_flag(self):
-        """_consolidation_done_callback must reset _state['consolidating'] to False."""
-        from paramem.server.app import _consolidation_done_callback, _state
-
-        future = MagicMock()
-        future.exception.return_value = None
-
-        _state["consolidating"] = True
-        _consolidation_done_callback(future)
-        assert _state["consolidating"] is False
-
-    def test_consolidation_done_callback_on_exception(self):
-        """_consolidation_done_callback still clears the flag when the future raised."""
-        from paramem.server.app import _consolidation_done_callback, _state
-
-        future = MagicMock()
-        future.exception.return_value = RuntimeError("simulated")
-
-        _state["consolidating"] = True
-        _consolidation_done_callback(future)
-        assert _state["consolidating"] is False
-
     def test_scheduled_extract_done_callback_on_exception(self):
         """_scheduled_extract_done_callback clears the flag if extraction failed."""
         from paramem.server.app import _scheduled_extract_done_callback, _state
