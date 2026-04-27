@@ -269,6 +269,13 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
     - Backup ``*.meta.json`` sidecars — operator visibility on wrong-key
       restore trumps the marginal info hiding.
 
+    Included (full-file encryption):
+    - ``adapters/<tier>/<slot>/adapter_model.safetensors`` (and any
+      ``episodic_interim_*`` siblings) — LoRA weight tensors encrypted
+      in-place by :func:`~paramem.models.loader._encrypt_adapter_safetensors`
+      at save time; decrypted into anonymous RAM at load time via
+      :func:`~paramem.models.loader._adapter_slot_for_load`.
+
     Parameters
     ----------
     data_dir:
@@ -307,6 +314,14 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
     if adapters_root.exists():
         for resume in adapters_root.rglob("in_training/resume_state.json"):
             paths.append(resume)
+    # Adapter safetensors — full-file encrypted when daily identity is loaded.
+    # Each tier's slot directories (and episodic_interim_* siblings) may hold
+    # one or more adapter_model.safetensors files.  Enumerate them so
+    # rotation, restore, and the startup mode-consistency scan all cover the
+    # adapter weight blobs alongside the JSON metadata.
+    if adapters_root.exists():
+        for safetensors in adapters_root.rglob("adapter_model.safetensors"):
+            paths.append(safetensors)
     # Simulate-mode peer-storage keyed_pairs (canonical per-tier layout).
     # Encryption posture matches train: respects the master switch via the
     # same encrypted helpers. Inclusion here ensures rotation/restore/scan

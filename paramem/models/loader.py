@@ -4,6 +4,7 @@ This module isolates all model-specific logic behind a clean interface.
 Swapping the base model requires only changing the model_id in config.
 """
 
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -364,7 +365,7 @@ def atomic_save_adapter(
 ) -> Path:
     """Save adapter atomically into a timestamped slot directory.
 
-    Implements the six-step in-pending-flatten sequence from the plan:
+    Implements the seven-step in-pending-flatten sequence:
 
     1. Ensure ``target_dir`` and ``target_dir/.pending/`` exist; pick a
        collision-safe ``<ts>`` stamp and create ``pending_slot =
@@ -376,6 +377,11 @@ def atomic_save_adapter(
        exists, iterate its children and rename each up one level into
        ``pending_slot/``, then rmdir the now-empty nested directory.  If the
        nested directory is absent, this step is a no-op.
+    3.5. **Encrypt ``adapter_model.safetensors`` in-place** via
+       :func:`_encrypt_adapter_safetensors`.  When the daily age identity is
+       loaded, the plaintext tensor bytes are replaced by an age envelope.
+       When no key is configured the file is rewritten unchanged (plaintext
+       pass-through, zero overhead).
     4. If *manifest* is not ``None``, write ``pending_slot/meta.json`` via
        :func:`paramem.adapters.manifest.write_manifest`.
     5. fsync ``pending_slot`` (best-effort; ``OSError`` tolerated on
@@ -431,6 +437,10 @@ def atomic_save_adapter(
             child.rename(pending_slot / child.name)
         nested.rmdir()
 
+    # Step 3.5 — Encrypt adapter_model.safetensors in-place (age when key loaded,
+    # plaintext pass-through when no key is configured — see SECURITY.md §1/§4).
+    _encrypt_adapter_safetensors(pending_slot)
+
     # Step 4 — Write manifest alongside adapter files (before fsync/rename)
     if manifest is not None:
         from paramem.adapters.manifest import write_manifest
@@ -468,6 +478,160 @@ def _make_slot_ts() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+# ---------------------------------------------------------------------------
+# Adapter safetensors encryption helpers
+# ---------------------------------------------------------------------------
+
+_SAFETENSORS_FILENAME = "adapter_model.safetensors"
+
+
+def _encrypt_adapter_safetensors(slot: Path) -> None:
+    """Encrypt ``adapter_model.safetensors`` inside *slot* in-place.
+
+    Reads the plaintext tensor file written by PEFT's ``save_pretrained``,
+    passes the bytes through :func:`paramem.backup.encryption.envelope_encrypt_bytes`
+    (age multi-recipient when the daily identity is loaded, plaintext pass-through
+    otherwise), then atomically replaces the file via
+    :func:`paramem.backup.encryption._atomic_write_bytes`.
+
+    When no daily identity is loaded this is a no-op: ``envelope_encrypt_bytes``
+    returns the bytes unchanged and ``_atomic_write_bytes`` overwrites with the
+    same plaintext — which is logically identical to the pre-encrypt state and
+    safe to perform.
+
+    Called by :func:`atomic_save_adapter` at Step 3.5 — after PEFT flatten
+    (Step 3), before manifest write (Step 4).  The pending slot is not yet
+    promoted so a failure here aborts the entire save without leaving an
+    inconsistent slot in the live tree.
+
+    Args:
+        slot: Pending slot directory.  Must contain ``adapter_model.safetensors``
+            at the top level (PEFT flatten step already done).
+
+    Raises:
+        OSError: On any filesystem error during read or atomic write.
+    """
+    from paramem.backup.encryption import _atomic_write_bytes, envelope_encrypt_bytes
+
+    safetensors_path = slot / _SAFETENSORS_FILENAME
+    if not safetensors_path.exists():
+        # PEFT wrote no safetensors (e.g. adapter_model.bin layout or unit-test
+        # mock that omits the file) — skip silently.
+        logger.debug(
+            "_encrypt_adapter_safetensors: %s absent in %s — skipping",
+            _SAFETENSORS_FILENAME,
+            slot,
+        )
+        return
+    plaintext = safetensors_path.read_bytes()
+    encrypted = envelope_encrypt_bytes(plaintext)
+    _atomic_write_bytes(safetensors_path, encrypted)
+
+
+@contextlib.contextmanager
+def _adapter_slot_for_load(slot: Path):
+    """Context manager that yields a readable slot directory for PEFT loading.
+
+    When ``adapter_model.safetensors`` inside *slot* is an age envelope,
+    decrypts it into an anonymous in-memory file (``os.memfd_create`` on
+    Linux; ``/dev/shm/paramem-<random>`` with mode ``0700`` as a fallback)
+    and yields a *temporary* copy of the slot directory where the safetensors
+    file is replaced by the decrypted bytes.  The caller passes the yielded
+    path to ``model.load_adapter`` or ``PeftModel.from_pretrained``.  All
+    temporary files are removed on context exit regardless of exceptions.
+
+    When ``adapter_model.safetensors`` is plaintext (or absent) the original
+    *slot* is yielded unchanged — zero overhead.
+
+    The memfd / shm file is opened with ``O_RDWR`` + ``F_SEAL_WRITE`` (Linux
+    memfd sealing, best-effort) so the kernel never needs to page the tensor
+    to a swap file.  The fd is closed on exit; no ``/proc/self/fd/<fd>``
+    symlink persists after the context.
+
+    Usage::
+
+        with _adapter_slot_for_load(slot) as load_path:
+            model.load_adapter(str(load_path), adapter_name=name)
+
+    Args:
+        slot: Path to the slot directory written by :func:`atomic_save_adapter`.
+
+    Yields:
+        Path — either the original *slot* (plaintext case) or a temporary
+        directory with the decrypted safetensors at the same relative path.
+    """
+    import shutil
+    import tempfile
+
+    from paramem.backup.age_envelope import AGE_MAGIC
+
+    safetensors_path = slot / _SAFETENSORS_FILENAME
+
+    # Fast path — plaintext or file absent: yield original slot unchanged.
+    if not safetensors_path.exists() or not safetensors_path.read_bytes()[:22].startswith(
+        AGE_MAGIC[:22]
+    ):
+        # Yield as a plain generator (no cleanup needed).
+        yield slot
+        return
+
+    # Encrypted path — need to decrypt into a temporary location.
+    from paramem.backup.encryption import read_maybe_encrypted
+
+    plaintext = read_maybe_encrypted(safetensors_path)
+
+    # Try memfd_create (Linux anonymous in-memory file, no on-disk residue).
+    # Fall back to /dev/shm with mode 0700 when memfd is unavailable.
+    tmp_dir: Path | None = None
+    memfd: int | None = None
+    shm_path: Path | None = None
+
+    try:
+        try:
+            memfd = os.memfd_create("paramem_adapter", flags=0)  # type: ignore[attr-defined]
+            os.write(memfd, plaintext)
+            os.lseek(memfd, 0, os.SEEK_SET)
+            # Expose via /proc/self/fd/<fd> so PEFT can open it as a regular path.
+            memfd_path = Path(f"/proc/self/fd/{memfd}")
+            # Build a temporary directory that mirrors the slot layout but
+            # replaces adapter_model.safetensors with a symlink to the memfd.
+            tmp_dir = Path(tempfile.mkdtemp(prefix="paramem_slot_"))
+            tmp_dir.chmod(0o700)
+            # Hardlink every non-safetensors file (adapter_config.json, meta.json).
+            for child in slot.iterdir():
+                if child.name != _SAFETENSORS_FILENAME:
+                    shutil.copy2(child, tmp_dir / child.name)
+            # Symlink safetensors → /proc/self/fd/<fd>.
+            (tmp_dir / _SAFETENSORS_FILENAME).symlink_to(memfd_path)
+            yield tmp_dir
+
+        except (AttributeError, OSError):
+            # memfd_create not available (non-Linux) or /proc not mounted.
+            # Fall back to /dev/shm with a random name and mode 0700.
+            import secrets
+
+            shm_dir = Path("/dev/shm")
+            if not shm_dir.exists():
+                shm_dir = Path(tempfile.gettempdir())
+            shm_name = f"paramem-{secrets.token_hex(8)}"
+            tmp_dir = shm_dir / shm_name
+            tmp_dir.mkdir(mode=0o700, exist_ok=False)
+            for child in slot.iterdir():
+                if child.name != _SAFETENSORS_FILENAME:
+                    shutil.copy2(child, tmp_dir / child.name)
+            shm_path = tmp_dir / _SAFETENSORS_FILENAME
+            shm_path.write_bytes(plaintext)
+            shm_path.chmod(0o600)
+            yield tmp_dir
+
+    finally:
+        if memfd is not None:
+            with contextlib.suppress(OSError):
+                os.close(memfd)
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def copy_adapter_weights(model: PeftModel, src: str, dst: str) -> None:

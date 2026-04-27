@@ -3688,13 +3688,19 @@ class ConsolidationLoop:
             verify_name,
         )
 
+        from paramem.models.loader import _adapter_slot_for_load
+
         recall_rate: float = 0.0
         try:
             # Load the saved slot into an isolated verify adapter.
             # Use the same pattern as _mount_adapters_from_slots (app.py L955):
             # model.load_adapter(str(slot), adapter_name=name) for PeftModel.
+            # _adapter_slot_for_load transparently decrypts the safetensors into
+            # an anonymous in-memory file (memfd) so the encrypted disk artifact
+            # exercises the real round-trip: save → encrypt → decrypt → verify.
             if isinstance(self.model, PeftModel):
-                self.model.load_adapter(str(slot_path), adapter_name=verify_name)
+                with _adapter_slot_for_load(slot_path) as load_path:
+                    self.model.load_adapter(str(load_path), adapter_name=verify_name)
             else:
                 # Base model — cannot load a second adapter without wrapping.
                 # This branch should not occur in production (the model is always

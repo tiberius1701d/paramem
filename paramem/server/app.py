@@ -948,13 +948,18 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
 
         Does not overwrite an existing manifest status row — the validator may
         have already recorded a manifest_missing or migrated_unverified row.
+        Transparently decrypts age-encrypted ``adapter_model.safetensors`` via
+        :func:`~paramem.models.loader._adapter_slot_for_load`.
         """
+        from paramem.models.loader import _adapter_slot_for_load
+
         nonlocal model
         try:
-            if isinstance(model, PeftModel):
-                model.load_adapter(str(slot), adapter_name=name)
-            else:
-                model = PeftModel.from_pretrained(model, str(slot), adapter_name=name)
+            with _adapter_slot_for_load(slot) as load_path:
+                if isinstance(model, PeftModel):
+                    model.load_adapter(str(load_path), adapter_name=name)
+                else:
+                    model = PeftModel.from_pretrained(model, str(load_path), adapter_name=name)
             logger.info("Mounted adapter %s from slot %s", name, slot.name)
         except Exception as exc:
             logger.error("Failed to load adapter %s from %s: %s", name, slot, exc)
@@ -1005,12 +1010,15 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             ).exists():
                 logger.info("Loading interim adapter (flat layout): %s", _interim_name)
                 try:
-                    if isinstance(model, PeftModel):
-                        model.load_adapter(str(_interim_path), adapter_name=_interim_name)
-                    else:
-                        model = PeftModel.from_pretrained(
-                            model, str(_interim_path), adapter_name=_interim_name
-                        )
+                    from paramem.models.loader import _adapter_slot_for_load
+
+                    with _adapter_slot_for_load(_interim_path) as _load_path:
+                        if isinstance(model, PeftModel):
+                            model.load_adapter(str(_load_path), adapter_name=_interim_name)
+                        else:
+                            model = PeftModel.from_pretrained(
+                                model, str(_load_path), adapter_name=_interim_name
+                            )
                 except Exception as exc:
                     logger.error("Failed to load interim adapter %s: %s", _interim_name, exc)
             else:
