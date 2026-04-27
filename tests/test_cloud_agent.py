@@ -377,22 +377,18 @@ class TestPrivacyRouting:
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None
 
-        with patch(
-            "paramem.server.inference.detect_temporal_query",
-            return_value=None,
-        ):
-            result = handle_chat(
-                text="What is the weather today?",
-                conversation_id="test",
-                speaker=None,
-                history=None,
-                model=model,
-                tokenizer=tokenizer,
-                config=config,
-                router=router,
-                ha_client=ha_client,
-                sota_agent=cloud_agent,
-            )
+        result = handle_chat(
+            text="What is the weather today?",
+            conversation_id="test",
+            speaker=None,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            router=router,
+            ha_client=ha_client,
+            sota_agent=cloud_agent,
+        )
 
         # HA was attempted first and returned None
         ha_client.conversation_process.assert_called_once()
@@ -416,10 +412,6 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
 
         with (
-            patch(
-                "paramem.server.inference.detect_temporal_query",
-                return_value=None,
-            ),
             patch(
                 "paramem.server.inference.generate_answer",
                 return_value="I'm not sure about that.",
@@ -469,19 +461,18 @@ class TestPrivacyRouting:
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA fails
 
-        with patch("paramem.server.inference.detect_temporal_query", return_value=None):
-            result = handle_chat(
-                text="Turn on the lights",
-                conversation_id="test",
-                speaker=None,
-                history=None,
-                model=model,
-                tokenizer=tokenizer,
-                config=config,
-                router=router,
-                ha_client=ha_client,
-                sota_agent=cloud_agent,
-            )
+        result = handle_chat(
+            text="Turn on the lights",
+            conversation_id="test",
+            speaker=None,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            router=router,
+            ha_client=ha_client,
+            sota_agent=cloud_agent,
+        )
 
         ha_client.conversation_process.assert_called_once()
         cloud_agent.call.assert_called_once()
@@ -506,19 +497,18 @@ class TestPrivacyRouting:
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA fails
 
-        with patch("paramem.server.inference.detect_temporal_query", return_value=None):
-            result = handle_chat(
-                text="Is the light on?",
-                conversation_id="test",
-                speaker=None,
-                history=None,
-                model=model,
-                tokenizer=tokenizer,
-                config=config,
-                router=router,
-                ha_client=ha_client,
-                sota_agent=cloud_agent,
-            )
+        result = handle_chat(
+            text="Is the light on?",
+            conversation_id="test",
+            speaker=None,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            router=router,
+            ha_client=ha_client,
+            sota_agent=cloud_agent,
+        )
 
         ha_client.conversation_process.assert_called_once()
         cloud_agent.call.assert_called_once()
@@ -547,7 +537,6 @@ class TestPrivacyRouting:
         ha_client.conversation_process.return_value = None  # HA fails
 
         with (
-            patch("paramem.server.inference.detect_temporal_query", return_value=None),
             patch(
                 "paramem.training.indexed_memory.probe_key",
                 return_value={"answer": "Alex prefers dim lights"},
