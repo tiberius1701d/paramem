@@ -316,15 +316,13 @@ def handle_chat(
         # turn — so they fall through to the base model for conversational
         # acknowledgement.  The interrogative gate distinguishes the two.
         #
-        # Gate uses the router's intent decision rather than the sanitizer's
-        # ``self_referential`` finding: the intent classifier draws on PA
-        # state and the encoder residual, which generalizes beyond first-
-        # person pronouns (e.g. "Where does Alex live?" classified as
-        # PERSONAL via PA match would also benefit from abstention if PA
-        # probe couldn't satisfy it; though in practice PERSONAL with steps
-        # is terminal-returned from _probe_and_reason and never reaches
-        # this branch).  ``self_referential`` is still emitted by the
-        # sanitizer for diagnostics but no longer drives routing.
+        # Gate uses the router's intent decision rather than a sanitizer
+        # finding: the intent classifier draws on PA state and the encoder
+        # residual, which generalizes beyond first-person pronouns
+        # (e.g. "Where does Alex live?" classified as PERSONAL via PA
+        # match would also benefit from abstention if PA probe couldn't
+        # satisfy it; though in practice PERSONAL with steps is terminal-
+        # returned from _probe_and_reason and never reaches this branch).
         #
         # Two response variants distinguish the two states:
         #

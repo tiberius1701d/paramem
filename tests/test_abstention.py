@@ -141,7 +141,7 @@ class TestAbstentionShortCircuit:
         with (
             patch(
                 "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["self_referential"]),
+                return_value=(None, ["first_person_personal"]),
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -171,7 +171,7 @@ class TestAbstentionShortCircuit:
         with (
             patch(
                 "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["self_referential"]),
+                return_value=(None, ["first_person_personal"]),
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -204,7 +204,7 @@ class TestAbstentionShortCircuit:
         with (
             patch(
                 "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["self_referential"]),
+                return_value=(None, ["first_person_personal"]),
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
@@ -240,7 +240,7 @@ class TestAbstentionShortCircuit:
         with (
             patch(
                 "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["personal_claim", "possessive_personal"]),
+                return_value=(None, ["first_person_personal"]),
             ),
             patch(
                 "paramem.server.inference._base_model_answer",
@@ -273,7 +273,7 @@ class TestAbstentionShortCircuit:
         with (
             patch(
                 "paramem.server.inference.sanitize_for_cloud",
-                return_value=(None, ["self_referential"]),
+                return_value=(None, ["first_person_personal"]),
             ),
             patch(
                 "paramem.server.inference._base_model_answer",

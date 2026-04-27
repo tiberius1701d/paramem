@@ -51,9 +51,9 @@ class TestPersonalEntityDetection:
             speaker_id="Speaker0",
         )
         assert "personal_entity" not in findings
-        # First-person + speaker_id + interrogative — the self_referential
-        # arm fires (which is correct: it's about the speaker).
-        assert "self_referential" in findings
+        # First-person + speaker_id — first_person_personal fires
+        # (correct: the query is about the speaker).
+        assert "first_person_personal" in findings
 
     def test_word_boundary_prevents_substring_false_positives(self):
         # "Pat" must not match inside "patron" — _anonymize_transcript
@@ -77,23 +77,28 @@ class TestPersonalEntityDetection:
 # ---------------------------------------------------------------------------
 
 
-class TestSelfReference:
-    """First-person pronouns resolve against the identified speaker."""
+class TestFirstPersonResolution:
+    """First-person pronouns resolve against the identified speaker.
 
-    def test_self_referential_question_with_speaker(self):
+    The interrogative-vs-declarative split that used to live here was
+    removed once ``Intent`` + ``_is_interrogative`` in inference.py
+    took over as the routing signals; the sanitizer now emits a single
+    ``first_person_personal`` finding for both shapes.
+    """
+
+    def test_question_with_speaker_flags_first_person_personal(self):
         findings = check_personal_content(
             "Where do I live?",
             speaker_id="Speaker0",
         )
-        assert "self_referential" in findings
+        assert "first_person_personal" in findings
 
-    def test_personal_claim_statement_with_speaker(self):
+    def test_statement_with_speaker_flags_first_person_personal(self):
         findings = check_personal_content(
             "I live in Kelkham.",
             speaker_id="Speaker0",
         )
-        assert "personal_claim" in findings
-        assert "self_referential" not in findings
+        assert "first_person_personal" in findings
 
     def test_first_person_without_speaker_is_clean(self):
         # No identified speaker → no resolution target for "I" → clean.
@@ -113,7 +118,7 @@ class TestSelfReference:
             "Tell me what's on my schedule today.",
             speaker_id="Speaker0",
         )
-        assert "self_referential" in findings or "personal_claim" in findings
+        assert "first_person_personal" in findings
 
 
 # ---------------------------------------------------------------------------
@@ -138,16 +143,16 @@ class TestSanitizeForCloud:
             speaker_id="Speaker0",
         )
         assert query == "Where do I live?"
-        assert "self_referential" in findings
+        assert "first_person_personal" in findings
 
-    def test_mode_block_returns_none_on_self_reference(self):
+    def test_mode_block_returns_none_on_first_person(self):
         query, findings = sanitize_for_cloud(
             "Where do I live?",
             mode="block",
             speaker_id="Speaker0",
         )
         assert query is None
-        assert "self_referential" in findings
+        assert "first_person_personal" in findings
 
     def test_mode_block_returns_none_on_known_entity(self):
         query, findings = sanitize_for_cloud(

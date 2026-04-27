@@ -7,28 +7,25 @@ Anchored on runtime ground truth, not lexical patterns:
   Detection reuses ``_anonymize_transcript`` from the extraction pipeline —
   the same primitive that produces SOTA-safe transcripts.  Anonymization
   replacing anything means the text contained a personal reference.
-* **First-person pronouns** plus an identified speaker are treated as a
-  self-reference even when no known entity is named (covers cold-start before
-  the graph has facts to anchor on).  The token set is explicit; there is no
+* **First-person pronouns** plus an identified speaker count as personal
+  even when no known entity is named (covers cold-start before the graph
+  has facts to anchor on).  The token set is explicit; there is no
   pattern matching.
 
-The contract ``(sanitized_text_or_None, findings)`` is unchanged so callers
-in ``inference.py`` and ``test_abstention.py`` keep working.  Findings:
+Findings emitted (purely for diagnostics / mode=warn logging — production
+routing reads :class:`paramem.server.router.Intent` instead):
 
 * ``personal_entity`` — query mentions an entity in the speaker's graph or
   an enrolled name.
-* ``self_referential`` — first-person pronoun + identified speaker +
-  interrogative shape (consumed by the abstention short-circuit).
-* ``personal_claim`` — first-person pronoun + identified speaker +
-  declarative shape.
+* ``first_person_personal`` — query contains a first-person pronoun and an
+  identified ``speaker_id``.
 
-Modes: ``off`` / ``warn`` / ``block``.  Same semantics as before.
+Modes: ``off`` / ``warn`` / ``block``.
 """
 
 import logging
 
 from paramem.graph.extractor import _anonymize_transcript
-from paramem.server.router import _is_interrogative
 
 logger = logging.getLogger(__name__)
 
@@ -120,10 +117,7 @@ def check_personal_content(
             findings.append("personal_entity")
 
     if speaker_id and _contains_first_person(text):
-        if _is_interrogative(text):
-            findings.append("self_referential")
-        else:
-            findings.append("personal_claim")
+        findings.append("first_person_personal")
 
     return findings
 

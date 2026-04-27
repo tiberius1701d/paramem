@@ -75,8 +75,8 @@ def exploding_model():
 
 class TestSanitizerPrecondition:
     """Prerequisite: the real sanitizer must classify the target queries
-    as self-referential / personal. Without this, the short-circuit
-    would never activate on these queries in production."""
+    as personal first-person. Without this, the short-circuit would
+    never activate on these queries in production."""
 
     @pytest.mark.parametrize(
         "query",
@@ -87,7 +87,7 @@ class TestSanitizerPrecondition:
             "Who is my partner?",
         ],
     )
-    def test_real_sanitizer_blocks_self_referential(self, query):
+    def test_real_sanitizer_blocks_first_person_query(self, query):
         # Self-referential resolution requires an identified speaker — the
         # sanitizer's whole point is "personal data is graph-truth", and
         # there is no resolution target for "I" / "my" without a
