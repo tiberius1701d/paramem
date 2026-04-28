@@ -393,8 +393,10 @@ tools:
 # SOTA reachability is independent: with `agents.sota.enabled: false` (or no
 # api_key), no queries reach SOTA regardless of `cloud_mode`.
 sanitization:
-  mode: block        # off | warn | block — PII detection layer
-  cloud_mode: block  # block | anonymize | both — direct-SOTA egress policy (ship-safe default)
+  mode: block            # off | warn | block — PII detection layer
+  cloud_mode: anonymize  # block | anonymize | both — direct-SOTA egress policy
+  cloud_scope:           # NER categories to anonymize when cloud_mode=anonymize|both ([] = off)
+    - person
 
 # ============================================================================
 # ABSTENTION — LAST-RESORT CONFABULATION GUARD

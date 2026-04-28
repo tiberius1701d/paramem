@@ -562,6 +562,168 @@ def extract_graph(
     return graph
 
 
+def extract_and_anonymize_for_cloud(
+    transcript: str,
+    model,
+    tokenizer,
+    *,
+    speaker_name: str | None = None,
+    prompts_dir: str | Path | None = None,
+    pii_scope: set[str] | frozenset[str] | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Local extract + local anonymize for cloud egress.
+
+    Composition over existing primitives — same anonymization sequence
+    ``_sota_pipeline`` runs every consolidation cycle, minus the SOTA
+    enrichment call:
+
+    1. ``extract_graph(validate=False)`` — local extraction only,
+       produces a SessionGraph the anonymizer can anchor on.
+    2. ``_anonymize_with_local_model(graph, transcript=transcript)`` —
+       model-based anonymization of facts + transcript.
+    3. Mechanical transcript fallback when the model omits
+       ``anonymized_transcript`` (older prompt schema returns facts only).
+    4. ``_normalize_anonymization_mapping`` — canonicalize direction.
+    5. ``verify_anonymization_completeness`` + ``_repair_anonymization_leaks``
+       — extend mapping for missed names, drop triples for hallucinated
+       ones (canonical-mapping path only).
+    6. Final completeness check; any residual leak → block.
+
+    ``pii_scope`` controls which NER categories are anonymized; passes
+    through to NER and verify.  ``None`` → :data:`_CLOUD_EGRESS_DEFAULT_SCOPE`
+    (``{"person"}``) — narrower than the primitive default because the
+    cloud-utility tradeoff (Berlin restaurants, organisation-aware
+    advice) bites here.  An empty scope short-circuits before any LLM
+    call: the helper returns ``(transcript, {})`` and the caller sends
+    the original text to the cloud verbatim — no anonymization, no
+    deanonymization needed.
+
+    Return shapes:
+
+    * ``(anon_transcript, mapping)`` — anonymization ran, mapping is
+      non-empty.  Caller deanonymizes the cloud's response with
+      :func:`deanonymize_text`.
+    * ``(transcript, {})`` — operator opted out (``pii_scope=[]``) or
+      the input had no in-scope content; caller forwards verbatim.
+    * ``("", {})`` — block.  Extraction error, anonymizer parse
+      failure, residual leak after repair, or non-canonical mapping.
+      Caller skips the cloud call.
+
+    The companion :func:`deanonymize_text` is a no-op on an empty
+    mapping, so callers can apply it unconditionally.
+    """
+    if not transcript or not transcript.strip():
+        return "", {}
+
+    scope = _CLOUD_EGRESS_DEFAULT_SCOPE if pii_scope is None else frozenset(pii_scope)
+    # Empty scope = operator opt-out.  Skip the entire LLM-driven
+    # anonymization path and let the caller forward the transcript
+    # verbatim.  Distinguished from ``("", {})`` block by non-empty text.
+    if not scope:
+        return transcript, {}
+
+    try:
+        graph = extract_graph(
+            model,
+            tokenizer,
+            transcript,
+            session_id="cloud_egress",
+            speaker_name=speaker_name,
+            prompts_dir=prompts_dir,
+            validate=False,
+            stt_correction=False,
+            ha_validation=False,
+            noise_filter="",
+        )
+    except Exception:
+        logger.exception("Cloud egress: local extraction failed; treating as block")
+        return "", {}
+
+    if not graph.relations:
+        return "", {}
+
+    try:
+        anon_facts, mapping, anon_transcript = _anonymize_with_local_model(
+            graph, model, tokenizer, transcript=transcript
+        )
+    except Exception:
+        logger.exception("Cloud egress: anonymization raised; treating as block")
+        return "", {}
+
+    if anon_facts is None or not mapping:
+        return "", {}
+
+    mapping, _norm_stats = _normalize_anonymization_mapping(mapping)
+    if not anon_transcript:
+        # Older anonymization prompt returns only facts; rebuild the
+        # transcript mechanically from the mapping (same fallback
+        # `_sota_pipeline` uses).
+        anon_transcript = _anonymize_transcript(transcript, mapping)
+
+    # Defense-in-depth: NER cross-check catches PII that extraction missed
+    # (e.g. Mistral 7B emits relations referencing place names without
+    # tagging them as entities — those slip past the entity-scoped verify).
+    # Cloud egress is privacy-critical so we always enable NER cross-check;
+    # falls back to no-op if spaCy isn't installed.  ``pii_scope`` filters
+    # which categories NER surfaces.
+    extra_pii = extract_pii_names_with_ner(transcript, pii_scope=scope)
+
+    leaked = verify_anonymization_completeness(
+        graph,
+        mapping,
+        anon_facts,
+        anon_transcript,
+        extra_pii_names=extra_pii,
+        pii_scope=scope,
+    )
+    if leaked:
+        if not _mapping_is_canonical(mapping):
+            logger.warning(
+                "Cloud egress: residual leaks with non-canonical mapping (%s); blocking",
+                leaked[:3],
+            )
+            return "", {}
+        anon_facts, mapping, anon_transcript, _status = _repair_anonymization_leaks(
+            graph,
+            mapping,
+            anon_facts,
+            anon_transcript,
+            transcript,
+            leaked,
+            extra_pii_types=extra_pii,
+        )
+        leaked = verify_anonymization_completeness(
+            graph,
+            mapping,
+            anon_facts,
+            anon_transcript,
+            extra_pii_names=extra_pii,
+            pii_scope=scope,
+        )
+        if leaked:
+            logger.warning("Cloud egress: residual leaks after repair (%s); blocking", leaked[:3])
+            return "", {}
+
+    if not anon_transcript or not mapping:
+        return "", {}
+
+    return anon_transcript, mapping
+
+
+def deanonymize_text(text: str, mapping: dict[str, str]) -> str:
+    """Restore real names in cloud-returned text via the reverse mapping.
+
+    ``mapping`` is the forward direction (``real -> placeholder``);
+    this function inverts it internally.  Word-boundary anchored, so
+    a placeholder embedded in unrelated text doesn't match.
+    Idempotent on text without placeholders or with empty mapping.
+    """
+    if not text or not mapping:
+        return text
+    reverse = {v: k for k, v in mapping.items() if isinstance(k, str) and isinstance(v, str)}
+    return _substitute_whole_words(text, reverse)
+
+
 def _generate_extraction(
     model,
     tokenizer,
@@ -1306,7 +1468,13 @@ def _sota_pipeline(
             if _mapping_is_canonical(mapping):
                 logger.info("Repairing %d leaked name(s): %s", len(leaked), leaked[:5])
                 anon_facts, mapping, anon_transcript, repair_status = _repair_anonymization_leaks(
-                    graph, mapping, anon_facts, anon_transcript, transcript, leaked
+                    graph,
+                    mapping,
+                    anon_facts,
+                    anon_transcript,
+                    transcript,
+                    leaked,
+                    extra_pii_types=extra_pii,
                 )
                 logger.info(
                     "Repair: missed_fixed=%d hallucinated_dropped=%d",
@@ -1645,6 +1813,7 @@ def _repair_anonymization_leaks(
     anon_transcript: str,
     original_transcript: str,
     leaked: list[str],
+    extra_pii_types: dict[str, str] | None = None,
 ) -> tuple[list[dict], dict, str, dict]:
     """Deterministic repair of anonymization leaks — no LLM call.
 
@@ -1655,6 +1824,17 @@ def _repair_anonymization_leaks(
       anon_transcript via the extended mapping.
     - Otherwise classify as "hallucinated": drop every triple in anon_facts
       whose subject or object matches the leaked name. Mapping is not extended.
+
+    ``extra_pii_types`` is a ``{name: "person"|"place"}`` mapping
+    contributed by NER (see :func:`extract_pii_names_with_ner`).
+    Consulted only when the extractor's own ``type_by_name`` has no
+    entry for a leaked name — without this fallback the type defaults
+    to ``"person"`` regardless of NER's classification, producing
+    misclassified placeholders (e.g. ``Berlin → Person_4`` instead of
+    ``Berlin → City_1``).  De-anonymization on the return path then
+    fails to swap the placeholder back to the real city name because
+    the mapping direction is wrong by category.  Extractor types win
+    on collision; NER is the fallback, not the override.
 
     Precondition: mapping must be in canonical {real: placeholder} direction.
     Caller checks `_mapping_is_canonical(mapping)` and skips repair otherwise.
@@ -1688,8 +1868,11 @@ def _repair_anonymization_leaks(
         if not in_transcript:
             hallucinated.add(name)
             continue
-        # Missed — allocate placeholder based on declared type.
-        etype = (type_by_name.get(name) or "person").lower()
+        # Missed — allocate placeholder based on declared type.  Extractor
+        # type wins; fall back to NER (extra_pii_types) when extractor has
+        # no opinion; final default to "person" preserves prior behaviour.
+        ner_type = (extra_pii_types or {}).get(name)
+        etype = (type_by_name.get(name) or ner_type or "person").lower()
         prefix = anonymizer_type_to_prefix().get(etype)
         if prefix is None:
             # Missed — allocate placeholder based on declared type. Types with a
@@ -2062,10 +2245,54 @@ def _mapping_is_canonical(mapping: dict) -> bool:
     )
 
 
-# spaCy PII-type → our internal PII bucket.
-# PERSON → person, GPE/LOC → place. Other spaCy labels (ORG, DATE, etc.)
-# we treat as non-PII, consistent with the extraction prompt's type policy.
-_SPACY_PII_LABELS = {"PERSON": "person", "GPE": "place", "LOC": "place"}
+# spaCy entity label → internal type name.
+#
+# Coverage is the set of spaCy ``en_core_web_sm`` labels that *can*
+# carry identifying information; the operator picks which subset to
+# actually anonymize via ``sanitization.cloud_scope``.  Numeric and
+# temporal labels (DATE, TIME, MONEY, ORDINAL, CARDINAL, PERCENT,
+# QUANTITY) are intentionally excluded: they don't carry PII even
+# under maximally-strict policy.
+#
+# Internal type names match the rest of the codebase's vocabulary
+# (``Entity.entity_type``, schema.yaml prefixes) so the same names
+# appear in extraction output, anonymizer placeholders, and the
+# ``cloud_scope`` config — operators don't have to learn spaCy's
+# label conventions to configure egress.
+_SPACY_PII_LABELS = {
+    "PERSON": "person",
+    "GPE": "place",
+    "LOC": "place",
+    "ORG": "organization",
+    "PRODUCT": "product",
+    "FAC": "facility",
+    "NORP": "group",
+    "EVENT": "event",
+    "WORK_OF_ART": "work",
+    "LAW": "law",
+    "LANGUAGE": "language",
+}
+
+# Primitive-layer default scope for ``verify_anonymization_completeness``
+# and ``extract_pii_names_with_ner`` when no explicit ``pii_scope`` is
+# passed.  Preserves the historical hardcoded ``{person, place}`` scope
+# of these primitives so consolidation (``_sota_pipeline``) and any
+# direct callers keep the prior leak-detection coverage.
+#
+# This is *not* the cloud-egress policy default — that is
+# :data:`_CLOUD_EGRESS_DEFAULT_SCOPE`, narrower and configurable via
+# ``SanitizationConfig.cloud_scope`` — different concern, different
+# default.  The primitive has no policy opinion; the helper does.
+_DEFAULT_PII_SCOPE: frozenset[str] = frozenset({"person", "place"})
+
+# Cloud-egress helper default scope for
+# :func:`extract_and_anonymize_for_cloud` when no explicit
+# ``pii_scope`` is passed.  Mirrors the production default in
+# ``SanitizationConfig.cloud_scope``; kept in sync by hand because the
+# extractor module shouldn't import from server config (would invert
+# the dependency direction).  Operators override at runtime via the
+# config knob; this is the in-code fallback only.
+_CLOUD_EGRESS_DEFAULT_SCOPE: frozenset[str] = frozenset({"person"})
 
 # Cached per-(lang) spaCy pipelines so we don't reload on every call.
 _SPACY_MODELS: dict[str, object] = {}
@@ -2089,21 +2316,39 @@ def _clean_ner_span(text: str) -> str:
     return cleaned.strip()
 
 
-def extract_pii_names_with_ner(transcript: str, spacy_model: str = "en_core_web_sm") -> set[str]:
+def extract_pii_names_with_ner(
+    transcript: str,
+    spacy_model: str = "en_core_web_sm",
+    pii_scope: set[str] | frozenset[str] | None = None,
+) -> dict[str, str]:
     """Independent PII detection via spaCy NER (optional defense-in-depth).
 
-    Returns a set of names classified as PII (person or place) by spaCy.
-    Empty set on failure (spaCy not installed, model missing, etc.) — the
-    caller uses this as a supplement to the extractor's own type tags, not
-    a replacement. Caller decides whether to require NER success.
+    Returns a ``{name: pii_type}`` mapping over names whose internal
+    type (per :data:`_SPACY_PII_LABELS`) is in ``pii_scope``.  When
+    ``pii_scope`` is ``None`` the module default :data:`_DEFAULT_PII_SCOPE`
+    applies.  An empty scope yields an empty dict — operator opt-out,
+    not an error.  Empty dict also returned on failure (spaCy not
+    installed, model missing, etc.).
+
+    The type information is load-bearing for the repair path: when
+    extraction emits a name only as a relation participant (not as a
+    typed entity), repair allocates a placeholder of the wrong category
+    (e.g. ``Berlin → Person_4`` instead of ``Berlin → City_1``) unless
+    NER's type is consulted.  Returning the type alongside the name
+    keeps the repair correct for places-emitted-as-relation-objects.
+
+    On a name collision between the extractor and NER (same name,
+    different types) the extractor wins downstream — repair only
+    consults NER when the extractor has no opinion.
     """
-    if not transcript:
-        return set()
+    scope = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
+    if not scope or not transcript:
+        return {}
     try:
         import spacy
     except ImportError:
         logger.info("spaCy not installed — NER cross-check disabled")
-        return set()
+        return {}
     nlp = _SPACY_MODELS.get(spacy_model)
     if nlp is None:
         try:
@@ -2111,19 +2356,21 @@ def extract_pii_names_with_ner(transcript: str, spacy_model: str = "en_core_web_
             _SPACY_MODELS[spacy_model] = nlp
         except Exception as e:
             logger.warning("spaCy model %r not loadable — NER disabled: %s", spacy_model, e)
-            return set()
+            return {}
     try:
         doc = nlp(transcript)
     except Exception as e:
         logger.warning("spaCy NER call failed — NER disabled: %s", e)
-        return set()
-    names = set()
+        return {}
+    names: dict[str, str] = {}
     for ent in doc.ents:
-        if ent.label_ not in _SPACY_PII_LABELS:
+        pii_type = _SPACY_PII_LABELS.get(ent.label_)
+        if pii_type is None or pii_type not in scope:
             continue
         cleaned = _clean_ner_span(ent.text)
         if cleaned:
-            names.add(cleaned)
+            # First spaCy span wins on collisions inside one transcript.
+            names.setdefault(cleaned, pii_type)
     return names
 
 
@@ -2132,9 +2379,10 @@ def verify_anonymization_completeness(
     mapping: dict,
     anon_facts: list[dict],
     anon_transcript: str,
-    extra_pii_names: set[str] | None = None,
+    extra_pii_names: set[str] | dict[str, str] | None = None,
+    pii_scope: set[str] | frozenset[str] | None = None,
 ) -> list[str]:
-    """Forward-path privacy guard — scope: KNOWN entities + optional NER.
+    """Forward-path privacy guard — scope-driven.
 
     Returns a list of real names that the anonymizer failed to handle properly.
     Empty list == safe. Non-empty list means callers MUST abort the SOTA call.
@@ -2146,28 +2394,41 @@ def verify_anonymization_completeness(
        NOT present in mapping.values(). De-anonymization will fail silently
        and produce placeholder strings in the final graph. Correctness gap.
 
-    Scope is limited to PII-sensitive entity types (person, place). Concepts,
-    preferences, organizations, and events are treated as non-PII and may
-    legitimately appear verbatim in the anonymized output. A substring check
-    on PII names still catches compound cases like "Li Na's Support" where
-    a person name is embedded in a concept-type phrase.
+    ``pii_scope`` is the set of internal type names the operator wants
+    anonymized; defaults to :data:`_DEFAULT_PII_SCOPE` (``{"person"}``).
+    Names whose extractor-declared ``entity_type`` is outside the scope
+    pass through verbatim — by design.  An empty scope yields an empty
+    "real names" set: the privacy guard returns empty (no leaks
+    possible because nothing is in scope), and the caller treats the
+    cloud egress as a no-op.
 
-    `extra_pii_names`: names contributed by an independent NER pass (see
-    `extract_pii_names_with_ner`). Supplements the extractor's type tags —
-    catches PII the extractor mislabeled or missed. Off by default (callers
-    opt in at the pipeline level).
+    A substring check on in-scope names still catches compound cases
+    like "Li Na's Support" where an in-scope name is embedded in an
+    out-of-scope phrase.
+
+    ``extra_pii_names``: names contributed by an independent NER pass
+    (see :func:`extract_pii_names_with_ner`).  When passed as a ``dict``
+    (the modern shape), it carries ``{name: type}`` and is filtered by
+    ``pii_scope``.  When passed as a ``set`` (back-compat), all names
+    are added unconditionally — caller is responsible for pre-filtering.
     """
-    pii_types = {"person", "place"}
+    scope = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
+    if not scope:
+        return []
     type_by_name = {e.name: e.entity_type for e in graph.entities}
-    real_names = {e.name for e in graph.entities if e.name and e.entity_type in pii_types}
-    # Defensive: pick up PII names from relation participants too.
+    real_names = {e.name for e in graph.entities if e.name and e.entity_type in scope}
+    # Defensive: pick up in-scope names from relation participants too.
     for r in graph.relations:
         for n in (r.subject, r.object):
-            if n and type_by_name.get(n) in pii_types:
+            if n and type_by_name.get(n) in scope:
                 real_names.add(n)
-    # Add externally-sourced PII names (e.g. NER cross-check).
+    # Add externally-sourced names.  Dict form is filtered by scope;
+    # set form is added wholesale (caller must pre-filter).
     if extra_pii_names:
-        real_names |= {n for n in extra_pii_names if n}
+        if isinstance(extra_pii_names, dict):
+            real_names |= {n for n, t in extra_pii_names.items() if n and t in scope}
+        else:
+            real_names |= {n for n in extra_pii_names if n}
 
     # Case-insensitive set of all mapped strings for coverage check.
     # Mapping direction is technically {real_name: placeholder}, but models

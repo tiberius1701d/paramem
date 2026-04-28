@@ -95,9 +95,22 @@ def test_local_adapters_remain_enabled(example_config):
     assert cfg.adapters.procedural.enabled is True
 
 
-def test_cloud_mode_blocks_by_default(example_config):
-    """Egress policy ships at the smallest cloud surface."""
-    assert example_config.sanitization.cloud_mode == "block"
+def test_cloud_mode_anonymizes_persons_by_default(example_config):
+    """Egress policy ships at "anonymize person-only".
+
+    Pairs ``cloud_mode: anonymize`` with ``cloud_scope: [person]``: the
+    cloud receives transcripts with person names placeholdered while
+    places, organisations, products, etc. pass through verbatim.  This
+    is the privacy/utility sweet spot — strict on identity, permissive
+    on public context — so cloud reasoning about "restaurants in
+    Berlin" or "engineers at Siemens" stays useful.
+
+    Stricter postures (``cloud_mode: block`` for zero-cloud-surface,
+    or wider ``cloud_scope`` to anonymize places/orgs) are explicit
+    operator opt-ins.
+    """
+    assert example_config.sanitization.cloud_mode == "anonymize"
+    assert example_config.sanitization.cloud_scope == ["person"]
 
 
 def test_intent_classifier_enabled(example_config):

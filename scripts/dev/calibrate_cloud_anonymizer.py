@@ -27,19 +27,22 @@ Optional flags:
                              for offline analysis.
 
 Outcome classification per query:
-  success            — non-empty mapping, no leak, every expected name
-                       in mapping, round-trip preserves the original
-                       text (whitespace-normalised).
+  success            — non-empty mapping, every expected name absent
+                       from anon_text (privacy contract), round-trip
+                       preserves the original text (whitespace-
+                       normalised).  A name being absent from the
+                       mapping is fine if the name also doesn't
+                       appear in anon_text — the cloud sees nothing
+                       to deanonymize either way.
   leak_blocked       — anonymizer returned ('', {}) — the wrapper's
-                       forward leak guard tripped or the model
-                       returned an empty result.  This is privacy-
-                       safe (the cloud call would have been blocked),
-                       but counts as "anonymizer failed to deliver"
-                       for calibration.
-  missing_coverage   — mapping non-empty but at least one expected
-                       name from the fixture is absent.  The
-                       forward gate did NOT block, but the cloud
-                       would receive a partially anonymized query.
+                       repair-and-verify pipeline blocked the call.
+                       Privacy-safe (the cloud call doesn't happen),
+                       but counts as "anonymizer failed to deliver".
+  privacy_leak       — mapping non-empty but at least one expected
+                       name still appears in anon_text.  This is a
+                       hard failure: extraction + NER both missed
+                       the name and the cloud would receive it
+                       verbatim.
   round_trip_failed  — mapping non-empty, no leak, but the response
                        fails to whitespace-equal the original after
                        deanon.  Indicates lossy whitespace handling
@@ -86,13 +89,14 @@ def _classify(
 ) -> str:
     if not mapping:
         return "leak_blocked"
-    # Forward leak-guard contract: anon_text shouldn't contain any real name
-    leaked = [n for n in mapping if re.search(r"\b" + re.escape(n) + r"\b", anon_text)]
-    if leaked:
-        return "leak_blocked"
-    missing = [n for n in expected_names if n not in mapping]
-    if missing:
-        return "missing_coverage"
+    # Privacy contract: every expected name (and every mapping key) must
+    # be absent from anon_text.  A name leaking means the cloud sees it.
+    leaked_keys = [n for n in mapping if re.search(r"\b" + re.escape(n) + r"\b", anon_text)]
+    leaked_expected = [
+        n for n in expected_names if re.search(r"\b" + re.escape(n) + r"\b", anon_text)
+    ]
+    if leaked_keys or leaked_expected:
+        return "privacy_leak"
     if _normalise(round_trip) != _normalise(original):
         return "round_trip_failed"
     return "success"
@@ -113,18 +117,30 @@ class QueryResult:
         return asdict(self)
 
 
-def _run_one(query: str, expected_names: list[str], model, tokenizer) -> tuple[str, dict, str]:
-    from paramem.server.cloud_anonymizer import (
-        anonymize_outbound,
-        deanonymize_inbound,
+def _run_one(
+    transcript: str,
+    expected_names: list[str],
+    model,
+    tokenizer,
+    *,
+    speaker_name: str,
+    pii_scope: set[str],
+) -> tuple[str, dict, str]:
+    from paramem.graph.extractor import (
+        deanonymize_text,
+        extract_and_anonymize_for_cloud,
     )
 
-    anon_text, mapping = anonymize_outbound(query, model, tokenizer)
+    anon_text, mapping = extract_and_anonymize_for_cloud(
+        transcript,
+        model,
+        tokenizer,
+        speaker_name=speaker_name,
+        pii_scope=pii_scope,
+    )
     if not mapping or not anon_text:
         return anon_text or "", mapping or {}, ""
-    # Synthetic cloud-response = the anon_text itself; the round-trip checks
-    # that deanon restores the names without altering surrounding tokens.
-    round_trip = deanonymize_inbound(anon_text, mapping)
+    round_trip = deanonymize_text(anon_text, mapping)
     return anon_text, mapping, round_trip
 
 
@@ -138,7 +154,7 @@ def _print_summary(results: list[QueryResult], total_personal: int) -> tuple[int
     print("=" * 72)
     print(f"  total queries scanned : {len(results)}")
     print(f"  with personal markers : {total_personal}")
-    for outcome in ("success", "leak_blocked", "missing_coverage", "round_trip_failed"):
+    for outcome in ("success", "leak_blocked", "privacy_leak", "round_trip_failed"):
         n = by_outcome.get(outcome, 0)
         if n:
             pct = 100.0 * n / max(1, len(results))
@@ -173,7 +189,7 @@ def _print_per_query(results: list[QueryResult]) -> None:
         outcome_marker = {
             "success": "OK",
             "leak_blocked": "BLK",
-            "missing_coverage": "MISS",
+            "privacy_leak": "LEAK",
             "round_trip_failed": "RT!",
         }[r.outcome]
         print(f"\n[{outcome_marker}] {r.id} (iter {r.iteration})")
@@ -181,9 +197,13 @@ def _print_per_query(results: list[QueryResult]) -> None:
         print(f"  expected : {r.expected_names}")
         print(f"  mapping  : {r.mapping}")
         print(f"  anon     : {r.anon_text!r}")
-        if r.outcome == "missing_coverage":
-            missing = [n for n in r.expected_names if n not in r.mapping]
-            print(f"  missing  : {missing}")
+        if r.outcome == "privacy_leak":
+            leaked = [
+                n
+                for n in (list(r.mapping) + r.expected_names)
+                if re.search(r"\b" + re.escape(n) + r"\b", r.anon_text)
+            ]
+            print(f"  leaked   : {sorted(set(leaked))}")
         if r.outcome == "round_trip_failed":
             print(f"  round_trip: {r.round_trip!r}")
 
@@ -211,6 +231,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional: write the full per-query record to this JSON path",
     )
+    parser.add_argument(
+        "--scope",
+        nargs="*",
+        default=None,
+        help=(
+            "NER categories to anonymize (e.g. --scope person place). "
+            "Defaults to the production default in server.yaml.example "
+            "(read from disk to stay in sync with the shipped config). "
+            "Pass --scope with no values to disable anonymization."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not os.environ.get("PARAMEM_DAILY_PASSPHRASE"):
@@ -231,37 +262,69 @@ def main(argv: list[str] | None = None) -> int:
 
     print("\nLoading local model + tokenizer...")
     from paramem.models.loader import load_base_model
-    from paramem.utils.config import load_config
+    from paramem.server.config import load_server_config
 
-    cfg = load_config()
-    print(f"  model: {cfg.model.model_id}")
-    model, tokenizer = load_base_model(cfg.model)
+    # Use the server config (Mistral 7B by default) — matches what the
+    # deployed cloud_anonymizer actually runs against.  The training-side
+    # default.yaml config defaults to Qwen 3B, which is too weak at
+    # structured JSON output for the anonymizer prompt.
+    server_cfg = load_server_config("configs/server.yaml.example")
+    model_cfg = server_cfg.model_config
+    print(f"  model: {model_cfg.model_id}")
+    model, tokenizer = load_base_model(model_cfg)
     print("  ready")
 
-    if args.query is not None:
-        queries = [{"id": "ad-hoc", "query": args.query, "expected_names": []}]
+    # Resolve the scope.  CLI override wins; otherwise inherit from the
+    # shipped default config so the calibration result reflects the
+    # operator-facing default unless explicitly varied.
+    if args.scope is None:
+        scope = set(server_cfg.sanitization.cloud_scope)
     else:
-        queries = list(_FIXTURE)
+        scope = set(args.scope)
+    print(f"  scope: {sorted(scope) or '[]  (anonymization disabled)'}")
+
+    if args.query is not None:
+        # Ad-hoc input: wrap as a single-turn transcript so the helper
+        # gets the production input shape.  Caller intent is "treat
+        # this as one [user] turn".  Synthesize a speaker_name so the
+        # extraction prompt's {SPEAKER_NAME} slot resolves cleanly --
+        # production always has a real speaker by the time cloud
+        # egress runs (greeting flow).
+        entries = [
+            {
+                "id": "ad-hoc",
+                "speaker_name": "Anna",
+                "transcript": f"[user] {args.query}",
+                "expected_names": [],
+            }
+        ]
+    else:
+        entries = list(_FIXTURE)
 
     results: list[QueryResult] = []
-    for entry in queries:
+    for entry in entries:
         for iteration in range(args.repeat):
-            print(f"\n[{entry['id']} iter {iteration}] query: {entry['query']!r}")
+            print(f"\n[{entry['id']} iter {iteration}]")
             anon_text, mapping, round_trip = _run_one(
-                entry["query"], entry["expected_names"], model, tokenizer
+                entry["transcript"],
+                entry["expected_names"],
+                model,
+                tokenizer,
+                speaker_name=entry["speaker_name"],
+                pii_scope=scope,
             )
             outcome = _classify(
                 expected_names=entry["expected_names"],
                 anon_text=anon_text,
                 mapping=mapping,
                 round_trip=round_trip,
-                original=entry["query"],
+                original=entry["transcript"],
             )
             print(f"  outcome: {outcome}")
             results.append(
                 QueryResult(
                     id=entry["id"],
-                    query=entry["query"],
+                    query=entry["transcript"],
                     expected_names=entry["expected_names"],
                     anon_text=anon_text,
                     mapping=mapping,
@@ -272,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     _print_per_query(results)
-    total_personal = sum(1 for q in queries if q["expected_names"]) * args.repeat
+    total_personal = sum(1 for e in entries if e["expected_names"]) * args.repeat
     _print_summary(results, total_personal)
 
     if args.out is not None:
@@ -281,8 +344,8 @@ def main(argv: list[str] | None = None) -> int:
             json.dump(
                 {
                     "schema": "cloud_anonymizer_calibration.v1",
-                    "model": cfg.model.model_id,
-                    "queries_per_iteration": len(queries),
+                    "model": model_cfg.model_id,
+                    "queries_per_iteration": len(entries),
                     "repeat": args.repeat,
                     "results": [r.to_dict() for r in results],
                 },

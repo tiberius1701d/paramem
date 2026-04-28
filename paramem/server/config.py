@@ -342,7 +342,7 @@ class ToolsConfig:
 class SanitizationConfig:
     """PII sanitization + cloud egress policy.
 
-    Two layered knobs:
+    Three layered knobs:
 
     * ``mode`` — sanitizer detection layer (off / warn / block).  Controls
       whether ``sanitize_for_cloud`` flags personal-marker queries and
@@ -352,22 +352,35 @@ class SanitizationConfig:
       (block / anonymize / both):
 
         - ``block``     — PERSONAL queries dropped before SOTA;
-          non-PERSONAL sent verbatim.  Phase 2 default: smallest cloud
-          surface, zero anonymizer cost.
-        - ``anonymize`` — ALL cloud-bound text is anonymized via the
-          local LLM, sent to SOTA as placeholders, and de-anonymized on
-          return.  PERSONAL queries reach cloud as redacted text.
+          non-PERSONAL sent verbatim.  Smallest cloud surface, zero
+          anonymizer cost.  Default.
+        - ``anonymize`` — cloud-bound text is anonymized via the local
+          LLM (scope set by ``cloud_scope``), sent to SOTA as
+          placeholders, and de-anonymized on return.  PERSONAL queries
+          reach cloud as redacted text.
         - ``both``      — strictest privacy posture.  PERSONAL blocked
-          AND non-PERSONAL anonymized.  Cloud only ever sees
-          placeholder-substituted non-personal text.
+          AND non-PERSONAL anonymized per ``cloud_scope``.
 
-    HA path is independent of ``cloud_mode``: HA receives cleartext
-    gated by intent classification.  Hardening the HA hop is a planned
-    follow-up.
+    * ``cloud_scope`` — list of NER categories anonymized when
+      ``cloud_mode`` selects an anonymizing mode.  Defaults to
+      ``["person"]``: only person names are placeholdered; place,
+      organization, etc. pass through verbatim so the cloud can answer
+      questions like "What's a good restaurant in Berlin?" sensibly.
+      An empty list (``[]``) disables the anonymization branch
+      entirely under ``cloud_mode=anonymize|both`` — cloud sees the
+      original text unchanged.  Operator owns the privacy/utility
+      tradeoff; values are passed through to the NER filter without an
+      allowlist check, so any spaCy-supported category may be used
+      (see ``configs/server.yaml.example`` for the documented set).
+
+    HA path is independent of ``cloud_mode`` and ``cloud_scope``: HA
+    receives cleartext gated by intent classification.  Hardening the
+    HA hop is a planned follow-up.
     """
 
     mode: str = "block"  # off, warn, block
     cloud_mode: str = "block"  # block, anonymize, both
+    cloud_scope: list[str] = field(default_factory=lambda: ["person"])
 
     def __post_init__(self):
         valid_mode = {"off", "warn", "block"}
@@ -380,6 +393,13 @@ class SanitizationConfig:
             raise ValueError(
                 f"Invalid sanitization cloud_mode '{self.cloud_mode}'. "
                 f"Must be one of: {valid_cloud_mode}"
+            )
+        if not isinstance(self.cloud_scope, list) or not all(
+            isinstance(v, str) and v for v in self.cloud_scope
+        ):
+            raise ValueError(
+                f"Invalid sanitization cloud_scope '{self.cloud_scope}'. "
+                f"Must be a list of non-empty strings (may be empty list to disable)."
             )
 
 

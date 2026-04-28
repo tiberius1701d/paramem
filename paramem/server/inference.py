@@ -130,6 +130,31 @@ def enqueue_post_session_train(
     )
 
 
+def _format_history_as_transcript(
+    history: list[dict] | None,
+    *,
+    current_user_turn: str,
+) -> str:
+    """Format conversation history + current turn as a [user]/[assistant] transcript.
+
+    Used by the cloud-egress anonymizer to produce a transcript shape
+    the local extraction primitives are anchored on (matches the
+    consolidation/enrichment path's session-transcript shape).
+    Each turn becomes one line; unknown roles fall back to ``[user]``.
+    """
+    lines: list[str] = []
+    for turn in history or []:
+        role = (turn.get("role") or "user").lower()
+        text = (turn.get("text") or "").strip()
+        if not text:
+            continue
+        prefix = "[assistant]" if role == "assistant" else "[user]"
+        lines.append(f"{prefix} {text}")
+    if current_user_turn:
+        lines.append(f"[user] {current_user_turn.strip()}")
+    return "\n".join(lines)
+
+
 def _language_instruction(language: str | None, config: ServerConfig | None = None) -> str:
     """Return a language instruction string, or empty for English/unknown.
 
@@ -497,14 +522,29 @@ def _escalate_via_cloud_policy(
                 "cloud_mode=%s requires model/tokenizer for anonymization; blocking", cloud_mode
             )
             return None
-        from paramem.server.cloud_anonymizer import (
-            anonymize_outbound,
-            deanonymize_inbound,
+        from paramem.graph.extractor import (
+            deanonymize_text,
+            extract_and_anonymize_for_cloud,
         )
 
-        anon_text, mapping = anonymize_outbound(text, model, tokenizer)
+        # Build a transcript-shaped input that the anonymizer prompt expects:
+        # the conversation history + the current turn, formatted with
+        # [user]/[assistant] line prefixes (matches the production transcript
+        # shape the consolidation/enrichment path uses successfully).
+        anon_transcript_input = _format_history_as_transcript(history, current_user_turn=text)
+        anon_text, mapping = extract_and_anonymize_for_cloud(
+            anon_transcript_input,
+            model,
+            tokenizer,
+            speaker_name=speaker,
+            pii_scope=set(config.sanitization.cloud_scope),
+        )
         if not anon_text:
-            # Per-query block: anonymizer failed or leak guard tripped.
+            # Per-query block: extraction error, anonymizer parse failure,
+            # leak guard tripped, residual leak after repair, or empty
+            # mapping under non-empty scope.  Privacy-safe — cloud call
+            # is suppressed.  Distinct from the (verbatim, {}) shape
+            # returned when cloud_scope is empty (operator opt-out).
             return None
         result = _escalate_to_sota(
             anon_text,
@@ -514,8 +554,9 @@ def _escalate_via_cloud_policy(
             history=history,
             language=language,
         )
-        if mapping:
-            result.text = deanonymize_inbound(result.text, mapping)
+        # deanonymize_text is a no-op on empty mapping, so the empty-scope
+        # opt-out path (mapping=={}) flows through unchanged.
+        result.text = deanonymize_text(result.text, mapping)
         return result
 
     # cloud_mode=block + non-PERSONAL: send verbatim (today's behaviour).

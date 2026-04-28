@@ -340,28 +340,52 @@ tools:
 #                     block      : PERSONAL queries dropped before SOTA;
 #                                  non-PERSONAL sent verbatim. Phase 2 default,
 #                                  zero anonymizer cost, smallest cloud surface.
-#                     anonymize  : ALL cloud-bound text is anonymized via the
-#                                  local LLM, sent to SOTA as placeholders, and
+#                     anonymize  : cloud-bound text is anonymized via the
+#                                  local LLM (categories chosen by `cloud_scope`),
+#                                  sent to SOTA as placeholders, and
 #                                  de-anonymized on the way back. PERSONAL
 #                                  queries reach cloud as redacted text.
 #                     both       : strictest privacy posture — PERSONAL is
-#                                  blocked AND non-PERSONAL is anonymized.
-#                                  Cloud only ever sees non-personal text, and
-#                                  even that is placeholder-substituted.
+#                                  blocked AND non-PERSONAL is anonymized
+#                                  per `cloud_scope`.
+#
+#   `cloud_scope` — list of NER categories anonymized when `cloud_mode` is
+#                   `anonymize` or `both`.  Default `[person]`: only person
+#                   names get redacted; place names, organizations, etc.
+#                   pass through verbatim so the cloud can answer questions
+#                   like "What's a good restaurant in Berlin?" sensibly.
+#                   Empty list `[]` disables anonymization entirely under
+#                   anonymizing modes (cloud sees the original text).
+#                   Operator owns the privacy/utility tradeoff; values are
+#                   passed through to NER without an allowlist check.
+#                   Supported categories (spaCy en_core_web_sm):
+#                     person       — PERSON
+#                     place        — GPE (countries, cities, states), LOC
+#                     organization — ORG
+#                     product      — PRODUCT
+#                     facility     — FAC
+#                     group        — NORP (nationalities, religious/political)
+#                     event        — EVENT
+#                     work         — WORK_OF_ART
+#                     law          — LAW
+#                     language     — LANGUAGE
+#                   Unrecognised values map to nothing (no error, but no effect).
 #
 # Per-query safety: in any anonymizing mode, if the leak guard detects a real
 # name surviving anonymization, that single query falls back to block (config
 # stays put for the next query).
 #
-# HA path (HA conversation agent) is NOT affected by `cloud_mode`. HA receives
-# cleartext, gated by intent classification. Hardening the HA hop is a planned
-# follow-up package.
+# HA path (HA conversation agent) is NOT affected by `cloud_mode`/`cloud_scope`.
+# HA receives cleartext, gated by intent classification. Hardening the HA hop
+# is a planned follow-up package.
 #
 # SOTA reachability is independent: with `agents.sota.enabled: false` (or no
 # api_key), no queries reach SOTA regardless of `cloud_mode`.
 sanitization:
-  mode: block        # off | warn | block — PII detection layer
-  cloud_mode: block  # block | anonymize | both — direct-SOTA egress policy (ship-safe default)
+  mode: block            # off | warn | block — PII detection layer
+  cloud_mode: anonymize  # block | anonymize | both — direct-SOTA egress policy
+  cloud_scope:           # NER categories to anonymize when cloud_mode=anonymize|both ([] = off)
+    - person
 
 # ============================================================================
 # ABSTENTION — LAST-RESORT CONFABULATION GUARD

@@ -762,11 +762,11 @@ class TestCloudModePolicy:
         cloud_agent.call.return_value = CloudResponse(text="Person_1 is a useful placeholder here.")
         with (
             patch(
-                "paramem.server.cloud_anonymizer.anonymize_outbound",
+                "paramem.graph.extractor.extract_and_anonymize_for_cloud",
                 return_value=("Person_1 query", {"Alex": "Person_1"}),
             ) as mock_anon,
             patch(
-                "paramem.server.cloud_anonymizer.deanonymize_inbound",
+                "paramem.graph.extractor.deanonymize_text",
                 return_value="Alex is a useful placeholder here.",
             ) as mock_deanon,
         ):
@@ -788,7 +788,7 @@ class TestCloudModePolicy:
         failure → per-query block, SOTA never called."""
         cloud_agent = self._make_cloud_agent()
         with patch(
-            "paramem.server.cloud_anonymizer.anonymize_outbound",
+            "paramem.graph.extractor.extract_and_anonymize_for_cloud",
             return_value=("", {}),  # leak guard tripped
         ):
             self._run(
@@ -815,11 +815,11 @@ class TestCloudModePolicy:
         cloud_agent_g.call.return_value = CloudResponse(text="<answer>")
         with (
             patch(
-                "paramem.server.cloud_anonymizer.anonymize_outbound",
+                "paramem.graph.extractor.extract_and_anonymize_for_cloud",
                 return_value=("anon q", {"Berlin": "City_1"}),
             ),
             patch(
-                "paramem.server.cloud_anonymizer.deanonymize_inbound",
+                "paramem.graph.extractor.deanonymize_text",
                 return_value="<answer>",
             ),
         ):

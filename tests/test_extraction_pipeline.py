@@ -1598,8 +1598,12 @@ class TestResidualLeakDropsReferencingTriples:
             return facts, None, None
 
         # Mock repair to return anon_facts that STILL contain Ghost (residual leak)
-        def fake_repair(graph, mapping, anon_facts, anon_transcript, orig_transcript, leaked):
-            # Repair "runs" but Ghost remains in object position — residual leak
+        def fake_repair(
+            graph, mapping, anon_facts, anon_transcript, orig_transcript, leaked, **kwargs
+        ):
+            # Repair "runs" but Ghost remains in object position — residual leak.
+            # **kwargs absorbs newer optional args like extra_pii_types so this
+            # mock doesn't need to change every time the real signature grows.
             return (
                 anon_facts,
                 mapping,
