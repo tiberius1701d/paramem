@@ -55,6 +55,7 @@ from paramem.server.trial_state import (
     clear_trial_marker,
     write_trial_marker,
 )
+from paramem.server.vram_guard import apply_process_cap
 from paramem.server.vram_validator import (
     ConfigurationError,
     assess_topology,
@@ -1318,6 +1319,11 @@ async def lifespan(app: FastAPI):
                 "Either provide a GPU, or start in cloud-only mode."
             )
             sys.exit(1)
+
+        # Apply the per-process VRAM cap before any allocation so that an
+        # over-allocation surfaces as a Python OOM exception rather than a
+        # host driver fault.
+        apply_process_cap()
 
         assessment = assess_topology(
             config.episodic_adapter_config,

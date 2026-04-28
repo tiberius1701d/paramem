@@ -17,6 +17,7 @@ from pathlib import Path
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 from paramem.server.config import ServerConfig
 from paramem.server.session_buffer import SessionBuffer
+from paramem.server.vram_guard import session_guard
 from paramem.training.consolidation import ConsolidationLoop
 
 logger = logging.getLogger(__name__)
@@ -260,24 +261,25 @@ def run_consolidation(
                 speaker_name = speaker_store.get_name(session_speaker_id)
             except Exception as e:
                 logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
-        episodic_qa, procedural_rels = loop.extract_session(
-            transcript,
-            session_id,
-            speaker_id=session_speaker_id,
-            speaker_name=speaker_name,
-            ha_context=ha_context,
-            stt_correction=config.consolidation.extraction_stt_correction,
-            ha_validation=config.consolidation.extraction_ha_validation,
-            noise_filter=config.consolidation.extraction_noise_filter,
-            noise_filter_model=config.consolidation.extraction_noise_filter_model,
-            noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
-            ner_check=config.consolidation.extraction_ner_check,
-            ner_model=config.consolidation.extraction_ner_model,
-            plausibility_judge=config.consolidation.extraction_plausibility_judge,
-            plausibility_stage=config.consolidation.extraction_plausibility_stage,
-            verify_anonymization=config.consolidation.extraction_verify_anonymization,
-            source_type=session.get("source_type", "transcript"),
-        )
+        with session_guard(session_id):
+            episodic_qa, procedural_rels = loop.extract_session(
+                transcript,
+                session_id,
+                speaker_id=session_speaker_id,
+                speaker_name=speaker_name,
+                ha_context=ha_context,
+                stt_correction=config.consolidation.extraction_stt_correction,
+                ha_validation=config.consolidation.extraction_ha_validation,
+                noise_filter=config.consolidation.extraction_noise_filter,
+                noise_filter_model=config.consolidation.extraction_noise_filter_model,
+                noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
+                ner_check=config.consolidation.extraction_ner_check,
+                ner_model=config.consolidation.extraction_ner_model,
+                plausibility_judge=config.consolidation.extraction_plausibility_judge,
+                plausibility_stage=config.consolidation.extraction_plausibility_stage,
+                verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                source_type=session.get("source_type", "transcript"),
+            )
 
         # Increment key session counts while last_seen is still correct
         _increment_key_sessions(loop, session_id)
