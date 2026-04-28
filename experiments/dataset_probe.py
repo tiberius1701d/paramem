@@ -18,7 +18,7 @@ Sections of this file follow the plan at:
 
 Hard rules carried forward:
   - Tests 1-11 are not modified. This file is a new consumer.
-  - ConsolidationLoop is used exactly as in experiments/phase3_consolidation.py.
+  - ConsolidationLoop is used exactly as in archive/experiments/phase3_consolidation.py.
   - Speaker-id tagging mirrors paramem/server/consolidation.py:155-158.
   - Write ordering: raw_qa → diagnostics → state (fsync at each step).
   - Smoke test uses _write_keyed_pairs from paramem/server/consolidation.py.

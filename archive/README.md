@@ -32,3 +32,53 @@ pipeline — confusion rate increased at lower ranks.
 ## experiments/phase4_keyed_json_smoke.py
 Early JSON keyed recall exploration. Superseded by the cleaner
 indexed_memory.py design (F4.9).
+
+---
+
+# Paper v1 Reference Experiments — Qwen 2.5 3B + configs/default.yaml
+
+The 11 files below were active research scripts that produced Paper v1
+results against Qwen 2.5 3B base via `configs/default.yaml`. Archived
+2026-04-28 as part of the `default.yaml` retirement arc. They remain
+runnable for paper reproducibility (artifact directories under
+`outputs/{phase4_indexed_keys,f4_9c_test*,f4_10_*}/qwen2.5-3b/`) but
+are not part of the active test/experiment harness.
+
+## experiments/phase3_consolidation.py
+Phase 3 consolidation loop driver. Predates the indexed-key pipeline.
+
+## experiments/phase3_smoke_test.py
+Phase 3 smoke test for the consolidation loop.
+
+## experiments/phase3_recall_probe.py
+Phase 3 recall probe.
+
+## experiments/phase4_curriculum.py
+Phase 4 curriculum-learning experiment.
+
+## experiments/phase4_hybrid.py
+Phase 4 hybrid (curriculum + replay) experiment.
+
+## experiments/phase4_rag_baseline.py
+Phase 4 RAG baseline for comparison against parametric memory. Also a
+"Dead End" per CLAUDE.md (RAG-as-substitute-for-parametric-recall
+rejected as a research direction).
+
+## experiments/eval_indexed_keys.py
+Re-evaluates the Phase 4 indexed-key adapter from
+`outputs/phase4_indexed_keys/qwen2.5-3b/`. Loads adapter weights and
+probes recall.
+
+## experiments/f4_9c_test1_capacity.py
+Phase 4.9c capacity test — how many indexed keys fit in a single
+adapter at rank 8.
+
+## experiments/f4_9c_test2_incremental.py
+Phase 4.9c incremental learning test — adding keys without forgetting
+old ones (full-replay baseline).
+
+## experiments/f4_9c_test3_two_adapter.py
+Phase 4.9c two-adapter test — episodic + semantic adapter promotion.
+
+## experiments/f4_10_indexed_consolidation.py
+Phase 4.10 — indexed-key training inside the full consolidation loop.
