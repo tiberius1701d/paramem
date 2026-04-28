@@ -69,6 +69,12 @@ def create_consolidation_loop(
         graph_enrichment_interim_enabled=config.consolidation.graph_enrichment_interim_enabled,
         graph_enrichment_min_triples_floor=config.consolidation.graph_enrichment_min_triples_floor,
         extraction_role_aware_grounding=config.consolidation.extraction_role_aware_grounding,
+        # Same `cloud_scope` knob as inference-time cloud egress: the SOTA
+        # enrichment cycle sends placeholders to the cloud just like the
+        # cloud_anonymizer egress path, so the privacy policy must match.
+        # Empty list disables NER-scope filtering entirely (consolidation
+        # then uses the primitive default {person, place}).
+        extraction_pii_scope=set(config.sanitization.cloud_scope),
         state_provider=state_provider,
     )
 

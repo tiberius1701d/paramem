@@ -459,6 +459,7 @@ def extract_graph(
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
     role_aware_grounding: str = "off",
+    pii_scope: set[str] | frozenset[str] | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
 ) -> SessionGraph:
@@ -557,6 +558,7 @@ def extract_graph(
             verify_anonymization=verify_anonymization,
             speaker_name=speaker_name,
             role_aware_grounding=role_aware_grounding,
+            pii_scope=pii_scope,
         )
 
     return graph
@@ -1366,6 +1368,7 @@ def _sota_pipeline(
     verify_anonymization: bool = True,
     speaker_name: str | None = None,
     role_aware_grounding: str = "off",
+    pii_scope: set[str] | frozenset[str] | None = None,
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
@@ -1460,9 +1463,18 @@ def _sota_pipeline(
     graph.diagnostics["anonymize"] = "ok"
     _skip_sota = False
     if verify_anonymization:
-        extra_pii = extract_pii_names_with_ner(transcript, ner_model) if ner_check else None
+        extra_pii = (
+            extract_pii_names_with_ner(transcript, ner_model, pii_scope=pii_scope)
+            if ner_check
+            else None
+        )
         leaked = verify_anonymization_completeness(
-            graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
+            graph,
+            mapping,
+            anon_facts,
+            anon_transcript,
+            extra_pii_names=extra_pii,
+            pii_scope=pii_scope,
         )
         if leaked:
             if _mapping_is_canonical(mapping):
@@ -1482,7 +1494,12 @@ def _sota_pipeline(
                     repair_status["hallucinated_dropped"],
                 )
                 leaked = verify_anonymization_completeness(
-                    graph, mapping, anon_facts, anon_transcript, extra_pii_names=extra_pii
+                    graph,
+                    mapping,
+                    anon_facts,
+                    anon_transcript,
+                    extra_pii_names=extra_pii,
+                    pii_scope=pii_scope,
                 )
                 if leaked:
                     # Residual leak after repair with canonical mapping:

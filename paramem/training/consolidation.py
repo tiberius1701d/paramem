@@ -163,6 +163,7 @@ class ConsolidationLoop:
         extraction_plausibility_stage: str = "deanon",
         extraction_verify_anonymization: bool = True,
         extraction_role_aware_grounding: str = "off",
+        extraction_pii_scope: set[str] | frozenset[str] | None = None,
         graph_config: Optional[GraphConfig] = None,
         graph_enrichment_enabled: bool = True,
         graph_enrichment_neighborhood_hops: int = 2,
@@ -215,6 +216,13 @@ class ConsolidationLoop:
         self.extraction_plausibility_stage = extraction_plausibility_stage
         self.extraction_role_aware_grounding = extraction_role_aware_grounding
         self.extraction_verify_anonymization = extraction_verify_anonymization
+        # Cloud egress / consolidation-enrichment PII anonymization scope.
+        # Sourced from ``ServerConfig.sanitization.cloud_scope`` at the
+        # bootstrap call site so consolidation honours the same operator
+        # policy as inference-time cloud egress.  ``None`` falls back to
+        # the primitive default in ``extractor.py`` (``{person, place}``)
+        # for back-compat with experiment scripts that don't pass a value.
+        self.extraction_pii_scope = extraction_pii_scope
 
         # Graph-level SOTA enrichment knobs (Task #10).
         self.graph_enrichment_enabled = graph_enrichment_enabled
@@ -507,6 +515,7 @@ class ConsolidationLoop:
             plausibility_stage=pick("plausibility_stage", self.extraction_plausibility_stage),
             verify_anonymization=pick("verify_anonymization", self.extraction_verify_anonymization),
             role_aware_grounding=pick("role_aware_grounding", self.extraction_role_aware_grounding),
+            pii_scope=pick("pii_scope", self.extraction_pii_scope),
             system_prompt_filename=system_prompt_filename,
             user_prompt_filename=user_prompt_filename,
         )
