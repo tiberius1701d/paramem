@@ -95,21 +95,22 @@ def test_local_adapters_remain_enabled(example_config):
     assert cfg.adapters.procedural.enabled is True
 
 
-def test_cloud_mode_anonymizes_persons_by_default(example_config):
-    """Egress policy ships at "anonymize person-only".
+def test_cloud_mode_blocks_by_default(example_config):
+    """Egress policy ships at the smallest cloud surface.
 
-    Pairs ``cloud_mode: anonymize`` with ``cloud_scope: [person]``: the
-    cloud receives transcripts with person names placeholdered while
-    places, organisations, products, etc. pass through verbatim.  This
-    is the privacy/utility sweet spot — strict on identity, permissive
-    on public context — so cloud reasoning about "restaurants in
-    Berlin" or "engineers at Siemens" stays useful.
+    ``cloud_mode: block`` means PERSONAL queries never reach the cloud
+    at all and non-PERSONAL goes verbatim — zero anonymizer cost,
+    smallest cloud surface, no risk of an under-tuned anonymizer
+    leaking PII on a fresh consumer's first query.  Operators who
+    want cloud reasoning over personal context flip to ``anonymize``
+    and accept the configured ``cloud_scope`` policy.
 
-    Stricter postures (``cloud_mode: block`` for zero-cloud-surface,
-    or wider ``cloud_scope`` to anonymize places/orgs) are explicit
-    operator opt-ins.
+    ``cloud_scope: [person]`` is shipped alongside so that any
+    operator who flips ``cloud_mode`` to an anonymizing mode inherits
+    the privacy/utility default (person names placeholdered, places /
+    organisations / etc. verbatim) without further configuration.
     """
-    assert example_config.sanitization.cloud_mode == "anonymize"
+    assert example_config.sanitization.cloud_mode == "block"
     assert example_config.sanitization.cloud_scope == ["person"]
 
 
