@@ -39,6 +39,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
 from paramem.evaluation.recall import generate_answer  # noqa: E402
 from paramem.models.loader import create_adapter, load_base_model, switch_adapter  # noqa: E402
+from paramem.server.config import MODEL_REGISTRY  # noqa: E402
 from paramem.training.dataset import _format_inference_prompt  # noqa: E402
 from paramem.training.indexed_memory import (  # noqa: E402
     DEFAULT_CONFIDENCE_THRESHOLD,
@@ -53,7 +54,7 @@ from paramem.training.indexed_memory import (  # noqa: E402
     verify_confidence,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
-from paramem.utils.config import AdapterConfig, TrainingConfig, load_config  # noqa: E402
+from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,12 +106,13 @@ def main():
     parser.add_argument("--rank", type=int, default=8)
     args = parser.parse_args()
 
-    config = load_config()
-    output_dir = make_output_dir("phase4_indexed_keys", config.model.model_id)
+    # README entry-point demo — pinned to Qwen 2.5 3B Instruct for fast iteration.
+    model_cfg = MODEL_REGISTRY["qwen3b"]
+    output_dir = make_output_dir("phase4_indexed_keys", model_cfg.model_id)
 
     # Load model
     logger.info("Loading base model...")
-    model, tokenizer = load_base_model(config.model)
+    model, tokenizer = load_base_model(model_cfg)
 
     adapter_config = AdapterConfig(
         rank=args.rank,
@@ -290,7 +292,7 @@ def main():
     # Save results
     results = {
         "experiment": "indexed_keys_smoke",
-        "model_id": config.model.model_id,
+        "model_id": model_cfg.model_id,
         "rank": args.rank,
         "epochs": args.num_epochs,
         "training_time_seconds": train_time,

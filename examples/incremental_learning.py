@@ -25,6 +25,7 @@ sys.path.insert(0, str(project_root))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from paramem.models.loader import create_adapter, load_base_model, switch_adapter  # noqa: E402
+from paramem.server.config import MODEL_REGISTRY  # noqa: E402
 from paramem.training.indexed_memory import (  # noqa: E402
     assign_keys,
     build_registry,
@@ -34,7 +35,7 @@ from paramem.training.indexed_memory import (  # noqa: E402
     validate_recall,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
-from paramem.utils.config import AdapterConfig, TrainingConfig, load_config  # noqa: E402
+from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
 
 ORIGINAL_PAIRS = [
     {"question": "Where does Alex live?", "answer": "Heilbronn"},
@@ -90,8 +91,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading base model...")
-    config = load_config()
-    model, tokenizer = load_base_model(config.model)
+    # Quick-iteration model — Qwen 2.5 3B Instruct.
+    model, tokenizer = load_base_model(MODEL_REGISTRY["qwen3b"])
 
     adapter_config = AdapterConfig(
         rank=8,

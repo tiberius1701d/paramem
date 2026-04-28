@@ -37,12 +37,20 @@ indexed_memory.py design (F4.9).
 
 # Paper v1 Reference Experiments — Qwen 2.5 3B + configs/default.yaml
 
-The 11 files below were active research scripts that produced Paper v1
+The 13 files below were active research scripts that produced Paper v1
 results against Qwen 2.5 3B base via `configs/default.yaml`. Archived
 2026-04-28 as part of the `default.yaml` retirement arc. They remain
 runnable for paper reproducibility (artifact directories under
 `outputs/{phase4_indexed_keys,f4_9c_test*,f4_10_*}/qwen2.5-3b/`) but
 are not part of the active test/experiment harness.
+
+## experiments/phase1_basic_recall.py
+Phase 1 basic-recall experiment. Earliest Paper v1 driver — single-fact
+recall via LoRA training, no consolidation loop yet.
+
+## experiments/phase2_forgetting.py
+Phase 2 catastrophic-forgetting study. Drove the move to replay-based
+training; reads `config.replay` heavily.
 
 ## experiments/phase3_consolidation.py
 Phase 3 consolidation loop driver. Predates the indexed-key pipeline.
