@@ -313,14 +313,47 @@ class ToolsConfig:
 
 @dataclass
 class SanitizationConfig:
-    """PII sanitization for cloud-bound queries."""
+    """PII sanitization + cloud egress policy.
+
+    Two layered knobs:
+
+    * ``mode`` — sanitizer detection layer (off / warn / block).  Controls
+      whether ``sanitize_for_cloud`` flags personal-marker queries and
+      whether it null-returns them so callers suppress the cloud call.
+
+    * ``cloud_mode`` — egress policy for direct SOTA escalation
+      (block / anonymize / both):
+
+        - ``block``     — PERSONAL queries dropped before SOTA;
+          non-PERSONAL sent verbatim.  Phase 2 default: smallest cloud
+          surface, zero anonymizer cost.
+        - ``anonymize`` — ALL cloud-bound text is anonymized via the
+          local LLM, sent to SOTA as placeholders, and de-anonymized on
+          return.  PERSONAL queries reach cloud as redacted text.
+        - ``both``      — strictest privacy posture.  PERSONAL blocked
+          AND non-PERSONAL anonymized.  Cloud only ever sees
+          placeholder-substituted non-personal text.
+
+    HA path is independent of ``cloud_mode``: HA receives cleartext
+    gated by intent classification.  Hardening the HA hop is a planned
+    follow-up.
+    """
 
     mode: str = "block"  # off, warn, block
+    cloud_mode: str = "block"  # block, anonymize, both
 
     def __post_init__(self):
-        valid = {"off", "warn", "block"}
-        if self.mode not in valid:
-            raise ValueError(f"Invalid sanitization mode '{self.mode}'. Must be one of: {valid}")
+        valid_mode = {"off", "warn", "block"}
+        if self.mode not in valid_mode:
+            raise ValueError(
+                f"Invalid sanitization mode '{self.mode}'. Must be one of: {valid_mode}"
+            )
+        valid_cloud_mode = {"block", "anonymize", "both"}
+        if self.cloud_mode not in valid_cloud_mode:
+            raise ValueError(
+                f"Invalid sanitization cloud_mode '{self.cloud_mode}'. "
+                f"Must be one of: {valid_cloud_mode}"
+            )
 
 
 _ABSTENTION_RESPONSE_FALLBACK = "I don't have that information stored yet."

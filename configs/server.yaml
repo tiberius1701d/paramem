@@ -299,8 +299,43 @@ tools:
       - media_player.*
   tool_timeout_seconds: 10.0
 
+# ============================================================================
+# SANITIZATION & CLOUD EGRESS POLICY
+# ============================================================================
+# Two layered knobs control what happens to cloud-bound text:
+#
+#   `mode`        — sanitizer detection layer
+#                     off    : no PII detection, queries flow through unchanged
+#                     warn   : log findings, queries flow through unchanged
+#                     block  : null-return personal-marker queries, suppressing
+#                              the cloud call at the first checkpoint
+#
+#   `cloud_mode`  — egress policy for direct SOTA escalation
+#                     block      : PERSONAL queries dropped before SOTA;
+#                                  non-PERSONAL sent verbatim. Phase 2 default,
+#                                  zero anonymizer cost, smallest cloud surface.
+#                     anonymize  : ALL cloud-bound text is anonymized via the
+#                                  local LLM, sent to SOTA as placeholders, and
+#                                  de-anonymized on the way back. PERSONAL
+#                                  queries reach cloud as redacted text.
+#                     both       : strictest privacy posture — PERSONAL is
+#                                  blocked AND non-PERSONAL is anonymized.
+#                                  Cloud only ever sees non-personal text, and
+#                                  even that is placeholder-substituted.
+#
+# Per-query safety: in any anonymizing mode, if the leak guard detects a real
+# name surviving anonymization, that single query falls back to block (config
+# stays put for the next query).
+#
+# HA path (HA conversation agent) is NOT affected by `cloud_mode`. HA receives
+# cleartext, gated by intent classification. Hardening the HA hop is a planned
+# follow-up package.
+#
+# SOTA reachability is independent: with `agents.sota.enabled: false` (or no
+# api_key), no queries reach SOTA regardless of `cloud_mode`.
 sanitization:
-  mode: block           # off, warn, block — controls PII detection for cloud queries
+  mode: block            # off | warn | block — PII detection layer
+  cloud_mode: anonymize  # block | anonymize | both — direct-SOTA egress policy
 
 # ============================================================================
 # ABSTENTION — LAST-RESORT CONFABULATION GUARD

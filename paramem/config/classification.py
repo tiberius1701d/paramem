@@ -149,6 +149,7 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "tools.tool_timeout_seconds": Tier.OPERATIONAL,
     # --- sanitization ---
     "sanitization.mode": Tier.OPERATIONAL,
+    "sanitization.cloud_mode": Tier.OPERATIONAL,
     # --- abstention ---
     "abstention.enabled": Tier.PIPELINE_ALTERING,
     "abstention.response_file": Tier.OPERATIONAL,

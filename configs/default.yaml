@@ -102,3 +102,37 @@ paths:
   output_dir: "outputs"
   adapter_dir: "outputs/adapters"
   graph_dir: "outputs/graphs"
+
+# ============================================================================
+# SANITIZATION & CLOUD EGRESS POLICY (server runtime)
+# ============================================================================
+# Currently informational here: the training loader does not consume this
+# block (sanitization is a runtime concern). Once configs/default.yaml and
+# configs/server.yaml are unified (see project_config_yaml_overlap.md),
+# these become the load-bearing shipped defaults.
+#
+#   `mode`        — sanitizer detection layer
+#                     off / warn / block
+#                       off:   no PII detection
+#                       warn:  log findings, queries flow through unchanged
+#                       block: null-return personal-marker queries, suppress
+#                              the cloud call at the first checkpoint
+#
+#   `cloud_mode`  — egress policy for direct SOTA escalation
+#                     block      : PERSONAL queries dropped before SOTA;
+#                                  non-PERSONAL sent verbatim. Smallest cloud
+#                                  surface, zero anonymizer cost. Safe ship
+#                                  default — works without a SOTA API key.
+#                     anonymize  : ALL cloud-bound text is anonymized via the
+#                                  local LLM, sent to SOTA as placeholders,
+#                                  and de-anonymized on the way back.
+#                     both       : strictest — PERSONAL blocked AND
+#                                  non-PERSONAL anonymized. Cloud only ever
+#                                  sees placeholder-substituted non-personal
+#                                  text.
+#
+# HA path is NOT affected by `cloud_mode`; HA receives cleartext gated by the
+# intent classifier. Hardening the HA hop is a planned follow-up.
+sanitization:
+  mode: block        # off | warn | block — PII detection layer
+  cloud_mode: block  # block | anonymize | both — direct-SOTA egress policy

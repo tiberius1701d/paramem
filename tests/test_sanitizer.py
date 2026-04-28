@@ -183,3 +183,82 @@ class TestSanitizeForCloud:
             )
             assert query == "Turn on the kitchen light"
             assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# SanitizationConfig — cloud_mode validator + YAML loader wiring
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizationConfigCloudMode:
+    """The cloud_mode field is the egress-policy knob added in Architecture #3.
+
+    These tests pin the dataclass surface (defaults, validator) and the
+    load_server_config wiring; the actual behavior change (anonymize-and-send,
+    block-PERSONAL, etc.) is tested in tests of inference.py once the
+    cloud_anonymizer module is wired.
+    """
+
+    def test_default_is_block(self):
+        from paramem.server.config import SanitizationConfig
+
+        cfg = SanitizationConfig()
+        assert cfg.cloud_mode == "block"
+
+    def test_anonymize_value_accepted(self):
+        from paramem.server.config import SanitizationConfig
+
+        cfg = SanitizationConfig(cloud_mode="anonymize")
+        assert cfg.cloud_mode == "anonymize"
+
+    def test_both_value_accepted(self):
+        from paramem.server.config import SanitizationConfig
+
+        cfg = SanitizationConfig(cloud_mode="both")
+        assert cfg.cloud_mode == "both"
+
+    def test_invalid_value_rejected(self):
+        import pytest
+
+        from paramem.server.config import SanitizationConfig
+
+        with pytest.raises(ValueError, match="cloud_mode"):
+            SanitizationConfig(cloud_mode="not_a_real_mode")
+
+    def test_mode_validator_still_fires(self):
+        # Regression guard: adding the cloud_mode validator must not break
+        # the existing mode validator.
+        import pytest
+
+        from paramem.server.config import SanitizationConfig
+
+        with pytest.raises(ValueError, match="sanitization mode"):
+            SanitizationConfig(mode="bogus")
+
+    def test_loaded_from_yaml(self, tmp_path):
+        """load_server_config wires sanitization.cloud_mode through SanitizationConfig(**raw)."""
+        from paramem.server.config import load_server_config
+
+        yaml_file = tmp_path / "server.yaml"
+        yaml_file.write_text(
+            "sanitization:\n  mode: block\n  cloud_mode: anonymize\n", encoding="utf-8"
+        )
+        config = load_server_config(yaml_file)
+        assert config.sanitization.cloud_mode == "anonymize"
+
+    def test_yaml_omits_cloud_mode_falls_back_to_default(self, tmp_path):
+        """Existing server.yaml files that don't carry cloud_mode get the safe default."""
+        from paramem.server.config import load_server_config
+
+        yaml_file = tmp_path / "server.yaml"
+        yaml_file.write_text("sanitization:\n  mode: warn\n", encoding="utf-8")
+        config = load_server_config(yaml_file)
+        assert config.sanitization.mode == "warn"
+        assert config.sanitization.cloud_mode == "block"  # dataclass default
+
+    def test_project_server_yaml_loads_cleanly(self):
+        """The shipped configs/server.yaml parses without validator errors."""
+        from paramem.server.config import load_server_config
+
+        config = load_server_config("configs/server.yaml")
+        assert config.sanitization.cloud_mode in {"block", "anonymize", "both"}
