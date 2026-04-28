@@ -119,7 +119,6 @@ def _pa_router_stub(adapter_name: str, keys: list[str]) -> MagicMock:
     """
     plan = RoutingPlan(
         strategy="direct",
-        match_source="pa",
         steps=[RoutingStep(adapter_name=adapter_name, keys_to_probe=keys)],
         intent=Intent.PERSONAL,
     )

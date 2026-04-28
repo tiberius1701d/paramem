@@ -260,15 +260,14 @@ class TestPrivacyRouting:
                     ],
                     strategy="entity",
                     matched_entities=matched,
-                    match_source="pa",
                     intent=Intent.PERSONAL,
                 )
-            return RoutingPlan(strategy="direct", match_source="none", intent=Intent.UNKNOWN)
+            return RoutingPlan(strategy="direct", intent=Intent.UNKNOWN)
 
         router.route = route
         return router
 
-    def _make_ha_only_router(self, imperative=False):
+    def _make_ha_only_router(self):
         """Create a mock router returning an HA-only match (no PA steps).
 
         HA hit without PA → COMMAND under classify_intent's state-first dispatch.
@@ -282,8 +281,6 @@ class TestPrivacyRouting:
                 steps=[],
                 strategy="entity",
                 matched_entities=["lights"],
-                match_source="ha",
-                imperative=imperative,
                 ha_domains=["light"],
                 intent=Intent.COMMAND,
             )
@@ -307,8 +304,6 @@ class TestPrivacyRouting:
                 steps=[RoutingStep(adapter_name="episodic", keys_to_probe=["graph1"])],
                 strategy="entity",
                 matched_entities=["lights", "alex"],
-                match_source="both",
-                imperative=True,
                 ha_domains=["light"],
                 intent=Intent.PERSONAL,
             )
@@ -461,11 +456,11 @@ class TestPrivacyRouting:
         assert result.escalated is False
 
     def test_imperative_ha_command_sota_fallback(self):
-        """Path 2a (match_source=ha): HA fails → SOTA fallback."""
+        """COMMAND intent + HA fails → SOTA fallback (imperative shape)."""
         from paramem.server.inference import handle_chat
 
         cloud_agent = self._make_mock_cloud_agent()
-        router = self._make_ha_only_router(imperative=True)
+        router = self._make_ha_only_router()
 
         model = MagicMock()
         model.gradient_checkpointing_disable = MagicMock()
@@ -497,11 +492,11 @@ class TestPrivacyRouting:
         assert result.text == "cloud answer"
 
     def test_ha_nonimperative_match_sota_fallback(self):
-        """Path 2c (non-imperative HA match): HA fails → SOTA fallback."""
+        """COMMAND intent + HA fails → SOTA fallback (interrogative shape)."""
         from paramem.server.inference import handle_chat
 
         cloud_agent = self._make_mock_cloud_agent()
-        router = self._make_ha_only_router(imperative=False)
+        router = self._make_ha_only_router()
 
         model = MagicMock()
         model.gradient_checkpointing_disable = MagicMock()
@@ -533,7 +528,7 @@ class TestPrivacyRouting:
         assert result.text == "cloud answer"
 
     def test_personal_both_match_uses_pa_probe_no_pre_flight_ha(self):
-        """match_source=both + intent=PERSONAL: PA probe runs directly.
+        """PA + HA overlap → intent=PERSONAL → PA probe runs directly.
 
         Under intent-keyed dispatch, intent=PERSONAL routes straight to the
         local PA probe.  The pre-flight HA call from the legacy cascade is

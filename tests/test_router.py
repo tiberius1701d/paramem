@@ -11,7 +11,6 @@ from paramem.server.router import (
     MAX_KEYS_PER_QUERY,
     QueryRouter,
     _interim_sort_key,
-    _is_declarative,
     _is_interrogative,
 )
 
@@ -115,58 +114,6 @@ class TestIsInterrogative:
 
     def test_single_word_imperative(self):
         assert _is_interrogative("Turn") is False
-
-
-class TestIsDeclarative:
-    """Pronoun- / possessive-fronted statements must NOT be classified as
-    imperatives by the no-entity-match fallback. Without this gate, the
-    introduction "I'm Alex…" was routed to HA as a device command,
-    silently blocked by the sanitizer, and ultimately answered by the
-    base model inventing a "tell me about myself" question to fit its
-    personal-assistant role.
-    """
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "I'm Alex.",
-            "I am Alex.",
-            "I'm 50 years old.",
-            "I have a dog.",
-            "I've been to Berlin.",
-            "We had dinner at six.",
-            "We're going camping.",
-            "My wife is named Pat.",
-            "My favourite colour is blue.",
-            "Our daughter just started school.",
-            "She's coming home tomorrow.",
-            "He's the one who called.",
-            "It's already late.",
-            "They left after lunch.",
-            "This is fine.",
-            "That worked.",
-            "There is no time.",
-            "Your guess is as good as mine.",
-        ],
-    )
-    def test_pronoun_and_possessive_openings_are_declarative(self, text: str):
-        assert _is_declarative(text) is True
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "Turn on the kitchen light",
-            "Set the thermostat to 20 degrees",
-            "Play music in the living room",
-            "Lock the front door",
-            "Remind me at 8 AM",
-            "What is the temperature?",
-            "Where is my phone?",
-            "",
-        ],
-    )
-    def test_imperatives_and_questions_are_not_declarative(self, text: str):
-        assert _is_declarative(text) is False
 
 
 # ---------------------------------------------------------------------------
@@ -298,24 +245,29 @@ class TestQueryRouterRoutePA:
         )
         return QueryRouter(adapter_dir=Path(tmp))
 
-    def test_no_speaker_id_returns_none_match(self):
+    def test_no_speaker_id_returns_no_steps(self):
+        from paramem.server.router import Intent
+
         with tempfile.TemporaryDirectory() as tmp:
             router = self._make_router(tmp)
             plan = router.route("Where does Alice live?", speaker_id=None)
-            assert plan.match_source == "none"
             assert plan.steps == []
+            assert plan.intent == Intent.UNKNOWN
 
-    def test_wrong_speaker_id_returns_none_match(self):
+    def test_wrong_speaker_id_returns_no_steps(self):
         with tempfile.TemporaryDirectory() as tmp:
             router = self._make_router(tmp)
             plan = router.route("Where does Alice live?", speaker_id="bob")
-            assert plan.match_source == "none"
+            assert plan.steps == []
 
     def test_correct_speaker_id_pa_match(self):
+        from paramem.server.router import Intent
+
         with tempfile.TemporaryDirectory() as tmp:
             router = self._make_router(tmp)
             plan = router.route("Where does Alice live?", speaker_id="alice")
-            assert plan.match_source == "pa"
+            assert plan.steps  # PA match → steps populated
+            assert plan.intent == Intent.PERSONAL
 
     def test_pa_match_steps_populated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,6 +292,8 @@ class TestQueryRouterRoutePA:
             assert plan.strategy == "direct"
 
     def test_speaker_name_injected_as_implicit_entity(self):
+        from paramem.server.router import Intent
+
         with tempfile.TemporaryDirectory() as tmp:
             # Only "alice" in the index
             _write_keyed_pairs(
@@ -350,7 +304,8 @@ class TestQueryRouterRoutePA:
             # Query doesn't mention alice, but speaker="Alice" injects it
             plan = router.route("Where do I live?", speaker="Alice", speaker_id="alice")
             # alice is now an implicit entity — should trigger PA match
-            assert plan.match_source == "pa"
+            assert plan.intent == Intent.PERSONAL
+            assert plan.steps
 
     def test_matched_entities_in_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,11 +314,14 @@ class TestQueryRouterRoutePA:
             assert "alice" in plan.matched_entities or "berlin" in plan.matched_entities
 
     def test_fuzzy_entity_match(self):
+        from paramem.server.router import Intent
+
         with tempfile.TemporaryDirectory() as tmp:
             router = self._make_router(tmp)
             # "Alic" should fuzzy-match "alice" at ratio ~89
             plan = router.route("Tell me about Alic", speaker_id="alice")
-            assert plan.match_source == "pa"
+            assert plan.intent == Intent.PERSONAL
+            assert plan.steps
 
     def test_adapter_order_procedural_episodic_semantic(self):
         """Procedural step comes before episodic and semantic.
@@ -401,73 +359,33 @@ class TestQueryRouterRouteHA:
         with tempfile.TemporaryDirectory() as tmp:
             router = QueryRouter(adapter_dir=Path(tmp), ha_graph=None)
             plan = router.route("Turn on the kitchen light")
-            assert plan.match_source == "none"
+            assert plan.ha_domains == []
+            assert plan.steps == []
 
     def test_ha_only_match(self):
+        from paramem.server.router import Intent
+
         with tempfile.TemporaryDirectory() as tmp:
             ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
             router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
             plan = router.route("Is the kitchen light on?")
-            assert plan.match_source == "ha"
+            assert plan.intent == Intent.COMMAND
+            assert plan.ha_domains == ["light"]
             assert plan.steps == []
 
-    def test_verb_only_ha_match_does_not_set_entity_match(self):
-        """Verb-only ha_match (no entity/area) → has_entity_match=False → entity path skipped.
-        An interrogative is used so the imperative fallback also does not fire, isolating
-        the entity-path invariant."""
+    def test_verb_only_ha_match_no_entity_no_pa_steps(self):
+        """Verb-only ha_match (no entity) does not produce PA steps and does
+        not classify as PERSONAL.  ha_domains may still be populated from the
+        match for observability."""
+        from paramem.server.router import Intent
+
         with tempfile.TemporaryDirectory() as tmp:
             match = _make_ha_match(verbs=["turn on"], domains=["light"])
             ha = _make_ha_graph(match)
             router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            # Interrogative → fallback does not fire; verb-only match → has_ha=False
             plan = router.route("Is turn on working?")
-            assert plan.match_source == "none"
-
-    def test_verb_only_ha_match_with_imperative_promoted_via_fallback(self):
-        """Verb-only ha_match + imperative → entity path skips, fallback promotes to HA."""
-        with tempfile.TemporaryDirectory() as tmp:
-            match = _make_ha_match(verbs=["turn on"], domains=["light"])
-            ha = _make_ha_graph(match)
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Turn on something")
-            # Entity path: has_ha=False (verb-only). Fallback: imperative → match_source="ha"
-            assert plan.match_source == "ha"
-            assert plan.imperative is True
-
-    def test_ha_verb_plus_entity_non_interrogative_is_imperative(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(
-                _make_ha_match(
-                    entities=["kitchen light"],
-                    verbs=["turn on"],
-                    domains=["light"],
-                )
-            )
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Turn on the kitchen light")
-            assert plan.imperative is True
-
-    def test_ha_verb_plus_entity_interrogative_is_not_imperative(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(
-                _make_ha_match(
-                    entities=["kitchen light"],
-                    verbs=["turn on"],
-                    domains=["light"],
-                )
-            )
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Is the kitchen light turned on?")
-            assert plan.imperative is False
-
-    def test_ha_entity_without_verb_not_imperative(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(
-                _make_ha_match(entities=["kitchen light"], verbs=[], domains=["light"])
-            )
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("kitchen light status")
-            assert plan.imperative is False
+            assert plan.steps == []
+            assert plan.intent != Intent.PERSONAL
 
     def test_ha_domains_populated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -485,7 +403,13 @@ class TestQueryRouterRouteHA:
             plan = router.route("Tell me something random")
             assert plan.ha_domains == []
 
-    def test_both_match_source(self):
+    def test_pa_and_ha_overlap_classifies_personal(self):
+        """When PA and HA both match the same query, intent=PERSONAL (PA wins
+        in classify_intent's state-first dispatch).  PA steps and HA domains
+        both populated so downstream consumers can still see both signals.
+        """
+        from paramem.server.router import Intent
+
         with tempfile.TemporaryDirectory() as tmp:
             _write_keyed_pairs(
                 Path(tmp),
@@ -494,88 +418,9 @@ class TestQueryRouterRouteHA:
             ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
             router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
             plan = router.route("Alice kitchen light", speaker_id="alice")
-            assert plan.match_source == "both"
-
-    def test_both_match_has_pa_steps(self):
-        """When both match, PA steps are still built."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "kitchen light", speaker_id="alice")],
-            )
-            ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Alice kitchen light", speaker_id="alice")
-            assert plan.steps  # PA steps present
-
-
-# ---------------------------------------------------------------------------
-# QueryRouter — imperative fallback routing
-# ---------------------------------------------------------------------------
-
-
-class TestQueryRouterImperativeFallback:
-    """Imperatives with no entity match should be promoted to HA when HA is configured."""
-
-    def test_imperative_no_match_routes_to_ha_when_graph_present(self):
-        """Generic imperative → match_source="ha", imperative=True."""
-        with tempfile.TemporaryDirectory() as tmp:
-            # ha_graph present but returns None (no entity matches "play music")
-            ha = _make_ha_graph(None)
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Play music")
-            assert plan.match_source == "ha"
-            assert plan.imperative is True
-
-    def test_interrogative_no_match_stays_none(self):
-        """Question with no match → match_source='none' (route to SOTA)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(None)
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("What is the capital of France?")
-            assert plan.match_source == "none"
-            assert plan.imperative is False
-
-    def test_imperative_no_ha_graph_stays_none(self):
-        """Without HA graph, imperative fallback does not fire."""
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=None)
-            plan = router.route("Play music")
-            assert plan.match_source == "none"
-
-    def test_imperative_fallback_does_not_fire_when_ha_already_matched(self):
-        """When HA entity graph already matched, match_source is 'ha' for that reason."""
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Turn on the kitchen light")
-            # Still "ha" — but driven by entity match, not fallback
-            assert plan.match_source == "ha"
-
-    def test_imperative_fallback_no_pa_steps(self):
-        """Fallback-promoted HA route has no PA steps (no PA match)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(None)
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Set a timer for five minutes")
-            assert plan.match_source == "ha"
-            assert plan.steps == []
-
-    def test_various_imperative_commands_promoted(self):
-        """Spot-check several real-world device commands that lack entity names."""
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(None)
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            for command in [
-                "Play music",
-                "Stop the music",
-                "Turn off everything",
-                "Lock the door",
-                "Dim the lights",
-            ]:
-                plan = router.route(command)
-                assert plan.match_source == "ha", f"Expected 'ha' for: {command!r}"
-                assert plan.imperative is True, f"Expected imperative=True for: {command!r}"
+            assert plan.intent == Intent.PERSONAL
+            assert plan.steps
+            assert "light" in plan.ha_domains
 
 
 # ---------------------------------------------------------------------------
@@ -756,12 +601,14 @@ class TestInterimAdapterRouting:
                 [_make_pair("int1", "Alice", "Vienna", speaker_id="alice")],
                 subdir="episodic_interim_20260417T0000",
             )
+            from paramem.server.router import Intent
+
             router = QueryRouter(adapter_dir=Path(tmp))
             plan = router.route("Alice", speaker_id="alice")
 
             assert len(plan.steps) == 1, f"Expected exactly one step, got {plan.steps}"
             assert plan.steps[0].adapter_name == "episodic_interim_20260417T0000"
-            assert plan.match_source == "pa"
+            assert plan.intent == Intent.PERSONAL
 
     def test_route_three_mains_correct_order(self):
         """All three mains + one interim: order must be procedural, interim, episodic, semantic.
@@ -846,8 +693,8 @@ class TestRouteIntentField:
             router = QueryRouter(adapter_dir=Path(tmp))
             plan = router.route("Where does Alex live?", speaker_id="alex")
 
-            assert plan.match_source == "pa"
             assert plan.intent == Intent.PERSONAL
+            assert plan.steps  # PA produced probe steps
 
     def test_ha_only_match_yields_command_intent(self):
         from paramem.server.router import Intent
@@ -857,8 +704,9 @@ class TestRouteIntentField:
             router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
             plan = router.route("Turn on the kitchen light")
 
-            assert plan.match_source == "ha"
             assert plan.intent == Intent.COMMAND
+            assert plan.ha_domains == ["light"]
+            assert plan.steps == []
 
     def test_both_pa_and_ha_match_personal_wins(self):
         # Privacy-first: PA + HA overlap routes to PERSONAL so cloud
@@ -875,8 +723,9 @@ class TestRouteIntentField:
             router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
             plan = router.route("Is Alex's bedroom light on?", speaker_id="alex")
 
-            assert plan.match_source == "both"
             assert plan.intent == Intent.PERSONAL
+            assert plan.steps  # PA path also produces steps
+            assert "light" in plan.ha_domains  # HA observability preserved
 
     def test_no_state_no_config_returns_unknown(self):
         # No PA, no HA, no IntentConfig — encoder isn't loaded so the

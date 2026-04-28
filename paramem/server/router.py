@@ -1,25 +1,23 @@
 """Query routing — selects adapters and keys based on query entities.
 
 Routes queries to the right adapter(s) and identifies which indexed keys
-to probe, using the knowledge graph's entity-to-key mappings. This avoids
-probing all keys for every query at scale.
+to probe, using the knowledge graph's entity-to-key mappings.  This
+avoids probing all keys for every query at scale.
 
-Dual-graph routing: queries are matched against both the PA knowledge graph
-(personal entities) and the HA entity graph (devices, areas, action verbs).
-The match_source field in RoutingPlan tells inference.py which path to take:
-  - "pa": personal knowledge → local adapter probe
-  - "ha": device/action → HA conversation agent
-  - "both": PA + HA overlap → PA first, HA on [ESCALATE]
-  - "none": no match → SOTA cloud agent
+Dual-graph matching feeds the intent classifier:
 
-Imperative fallback: when match_source would be "none" and the query is an
-imperative command (not a question), it is promoted to "ha" so the HA
-conversation agent can attempt to resolve it. Commands like "play music" or
-"set a timer" name no specific entity but are almost certainly device actions.
-Interrogatives ("What is X?") stay on the "none" → SOTA path.
+* PA knowledge graph (personal entities) → ``has_pa``
+* HA entity graph (devices, areas, action verbs) → ``has_ha``
 
-The router is stateless per query — all state lives in the indexes built
-from keyed_pairs.json, the knowledge graph, and the HA entity graph.
+``classify_intent`` collapses these signals into a single
+:class:`Intent` value on the returned :class:`RoutingPlan`.  Downstream
+routing in ``inference.py`` dispatches on ``plan.intent`` alone; the
+graph-coverage details are still surfaced via ``plan.steps`` (PA probe
+targets) and ``plan.ha_domains`` (HA observability).
+
+The router is stateless per query — all state lives in the indexes
+built from keyed_pairs.json, the knowledge graph, and the HA entity
+graph.
 """
 
 from __future__ import annotations
@@ -80,20 +78,23 @@ class RoutingStep:
 
 @dataclass
 class RoutingPlan:
-    """What to activate and probe for a given query."""
+    """What to activate and probe for a given query.
+
+    ``intent`` is the single explicit routing axis the chat handler
+    dispatches on.  ``steps`` carries the PA probe targets when
+    ``intent == PERSONAL``; ``ha_domains`` is observability for the
+    HA path.  The legacy ``match_source`` / ``imperative`` fields were
+    retired once the if/elif cascade was replaced with intent-keyed
+    dispatch — the same information is recoverable from
+    ``(bool(steps), bool(ha_domains))`` if any tooling needs it.
+    """
 
     steps: list[RoutingStep] = field(default_factory=list)
     strategy: str = "direct"
     matched_entities: list[str] = field(default_factory=list)
-    # Dual-graph routing: which graph(s) produced the match
-    match_source: str = "none"  # "pa", "ha", "both", "none"
-    # Action verb + HA entity detected (strong HA signal)
-    imperative: bool = False
-    # HA domains of matched entities/verbs
+    # HA domains of matched entities/verbs (observability + UI)
     ha_domains: list[str] = field(default_factory=list)
-    # Single explicit routing axis.  Default UNKNOWN until populated by
-    # the residual-classifier work; consumers that read this should
-    # treat UNKNOWN as conservative (same as GENERAL).
+    # Single routing axis the chat handler dispatches on.
     intent: Intent = Intent.UNKNOWN
 
 
@@ -134,57 +135,6 @@ _INTERROGATIVE_PREFIXES = frozenset(
 )
 
 
-# Declarative openings — pronoun- or possessive-fronted statements ("I'm Alex",
-# "We had dinner", "My wife is here"). The imperative fallback below uses this
-# to avoid misclassifying personal statements as device commands. Imperative
-# English typically opens with a base-form verb ("play", "turn on", "set"),
-# never with a subject pronoun or possessive.
-_DECLARATIVE_PREFIXES = frozenset(
-    {
-        "i",
-        "i'm",
-        "i'd",
-        "i've",
-        "i'll",
-        "we",
-        "we're",
-        "we'd",
-        "we've",
-        "we'll",
-        "you",
-        "you're",
-        "you'd",
-        "you've",
-        "you'll",
-        "he",
-        "he's",
-        "he'd",
-        "she",
-        "she's",
-        "she'd",
-        "it",
-        "it's",
-        "it'd",
-        "they",
-        "they're",
-        "they'd",
-        "they've",
-        "they'll",
-        "this",
-        "that",
-        "these",
-        "those",
-        "there",
-        "my",
-        "our",
-        "your",
-        "his",
-        "her",
-        "their",
-    }
-)
-
-
 def _is_interrogative(text: str) -> bool:
     """Check if the query is a question (not an imperative command)."""
     first_word = text.strip().split()[0].lower() if text.strip() else ""
@@ -192,12 +142,6 @@ def _is_interrogative(text: str) -> bool:
     if first_word.endswith("'s"):
         first_word = first_word[:-2]
     return first_word in _INTERROGATIVE_PREFIXES
-
-
-def _is_declarative(text: str) -> bool:
-    """First-word heuristic for pronoun/possessive-fronted statements."""
-    first_word = text.strip().split()[0].lower() if text.strip() else ""
-    return first_word in _DECLARATIVE_PREFIXES
 
 
 class QueryRouter:
@@ -364,44 +308,6 @@ class QueryRouter:
             ha_match = self._ha_graph.match(text)
         has_ha = ha_match is not None and ha_match.has_entity_match
 
-        # --- Determine match_source ---
-        if has_pa and has_ha:
-            match_source = "both"
-        elif has_pa:
-            match_source = "pa"
-        elif has_ha:
-            match_source = "ha"
-        else:
-            match_source = "none"
-
-        # --- Imperative detection ---
-        imperative = False
-        if has_ha and ha_match is not None:
-            has_verb = ha_match.has_verb_match
-            is_question = _is_interrogative(text)
-            imperative = has_verb and not is_question
-
-        # --- Imperative fallback: no graph match but clearly a command ---
-        # Imperatives with no entity match (e.g. "play music", "set a timer") are
-        # almost certainly device commands. Route them to HA so its conversation
-        # agent can resolve the intent — it's better equipped than the routing
-        # layer to handle commands that don't name a specific entity.
-        # Interrogatives stay on the SOTA path (knowledge/reasoning questions).
-        # Pronoun- or possessive-fronted statements ("I'm Alex", "My wife
-        # is here") are declarative and stay off the HA path — without this
-        # gate they were classified as imperatives and routed to HA, which
-        # the sanitizer then blocked, leaving _base_model_answer to invent
-        # an implicit question to answer.
-        if (
-            match_source == "none"
-            and self._ha_graph is not None
-            and not _is_interrogative(text)
-            and not _is_declarative(text)
-        ):
-            match_source = "ha"
-            imperative = True
-            logger.info("Imperative fallback: no entity match, routing to HA agent")
-
         # --- Build PA adapter steps (only if PA matched) ---
         steps = []
         if has_pa:
@@ -462,11 +368,8 @@ class QueryRouter:
         # State-first dispatch: has_pa → PERSONAL, has_ha → COMMAND.  When
         # neither fires, classify_intent falls through to the encoder
         # residual (cosine vs exemplars + margin gate) or fail-closed.
-        # Uses the *raw* state signals (has_pa / has_ha) — not the
-        # post-imperative-fallback match_source, since the fallback is a
-        # heuristic and the intent classifier expects clean state.  The
-        # call is local-cheap when state hits and a single matrix-vector
-        # dot product otherwise; failure modes are non-raising.
+        # The call is local-cheap when state hits and a single matrix-
+        # vector dot product otherwise; failure modes are non-raising.
         from paramem.server.intent import classify_intent  # lazy: breaks router↔intent cycle
 
         intent = classify_intent(
@@ -476,22 +379,18 @@ class QueryRouter:
             config=self._intent_config,
         )
 
-        if match_source != "none":
+        if has_pa or has_ha:
             logger.info(
-                "Routed query: source=%s, intent=%s, pa_entities=%s, ha=%s, imperative=%s",
-                match_source,
+                "Routed query: intent=%s, pa_entities=%s, ha=%s",
                 intent.value,
                 pa_entities if has_pa else [],
                 ha_domains if has_ha else [],
-                imperative,
             )
 
         return RoutingPlan(
             steps=steps,
             strategy=strategy,
             matched_entities=pa_entities,
-            match_source=match_source,
-            imperative=imperative,
             ha_domains=ha_domains,
             intent=intent,
         )

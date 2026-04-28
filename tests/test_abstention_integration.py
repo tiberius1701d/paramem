@@ -31,15 +31,14 @@ def server_config():
 @pytest.fixture
 def empty_adapter_router():
     """Router stub mimicking an untrained/empty adapter: no entities,
-    no keys, ``match_source="none"`` for every query. Matches the
-    exact failure state observed in the bug report.
+    no PA steps, no HA domains.  Matches the failure state observed in
+    the original bug report.
 
-    Sets ``intent=PERSONAL`` because the production router with the
-    cosine residual classifies the test queries ("Where do I live?"
-    etc.) as PERSONAL via the encoder + exemplars even when no PA
-    state matches.  Without an intent the new abstention gate would
-    not fire and the regression test would silently pass on the wrong
-    path.
+    Sets ``intent=PERSONAL`` for first-person queries because the
+    production router with the cosine residual classifies them that
+    way via the encoder + exemplars even when no PA state matches.
+    Without an intent the abstention gate would not fire and the
+    regression test would silently pass on the wrong path.
     """
     from paramem.server.router import Intent
 
@@ -52,7 +51,7 @@ def empty_adapter_router():
             intent = Intent.PERSONAL
         else:
             intent = Intent.GENERAL
-        return RoutingPlan(strategy="direct", match_source="none", intent=intent)
+        return RoutingPlan(strategy="direct", intent=intent)
 
     router.route = route
     router._speaker_key_index = {}

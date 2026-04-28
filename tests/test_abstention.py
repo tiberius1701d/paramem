@@ -91,7 +91,7 @@ class TestAbstentionShortCircuit:
     """
 
     def _make_none_match_router(self, intent=None):
-        """Router stub returning match_source=none.
+        """Router stub with no PA steps and no HA domains.
 
         ``intent`` defaults to PERSONAL because every abstention test in
         this class deals with personal-class queries — that is the
@@ -105,7 +105,7 @@ class TestAbstentionShortCircuit:
 
         router = MagicMock()
         router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
-            strategy="direct", match_source="none", intent=intent
+            strategy="direct", intent=intent
         )
         router._speaker_key_index = {}
         return router
@@ -124,7 +124,7 @@ class TestAbstentionShortCircuit:
 
         router = MagicMock()
         router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
-            strategy="direct", match_source="none", intent=intent
+            strategy="direct", intent=intent
         )
         router._speaker_key_index = {speaker_id: {"graph0001"}}
         return router

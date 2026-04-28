@@ -25,7 +25,7 @@ from paramem.models.loader import adapt_messages
 from paramem.server.cloud.base import CloudAgent
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
-from paramem.server.router import RoutingPlan
+from paramem.server.router import Intent, RoutingPlan
 from paramem.server.sanitizer import sanitize_for_cloud
 from paramem.server.tools.ha_client import HAClient
 
@@ -205,21 +205,16 @@ def handle_chat(
     * ``COMMAND`` / ``GENERAL`` / ``UNKNOWN`` → HA first (tools, live
       state), SOTA fallback (reasoning).
 
-    The ``is_residual`` diagnostic still tracks "did any graph signal
-    fire?" for the routing-quality metric independent of the intent
-    decision; ``match_source`` and ``imperative`` remain in the diag
-    dict for observability but no longer drive control flow.
+    The ``is_residual`` diagnostic tracks "did any graph signal fire?"
+    for the routing-quality metric independent of the intent decision —
+    ``True`` when neither PA steps nor HA domains were produced.
 
     When ``config.debug`` is True a per-request routing-decision
     diagnostic is emitted via ``logging.info(extra={"routing": …})`` at
     function exit.
     """
-    from paramem.server.router import Intent
-
     routing_diags: dict = {
         "conversation_id": conversation_id,
-        "match_source": "none",
-        "imperative": False,
         "intent": Intent.UNKNOWN.value,
         "paths_attempted": [],
         "fallthrough_reason": None,
@@ -240,8 +235,6 @@ def handle_chat(
         if router is not None:
             plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
         if plan is not None:
-            routing_diags["match_source"] = plan.match_source
-            routing_diags["imperative"] = plan.imperative
             routing_diags["intent"] = plan.intent.value
 
         intent = plan.intent if plan is not None else Intent.UNKNOWN
@@ -376,7 +369,12 @@ def handle_chat(
         )
     finally:
         if getattr(config, "debug", False):
-            routing_diags["is_residual"] = routing_diags["match_source"] == "none"
+            # is_residual: neither graph signal fired (no PA steps, no HA
+            # domains).  Tracks whether the routing-quality metric should
+            # count this query toward the residual classifier's evaluation.
+            routing_diags["is_residual"] = bool(
+                plan is not None and not plan.steps and not plan.ha_domains
+            )
             logger.info("routing decision", extra={"routing": routing_diags})
 
 
@@ -575,10 +573,10 @@ def _probe_and_reason(
 
     if not layers:
         logger.info(
-            "All %d probed key(s) failed, escalating via HA%s (source=%s)",
+            "All %d probed key(s) failed, escalating via HA%s (intent=%s)",
             sum(len(s.keys_to_probe) for s in plan.steps),
             "" if is_personal else " → SOTA",
-            plan.match_source,
+            plan.intent.value,
         )
         sanitized, _ = sanitize_for_cloud(text, mode=config.sanitization.mode)
         if sanitized is not None:
@@ -637,7 +635,7 @@ def _probe_and_reason(
     return _maybe_escalate(
         response,
         config,
-        match_source=plan.match_source,
+        intent=plan.intent,
         probed_keys=successful_keys,
         sota_agent=sota_agent,
         ha_client=ha_client,
@@ -695,7 +693,7 @@ def _base_model_answer(
 def _maybe_escalate(
     response: str,
     config: ServerConfig,
-    match_source: str = "none",
+    intent: Intent | None = None,
     probed_keys: list[str] | None = None,
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
@@ -723,14 +721,15 @@ def _maybe_escalate(
     if not should_escalate:
         return ChatResult(text=response, probed_keys=probed_keys or [])
 
+    intent_label = intent.value if intent is not None else "unknown"
     sanitized, _ = sanitize_for_cloud(forwarded_query, mode=config.sanitization.mode)
     if sanitized is not None:
-        logger.info("[ESCALATE] → HA (source=%s): %s", match_source, sanitized[:100])
+        logger.info("[ESCALATE] → HA (intent=%s): %s", intent_label, sanitized[:100])
         result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
         if result is not None:
             return result
         if sota_agent is not None and not is_personal:
-            logger.info("[ESCALATE] → SOTA fallback (source=%s): %s", match_source, sanitized[:100])
+            logger.info("[ESCALATE] → SOTA fallback (intent=%s): %s", intent_label, sanitized[:100])
             return _escalate_to_sota(
                 sanitized,
                 sota_agent,

@@ -432,12 +432,12 @@ class TestProbeAndReasonDispatch:
 
     def _make_plan(self, steps):
         """Build a RoutingPlan from a list of (adapter_name, keys) tuples."""
-        from paramem.server.router import RoutingPlan, RoutingStep
+        from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
         return RoutingPlan(
             steps=[RoutingStep(adapter_name=a, keys_to_probe=list(k)) for a, k in steps],
             strategy="direct",
-            match_source="pa",
+            intent=Intent.PERSONAL,
         )
 
     def _make_model(self, adapter_names):
