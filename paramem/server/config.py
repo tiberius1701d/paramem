@@ -201,6 +201,33 @@ class SecurityConfig:
 
 
 @dataclass
+class VramConfig:
+    """Process-side VRAM safety net configuration.
+
+    ``process_cap_fraction`` is the share of device VRAM that
+    ``torch.cuda.set_per_process_memory_fraction`` allows the paramem
+    process to allocate. The reserved ``(1 - fraction)`` is a bulkhead
+    between PyTorch's allocator and the host GPU driver: an over-
+    allocation past the cap surfaces as ``torch.cuda.OutOfMemoryError``
+    in Python rather than as a host driver fault (which on WSL2 takes
+    the VM down with it).
+
+    Default 0.85 leaves ~15 % of the device for OS / other consumers
+    on an 8 GiB device that is the project's primary target. Lower it
+    if other GPU workloads share the device; raise it cautiously if
+    you've measured spare headroom and need every byte.
+    """
+
+    process_cap_fraction: float = 0.85
+
+    def __post_init__(self) -> None:
+        if not (0.0 < self.process_cap_fraction <= 1.0):
+            raise ValueError(
+                f"vram.process_cap_fraction must be in (0, 1]; got {self.process_cap_fraction!r}"
+            )
+
+
+@dataclass
 class ServerNetConfig:
     host: str = "0.0.0.0"
     port: int = 8420
@@ -811,6 +838,7 @@ class ServerConfig:
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
+    vram: VramConfig = field(default_factory=VramConfig)
 
     # Derived path accessors for backward compatibility
     @property
@@ -1001,6 +1029,11 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             )
     if consolidation_raw:
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
+
+    # VRAM safety net (process-side cap; see VramConfig).
+    vram_raw = raw.get("vram", {})
+    if vram_raw:
+        config.vram = VramConfig(**vram_raw)
 
     agents_raw = raw.get("agents", {})
     config.ha_agent_id = agents_raw.get("ha_agent_id", "")

@@ -8,14 +8,13 @@ Two integration points, one component:
    ceiling becomes a Python ``torch.cuda.OutOfMemoryError`` instead of a
    dxgkrnl driver fault (which on WSL2 takes the VM down with it).
 
-2. :func:`session_guard` — context manager that wraps a single
-   consolidation extract call. On exit it always runs
-   ``torch.cuda.empty_cache()`` so fragmentation does not accumulate
-   across a multi-session cycle. On
-   ``torch.cuda.OutOfMemoryError`` it logs the offending session id,
-   clears the cache, and re-raises as :class:`VramExhausted` so the
-   cycle handler aborts rather than silently continuing on indeterminate
-   state.
+2. :func:`vram_scope` — context manager that wraps a single VRAM-
+   allocating phase of a consolidation cycle (an extract session, the
+   training step). On exit it always runs ``torch.cuda.empty_cache()``
+   so fragmentation does not accumulate across phases. On
+   ``torch.cuda.OutOfMemoryError`` it logs the phase label, clears the
+   cache, and re-raises as :class:`VramExhausted` so the cycle handler
+   aborts rather than silently continuing on indeterminate state.
 
 The component is intentionally a no-op when CUDA is unavailable so test
 suites and CPU-only environments are unaffected.
@@ -36,10 +35,13 @@ DEFAULT_PROCESS_FRACTION = 0.85
 
 
 class VramExhausted(RuntimeError):
-    """Raised when an extract session triggers ``torch.cuda.OutOfMemoryError``.
+    """Raised when a guarded phase triggers ``torch.cuda.OutOfMemoryError``.
 
     The cycle handler must catch (or let propagate) and abort the cycle —
-    do NOT continue, the failed session leaves indeterminate model state.
+    do NOT continue, the failed phase leaves indeterminate model state.
+    The first arg of the exception is the phase label (e.g. the
+    extract session id, or ``"training"``) so operators can identify
+    where the cycle died.
     """
 
 
@@ -63,12 +65,16 @@ def apply_process_cap(
 
 
 @contextmanager
-def session_guard(session_id: str) -> Iterator[None]:
-    """Wrap a single extract session with VRAM hygiene + OOM containment.
+def vram_scope(label: str) -> Iterator[None]:
+    """Wrap a VRAM-allocating phase with hygiene + OOM containment.
+
+    *label* identifies the phase for logging and for the
+    :class:`VramExhausted` payload (typical values: an extract session
+    id, ``"training"``).
 
     On exit (success or failure) calls ``torch.cuda.empty_cache()`` so
-    inter-session fragmentation does not accumulate. On
-    ``torch.cuda.OutOfMemoryError`` logs the session id and re-raises as
+    fragmentation does not accumulate across phases. On
+    ``torch.cuda.OutOfMemoryError`` logs *label* and re-raises as
     :class:`VramExhausted`.
 
     No-op when CUDA is unavailable.
@@ -79,9 +85,9 @@ def session_guard(session_id: str) -> Iterator[None]:
     try:
         yield
     except torch.cuda.OutOfMemoryError as exc:
-        logger.error("VRAM guard: session %s exhausted device memory: %s", session_id, exc)
+        logger.error("VRAM guard: phase %s exhausted device memory: %s", label, exc)
         _safe_empty_cache()
-        raise VramExhausted(f"session {session_id} exhausted VRAM") from exc
+        raise VramExhausted(label) from exc
     finally:
         _safe_empty_cache()
 

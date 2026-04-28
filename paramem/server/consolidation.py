@@ -17,7 +17,7 @@ from pathlib import Path
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 from paramem.server.config import ServerConfig
 from paramem.server.session_buffer import SessionBuffer
-from paramem.server.vram_guard import session_guard
+from paramem.server.vram_guard import vram_scope
 from paramem.training.consolidation import ConsolidationLoop
 
 logger = logging.getLogger(__name__)
@@ -261,7 +261,7 @@ def run_consolidation(
                 speaker_name = speaker_store.get_name(session_speaker_id)
             except Exception as e:
                 logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
-        with session_guard(session_id):
+        with vram_scope(session_id):
             episodic_qa, procedural_rels = loop.extract_session(
                 transcript,
                 session_id,
@@ -420,9 +420,10 @@ def run_consolidation(
         # _save_keyed_pairs_for_router because it uses simulated_training which does
         # NOT call _save_adapters — the simulate path's _save_keyed_pairs_for_router
         # is the only kp write in that branch and must be preserved.
-        train_result = loop.train_adapters_no_save(
-            all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
-        )
+        with vram_scope("training"):
+            train_result = loop.train_adapters_no_save(
+                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
+            )
 
         # Key-level promotion: promote keys that reached the threshold.
         # Must run BEFORE _save_adapters so the manifest reflects post-promotion

@@ -136,3 +136,9 @@ paths:
 sanitization:
   mode: block        # off | warn | block — PII detection layer
   cloud_mode: block  # block | anonymize | both — direct-SOTA egress policy
+
+# Process-side VRAM safety net. Read by paramem.server.config.load_server_config
+# (runtime). The training loader (paramem.utils.config.load_config) does NOT
+# consume this section today — see project_config_yaml_overlap.md.
+vram:
+  process_cap_fraction: 0.85   # in (0, 1]; share of device VRAM the process may allocate

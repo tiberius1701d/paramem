@@ -440,6 +440,22 @@ tts:
       # device: cpu            # per-voice override (default: inherit from tts.device)
 
 # ============================================================================
+# VRAM
+# ============================================================================
+# Process-side memory safety net. Sets
+# torch.cuda.set_per_process_memory_fraction(process_cap_fraction) at server
+# startup so PyTorch raises OutOfMemoryError when allocations would push past
+# the cap, instead of letting the host GPU driver fault. On WSL2 a host-side
+# fault collapses the entire VM; the cap converts that into a clean Python
+# exception that the consolidation guard turns into a per-phase abort.
+#
+# Reserve ~15 % of device VRAM by default (8 GiB → 1.2 GiB headroom for OS
+# and any non-paramem GPU consumer). Lower if other processes share the
+# device; raise cautiously, only after measuring.
+vram:
+  process_cap_fraction: 0.85   # in (0, 1]; rejected at startup otherwise
+
+# ============================================================================
 # SECURITY
 # ============================================================================
 # Two independent areas under `security:`:

@@ -110,6 +110,12 @@ _state = {
     "consolidation_loop": None,
     "consolidating": False,
     "last_consolidation": None,
+    # Last structured error from a consolidation attempt. Populated by the
+    # done-callback when the cycle raised an exception that the operator
+    # should be able to see via /status without scraping logs. Currently
+    # populated only for VramExhausted; other failures still log loudly.
+    # Shape: {"type": "vram_exhausted", "phase": str, "at": iso8601} | None
+    "last_consolidation_error": None,
     "background_trainer": None,
     "reclaim_task": None,
     "config_path": None,
@@ -229,6 +235,11 @@ class StatusResponse(BaseModel):
     pending_sessions: int
     consolidating: bool
     last_consolidation: str | None
+    # Structured error from the most recent failed consolidation, surfaced
+    # so operators can see VRAM exhaustion without scraping journald.
+    # None means the last cycle finished cleanly (or none has run yet).
+    # Shape: {"type": "vram_exhausted", "phase": str, "at": iso8601}
+    last_consolidation_error: dict | None = None
     speaker_profiles: int = 0
     # Speaker-embedding backend (pyannote) + HF model id + device. None in
     # three cases: speaker id disabled in yaml, pyannote not installed, or
@@ -1323,7 +1334,7 @@ async def lifespan(app: FastAPI):
         # Apply the per-process VRAM cap before any allocation so that an
         # over-allocation surfaces as a Python OOM exception rather than a
         # host driver fault.
-        apply_process_cap()
+        apply_process_cap(fraction=config.vram.process_cap_fraction)
 
         assessment = assess_topology(
             config.episodic_adapter_config,
@@ -2615,6 +2626,7 @@ async def status():
         pending_sessions=summary["total"],
         consolidating=_state["consolidating"],
         last_consolidation=_state["last_consolidation"],
+        last_consolidation_error=_state.get("last_consolidation_error"),
         speaker_profiles=store.profile_count if store else 0,
         stt_loaded=stt_loaded,
         stt_model=stt.model_name if stt_loaded else None,
@@ -5577,6 +5589,9 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     # acceptable given the period is much longer than the cadence.
     if _is_full_cycle_due(config):
         logger.info("Scheduler tick: full cycle due — running consolidate_interim_adapters")
+        # Clear stale error from a prior failed cycle — a new attempt is
+        # starting; the done-callback will re-populate on failure.
+        _state["last_consolidation_error"] = None
         _state["consolidating"] = True
         event_loop = asyncio.get_running_loop()
         future = event_loop.run_in_executor(None, _run_full_consolidation_sync)
@@ -5592,6 +5607,7 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         return "noop_no_speaker"
 
     logger.info("Scheduler tick: %d pending sessions, starting extract + train", len(pending))
+    _state["last_consolidation_error"] = None
     _state["consolidating"] = True
 
     event_loop = asyncio.get_running_loop()
@@ -5648,10 +5664,24 @@ def _scheduled_extract_done_callback(future):
     On success, _extract_and_start_training has submitted the interim
     training job to the BG trainer and the flag will be cleared by the
     job's _finalize_interim closure when the worker thread completes.
+
+    On VramExhausted, populate ``_state["last_consolidation_error"]`` so
+    the failure is visible via ``/status`` without scraping logs. Other
+    exceptions still surface only through the loud ``logger.exception``
+    line (operators tail the journal).
     """
+    from paramem.server.vram_guard import VramExhausted
+
     exc = future.exception()
     if exc:
         logger.exception("Scheduled extraction failed: %s", exc)
+        if isinstance(exc, VramExhausted):
+            phase = exc.args[0] if exc.args else "unknown"
+            _state["last_consolidation_error"] = {
+                "type": "vram_exhausted",
+                "phase": phase,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
         _state["consolidating"] = False
 
 
