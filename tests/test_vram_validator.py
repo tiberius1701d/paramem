@@ -778,6 +778,13 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
             patch.object(server_app, "load_base_model", spy_load_base_model),
             patch.object(server_app, "_gpu_occupied", return_value=False),
             patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+            # Patching ``app.torch.cuda.is_available`` to True flips ``torch`` to
+            # the GPU branch globally (it's the same module object imported by
+            # vram_guard), so apply_process_cap's own is_available guard also
+            # returns True and it then calls set_per_process_memory_fraction —
+            # which requires a real driver. Stub it so the test can run on
+            # CI runners with no GPU.
+            patch.object(server_app, "apply_process_cap", lambda **kwargs: None),
         ):
 
             async def _run() -> None:
