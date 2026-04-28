@@ -310,6 +310,68 @@ def test_default_scopes_are_frozensets():
     assert isinstance(_CLOUD_EGRESS_DEFAULT_SCOPE, frozenset)
 
 
+# ---------------------------------------------------------------------------
+# ConsolidationLoop wiring — value flows from constructor through
+# _extraction_kwargs to extract_graph
+# ---------------------------------------------------------------------------
+
+
+def test_consolidation_extraction_kwargs_threads_pii_scope():
+    """Value passed to ConsolidationLoop.extraction_pii_scope appears in
+    _extraction_kwargs output under the ``pii_scope`` key.
+
+    This closes the wiring-without-test gap: structural guards in
+    test_extraction_pipeline_guard.py confirm the kwarg name lines up
+    with extract_graph's signature, but don't verify the configured
+    *value* actually flows.  Without this test, a regression that drops
+    the line ``self.extraction_pii_scope = extraction_pii_scope`` (or
+    the corresponding ``pick("pii_scope", ...)`` entry) would compile
+    and pass the structural guard, but silently revert consolidation
+    to the primitive default scope.
+    """
+    from types import SimpleNamespace
+
+    from paramem.training.consolidation import ConsolidationLoop
+
+    # Construct a SimpleNamespace mirroring the loop's attribute shape so
+    # we can call _extraction_kwargs without the full constructor (which
+    # needs a real model for adapter setup).  The structural guard in
+    # tests/test_extraction_pipeline_guard.py uses the same pattern.
+    ns = SimpleNamespace(
+        extraction_temperature=0.0,
+        extraction_max_tokens=2048,
+        prompts_dir=None,
+        extraction_stt_correction=True,
+        extraction_ha_validation=True,
+        extraction_noise_filter="",
+        extraction_noise_filter_model="claude-sonnet-4-6",
+        extraction_noise_filter_endpoint=None,
+        extraction_ner_check=False,
+        extraction_ner_model="en_core_web_sm",
+        extraction_plausibility_judge="auto",
+        extraction_plausibility_stage="deanon",
+        extraction_verify_anonymization=True,
+        extraction_role_aware_grounding="off",
+        extraction_pii_scope={"person", "place", "organization"},
+        save_cycle_snapshots=False,
+        snapshot_dir=None,
+    )
+
+    # Loop-level default propagates when no override is given.
+    kwargs = ConsolidationLoop._extraction_kwargs(ns)
+    assert kwargs["pii_scope"] == {"person", "place", "organization"}
+
+    # Per-call override wins over the loop-level default.
+    overridden = ConsolidationLoop._extraction_kwargs(ns, pii_scope={"person"})
+    assert overridden["pii_scope"] == {"person"}
+
+    # None at the loop level is honoured (callers downstream interpret
+    # this as "use the primitive default").  Distinct from set().
+    ns.extraction_pii_scope = None
+    kwargs = ConsolidationLoop._extraction_kwargs(ns)
+    assert kwargs["pii_scope"] is None
+
+
 def test_cloud_egress_default_is_subset_of_primitive_default():
     """Cloud-egress default must be no wider than the primitive default.
 
