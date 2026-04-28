@@ -70,14 +70,20 @@ def _write_keyed_pairs(path: Path, pairs: list[dict]) -> None:
 def _simulate_config(tmp_path: Path):
     """Return a ``ServerConfig`` with simulate mode and tmp_path stores.
 
-    Loads ``configs/server.yaml`` as the base config, then overrides:
+    Loads ``tests/fixtures/server.yaml`` (the CI test fixture), then
+    overrides:
 
     * ``consolidation.mode`` → ``"simulate"``
     * ``paths.simulate``      → ``tmp_path / "simulate"``
     * ``paths.data``          → ``tmp_path / "data"``  (drives ``paths.adapters``)
 
-    All other fields inherit from the YAML so the sanitizer, abstention,
-    and voice configs are real.
+    All other fields inherit from the fixture so the sanitizer,
+    abstention, and voice configs are real but stable across machines.
+
+    Per CLAUDE.md: tests must use the fixture, not ``configs/server.yaml``
+    (operator-local, gitignored, drifts per machine) or
+    ``configs/server.yaml.example`` (deployment-shape, drifts as
+    deployment patterns evolve).
 
     Args:
         tmp_path: pytest ``tmp_path`` fixture value — unique per test.
@@ -85,7 +91,7 @@ def _simulate_config(tmp_path: Path):
     Returns:
         A ``ServerConfig`` configured for simulate-mode inference.
     """
-    config = load_server_config("configs/server.yaml")
+    config = load_server_config("tests/fixtures/server.yaml")
     config.consolidation.mode = "simulate"
     config.paths = PathsConfig(
         data=tmp_path / "data",
@@ -295,6 +301,13 @@ class TestSimulateInferenceEndToEnd:
         breaks this test.
         """
         config = _simulate_config(tmp_path)
+        # The privacy invariant tested here ("PERSONAL never reaches
+        # SOTA via direct escalation") only holds under cloud_mode=block
+        # — under cloud_mode=anonymize PERSONAL queries DO reach SOTA
+        # via the anonymization+deanonymization round-trip.  Pin
+        # cloud_mode here so the test's stated invariant is the one
+        # being asserted, regardless of the deployed default.
+        config.sanitization.cloud_mode = "block"
         # Create the simulate_dir but write no keyed_pairs.json.
         config.simulate_dir.mkdir(parents=True, exist_ok=True)
 
