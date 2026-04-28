@@ -457,6 +457,24 @@ class ConsolidationScheduleConfig:
     retain_sessions: bool = True
     indexed_key_replay: bool = True  # indexed key training mechanism
     decay_window: int = 10  # cycles before unreinforced keys decay
+    # Maximum LoRA training epochs per consolidation cycle. None = use the
+    # validated 30 from VALIDATED_TRAINING_CONFIG (the Test 1-8 campaign
+    # floor for 100% indexed-key recall on the validated models).
+    #
+    # Override semantics: ceiling, not target. Once the recall-driven
+    # early-stop callback (project_recall_early_stop_design.md) ships,
+    # training will terminate at the recall plateau; this field caps the
+    # upper bound. Until then, training runs the full configured count.
+    #
+    # Operator guidance: do NOT lower below 30 in production without an
+    # empirical recall-vs-epochs validation on your specific base model.
+    # The 30-epoch value was anchored on Mistral 7B; future base models
+    # may converge sooner. Lower this only with evidence.
+    #
+    # Development harnesses (e.g. scripts/dev/e2e_artifact_smoke.py) may
+    # set this to a small value to skip the full validated budget when
+    # testing layout/encryption invariants rather than recall quality.
+    max_epochs: int | None = None
     extraction_max_tokens: int = 2048  # max output tokens for graph extraction
     extraction_stt_correction: bool = True  # correct STT errors from assistant responses
     extraction_ha_validation: bool = True  # validate locations against HA home context
@@ -826,12 +844,22 @@ class ServerConfig:
 
     @property
     def training_config(self) -> TrainingConfig:
-        """Validated training config from test campaign."""
+        """Validated training config from test campaign.
+
+        ``num_epochs`` honours ``consolidation.max_epochs`` when set,
+        otherwise falls back to the validated default. The override is
+        a ceiling — once recall-driven early-stop ships, training will
+        terminate at the recall plateau bounded by this value.
+        """
         return TrainingConfig(
             batch_size=VALIDATED_TRAINING_CONFIG.batch_size,
             gradient_accumulation_steps=VALIDATED_TRAINING_CONFIG.gradient_accumulation_steps,
             max_seq_length=VALIDATED_TRAINING_CONFIG.max_seq_length,
-            num_epochs=VALIDATED_TRAINING_CONFIG.num_epochs,
+            num_epochs=(
+                self.consolidation.max_epochs
+                if self.consolidation.max_epochs is not None
+                else VALIDATED_TRAINING_CONFIG.num_epochs
+            ),
             warmup_ratio=VALIDATED_TRAINING_CONFIG.warmup_ratio,
             weight_decay=VALIDATED_TRAINING_CONFIG.weight_decay,
             gradient_checkpointing=VALIDATED_TRAINING_CONFIG.gradient_checkpointing,

@@ -176,6 +176,13 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
+  # max_epochs: ceiling for LoRA training epochs per consolidation cycle.
+  # Unset (or null) → use the validated 30-epoch default from the Test 1-8
+  # campaign. Lower this only with empirical recall-vs-epochs evidence on
+  # your specific base model — 30 was validated on Mistral 7B and may be
+  # overkill on future base models. Once recall-driven early-stop ships,
+  # this becomes the upper bound; until then it is the fixed budget.
+  # max_epochs: null
   extraction_max_tokens: 2048  # max output tokens for graph extraction
   extraction_stt_correction: true  # correct STT errors from assistant responses
   extraction_ha_validation: true  # validate locations against HA home context

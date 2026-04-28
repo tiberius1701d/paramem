@@ -205,3 +205,50 @@ class TestPathsConfigNoneGuard:
         cfg = PathsConfig(data=None)
         with pytest.raises(ValueError, match="paths.data must be set"):
             _ = cfg.registry_dir
+
+
+class TestConsolidationMaxEpochsOverride:
+    """consolidation.max_epochs (added 2026-04-28) is read from YAML and
+    flows through ServerConfig.training_config.
+
+    Default is None → training_config.num_epochs == VALIDATED_TRAINING_CONFIG
+    .num_epochs (30 from the Test 1-8 campaign). When set, it overrides.
+    """
+
+    def test_max_epochs_default_none_uses_validated(self, tmp_path):
+        """Absent max_epochs → property returns the validated 30."""
+        from paramem.server.config import VALIDATED_TRAINING_CONFIG
+
+        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
+        config = load_server_config(yaml_file)
+        assert config.consolidation.max_epochs is None
+        assert config.training_config.num_epochs == VALIDATED_TRAINING_CONFIG.num_epochs
+
+    def test_max_epochs_yaml_override_flows_to_training_config(self, tmp_path):
+        """consolidation.max_epochs: 2 → training_config.num_epochs == 2."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              max_epochs: 2
+            """,
+        )
+        config = load_server_config(yaml_file)
+        assert config.consolidation.max_epochs == 2
+        assert config.training_config.num_epochs == 2
+
+    def test_max_epochs_runtime_override_flows_to_training_config(self, tmp_path):
+        """Setting consolidation.max_epochs at runtime flows through the property.
+
+        The property re-reads max_epochs each time (no stale cache),
+        so a mutation after load takes effect on the next read.
+        """
+        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
+        config = load_server_config(yaml_file)
+        # Default
+        assert config.consolidation.max_epochs is None
+        # Mutate
+        config.consolidation.max_epochs = 5
+        # Property honours the new value
+        assert config.training_config.num_epochs == 5
