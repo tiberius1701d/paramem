@@ -54,16 +54,17 @@ pytestmark = [
 
 
 # Empirical baseline calibrated on Mistral 7B Instruct v0.3 with the
-# repair pipeline + NER cross-check + default scope ``[person]``.
-# Threshold set to 0.75 to absorb single transient failure (Mistral 7B
-# non-determinism).  Raise the threshold only when the anonymization
-# prompt is structurally improved (not when the local model is
-# upgraded — a stronger model raising the rate is welcome but raising
-# the threshold without recalibration would silently break this test
-# if the user reverts).  Re-run scripts/dev/calibrate_cloud_anonymizer.py
-# after any change to extractor.py, NER scope, or the anonymization
-# prompt.
-_MATCH_THRESHOLD = 0.75
+# repair pipeline + NER cross-check + default scope ``[person]`` + the
+# adapted (codebase-pattern-aligned) anonymization prompt.  Variance
+# recalibration on 2026-04-29 across 10 iterations × 5 fixtures (50
+# runs) showed 40/40 personal-marker success with zero flakes —
+# Mistral 7B at temperature=0.0 is fully deterministic on this fixture.
+# Threshold raised from 0.75 to 0.80 so the test trips on the very
+# first per-fixture regression (any 1/4 failure) without going to the
+# strict 0.9× empirical recommendation.  Re-run
+# scripts/dev/calibrate_cloud_anonymizer.py after any change to
+# extractor.py, NER scope, or the anonymization prompt.
+_MATCH_THRESHOLD = 0.80
 
 
 # Default scope under which the contract is asserted.  Mirrors the
