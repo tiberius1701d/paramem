@@ -68,6 +68,7 @@ def create_consolidation_loop(
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
         graph_enrichment_interim_enabled=config.consolidation.graph_enrichment_interim_enabled,
         graph_enrichment_min_triples_floor=config.consolidation.graph_enrichment_min_triples_floor,
+        extraction_role_aware_grounding=config.consolidation.extraction_role_aware_grounding,
         state_provider=state_provider,
     )
 
@@ -278,6 +279,7 @@ def run_consolidation(
                 plausibility_judge=config.consolidation.extraction_plausibility_judge,
                 plausibility_stage=config.consolidation.extraction_plausibility_stage,
                 verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                role_aware_grounding=config.consolidation.extraction_role_aware_grounding,
                 source_type=session.get("source_type", "transcript"),
             )
 

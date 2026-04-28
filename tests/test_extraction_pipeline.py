@@ -1060,6 +1060,108 @@ class TestRoleAwareGroundingGate:
         assert kept == facts
 
 
+class TestApplyGroundingGate:
+    """``_apply_grounding_gate`` orchestrates the role-blind / role-aware
+    gate per the configured mode (off / diagnostic / active).
+    """
+
+    @staticmethod
+    def _hallucination():
+        # Object only in [assistant] turn — role-aware would drop, role-blind keeps.
+        return [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
+
+    @staticmethod
+    def _transcript():
+        return "[user] suggest a hobby for me\n[assistant] yoga is great for stress"
+
+    def test_off_mode_role_blind(self):
+        from paramem.graph.extractor import _apply_grounding_gate
+
+        kept, dropped, would_drop = _apply_grounding_gate(
+            self._hallucination(),
+            self._transcript(),
+            {"Alex"},
+            speaker_name="Alex",
+            mode="off",
+        )
+        assert kept == self._hallucination()  # role-blind passes it
+        assert dropped == []
+        assert would_drop == []
+
+    def test_diagnostic_mode_passes_facts_but_records_would_drops(self):
+        from paramem.graph.extractor import _apply_grounding_gate
+
+        kept, dropped, would_drop = _apply_grounding_gate(
+            self._hallucination(),
+            self._transcript(),
+            {"Alex"},
+            speaker_name="Alex",
+            mode="diagnostic",
+        )
+        # Production behaviour unchanged: fact still kept.
+        assert kept == self._hallucination()
+        assert dropped == []
+        # But the role-aware gate would have dropped it — recorded.
+        assert would_drop == self._hallucination()
+
+    def test_active_mode_drops_role_aware_failures(self):
+        from paramem.graph.extractor import _apply_grounding_gate
+
+        kept, dropped, would_drop = _apply_grounding_gate(
+            self._hallucination(),
+            self._transcript(),
+            {"Alex"},
+            speaker_name="Alex",
+            mode="active",
+        )
+        assert kept == []
+        assert dropped == self._hallucination()
+        # Active mode does not need to track would_drop — the drop is real.
+        assert would_drop == []
+
+    def test_no_speaker_name_falls_back_to_role_blind(self):
+        from paramem.graph.extractor import _apply_grounding_gate
+
+        # Even in active mode, without a speaker_name there's no [user] anchor.
+        kept, dropped, would_drop = _apply_grounding_gate(
+            self._hallucination(),
+            self._transcript(),
+            {"Alex"},
+            speaker_name=None,
+            mode="active",
+        )
+        assert kept == self._hallucination()  # role-blind kept it
+        assert dropped == []
+        assert would_drop == []
+
+    def test_unknown_mode_warns_and_falls_back_to_off(self):
+        from paramem.graph.extractor import _apply_grounding_gate
+
+        kept, _dropped, would_drop = _apply_grounding_gate(
+            self._hallucination(),
+            self._transcript(),
+            {"Alex"},
+            speaker_name="Alex",
+            mode="hyperactive",  # unknown
+        )
+        # Falls back to off → role-blind result, no would_drop tracking.
+        assert kept == self._hallucination()
+        assert would_drop == []
+
+    def test_diagnostic_mode_with_legitimate_triple_records_nothing(self):
+        """Triples grounded in [user] turns are not flagged in diagnostic mode."""
+        from paramem.graph.extractor import _apply_grounding_gate
+
+        transcript = "[user] i practice yoga every morning"
+        facts = [{"subject": "Alex", "predicate": "practices", "object": "yoga"}]
+        kept, dropped, would_drop = _apply_grounding_gate(
+            facts, transcript, {"Alex"}, speaker_name="Alex", mode="diagnostic"
+        )
+        assert kept == facts
+        assert dropped == []
+        assert would_drop == []
+
+
 class TestProvenanceGateFixture:
     """Integration test against the curated PerLTQA failure fixture.
 
@@ -1554,7 +1656,7 @@ class TestAnonFailureFallback:
 
         fallback_calls = []
 
-        def fake_fallback(g, t, m, tok, reason):
+        def fake_fallback(g, t, m, tok, reason, **_kwargs):
             fallback_calls.append(reason)
             g.relations = []
             g.entities = []
@@ -1609,7 +1711,7 @@ class TestAllDroppedSafetyNet:
 
         fallback_calls = []
 
-        def fake_fallback(g, t, m, tok, reason):
+        def fake_fallback(g, t, m, tok, reason, **_kwargs):
             fallback_calls.append(reason)
             g.diagnostics["fallback_path"] = reason
             return g

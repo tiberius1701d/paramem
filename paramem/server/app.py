@@ -5773,6 +5773,7 @@ def _extract_and_start_training():
                 plausibility_judge=config.consolidation.extraction_plausibility_judge,
                 plausibility_stage=config.consolidation.extraction_plausibility_stage,
                 verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                role_aware_grounding=config.consolidation.extraction_role_aware_grounding,
                 source_type=session.get("source_type", "transcript"),
             )
             _increment_key_sessions(loop, session_id)

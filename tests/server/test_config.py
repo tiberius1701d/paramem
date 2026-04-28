@@ -252,3 +252,65 @@ class TestConsolidationMaxEpochsOverride:
         config.consolidation.max_epochs = 5
         # Property honours the new value
         assert config.training_config.num_epochs == 5
+
+
+class TestRoleAwareGroundingValidator:
+    """``ServerConfig.consolidation.extraction_role_aware_grounding`` validator."""
+
+    def test_default_is_off(self):
+        from paramem.server.config import ServerConfig
+
+        cfg = ServerConfig()
+        assert cfg.consolidation.extraction_role_aware_grounding == "off"
+
+    def test_diagnostic_accepted(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              extraction_role_aware_grounding: diagnostic
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        assert cfg.consolidation.extraction_role_aware_grounding == "diagnostic"
+
+    def test_active_accepted(self, tmp_path):
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              extraction_role_aware_grounding: active
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        assert cfg.consolidation.extraction_role_aware_grounding == "active"
+
+    def test_invalid_value_rejected(self, tmp_path):
+        import pytest
+
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              extraction_role_aware_grounding: aggressive
+            """,
+        )
+        with pytest.raises(ValueError, match="extraction_role_aware_grounding"):
+            load_server_config(yaml_file)
+
+    def test_project_server_yaml_example_loads_cleanly(self):
+        """Shipped configs/server.yaml.example parses without validator errors.
+
+        The shipped template is the canonical reference; the operator-local
+        configs/server.yaml is gitignored (see project_config_yaml_overlap.md
+        for the YAML cleanup arc).
+        """
+        cfg = load_server_config("configs/server.yaml.example")
+        assert cfg.consolidation.extraction_role_aware_grounding in {
+            "off",
+            "diagnostic",
+            "active",
+        }

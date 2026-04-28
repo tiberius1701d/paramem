@@ -162,6 +162,7 @@ class ConsolidationLoop:
         extraction_plausibility_judge: str = "auto",
         extraction_plausibility_stage: str = "deanon",
         extraction_verify_anonymization: bool = True,
+        extraction_role_aware_grounding: str = "off",
         graph_config: Optional[GraphConfig] = None,
         graph_enrichment_enabled: bool = True,
         graph_enrichment_neighborhood_hops: int = 2,
@@ -212,6 +213,7 @@ class ConsolidationLoop:
         self.extraction_ner_model = extraction_ner_model
         self.extraction_plausibility_judge = extraction_plausibility_judge
         self.extraction_plausibility_stage = extraction_plausibility_stage
+        self.extraction_role_aware_grounding = extraction_role_aware_grounding
         self.extraction_verify_anonymization = extraction_verify_anonymization
 
         # Graph-level SOTA enrichment knobs (Task #10).
@@ -504,6 +506,7 @@ class ConsolidationLoop:
             plausibility_judge=pick("plausibility_judge", self.extraction_plausibility_judge),
             plausibility_stage=pick("plausibility_stage", self.extraction_plausibility_stage),
             verify_anonymization=pick("verify_anonymization", self.extraction_verify_anonymization),
+            role_aware_grounding=pick("role_aware_grounding", self.extraction_role_aware_grounding),
             system_prompt_filename=system_prompt_filename,
             user_prompt_filename=user_prompt_filename,
         )
@@ -640,6 +643,7 @@ class ConsolidationLoop:
         plausibility_judge: str | None = None,
         plausibility_stage: str | None = None,
         verify_anonymization: bool | None = None,
+        role_aware_grounding: str | None = None,
         source_type: str = "transcript",
     ) -> tuple[list[dict], list[dict]]:
         """Extract and generate QA pairs from a session without training.
@@ -680,6 +684,7 @@ class ConsolidationLoop:
             plausibility_judge=plausibility_judge,
             plausibility_stage=plausibility_stage,
             verify_anonymization=verify_anonymization,
+            role_aware_grounding=role_aware_grounding,
         )
 
         logger.info(

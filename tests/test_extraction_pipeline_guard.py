@@ -117,6 +117,7 @@ def _extraction_kwargs_namespace():
         extraction_plausibility_judge="auto",
         extraction_plausibility_stage="deanon",
         extraction_verify_anonymization=True,
+        extraction_role_aware_grounding="off",
         # Per-session debug-dump gate read by _dump_session_graph (called
         # from both extraction chokepoints).  Wrappers short-circuit when
         # either attr is falsy, keeping these tests file-system-free.

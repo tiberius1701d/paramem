@@ -458,6 +458,7 @@ def extract_graph(
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
+    role_aware_grounding: str = "off",
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
 ) -> SessionGraph:
@@ -554,6 +555,8 @@ def extract_graph(
             plausibility_judge=plausibility_judge,
             plausibility_stage=plausibility_stage,
             verify_anonymization=verify_anonymization,
+            speaker_name=speaker_name,
+            role_aware_grounding=role_aware_grounding,
         )
 
     return graph
@@ -1078,6 +1081,9 @@ def _fallback_plausibility_on_raw(
     model,
     tokenizer,
     reason: str,
+    *,
+    speaker_name: str | None = None,
+    role_aware_grounding: str = "off",
 ) -> SessionGraph:
     """Fallback pipeline path: run local plausibility + grounding on raw (unanonymized) facts.
 
@@ -1118,13 +1124,21 @@ def _fallback_plausibility_on_raw(
         )
 
     # Step 3: grounding gate with empty known_names (no mapping available)
-    raw_facts, ungrounded = _drop_ungrounded_facts(raw_facts, transcript, set())
+    raw_facts, ungrounded, would_drop = _apply_grounding_gate(
+        raw_facts,
+        transcript,
+        set(),
+        speaker_name=speaker_name,
+        mode=role_aware_grounding,
+    )
     if ungrounded:
         graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
         logger.warning(
             "_fallback_plausibility_on_raw: dropped %d ungrounded fact(s)",
             len(ungrounded),
         )
+    if would_drop:
+        graph.diagnostics["role_aware_would_drop"] = would_drop
 
     # Step 4: local plausibility filter (uses real names)
     if raw_facts and model is not None and tokenizer is not None:
@@ -1188,6 +1202,8 @@ def _sota_pipeline(
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
+    speaker_name: str | None = None,
+    role_aware_grounding: str = "off",
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
@@ -1248,7 +1264,15 @@ def _sota_pipeline(
     if anon_facts is None:
         logger.warning("Anonymization failed — falling back to raw plausibility")
         graph.diagnostics["anonymize"] = "failed"
-        return _fallback_plausibility_on_raw(graph, transcript, model, tokenizer, "anon_failed")
+        return _fallback_plausibility_on_raw(
+            graph,
+            transcript,
+            model,
+            tokenizer,
+            "anon_failed",
+            speaker_name=speaker_name,
+            role_aware_grounding=role_aware_grounding,
+        )
     if not anon_facts:
         logger.info("Anonymization produced 0 facts — skipping SOTA pipeline")
         graph.diagnostics["grounding_gate"] = "no_input"
@@ -1325,7 +1349,13 @@ def _sota_pipeline(
                 )
                 graph.diagnostics["anonymize"] = "leaked_noncanonical"
                 return _fallback_plausibility_on_raw(
-                    graph, transcript, model, tokenizer, "anon_leaked_noncanonical"
+                    graph,
+                    transcript,
+                    model,
+                    tokenizer,
+                    "anon_leaked_noncanonical",
+                    speaker_name=speaker_name,
+                    role_aware_grounding=role_aware_grounding,
                 )
 
     # Step 2: SOTA enrichment — coreference + compound splitting + safe reification.
@@ -1472,7 +1502,13 @@ def _sota_pipeline(
     # transcript that only mentions "Langley") — those entities are dropped because
     # they never existed in the user's actual words.
     known_real_names = set(mapping.keys())
-    deanon_facts, ungrounded = _drop_ungrounded_facts(deanon_facts, transcript, known_real_names)
+    deanon_facts, ungrounded, would_drop = _apply_grounding_gate(
+        deanon_facts,
+        transcript,
+        known_real_names,
+        speaker_name=speaker_name,
+        mode=role_aware_grounding,
+    )
     if ungrounded:
         graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
         logger.warning(
@@ -1480,6 +1516,8 @@ def _sota_pipeline(
             "(likely SOTA world-knowledge inference).",
             len(ungrounded),
         )
+    if would_drop:
+        graph.diagnostics["role_aware_would_drop"] = would_drop
 
     if _sota_raw:
         graph.diagnostics["sota_raw_response"] = _sota_raw
@@ -1555,7 +1593,15 @@ def _sota_pipeline(
             "All %d relation(s) dropped by pipeline — triggering all_dropped fallback",
             original_count,
         )
-        return _fallback_plausibility_on_raw(graph, transcript, model, tokenizer, "all_dropped")
+        return _fallback_plausibility_on_raw(
+            graph,
+            transcript,
+            model,
+            tokenizer,
+            "all_dropped",
+            speaker_name=speaker_name,
+            role_aware_grounding=role_aware_grounding,
+        )
 
     # Rebuild entity list from surviving + new relations.
     # Every relation endpoint must have a corresponding Entity record.
@@ -1757,6 +1803,81 @@ def _entity_is_grounded(entity: str, transcript_norm: str, known_names: set[str]
     # "Munich Airport" against transcript saying only "Munich"). We favour
     # precision (drop plausibly-enriched entities) over recall.
     return all(_contains_whole_word(transcript_norm, t) for t in tokens)
+
+
+_VALID_ROLE_AWARE_MODES = ("off", "diagnostic", "active")
+
+
+def _apply_grounding_gate(
+    facts: list[dict],
+    transcript: str,
+    known_names: set[str],
+    *,
+    speaker_name: str | None = None,
+    mode: str = "off",
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Run the grounding gate per the configured ``role_aware_grounding`` mode.
+
+    Returns ``(kept, dropped, would_drop_role_aware)``:
+
+    * ``kept`` — facts to persist.  In ``off`` and ``diagnostic`` modes
+      this is the role-blind result (today's behaviour).  In ``active``
+      mode this is the role-aware result.
+    * ``dropped`` — facts the gate dropped (always honoured by callers).
+    * ``would_drop_role_aware`` — facts the role-aware gate would
+      *additionally* drop versus the role-blind gate.  Populated only in
+      ``diagnostic`` mode; empty in the other two modes.  Surfaces the
+      structural-defense observability without changing production
+      behaviour.
+
+    ``mode`` accepts ``off`` / ``diagnostic`` / ``active``.  Unknown
+    values fall back to ``off`` with a warning — production paths
+    can't reach that branch because the server config validates the
+    field at construction.
+
+    ``speaker_name`` is required for ``diagnostic`` and ``active`` modes
+    (it identifies whose turns count as ``[user]``).  When ``None`` the
+    gate falls back to role-blind regardless of mode.
+    """
+    if mode not in _VALID_ROLE_AWARE_MODES:
+        logger.warning("Unknown role_aware_grounding mode %r; falling back to 'off'", mode)
+        mode = "off"
+
+    speaker_names = {speaker_name} if speaker_name else None
+    if not speaker_names:
+        # No speaker to anchor [user] spans against.  Behave as today.
+        kept, dropped = _drop_ungrounded_facts(facts, transcript, known_names)
+        return kept, dropped, []
+
+    if mode == "active":
+        kept, dropped = _drop_ungrounded_facts(
+            facts, transcript, known_names, speaker_names=speaker_names
+        )
+        return kept, dropped, []
+
+    # off or diagnostic: production result is the role-blind one.
+    blind_kept, blind_dropped = _drop_ungrounded_facts(facts, transcript, known_names)
+
+    if mode != "diagnostic":
+        return blind_kept, blind_dropped, []
+
+    # Diagnostic: also run role-aware to compute *additional* would-drops.
+    # Identity comparison is safe — _drop_ungrounded_facts doesn't copy facts.
+    _aware_kept, aware_dropped = _drop_ungrounded_facts(
+        facts, transcript, known_names, speaker_names=speaker_names
+    )
+    blind_kept_ids = {id(f) for f in blind_kept}
+    would_drop = [f for f in aware_dropped if id(f) in blind_kept_ids]
+    if would_drop:
+        logger.info(
+            "Role-aware grounding (diagnostic): would drop %d additional fact(s) "
+            "for speaker=%r; kept-by-prod=%d, dropped-by-prod=%d.",
+            len(would_drop),
+            speaker_name,
+            len(blind_kept),
+            len(blind_dropped),
+        )
+    return blind_kept, blind_dropped, would_drop
 
 
 def _drop_ungrounded_facts(
