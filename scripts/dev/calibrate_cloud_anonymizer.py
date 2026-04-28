@@ -64,13 +64,17 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-# Re-use the contract test's fixture as the single source of truth.
+# Re-use the contract test's fixture and threshold as the single source
+# of truth — calibration and CI must agree on the bar they're measuring
+# against, otherwise the calibrator's "currently shipped" line drifts
+# from reality after every threshold bump.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
 try:
-    from test_cloud_anonymizer_contract_gpu import _FIXTURE  # noqa: E402
+    from test_cloud_anonymizer_contract_gpu import _FIXTURE, _MATCH_THRESHOLD  # noqa: E402
 except ImportError as e:
     raise SystemExit(
-        f"could not import _FIXTURE from tests/test_cloud_anonymizer_contract_gpu.py: {e}"
+        f"could not import _FIXTURE / _MATCH_THRESHOLD from "
+        f"tests/test_cloud_anonymizer_contract_gpu.py: {e}"
     )
 
 
@@ -177,7 +181,7 @@ def _print_summary(results: list[QueryResult], total_personal: int) -> tuple[int
         print(
             f"  Recommended _MATCH_THRESHOLD : {recommended:.2f}  (0.9 × measured, floored to 0.05)"
         )
-        print("  Currently shipped value      : 0.60")
+        print(f"  Currently shipped value      : {_MATCH_THRESHOLD:.2f}")
     return personal_success, rate
 
 
