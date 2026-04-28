@@ -1,4 +1,18 @@
-"""Configuration loading and validation."""
+"""Configuration loading and validation — archived training-pipeline loader.
+
+This module is the YAML loader for the archived Phase 1-4 research scripts
+under ``archive/experiments/`` and their reference YAML at
+``archive/configs/default.yaml``. All active runtime, server, test, and
+example code was migrated off ``load_config`` during the default.yaml
+retirement arc (2026-04-28); the lint guard
+``tests/test_test_config_loader_usage.py`` enforces this.
+
+The dataclasses defined below (``ParaMemConfig``, ``AdapterConfig``,
+``TrainingConfig``, ``ConsolidationConfig``, etc.) remain importable by
+active code as standalone types — many are reused directly by
+``paramem.server.config``. Only ``load_config`` and the YAML population
+path are archive-only.
+"""
 
 from dataclasses import dataclass, field
 from pathlib import Path

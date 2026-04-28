@@ -314,3 +314,82 @@ class TestRoleAwareGroundingValidator:
             "diagnostic",
             "active",
         }
+
+
+class TestAdaptersFactoryDefaultMerge:
+    """Loader must merge YAML adapter keys onto the slot's factory defaults
+    rather than constructing fresh ``ServerAdapterConfig(**proc)``. The
+    factory default for procedural targets attention + MLP; the
+    dataclass-level default for ``target_modules`` is attention-only.
+
+    Pre-fix bug: a YAML that specified any procedural key (rank, alpha,
+    learning_rate, enabled) WITHOUT specifying target_modules would silently
+    fall back to attention-only — contradicting CLAUDE.md design intent
+    ("behavioral patterns live in feed-forward layers; attention-only
+    would limit procedural learning to routing").
+    """
+
+    def test_procedural_yaml_partial_keys_keep_mlp_targets(self, tmp_path):
+        """Partial procedural YAML must inherit MLP targets from the factory."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              procedural:
+                enabled: true
+                rank: 8
+                alpha: 16
+                learning_rate: 5.0e-5
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        targets = cfg.adapters.procedural.target_modules
+        assert "gate_proj" in targets, f"procedural target_modules lost MLP layers: {targets}"
+        assert "up_proj" in targets
+        assert "down_proj" in targets
+
+    def test_procedural_yaml_full_override_target_modules(self, tmp_path):
+        """Explicit target_modules in YAML must win over the factory default."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              procedural:
+                enabled: true
+                target_modules: ["q_proj", "v_proj"]
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        assert cfg.adapters.procedural.target_modules == ["q_proj", "v_proj"]
+
+    def test_episodic_yaml_partial_keys_keep_attention_targets(self, tmp_path):
+        """Episodic factory default is attention-only; partial YAML must preserve it."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              episodic:
+                enabled: true
+                rank: 16
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        # Episodic factory: attention-only, rank 8. YAML overrides rank to 16.
+        assert cfg.adapters.episodic.target_modules == ["q_proj", "v_proj", "k_proj", "o_proj"]
+        assert cfg.adapters.episodic.rank == 16
+
+    def test_no_adapters_block_uses_factory_defaults(self, tmp_path):
+        """YAML without an adapters block falls through to the full factory defaults."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        # Procedural factory ships MLP-targeting + enabled=False.
+        assert "gate_proj" in cfg.adapters.procedural.target_modules
+        assert cfg.adapters.procedural.enabled is False

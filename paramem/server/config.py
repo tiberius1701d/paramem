@@ -3,7 +3,7 @@
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import yaml
@@ -1052,19 +1052,21 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             setattr(config.paths, path_field, config_dir / p)
 
     # Adapters
+    #
+    # Merge YAML keys onto the factory-default ServerAdaptersConfig (not the
+    # ServerAdapterConfig dataclass defaults). The factories carry slot-
+    # specific defaults that the dataclass alone does not — most importantly
+    # procedural's MLP target_modules. Constructing fresh
+    # ServerAdapterConfig(**proc) instead would silently fall back to
+    # attention-only target_modules whenever YAML omits target_modules but
+    # specifies any other procedural key.
     adapters_raw = raw.get("adapters", {})
     if adapters_raw:
-        ep = adapters_raw.get("episodic", {})
-        sem = adapters_raw.get("semantic", {})
-        proc = adapters_raw.get("procedural", {})
+        factory = ServerAdaptersConfig()
         config.adapters = ServerAdaptersConfig(
-            episodic=ServerAdapterConfig(**ep) if ep else ServerAdapterConfig(),
-            semantic=ServerAdapterConfig(**sem)
-            if sem
-            else ServerAdapterConfig(rank=8, alpha=16, learning_rate=1e-5),
-            procedural=ServerAdapterConfig(**proc)
-            if proc
-            else ServerAdapterConfig(rank=8, alpha=16, learning_rate=5e-5),
+            episodic=replace(factory.episodic, **adapters_raw.get("episodic", {})),
+            semantic=replace(factory.semantic, **adapters_raw.get("semantic", {})),
+            procedural=replace(factory.procedural, **adapters_raw.get("procedural", {})),
         )
 
     # Consolidation — refresh_cadence is the single user-facing scheduling knob.
