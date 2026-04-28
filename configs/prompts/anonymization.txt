@@ -1,13 +1,50 @@
-Anonymize the following extracted personal facts by replacing all identifying information with category-prefixed placeholders.
+Identify all identifying names in the extracted personal facts and replace them with category-prefixed placeholders. Return the anonymized facts and a `real_name → placeholder` mapping.
 
 Replace:
 {replacement_rules}
 
-Keep predicates, relation_type, and confidence unchanged.
-Return the anonymized facts as a JSON array AND a mapping object.
+Rules:
+- Mapping direction is `real_name → placeholder`: real name is the JSON KEY, placeholder is the JSON VALUE.
+- Use the SAME placeholder for every occurrence of a name across the facts.
+- Allocate placeholder indices in order of first appearance (Person_1 before Person_2, City_1 before City_2, etc.).
+- Keep `predicate`, `relation_type`, and `confidence` of every fact unchanged.
+- The transcript at the bottom is CONTEXT — it helps you tell identifying names from common nouns. Do NOT echo, paraphrase, or rewrite the transcript in your output. Only the facts and the mapping appear in your output.
+- Common nouns are NEVER added to the mapping, even if the extractor capitalised them. "Dog", "Partner", "Friend", "Assistant", "User" are common nouns. "Rex", "Alice", "Berlin", "Acme Corp" are identifying names.
+
+POSITIVE example — facts: [{{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", "relation_type": "factual", "confidence": 1.0}}]
+Transcript: "[user] My friend Alice lives in Berlin. [assistant] Got it."
+Output:
+{{"anonymized": [{{"subject": "Person_1", "predicate": "lives_in", "object": "City_1", "relation_type": "factual", "confidence": 1.0}}],
+  "mapping": {{"Alice": "Person_1", "Berlin": "City_1"}}}}
+
+POSITIVE example — facts: [{{"subject": "Pat", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}]
+Transcript: "[user] My partner Pat noticed our dog was sick last week."
+Output:
+{{"anonymized": [{{"subject": "Person_1", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}],
+  "mapping": {{"Pat": "Person_1"}}}}
+
+Note: "Dog" appears in the input facts, but the transcript context ("our dog") makes clear it is a common noun, not a name. Pat is anonymized; "Dog" stays verbatim.
+
+POSITIVE example — facts: [{{"subject": "Charlie", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}]
+Transcript: "[user] I work at Siemens in the R&D group."
+Output:
+{{"anonymized": [{{"subject": "Person_1", "predicate": "works_at", "object": "Org_1", "relation_type": "factual", "confidence": 1.0}}],
+  "mapping": {{"Charlie": "Person_1", "Siemens": "Org_1"}}}}
+
+NEGATIVE example — mapping direction reversed:
+WRONG: {{"mapping": {{"Person_1": "Alice", "City_1": "Berlin"}}}}
+RIGHT: {{"mapping": {{"Alice": "Person_1", "Berlin": "City_1"}}}}
+The real name is the KEY; the placeholder is the VALUE.
+
+NEGATIVE example — common noun anonymized:
+Given facts where a fact object is "Dog" but the transcript clearly says "my dog":
+WRONG: {{"mapping": {{"Dog": "Thing_1"}}}}
+"dog" is a common noun, not an identifying name. Do NOT add it to the mapping. The fact subject/object stays as "Dog" verbatim.
 
 Facts to anonymize:
 {facts_json}
 
-Return JSON in this exact format:
-{{"anonymized": [...], "mapping": {{"Person_1": "original_name", ...}}}}
+Conversation transcript (context only — do not echo or rewrite):
+{transcript}
+
+Return JSON only with exactly the keys `anonymized` and `mapping`. No prose, no markdown, no extra keys.
