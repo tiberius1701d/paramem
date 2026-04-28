@@ -1,0 +1,588 @@
+# ============================================================================
+# TEST FIXTURE — load with load_server_config("tests/fixtures/server.yaml")
+# ============================================================================
+# This is the canonical server config for GPU / integration / contract tests.
+# It mirrors configs/server.yaml.example option-for-option (parity-asserted in
+# tests/server/test_config_parity.py) but pins values for deterministic test
+# runs:
+#
+#   * model: mistral
+#     - Mistral 7B is the validated production model. All contract-test
+#       thresholds are calibrated against it. DO NOT change without
+#       re-running every threshold-bearing test under --gpu.
+#
+#   * services that need network or external models: enabled: false
+#     - SOTA agents, HA tools, speaker (pyannote), STT, TTS — all off so
+#       tests run without API keys, model downloads, or daemons.
+#
+#   * ports: shifted by 10000 (8420 -> 18420, 10300 -> 19300, 10301 -> 19301)
+#     - Lets the test fixture coexist with a live server during development.
+#
+# When you need different values for a specific test, override at construction
+# time (cfg.consolidation.mode = "simulate") rather than editing this file.
+# Editing this file ripples to every test that loads it.
+#
+# Lint guard: tests/test_test_config_loader_usage.py forbids tests from
+# loading configs/server.yaml.example as their model fixture (it drifts).
+# ============================================================================
+#
+# Original operator-facing comments below this line. Update them in
+# configs/server.yaml.example first; sync key changes here via the parity
+# test.
+# ============================================================================
+
+# ============================================================================
+# CLOUD-ONLY INFERENCE — PRIVACY OPT-OUT
+# ============================================================================
+# When true, ParaMem routes EVERY query to the configured SOTA cloud agent
+# instead of the local parametric-memory model.
+#
+# SECURITY IMPLICATIONS
+# - Personal knowledge (conversations, preferences, relationships, schedules,
+#   health, finances) is transmitted to a third-party model provider and
+#   subject to their retention, logging, and training policies.
+# - Once sent, data cannot be recalled. Providers may retain prompts for
+#   abuse monitoring even when opt-out flags are set.
+# - This setting OVERRIDES ParaMem's primary privacy guarantee for
+#   conversation content — no local redaction layer intervenes.
+#
+# SCOPE
+# - Routing only. Local extraction and consolidation continue to run against
+#   captured transcripts, so the local memory stays warm if the user
+#   toggles this flag back off in the future.
+#
+# QUALITY CONSIDERATIONS (self-bias risk)
+# - If your extraction pipeline uses the SAME cloud model/provider that will
+#   answer inference queries, the LLM-judge stages (noise_filter,
+#   plausibility, ner_check, anonymization verify, STT correction) become
+#   "model-as-judge-for-itself": the judge rates its own outputs, confirming
+#   its own biases and systematically over- or under-filtering certain
+#   fact classes. Expected quality degradation.
+# - Mitigation: disable the LLM-judge stages (`extraction.*` toggles below)
+#   OR route them to a different provider than the inference agent.
+#
+# Default is false. Change to true ONLY if you have explicitly decided to
+# trust the configured SOTA provider with your household's personal data.
+# Takes precedence over the `--cloud-only` CLI flag.
+# ============================================================================
+cloud_only: false
+
+# ============================================================================
+# HEADLESS BOOT — AUTO-START WITHOUT USER LOGIN
+# ============================================================================
+# When true, the server reconciles two OS-level settings on every startup so
+# the ParaMem stack comes up after a full machine reboot without any user
+# login:
+#
+#   1. systemd user linger    — `loginctl enable-linger $USER`
+#      Makes the user's systemd manager (and therefore paramem-server.service)
+#      start at boot instead of at first login. Requires sudo.
+#
+#   2. Windows scheduled task — `ParaMem-Start-WSL-Boot` (WSL hosts only)
+#      Runs `wsl.exe -d <distro> -u <user> --exec /bin/true` at Windows
+#      startup to trigger the WSL2 VM before any interactive Windows login.
+#      Runs as SYSTEM — requires a one-time UAC approval when created.
+#
+# Reconciliation happens in `scripts/setup/headless-boot.sh`, invoked by
+# `scripts/server/start-server.sh` right after the port-forward step. The
+# script compares desired state (this flag) to current state and applies or
+# reverses as needed. It is non-fatal: if elevation (sudo / UAC) is not
+# available in the current context, it WARNs with the exact command to run
+# and lets the server start anyway.
+#
+# Caveats
+# - Initial transition requires an interactive session (TTY for sudo, Windows
+#   desktop for UAC). Edit this flag, then run `bash
+#   scripts/server/start-server.sh` or `bash scripts/setup/headless-boot.sh`
+#   once from a terminal to apply.
+# - On non-WSL hosts only the linger half is reconciled — step 2 is skipped.
+# - Flipping this flag back to false reverses both steps on the next startup.
+# ============================================================================
+headless_boot: false
+
+server:
+  host: "0.0.0.0"
+  port: 18420                   # +10000 vs production (8420) so a test instance can coexist with a live server
+  reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
+  vram_safety_margin_mb: 200   # free VRAM to keep after loading all GPU components
+
+model: mistral  # mistral | gemma | qwen3b | gemma4
+
+debug: false  # ship-safe default — true writes plaintext fact copies to data/ha/sessions/*.jsonl
+              # and data/ha/debug/cycle_*/ on every consolidation. Flip true ONLY when actively
+              # debugging a deployment (see SECURITY.md §debug carve-outs).
+
+# --- Paths (mount points) ---
+paths:
+  data: data/ha                 # persistent artifacts (adapters, registry, key_metadata)
+  sessions: data/ha/sessions    # conversation transcripts pending consolidation
+  simulate: data/ha/simulate    # encrypted JSON-store outputs when consolidation.mode = simulate
+  debug: data/ha/debug          # cycle snapshots, diagnostic output (only when debug=true)
+  prompts: configs/prompts      # extraction and voice prompt templates
+
+adapters:
+  episodic:
+    enabled: true
+    rank: 8
+    alpha: 16
+    learning_rate: 1.0e-4
+  semantic:
+    enabled: true
+    rank: 8
+    alpha: 16
+    learning_rate: 1.0e-5
+  procedural:
+    enabled: true       # behavioral patterns, routines, preferences (F5.6)
+    rank: 8
+    alpha: 16
+    learning_rate: 5.0e-5
+    # MLP targeting is load-bearing: behavioral patterns (style, formatting,
+    # preferences) live in feed-forward layers. Attention-only would limit
+    # procedural learning to routing, not representational change. Must be
+    # spelled out explicitly — the YAML loader's dataclass-default path does
+    # NOT pick up the attention+MLP factory default when other adapter fields
+    # are present.
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# ============================================================================
+# CONSOLIDATION — MEMORY TIER LIFECYCLE
+# ============================================================================
+# ParaMem has two memory tiers:
+#   * Main adapters (episodic / semantic / procedural) — long-term
+#     consolidated knowledge, refreshed on the full consolidation cycle.
+#   * Interim adapters (episodic_interim_YYYYMMDDTHHMM) — short-lived
+#     per-window buckets that absorb new facts between full consolidations
+#     so recall is possible without waiting a full cycle.
+#
+# THE ONLY SCHEDULING KNOB — refresh_cadence
+# - `refresh_cadence` is how often a NEW interim adapter is minted (the
+#   interim tick interval). Grammar: "every Nh" / "every Nm" / "HH:MM"
+#   (daily) / "daily" / "" (manual only, no timer).
+# - The FULL consolidation period is DERIVED, not configured:
+#       full_cycle = refresh_cadence × max_interim_count
+#   Example (default): refresh_cadence="12h", max_interim_count=7
+#       → full consolidation every 84h (3.5 days), with at most 7
+#         concurrent interim adapters before the cycle fires.
+# - At each interim tick a new adapter episodic_interim_<stamp> is created
+#   (activity-gated) and trained. No rolling eviction — adapters accumulate
+#   until the full cycle, which collapses them into the mains via replay
+#   and deletes them. Cycle latency can distribute over time via
+#   BackgroundTrainer's pause/resume — it yields to inference and resumes
+#   when idle.
+#
+# INTERIM ADAPTER CAP — max_interim_count
+# - HARD CAP on concurrent interim adapters resident in VRAM.
+# - If extraction arrives after the cap is reached (full cycle late or
+#   skipped), the NEWEST interim adapter keeps absorbing new facts via a
+#   full 30-epoch retrain on (original indexed keys ∪ new QA). No rolling
+#   eviction of older adapters — that would silently discard temporal
+#   ordering. The adapter grows until the recall sanity check fails, at
+#   which point the snapshot is restored and that adapter is marked
+#   degenerated (no further learning until next full consolidation).
+# - Startup VRAM validator refuses to start if base + main adapters +
+#   max_interim_count + staging + KV cache exceeds the configured GPU
+#   budget.
+#
+# ACTIVITY GATING
+# - At each interim tick, if no new session transcripts AND no queued
+#   pending triples since the last tick, the tick is a no-op — no new
+#   adapter is created, no training runs.
+# - After extraction, duplicate triples are filtered by the graph merger
+#   (idempotent on subject/predicate/object); no new knowledge → no training.
+# - Result: adapter VRAM and router probe cost scale with real conversation
+#   volume, not wall clock.
+#
+# RECALL LATENCY — INTENTIONAL
+# - A fact spoken at 14:00 under refresh_cadence="12h" may not be recallable
+#   from parametric memory until the next tick boundary. In-conversation
+#   context still carries the fact via the conversation buffer;
+#   cross-conversation recall inside the refresh window falls back to the
+#   pending-queue or SOTA path.
+# - Rationale: if the user immediately consumes the answer, they rarely ask
+#   again within the refresh window. Facts that matter ("my daughter's play
+#   is tomorrow", "I prefer jazz at dinner") are either already in
+#   conversation context or benefit from consolidating over multiple
+#   exposures. Shorten refresh_cadence only after confirming the startup
+#   validator still passes for your GPU budget.
+#
+# VRAM envelope is proven at startup from
+#   rank × target_modules × (main_count + max_interim_count + 1 staging)
+#   × base_model_size.
+# Server refuses to start if the configured topology exceeds the GPU.
+# ============================================================================
+consolidation:
+  refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
+                               # 12h + max_interim_count=7 → full cycle every 84h (derived).
+  mode: train                  # "train" persists to LoRA weights; "simulate" persists encrypted JSON store under paths.simulate
+  promotion_threshold: 3       # sessions_seen count for key promotion to semantic
+  retain_sessions: true        # archive transcripts after consolidation (false = delete)
+  indexed_key_replay: true     # indexed key training mechanism
+  decay_window: 10             # cycles before unreinforced keys decay
+  # max_epochs: ceiling for LoRA training epochs per consolidation cycle.
+  # Unset (or null) → use the validated 30-epoch default from the Test 1-8
+  # campaign. Lower this only with empirical recall-vs-epochs evidence on
+  # your specific base model — 30 was validated on Mistral 7B and may be
+  # overkill on future base models. Once recall-driven early-stop ships,
+  # this becomes the upper bound; until then it is the fixed budget.
+  # max_epochs: null
+  extraction_max_tokens: 2048  # max output tokens for graph extraction
+  extraction_stt_correction: true  # correct STT errors from assistant responses
+  extraction_ha_validation: true  # validate locations against HA home context
+  extraction_noise_filter: ""  # SOTA provider for noise filtering ("" = disabled, ship default)
+  extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
+  # --- Extraction-pipeline stages (all configurable) ---
+  #
+  # Plausibility filter — final quality gate on extracted facts.
+  #
+  # Recommended default: local judge (`auto`) at the `deanon` stage.
+  #   * Zero cloud cost. Privacy-safe (real names stay local).
+  #   * Cross-family by construction (local model != cloud enricher).
+  #
+  # Alternative: SOTA judge at the `anon` stage (e.g. `claude`).
+  #   * Higher judgment quality. Paid.
+  #   * Runs on anonymized facts + anonymized transcript — cloud-safe.
+  #   * IMPORTANT: pick a family DIFFERENT from the enricher to avoid
+  #     same-family bias. Enricher=Claude -> judge with a non-Anthropic
+  #     provider (or stay local).
+  #
+  # `auto` => use the same local model that performed extraction.
+  # `off`  => disable plausibility entirely (not recommended).
+  extraction_plausibility_judge: auto
+  extraction_plausibility_stage: deanon         # "anon" | "deanon"
+
+  extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
+  extraction_ner_check: false                   # optional spaCy PII cross-check
+  extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
+  # Role-aware grounding gate (assistant-into-graph defense). When the
+  # speaker is the subject of a triple, require the object's substantive
+  # tokens to ground in the speaker's own [user] turns, not in [assistant]
+  # turns. Closes the cascade: confabulated answer → extracted as fact →
+  # trained into adapter weights.
+  #   "off"        — role-blind grounding (ship default, backward-compatible)
+  #   "diagnostic" — log triples the gate WOULD drop, drop nothing
+  #                  (use to measure false-positive rate on your corpus)
+  #   "active"     — gate drops triples that fail role checking
+  extraction_role_aware_grounding: "off"   # quoted: bare off/on parse as YAML 1.1 booleans
+  # Max concurrent interim adapters in VRAM. Together with refresh_cadence
+  # this determines the derived full-consolidation period:
+  #     full_cycle = refresh_cadence × max_interim_count
+  # Default 7 + "12h" refresh → 84h full cycle. Validated at startup —
+  # server refuses to start if base + mains + this + staging + KV exceeds
+  # the configured GPU budget. Raise only after re-running the validator.
+  max_interim_count: 7
+  # Post-session (inline) training: extract and train facts immediately after
+  # each assistant response.  Default is false — facts accumulate via the
+  # scheduled consolidation cycle instead, which is lower-overhead and avoids
+  # continuous GPU use during conversations.  Set to true only if you need
+  # sub-cycle recall latency and your GPU budget allows continuous training.
+  # Missed triggers (server crash between session end and training start) are
+  # recovered automatically at the next startup via post_session_queue.json.
+  post_session_train_enabled: false
+  # Thermal throttle: keeps the machine silent during background training.
+  # Training pauses when GPU temp exceeds the limit and resumes when it cools.
+  # Set to 0 to disable. Adjust to match your fan ramp-up threshold.
+  training_temp_limit: 55      # GPU temp ceiling in °C (0 = disabled)
+  training_temp_check_interval: 5  # check GPU temp every N training steps
+  # Quiet-hours policy — schedules *when* the thermal throttle above applies.
+  # Two realistic deployment shapes:
+  #   * Server-room host (rack, cellar PC, NAS) — nobody listens, just set
+  #     `quiet_hours_mode: always_off` and let fans spin 24/7.
+  #   * Daytime-used laptop/PC (work, study, shared living space) — silent at
+  #     the desk during the day, free to spin overnight. Default below.
+  #   "always_on"  — throttle 24/7
+  #   "always_off" — throttle never (server rack, cellar)
+  #   "auto"       — throttle only inside [start, end] (wraps past midnight)
+  quiet_hours_mode: auto
+  quiet_hours_start: "07:00"
+  quiet_hours_end: "22:00"
+  entity_similarity_threshold: 85.0        # rapidfuzz token_sort_ratio minimum (0-100)
+  # --- Graph-level SOTA enrichment (Task #10) ---
+  # Post-merge enrichment pass over the cumulative knowledge graph at every full
+  # consolidation. Captures cross-transcript second-order relations and resolves
+  # entity coreference (same_as pairs) that per-transcript enrichment cannot see.
+  # Reuses the extraction_noise_filter SOTA credentials — no new provider config.
+  graph_enrichment_enabled: false             # ship default — uses SOTA, needs an API key
+  graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
+  graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
+  # Mini-enrichment at interim-adapter rollover (sub-interval boundary,
+  # default 12h). Amortises the 84h enrichment cost across the cycle.
+  # Fires only when enough new triples have accumulated since the last pass.
+  graph_enrichment_interim_enabled: false    # ship default — companion to graph_enrichment_enabled
+  graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
+
+# --- Agents ---
+# PA (local model) handles personal knowledge. HA agent handles tool use.
+# SOTA is the fallback for general reasoning when HA cannot answer.
+#
+# All cloud agents ship disabled. To enable, set the relevant API key env var
+# (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY) and flip enabled: true.
+# The ${VAR} placeholders below document the surface; they are resolved at
+# load time.
+agents:
+  sota:
+    enabled: false
+    provider: anthropic
+    model: claude-sonnet-4-6
+    api_key: ${ANTHROPIC_API_KEY}
+    endpoint: ""
+  sota_providers:
+    anthropic:
+      enabled: false
+      provider: anthropic
+      model: claude-sonnet-4-6
+      api_key: ${ANTHROPIC_API_KEY}
+    openai:
+      enabled: false
+      provider: openai
+      model: gpt-4o-search-preview
+      api_key: ${OPENAI_API_KEY}
+    google:
+      enabled: false
+      provider: google
+      model: gemini-2.5-flash
+      api_key: ${GOOGLE_API_KEY}
+  ha_agent_id: ""  # set to e.g. "conversation.groq" once HA token configured
+
+# --- Tools ---
+tools:
+  ha:
+    url: ${HA_URL}                # e.g. http://homeassistant.local:8123
+    token: ${HA_TOKEN}
+    auto_discover: true
+    supported_languages: [en, de, fr, es]  # languages HA conversation agent accepts
+    allowlist:
+      - light.*
+      - switch.*
+      - script.*
+      - climate.*
+      - media_player.*
+  tool_timeout_seconds: 10.0
+
+# ============================================================================
+# SANITIZATION & CLOUD EGRESS POLICY
+# ============================================================================
+# Two layered knobs control what happens to cloud-bound text:
+#
+#   `mode`        — sanitizer detection layer
+#                     off    : no PII detection, queries flow through unchanged
+#                     warn   : log findings, queries flow through unchanged
+#                     block  : null-return personal-marker queries, suppressing
+#                              the cloud call at the first checkpoint
+#
+#   `cloud_mode`  — egress policy for direct SOTA escalation
+#                     block      : PERSONAL queries dropped before SOTA;
+#                                  non-PERSONAL sent verbatim. Phase 2 default,
+#                                  zero anonymizer cost, smallest cloud surface.
+#                     anonymize  : ALL cloud-bound text is anonymized via the
+#                                  local LLM, sent to SOTA as placeholders, and
+#                                  de-anonymized on the way back. PERSONAL
+#                                  queries reach cloud as redacted text.
+#                     both       : strictest privacy posture — PERSONAL is
+#                                  blocked AND non-PERSONAL is anonymized.
+#                                  Cloud only ever sees non-personal text, and
+#                                  even that is placeholder-substituted.
+#
+# Per-query safety: in any anonymizing mode, if the leak guard detects a real
+# name surviving anonymization, that single query falls back to block (config
+# stays put for the next query).
+#
+# HA path (HA conversation agent) is NOT affected by `cloud_mode`. HA receives
+# cleartext, gated by intent classification. Hardening the HA hop is a planned
+# follow-up package.
+#
+# SOTA reachability is independent: with `agents.sota.enabled: false` (or no
+# api_key), no queries reach SOTA regardless of `cloud_mode`.
+sanitization:
+  mode: block        # off | warn | block — PII detection layer
+  cloud_mode: block  # block | anonymize | both — direct-SOTA egress policy (ship-safe default)
+
+# ============================================================================
+# ABSTENTION — LAST-RESORT CONFABULATION GUARD
+# ============================================================================
+# When all of the following hold simultaneously:
+#   * no local parametric-memory match (adapter has no relevant fact)
+#   * no Home Assistant entity match
+#   * the sanitizer blocked cloud escalation (query is self-referential /
+#     personal — e.g. "Where do I live?", "What's my birthday?")
+# ...the server would otherwise fall through to the bare base model with no
+# context. That path confabulates confident personal data (observed:
+# untrained adapter + "Where do I live?" → "New York City").
+#
+# When enabled, the server returns `response` verbatim instead of invoking
+# the base model. Deterministic, zero hallucination risk on the last-resort
+# branch.
+#
+# Prompt-only abstention at 7B-9B is unreliable (AbstentionBench, NeurIPS
+# 2025) — a deterministic short-circuit is the only fix that does not leak
+# confabulated personal data on the sanitizer-blocked path. Disable only if
+# a downstream layer handles the empty-knowledge case without confabulation.
+# ============================================================================
+abstention:
+  enabled: true
+  # Messages live in dedicated prompt files so they can be tuned without
+  # code changes — same pattern as voice.prompt_file. The *_override
+  # fields take precedence when set; an empty override falls back to the
+  # file, and a missing file falls back to a module-level constant in
+  # paramem/server/config.py.
+  response_file: configs/prompts/abstention_response.txt
+  cold_start_response_file: configs/prompts/abstention_cold_start.txt
+  # response_override: "..."             # uncomment to pin inline
+  # cold_start_response_override: "..."  # uncomment to pin inline
+
+# Intent classifier — residual classifier for routing decisions.  State
+# signals (graph match, HA match) decide cleanly when present; the
+# encoder-backed cosine router resolves the residual.  Every knob is an
+# operator-tunable: encoder model, device, exemplars directory,
+# confidence threshold, and the fail-closed default intent.  Whatever
+# encoder/dataset is best today may be outdated tomorrow — operators
+# can swap without code changes.
+intent:
+  enabled: true                                   # local-only; encoder downloads from HF on first use (~250MB)
+  encoder_model: intfloat/multilingual-e5-small  # any sentence-transformers-compatible HF model
+  encoder_device: auto                            # auto | cuda | cpu
+  encoder_dtype: float16                          # float16 | float32
+  encoder_query_prefix: "query: "                 # E5 family requires this; empty for other models
+  exemplars_dir: configs/intents
+  confidence_margin: 0.05                         # min top1-top2 margin; below → fail_closed_intent
+  fail_closed_intent: personal                    # privacy-preserving default on uncertainty
+
+voice:
+  prompt_file: configs/prompts/ha_voice.txt
+  greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)
+
+speaker:
+  enabled: false  # voice-based speaker identification via pyannote (requires pyannote install + HF auth token)
+  high_confidence_threshold: 0.60  # confirmed match (cross-device centroid)
+  low_confidence_threshold: 0.45   # tentative match, no interruption
+  enrollment_prompt: "By the way, I don't think we've met yet. Please introduce yourself with your next request."
+  enrollment_reprompt_interval: 600  # seconds between re-prompting unknown speakers
+  min_embedding_duration_seconds: 1.0  # discard embeddings from utterances shorter than this; pyannote needs sustained voice
+  max_embeddings_per_profile: 50     # cap on stored embeddings per speaker
+  redundancy_threshold: 0.95         # skip enrichment if similarity to centroid exceeds this
+  grouping_threshold_factor: 0.6     # unknown grouping = low_threshold * this factor
+  # store_path: ""                 # default: data/ha/speaker_profiles.json
+
+stt:
+  enabled: false             # local Whisper STT via Wyoming protocol (requires faster-whisper + GPU model download)
+  model: distil-large-v3     # GPU model: distil-large-v3, large-v3, etc.
+  cpu_fallback_model: small  # multilingual CPU model for cloud-only mode (distil-* variants are English-only)
+  device: cuda               # cuda, cpu, auto
+  compute_type: int8         # int8, float16, float32
+  port: 19300                # +9000 vs production (10300) for test isolation
+  language: auto             # "auto" for multilingual detection, or fixed code (e.g. "en")
+  beam_size: 5               # Whisper beam search width (higher = better, slower)
+  vad_filter: true           # voice activity detection (trims silence)
+
+tts:
+  enabled: false             # local TTS via Wyoming protocol (requires Piper / MMS-TTS model downloads)
+  port: 19301                # +9000 vs production (10301) for test isolation
+  device: cuda               # default device; per-voice override possible
+  default_language: en
+  language_confidence_threshold: 0.8  # Whisper detection probability to trust
+  # model_dir: ""            # TTS model storage; default: data/ha/tts
+  voices:
+    en:
+      engine: piper
+      model: en_US-lessac-high
+    de:
+      engine: piper
+      model: de_DE-thorsten-high
+    fr:
+      engine: piper
+      model: fr_FR-siwis-medium
+    es:
+      engine: piper
+      model: es_ES-davefx-medium
+    tl:
+      engine: mms
+      model: facebook/mms-tts-tgl
+      # device: cpu            # per-voice override (default: inherit from tts.device)
+
+# ============================================================================
+# VRAM
+# ============================================================================
+# Process-side memory safety net. Sets
+# torch.cuda.set_per_process_memory_fraction(process_cap_fraction) at server
+# startup so PyTorch raises OutOfMemoryError when allocations would push past
+# the cap, instead of letting the host GPU driver fault. On WSL2 a host-side
+# fault collapses the entire VM; the cap converts that into a clean Python
+# exception that the consolidation guard turns into a per-phase abort.
+#
+# Reserve ~15 % of device VRAM by default (8 GiB → 1.2 GiB headroom for OS
+# and any non-paramem GPU consumer). Lower if other processes share the
+# device; raise cautiously, only after measuring.
+vram:
+  process_cap_fraction: 0.85   # in (0, 1]; rejected at startup otherwise
+
+# ============================================================================
+# SECURITY
+# ============================================================================
+# Two independent areas under `security:`:
+#
+#   1. require_encryption — uniform startup gate.
+#   2. backups            — retention + schedule for backup slots.
+#
+# ----------------------------------------------------------------------------
+# require_encryption
+# ----------------------------------------------------------------------------
+# When true, the server refuses to start unless the daily age identity is
+# loadable (PARAMEM_DAILY_PASSPHRASE set + ~/.config/paramem/daily_key.age
+# present). The gate covers every feature that writes to disk: session
+# snapshots, HF Trainer checkpoint shards, backup artifacts, and
+# infrastructure metadata.
+#
+# Default (false) is AUTO everywhere: encrypt when a key is loaded, plaintext
+# otherwise. Set to true when a misconfig must fail loud instead of
+# silently producing plaintext on disk.
+#
+# ----------------------------------------------------------------------------
+# backups.orphan_sweep
+# ----------------------------------------------------------------------------
+# max_age_hours bounds the look-back window for the migration-trial recovery
+# path that runs at startup. A TRIAL marker older than this is not resumed.
+# Unrelated .pending/ slots from crashed writes are always swept on startup
+# regardless of this value.
+#
+# ----------------------------------------------------------------------------
+# backups.retention
+# ----------------------------------------------------------------------------
+# Per-tier retention budget. Rules apply in this precedence (strongest first):
+#   1. max_total_disk_gb — global cap across all tiers; new backups refused
+#      when reached, DISK PRESSURE alert raised at 80% of cap.
+#   2. per-tier max_disk_gb (e.g. manual) — same behaviour scoped to tier.
+#   3. tier `keep` counts — oldest-within-tier pruned first.
+#   4. pre_migration entries within last 30 days are immune from rule 3.
+#   5. manual entries are immune from time + count pruning, subject to 1+2.
+# Live A-backup slots referenced by state/trial.json are NEVER pruned while
+# TRIAL is active (immunity is unconditional — outranks every rule).
+#
+# ----------------------------------------------------------------------------
+# backups.schedule / backups.artifacts / backups.max_total_disk_gb
+# ----------------------------------------------------------------------------
+# schedule: "daily HH:MM" / "every Nh" / "every Nm" / "off". Same grammar as
+# consolidation.refresh_cadence. "off" disables the scheduled backup timer
+# (manual backups via the CLI still work).
+#
+# artifacts: subset of [config, graph, registry]. Each element becomes a
+# slot directory under data/ha/backups/<artifact>/<ts>/.
+#
+# max_total_disk_gb: global cap. The retention engine enforces rules 2+3+4+5
+# against this; the runner enforces rule 1 (write refusal at 100%).
+#
+# Defaults shown below. Uncomment to override.
+# security:
+#   require_encryption: false
+#   backups:
+#     orphan_sweep:
+#       max_age_hours: 24
+#     retention:
+#       daily:         { keep: 7 }
+#       weekly:        { keep: 4 }
+#       monthly:       { keep: 12 }
+#       yearly:        { keep: 3 }
+#       pre_migration: { keep: 10 }
+#       trial_adapter: { keep: 5 }
+#       manual:        { keep: "unlimited", max_disk_gb: 5 }
+#     schedule: "daily 04:00"
+#     artifacts: [config, graph, registry]
+#     max_total_disk_gb: 20
