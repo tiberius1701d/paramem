@@ -130,6 +130,29 @@ HA_TOKEN=<your-ha-long-lived-token>      # HA → Profile → Long-Lived Access 
 GROQ_API_KEY=<your-groq-api-key>         # groqcloud.com → API Keys
 ```
 
+### Secrets Management
+
+ParaMem never bakes secrets into config files. Every secret-bearing field
+in `configs/server.yaml` is a `${VAR_NAME}` placeholder that the loader
+resolves from the process environment at startup. The *backing store* for
+those env vars is the operator's choice — pick the row that matches the
+deployment posture:
+
+| Backing | Fit | Notes |
+|---|---|---|
+| **`.env` file (gitignored)** | Local development, single-user host | Simplest. Already wired — `python-dotenv` loads it on startup. Plaintext on disk. Path is gitignored at repo root. |
+| **systemd `EnvironmentFile=`** | Headless server (this project's primary deployment) | Standard for daemonized services. Plaintext on disk but root-owned. Set `EnvironmentFile=/etc/paramem/secrets.env` in `~/.config/systemd/user/paramem-server.service`. |
+| **Shell session export** | One-off interactive runs | No persistence, requires re-export. Useful for tests. |
+| **OS keychain (`keyring` Python pkg)** | Multi-user desktop | Encrypted at rest (Keychain / Credential Manager / libsecret). Requires extra dep + a small loader shim — not wired by default. |
+| **age-encrypted file** | Privacy-conscious dev | Strongest local protection. ParaMem already uses age for daily keys (see `SECURITY.md`); the same identity can decrypt a secrets bundle into env at startup. |
+| **HashiCorp Vault / AWS Secrets Manager / 1Password CLI** | Team / regulated production | Heavyweight, audit-logged. Operators wire a wrapper script that exports env vars before launching the server. |
+
+Defense in depth: the smoke test at
+`tests/server/test_server_yaml_example.py::test_no_inline_api_key_literals`
+regex-scans the shipped template for OpenAI/Anthropic/Google/Groq/HuggingFace
+key prefixes — a careless paste of a real key into the tracked file trips
+CI before it can leak.
+
 ### Run the Smoke Test
 
 ```bash
