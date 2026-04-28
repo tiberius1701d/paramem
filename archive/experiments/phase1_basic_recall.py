@@ -8,9 +8,9 @@ This experiment:
 5. Logs results to wandb
 
 Usage:
-    python experiments/phase1_basic_recall.py
-    python experiments/phase1_basic_recall.py --config configs/default.yaml
-    python experiments/phase1_basic_recall.py --no-wandb
+    python archive/experiments/phase1_basic_recall.py
+    python archive/experiments/phase1_basic_recall.py --config archive/configs/default.yaml
+    python archive/experiments/phase1_basic_recall.py --no-wandb
 """
 
 import argparse
@@ -41,7 +41,7 @@ logger = logging.getLogger("phase1")
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Basic LoRA recall")
-    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--config", default="archive/configs/default.yaml")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--num-epochs", type=int, default=None)
     args = parser.parse_args()

@@ -141,7 +141,7 @@ def run_condition(
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 2: Catastrophic forgetting & replay")
-    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--config", default="archive/configs/default.yaml")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument(
         "--num-topics",

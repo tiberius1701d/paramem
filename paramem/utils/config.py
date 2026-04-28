@@ -127,9 +127,16 @@ def _build_dataclass(cls, data: dict):
 def load_config(
     config_path: Optional[str | Path] = None,
 ) -> ParaMemConfig:
-    """Load configuration from a YAML file, falling back to defaults."""
+    """Load configuration from a YAML file, falling back to defaults.
+
+    Archived loader: ``configs/default.yaml`` was retired during the
+    default.yaml retirement arc (2026-04-28). The yaml lives at
+    ``archive/configs/default.yaml`` alongside the archived Phase 1-4
+    research scripts that depend on it. Active code does not call this
+    function -- enforced by ``tests/test_test_config_loader_usage.py``.
+    """
     if config_path is None:
-        config_path = Path(__file__).parent.parent.parent / "configs" / "default.yaml"
+        config_path = Path(__file__).parent.parent.parent / "archive" / "configs" / "default.yaml"
     else:
         config_path = Path(config_path)
 

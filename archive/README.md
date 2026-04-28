@@ -35,14 +35,27 @@ indexed_memory.py design (F4.9).
 
 ---
 
-# Paper v1 Reference Experiments — Qwen 2.5 3B + configs/default.yaml
+# Paper v1 Reference Experiments — Qwen 2.5 3B + archive/configs/default.yaml
 
 The 13 files below were active research scripts that produced Paper v1
 results against Qwen 2.5 3B base via `configs/default.yaml`. Archived
-2026-04-28 as part of the `default.yaml` retirement arc. They remain
-runnable for paper reproducibility (artifact directories under
-`outputs/{phase4_indexed_keys,f4_9c_test*,f4_10_*}/qwen2.5-3b/`) but
-are not part of the active test/experiment harness.
+2026-04-28 as part of the `default.yaml` retirement arc. The yaml
+itself moved alongside them to `archive/configs/default.yaml`; the
+`paramem.utils.config.load_config` loader's default-when-None path
+points at that location, and the archived scripts' `--config` argparse
+defaults were updated to match.
+
+Active test/experiment code does not call `load_config` (enforced by
+`tests/test_test_config_loader_usage.py`); these archived scripts are
+the only consumers. They remain runnable for paper reproducibility:
+
+```
+python archive/experiments/phase4_indexed_keys_smoke.py
+python archive/experiments/phase1_basic_recall.py --config archive/configs/default.yaml
+```
+
+Artifact directories under `outputs/{phase4_indexed_keys,f4_9c_test*,
+f4_10_*}/qwen2.5-3b/` are the canonical reference for paper numbers.
 
 ## experiments/phase1_basic_recall.py
 Phase 1 basic-recall experiment. Earliest Paper v1 driver — single-fact
