@@ -32,17 +32,23 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def model_and_tokenizer():
-    """Load Mistral model once for all GPU tests, unload on teardown."""
+    """Load Mistral 7B once for all GPU integration tests, unload on teardown.
+
+    Uses ``load_server_config("tests/fixtures/server.yaml")`` to pin the
+    calibration target. Test methods that need a different model should
+    not be using this fixture — they should construct their own model
+    explicitly, since this fixture is shared across the file.
+    """
     import gc
 
     import torch
 
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
     from paramem.models.loader import load_base_model
-    from paramem.utils.config import load_config
+    from paramem.server.config import load_server_config
 
-    config = load_config()
-    model, tokenizer = load_base_model(config.model)
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    model, tokenizer = load_base_model(cfg.model_config)
     yield model, tokenizer
 
     # Release GPU memory
@@ -50,13 +56,6 @@ def model_and_tokenizer():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-@pytest.fixture(scope="module")
-def training_config():
-    from paramem.utils.config import load_config
-
-    return load_config()
 
 
 # --- 1. rollback_preparation ---
@@ -286,7 +285,7 @@ class TestTrainingSchedulerBehavior:
 
 
 class TestBackgroundTrainerTraining:
-    def test_train_adapter_with_real_model(self, model_and_tokenizer, training_config, tmp_path):
+    def test_train_adapter_with_real_model(self, model_and_tokenizer, tmp_path):
         """Test BackgroundTrainer can train an adapter on real model."""
         from paramem.models.loader import create_adapter
         from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
@@ -331,7 +330,7 @@ class TestBackgroundTrainerTraining:
         assert completed == [True]
         assert not bt.is_training
 
-    def test_pause_resume(self, model_and_tokenizer, training_config, tmp_path):
+    def test_pause_resume(self, model_and_tokenizer, tmp_path):
         """Test pause/resume during training."""
         from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
         from paramem.training.indexed_memory import assign_keys

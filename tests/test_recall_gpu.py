@@ -66,15 +66,21 @@ class _ListDataset:
 
 @pytest.fixture(scope="module")
 def recall_model_and_tokenizer():
-    """Load Mistral model once for all recall tests, unload on teardown."""
+    """Load Mistral 7B once for all recall tests, unload on teardown.
+
+    Uses ``load_server_config("tests/fixtures/server.yaml")`` to pin the
+    calibration target. The ≥95% recall threshold above was measured
+    against Mistral 7B at 30 epochs on small key sets; loading any other
+    model would silently re-calibrate against an untested baseline.
+    """
     import torch
 
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
     from paramem.models.loader import load_base_model
-    from paramem.utils.config import load_config
+    from paramem.server.config import load_server_config
 
-    config = load_config()
-    model, tokenizer = load_base_model(config.model)
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    model, tokenizer = load_base_model(cfg.model_config)
     yield model, tokenizer
 
     del model

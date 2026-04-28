@@ -47,33 +47,17 @@ EXAMPLE_VERIFY_ALLOWLIST = frozenset(
         # Validates that the shipped example loads under all dataclass
         # validators (role_aware_grounding, sanitization.cloud_mode, etc.).
         "tests/server/test_config.py",
-        # Transition entry: this contract test was partially pivoted from
-        # load_config() to load_server_config(.example) by the parallel agent
-        # mid-arc. Step 3 of the default.yaml retirement arc finishes the
-        # pivot to load_server_config('tests/fixtures/server.yaml'). Remove
-        # this entry as part of that commit.
-        "tests/test_cloud_anonymizer_contract_gpu.py",
     }
 )
 
 # Tests still using paramem.utils.config.load_config(). The default.yaml
 # retirement arc removes entries here as each test pivots to
-# load_server_config("tests/fixtures/server.yaml").
-#
-#   Legitimate: tests/test_config.py meta-tests the loader itself; it stays
-#   here until load_config() retires entirely (Step 7 of the arc).
-#
-#   Transition: the four GPU tests below cargo-culted load_config() but
-#   are calibrated against Mistral 7B per their docstrings. Step 3 of the
-#   arc pivots each to load_server_config("tests/fixtures/server.yaml").
-#   Remove the entry from this list as part of that test's pivot commit.
+# load_server_config("tests/fixtures/server.yaml"). Only the loader's own
+# meta-test remains: tests/test_config.py exercises load_config() directly
+# and stays here until the loader retires entirely (Step 7 of the arc).
 LEGACY_LOAD_CONFIG_ALLOWLIST = frozenset(
     {
         "tests/test_config.py",
-        "tests/test_integration_gpu.py",
-        "tests/test_recall_gpu.py",
-        "tests/test_cloud_anonymizer_contract_gpu.py",
-        "tests/test_plausibility_contract_gpu.py",
     }
 )
 

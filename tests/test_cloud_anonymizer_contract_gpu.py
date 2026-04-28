@@ -42,8 +42,6 @@ scoped fixture loads the local model once.
 
 from __future__ import annotations
 
-import gc
-
 import pytest
 
 pytestmark = [
@@ -153,14 +151,14 @@ _FIXTURE = [
 
 @pytest.fixture(scope="module")
 def loaded_model():
-    """Load the live server model (Mistral 7B by default) once per module.
+    """Load the Mistral 7B local cloud anonymizer judge once per module.
 
-    Uses ``load_server_config('configs/server.yaml.example')`` so the test
-    exercises the SAME model that the deployed cloud anonymizer runs against.
-    The training-side ``load_config()`` defaults to Qwen 2.5 3B (much weaker
-    at structured JSON output for the anonymizer prompt) and would silently
-    test a model the production path never uses.
+    Uses ``load_server_config("tests/fixtures/server.yaml")`` to pin the
+    calibration target. The 60% threshold above is anchored to Mistral
+    7B at temperature 0; loading any other model would silently
+    re-calibrate against an untested baseline.
     """
+    import gc
     import os
 
     import torch
@@ -169,9 +167,8 @@ def loaded_model():
     from paramem.models.loader import load_base_model
     from paramem.server.config import load_server_config
 
-    server_cfg = load_server_config("configs/server.yaml.example")
-    model_cfg = server_cfg.model_config
-    model, tokenizer = load_base_model(model_cfg)
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    model, tokenizer = load_base_model(cfg.model_config)
     yield model, tokenizer
 
     del model

@@ -51,7 +51,13 @@ _MATCH_THRESHOLD = 0.75
 
 @pytest.fixture(scope="module")
 def loaded_model():
-    """Load the local plausibility model once per module."""
+    """Load the Mistral 7B local plausibility judge once per module.
+
+    Uses ``load_server_config("tests/fixtures/server.yaml")`` to pin the
+    calibration target. The 75% threshold above is anchored to Mistral
+    7B at temperature 0; loading any other model would silently
+    re-calibrate against an untested baseline.
+    """
     import gc
     import os
 
@@ -59,10 +65,10 @@ def loaded_model():
 
     os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
     from paramem.models.loader import load_base_model
-    from paramem.utils.config import load_config
+    from paramem.server.config import load_server_config
 
-    config = load_config()
-    model, tokenizer = load_base_model(config.model)
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    model, tokenizer = load_base_model(cfg.model_config)
     yield model, tokenizer
 
     del model
