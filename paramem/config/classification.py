@@ -62,11 +62,6 @@ EXTENSION_FIELDS: frozenset[str] = frozenset(
         # operator pins a string.
         "abstention.response_override",
         "abstention.cold_start_response_override",
-        # Provenance gate (role-aware extension of _drop_ungrounded_facts)
-        # — config field exists, dataclass default is "off"; YAML
-        # description / operator-facing comment lands as part of the
-        # YAML cleanup arc (see project_config_yaml_overlap.md).
-        "consolidation.extraction_role_aware_grounding",
     }
 )
 
