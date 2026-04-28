@@ -286,17 +286,21 @@ def handle_chat(
             if result is not None:
                 routing_diags["exit_via"] = f"{intent_label}_ha"
                 return result
-            if sota_agent is not None and not is_personal:
+            sota_result = _escalate_via_cloud_policy(
+                sanitized_text,
+                sota_agent,
+                config,
+                is_personal=is_personal,
+                model=model,
+                tokenizer=tokenizer,
+                speaker=speaker,
+                history=history,
+                language=language,
+            )
+            if sota_result is not None:
                 routing_diags["exit_via"] = f"{intent_label}_sota"
                 logger.info("HA failed, routing to SOTA agent")
-                return _escalate_to_sota(
-                    sanitized_text,
-                    sota_agent,
-                    config,
-                    speaker=speaker,
-                    history=history,
-                    language=language,
-                )
+                return sota_result
         else:
             routing_diags["fallthrough_reason"] = "sanitizer_blocked"
             logger.info("Sanitizer blocked query: %s", sanitization_findings)
@@ -430,6 +434,99 @@ def _sanitize_history(
         if clean is not None:
             sanitized.append({"role": role, "text": clean})
     return sanitized
+
+
+def _escalate_via_cloud_policy(
+    text: str,
+    sota_agent: CloudAgent | None,
+    config: ServerConfig,
+    *,
+    is_personal: bool,
+    model=None,
+    tokenizer=None,
+    speaker: str | None = None,
+    history: list[dict] | None = None,
+    language: str | None = None,
+) -> ChatResult | None:
+    """Apply the configured cloud-egress policy and call SOTA accordingly.
+
+    Returns the SOTA result on success, or ``None`` when policy or per-query
+    safety blocks the call (caller falls through to the next mechanism in the
+    escalation chain — typically the base model or abstention).
+
+    Policy matrix from ``config.sanitization.cloud_mode``:
+
+    +-------------+----------------------+----------------------+
+    | mode        | PERSONAL query       | non-PERSONAL query   |
+    +=============+======================+======================+
+    | ``block``   | None (blocked)       | SOTA verbatim        |
+    | ``anonymize`` | anon → SOTA → deanon | anon → SOTA → deanon |
+    | ``both``    | None (blocked)       | anon → SOTA → deanon |
+    +-------------+----------------------+----------------------+
+
+    Per-query safety: when an anonymizing path is selected and the local
+    anonymizer can't produce a clean mapping (leak guard tripped, model
+    failure, empty result), this call returns ``None`` so the caller falls
+    back without leaking text.  The config knob is unchanged for the next
+    query.
+
+    ``model`` and ``tokenizer`` are required when ``cloud_mode`` selects
+    anonymization; they're ignored in ``block`` mode.  Passing ``None``
+    in an anonymizing mode is treated as a per-query block.
+    """
+    if sota_agent is None:
+        return None
+
+    cloud_mode = config.sanitization.cloud_mode
+    if cloud_mode not in {"block", "anonymize", "both"}:
+        # Unknown / mock value — fall back to the safest mode (block).
+        # Production paths can't reach this branch because
+        # SanitizationConfig.__post_init__ validates the field; this guard
+        # protects test mocks and any future config drift.
+        cloud_mode = "block"
+
+    blocks_personal = cloud_mode in {"block", "both"}
+    anonymizes_outbound = cloud_mode in {"anonymize", "both"}
+
+    if is_personal and blocks_personal:
+        return None
+
+    if anonymizes_outbound:
+        if model is None or tokenizer is None:
+            logger.warning(
+                "cloud_mode=%s requires model/tokenizer for anonymization; blocking", cloud_mode
+            )
+            return None
+        from paramem.server.cloud_anonymizer import (
+            anonymize_outbound,
+            deanonymize_inbound,
+        )
+
+        anon_text, mapping = anonymize_outbound(text, model, tokenizer)
+        if not anon_text:
+            # Per-query block: anonymizer failed or leak guard tripped.
+            return None
+        result = _escalate_to_sota(
+            anon_text,
+            sota_agent,
+            config,
+            speaker=speaker,
+            history=history,
+            language=language,
+        )
+        if mapping:
+            result.text = deanonymize_inbound(result.text, mapping)
+        return result
+
+    # cloud_mode=block + non-PERSONAL: send verbatim (today's behaviour).
+    return _escalate_to_sota(
+        text,
+        sota_agent,
+        config,
+        speaker=speaker,
+        history=history,
+        language=language,
+    )
 
 
 def _escalate_to_sota(
@@ -583,15 +680,19 @@ def _probe_and_reason(
             result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
             if result is not None:
                 return result
-            if sota_agent is not None and not is_personal:
-                return _escalate_to_sota(
-                    sanitized,
-                    sota_agent,
-                    config,
-                    speaker=speaker,
-                    history=history,
-                    language=language,
-                )
+            sota_result = _escalate_via_cloud_policy(
+                sanitized,
+                sota_agent,
+                config,
+                is_personal=is_personal,
+                model=model,
+                tokenizer=tokenizer,
+                speaker=speaker,
+                history=history,
+                language=language,
+            )
+            if sota_result is not None:
+                return sota_result
         return _base_model_answer(
             text,
             history,
@@ -643,6 +744,8 @@ def _probe_and_reason(
         history=history,
         language=language,
         is_personal=is_personal,
+        model=model,
+        tokenizer=tokenizer,
     )
 
 
@@ -687,6 +790,8 @@ def _base_model_answer(
         history=history,
         language=language,
         is_personal=is_personal,
+        model=model,
+        tokenizer=tokenizer,
     )
 
 
@@ -701,6 +806,8 @@ def _maybe_escalate(
     history: list[dict] | None = None,
     language: str | None = None,
     is_personal: bool = False,
+    model=None,
+    tokenizer=None,
 ) -> ChatResult:
     """Check for [ESCALATE] tag and route HA → SOTA.
 
@@ -710,11 +817,13 @@ def _maybe_escalate(
     local response is returned (text before the [ESCALATE] marker).
 
     Privacy invariant: when ``is_personal`` is True the SOTA fallback is
-    suppressed regardless of the agent being available.  Personal-class
-    queries never reach the cloud — even after a local-model
-    [ESCALATE] — to keep the speaker's parametric context off
-    third-party services.  HA stays in play because HA holds tools the
-    user already trusts.
+    suppressed regardless of the agent being available (under
+    ``cloud_mode=block`` or ``both``).  Under ``cloud_mode=anonymize``
+    the SOTA call goes through with placeholder substitution.
+
+    ``model`` and ``tokenizer`` are forwarded to
+    :func:`_escalate_via_cloud_policy` so the anonymizer (when
+    selected) can rewrite outbound text.
     """
     should_escalate, forwarded_query = detect_escalation(response)
 
@@ -728,16 +837,20 @@ def _maybe_escalate(
         result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
         if result is not None:
             return result
-        if sota_agent is not None and not is_personal:
+        sota_result = _escalate_via_cloud_policy(
+            sanitized,
+            sota_agent,
+            config,
+            is_personal=is_personal,
+            model=model,
+            tokenizer=tokenizer,
+            speaker=speaker,
+            history=history,
+            language=language,
+        )
+        if sota_result is not None:
             logger.info("[ESCALATE] → SOTA fallback (intent=%s): %s", intent_label, sanitized[:100])
-            return _escalate_to_sota(
-                sanitized,
-                sota_agent,
-                config,
-                speaker=speaker,
-                history=history,
-                language=language,
-            )
+            return sota_result
 
     # All escalation paths exhausted — return pre-escalation text from local model
     local_text = response.split("[ESCALATE]")[0].strip()

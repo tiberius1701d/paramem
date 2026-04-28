@@ -652,3 +652,182 @@ class TestPrivacyRouting:
         # Pre-[ESCALATE] portion of local response is returned when both
         # HA and SOTA are unavailable.
         assert "I'm not sure" in result.text
+
+
+class TestCloudModePolicy:
+    """Architecture #3: ``sanitization.cloud_mode`` selects the egress policy.
+
+    These tests pin the dispatch in ``_escalate_via_cloud_policy`` against
+    each (cloud_mode, is_personal) combination.  They mock the anonymizer
+    surface (``anonymize_outbound``, ``deanonymize_inbound``) so the
+    policy logic is exercised without invoking the local LLM.
+    """
+
+    def _make_cloud_agent(self):
+        agent = MagicMock(spec=CloudAgent)
+        agent.call.return_value = CloudResponse(text="<placeholder> answer")
+        agent.is_available.return_value = True
+        return agent
+
+    def _config(self, cloud_mode: str):
+        config = MagicMock()
+        config.sanitization.mode = "off"
+        config.sanitization.cloud_mode = cloud_mode
+        config.voice.load_prompt.return_value = "You are a helper."
+        return config
+
+    def _personal_router(self):
+        from paramem.server.router import Intent, RoutingPlan
+
+        router = MagicMock()
+        router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
+            strategy="direct", intent=Intent.PERSONAL
+        )
+        router._speaker_key_index = {}
+        return router
+
+    def _general_router(self):
+        from paramem.server.router import Intent, RoutingPlan
+
+        router = MagicMock()
+        router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
+            strategy="direct", intent=Intent.GENERAL
+        )
+        router._speaker_key_index = {}
+        return router
+
+    def _run(self, *, router, config, cloud_agent, ha_client=None):
+        """Drive handle_chat with HA missing/None so SOTA is the next stop.
+
+        Patches ``_base_model_answer`` so tests that get blocked at SOTA
+        (PERSONAL under block / both, leak-guard tripped under anonymize)
+        still terminate cleanly without invoking the base-model path.
+        """
+        from paramem.server.inference import ChatResult, handle_chat
+
+        if ha_client is None:
+            ha_client = MagicMock()
+            ha_client.conversation_process.return_value = None
+
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        tokenizer = MagicMock()
+
+        with patch(
+            "paramem.server.inference._base_model_answer",
+            return_value=ChatResult(text="<base-fallback>"),
+        ):
+            return handle_chat(
+                text="What's the population of Berlin?",
+                conversation_id="cloud-mode-test",
+                speaker=None,
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                router=router,
+                ha_client=ha_client,
+                sota_agent=cloud_agent,
+            )
+
+    # ---- block mode ----
+
+    def test_block_mode_personal_query_blocks_sota(self):
+        cloud_agent = self._make_cloud_agent()
+        result = self._run(
+            router=self._personal_router(),
+            config=self._config("block"),
+            cloud_agent=cloud_agent,
+        )
+        cloud_agent.call.assert_not_called()
+        assert result.escalated is False
+
+    def test_block_mode_general_query_sends_verbatim(self):
+        cloud_agent = self._make_cloud_agent()
+        cloud_agent.call.return_value = CloudResponse(text="Berlin has 3.7M people.")
+        self._run(
+            router=self._general_router(),
+            config=self._config("block"),
+            cloud_agent=cloud_agent,
+        )
+        cloud_agent.call.assert_called_once()
+        # block mode + non-PERSONAL: text passed through unmodified.
+        sent = cloud_agent.call.call_args.kwargs["query"]
+        assert sent == "What's the population of Berlin?"
+
+    # ---- anonymize mode ----
+
+    def test_anonymize_mode_round_trips_via_anonymizer(self):
+        cloud_agent = self._make_cloud_agent()
+        cloud_agent.call.return_value = CloudResponse(text="Person_1 is a useful placeholder here.")
+        with (
+            patch(
+                "paramem.server.cloud_anonymizer.anonymize_outbound",
+                return_value=("Person_1 query", {"Alex": "Person_1"}),
+            ) as mock_anon,
+            patch(
+                "paramem.server.cloud_anonymizer.deanonymize_inbound",
+                return_value="Alex is a useful placeholder here.",
+            ) as mock_deanon,
+        ):
+            result = self._run(
+                router=self._personal_router(),
+                config=self._config("anonymize"),
+                cloud_agent=cloud_agent,
+            )
+
+        mock_anon.assert_called_once()
+        mock_deanon.assert_called_once()
+        cloud_agent.call.assert_called_once()
+        sent = cloud_agent.call.call_args.kwargs["query"]
+        assert sent == "Person_1 query"
+        assert result.text == "Alex is a useful placeholder here."
+
+    def test_anonymize_mode_leak_guard_blocks_query(self):
+        """Empty mapping from anonymize_outbound = leak guard or model
+        failure → per-query block, SOTA never called."""
+        cloud_agent = self._make_cloud_agent()
+        with patch(
+            "paramem.server.cloud_anonymizer.anonymize_outbound",
+            return_value=("", {}),  # leak guard tripped
+        ):
+            self._run(
+                router=self._personal_router(),
+                config=self._config("anonymize"),
+                cloud_agent=cloud_agent,
+            )
+        cloud_agent.call.assert_not_called()
+
+    # ---- both mode ----
+
+    def test_both_mode_personal_blocked_non_personal_anonymized(self):
+        # PERSONAL blocked.
+        cloud_agent_p = self._make_cloud_agent()
+        self._run(
+            router=self._personal_router(),
+            config=self._config("both"),
+            cloud_agent=cloud_agent_p,
+        )
+        cloud_agent_p.call.assert_not_called()
+
+        # non-PERSONAL anonymized + sent.
+        cloud_agent_g = self._make_cloud_agent()
+        cloud_agent_g.call.return_value = CloudResponse(text="<answer>")
+        with (
+            patch(
+                "paramem.server.cloud_anonymizer.anonymize_outbound",
+                return_value=("anon q", {"Berlin": "City_1"}),
+            ),
+            patch(
+                "paramem.server.cloud_anonymizer.deanonymize_inbound",
+                return_value="<answer>",
+            ),
+        ):
+            self._run(
+                router=self._general_router(),
+                config=self._config("both"),
+                cloud_agent=cloud_agent_g,
+            )
+        cloud_agent_g.call.assert_called_once()
+        sent = cloud_agent_g.call.call_args.kwargs["query"]
+        assert sent == "anon q"
