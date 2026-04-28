@@ -1,0 +1,149 @@
+{
+  "schema": "provenance_gate_failures.v1",
+  "description": "Hallucinated triples surfaced by detect_assistant_into_graph.py against PerLTQA Mistral 7B probe run 20260417_165915.  Subject is the canonical speaker; object's substantive tokens appear only in non-user turns.  The role-aware extension of _drop_ungrounded_facts must drop every entry.",
+  "source_run": "outputs/dataset_probe/perltqa/mistral/20260417_165915",
+  "dialogues": {
+    "119_0_0#0": {
+      "speaker": "Xia Yu",
+      "transcript": "[user] I recently became interested in machine learning and deep learning. I think they can really enhance the way we teach adult learners.\n[assistant] That sounds promising, Xiaoyu. Have you considered using tools like TensorFlow? It's a powerful platform for machine learning.\n[user] Yes, I've heard a bit about TensorFlow. Can you tell me more about how it could be applied in education?\n[assistant] Certainly. TensorFlow allows you to build and train large-scale machine learning models. You can apply it in areas like image recognition, which could be useful for visual learning materials.\n[user] Image recognition sounds intriguing. Could it also be useful for improving content accessibility for students?\n[assistant] Absolutely. TensorFlow can help with natural language processing, which is great for analyzing student feedback or adapting learning materials.\n[user] That could really help personalize the learning experience. I want my students to have the best possible tools to succeed.\n[assistant] And don't forget speech recognition. This could enable voice-based interactions, making learning more interactive.\n[user] That could be beneficial for language learners, enhancing their pronunciation and listening skills.\n[assistant] I'm glad you're seeing the possibilities, Xiaoyu. With your dedication, using TensorFlow could really elevate your teaching methods.\n[user] Thank you for the recommendation. I'm grateful for your guidance on this.\n[assistant] You're welcome, Xiaoyu. I'm always here to support your academic and career goals.\n[user] I plan to study TensorFlow in depth and explore its applications in our courses. I'm excited to see how it can transform our teaching.\n[assistant] That's the spirit. If you need any resources or further guidance, feel free to reach out.\n[user] I definitely will. It's great to know I have your support."
+    },
+    "119_0_2#2": {
+      "speaker": "Xia Yu",
+      "transcript": "[user] It's such a special day for Zhiqi Culture, celebrating ten years of our hard work and achievements.\n[assistant] I heard your brother Xia Zhongtian joined as the chief financial officer recently. It seems like a perfect match for your company.\n[user] Yes, his expertise in economics has been invaluable, especially with the financial strategies we've been implementing.\n[assistant] That's wonderful. Having family involved in your business must be both rewarding and challenging.\n[user] Absolutely. But Zhongtian and I have always supported each other, both in family matters and our careers.\n[assistant] Did you do anything special to mark his contributions during the celebration today?\n[user] I prepared a gift for him as a token of my gratitude. It was important to show him how much his support has meant to me over the years.\n[assistant] That's a lovely gesture. I'm sure it reinforced the strong relationship you two share.\n[user] Yes, during our speeches, we reflected on the company's journey and how our shared vision has contributed to its success.\n[assistant] And what's the vision for the future of Zhiqi Culture?\n[user] We're looking forward to more innovative projects and expanding our influence in media education, always striving for excellence.\n[assistant] Having both family and professional support like you do is quite inspiring. How do you balance it all?\n[user] It's about understanding each other's strengths and maintaining clear communication. Zhongtian and I have mastered this over the years.\n[assistant] It sounds like your relationship with your brother is a cornerstone of your success.\n[user] Indeed. We toasted to our future today, embracing the potential for even greater achievements."
+    },
+    "119_2_1#4": {
+      "speaker": "Xia Yu",
+      "transcript": "[user] I can't believe how vibrant the colors in Cézanne's 'Turquoise and Jade Vase' are. They really draw you in.\n[assistant] Absolutely, Xiaoyu. The techniques he used to layer those colors are just incredible. It's like each brushstroke tells a story.\n[user] And the bold composition! It's like he wanted to challenge the traditional norms of still life painting.\n[assistant] Exactly. It feels like he brought a whole new perspective to life in his work. It’s something I aspire to in my own art.\n[user] You know, seeing such art makes me want to incorporate more artistic appreciation into my future teaching methods.\n[assistant] That sounds amazing. Helping others see the beauty in art like this could really open minds.\n[user] And understanding art's value... not just monetarily, but culturally. It can be so impactful.\n[assistant] Yes, it can broaden horizons and encourage critical thinking. I see that in the way you approach education.\n[user] Thank you, Li Ming. I think experiences like this exhibition deepen not only our friendship but our professional aspirations as well.\n[assistant] I couldn’t agree more. It’s moments like these that reinforce why art holds such a significant place in our lives."
+    },
+    "119_4_2#8": {
+      "speaker": "Xia Yu",
+      "transcript": "[user] This place really does have a great reputation. The aroma is absolutely delightful, don't you think?\n[assistant] Absolutely, Xiaoyu. I've been looking forward to this all week. The atmosphere here is just perfect for enjoying hot pot.\n[user] Look at the way the butter is melting in the copper pot. It’s mesmerizing. It’s making me even hungrier.\n[assistant] I can feel the excitement. Let's start with the beef slices. I've heard they're exceptionally tender.\n[user] Great choice. I'll add some tofu as well. It's always nice to have a mix of textures.\n[assistant] Did you know that tofu has been used in Sichuan hot pot for centuries? It really absorbs the flavors well.\n[user] That's fascinating. It's little things like these that make our outings educational, not just fun.\n[assistant] Speaking of education, how's the new batch of students doing? Are they adapting well to your innovative methods?\n[user] They are! It’s rewarding to see them so eager to learn. I think Li Hua would be proud of how far we’ve come.\n[assistant] That's wonderful to hear. Your dedication is truly inspiring, Xiaoyu.\n[user] Thank you, Qiang. It means a lot. Now, let's enjoy this spicy base. It's incredibly aromatic.\n[assistant] Yes, and the numbing sensation from the Sichuan peppercorn is quite the experience. I love it.\n[user] It's interesting how the spice and numbing flavors balance each other out. It leaves a memorable aftertaste.\n[assistant] Indeed. Here's to more nights like this one, filled with good food and even better company.\n[user] Cheers to that! Sharing this moment with you makes the experience all the more special.\n[assistant] I feel the same way, Xiaoyu. Let's savor every bite of this delightful meal.\n[user] And maybe plan our next adventure while we’re at it? A new place to explore, perhaps?\n[assistant] Definitely. How about somewhere we can combine your love for yoga and travel?\n[user] That sounds perfect. I'll start looking into it. Meanwhile, let’s enjoy this moment.\n[assistant] Agreed. Here's to us, and to many more delightful nights."
+    },
+    "119_6_2#17": {
+      "speaker": "Xia Yu",
+      "transcript": "[user] It's amazing how CRISPR-Cas9 technology is advancing so quickly. Just recently, I read about its use in preventing genetic diseases through gene editing in blastocysts.\n[assistant] That sounds fascinating, Xia Yu. I'm particularly interested in how this technology could impact agriculture, especially with improving crop varieties like rice.\n[user] Yes, they've had some success with enhancing rice's resistance to stress, which could revolutionize how we approach food security.\n[assistant] The potential is incredible, but I'm curious about the ethical implications of gene editing. How do we address the concerns surrounding this technology?\n[user] It's definitely a complex issue. In education, I focus on guiding students to understand both the capabilities and the responsibilities that come with such innovations.\n[assistant] It's important to consider the societal impact. How do you approach these discussions with your students?\n[user] I encourage critical thinking by presenting real-life cases and having them debate the benefits and risks. It's crucial they see both sides.\n[assistant] That sounds like a balanced approach. We should definitely integrate this into our curriculum to prepare students for future challenges.\n[user] Absolutely, and by discussing these innovations, we can inspire them to contribute to future research and development.\n[assistant] Let's plan a workshop for our students to explore these concepts further. It could really spark their interest in biotechnology.\n[user] Great idea! We can create collaborative projects where they research current applications of CRISPR-Cas9 and present their findings.\n[assistant] That would not only enhance their knowledge but also develop their analytical skills. Let's start organizing it soon.\n[user] I'll gather some resources and case studies that we can use as references. It will make the learning experience richer.\n[assistant] I'll work on a framework for the ethical discussion part. This will be an excellent opportunity for them to engage with real-world issues.\n[user] Perfect! This collaboration will undoubtedly deepen our understanding too, as we prepare and learn from our students' perspectives.\n[assistant] I look forward to it. Together, we can make a significant impact in their educational journey.\n[user] Indeed, Li Hua. It's collaborations like these that make our work so fulfilling and meaningful.\n[assistant] It's always a pleasure to share insights and grow together. Let's make it happen!"
+    },
+    "119_8_1#22": {
+      "speaker": "Xia Yu",
+      "transcript": "[user] Mingda, your work on the Human Genome Project has been truly impressive. How are you finding the sequencing tasks?\n[assistant] Thank you, Xia Yu. It's been challenging, but the learning curve is steep. Using the Illumina sequencers has been a fascinating experience.\n[user] Indeed, mastering both Sanger and high-throughput sequencing is no small feat. How do you think this project is shaping your understanding of systems biology?\n[assistant] It's profound. The project has given me insights into genome sequencing that are invaluable for understanding genetic complexities.\n[user] That's wonderful to hear. Such a foundation will serve you well in your educational career.\n[assistant] Yes, the knowledge I've gained here is something I aim to pass on, much like you've done for us.\n[user] Passing on knowledge is essential. How do you feel your contributions have impacted the discovery of genetic associations?\n[assistant] Our data submissions have already aided in identifying several gene-disease correlations. It's rewarding to know our efforts contribute to global research.\n[user] You're part of something revolutionary. It's similar to the educational impact we strive for—empowering through knowledge.\n[assistant] Absolutely. This experience echoes your teaching philosophy, inspiring me to uplift others through education.\n[user] It's gratifying to see you embody that spirit, Mingda. How do you envision utilizing these skills in your future teaching?\n[assistant] I hope to incorporate genome sequencing techniques into my curriculum, sparking curiosity in future students.\n[user] That sounds like a fantastic plan. Encouraging curiosity is a powerful tool in education.\n[assistant] It is. Watching you balance teaching and personal growth has been influential. Your commitment to lifelong learning is inspiring.\n[user] Thank you, Mingda. Your journey with the Human Genome Project is a testament to the impact of dedication and passion.\n[assistant] It's because of mentors like you that I've been able to achieve this. I aim to honor your guidance through my work.\n[user] I'm proud of your accomplishments. Continue to cultivate that spirit of inquiry and education.\n[assistant] I will, Xia Yu. Let's keep pushing the boundaries of what we can achieve in adult education."
+    },
+    "119_8_4#25": {
+      "speaker": "Xia Yu",
+      "transcript": "[user] Mingda, I’m glad you could join me for the Confucius Temple Fair. It’s such a unique opportunity to immerse ourselves in traditional culture.\n[assistant] Thank you for inviting me, Ms. Xia. I've always been fascinated by Confucius' teachings, and experiencing this fair firsthand is truly special.\n[user] The fair in Qufu, especially on Confucius' birthday during the Mid-Autumn Festival, is the best place to appreciate his legacy. Did you enjoy the folk art performances?\n[assistant] Absolutely! The performances really brought the teachings to life, and seeing the cultural exhibitions helped me understand their historical context.\n[user] That’s wonderful to hear. The ceremony for worshiping Confucius was particularly moving, wasn’t it? It's a solemn tradition that reinforces the importance of respecting cultural heritage.\n[assistant] Yes, the ceremony was profound. It made me reflect on Confucius’ emphasis on respect and education, which are as relevant today as ever.\n[user] I agree. Traditional culture provides timeless insights. How did you find the Confucius Temple Tofu and Sausage? It’s delightful to see food contributing to cultural appreciation.\n[assistant] The food was exceptional. The unique flavors of the tofu and sausage highlighted the culinary art of our heritage. It’s fascinating how cuisine can tell stories of history.\n[user] Exactly. It’s part of what makes these traditions so rich and fulfilling. I hope this experience has deepened your enthusiasm for exploring and promoting traditional culture.\n[assistant] It certainly has. Attending the fair has strengthened my resolve to learn more and incorporate these elements into my education journey. Thank you, Ms. Xia, for guiding me through this."
+    }
+  },
+  "candidates": [
+    {
+      "dialogue_key": "119_0_0#0",
+      "subject": "Xia Yu",
+      "predicate": "seeks",
+      "object": "Resources",
+      "tokens_checked": [
+        "resources"
+      ],
+      "said_by": "midsummer sky",
+      "source_turn": "That's the spirit. If you need any resources or further guidance, feel free to reach out."
+    },
+    {
+      "dialogue_key": "119_0_2#2",
+      "subject": "Xia Yu",
+      "predicate": "celebrated",
+      "object": "celebration",
+      "tokens_checked": [
+        "celebration"
+      ],
+      "said_by": "midsummer sky",
+      "source_turn": "Did you do anything special to mark his contributions during the celebration today?"
+    },
+    {
+      "dialogue_key": "119_0_2#2",
+      "subject": "Xia Yu",
+      "predicate": "gave_speech_at",
+      "object": "celebration",
+      "tokens_checked": [
+        "celebration"
+      ],
+      "said_by": "midsummer sky",
+      "source_turn": "Did you do anything special to mark his contributions during the celebration today?"
+    },
+    {
+      "dialogue_key": "119_2_1#4",
+      "subject": "Xia Yu",
+      "predicate": "teaches",
+      "object": "Education",
+      "tokens_checked": [
+        "education"
+      ],
+      "said_by": "Li Ming",
+      "source_turn": "Yes, it can broaden horizons and encourage critical thinking. I see that in the way you approach education."
+    },
+    {
+      "dialogue_key": "119_4_2#8",
+      "subject": "Xia Yu",
+      "predicate": "likes",
+      "object": "yoga",
+      "tokens_checked": [
+        "yoga"
+      ],
+      "said_by": "Zhang Qiang",
+      "source_turn": "Definitely. How about somewhere we can combine your love for yoga and travel?"
+    },
+    {
+      "dialogue_key": "119_4_2#8",
+      "subject": "Xia Yu",
+      "predicate": "likes",
+      "object": "travel",
+      "tokens_checked": [
+        "travel"
+      ],
+      "said_by": "Zhang Qiang",
+      "source_turn": "Definitely. How about somewhere we can combine your love for yoga and travel?"
+    },
+    {
+      "dialogue_key": "119_6_2#17",
+      "subject": "Xia Yu",
+      "predicate": "plans",
+      "object": "Workshop",
+      "tokens_checked": [
+        "workshop"
+      ],
+      "said_by": "Li Hua",
+      "source_turn": "Let's plan a workshop for our students to explore these concepts further. It could really spark their interest in biotechnology."
+    },
+    {
+      "dialogue_key": "119_6_2#17",
+      "subject": "Xia Yu",
+      "predicate": "interested_in",
+      "object": "the ethical implications",
+      "tokens_checked": [
+        "ethical",
+        "implications"
+      ],
+      "said_by": "Li Hua",
+      "source_turn": "The potential is incredible, but I'm curious about the ethical implications of gene editing. How do we address the concerns surrounding this technology?"
+    },
+    {
+      "dialogue_key": "119_8_1#22",
+      "subject": "Xia Yu",
+      "predicate": "values",
+      "object": "lifelong learning",
+      "tokens_checked": [
+        "lifelong",
+        "learning"
+      ],
+      "said_by": "Wang Mingda",
+      "source_turn": "Thank you, Xia Yu. It's been challenging, but the learning curve is steep. Using the Illumina sequencers has been a fascinating experience."
+    },
+    {
+      "dialogue_key": "119_8_4#25",
+      "subject": "Xia Yu",
+      "predicate": "learns",
+      "object": "More",
+      "tokens_checked": [
+        "more"
+      ],
+      "said_by": "Wang Mingda",
+      "source_turn": "It certainly has. Attending the fair has strengthened my resolve to learn more and incorporate these elements into my education journey. Thank you, Ms. Xia, for guiding me through this."
+    }
+  ]
+}
