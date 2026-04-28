@@ -241,7 +241,14 @@ Set `headless_boot: true` in `configs/server.yaml` to have the server come up be
 
 ### Configuration
 
-`configs/server.yaml` is fully commented — every option has inline docs
+The shipped template is `configs/server.yaml.example` (tracked, disabled-by-default
+for optional services). Operators copy it to `configs/server.yaml` (gitignored)
+to add local overrides such as API keys or enabled services. The server falls
+back to the template on a fresh checkout, so `cp configs/server.yaml.example
+configs/server.yaml` is only required when you actually want to diverge from the
+ship-safe defaults.
+
+`configs/server.yaml.example` is fully commented — every option has inline docs
 explaining its effect, privacy implications, and interaction with other
 options. A short map of the top-level sections:
 

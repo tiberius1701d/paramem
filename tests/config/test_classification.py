@@ -12,7 +12,10 @@ from paramem.config.classification import (
     iter_shipped_paths,
 )
 
-_SERVER_YAML = Path(__file__).parent.parent.parent / "configs" / "server.yaml"
+# Authoritative reference for "what fields ship in the canonical server config"
+# is configs/server.yaml.example (tracked template). The operator-local
+# configs/server.yaml is gitignored, so a fresh checkout has only the example.
+_SERVER_YAML = Path(__file__).parent.parent.parent / "configs" / "server.yaml.example"
 
 
 class TestEveryShippedPathIsClassified:
@@ -169,7 +172,7 @@ class TestNoOrphanClassifications:
                 continue
             assert entry_path in real_paths, (
                 f"Classification entry {entry_path!r} does not appear in "
-                f"configs/server.yaml and is not in EXTENSION_FIELDS. "
+                f"configs/server.yaml.example and is not in EXTENSION_FIELDS. "
                 "Remove or move to EXTENSION_FIELDS."
             )
 

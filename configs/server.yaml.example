@@ -65,7 +65,7 @@ cloud_only: false
 # - On non-WSL hosts only the linger half is reconciled — step 2 is skipped.
 # - Flipping this flag back to false reverses both steps on the next startup.
 # ============================================================================
-headless_boot: true
+headless_boot: false
 
 server:
   host: "0.0.0.0"
@@ -75,7 +75,9 @@ server:
 
 model: mistral  # mistral | gemma | qwen3b | gemma4
 
-debug: true  # cycle snapshots, verbose logging
+debug: false  # ship-safe default — true writes plaintext fact copies to data/ha/sessions/*.jsonl
+              # and data/ha/debug/cycle_*/ on every consolidation. Flip true ONLY when actively
+              # debugging a deployment (see SECURITY.md §debug carve-outs).
 
 # --- Paths (mount points) ---
 paths:
@@ -186,7 +188,7 @@ consolidation:
   extraction_max_tokens: 2048  # max output tokens for graph extraction
   extraction_stt_correction: true  # correct STT errors from assistant responses
   extraction_ha_validation: true  # validate locations against HA home context
-  extraction_noise_filter: anthropic  # SOTA provider for noise filtering ("" = disabled)
+  extraction_noise_filter: ""  # SOTA provider for noise filtering ("" = disabled, ship default)
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
   # --- Extraction-pipeline stages (all configurable) ---
   #
@@ -211,6 +213,16 @@ consolidation:
   extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
   extraction_ner_check: false                   # optional spaCy PII cross-check
   extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
+  # Role-aware grounding gate (assistant-into-graph defense). When the
+  # speaker is the subject of a triple, require the object's substantive
+  # tokens to ground in the speaker's own [user] turns, not in [assistant]
+  # turns. Closes the cascade: confabulated answer → extracted as fact →
+  # trained into adapter weights.
+  #   "off"        — role-blind grounding (ship default, backward-compatible)
+  #   "diagnostic" — log triples the gate WOULD drop, drop nothing
+  #                  (use to measure false-positive rate on your corpus)
+  #   "active"     — gate drops triples that fail role checking
+  extraction_role_aware_grounding: "off"   # quoted: bare off/on parse as YAML 1.1 booleans
   # Max concurrent interim adapters in VRAM. Together with refresh_cadence
   # this determines the derived full-consolidation period:
   #     full_cycle = refresh_cadence × max_interim_count
@@ -232,9 +244,11 @@ consolidation:
   training_temp_limit: 55      # GPU temp ceiling in °C (0 = disabled)
   training_temp_check_interval: 5  # check GPU temp every N training steps
   # Quiet-hours policy — schedules *when* the thermal throttle above applies.
-  # This host is a work laptop: silent at the desk during the day, free to
-  # spin fans overnight when nobody is listening. For a stationary home
-  # install, default.yaml uses the inverted (nighttime) window instead.
+  # Two realistic deployment shapes:
+  #   * Server-room host (rack, cellar PC, NAS) — nobody listens, just set
+  #     `quiet_hours_mode: always_off` and let fans spin 24/7.
+  #   * Daytime-used laptop/PC (work, study, shared living space) — silent at
+  #     the desk during the day, free to spin overnight. Default below.
   #   "always_on"  — throttle 24/7
   #   "always_off" — throttle never (server rack, cellar)
   #   "auto"       — throttle only inside [start, end] (wraps past midnight)
@@ -247,42 +261,47 @@ consolidation:
   # consolidation. Captures cross-transcript second-order relations and resolves
   # entity coreference (same_as pairs) that per-transcript enrichment cannot see.
   # Reuses the extraction_noise_filter SOTA credentials — no new provider config.
-  graph_enrichment_enabled: true              # set to false to disable entirely
+  graph_enrichment_enabled: false             # ship default — uses SOTA, needs an API key
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
   # Mini-enrichment at interim-adapter rollover (sub-interval boundary,
   # default 12h). Amortises the 84h enrichment cost across the cycle.
   # Fires only when enough new triples have accumulated since the last pass.
-  graph_enrichment_interim_enabled: true
+  graph_enrichment_interim_enabled: false    # ship default — companion to graph_enrichment_enabled
   graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.
 # SOTA is the fallback for general reasoning when HA cannot answer.
+#
+# All cloud agents ship disabled. To enable, set the relevant API key env var
+# (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY) and flip enabled: true.
+# The ${VAR} placeholders below document the surface; they are resolved at
+# load time.
 agents:
   sota:
-    enabled: true
+    enabled: false
     provider: anthropic
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
     endpoint: ""
   sota_providers:
     anthropic:
-      enabled: true
+      enabled: false
       provider: anthropic
       model: claude-sonnet-4-6
       api_key: ${ANTHROPIC_API_KEY}
     openai:
-      enabled: true
+      enabled: false
       provider: openai
       model: gpt-4o-search-preview
       api_key: ${OPENAI_API_KEY}
     google:
-      enabled: true
+      enabled: false
       provider: google
       model: gemini-2.5-flash
       api_key: ${GOOGLE_API_KEY}
-  ha_agent_id: conversation.groq  # HA conversation agent (Groq for fast inference)
+  ha_agent_id: ""  # set to e.g. "conversation.groq" once HA token configured
 
 # --- Tools ---
 tools:
@@ -334,8 +353,8 @@ tools:
 # SOTA reachability is independent: with `agents.sota.enabled: false` (or no
 # api_key), no queries reach SOTA regardless of `cloud_mode`.
 sanitization:
-  mode: block            # off | warn | block — PII detection layer
-  cloud_mode: anonymize  # block | anonymize | both — direct-SOTA egress policy
+  mode: block        # off | warn | block — PII detection layer
+  cloud_mode: block  # block | anonymize | both — direct-SOTA egress policy (ship-safe default)
 
 # ============================================================================
 # ABSTENTION — LAST-RESORT CONFABULATION GUARD
@@ -378,7 +397,7 @@ abstention:
 # encoder/dataset is best today may be outdated tomorrow — operators
 # can swap without code changes.
 intent:
-  enabled: true
+  enabled: true                                   # local-only; encoder downloads from HF on first use (~250MB)
   encoder_model: intfloat/multilingual-e5-small  # any sentence-transformers-compatible HF model
   encoder_device: auto                            # auto | cuda | cpu
   encoder_dtype: float16                          # float16 | float32
@@ -392,7 +411,7 @@ voice:
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)
 
 speaker:
-  enabled: true   # voice-based speaker identification via pyannote
+  enabled: false  # voice-based speaker identification via pyannote (requires pyannote install + HF auth token)
   high_confidence_threshold: 0.60  # confirmed match (cross-device centroid)
   low_confidence_threshold: 0.45   # tentative match, no interruption
   enrollment_prompt: "By the way, I don't think we've met yet. Please introduce yourself with your next request."
@@ -404,7 +423,7 @@ speaker:
   # store_path: ""                 # default: data/ha/speaker_profiles.json
 
 stt:
-  enabled: true              # local Whisper STT via Wyoming protocol
+  enabled: false             # local Whisper STT via Wyoming protocol (requires faster-whisper + GPU model download)
   model: distil-large-v3     # GPU model: distil-large-v3, large-v3, etc.
   cpu_fallback_model: small  # multilingual CPU model for cloud-only mode (distil-* variants are English-only)
   device: cuda               # cuda, cpu, auto
@@ -415,7 +434,7 @@ stt:
   vad_filter: true           # voice activity detection (trims silence)
 
 tts:
-  enabled: true              # local TTS via Wyoming protocol
+  enabled: false             # local TTS via Wyoming protocol (requires Piper / MMS-TTS model downloads)
   port: 10301                # Wyoming TTS listener port
   device: cuda               # default device; per-voice override possible
   default_language: en
