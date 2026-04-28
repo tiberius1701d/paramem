@@ -75,41 +75,35 @@ _MATCH_THRESHOLD = 0.80
 _DEFAULT_SCOPE = {"person"}
 
 
-# Fixture transcripts: multi-turn dialogues with self-claims that the
-# extractor can anchor on.  Each entry carries the production-shape
-# transcript ([user]/[assistant] role prefixes), the speaker_name that
-# the chat handler would have already resolved (greeting flow), and the
-# names that appear *in the transcript text* and MUST therefore be
-# anonymized before the cloud sees the transcript.
+# Fixture transcripts: single-turn user queries — the production input
+# shape ``_handle_cloud_response`` passes to ``extract_and_anonymize_for_cloud``
+# (the cloud-egress entry point anonymizes only the current-turn text;
+# conversation history flows separately through ``_sanitize_history``).
+# Earlier multi-turn ``[user]/[assistant]`` fixtures here were testing
+# a code path the cloud-egress helper no longer receives in production.
 #
-# ``speaker_name`` is metadata (provided by voice enrollment in
-# production) that the prompt uses to bind first-person facts to a
-# concrete subject.  It is NOT included in ``expected_names`` because
-# the speaker's name doesn't appear in the transcript text — there is
-# nothing to leak.  The anonymizer may or may not bind the speaker to
-# a placeholder; either is privacy-safe.
+# Each entry carries the user query, the speaker_name the chat handler
+# would have resolved via voice enrollment, and the names that appear
+# *in the query text* and MUST therefore be anonymized before the cloud
+# sees the query.
 #
-# These mirror the shape of real archived sessions in
-# data/ha/sessions/archive/ (statements interleaved with questions),
-# but use synthetic names so the fixture is safe to ship.
+# ``speaker_name`` is metadata used by the extraction prompt to bind
+# first-person facts to a concrete subject.  It is NOT included in
+# ``expected_names`` because the speaker's name does not appear in the
+# query text itself — there is nothing to leak.  The anonymizer may or
+# may not bind the speaker to a placeholder; either is privacy-safe.
 _FIXTURE = [
     {
         "id": "single_person_self_claim",
         "speaker_name": "Anna",
-        "transcript": (
-            "[user] My colleague Alex told me about a project deadline.\n"
-            "[assistant] Got it.\n"
-            "[user] Should I follow up tomorrow?"
-        ),
+        "transcript": "Should I follow up with Alex tomorrow about the project deadline?",
         "expected_names": ["Alex"],
     },
     {
         "id": "person_and_place",
         "speaker_name": "Anna",
         "transcript": (
-            "[user] My friend Alex is moving to Berlin next month.\n"
-            "[assistant] That's exciting news.\n"
-            "[user] What restaurants should I recommend to them?"
+            "What restaurants should I recommend to Alex when they move to Berlin next month?"
         ),
         # Berlin is intentionally NOT in expected_names under the
         # default scope ``[person]`` — places pass through verbatim so
@@ -120,31 +114,19 @@ _FIXTURE = [
     {
         "id": "two_people",
         "speaker_name": "Anna",
-        "transcript": (
-            "[user] My colleagues Alex and Sam are planning a workshop.\n"
-            "[assistant] Sounds productive.\n"
-            "[user] Did they finalize the agenda?"
-        ),
+        "transcript": "Did Alex and Sam finalize the agenda for the workshop?",
         "expected_names": ["Alex", "Sam"],
     },
     {
         "id": "no_personal_markers",
         "speaker_name": "Anna",
-        "transcript": (
-            "[user] What is the speed of light in vacuum?\n"
-            "[assistant] About 299,792 kilometres per second.\n"
-            "[user] How fast is that compared to sound?"
-        ),
+        "transcript": "What is the speed of light in vacuum?",
         "expected_names": [],
     },
     {
         "id": "conversational_shape",
         "speaker_name": "Anna",
-        "transcript": (
-            "[user] My partner Pat noticed our dog was sick last week.\n"
-            "[assistant] I hope the dog is feeling better.\n"
-            "[user] Should I call the vet for a follow-up?"
-        ),
+        "transcript": "Should I call the vet about Pat's dog being sick?",
         "expected_names": ["Pat"],
     },
 ]
@@ -281,3 +263,63 @@ def test_cloud_anonymizer_contract(loaded_model):
             f"(rate {rate:.0%}, blocks {blocks}, threshold {_MATCH_THRESHOLD:.0%}).\n"
             f"Per-query notes:\n{report}"
         )
+
+
+def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
+    """Wider-scope contract: under cloud_scope={person, place}, place
+    names also get anonymized.
+
+    The default-scope test above leaves place names verbatim by design
+    (so the cloud can answer "Berlin restaurants?" sensibly).  This
+    test differentiates: picks the ``person_and_place`` fixture entry —
+    the only one carrying both categories — and runs it under the
+    stricter scope ``{person, place}``.  Validates that the wider
+    scope path actually anonymizes places on real LLM output, not
+    just in unit tests with synthetic graphs.
+
+    Operators picking the stricter posture (privacy over cloud-utility
+    on places) need this guarantee to hold.
+    """
+    from paramem.graph.extractor import (
+        deanonymize_text,
+        extract_and_anonymize_for_cloud,
+    )
+
+    model, tokenizer = loaded_model
+
+    entry = next(e for e in _FIXTURE if e["id"] == "person_and_place")
+    transcript = entry["transcript"]
+
+    anon_text, mapping = extract_and_anonymize_for_cloud(
+        transcript,
+        model,
+        tokenizer,
+        speaker_name=entry["speaker_name"],
+        pii_scope={"person", "place"},
+    )
+
+    if not mapping:
+        pytest.fail(
+            f"Strict scope produced empty mapping (block) on {entry['id']}; "
+            f"expected both Alex and Berlin to be anonymized."
+        )
+
+    # Both person AND place must be absent from anon_text under the
+    # stricter scope.  This is the privacy contract the operator opted
+    # into; a leak of either is a regression.
+    for name in ("Alex", "Berlin"):
+        assert name not in anon_text, (
+            f"[{entry['id']}, scope=person+place] Privacy breach: {name!r} "
+            f"present in anon_text {anon_text!r}"
+        )
+
+    # Round-trip: deanonymize_text restores the original (modulo
+    # whitespace, which the anonymizer LLM may reflow).  Catches a
+    # mapping/transcript inconsistency that would silently leave the
+    # cloud's response with placeholders the user sees.
+    round_trip = deanonymize_text(anon_text, mapping)
+    assert _normalise(round_trip) == _normalise(transcript), (
+        f"[{entry['id']}, scope=person+place] Round-trip mismatch:\n"
+        f"  original:   {transcript!r}\n"
+        f"  round-trip: {round_trip!r}"
+    )
