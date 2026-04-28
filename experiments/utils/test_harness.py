@@ -2,6 +2,17 @@
 
 Wraps the existing indexed key pipeline into reusable functions
 for consistent experiment setup across all 7 tests.
+
+Environment loading is a per-script concern — call
+:func:`load_test_env` from a script's main() / argparse entrypoint
+when you need ``.env`` populated. Module-level ``load_dotenv`` was
+removed on 2026-04-28 because importing this module from production
+code paths (``ConsolidationLoop._run_recall_sanity_probe``) re-set
+operator env vars on first import, defeating any caller that had
+explicitly cleared a key — e.g. the smoke harness running under
+Security OFF saw ``PARAMEM_DAILY_PASSPHRASE`` snap back from disk
+mid-run, with subsequent saves silently encrypted under a "popped"
+identity.
 """
 
 import json
@@ -16,8 +27,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 
-load_dotenv(PROJECT_ROOT / ".env")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+def load_test_env() -> None:
+    """Source ``.env`` into the current process and set the CUDA alloc default.
+
+    Call from a script's main() / CLI entrypoint, NOT at module scope.
+    Module-scope ``load_dotenv`` re-sets env vars at first import, which
+    breaks any caller that has explicitly cleared a var between server
+    startup and a downstream import — see the module docstring.
+    """
+    load_dotenv(PROJECT_ROOT / ".env")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
 from paramem.evaluation.recall import generate_answer  # noqa: E402

@@ -1087,3 +1087,56 @@ class TestFullCycleGateHelpers:
         self._write_meta(tmp_path / "episodic" / "20260420-000000", window_stamp="20260101T0000")
         cfg = self._make_config("every 84h", tmp_path)
         assert _is_full_cycle_due(cfg) is True
+
+
+class TestTestHarnessImportNoEnvRestoration:
+    """Regression: importing experiments.utils.test_harness must NOT re-load .env.
+
+    Background — fix for the Security-OFF e2e smoke bug (2026-04-28):
+    Before the fix, ``experiments/utils/test_harness.py`` called
+    ``load_dotenv(...)`` at module scope. The first import (triggered
+    inside ``ConsolidationLoop._run_recall_sanity_probe``) re-set every
+    operator env var. The smoke harness, which had explicitly popped
+    ``PARAMEM_DAILY_PASSPHRASE`` to exercise Security OFF, saw the var
+    snap back from disk during the first verify probe — every save after
+    that point silently encrypted under a "popped" identity. Production
+    was unaffected because production never pops env vars between server
+    start and verify-probe import; ``load_dotenv(override=False)`` is a
+    no-op when the values are already set.
+
+    This test pins the invariant so a future regression doesn't
+    re-introduce the module-level side effect.
+    """
+
+    def test_importing_test_harness_does_not_set_passphrase_when_unset(self, monkeypatch):
+        """Importing test_harness with PARAMEM_DAILY_PASSPHRASE unset must
+        NOT cause it to be set, even if a ``.env`` file on disk lists it.
+        """
+        import importlib
+        import os
+
+        # Simulate: shell exported the var, then preflight popped it.
+        monkeypatch.delenv("PARAMEM_DAILY_PASSPHRASE", raising=False)
+
+        # Force-reload test_harness so its module-level code runs in this
+        # monkey-patched state (the module may already be cached from a
+        # prior test in this session).
+        import experiments.utils.test_harness as th  # noqa: F401
+
+        importlib.reload(th)
+
+        # The bug we're guarding against: load_dotenv at module scope
+        # re-set the var from .env on first import. Post-fix, no
+        # module-level load_dotenv exists, so the env stays popped.
+        assert "PARAMEM_DAILY_PASSPHRASE" not in os.environ, (
+            "experiments.utils.test_harness import must not re-load .env "
+            "into os.environ. Module-scope load_dotenv was removed on "
+            "2026-04-28 — see module docstring."
+        )
+
+    def test_load_test_env_helper_is_explicit_opt_in(self):
+        """The replacement ``load_test_env()`` helper is the explicit, opt-in
+        way to source ``.env`` from a script's main() / CLI entrypoint."""
+        from experiments.utils.test_harness import load_test_env
+
+        assert callable(load_test_env)
