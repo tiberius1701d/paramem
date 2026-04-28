@@ -1265,7 +1265,7 @@ def main():
         print(f"  Recall probing: every {PROBE_EVERY_N_EPOCHS} epochs")
         print(f"{'=' * 72}")
 
-        model, tokenizer, config = load_model_and_config(bench_model_config)
+        model, tokenizer = load_model_and_config(bench_model_config)
 
         if args.resume:
             # For resume, find the most recent output dir for this model

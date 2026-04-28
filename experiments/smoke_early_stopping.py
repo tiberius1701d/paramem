@@ -59,7 +59,7 @@ def main():
         print(f"  Early stopping smoke test: {bench_name}")
         print(f"{'=' * 60}")
 
-        model, tokenizer, config = load_model_and_config(bench_model_config)
+        model, tokenizer = load_model_and_config(bench_model_config)
 
         # Distill 25 QA pairs
         if sessions:

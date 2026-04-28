@@ -434,7 +434,7 @@ def main():
         print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
 
-        model, tokenizer, config = load_model_and_config(bench_model_config)
+        model, tokenizer = load_model_and_config(bench_model_config)
         output_dir = model_output_dir(base_output_dir, bench_name)
 
         # --- Distill once using all loaded QA pairs (2x buffer for loss) ---

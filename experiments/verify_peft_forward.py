@@ -68,7 +68,7 @@ def main():
 
     # Load model + adapter
     print("\nLoading model...")
-    model, tokenizer, _ = load_model_and_config(BENCHMARK_MODELS["mistral"])
+    model, tokenizer = load_model_and_config(BENCHMARK_MODELS["mistral"])
     model = PeftModel.from_pretrained(model, str(s1_path), adapter_name="session_1")
     model.eval()
     model.gradient_checkpointing_disable()

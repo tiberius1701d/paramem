@@ -52,7 +52,7 @@ def load_model_and_adapter(adapter_path):
     models = list(get_benchmark_models(dummy_args))
     bench_name, bench_config = models[0]
 
-    model, tokenizer, config = load_model_and_config(bench_config)
+    model, tokenizer = load_model_and_config(bench_config)
 
     # Load saved adapter
     from peft import PeftModel

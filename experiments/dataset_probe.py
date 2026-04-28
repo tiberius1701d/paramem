@@ -33,7 +33,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -56,7 +55,11 @@ from experiments.utils.test_harness import (  # noqa: E402
     model_output_dir,
     setup_logging,
 )
-from paramem.utils.config import TrainingConfig, load_config  # noqa: E402
+from paramem.utils.config import (  # noqa: E402
+    AdapterConfig,
+    ConsolidationConfig,
+    TrainingConfig,
+)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -730,48 +733,42 @@ def main() -> None:
         logger.info("GPU acquired")
         wait_for_cooldown(52)
 
-        # Load model and config (pattern from test_harness.load_model_and_config).
+        # Load model directly from the BENCHMARK_MODELS registry.
         from paramem.models.loader import load_base_model
 
-        config = load_config()
         model_cfg = BENCHMARK_MODELS[args.model]
-        config.model = model_cfg
-        logger.info("Loading base model: %s", config.model.model_id)
-        model, tokenizer = load_base_model(config.model)
+        logger.info("Loading base model: %s", model_cfg.model_id)
+        model, tokenizer = load_base_model(model_cfg)
 
         # --- 6. Build ConsolidationLoop ---
-        # Pattern copied from experiments/phase3_consolidation.py:143-168.
         from paramem.training.consolidation import ConsolidationLoop
 
-        episodic_config = config.adapters.get("episodic")
-        if episodic_config is None:
-            raise ValueError(
-                "Episodic adapter config is required in config. Check configs/default.yaml."
-            )
         # Probe is episodic-only: never trains or promotes to semantic. Reuse
-        # episodic_config in the semantic slot so staging-compat validation
-        # passes (default.yaml has rank 8 vs 24 mismatch).
+        # the same AdapterConfig in the semantic slot so staging-compat
+        # validation passes (rank/alpha must match across slots). Values
+        # match the legacy default.yaml episodic adapter exactly.
+        episodic_config = AdapterConfig(rank=8, alpha=16, learning_rate=1e-4, dropout=0.0)
         semantic_config = episodic_config
 
+        # Probe training config. Values match the legacy default.yaml
+        # training block exactly except for gradient_accumulation_steps
+        # (set to 2 instead of the default.yaml value of 8 -- mirrors the
+        # original probe's explicit override).
         consolidation_training = TrainingConfig(
-            batch_size=config.training.batch_size,
+            batch_size=1,
             gradient_accumulation_steps=2,
-            max_seq_length=config.training.max_seq_length,
+            max_seq_length=512,
             num_epochs=args.num_epochs,
-            warmup_ratio=config.training.warmup_ratio,
-            weight_decay=config.training.weight_decay,
-            gradient_checkpointing=config.training.gradient_checkpointing,
-            max_grad_norm=config.training.max_grad_norm,
-            seed=config.training.seed,
+            warmup_ratio=0.1,
+            weight_decay=0.01,
+            gradient_checkpointing=True,
+            max_grad_norm=1.0,
+            seed=42,
         )
 
-        # Force indexed-key replay on so train_adapters exercises the full
-        # keyed training path (default.yaml leaves it off). The probe's
-        # whole point is to dry-run extraction → merge → QA → train → smoke.
-        consolidation_cfg = replace(
-            config.consolidation,
-            indexed_key_replay_enabled=True,
-        )
+        # Indexed-key replay must be ON: the probe's whole point is to
+        # dry-run extraction → merge → QA → train → smoke.
+        consolidation_cfg = ConsolidationConfig(indexed_key_replay_enabled=True)
 
         loop = ConsolidationLoop(
             model=model,

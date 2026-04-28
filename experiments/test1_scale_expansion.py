@@ -268,7 +268,7 @@ def main():
         print(f"  Model: {bench_name} ({bench_model_config.model_id})")
         print(f"{'=' * 72}")
 
-        model, tokenizer, config = load_model_and_config(bench_model_config)
+        model, tokenizer = load_model_and_config(bench_model_config)
         bench_output_dir = model_output_dir(output_dir, bench_name)
 
         # Distill sessions on the fly until we have enough QA pairs

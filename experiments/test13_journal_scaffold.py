@@ -1031,7 +1031,7 @@ def main():
         # Single base-model load for the whole run — avoids WSL2 CUDA
         # reload instability (see CLAUDE.md "GPU / CUDA / WSL2"). Adapter
         # transitions use unwrap→create_adapter per test 10's pattern.
-        model, tokenizer, _ = load_model_and_config(model_config)
+        model, tokenizer = load_model_and_config(model_config)
         base_keyed = None
         c1_keyed = None
 

@@ -114,7 +114,7 @@ def main():
         print(f"  Persona B: {len(kp_b)} keys")
 
         # Load model + both adapters
-        model, tokenizer, _ = load_model_and_config(bench_model_config)
+        model, tokenizer = load_model_and_config(bench_model_config)
         model = load_adapter(model, str(persona_a_dir / "adapter"), "persona_a")
         model = load_adapter(model, str(persona_b_dir / "adapter"), "persona_b")
         print(f"  Adapters loaded: {list(model.peft_config.keys())}")

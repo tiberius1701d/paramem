@@ -766,7 +766,7 @@ def main():  # noqa: C901  (complexity acceptable for experiment orchestration)
     # --- Dataset ---
     model_config_ref = model_config  # capture for acquire_gpu scope
     with acquire_gpu(interactive=True):
-        model, tokenizer, _ = load_model_and_config(model_config_ref)
+        model, tokenizer = load_model_and_config(model_config_ref)
 
         # Load C1 adapter weights into the model
         logger.info("Loading C1 adapter from %s", c1_adapter_dir)

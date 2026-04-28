@@ -316,7 +316,7 @@ def main():
         print(f"  {'SMOKE TEST' if args.smoke else 'Full run'}")
         print(f"{'=' * 72}")
 
-        model, tokenizer, config = load_model_and_config(bench_model_config)
+        model, tokenizer = load_model_and_config(bench_model_config)
         output_dir = model_output_dir(base_output_dir, bench_name)
 
         # Create persistent adapter (used throughout all phases)

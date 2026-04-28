@@ -174,7 +174,7 @@ def main():
 
     # Load model
     print("\nLoading model...")
-    model, tokenizer, _ = load_model_and_config(BENCHMARK_MODELS["mistral"])
+    model, tokenizer = load_model_and_config(BENCHMARK_MODELS["mistral"])
 
     # ---- Phase 1: Train on original 108 keys (baseline) ----
     print("\n" + "=" * 80)

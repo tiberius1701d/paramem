@@ -2973,7 +2973,7 @@ def main() -> None:
     model_config = BENCHMARK_MODELS[args.model]
 
     with acquire_gpu(interactive=True):
-        model, tokenizer, _ = load_model_and_config(model_config)
+        model, tokenizer = load_model_and_config(model_config)
 
         if args.smoke:
             run_smoke(model, tokenizer, run_dir, args)

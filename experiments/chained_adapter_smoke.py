@@ -281,7 +281,7 @@ def main():
         )
 
     print(f"Loading {model_name} (quantization={quant_label})...")
-    model, tokenizer, _ = load_model_and_config(model_config)
+    model, tokenizer = load_model_and_config(model_config)
 
     # Load session data
     if use_extraction:

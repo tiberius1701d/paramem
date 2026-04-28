@@ -89,7 +89,7 @@ def main() -> None:
     model_config = BENCHMARK_MODELS[args.model]
 
     with acquire_gpu(interactive=True):
-        model, tokenizer, _ = load_model_and_config(model_config)
+        model, tokenizer = load_model_and_config(model_config)
 
         slot = resolve_adapter_slot(adapter_dir, adapter_name, "")
         if slot is None:

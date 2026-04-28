@@ -62,7 +62,6 @@ from paramem.utils.config import (  # noqa: E402
     AdapterConfig,
     ModelConfig,
     TrainingConfig,
-    load_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -302,18 +301,16 @@ def distill_session(
     return new_pairs
 
 
-def load_model_and_config(model_config: ModelConfig | None = None):
-    """Load base model and default config.
+def load_model_and_config(model_config: ModelConfig):
+    """Load the base model for the given ``ModelConfig``.
 
-    If model_config is provided, it overrides the default model settings.
-    Returns (model, tokenizer, config).
+    Callers pass an explicit ``ModelConfig`` (typically
+    ``BENCHMARK_MODELS[args.model]``); the harness does not load any
+    YAML on its own. Returns ``(model, tokenizer)``.
     """
-    config = load_config()
-    if model_config is not None:
-        config.model = model_config
-    logger.info("Loading base model: %s", config.model.model_id)
-    model, tokenizer = load_base_model(config.model)
-    return model, tokenizer, config
+    logger.info("Loading base model: %s", model_config.model_id)
+    model, tokenizer = load_base_model(model_config)
+    return model, tokenizer
 
 
 def train_indexed_keys(
@@ -565,7 +562,7 @@ def smoke_test_adapter(
         registry = json.load(f)
 
     # Load model and adapter from disk
-    model, tokenizer, _ = load_model_and_config(model_config)
+    model, tokenizer = load_model_and_config(model_config)
     model = load_adapter(model, adapter_dir, adapter_name)
 
     # Evaluate using the standard pipeline

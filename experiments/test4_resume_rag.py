@@ -107,7 +107,7 @@ def main():
     from paramem.server.config import MODEL_REGISTRY
 
     bench_model_config = MODEL_REGISTRY[args.model]
-    model, tokenizer = load_model_and_config(bench_model_config)[:2]
+    model, tokenizer = load_model_and_config(bench_model_config)
 
     # load_adapter expects the parent dir; it appends adapter_name
     adapter_dir = last_session / "adapter"
