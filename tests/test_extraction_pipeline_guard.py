@@ -497,6 +497,8 @@ def test_consolidation_loop_constructor_stores_extraction_flags(tmp_path):
     """
     from unittest.mock import MagicMock
 
+    from peft import PeftModel
+
     from paramem.training.consolidation import ConsolidationLoop
     from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
@@ -516,7 +518,10 @@ def test_consolidation_loop_constructor_stores_extraction_flags(tmp_path):
     }
 
     # Skip adapter wiring — we only care about flag storage on self.
+    # __class__ = PeftModel so _ensure_adapters' isinstance check short-circuits
+    # without restricting the mock's attribute surface.
     model = MagicMock()
+    model.__class__ = PeftModel
     model.peft_config = {
         "episodic": MagicMock(),
         "semantic": MagicMock(),

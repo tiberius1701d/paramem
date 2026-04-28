@@ -3826,9 +3826,11 @@ class ConsolidationLoop:
         """
         import shutil
 
+        from peft import PeftModel
+
         from paramem.models.loader import create_adapter
 
-        has_peft = hasattr(self.model, "peft_config")
+        has_peft = isinstance(self.model, PeftModel)
         if not has_peft or "episodic" not in self.model.peft_config:
             logger.info("Creating episodic adapter")
             self.model = create_adapter(self.model, self.episodic_config, "episodic")

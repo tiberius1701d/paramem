@@ -164,6 +164,8 @@ class TestExtractionPathParity:
         **loop_kwargs,
     ):
 
+        from peft import PeftModel
+
         from paramem.graph.qa_generator import generate_qa_from_relations as _real_qa
         from paramem.graph.schema import Entity, Relation, SessionGraph
         from paramem.training.consolidation import ConsolidationLoop
@@ -227,7 +229,10 @@ class TestExtractionPathParity:
             lambda relations, model=None, tokenizer=None: _real_qa(relations),
         )
 
+        # __class__ = PeftModel so _ensure_adapters' isinstance check
+        # short-circuits without restricting the mock's attribute surface.
         model = MagicMock()
+        model.__class__ = PeftModel
         model.peft_config = {
             "episodic": MagicMock(),
             "semantic": MagicMock(),

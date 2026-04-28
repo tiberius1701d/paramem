@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from peft import PeftModel
 
 from paramem.models.loader import (
     atomic_save_adapter,
@@ -765,8 +766,11 @@ class TestStaleInTrainingCleanup:
         stale.mkdir(parents=True)
         (stale / "leftover.bin").write_bytes(b"stale garbage")
 
-        # Build a loop with pre-wrapped mock model that has peft_config
+        # Build a loop with pre-wrapped mock model that has peft_config.
+        # __class__ = PeftModel so _ensure_adapters' isinstance check
+        # short-circuits without restricting the mock's attribute surface.
         model = MagicMock()
+        model.__class__ = PeftModel
         model.peft_config = {
             "episodic": MagicMock(),
             "semantic": MagicMock(),

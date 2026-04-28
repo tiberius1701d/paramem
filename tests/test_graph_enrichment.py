@@ -9,6 +9,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import networkx as nx
+from peft import PeftModel
 
 from paramem.training.consolidation import ConsolidationLoop, _serialize_subgraph_triples
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
@@ -30,7 +31,10 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     set here (e.g. pass ``extraction_noise_filter=""`` to test the
     no-provider skip path).
     """
+    # __class__ = PeftModel so _ensure_adapters' isinstance check
+    # short-circuits without restricting the mock's attribute surface.
     model = MagicMock()
+    model.__class__ = PeftModel
     model.peft_config = {
         "episodic": MagicMock(),
         "semantic": MagicMock(),
