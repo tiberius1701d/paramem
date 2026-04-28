@@ -103,6 +103,13 @@ adapters:
     rank: 8
     alpha: 16
     learning_rate: 5.0e-5
+    # MLP targeting is load-bearing: behavioral patterns (style, formatting,
+    # preferences) live in feed-forward layers. Attention-only would limit
+    # procedural learning to routing, not representational change. Must be
+    # spelled out explicitly — the YAML loader's dataclass-default path does
+    # NOT pick up the attention+MLP factory default when other adapter fields
+    # are present.
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # ============================================================================
 # CONSOLIDATION — MEMORY TIER LIFECYCLE

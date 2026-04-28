@@ -125,6 +125,91 @@ def test_role_aware_grounding_off_by_default(example_config):
     assert example_config.consolidation.extraction_role_aware_grounding == "off"
 
 
+def test_episodic_adapter_config_builds(example_config):
+    """Property accessor must produce a valid AdapterConfig with attention targets."""
+    cfg = example_config.episodic_adapter_config
+    assert cfg.rank == 8
+    assert cfg.alpha == 16
+    assert cfg.learning_rate == 1e-4
+    assert "q_proj" in cfg.target_modules
+    assert cfg.dropout == 0.0
+
+
+def test_procedural_adapter_targets_mlp_layers(example_config):
+    """Procedural adapter must include MLP layers — behavioural patterns live there."""
+    cfg = example_config.procedural_adapter_config
+    assert "gate_proj" in cfg.target_modules, (
+        "procedural adapter must target MLP gate_proj for representational imprinting"
+    )
+    assert "up_proj" in cfg.target_modules
+    assert "down_proj" in cfg.target_modules
+
+
+def test_training_config_uses_validated_constants(example_config):
+    """training_config property must return the Test-1-8 validated values."""
+    tc = example_config.training_config
+    assert tc.num_epochs == 30, "30 epochs is the validated floor for 100% indexed-key recall"
+    assert tc.batch_size == 1
+    assert tc.gradient_checkpointing is True
+
+
+def test_model_registry_resolves(example_config):
+    """The shipped model name must exist in MODEL_REGISTRY (no typo, no removed model)."""
+    mc = example_config.model_config
+    assert mc.model_id, "model_config must return a non-empty model_id"
+    assert mc.quantization == "nf4"
+
+
+def test_consolidation_period_derived(example_config):
+    """Full-cycle period derives from refresh_cadence × max_interim_count.
+    Default 12h × 7 = 84h.
+    """
+    period = example_config.consolidation.consolidation_period_seconds
+    assert period == 12 * 3600 * 7, f"expected 84h (302400s), got {period}s"
+    assert example_config.consolidation.consolidation_period_string == "every 84h"
+
+
+def test_voice_prompt_loads(example_config):
+    """Voice prompt file referenced by the example must exist and be non-empty."""
+    text = example_config.voice.load_prompt()
+    assert text, "voice.load_prompt() returned empty — check configs/prompts/ha_voice.txt"
+    assert len(text) > 50, "voice prompt is suspiciously short"
+
+
+def test_abstention_messages_load(example_config):
+    """Both abstention prompt files referenced by the example must exist and be non-empty."""
+    response = example_config.abstention.load_response()
+    cold = example_config.abstention.load_cold_start_response()
+    assert response, "abstention.load_response() empty — check abstention_response.txt"
+    assert cold, "abstention.load_cold_start_response() empty — check abstention_cold_start.txt"
+    assert response != cold, "cold-start and standard abstention messages should differ"
+
+
+def test_intent_exemplars_dir_populated(example_config):
+    """Intent exemplars directory must exist and contain at least one exemplar file
+    per shipped intent class. Empty/missing dir = silent fall-through to fail_closed_intent.
+    """
+    from pathlib import Path
+
+    exemplars = Path(example_config.intent.exemplars_dir)
+    assert exemplars.is_dir(), f"intent.exemplars_dir does not exist: {exemplars}"
+    classes = {p.stem.split(".", 1)[0] for p in exemplars.glob("*.txt")}
+    for required in ("personal", "command", "general"):
+        assert required in classes, (
+            f"intent exemplars missing class {required!r} (found: {sorted(classes)})"
+        )
+
+
+def test_prompts_dir_contains_extraction_templates(example_config):
+    """The prompts directory must hold the extraction templates the pipeline depends on."""
+    prompts = example_config.paths.prompts
+    assert prompts.is_dir(), f"paths.prompts does not exist: {prompts}"
+    expected = {"extraction.txt", "extraction_system.txt", "ha_voice.txt"}
+    actual = {p.name for p in prompts.iterdir()}
+    missing = expected - actual
+    assert not missing, f"prompts dir missing required templates: {missing}"
+
+
 def test_no_inline_api_key_literals():
     """Defense-in-depth: the tracked example must never contain a literal-looking
     API key. Operators should always use ${VAR} env-var interpolation. Catches a
