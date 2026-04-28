@@ -1698,6 +1698,32 @@ def _normalize_for_grounding(text: str) -> str:
     return (text or "").replace("_", " ").lower()
 
 
+def _extract_user_spans(transcript: str) -> str:
+    """Concatenate the text of every ``[user]`` (or ``user:``) line.
+
+    Production transcripts tag turns with ``[user]`` / ``[assistant]``
+    line prefixes (also ``user:`` / ``assistant:`` colon form).  This
+    helper isolates the user-authored content so role-aware grounding
+    can verify a triple's substantive tokens come from the speaker
+    themselves, not from an assistant or third-party turn.
+
+    Lines that don't carry a recognised role prefix are conservatively
+    dropped — the goal is high precision on "user said this", not
+    inclusivity.  Mirrors the asymmetric extraction in
+    :func:`_correct_entity_names` (which pulls ``[assistant]`` text).
+    """
+    out: list[str] = []
+    for line in (transcript or "").split("\n"):
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("[user]"):
+            prefix_len = stripped.index("]") + 1
+            out.append(stripped[prefix_len:].lstrip())
+        elif lower.startswith("user:"):
+            out.append(stripped[len("user:") :].lstrip())
+    return "\n".join(out)
+
+
 def _entity_is_grounded(entity: str, transcript_norm: str, known_names: set[str]) -> bool:
     """True iff every significant token in `entity` appears in the transcript.
 
@@ -1734,16 +1760,49 @@ def _entity_is_grounded(entity: str, transcript_norm: str, known_names: set[str]
 
 
 def _drop_ungrounded_facts(
-    facts: list[dict], original_transcript: str, known_names: set[str]
+    facts: list[dict],
+    original_transcript: str,
+    known_names: set[str],
+    *,
+    speaker_names: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Gate every fact's subject and object against transcript grounding.
 
-    Returns `(kept_facts, dropped_facts)`. Dropped facts had at least one
-    endpoint that was neither a known real-name nor grounded in the user's
-    transcript — they were SOTA's world-knowledge inferences, not facts
-    about the user's session. The kept facts are safe to persist.
+    Returns ``(kept_facts, dropped_facts)``.  Dropped facts had at least
+    one endpoint that was neither a known real-name nor grounded in the
+    transcript — typically SOTA world-knowledge inferences rather than
+    facts about the user's session.
+
+    Two grounding modes:
+
+    * **Role-blind** (default, ``speaker_names`` is ``None`` or empty):
+      every endpoint must ground in the *full* transcript or be in
+      ``known_names``.  Today's behaviour, preserved for backward
+      compatibility with both production callers.
+
+    * **Role-aware** (``speaker_names`` provided): when the *subject* of
+      a triple is in ``speaker_names`` (i.e. the triple makes a claim
+      *about* the speaker), the *object* must additionally ground in
+      the user-only spans of the transcript — text uttered in
+      ``[user]`` lines, not ``[assistant]`` lines.  Closes the
+      assistant-into-graph hallucination class: triples whose
+      substantive content comes only from non-speaker turns are
+      dropped deterministically, regardless of whether the prompt-
+      level attribution rule held.  ``known_names`` exemption still
+      applies on both endpoints, so cross-role spelling corrections
+      (assistant fixing a user typo) still pass.
+
+    Subject-side grounding stays role-blind even in role-aware mode:
+    the speaker can be referred to by other parties (the assistant
+    addressing them by name), so an ``[assistant]`` mention of the
+    subject doesn't disqualify the triple — only the *content* claim
+    in the object does.
     """
     transcript_norm = _normalize_for_grounding(original_transcript)
+    user_norm: str | None = None
+    if speaker_names:
+        user_norm = _normalize_for_grounding(_extract_user_spans(original_transcript))
+
     kept: list[dict] = []
     dropped: list[dict] = []
     for f in facts:
@@ -1751,12 +1810,24 @@ def _drop_ungrounded_facts(
             continue
         subj = str(f.get("subject", ""))
         obj = str(f.get("object", ""))
-        if _entity_is_grounded(subj, transcript_norm, known_names) and _entity_is_grounded(
-            obj, transcript_norm, known_names
-        ):
-            kept.append(f)
-        else:
+
+        # Subject grounding: full transcript (subject can be referred to by
+        # any participant; what matters is that they exist in the session).
+        if not _entity_is_grounded(subj, transcript_norm, known_names):
             dropped.append(f)
+            continue
+
+        # Object grounding: role-aware when speaker is the subject.
+        if speaker_names and user_norm is not None and subj in speaker_names:
+            if not _entity_is_grounded(obj, user_norm, known_names):
+                dropped.append(f)
+                continue
+        else:
+            if not _entity_is_grounded(obj, transcript_norm, known_names):
+                dropped.append(f)
+                continue
+
+        kept.append(f)
     return kept, dropped
 
 

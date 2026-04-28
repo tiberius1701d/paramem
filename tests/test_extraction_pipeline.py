@@ -915,6 +915,239 @@ class TestGroundingGate:
         assert _entity_is_grounded("Li", "i spoke with li yesterday", set())
 
 
+class TestRoleAwareGroundingGate:
+    """Role-aware extension of ``_drop_ungrounded_facts``.
+
+    With ``speaker_names`` provided, the gate requires speaker-attributed
+    object content to ground in user-only transcript spans, blocking the
+    assistant-into-graph hallucination class deterministically.  Without
+    ``speaker_names`` (or with an empty set), behaviour is exactly as the
+    role-blind gate — backward compatibility for existing call sites.
+    """
+
+    def test_extract_user_spans_handles_bracket_form(self):
+        from paramem.graph.extractor import _extract_user_spans
+
+        t = "[user] hello there\n[assistant] hi back\n[user] how are you"
+        out = _extract_user_spans(t)
+        assert "hello there" in out
+        assert "how are you" in out
+        assert "hi back" not in out
+
+    def test_extract_user_spans_handles_colon_form(self):
+        from paramem.graph.extractor import _extract_user_spans
+
+        t = "user: i live in berlin\nassistant: that is a great city\nuser: i love it"
+        out = _extract_user_spans(t)
+        assert "i live in berlin" in out
+        assert "i love it" in out
+        assert "great city" not in out
+
+    def test_extract_user_spans_drops_unprefixed_lines(self):
+        from paramem.graph.extractor import _extract_user_spans
+
+        t = "[user] tagged line\nuntagged line\n[assistant] also tagged"
+        out = _extract_user_spans(t)
+        assert "tagged line" in out
+        assert "untagged line" not in out
+        assert "also tagged" not in out
+
+    def test_speaker_subject_object_in_user_kept(self):
+        """Triple grounded in [user] turn passes role-aware gate."""
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        transcript = "[user] i love yoga and reading\n[assistant] that's wonderful"
+        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
+        kept, dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"}, speaker_names={"Alex"})
+        assert kept == facts
+        assert dropped == []
+
+    def test_speaker_subject_object_only_in_assistant_dropped(self):
+        """Triple about the speaker grounded only in [assistant] turn → dropped."""
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        transcript = (
+            "[user] what's a good hobby for me\n"
+            "[assistant] how about combining your love for yoga and travel"
+        )
+        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
+        kept, dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"}, speaker_names={"Alex"})
+        assert kept == []
+        assert dropped == facts
+
+    def test_third_party_subject_uses_full_transcript(self):
+        """Triple where subject is NOT a speaker stays under role-blind grounding.
+
+        Production case: 'Max Schmidt works_at Lorem Industries' extracted from
+        the speaker's mention of a colleague.  Both endpoints appear somewhere
+        in the transcript (possibly only assistant turns confirming names);
+        the role-aware gate must not over-drop these.
+        """
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        transcript = (
+            "[user] my colleague max schmidt joined the office\n"
+            "[assistant] understood; lorem industries"
+        )
+        facts = [
+            {"subject": "Max Schmidt", "predicate": "works_at", "object": "Lorem Industries"},
+        ]
+        kept, dropped = _drop_ungrounded_facts(facts, transcript, set(), speaker_names={"Alex"})
+        assert kept == facts
+        assert dropped == []
+
+    def test_speaker_subject_object_in_known_names_kept(self):
+        """Spelling-fix exemption survives role-aware gating.
+
+        User says 'Frankford', assistant resolves to 'Frankfurt', the
+        anonymization mapping carries 'Frankfurt' as a known real name.
+        The triple uses 'Frankfurt' as the object — under strict role-aware
+        gating it would fail (not in [user] spans verbatim), but the
+        known_names exemption must keep it.
+        """
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        transcript = (
+            "[user] my sister lives in frankford\n[assistant] frankfurt is about 200km from here"
+        )
+        facts = [
+            {"subject": "Alex", "predicate": "sister_lives_in", "object": "Frankfurt"},
+        ]
+        kept, dropped = _drop_ungrounded_facts(
+            facts,
+            transcript,
+            {"Alex", "Frankfurt"},  # 'Frankfurt' came in via mapping
+            speaker_names={"Alex"},
+        )
+        assert kept == facts
+        assert dropped == []
+
+    def test_default_no_speaker_names_is_role_blind(self):
+        """``speaker_names=None`` (default) preserves the old role-blind behaviour."""
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        # Object only in assistant turn — would be dropped under role-aware,
+        # but role-blind accepts it (token appears in transcript).
+        transcript = "[user] suggest a hobby\n[assistant] yoga is great"
+        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
+        kept, _dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"})
+        assert kept == facts  # legacy behaviour preserved
+
+    def test_empty_speaker_names_is_role_blind(self):
+        """An empty set behaves identically to ``None`` (no role-aware path)."""
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        transcript = "[user] suggest a hobby\n[assistant] yoga is great"
+        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
+        kept, _dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"}, speaker_names=set())
+        assert kept == facts
+
+    def test_subject_grounded_via_assistant_turn_still_passes(self):
+        """Subject-side grounding stays role-blind even in role-aware mode.
+
+        The speaker can be addressed by name in [assistant] turns ("Alex,
+        about your question..."); that mention is sufficient grounding for
+        the subject.  Only the *object's* substantive content needs role-
+        aware grounding.
+        """
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        # Speaker's name appears in [assistant] turn (addressing them).
+        # User's own turn has the object content.
+        transcript = "[user] i practice yoga every morning\n[assistant] alex, that's wonderful"
+        facts = [{"subject": "Alex", "predicate": "practices", "object": "yoga"}]
+        kept, _dropped = _drop_ungrounded_facts(facts, transcript, set(), speaker_names={"Alex"})
+        assert kept == facts
+
+
+class TestProvenanceGateFixture:
+    """Integration test against the curated PerLTQA failure fixture.
+
+    Every candidate in ``tests/fixtures/provenance_gate_failures.json`` is a
+    real assistant-into-graph hallucination from a probe run.  The role-
+    aware gate must drop every one when given the dialogue's speaker as
+    ``speaker_names``.  Conversely, the legacy role-blind path keeps them
+    (object tokens appear in the transcript, just on the wrong side) —
+    asserting both halves proves the gate is what catches them.
+    """
+
+    @staticmethod
+    def _load_fixture():
+        import json
+        from pathlib import Path
+
+        fp = Path(__file__).parent / "fixtures" / "provenance_gate_failures.json"
+        with fp.open() as f:
+            return json.load(f)
+
+    def test_role_aware_drops_every_fixture_candidate(self):
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        fixture = self._load_fixture()
+        misses: list[str] = []
+        for c in fixture["candidates"]:
+            dialogue = fixture["dialogues"][c["dialogue_key"]]
+            transcript = dialogue["transcript"]
+            speaker = dialogue["speaker"]
+            triple = {
+                "subject": c["subject"],
+                "predicate": c["predicate"],
+                "object": c["object"],
+            }
+            kept, _dropped = _drop_ungrounded_facts(
+                [triple], transcript, {speaker}, speaker_names={speaker}
+            )
+            if kept:
+                misses.append(
+                    f"{c['dialogue_key']}: {triple['subject']} | "
+                    f"{triple['predicate']} | {triple['object']!r} "
+                    f"(said by {c['said_by']})"
+                )
+        assert misses == [], (
+            f"Role-aware gate failed to drop {len(misses)} fixture hallucinations:\n"
+            + "\n".join(f"  {m}" for m in misses)
+        )
+
+    def test_role_blind_keeps_fixture_candidates_proves_gate_is_load_bearing(self):
+        """Without ``speaker_names`` the legacy gate keeps every candidate.
+
+        This asserts the gate is doing real work — the fixture's
+        hallucinations *do* ground in the transcript token-wise (the
+        object appears somewhere), they just appear in the wrong role.
+        Role-blind grounding can't tell.  If this test ever fails, it
+        means the role-blind path got tightened separately — re-evaluate
+        the role-aware contract.
+        """
+        from paramem.graph.extractor import _drop_ungrounded_facts
+
+        fixture = self._load_fixture()
+        unexpectedly_dropped = 0
+        for c in fixture["candidates"]:
+            dialogue = fixture["dialogues"][c["dialogue_key"]]
+            transcript = dialogue["transcript"]
+            speaker = dialogue["speaker"]
+            triple = {
+                "subject": c["subject"],
+                "predicate": c["predicate"],
+                "object": c["object"],
+            }
+            kept, _dropped = _drop_ungrounded_facts([triple], transcript, {speaker})
+            if not kept:
+                unexpectedly_dropped += 1
+        # Most fixture candidates should pass role-blind grounding (their
+        # object tokens are present in transcript, just in assistant turns).
+        # A small number may be dropped if the object also fails the basic
+        # grounding (e.g. SOTA invented a name).  Assert >= 80% are kept by
+        # role-blind so the gate's value is demonstrably the role split.
+        total = len(fixture["candidates"])
+        kept_count = total - unexpectedly_dropped
+        assert kept_count / total >= 0.8, (
+            f"Role-blind gate already drops {unexpectedly_dropped}/{total} "
+            f"fixture candidates — fixture may be miscalibrated, or the "
+            f"role-blind gate has tightened.  Re-curate the fixture."
+        )
+
+
 class TestSpeakerContextInjection:
     def test_build_speaker_context_empty_when_unknown(self):
         from paramem.graph.extractor import build_speaker_context
