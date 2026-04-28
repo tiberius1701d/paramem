@@ -2412,8 +2412,11 @@ def verify_anonymization_completeness(
        and produce placeholder strings in the final graph. Correctness gap.
 
     ``pii_scope`` is the set of internal type names the operator wants
-    anonymized; defaults to :data:`_DEFAULT_PII_SCOPE` (``{"person"}``).
-    Names whose extractor-declared ``entity_type`` is outside the scope
+    anonymized; defaults to :data:`_DEFAULT_PII_SCOPE`
+    (``{"person", "place"}`` — the primitive-layer fallback, wider than
+    the cloud-egress helper's ``{"person"}`` ship default to preserve
+    consolidation's prior leak-detection coverage).  Names whose
+    extractor-declared ``entity_type`` is outside the scope
     pass through verbatim — by design.  An empty scope yields an empty
     "real names" set: the privacy guard returns empty (no leaks
     possible because nothing is in scope), and the caller treats the
