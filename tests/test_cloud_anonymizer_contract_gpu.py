@@ -154,8 +154,8 @@ def loaded_model():
     """Load the Mistral 7B local cloud anonymizer judge once per module.
 
     Uses ``load_server_config("tests/fixtures/server.yaml")`` to pin the
-    calibration target. The 60% threshold above is anchored to Mistral
-    7B at temperature 0; loading any other model would silently
+    calibration target.  The ``_MATCH_THRESHOLD`` above is anchored to
+    Mistral 7B at temperature 0; loading any other model would silently
     re-calibrate against an untested baseline.
     """
     import gc
