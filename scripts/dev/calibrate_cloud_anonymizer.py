@@ -264,19 +264,23 @@ def main(argv: list[str] | None = None) -> int:
     from paramem.models.loader import load_base_model
     from paramem.server.config import load_server_config
 
-    # Use the server config (Mistral 7B by default) — matches what the
-    # deployed cloud_anonymizer actually runs against.  The training-side
-    # default.yaml config defaults to Qwen 3B, which is too weak at
-    # structured JSON output for the anonymizer prompt.
-    server_cfg = load_server_config("configs/server.yaml.example")
+    # Load the CI test fixture so the calibration target matches what
+    # ``tests/test_cloud_anonymizer_contract_gpu.py`` runs against —
+    # same model (Mistral 7B), same default cloud_scope.  Loading
+    # ``configs/server.yaml.example`` instead would re-anchor the
+    # calibration whenever the shipped template's ship-default drifts
+    # (e.g. cloud_mode block ↔ anonymize) without changing what the
+    # contract test actually exercises.  Per CLAUDE.md, calibration
+    # and tests share the fixture as the single calibration anchor.
+    server_cfg = load_server_config("tests/fixtures/server.yaml")
     model_cfg = server_cfg.model_config
     print(f"  model: {model_cfg.model_id}")
     model, tokenizer = load_base_model(model_cfg)
     print("  ready")
 
     # Resolve the scope.  CLI override wins; otherwise inherit from the
-    # shipped default config so the calibration result reflects the
-    # operator-facing default unless explicitly varied.
+    # fixture so the calibration result reflects the contract test's
+    # default scope unless explicitly varied.
     if args.scope is None:
         scope = set(server_cfg.sanitization.cloud_scope)
     else:
