@@ -585,6 +585,27 @@ def parse_args() -> argparse.Namespace:
             "Saves GPU time when the goal is extraction quality, not adapter recall."
         ),
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Set cfg.debug=True so the canonical _dump_session_graph path "
+            "persists per-session SessionGraphs (with full graph.diagnostics) "
+            "under <run_dir>/debug/cycle_<N>/sessions/<id>/. Required to "
+            "capture diagnostics that aren't surfaced via _build_session_diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--role-aware-grounding",
+        choices=["off", "diagnostic", "active"],
+        default=None,
+        dest="role_aware_grounding",
+        help=(
+            "Override cfg.consolidation.extraction_role_aware_grounding for this run. "
+            "diagnostic mode populates graph.diagnostics['role_aware_would_drop'] "
+            "without affecting production behaviour — pair with --debug to persist."
+        ),
+    )
     args = parser.parse_args()
     if args.sample_strategy == "stratified" and args.sample_size is None:
         parser.error("--sample-size is required when --sample-strategy=stratified")
@@ -762,6 +783,11 @@ def main() -> None:
             cfg.consolidation.extraction_noise_filter = ""
             cfg.consolidation.extraction_plausibility_judge = "off"
 
+        if args.debug:
+            cfg.debug = True
+        if args.role_aware_grounding is not None:
+            cfg.consolidation.extraction_role_aware_grounding = args.role_aware_grounding
+
         cfg.consolidation.indexed_key_replay = True
 
         loop = create_consolidation_loop(
@@ -770,7 +796,7 @@ def main() -> None:
             config=cfg,
             state_provider=None,
             output_dir=run_dir,
-            save_cycle_snapshots=False,
+            save_cycle_snapshots=None,
             persist_graph=False,
             seed_state_from_disk=False,
         )
