@@ -382,7 +382,7 @@ def distill_qa_from_sessions(model, tokenizer, character, target_count, extracto
 # ============================================================================
 
 
-def wait_for_cooldown(target=45):
+def wait_for_cooldown(target=52):
     """Block until GPU temperature drops below target."""
     subprocess.run(
         [
@@ -610,7 +610,7 @@ def main():
                 continue
 
             print(f"\n--- Scale point: {scale} keys ---")
-            wait_for_cooldown(45)
+            wait_for_cooldown(52)
 
             model, epoch_log, epoch_details, scale_result = run_scale_point(
                 model, tokenizer, qa_pairs, scale, args.rank, num_epochs, output_dir

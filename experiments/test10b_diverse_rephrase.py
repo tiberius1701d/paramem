@@ -34,7 +34,7 @@ def is_paused():
     return PAUSE_FILE.exists()
 
 
-def wait_for_cooldown(target=45):
+def wait_for_cooldown(target=52):
     """Block until GPU temperature drops below target."""
     try:
         subprocess.run(
@@ -564,7 +564,7 @@ def run_test10b(
         )
 
     # Cooldown after question generation (sustained GPU burst)
-    wait_for_cooldown(45)
+    wait_for_cooldown(52)
 
     # Evaluate each checkpoint
     completed = 0
@@ -615,7 +615,7 @@ def run_test10b(
         if i < len(checkpoints) - 1:
             if isinstance(model, PeftModel):
                 model = model.base_model.model
-            wait_for_cooldown(45)
+            wait_for_cooldown(52)
 
     # Unwrap final adapter
     if isinstance(model, PeftModel):

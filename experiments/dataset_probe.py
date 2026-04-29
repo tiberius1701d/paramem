@@ -71,7 +71,7 @@ _LOADER_REGISTRY: dict[str, type] = {
 # ---------------------------------------------------------------------------
 
 
-def wait_for_cooldown(target: int = 45) -> None:
+def wait_for_cooldown(target: int = 52) -> None:
     """Block until GPU temperature drops below target (°C).
 
     Shells out to gpu-cooldown.sh. Returns instantly if GPU is already cool.

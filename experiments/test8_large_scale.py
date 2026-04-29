@@ -93,7 +93,7 @@ ESTIMATED_CYCLE_DISK_MB = 35
 # ============================================================================
 
 
-def wait_for_cooldown(target=45):
+def wait_for_cooldown(target=52):
     """Block until GPU temperature drops below target.
 
     Falls back to a fixed 60s sleep if the cooldown script is unavailable.
@@ -1192,7 +1192,7 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
 
         # GPU cooldown between cycles (only if continuing)
         print("  Cooling down...")
-        wait_for_cooldown(45)
+        wait_for_cooldown(52)
 
     # Clean up pause file — run is finished regardless of how the loop exited
     if PAUSE_FILE.exists():

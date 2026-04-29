@@ -65,7 +65,7 @@ CHARACTER = "Deng Yu"
 TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "o_proj"]
 
 
-def wait_for_cooldown(target=45):
+def wait_for_cooldown(target=52):
     """Block until GPU temperature drops below target."""
     try:
         subprocess.run(
@@ -529,7 +529,7 @@ def main():
         # GPU cooldown between sessions
         if i < len(sessions) - 1:
             print("  Cooling down...")
-            wait_for_cooldown(45)
+            wait_for_cooldown(52)
 
     # Unmerge is not possible with merge_and_unload (PEFT wrapper stripped).
     # This is by design — the merged base IS the model.

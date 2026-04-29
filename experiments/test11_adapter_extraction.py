@@ -38,7 +38,7 @@ def is_paused():
     return PAUSE_FILE.exists()
 
 
-def wait_for_cooldown(target=45):
+def wait_for_cooldown(target=52):
     """Block until GPU temperature drops below target."""
     try:
         subprocess.run(
@@ -600,7 +600,7 @@ def run_experiment(model_name: str, num_sessions: int, resume: bool = False):
     save_json_atomic(state, state_path)
 
     logger.info("Cooldown between passes...")
-    wait_for_cooldown(45)
+    wait_for_cooldown(52)
 
     # ---- Pass 2: adapter ON (base model + Test 8 adapter) ----
     state["current_pass"] = "adapter_on"

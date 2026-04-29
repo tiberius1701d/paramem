@@ -44,7 +44,7 @@ def is_paused():
     return PAUSE_FILE.exists()
 
 
-def wait_for_cooldown(target=45):
+def wait_for_cooldown(target=52):
     """Block until GPU temperature drops below target.
 
     Falls back to a fixed 60s sleep if the cooldown script is unavailable.
@@ -1189,7 +1189,7 @@ def run_control_shuffled(
             probe_results["threehop"]["recall_rate"] * 100,
         )
 
-        wait_for_cooldown(45)
+        wait_for_cooldown(52)
 
         if is_paused():
             logger.info("  Shuffled control paused at E%d", current_epoch)
@@ -1539,7 +1539,7 @@ def run_experiment(
 
         # GPU cooldown
         logger.info("  Cooling down GPU...")
-        wait_for_cooldown(45)
+        wait_for_cooldown(52)
 
         # Check pause
         if is_paused():

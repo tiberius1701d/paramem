@@ -182,7 +182,7 @@ def generate_synthetic_qa(n: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def wait_for_cooldown(target: int = 45) -> None:
+def wait_for_cooldown(target: int = 52) -> None:
     """Block until GPU temperature drops below target Celsius.
 
     Falls back to a 60-second sleep if the cooldown script is unavailable.
@@ -562,7 +562,7 @@ def run_experiment_outer(model_name: str) -> None:
         cohort_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("=== Cohort n=%d: cooling down GPU before subprocess ===", n)
-        wait_for_cooldown(45)
+        wait_for_cooldown(52)
 
         print(f"\n--- Cohort n={n}: launching subprocess ---")
 
