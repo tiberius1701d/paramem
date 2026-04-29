@@ -414,10 +414,21 @@ def assert_mode_consistency(
         sample_enc = probe.age_paths[0]
         sample_pt = probe.plaintext_paths[0]
         raise FatalConfigError(
-            "Mixed encryption state on disk: "
+            f"Mixed encryption state on disk: "
             f"{sample_enc} is age-encrypted but {sample_pt} is plaintext "
             f"({len(probe.age_paths)} age, {len(probe.plaintext_paths)} "
-            "plaintext in total). Reconcile the store before startup."
+            f"plaintext in total).\n"
+            f"\n"
+            f"Likely cause:\n"
+            f"  Encryption was enabled after some files were written plaintext,\n"
+            f"  or a writer skipped the encrypted helper.\n"
+            f"\n"
+            f"Remediation:\n"
+            f"  - paramem encrypt-infra --dry-run  # preview what would change\n"
+            f"  - paramem encrypt-infra            # migrate plaintext files in-place\n"
+            f"\n"
+            f"See SECURITY.md for a full reset procedure that\n"
+            f"preserves speaker_profiles.json."
         )
 
     # Plaintext files while the daily identity is loaded → encryption enabled
@@ -426,9 +437,18 @@ def assert_mode_consistency(
         raise FatalConfigError(
             f"The daily identity is loaded but {len(probe.plaintext_paths)} "
             f"infrastructure file(s) on disk are plaintext "
-            f"(e.g. {probe.plaintext_paths[0]}). Migrate the store to age "
-            "before startup, or unset the daily passphrase to run in the "
-            "Security-OFF posture."
+            f"(e.g. {probe.plaintext_paths[0]}).\n"
+            f"\n"
+            f"Likely cause:\n"
+            f"  The daily identity is loaded but legacy plaintext files predate\n"
+            f"  the encryption rollout (or a prior migration was incomplete).\n"
+            f"\n"
+            f"Remediation:\n"
+            f"  - paramem encrypt-infra  # migrate plaintext files in-place\n"
+            f"  - OR unset {DAILY_PASSPHRASE_ENV_VAR} to run in the Security-OFF posture.\n"
+            f"\n"
+            f"See SECURITY.md for a full reset procedure that\n"
+            f"preserves speaker_profiles.json."
         )
 
     # age files present without the daily identity → unreadable.
@@ -436,8 +456,19 @@ def assert_mode_consistency(
         raise FatalConfigError(
             f"{len(probe.age_paths)} infrastructure file(s) on disk are age-"
             f"encrypted (e.g. {probe.age_paths[0]}) but the daily identity "
-            f"is not loadable. Set {DAILY_PASSPHRASE_ENV_VAR} and ensure "
-            "~/.config/paramem/daily_key.age exists before startup."
+            f"is not loadable.\n"
+            f"\n"
+            f"Likely cause:\n"
+            f"  {DAILY_PASSPHRASE_ENV_VAR} is unset, the daily key file moved,\n"
+            f"  or the passphrase changed since the files were written.\n"
+            f"\n"
+            f"Remediation:\n"
+            f"  - export {DAILY_PASSPHRASE_ENV_VAR}=<your daily passphrase>\n"
+            f"  - Confirm ~/.config/paramem/daily_key.age exists and is readable.\n"
+            f"  - If you've lost the passphrase, see: paramem restore --help\n"
+            f"\n"
+            f"See SECURITY.md for a full reset procedure that\n"
+            f"preserves speaker_profiles.json."
         )
 
     # Otherwise the store is consistent with the loaded keys — proceed.

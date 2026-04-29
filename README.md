@@ -437,6 +437,8 @@ Under Security ON (operator-configured daily age identity loaded), ParaMem envel
 
 Key lifecycle is driven by the `paramem generate-key` / `change-passphrase` / `rotate-daily` / `rotate-recovery` / `restore` / `dump` commands — see [`SECURITY.md`](SECURITY.md) for the first-run walkthrough, threat model, operator responsibilities, and known limitations.
 
+If the startup gate fires with a "mixed encryption state" or "plaintext present" error, run `paramem encrypt-infra` to migrate plaintext files in-place without losing data. For a full store reset (e.g. after a failed migration or lost passphrase), see [`SECURITY.md`](SECURITY.md).
+
 ## Data
 
 Synthetic test data (`data/synthetic/`) is included in the repository. Additional datasets used for benchmarking and probing:

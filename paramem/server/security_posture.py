@@ -86,7 +86,19 @@ def assert_startup_posture(
     if daily_loadable:
         return
     raise FatalConfigError(
-        "security.require_encryption=true but the daily age identity is not "
-        f"loadable — run `paramem generate-key` and set {DAILY_PASSPHRASE_ENV_VAR} "
-        "before starting the server"
+        f"security.require_encryption=true but the daily age identity is not loadable.\n"
+        f"\n"
+        f"Likely cause:\n"
+        f"  security.require_encryption: true is set in server.yaml but\n"
+        f"  {DAILY_PASSPHRASE_ENV_VAR} is unset or ~/.config/paramem/daily_key.age\n"
+        f"  is missing at startup.\n"
+        f"\n"
+        f"Remediation:\n"
+        f"  - export {DAILY_PASSPHRASE_ENV_VAR}=<your daily passphrase>\n"
+        f"  - Confirm ~/.config/paramem/daily_key.age exists and is readable.\n"
+        f"  - If no key exists yet, run: paramem generate-key\n"
+        f"  - OR set security.require_encryption: false to fall back to AUTO posture.\n"
+        f"\n"
+        f"See SECURITY.md for a full reset procedure that\n"
+        f"preserves speaker_profiles.json."
     )

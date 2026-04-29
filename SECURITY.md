@@ -127,6 +127,35 @@ The Security-OFF opt-out is the operator's choice. Deployments that want a misco
 - Plaintext files alongside age envelopes → startup refused; reconcile the store before restart.
 - Plaintext files while the daily identity is loaded → startup refused; migrate the store or unset the passphrase.
 
+### Recovering from a startup-gate refusal
+
+The error message from each refusal points at one of two paths.
+
+**Migration path** — the store is sound but partially encrypted (typical when encryption was enabled after some files were already written plaintext, or a writer skipped the encrypted helper):
+
+```
+paramem encrypt-infra --dry-run     # preview what would change
+paramem encrypt-infra                # migrate plaintext files in-place
+```
+
+The CLI walks the same `infra_paths` set the gate scans, skips files already in age form, and atomically encrypts the rest under the loaded daily identity. Idempotent — safe to re-run. Refuses without `PARAMEM_DAILY_PASSPHRASE` set unless `--dry-run`.
+
+**Reset path** — the on-disk artifacts are stale (old training checkpoints, debug dumps from prior runs) and migrating them would only preserve clutter. Drops everything except voice enrollment and the keys themselves:
+
+```bash
+systemctl --user stop paramem-server.service
+SAFETY=/tmp/paramem-fresh-backup-$(date +%Y%m%d-%H%M)
+mkdir -p "$SAFETY"
+cd "$PARAMEM_DATA_DIR"   # typically data/ha/
+mv adapters debug sessions backups state observed_languages.json registry/key_metadata.json "$SAFETY/"
+rmdir registry 2>/dev/null
+systemctl --user start paramem-server.service
+```
+
+Preserved: `data/ha/speaker_profiles.json` (voice enrollment), `data/ha/tts/` (static models), `~/.config/paramem/{daily_key.age,recovery.pub}` (key material).
+
+Rollback by `mv`-ing each item back from `$SAFETY/` into `data/ha/`. Once the new state has soaked for long enough that you trust it, `rm -rf "$SAFETY"`.
+
 ### Plaintext-by-design carve-outs
 
 Some on-disk artifacts are intentionally kept plaintext in both modes:
