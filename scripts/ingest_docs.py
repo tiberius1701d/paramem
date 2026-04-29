@@ -25,7 +25,10 @@ Exit codes:
     0  success
     1  HTTP error or unexpected server response
     2  file problem (unsupported format, empty file, scanned PDF)
-    3  argparse error (handled by argparse itself)
+    3  argparse error (handled by argparse itself).  Note: the server's
+       FatalConfigError convention also uses exit 3 (never-restart, see
+       configs/server.yaml ``process.restart``) — that is a separate
+       process; this CLI's exit 3 is argparse-only.
 """
 
 from __future__ import annotations
@@ -225,11 +228,7 @@ def post_chunks(server_url: str, speaker_id: str, chunks: list[DocumentChunk]) -
     try:
         return post_json(url, payload, timeout=30.0)
     except ServerUnreachable as exc:
-        print(
-            f"ERROR: server not reachable at {server_url} — {exc}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        _exit_unreachable(server_url, exc)
     except ServerUnavailable:
         print(
             "ERROR: POST /ingest-sessions not available on this server version.",
@@ -238,6 +237,34 @@ def post_chunks(server_url: str, speaker_id: str, chunks: list[DocumentChunk]) -
         sys.exit(1)
     except ServerHTTPError as exc:
         _handle_ingest_http_error(exc)
+
+
+_UNREACHABLE_HINT = (
+    "Run `pstatus` to diagnose — if startup was refused by the encryption "
+    "gate, pstatus prints the Reason / Cause / Remedy block. "
+    "See SECURITY.md §4 for recovery."
+)
+
+
+def _exit_unreachable(server_url: str, exc: Exception) -> None:
+    """Print the standard 'server not reachable' error and exit 1.
+
+    Centralises the message so every caller surfaces the same pstatus /
+    SECURITY.md hint when the server is down (commonly: gate-refused
+    startup under ``require_encryption: true``).
+
+    Args:
+        server_url: Base URL the CLI tried to reach.
+        exc: The underlying exception (typically ``ServerUnreachable``).
+
+    Raises:
+        SystemExit(1): Always.
+    """
+    print(
+        f"ERROR: server not reachable at {server_url} — {exc}\n{_UNREACHABLE_HINT}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def _handle_ingest_http_error(exc: ServerHTTPError) -> None:
@@ -261,9 +288,11 @@ def _handle_ingest_http_error(exc: ServerHTTPError) -> None:
             file=sys.stderr,
         )
     elif exc.status_code == 409:
+        # Echo the server body verbatim — it carries the actionable
+        # remedy (POST /migration/accept or /migration/rollback) and the
+        # CLI should not paper over it with a less-informative message.
         print(
-            "ERROR: server is busy with a migration trial (HTTP 409). "
-            "Try again after the trial completes.",
+            f"ERROR: ingest blocked by migration trial (HTTP 409): {exc.body}",
             file=sys.stderr,
         )
     else:
@@ -290,8 +319,7 @@ def request_consolidate(server_url: str) -> dict:
     try:
         return post_json(url, timeout=10.0)
     except ServerUnreachable as exc:
-        print(f"ERROR: server not reachable: {exc}", file=sys.stderr)
-        sys.exit(1)
+        _exit_unreachable(server_url, exc)
     except (ServerUnavailable, ServerHTTPError) as exc:
         print(f"ERROR: consolidate request failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -314,8 +342,7 @@ def request_cancel(server_url: str, session_ids: list[str]) -> dict:
     try:
         return post_json(url, {"session_ids": session_ids}, timeout=10.0)
     except ServerUnreachable as exc:
-        print(f"ERROR: server not reachable: {exc}", file=sys.stderr)
-        sys.exit(1)
+        _exit_unreachable(server_url, exc)
     except (ServerUnavailable, ServerHTTPError) as exc:
         print(f"ERROR: cancel request failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -339,8 +366,11 @@ def _fetch_speaker_profiles(server_url: str) -> list[dict]:
     try:
         data = get_json(url, timeout=5.0)
     except ServerUnreachable as exc:
+        # Same hint as the other reachability sites; also remind the
+        # operator that --non-interactive avoids needing /status at all.
         print(
             f"ERROR: server not reachable at {server_url} — {exc}\n"
+            f"{_UNREACHABLE_HINT}\n"
             "Tip: if you already know the speaker id, use --non-interactive --speaker <id>.",
             file=sys.stderr,
         )
