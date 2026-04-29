@@ -24,6 +24,7 @@ import pytest
 from paramem.server.active_store_migration import (
     TIERS,
     MigrationState,
+    _migrate_tier_simulate_to_train,
     _migrate_tier_train_to_simulate,
     _TierSkipped,
     clear_state,
@@ -59,15 +60,26 @@ def _write_simulate_kp(simulate_dir: Path, tier: str, keyed_pairs: list[dict]) -
     return p
 
 
-def _write_adapter_slot_kp(
-    adapter_dir: Path, tier: str, slot_ts: str, keyed_pairs: list[dict]
-) -> Path:
-    """Write a kp file in the adapter slot layout: <adapters>/<tier>/<ts>/keyed_pairs.json."""
-    slot_dir = adapter_dir / tier / slot_ts
-    slot_dir.mkdir(parents=True, exist_ok=True)
-    p = slot_dir / "keyed_pairs.json"
+def _write_adapter_kp(adapter_dir: Path, tier: str, keyed_pairs: list[dict]) -> Path:
+    """Write a kp file at the canonical TIER-LEVEL path:
+    ``<adapter_dir>/<tier>/keyed_pairs.json``.
+
+    Matches the layout produced by ``_save_adapters._write_kp`` /
+    ``_save_keyed_pairs_for_router``; verified live (the tier-level kp is the
+    canonical artifact, slot subdirs hold weights + manifest only).
+    """
+    tier_dir = adapter_dir / tier
+    tier_dir.mkdir(parents=True, exist_ok=True)
+    p = tier_dir / "keyed_pairs.json"
     p.write_bytes(json.dumps(keyed_pairs).encode("utf-8"))
     return p
+
+
+def _write_adapter_slot_dir(adapter_dir: Path, tier: str, slot_ts: str) -> Path:
+    """Create an empty slot subdir to simulate trained-but-not-yet-collected state."""
+    slot_dir = adapter_dir / tier / slot_ts
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    return slot_dir
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +188,7 @@ class TestDetectModeSwitch:
 
     def test_train_to_simulate_detected(self, tmp_path):
         cfg = _make_config(tmp_path, mode="simulate")
-        _write_adapter_slot_kp(cfg.adapter_dir, "episodic", "20260429-180000", [{"key": "g1"}])
+        _write_adapter_kp(cfg.adapter_dir, "episodic", [{"key": "g1"}])
         result = detect_mode_switch(cfg)
         assert result is not None
         assert result.direction == "train_to_simulate"
@@ -185,7 +197,7 @@ class TestDetectModeSwitch:
     def test_active_state_consistent_no_migration(self, tmp_path):
         # Both stores have content matching the operator's mode → no switch
         cfg = _make_config(tmp_path, mode="train")
-        _write_adapter_slot_kp(cfg.adapter_dir, "episodic", "20260429-180000", [{"key": "g1"}])
+        _write_adapter_kp(cfg.adapter_dir, "episodic", [{"key": "g1"}])
         # Stale simulate-store from prior mode IS present, but adapter is too —
         # this is a "stale inactive store" case, not a mode switch.
         _write_simulate_kp(cfg.simulate_dir, "episodic", [{"key": "g1"}])
@@ -208,23 +220,11 @@ class TestMigrateTierTrainToSimulate:
             keyed_pairs = [
                 {"key": f"g{i}", "question": f"q{i}", "answer": f"a{i}"} for i in range(3)
             ]
-        _write_adapter_slot_kp(cfg.adapter_dir, tier, "20260429-180000", keyed_pairs)
+        _write_adapter_kp(cfg.adapter_dir, tier, keyed_pairs)
         return cfg, keyed_pairs
 
-    def test_no_adapter_dir_skipped(self, tmp_path):
+    def test_no_kp_skipped(self, tmp_path):
         cfg = _make_config(tmp_path, mode="simulate")
-        with pytest.raises(_TierSkipped, match="no adapter dir"):
-            _migrate_tier_train_to_simulate(MagicMock(), cfg, "episodic")
-
-    def test_no_slots_skipped(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="simulate")
-        (cfg.adapter_dir / "episodic").mkdir(parents=True)
-        with pytest.raises(_TierSkipped, match="no adapter slots"):
-            _migrate_tier_train_to_simulate(MagicMock(), cfg, "episodic")
-
-    def test_no_kp_in_latest_slot_skipped(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="simulate")
-        (cfg.adapter_dir / "episodic" / "20260429-180000").mkdir(parents=True)
         with pytest.raises(_TierSkipped, match="no keyed_pairs.json"):
             _migrate_tier_train_to_simulate(MagicMock(), cfg, "episodic")
 
@@ -235,7 +235,9 @@ class TestMigrateTierTrainToSimulate:
 
     def test_happy_path_copies_writes_probes_cleans_up(self, tmp_path):
         cfg, keyed_pairs = self._setup_tier(tmp_path)
-        # Probe stub: every key returns a hit (recall = 1.0)
+        # Slot subdir present alongside the tier-level kp — should be cleaned up
+        # by the post-pass shutil.rmtree of the entire tier dir.
+        _write_adapter_slot_dir(cfg.adapter_dir, "episodic", "20260429-180000")
         with patch("paramem.training.indexed_memory.probe_keys_from_disk") as probe:
             probe.return_value = {kp["key"]: {"raw_output": "ok"} for kp in keyed_pairs}
             _migrate_tier_train_to_simulate(MagicMock(), cfg, "episodic")
@@ -244,11 +246,12 @@ class TestMigrateTierTrainToSimulate:
         assert target.exists()
         loaded = json.loads(target.read_bytes())
         assert loaded == keyed_pairs
-        # Adapter dir for the tier was deleted
+        # Adapter dir for the tier (and its slot subdirs) deleted
         assert not (cfg.adapter_dir / "episodic").exists()
 
     def test_probe_failure_rolls_back(self, tmp_path):
         cfg, keyed_pairs = self._setup_tier(tmp_path)
+        _write_adapter_slot_dir(cfg.adapter_dir, "episodic", "20260429-180000")
         with patch("paramem.training.indexed_memory.probe_keys_from_disk") as probe:
             # Half the keys fail to probe
             probe.return_value = {
@@ -259,20 +262,9 @@ class TestMigrateTierTrainToSimulate:
                 _migrate_tier_train_to_simulate(MagicMock(), cfg, "episodic")
         # Rollback: simulate-store write removed
         assert not (cfg.simulate_dir / "episodic" / "keyed_pairs.json").exists()
-        # Adapter dir for the tier preserved (source authoritative)
+        # Adapter tier dir preserved (source authoritative)
+        assert (cfg.adapter_dir / "episodic" / "keyed_pairs.json").exists()
         assert (cfg.adapter_dir / "episodic" / "20260429-180000").exists()
-
-    def test_picks_lex_max_slot(self, tmp_path):
-        cfg = _make_config(tmp_path, mode="simulate")
-        old_kp = [{"key": "old1", "question": "q", "answer": "a"}]
-        new_kp = [{"key": "new1", "question": "q", "answer": "a"}]
-        _write_adapter_slot_kp(cfg.adapter_dir, "episodic", "20260101-000000", old_kp)
-        _write_adapter_slot_kp(cfg.adapter_dir, "episodic", "20260429-180000", new_kp)
-        with patch("paramem.training.indexed_memory.probe_keys_from_disk") as probe:
-            probe.return_value = {"new1": {"raw_output": "ok"}}
-            _migrate_tier_train_to_simulate(MagicMock(), cfg, "episodic")
-        loaded = json.loads((cfg.simulate_dir / "episodic" / "keyed_pairs.json").read_bytes())
-        assert loaded == new_kp  # latest slot, not the older one
 
 
 # ---------------------------------------------------------------------------
@@ -293,12 +285,11 @@ class TestMigrateOrchestrator:
 
     def test_per_tier_failure_isolated(self, tmp_path):
         cfg = _make_config(tmp_path, mode="simulate")
-        # Set up all three tiers with kp files
+        # Set up all three tiers with kp files at the canonical tier-level path
         for tier in TIERS:
-            _write_adapter_slot_kp(
+            _write_adapter_kp(
                 cfg.adapter_dir,
                 tier,
-                "20260429-180000",
                 [{"key": f"{tier}_g1", "question": "q", "answer": "a"}],
             )
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
@@ -320,7 +311,7 @@ class TestMigrateOrchestrator:
         # State file persists because not all_tiers_done
         assert state_path(cfg.adapter_dir).exists()
         # Source for failed tier still on disk
-        assert (cfg.adapter_dir / "episodic" / "20260429-180000").exists()
+        assert (cfg.adapter_dir / "episodic" / "keyed_pairs.json").exists()
         # Sources for succeeded tiers cleaned up
         assert not (cfg.adapter_dir / "semantic").exists()
         assert not (cfg.adapter_dir / "procedural").exists()
@@ -328,10 +319,9 @@ class TestMigrateOrchestrator:
     def test_all_complete_clears_state_file(self, tmp_path):
         cfg = _make_config(tmp_path, mode="simulate")
         for tier in TIERS:
-            _write_adapter_slot_kp(
+            _write_adapter_kp(
                 cfg.adapter_dir,
                 tier,
-                "20260429-180000",
                 [{"key": f"{tier}_g1", "question": "q", "answer": "a"}],
             )
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
@@ -347,10 +337,9 @@ class TestMigrateOrchestrator:
         cfg = _make_config(tmp_path, mode="simulate")
         # Only semantic + procedural have on-disk content; episodic was already done
         for tier in ("semantic", "procedural"):
-            _write_adapter_slot_kp(
+            _write_adapter_kp(
                 cfg.adapter_dir,
                 tier,
-                "20260429-180000",
                 [{"key": f"{tier}_g1", "question": "q", "answer": "a"}],
             )
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
@@ -362,3 +351,115 @@ class TestMigrateOrchestrator:
             result = migrate(MagicMock(), cfg, state)
         # All tiers complete now (episodic from prior, others from this run)
         assert set(result.completed_tiers) == set(TIERS)
+
+
+# ---------------------------------------------------------------------------
+# Per-tier: simulate -> train
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateTierSimulateToTrain:
+    """Mocks the entire training stack — verifies orchestration and rollback."""
+
+    def _make_loop(self, *, tier_in_peft=False):
+        loop = MagicMock()
+        # Per-tier configs (simulate the dataclass attributes the helper reads)
+        loop.episodic_config = MagicMock()
+        loop.semantic_config = MagicMock()
+        loop.procedural_config = MagicMock()
+        loop.training_config = MagicMock(num_epochs=2)
+        loop.indexed_key_qa = {}
+        loop.indexed_key_registry = MagicMock()
+        loop.indexed_key_registry.__contains__ = MagicMock(return_value=False)
+        loop.wandb_config = None
+        loop.fingerprint_cache = None
+        loop._shutdown_callbacks = []
+        # Model with peft_config — start without the tier so create_adapter is exercised
+        loop.model = MagicMock()
+        loop.model.peft_config = {"episodic": MagicMock()} if tier_in_peft else {}
+        return loop
+
+    def test_no_source_skipped(self, tmp_path):
+        cfg = _make_config(tmp_path, mode="train")
+        with pytest.raises(_TierSkipped, match="no keyed_pairs.json"):
+            _migrate_tier_simulate_to_train(self._make_loop(), cfg, "episodic")
+
+    def test_empty_source_skipped(self, tmp_path):
+        cfg = _make_config(tmp_path, mode="train")
+        _write_simulate_kp(cfg.simulate_dir, "episodic", [])
+        with pytest.raises(_TierSkipped, match="empty"):
+            _migrate_tier_simulate_to_train(self._make_loop(), cfg, "episodic")
+
+    def test_disabled_tier_skipped(self, tmp_path):
+        cfg = _make_config(tmp_path, mode="train")
+        _write_simulate_kp(
+            cfg.simulate_dir, "procedural", [{"key": "p1", "question": "q", "answer": "a"}]
+        )
+        loop = self._make_loop()
+        loop.procedural_config = None  # operator disabled procedural
+        with pytest.raises(_TierSkipped, match="not enabled"):
+            _migrate_tier_simulate_to_train(loop, cfg, "procedural")
+
+    def test_happy_path_orchestration(self, tmp_path):
+        cfg = _make_config(tmp_path, mode="train")
+        keyed_pairs = [{"key": f"g{i}", "question": "q", "answer": "a"} for i in range(2)]
+        _write_simulate_kp(cfg.simulate_dir, "episodic", keyed_pairs)
+        loop = self._make_loop()
+        # 1.0 recall on probe
+        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._indexed_dataset.return_value = MagicMock()
+        loop._make_training_config.return_value = MagicMock()
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch(
+                "paramem.training.indexed_memory.format_indexed_training",
+                return_value=[{"input_ids": [0]}],
+            ),
+            patch(
+                "paramem.training.indexed_memory.build_registry", return_value={"g0": 0, "g1": 0}
+            ),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.training.trainer.train_adapter") as train_mock,
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+        # train_adapter was called with adapter_name=tier
+        assert train_mock.call_count == 1
+        assert train_mock.call_args.kwargs["adapter_name"] == "episodic"
+        # Source kp deleted post-success
+        assert not (cfg.simulate_dir / "episodic" / "keyed_pairs.json").exists()
+        # Tier-level kp written at canonical path
+        assert (cfg.adapter_dir / "episodic" / "keyed_pairs.json").exists()
+
+    def test_probe_failure_rolls_back(self, tmp_path):
+        cfg = _make_config(tmp_path, mode="train")
+        keyed_pairs = [{"key": f"g{i}", "question": "q", "answer": "a"} for i in range(3)]
+        _write_simulate_kp(cfg.simulate_dir, "episodic", keyed_pairs)
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 0.66  # below 1.0 → rollback
+        loop._indexed_dataset.return_value = MagicMock()
+        loop._make_training_config.return_value = MagicMock()
+
+        with (
+            patch(
+                "paramem.training.indexed_memory.format_indexed_training",
+                return_value=[{"input_ids": [0]}],
+            ),
+            patch("paramem.training.indexed_memory.build_registry", return_value={}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter") as save_mock,
+            patch("paramem.training.trainer.train_adapter"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
+        ):
+            with pytest.raises(RuntimeError, match=r"recall .* < 1.0"):
+                _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+        # No save was attempted (probe failed first)
+        save_mock.assert_not_called()
+        # Source preserved
+        assert (cfg.simulate_dir / "episodic" / "keyed_pairs.json").exists()
+        # No tier-level kp written under adapters
+        assert not (cfg.adapter_dir / "episodic" / "keyed_pairs.json").exists()

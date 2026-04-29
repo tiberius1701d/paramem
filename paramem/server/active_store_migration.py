@@ -138,15 +138,14 @@ def _has_simulate_kp(simulate_dir: Path, tier: str) -> bool:
 
 
 def _has_adapter_kp(adapter_dir: Path, tier: str) -> bool:
-    """Is there a main slot for this tier with a keyed_pairs.json on disk?"""
-    tier_dir = Path(adapter_dir) / tier
-    if not tier_dir.is_dir():
-        return False
-    return any(
-        (slot / "keyed_pairs.json").exists()
-        for slot in tier_dir.iterdir()
-        if slot.is_dir() and not slot.name.startswith(".")
-    )
+    """Is there a tier-level keyed_pairs.json under this adapter dir?
+
+    The canonical layout (verified live) is ``<adapter_dir>/<tier>/keyed_pairs.json``
+    at the **tier level** — written by ``_save_adapters._write_kp`` /
+    ``_save_keyed_pairs_for_router``. Slot subdirectories
+    (``<adapter_dir>/<tier>/<ts>/``) hold weight + manifest only.
+    """
+    return (Path(adapter_dir) / tier / "keyed_pairs.json").exists()
 
 
 def detect_mode_switch(config: "ServerConfig") -> Optional[MigrationState]:
@@ -252,26 +251,21 @@ def migrate(
 def _migrate_tier_train_to_simulate(
     loop: "ConsolidationLoop", config: "ServerConfig", tier: str
 ) -> None:
-    """Read latest adapter slot's keyed_pairs.json → write to simulate-store →
-    probe at threshold=1.0 → on pass, delete adapter slots.
+    """Read tier-level keyed_pairs.json → write to simulate-store →
+    probe at threshold=1.0 → on pass, delete the adapter tier dir.
+
+    Source layout (verified live, see _save_adapters._write_kp):
+        ``<adapter_dir>/<tier>/keyed_pairs.json``  (tier level)
+        ``<adapter_dir>/<tier>/<ts>/adapter_model.safetensors`` etc. (slot level)
 
     Rollback: on probe failure the simulate-store write is removed and
-    RuntimeError is raised. Adapter slots stay intact.
+    ``RuntimeError`` is raised. The adapter tier dir stays intact.
     """
     from paramem.training.indexed_memory import probe_keys_from_disk
 
-    tier_dir = Path(config.adapter_dir) / tier
-    if not tier_dir.is_dir():
-        raise _TierSkipped(f"no adapter dir for tier {tier}")
-
-    slots = sorted(d for d in tier_dir.iterdir() if d.is_dir() and not d.name.startswith("."))
-    if not slots:
-        raise _TierSkipped(f"no adapter slots under {tier_dir}")
-
-    latest_slot = slots[-1]
-    source_kp = latest_slot / "keyed_pairs.json"
+    source_kp = Path(config.adapter_dir) / tier / "keyed_pairs.json"
     if not source_kp.exists():
-        raise _TierSkipped(f"no keyed_pairs.json in latest slot {latest_slot}")
+        raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
 
     keyed_pairs = json.loads(read_maybe_encrypted(source_kp).decode("utf-8"))
     if not keyed_pairs:
@@ -306,8 +300,10 @@ def _migrate_tier_train_to_simulate(
                 f"rolled back simulate-store write"
             )
 
-    # Cleanup: remove the adapter slots for this tier. Source authoritative
-    # state has been transferred to the target store and probe-confirmed.
+    # Cleanup: remove the entire adapter tier dir (kp file + all slot subdirs +
+    # .pending). Source authoritative state has been transferred to the target
+    # store and probe-confirmed.
+    tier_dir = Path(config.adapter_dir) / tier
     shutil.rmtree(tier_dir)
     logger.info(
         "active_store_migration: tier %s migrated to simulate; deleted adapter dir %s",
@@ -316,46 +312,169 @@ def _migrate_tier_train_to_simulate(
     )
 
 
+def _tier_adapter_config(loop: "ConsolidationLoop", tier: str):
+    """Resolve the per-tier ``AdapterConfig`` from the loop.
+
+    Raises ``_TierSkipped`` when the tier is configured-out
+    (``procedural_config is None`` after operator disabled procedural).
+    """
+    cfg_map = {
+        "episodic": loop.episodic_config,
+        "semantic": loop.semantic_config,
+        "procedural": loop.procedural_config,
+    }
+    tier_config = cfg_map.get(tier)
+    if tier_config is None:
+        raise _TierSkipped(f"tier {tier} not enabled (config is None)")
+    return tier_config
+
+
 def _migrate_tier_simulate_to_train(
     loop: "ConsolidationLoop", config: "ServerConfig", tier: str
 ) -> None:
     """Read simulate-store keyed_pairs → train into <tier> adapter →
-    probe at threshold=1.0 → on pass, delete simulate-store kp file.
+    probe at threshold=1.0 → on pass, persist slot + delete source.
 
-    NOT YET IMPLEMENTED.
+    Caller must hold the GPU lock — training and the recall probe both
+    drive the model forward and would race STT/TTS otherwise.
 
-    Spec for follow-up:
+    Sequence:
 
     1. Load source kp from ``<simulate>/<tier>/keyed_pairs.json``.
-    2. Hot-load the keyed pairs into ``loop.indexed_key_qa``, register
-       each key in ``loop.indexed_key_registry`` with adapter_id=tier,
-       update ``loop.<tier>_simhash`` via build_registry.
-    3. Format training examples via
-       ``format_indexed_training(keyed_pairs, loop.tokenizer, max_length=1024)``.
-    4. Switch active adapter to *tier*; build a fresh adapter slot
-       (delete + create_adapter from the tier's config so weights start
-       at LoRA-zero).
-    5. Call ``train_adapter(...)`` with the tier's training config and
-       per-tier adapter config (loop.episodic_config / semantic_config /
-       procedural_config). Use ``loop.training_config.num_epochs`` as the
-       budget.
-    6. After training, run ``loop._run_recall_sanity_probe(tier, keyed_pairs)``
-       and assert ``recall == 1.0``. Lower threshold than the existing
-       0.95 default — the operator's transition gate is intentionally
-       stricter.
-    7. On success, ``atomic_save_adapter`` writes the trained slot to
-       ``<adapters>/<tier>/<ts>/`` with manifest. Delete the source
+    2. Hot-load into ``loop.indexed_key_qa`` + register keys into
+       ``loop.indexed_key_registry`` with ``adapter_id=tier`` so the
+       recall probe can find them.
+    3. Reset the tier adapter to LoRA-zero
+       (``delete_adapter`` + ``create_adapter`` from the tier's config),
+       then ``switch_adapter`` so training writes into this tier.
+    4. ``format_indexed_training`` + ``_indexed_dataset`` to build the
+       HF dataset; gradient checkpointing toggled around the format
+       call to mirror the existing post_session_train pattern.
+    5. ``train_adapter`` with the tier's adapter config and the loop's
+       configured num_epochs.
+    6. Recall probe via ``loop._run_recall_sanity_probe(tier, keyed_pairs)``
+       at threshold 1.0 — stricter than the 0.95 in-process default.
+    7. On pass: ``atomic_save_adapter`` writes the slot under
+       ``<adapter_dir>/<tier>/<ts>/`` + writes the kp file at the
+       canonical tier-level path
+       ``<adapter_dir>/<tier>/keyed_pairs.json`` (matches
+       ``_save_adapters._write_kp`` layout). Delete the source
        ``<simulate>/<tier>/keyed_pairs.json``.
-    8. On recall < 1.0: delete the trained adapter slot, leave source
-       intact, raise ``RuntimeError``.
-
-    The training step requires the GPU lock (held by the BG-trainer
-    worker thread that orchestrates the migration). The caller is
-    expected to run this function under the GPU lock. See
-    ``_run_migration_sync`` in paramem/server/app.py (when wired up).
+    8. On fail: reset the adapter back to LoRA-zero so failure does not
+       leave half-trained weights resident, raise ``RuntimeError``.
     """
-    raise NotImplementedError(
-        "simulate_to_train tier migration is not yet implemented. "
-        "See module docstring for the spec; the train entry point is "
-        "loop._train_adapter or train_adapter from paramem.training.trainer."
+    from paramem.adapters.manifest import build_manifest_for
+    from paramem.models.loader import (
+        atomic_save_adapter,
+        create_adapter,
+        switch_adapter,
+    )
+    from paramem.training.indexed_memory import (
+        build_registry,
+        format_indexed_training,
+    )
+    from paramem.training.trainer import train_adapter as _train_adapter
+
+    source_kp = Path(config.simulate_dir) / tier / "keyed_pairs.json"
+    if not source_kp.exists():
+        raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
+
+    keyed_pairs = json.loads(read_maybe_encrypted(source_kp).decode("utf-8"))
+    if not keyed_pairs:
+        raise _TierSkipped(f"empty keyed_pairs.json at {source_kp}")
+
+    tier_config = _tier_adapter_config(loop, tier)
+
+    # Step 2: hot-load into loop in-memory state so the recall probe (which
+    # reads from loop.indexed_key_qa via build_registry) can find the keys.
+    setattr(loop, f"{tier}_simhash", build_registry(keyed_pairs))
+    for kp in keyed_pairs:
+        loop.indexed_key_qa[kp["key"]] = kp
+        if loop.indexed_key_registry is not None and kp["key"] not in loop.indexed_key_registry:
+            loop.indexed_key_registry.add(kp["key"], adapter_id=tier)
+
+    # Step 3: reset adapter to LoRA-zero so training starts from a clean state.
+    if tier in loop.model.peft_config:
+        loop.model.delete_adapter(tier)
+    loop.model = create_adapter(loop.model, tier_config, tier)
+    switch_adapter(loop.model, tier)
+
+    # Step 4: build training dataset. Disable gradient checkpointing for the
+    # tokenizer call (matches the post_session_train pattern at
+    # consolidation.py:2692-2696); re-enable before training.
+    loop._disable_gradient_checkpointing()
+    examples = format_indexed_training(keyed_pairs, loop.tokenizer, max_length=1024)
+    if not examples:
+        raise _TierSkipped(f"format_indexed_training produced no examples for tier {tier}")
+    dataset = loop._indexed_dataset(examples)
+    loop._enable_gradient_checkpointing()
+    training_config = loop._make_training_config(num_epochs=loop.training_config.num_epochs)
+
+    # Step 5: train. Output dir under a migration-scoped subdir so checkpoint
+    # debris doesn't pollute the main slot layout.
+    _train_adapter(
+        model=loop.model,
+        tokenizer=loop.tokenizer,
+        train_dataset=dataset,
+        adapter_name=tier,
+        training_config=training_config,
+        adapter_config=tier_config,
+        wandb_config=loop.wandb_config,
+        output_dir=Path(config.adapter_dir) / "active_store_migration" / tier,
+        run_name=f"migrate-simulate-to-train-{tier}",
+        callbacks_extra=loop._shutdown_callbacks,
+    )
+
+    # Step 6: recall probe at threshold=1.0 (stricter than 0.95 default).
+    recall = loop._run_recall_sanity_probe(tier, keyed_pairs)
+    if recall < 1.0:
+        # Rollback: reset adapter to LoRA-zero. The slot was not yet saved to
+        # disk so there's nothing to delete on the filesystem side.
+        loop.model.delete_adapter(tier)
+        loop.model = create_adapter(loop.model, tier_config, tier)
+        raise RuntimeError(
+            f"simulate_to_train tier {tier} recall {recall:.3f} < 1.0; "
+            f"rolled back trained adapter to LoRA-zero"
+        )
+
+    # Step 7a: atomic-save the slot. Manifest building can fail (e.g. base-model
+    # hash unavailable); we save without manifest in that case so the weights
+    # are durable even when the manifest sidecar isn't.
+    fingerprint_cache = getattr(loop, "fingerprint_cache", None)
+    try:
+        manifest = build_manifest_for(
+            loop.model,
+            loop.tokenizer,
+            tier,
+            registry_path=None,
+            keyed_pairs_path=Path(config.adapter_dir) / tier / "keyed_pairs.json",
+            key_count=len(keyed_pairs),
+            base_model_hash_cache=fingerprint_cache,
+        )
+    except Exception:
+        logger.warning(
+            "active_store_migration: tier %s manifest build failed — saving without manifest",
+            tier,
+        )
+        manifest = None
+    slot_path = atomic_save_adapter(
+        loop.model,
+        Path(config.adapter_dir) / tier,
+        tier,
+        manifest=manifest,
+    )
+
+    # Step 7b: write the canonical tier-level keyed_pairs.json.
+    kp_path = Path(config.adapter_dir) / tier / "keyed_pairs.json"
+    kp_path.parent.mkdir(parents=True, exist_ok=True)
+    write_infra_bytes(kp_path, json.dumps(keyed_pairs, indent=2).encode("utf-8"))
+
+    # Step 7c: delete source (target is now authoritative + probe-confirmed).
+    source_kp.unlink()
+
+    logger.info(
+        "active_store_migration: tier %s migrated to train; slot=%s, %d keys",
+        tier,
+        slot_path,
+        len(keyed_pairs),
     )
