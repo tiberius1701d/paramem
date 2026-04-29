@@ -88,7 +88,7 @@ Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/ext
 
 At every **full consolidation** the cumulative merged graph then passes through a **graph-level SOTA enrichment** stage that per-transcript extraction cannot see: the SOTA model receives N-hop subgraphs (serialized as triples, chunked by focal entity) and emits cross-session second-order relations plus `same_as` pairs for entity coreference. Duplicates are contracted into canonical nodes under a token-subset / Jaro-Winkler safety gate; new edges are tagged `source="graph_enrichment"` and feed the downstream partition + training pipeline unchanged. A **mini-enrichment** pass also fires at each interim-adapter rollover (per sub-interval, default 12h) when enough new triples have accumulated since the last pass (`graph_enrichment_min_triples_floor`), amortising the SOTA cost across the 84h cycle instead of concentrating it at the final boundary. Both passes are budget-bound by `graph_enrichment_neighborhood_hops` and `graph_enrichment_max_entities_per_pass`.
 
-**Background training** is driven by a systemd user timer whose period derives from `consolidation.refresh_cadence` (default `"12h"`). The full-consolidation period is derived, not configured: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Interim adapters absorb new facts between full cycles so recall does not wait a full period. `BackgroundTrainer` pauses at step boundaries for inference requests, switches the model between eval/train mode, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes from the last completed epoch rather than restarting from zero. A missed post-session training trigger is replayed from a persistent queue (`post_session_queue.json`) on startup. A **simulation mode** (`consolidation.mode: simulate`) runs extraction only, saving results to a debug directory without training.
+**Background training** is driven by a systemd user timer whose period derives from `consolidation.refresh_cadence` (default `"12h"`). The full-consolidation period is derived, not configured: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Interim adapters absorb new facts between full cycles so recall does not wait a full period. `BackgroundTrainer` pauses at step boundaries for inference requests, switches the model between eval/train mode, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes from the last completed epoch rather than restarting from zero. A missed post-session training trigger is replayed from a persistent queue (`post_session_queue.json`) on startup. A **simulation mode** (`consolidation.mode: simulate`) persists QA pairs and registries to disk instead of weights; `probe_keys_from_disk` serves recall from the same per-tier `keyed_pairs.json` layout that train mode produces. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`; `pstatus` shows a `REHYDRATING` banner while it runs).
 
 **Speaker identification** uses pyannote 512-dim voice embeddings with multi-embedding centroid matching and auto-enrichment on confirmed matches.
 
@@ -381,6 +381,13 @@ pstatus --force-local
 Auto-reclaim **never auto-clears orphans** — by design, visibility over
 silent self-healing.  The loop stops on orphan detection and waits for
 the operator.
+
+`pstatus --config` renders the effective `ServerConfig` (after yaml
+load + env merge) as YAML — useful for verifying what the running server
+actually sees, not what is on disk.  When an active-store migration is
+pending (mode flip detected at startup, see *Background training*),
+`pstatus` prints a `REHYDRATING` banner with per-tier completed/failed
+state until the migration finishes.
 
 ### API
 

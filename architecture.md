@@ -239,7 +239,7 @@ Consolidation supports two code paths:
 
 Batch consolidation processes sessions as: `extract_session()` for all pending sessions, then `train_adapters()` once.
 
-A **simulation mode** (`consolidation.mode: simulate`) runs extraction only, saving results to a debug directory without training — useful for tuning extraction quality.
+A **simulation mode** (`consolidation.mode: simulate`) persists QA pairs and registries to disk under `simulate_dir` instead of training them into weights; `probe_keys_from_disk` serves recall from the same per-tier `keyed_pairs.json` layout that train mode produces, so the inference path is mode-agnostic. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`).
 
 ### AD-18: Dual-Engine Multilingual TTS (Phase 5, F5.7)
 
