@@ -85,6 +85,7 @@ from experiments.utils.test_harness import (  # noqa: E402
 from paramem.adapters import resolve_adapter_slot  # noqa: E402
 from paramem.adapters.manifest import build_manifest_for  # noqa: E402
 from paramem.models.loader import (  # noqa: E402
+    _adapter_slot_for_load,
     create_adapter,
     save_adapter,
     switch_adapter,
@@ -1212,8 +1213,11 @@ def load_phase_a_from_existing(
 
     # Load adapter; model must be the bare base model here (not PeftModel).
     # Use the module-level PeftModel import so test mocks of
-    # `experiments.test14.PeftModel` take effect.
-    model = PeftModel.from_pretrained(model, str(a_slot), adapter_name=adapter_name_a)
+    # `experiments.test14.PeftModel` take effect.  _adapter_slot_for_load
+    # transparently decrypts age-encrypted safetensors via memfd, no-op on
+    # plaintext slots.
+    with _adapter_slot_for_load(a_slot) as _load_path:
+        model = PeftModel.from_pretrained(model, str(_load_path), adapter_name=adapter_name_a)
     logger.info(
         "Phase A reuse: loaded %s adapter from %s",
         adapter_name_a,
@@ -1808,7 +1812,10 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     raise FileNotFoundError(
                         f"V3_extended Phase B: journal adapter not found under {v3_b_adapter_dir}"
                     )
-                model = PeftModel.from_pretrained(model, str(v3_b_slot), adapter_name="journal")
+                with _adapter_slot_for_load(v3_b_slot) as _load_path:
+                    model = PeftModel.from_pretrained(
+                        model, str(_load_path), adapter_name="journal"
+                    )
                 logger.info("V3_extended Phase B: loaded journal adapter from %s", v3_b_slot)
                 switch_adapter(model, "journal")
 
@@ -1945,9 +1952,10 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                         f"Variant {variant}: journal adapter not found under "
                         f"{v_dir / 'B' / 'adapter'}; cannot resume Phase C."
                     )
-                model = PeftModel.from_pretrained(
-                    model, str(b_journal_slot), adapter_name="journal"
-                )
+                with _adapter_slot_for_load(b_journal_slot) as _load_path:
+                    model = PeftModel.from_pretrained(
+                        model, str(_load_path), adapter_name="journal"
+                    )
                 logger.info(
                     "Variant %s Phase C resume: loaded journal adapter from %s",
                     variant,
@@ -2187,7 +2195,8 @@ def run_mode_scale(
                     f"Scale: journal adapter not found under {run_dir / 'B' / 'adapter'}; "
                     "cannot resume Phase C."
                 )
-            model = PeftModel.from_pretrained(model, str(b_journal_slot), adapter_name="journal")
+            with _adapter_slot_for_load(b_journal_slot) as _load_path:
+                model = PeftModel.from_pretrained(model, str(_load_path), adapter_name="journal")
             logger.info("Scale Phase C resume: loaded journal adapter from %s", b_journal_slot)
         switch_adapter(model, "journal")
 
@@ -2289,7 +2298,8 @@ def run_mode_multiround(
     if not (run_dir / "P0_done.json").exists():
         if isinstance(model, PeftModel):
             model = model.base_model.model
-        model = PeftModel.from_pretrained(model, str(journal_slot), adapter_name="journal")
+        with _adapter_slot_for_load(journal_slot) as _load_path:
+            model = PeftModel.from_pretrained(model, str(_load_path), adapter_name="journal")
         switch_adapter(model, "journal")
 
         p0_probe = _safe_probe(model, tokenizer, all_keyed, all_registry, "journal")
@@ -2315,7 +2325,8 @@ def run_mode_multiround(
     else:
         logger.info("P0: already done")
         if not isinstance(model, PeftModel):
-            model = PeftModel.from_pretrained(model, str(journal_slot), adapter_name="journal")
+            with _adapter_slot_for_load(journal_slot) as _load_path:
+                model = PeftModel.from_pretrained(model, str(_load_path), adapter_name="journal")
         switch_adapter(model, "journal")
 
     # --- Rounds plan (frozen at first launch for deterministic resume) ---
@@ -2364,7 +2375,10 @@ def run_mode_multiround(
             if carry_slot is not None:
                 if isinstance(model, PeftModel):
                     model = model.base_model.model
-                model = PeftModel.from_pretrained(model, str(carry_slot), adapter_name="journal")
+                with _adapter_slot_for_load(carry_slot) as _load_path:
+                    model = PeftModel.from_pretrained(
+                        model, str(_load_path), adapter_name="journal"
+                    )
                 logger.info(
                     "Round %s carry-forward: loaded adapter from %s", round_label, carry_slot
                 )
