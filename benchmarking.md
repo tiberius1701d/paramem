@@ -2314,12 +2314,15 @@ also stays deferred.
 ## Test 14: Content-Free Scaffold + Multi-Round Early-Stop at Scale
 
 **Script:** `experiments/test14.py`
-**Status:** 14a-pre core **COMPLETE** (2026-04-26 01:29 → ~17:55, ~16.5 h
-wall). **Winner so far: V3** (uniform sentinel). Extended-cell run
-**partial**: V3_extended complete and **rejected** (e25 fill, slower than
-V3); V4 (empty Q/A) **unprobed**; V5 (per-slot SHA placeholders)
-deprioritized. 14a (scale to N=500) and 14b (multi-round) pending — gated
-on V4.
+**Status (2026-04-29 update):** 14a-pre core **COMPLETE** (2026-04-26).
+Extended cells **partially complete at single seed**: V3_extended complete
+(e25, slower than V3); V4 complete (e29 first_perfect, no stable window in
+30 epochs); V5 started (Phase B e1) then stopped pending multi-seed
+re-design. **Provisional winner: V3** (stable_perfect e20 at n=1).
+**Going full-length on the optimization question**: a multi-seed
+replication batch + V6a/V6b/V6c uniform-axis variants is now planned
+(see "Multi-seed replication + V6 family" below). 14a (scale to N=500)
+and 14b (multi-round) remain gated on the multi-seed result.
 
 ### What it tests
 
@@ -2477,31 +2480,35 @@ since Phase A trains on the same 100 PerLTQA pairs with a fixed seed.
 (5.02 h vs 5.32 / 5.64 h). The variant-selection rule's tie-breaker did
 not need to engage — V3's fill was strictly faster.
 
-### Conclusions from 14a-pre
+### Conclusions from 14a-pre (n=1)
 
-**The "key alone routes" hypothesis is empirically supported.** V3's Phase
-B placeholder content is uniform across every slot (`"question": "pending"`,
-`"answer": "pending"` — zero per-slot information). The fact that V3
-nonetheless pre-formed (key → slot) bindings well enough for Phase C fill
-to converge faster than V1/V2 means the per-slot integer index `N` in
-V1/V2's placeholders was **not** the load-bearing discriminator. The
-binding circuit forms from the input prompt's `'graphN'` key plus the
-JSON-output framing alone; placeholder content adds nothing routing-wise
-and only costs epochs at fill when the model has to overwrite it.
+**The "key alone routes" hypothesis is consistent with V3 winning at
+n=1**, but the V3<V2<V1 stable_perfect ordering (20 / 22 / 24) sits
+within plausible single-seed variance and the multi-seed replication
+(below) is required before treating it as a result. V3's Phase B
+placeholder content is uniform across every slot (`"question":
+"pending"`, `"answer": "pending"` — zero per-slot information), and
+V3 nonetheless pre-forms (key → slot) bindings well enough for Phase
+C fill to converge by `stable_perfect` e20 — beating V1/V2 by 2-4
+epochs at this seed. Whether per-slot uniqueness in V1/V2's
+placeholders is *causally* slower or just unlucky at seed=42 is the
+multi-seed batch's first question.
 
-**Production implication.** V3 is the cleanest deployable scaffold artifact
-yet validated on this task: a single 500-key adapter trained on uniform
-`"pending"` placeholders, content-uniform across all slots, with no
-dataset-specific text baked in. The same scaffold serves any downstream
-fill of real Q+A.
+**Production direction (provisional).** V3 is the deployable scaffold
+candidate at n=1: a single 500-key adapter trained on uniform `"pending"`
+placeholders, content-uniform across all slots, with no dataset-specific
+text baked in. The same scaffold would serve any downstream fill of
+real Q+A. Whether V3 stays the winner after multi-seed replication and
+the V6 family probe is the open question.
 
 **Caveats.** All three content-free variants converge their fill phase
 slower than Test 13's real-Q scaffold did at N=200 (C2 fired at
 stable_perfect = 11). V3's e20 fill at N=100 is ~2× slower. The
 content-free scaffold pre-forms bindings, but less efficiently than a
-real-Q scaffold does — content-free production reuse trades off fill speed
-for deployment simplicity. Whether the gap holds at N=500 is what 14a
-tests next.
+real-Q scaffold does at this seed — content-free production reuse
+trades off fill speed for deployment simplicity. Whether the gap holds
+at N=500 is what 14a tests next; whether the gap can be narrowed by a
+better uniform placeholder is what V6c probes.
 
 **Per-field Q/A split** at fill convergence was clean across all three
 variants — `both/total = 1.00`, `q_only/total = 0.00`, no discriminator
@@ -2527,7 +2534,14 @@ or `pending` tokens emitted after Phase C).
   `outputs/test14_pre/mistral/20260426_012907/<variant>/<phase>_done.json`
   and `epoch_log.json` for replay or finer-grained analysis.
 
-### Planned extension: 14a-pre extended (V3_extended / V4 / V5)
+### Original extension plan: 14a-pre extended (V3_extended / V4 / V5)
+
+> **Historical (executed 2026-04-27 → 2026-04-29).** V3_extended and V4
+> are complete; V5 was started 2026-04-29 then stopped to fold into the
+> multi-seed batch (see "Multi-seed replication + V6 family" below).
+> The original "stop_epoch ≤ 14" decision rule was *not* met by any
+> variant; V3 remains the n=1 winner. The multi-seed batch supersedes
+> this single-seed extension as the gate for 14a launch.
 
 Before committing to 14a's ~45 h scale-up of V3, three additional
 variants are run on the same N=100 budget to test whether the ~9-epoch gap
@@ -2566,9 +2580,9 @@ fixed before launch):**
   Phase B (the only sensible behavior — there is no use case for
   EarlyStop on a deepening run).
 
-### Results — extended cells (partial, 2026-04-27)
+### Results — extended cells (single seed, n=1)
 
-Run dir: `outputs/test14_pre/mistral/20260426_012907/V3_extended/`.
+Run dir: `outputs/test14_pre/mistral/20260426_012907/`.
 
 **V3_extended — REJECTED.** Resumed `V3/B/adapter` for +30 scaffold epochs
 (effective e10 → e40), then filled 20 keys.
@@ -2579,63 +2593,191 @@ Run dir: `outputs/test14_pre/mistral/20260426_012907/V3_extended/`.
 | C (fill 20) | 1.99 h | **e23** | e25 | **e25** | both/total = 1.00, q_only = 0, leakage 0 |
 
 vs V3 plain (B at e10 floor, C stop at **e20**): V3_extended fills **5
-epochs slower**. The decision-rule bar (`stop_epoch ≤ 14`) is missed by
-11 epochs.
+epochs slower**. Deepening Phase B sharpened the model's commitment to
+`"pending"`, which the fill phase then had to overwrite — costing more
+epochs, not fewer.
 
-The "shallow Phase B may be undertrained" hypothesis is empirically
-falsified. V3's Phase B was already saturated at the floor — every probe
-across the 30 added epochs scored 100 / 100, train loss collapsed to ~2e-8.
-There was no undertraining to fix. Deepening only sharpened the model's
-commitment to `"pending"`, which the fill phase then had to overwrite —
-costing more epochs, not fewer. This confirms (rather than overturns) the
-V3 conclusion already on file: *placeholder content adds nothing routing-
-wise and only costs epochs at fill when the model has to overwrite it.*
+**V4 — DOES NOT CLEAR THE BAR (n=1).** Empty Q/A scaffold
+(`{"key":"graphN", "question":"", "answer":""}`), 30-epoch budget,
+fresh Phase B. Resumed across two sessions on 2026-04-27 (CUDA crash) and
+2026-04-29 (pause-bug fix to `_done.json` writer + age-decryption fix to
+PEFT load path).
 
-Retention on the 80 unfilled placeholder slots was 0 / 80 throughout
-Phase C, identical to V3 plain — this is the standard V3 fill behavior on
-uniform sentinel placeholders, not a V3_extended regression.
+| Phase | Wall | First perfect | Stable perfect | Stop epoch | Notes |
+|---|---:|---:|---:|---:|---|
+| B (scaffold) | 0.66 h | e1 | e3 | e10 (floor) | 100 / 100; train loss 0.020 |
+| C (fill 20) | 2.22 h | **e29** | **None** | None (ES never fired) | final 20/20 at e29-30; leakage 0 |
 
-**V4 — UNPROBED.** V4 is the *low-content* end of the placeholder-mass
-axis (`{"key":"graphN", "question":"", "answer":""}`). It is the only
-remaining cell that can still move the winner — see "Consequences" below.
+V4 reaches 100% fill recall but only at e29 of 30 — `stable_perfect`
+never fires (would need 3 consecutive perfect epochs, only 2 available
+in budget). The fill curve is non-monotone: 0.40 (e21) → 0.20 (e23) →
+0.65 (e25) → 0.90 (e26) → 1.00 (e29). Decision-rule bar (`stop_epoch
+≤ 14`) is missed by ≥15 epochs.
 
-**V5 — DEPRIORITIZED.** Per-slot SHA placeholders are *high* per-slot
-content mass. V3_extended's result establishes the direction of the
-content-mass axis: more commitment → slower fill. V5 sits at the opposite
-end from V4 along that axis, so the directional prior runs against V5
-beating V3, let alone clearing e ≤ 14. V5 is not worth its ~2.5 h slot
-unless V4 produces a surprise that re-opens the axis question.
+**Per-key diagnostic (V4 vs V3):**
 
-### Consequences for next trials
+The `first_perfect_log.json` per-key trajectories diverge sharply between
+V3 and V4 even though both reach the same final 20/20:
 
-1. **V4 is the next run.** V3_extended is *positive* directional evidence
-   for V4: stronger placeholder commitment slowed fill, so weaker
-   placeholder commitment is the credible path to faster fill. Whether
-   the gap is enough to clear e ≤ 14 is genuinely open and only V4 can
-   answer it.
-2. **V5 is dropped.** Re-add only if V4 produces a non-monotonic result
-   on the content-mass axis (e.g. V4 fills slower than V3, suggesting
-   some content mass is load-bearing after all).
-3. **14a remains gated on V4.** V3 stays as provisional winner. If V4
-   clears e ≤ 14, V4 replaces V3 as 14a's variant; if V4 fails the bar,
-   14a launches with V3 unchanged.
-4. **No design changes to 14a or 14b.** The A → B → C structure, decision
-   rules, three-point retention probe, and touch-up primitive are
-   unchanged regardless of which variant ships into 14a. Variant choice
-   only swaps Phase B's placeholder text.
+| Variant | per-key first_perfect (sorted) | min | max | median | std |
+|---|---|---:|---:|---:|---:|
+| V1 | 3,5,6,8,13,14×6,15,15,16,16,17,17,17,18,18 | 3 | 18 | 14 | 4.3 |
+| V2 | 2,4,5,6,8,9,9,10,10,11,11,12,13,14,14,14,15,15,15,17 | 2 | 17 | **11** | 4.0 |
+| **V3** | 3,5,6,8,10,11,12,13×4,14×6,15×3 | 3 | **15** | 13 | **3.5** |
+| V3_extended | 3,4,7,12,13,14,14,16,17,18,19,19,19,19,19,19,19,19,22,23 | 3 | 23 | 18.5 | 5.4 |
+| **V4** | 3,4,5,9,11,17,18,18,22,22,24,24,25,25,26,26,26,26,28,29 | 3 | **29** | **23** | **8.2** |
 
-**Next-trial wall estimate:** V4 ~2.5 h, no Phase A (reuses
-`V3/A/adapter`).
+**Headline observations from per-key data:**
+
+1. **V4's per-key spread is dramatically wider than V3's** (range 26 vs
+   12, std 8.2 vs 3.5). This is the clearest signal in the data and is
+   robust at n=1.
+2. **V3 wins `stable_perfect` not by faster average convergence but by
+   tighter spread.** V2 has the lowest *median* first_perfect (e11) but
+   the slower-converging tail keeps stable_perfect at e22 vs V3's e20.
+   V3's slowest key (e15) converges ahead of V2's slowest (e17) and
+   V1's slowest (e18). The 3-window stable arrives sooner because all
+   keys are "ready" within a tighter epoch band.
+3. **V3 vs V1/V2 std differences are small** (3.5 / 4.0 / 4.3). The
+   ordering V3 < V2 < V1 on stable_perfect (20 / 22 / 24) sits within
+   plausible single-seed noise envelope and **needs multi-seed
+   replication to confirm**.
+4. **V4 reaches real Q+A content, not empty strings.** All 20 fill keys
+   ultimately recall correct content (e.g. graph81: "Liang Xin is
+   female."). An earlier diagnostic suggesting an "empty-string
+   attractor" failure mode was a bug in the trace-reading script
+   (wrong field name) — refuted on re-inspection.
+
+### Mechanism — candidate hypothesis (n=1; not validated)
+
+The V3 vs V1 vs V4 results are consistent with a **shared-update-channel
+hypothesis**, but the evidence is single-seed and the V3<V2<V1 fine
+ordering is within noise:
+
+- **Uniform scaffolds may enable cross-slot transfer in Phase C.** Phase
+  B with uniform `"pending"` content encodes a near-identical (key →
+  pending) mapping across all 100 slots. Phase C gradients update the
+  shared structure; the model learns "for slots like these, content can
+  be anything" almost simultaneously across the fill set, which could
+  explain V3's tight per-key cluster at e13–e15.
+- **Per-slot unique scaffolds (V1, V2) split this channel.** Each slot
+  has its own placeholder, so updates don't share — closer to per-slot
+  independent learning. V1's per-slot uniqueness on both Q and A pulls
+  the slowest keys to e18; V2's structural Q + per-slot unique A is in
+  between (max e17). This is the *direction* the hypothesis predicts;
+  the *magnitude* is small and could be noise.
+- **Empty placeholders (V4) invest minimal Phase B weight at all.**
+  Predicting `""` is trivially low-loss; the adapter develops only weak
+  slot-specific commitment in Phase B. Phase C then learns each slot's
+  binding essentially from scratch, with per-key time correlated to
+  answer difficulty. Wide spread (e3 to e29) is the signature.
+- **V3_extended (deeper Phase B) is slower** — deepening sharpens the
+  model's commitment to `"pending"`, increasing per-token overwrite
+  cost in Phase C. Negative directional evidence on the "deepen
+  scaffold" axis.
+
+**This hypothesis is not yet validated.** The V3<V2<V1 ordering at n=1
+sits within plausible single-seed variance (±3-5 epochs at rank 8 / 30
+epochs). Multi-seed replication is required before treating the shared-
+channel framing as a result rather than a design hint. The V4 wide-
+spread signature is robust at n=1 but the underlying mechanism (no
+scaffold weight invested) needs corroboration via the next-step
+multi-seed batch.
+
+### Multi-seed replication + V5–V8 expansion (planned, ~58 h GPU)
+
+The next experiment block extends the existing 14a-pre run rather than
+starting a new run dir. **Variant numbering reflects the multi-seed
+batch run order**: V1–V4 keep their original meanings; V5–V8 are new
+cells (renamed 2026-04-29 from a working V6a/V6b/V6c label set, and
+the previously-unstarted SHA per-slot variant moved from V5 to V7).
+The block addresses two questions in parallel:
+
+1. **Is the V3 < V2 < V1 ordering real or n=1 noise?** Replicate Phase C
+   on 3 seeds (42, 7, 1337) for V1/V2/V3, reusing the existing
+   `<variant>/B/adapter` so only Phase C optimizer / shuffler seed
+   varies. Decision criterion: V3 mean stable_perfect < V1 mean by more
+   than the pooled std → ordering is real.
+2. **Can the uniform regime be optimized further?** Three new
+   uniform-axis variants probe around V3's `"pending"` baseline; one
+   per-slot-unique variant pins the upper bound:
+
+| Variant | Q | A | Hypothesis under test |
+|---|---|---|---|
+| **V5** | `"What is the answer to this query?"` | `"The answer is currently unknown."` | Uniform long natural-language template. Most informative test of the shared-transfer-channel hypothesis: if a richer natural-language placeholder accelerates the channel, V5 could beat V3. If it slows it (more weight to overwrite), V3's short uniform stays optimal. |
+| **V6** | `"<PLACEHOLDER>"` | `"<PLACEHOLDER>"` | Same uniformity as V3 with a shorter, less natural-language token. Isolates uniformity from length within the uniform regime. Predicted ≈ V3 under the shared-channel hypothesis. |
+| **V7** | sha256 hex per slot (unique) | sha256 hex per slot (unique) | Per-slot unique OOD tokens — falsifiable upper-bound check on the shared-channel hypothesis. Researcher prediction: V7 stable_perfect ≥ 25. Refuted if V7 ≤ 22. |
+| **V8** | `"a1b2c3d4e5f60718"` (same hex all slots) | same | Uniform long OOD hex — disentangles length from naturalness within the uniform regime. Run only if V5 / V6 results are ambiguous. |
+
+V4 is included in the multi-seed batch with **extended 50-epoch budget**
+(its single-seed result hit budget exhaustion before stable). The goal
+is to obtain a finite `stable_perfect` for V4 to compare against the
+others, not to qualify it as a contender.
+
+**Run order (frontier-first; matches variant numbering):**
+
+Smoke-measured cost: ~5 min per Phase C epoch (probe-dominated) plus
+~10 min for the post-Phase-C final probe.  At 30 epochs that is
+~160 min ≈ 2.7 h per (variant, seed) Phase C run.  The earlier 9 h /
+58 h totals omitted the final-probe cost; revised below.
+
+| Order | Variants × seeds | Phase scope | Wall (~) |
+|---|---|---|---|
+| 1 | V1, V2, V3 × 3 seeds | Phase C only (reuse Phase B) | 24 h |
+| 2 | V5 × 3 seeds | Full Phase B + C (Phase A reused) | 10 h |
+| 3 | V6 × 3 seeds | Full Phase B + C (Phase A reused) | 10 h |
+| 4 | V7 × 3 seeds, 50-epoch budget | Full Phase B + C | 14 h |
+| 5 | V4 × 3 seeds, 50-epoch budget | Phase C only (reuse Phase B) | 14 h |
+| (6) | V8 × 3 seeds (only if V5 / V6 ambiguous) | Full Phase B + C | 10 h |
+
+Total ~72 h GPU (~3 days continuous); resumable per (variant, seed)
+unit via `tresume 14`.  V5/V6 full pipeline includes Phase B (~40 min
+×3 seeds = 2 h) plus Phase C (~2.7 h ×3 seeds = 8 h) = ~10 h per
+variant.  V7/V4 use 50-epoch budgets so Phase C is ~4.5 h × 3 = 13.5 h
+plus Phase B for V7.
+
+**Decision rule (post-batch):** the new winner replaces V3 only if its
+mean `stable_perfect` is below V3's mean by more than the pooled standard
+deviation across seeds (lower-bound 95% CI gap). Marginal improvements
+inside the noise envelope retain V3 for production simplicity. If V5
+wins clearly, it ships as the production scaffold.
+
+**Implementation deliverables (in progress):**
+- `experiments/utils/scaffold.py` — V5/V6/V7/V8 builders added; V7
+  reuses the per-slot-sha256 logic that previously lived under the
+  V5 name (renamed to match run order); VARIANTS, VARIANT_BUILDERS,
+  PLACEHOLDER_STRINGS updated. Tests in `tests/test_scaffold.py`
+  cover all four new builders.
+- `experiments/test14.py` — `--phase-c-seeds` flag (multi-seed Phase C
+  loop with `<variant>/C/seed<N>/` sub-dir convention) — pending.
+- `scripts/dev/training-control.sh` — V5–V8 added to the per-variant
+  rendering and in-flight detection; per-seed status surfacing pending.
+- Tests for multi-seed resume — pending.
+
+### Edge-device motivation (2026-04-29)
+
+The optimization target is **fastest Phase C convergence** for a fixed
+N=500 scale. Each saved epoch on Phase C is a measurable training-time
+reduction on edge hardware (the Phase C probe dominates wall time, not
+the training step). V3's e20 stable_perfect on N=20 fill is the current
+baseline; V5 is the most credible single-experiment shot at lowering
+that baseline.
 
 ### Next: 14a launch (winning variant scaled to N=500)
+
+Gated on the multi-seed batch above. The launch command is unchanged:
 
 ```
 python experiments/test14.py --mode=scale --variant=<winner>
 ```
 
-`<winner>` resolves from the extended-run `results.json` — V3 by default,
-overridden only if V4 (the only remaining unprobed cell) beats the e ≤ 14
-decision threshold. V3_extended is rejected (e25); V5 is deprioritized.
+`<winner>` is **decided by the multi-seed batch**, not the n=1 result.
+Default is V3. Replaced by V5/V6/V8 only if the post-batch decision
+rule fires (mean `stable_perfect` below V3's mean by more than pooled
+seed std). V3_extended is rejected at n=1 (e25). V7 is included in the
+multi-seed batch as the per-slot-unique upper bound but is not a
+candidate winner. V4 is included for diagnostic comparison only — the
+n=1 result (no `stable_perfect` in 30 epochs) already disqualifies it.
 
 Same A→B→C structure as 14a-pre, single variant. Phase A wall expected
 ~17 h, Phase B (scaffold-build) ~17 h, Phase C (fill 100 on 500-key
