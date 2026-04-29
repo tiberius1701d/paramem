@@ -1054,20 +1054,30 @@ class TestFullCycleGateHelpers:
         cfg = self._make_config("", tmp_path)
         assert _is_full_cycle_due(cfg) is False
 
-    def test_is_full_cycle_due_no_prior_full_returns_true(self, tmp_path):
-        """Fresh install (no prior window_stamp) → first full is due."""
+    def test_is_full_cycle_due_no_prior_full_returns_false(self, tmp_path):
+        """Fresh install (no main slot) → defer to interim cycle, NOT full.
+
+        The full cycle (consolidate_interim_adapters) operates by collapsing
+        existing interim adapters into main; with none on disk it is a
+        no-op. Returning True here previously caused /consolidate to route
+        to a no-op full cycle instead of the interim path that actually
+        extracts pending sessions on a fresh store.
+        """
         from paramem.server.app import _is_full_cycle_due
 
         cfg = self._make_config("every 84h", tmp_path)
-        assert _is_full_cycle_due(cfg) is True
+        assert _is_full_cycle_due(cfg) is False
 
-    def test_is_full_cycle_due_legacy_v1_treated_as_unknown(self, tmp_path):
-        """A v1 manifest (empty window_stamp) is treated as unknown → due."""
+    def test_is_full_cycle_due_legacy_v1_treated_as_no_main_slot(self, tmp_path):
+        """A v1 manifest (empty window_stamp) is treated like no main slot
+        — defer to the interim path until the slot has been re-stamped by
+        a real full cycle.
+        """
         from paramem.server.app import _is_full_cycle_due
 
         self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="")
         cfg = self._make_config("every 84h", tmp_path)
-        assert _is_full_cycle_due(cfg) is True
+        assert _is_full_cycle_due(cfg) is False
 
     def test_is_full_cycle_due_same_window_returns_false(self, tmp_path):
         """Last full's window_stamp matches current → already consolidated."""

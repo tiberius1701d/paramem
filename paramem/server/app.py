@@ -5493,8 +5493,11 @@ def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":
       * The recorded ``window_stamp`` is empty (legacy v1 manifest, or a
         synthesized fallback that did not know its window).
 
-    Callers treat ``None`` as "unknown — first full cycle is due" so fresh
-    installs and post-migration states bootstrap correctly.
+    Callers treat ``None`` as "no main slot exists yet — defer to the
+    interim path." Fresh installs and post-migration states bootstrap by
+    extracting pending sessions into an interim adapter first; only after
+    at least one interim has been written does the full cycle have anything
+    to consolidate (see ``_is_full_cycle_due``).
     """
     episodic_dir = adapter_dir / "episodic"
     if not episodic_dir.is_dir():
@@ -5529,7 +5532,18 @@ def _is_full_cycle_due(config) -> bool:
     and dispatches the full cycle.
 
     Returns ``False`` when ``refresh_cadence`` is disabled (period string is
-    empty → manual-only operation).
+    empty → manual-only operation), OR when no main episodic slot exists yet.
+
+    Fresh-install behaviour: ``last is None`` means no main slot has ever
+    been written. The full cycle (``consolidate_interim_adapters``) operates
+    by collapsing existing interim adapters into the main tiers — with no
+    interims on disk it is a no-op (``tiers_rebuilt=[]``) and the on-disk
+    main slot stays absent, so the gate would re-fire forever. The natural
+    first action on a fresh store is the interim cycle: extract pending
+    sessions into a new ``episodic_interim_<stamp>`` slot. Once at least
+    one interim has been written, the full cycle becomes "due" only after
+    a full window has elapsed, and at that point it has actual content to
+    consolidate.
     """
     from paramem.server.interim_adapter import current_full_consolidation_stamp
 
@@ -5541,7 +5555,7 @@ def _is_full_cycle_due(config) -> bool:
         return False
     last = _last_full_consolidation_window(config.adapter_dir)
     if last is None:
-        return True
+        return False
     return current != last
 
 
@@ -6058,6 +6072,37 @@ def _run_full_consolidation_sync() -> None:
             result.get("graph_drift_count", 0),
             result.get("rolled_back"),
         )
+
+        # Layering boundary. ``consolidate_interim_adapters`` already
+        # finished its internal finalize on its way out (registry rewrite,
+        # interim purge, router reload — see its Step 6 block) regardless
+        # of whether anything was rebuilt. The post-cycle work below
+        # (``_save_adapters``, key-metadata persistence, ``_finalize_full``)
+        # is for the WEIGHT-LEVEL persist of the rebuilt main slots — its
+        # precondition is ``tiers_rebuilt != []``. Calling these functions
+        # on the no-op outcome violates that precondition: ``_save_adapters``
+        # would re-save zero-init slots whose meta.json has no fresh
+        # registry hash to stamp, key-metadata persistence has nothing
+        # new, and ``_finalize_full`` would double the router reload that
+        # the inner finalize already did.
+        #
+        # Honor the precondition at the orchestration layer (here) rather
+        # than retrofitting each downstream helper with no-op tolerance.
+        # Clear the consolidating flag, record the no-op as a successful
+        # cycle outcome, and return.
+        if not result.get("tiers_rebuilt"):
+            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+            _state["last_consolidation_result"] = {
+                "status": "noop",
+                "tiers_rebuilt": [],
+                "graph_drift_count": result.get("graph_drift_count", 0),
+            }
+            _state["consolidating"] = False
+            logger.info(
+                "Full cycle no-op — nothing to rebuild, inner finalize already "
+                "ran inside consolidate_interim_adapters; consolidating flag cleared"
+            )
+            return
 
         # Persist the rebuilt main slots to disk via the I5 atomic save path.
         # consolidate_interim_adapters rebuilt tiers in PEFT memory + rewrote
