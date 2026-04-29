@@ -319,20 +319,24 @@ class TestRoleAwareGroundingValidator:
 
 
 class TestAdaptersFactoryDefaultMerge:
-    """Loader must merge YAML adapter keys onto the slot's factory defaults
-    rather than constructing fresh ``ServerAdapterConfig(**proc)``. The
-    factory default for procedural targets attention + MLP; the
-    dataclass-level default for ``target_modules`` is attention-only.
+    """Loader contract for adapter target_modules under the explicit-yaml posture.
 
-    Pre-fix bug: a YAML that specified any procedural key (rank, alpha,
-    learning_rate, enabled) WITHOUT specifying target_modules would silently
-    fall back to attention-only — contradicting CLAUDE.md design intent
-    ("behavioral patterns live in feed-forward layers; attention-only
-    would limit procedural learning to routing").
+    The yaml is the contract for load-bearing fields. When an operator
+    partially specifies an adapter tier in yaml and that tier ends up
+    enabled, the loader refuses to start without an explicit
+    ``target_modules`` — silent fallback to the factory default would
+    hide architectural choices like procedural's attn+mlp targeting.
+
+    The previous test suite asserted the silent-fallback merge was
+    correct; that behaviour is now explicitly forbidden by
+    ``load_server_config``'s loader guard, so those tests have been
+    converted to verify the guard fires.
     """
 
-    def test_procedural_yaml_partial_keys_keep_mlp_targets(self, tmp_path):
-        """Partial procedural YAML must inherit MLP targets from the factory."""
+    def test_procedural_partial_yaml_without_target_modules_refuses(self, tmp_path):
+        """Partial procedural YAML without target_modules must refuse loud."""
+        from paramem.backup.types import FatalConfigError
+
         yaml_file = _write_yaml(
             tmp_path,
             """\
@@ -345,11 +349,40 @@ class TestAdaptersFactoryDefaultMerge:
                 learning_rate: 5.0e-5
             """,
         )
+        with pytest.raises(FatalConfigError, match="adapters.procedural.enabled=true"):
+            load_server_config(yaml_file)
+
+    def test_episodic_partial_yaml_without_target_modules_refuses(self, tmp_path):
+        """Partial episodic YAML without target_modules must refuse loud."""
+        from paramem.backup.types import FatalConfigError
+
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              episodic:
+                enabled: true
+                rank: 16
+            """,
+        )
+        with pytest.raises(FatalConfigError, match="adapters.episodic.enabled=true"):
+            load_server_config(yaml_file)
+
+    def test_disabled_tier_with_partial_yaml_passes(self, tmp_path):
+        """When the tier is explicitly disabled, the missing-target_modules guard does not fire."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            adapters:
+              procedural:
+                enabled: false
+                rank: 8
+            """,
+        )
         cfg = load_server_config(yaml_file)
-        targets = cfg.adapters.procedural.target_modules
-        assert "gate_proj" in targets, f"procedural target_modules lost MLP layers: {targets}"
-        assert "up_proj" in targets
-        assert "down_proj" in targets
+        assert cfg.adapters.procedural.enabled is False
 
     def test_procedural_yaml_full_override_target_modules(self, tmp_path):
         """Explicit target_modules in YAML must win over the factory default."""
@@ -365,23 +398,6 @@ class TestAdaptersFactoryDefaultMerge:
         )
         cfg = load_server_config(yaml_file)
         assert cfg.adapters.procedural.target_modules == ["q_proj", "v_proj"]
-
-    def test_episodic_yaml_partial_keys_keep_attention_targets(self, tmp_path):
-        """Episodic factory default is attention-only; partial YAML must preserve it."""
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            adapters:
-              episodic:
-                enabled: true
-                rank: 16
-            """,
-        )
-        cfg = load_server_config(yaml_file)
-        # Episodic factory: attention-only, rank 8. YAML overrides rank to 16.
-        assert cfg.adapters.episodic.target_modules == ["q_proj", "v_proj", "k_proj", "o_proj"]
-        assert cfg.adapters.episodic.rank == 16
 
     def test_no_adapters_block_uses_factory_defaults(self, tmp_path):
         """YAML without an adapters block falls through to the full factory defaults."""

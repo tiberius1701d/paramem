@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from paramem.backup.types import FatalConfigError
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -1149,6 +1150,48 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             episodic=replace(factory.episodic, **adapters_raw.get("episodic", {})),
             semantic=replace(factory.semantic, **adapters_raw.get("semantic", {})),
             procedural=replace(factory.procedural, **adapters_raw.get("procedural", {})),
+        )
+
+    # Loader guard — explicit-yaml posture for load-bearing adapter fields.
+    #
+    # When an operator partially specifies a tier in yaml (any field present)
+    # AND that tier ends up enabled, ``target_modules`` must be spelled out.
+    # The loader otherwise silently merges from the factory default, which
+    # hides architectural choices like procedural's attn+mlp targeting from
+    # the operator's config. Refuse-loud here so future drift surfaces at
+    # startup rather than as a confusing runtime mismatch later.
+    #
+    # Operators who omit the tier block entirely (no fields specified) are
+    # signalling "use defaults for everything" — that's a legitimate posture
+    # and is not gated.
+    for _tier in ("episodic", "semantic", "procedural"):
+        _raw_tier = adapters_raw.get(_tier)
+        if not _raw_tier:
+            continue  # operator did not mention this tier; defaults apply silently
+        if "target_modules" in _raw_tier:
+            continue  # operator was explicit
+        _merged = getattr(config.adapters, _tier)
+        if not _merged.enabled:
+            continue  # tier disabled by operator; the field is moot
+        raise FatalConfigError(
+            f"adapters.{_tier}.enabled=true but target_modules is missing in "
+            f"{path}.\n"
+            f"\n"
+            f"Likely cause:\n"
+            f"  The yaml partially specifies adapters.{_tier} (e.g. enabled,\n"
+            f"  rank, alpha, learning_rate) but omits target_modules. The loader\n"
+            f"  would silently fall back to the factory default — hiding the\n"
+            f"  architectural choice ({_tier}'s LoRA shape) from the operator's\n"
+            f"  config. The yaml is the contract for load-bearing fields.\n"
+            f"\n"
+            f"Remediation:\n"
+            f"  - Open {path} and add under adapters.{_tier}:\n"
+            f"      target_modules: [...]\n"
+            f"  - See configs/server.yaml.example for canonical values\n"
+            f"    (procedural targets attn+mlp; episodic and semantic target\n"
+            f"    attn-only).\n"
+            f"  - OR remove the entire adapters.{_tier} block to fall back to\n"
+            f"    the factory defaults intentionally."
         )
 
     # Consolidation — refresh_cadence is the single user-facing scheduling knob.
