@@ -1130,10 +1130,33 @@ _show_test14_status() {
         # signal for completion — pause-during-phase no longer writes the
         # marker, so its absence reliably means the phase did not converge.
         # When progress.json exists without a *_done.json, render an
-        # in-flight indicator (epoch progress bar follows below).
-        python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+        # in-flight indicator: ▶ running (process alive), ⏸ paused
+        # (paused.json names this phase), or ✗ stopped (no process and no
+        # paused marker — a crash).
+        python3 - "$run_dir" "$running_flag" <<'PYEOF' 2>/dev/null
 import json, sys, os
 run_dir = sys.argv[1]
+is_running = bool(sys.argv[2]) if len(sys.argv) > 2 else False
+
+# Read top-level paused.json once so we can attribute the pause to the
+# specific (variant, phase) it stopped during.  ``stopped_after_phase``
+# is e.g. "during C, variant V4" or "after C, variant V4" depending on
+# whether the halt was mid-phase or at a phase boundary.
+paused_label = ""
+paused_path = os.path.join(run_dir, "paused.json")
+if os.path.exists(paused_path):
+    try:
+        paused_label = json.load(open(paused_path)).get("stopped_after_phase", "") or ""
+    except Exception:
+        paused_label = ""
+
+def _phase_paused_here(variant: str, phase: str) -> bool:
+    """True iff the run-level paused.json names this exact (variant, phase)."""
+    if not paused_label.startswith("during "):
+        return False
+    # Format: "during {phase}[ (extended|scale|...)], variant {variant}"
+    return f"during {phase}" in paused_label and f"variant {variant}" in paused_label
+
 # Render in deterministic order; include extended-run variants
 # (V3_extended / V4 / V5) when their dirs exist.  Phase A may be
 # either a fresh A_done.json or a phase_a_reused.json marker.
@@ -1160,7 +1183,7 @@ for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5"):
             marker = done_path if os.path.exists(done_path) else None
             tag = ""
         if marker is None:
-            # No done marker: check for in-flight progress.
+            # No done marker: classify the in-flight state.
             progress_path = os.path.join(phase_dir, "progress.json")
             if os.path.exists(progress_path):
                 try:
@@ -1170,12 +1193,23 @@ for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5"):
                     keys = pg.get("keys", "?")
                     fr = pg.get("fill_rate")
                     fr_str = f", fill={fr:.2f}" if isinstance(fr, (int, float)) else ""
+                    if _phase_paused_here(variant, phase):
+                        label = "\x1b[33m⏸ paused\x1b[0m"
+                        suffix = "\x1b[2m(no done marker — incomplete)\x1b[0m"
+                    elif is_running:
+                        label = "\x1b[36m▶ running\x1b[0m"
+                        suffix = ""
+                    else:
+                        label = "\x1b[31m✗ stopped\x1b[0m"
+                        suffix = "\x1b[2m(no done marker, no pause flag — likely crashed)\x1b[0m"
                     any_state = True
-                    print(
-                        f"  {variant}/{phase}:    \x1b[33m⏸ paused\x1b[0m  "
-                        f"epoch {cur}/{total}, n={keys}{fr_str}  "
-                        f"\x1b[2m(no done marker — incomplete)\x1b[0m"
+                    line = (
+                        f"  {variant}/{phase}:    {label}  "
+                        f"epoch {cur}/{total}, n={keys}{fr_str}"
                     )
+                    if suffix:
+                        line += f"  {suffix}"
+                    print(line)
                 except Exception:
                     pass
             continue
@@ -1230,14 +1264,22 @@ PYEOF
         fi
 
     elif [[ "$mode" == "scale" ]]; then
-        python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+        python3 - "$run_dir" "$running_flag" <<'PYEOF' 2>/dev/null
 import json, sys, os
 run_dir = sys.argv[1]
+is_running = bool(sys.argv[2]) if len(sys.argv) > 2 else False
+paused_label = ""
+paused_path = os.path.join(run_dir, "paused.json")
+if os.path.exists(paused_path):
+    try:
+        paused_label = json.load(open(paused_path)).get("stopped_after_phase", "") or ""
+    except Exception:
+        paused_label = ""
 for phase in ("A", "B", "C"):
     phase_dir = os.path.join(run_dir, phase)
     marker = os.path.join(phase_dir, f"{phase}_done.json")
     if not os.path.exists(marker):
-        # In-flight (or paused without done): show progress instead.
+        # No done marker: classify the in-flight state (running / paused / stopped).
         progress_path = os.path.join(phase_dir, "progress.json")
         if os.path.exists(progress_path):
             try:
@@ -1245,11 +1287,19 @@ for phase in ("A", "B", "C"):
                 cur = pg.get("epoch", "?")
                 total = pg.get("total_epochs") or pg.get("target_epoch") or "?"
                 keys = pg.get("keys", "?")
-                print(
-                    f"  {phase}:        \x1b[33m⏸ paused\x1b[0m  "
-                    f"epoch {cur}/{total}, n={keys}  "
-                    f"\x1b[2m(no done marker — incomplete)\x1b[0m"
-                )
+                if paused_label.startswith("during ") and f"during {phase}" in paused_label:
+                    label = "\x1b[33m⏸ paused\x1b[0m"
+                    suffix = "\x1b[2m(no done marker — incomplete)\x1b[0m"
+                elif is_running:
+                    label = "\x1b[36m▶ running\x1b[0m"
+                    suffix = ""
+                else:
+                    label = "\x1b[31m✗ stopped\x1b[0m"
+                    suffix = "\x1b[2m(no done marker, no pause flag — likely crashed)\x1b[0m"
+                line = f"  {phase}:        {label}  epoch {cur}/{total}, n={keys}"
+                if suffix:
+                    line += f"  {suffix}"
+                print(line)
             except Exception:
                 pass
         continue
