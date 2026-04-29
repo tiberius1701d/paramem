@@ -999,3 +999,73 @@ class TestDecidePreWinnerExtended:
 
         winner = decide_pre_winner(tmp_path, existing_winner="V3")
         assert winner == "V5"  # stable_c=10 < 12
+
+
+# ---------------------------------------------------------------------------
+# _exit_if_paused_mid_phase — pause-vs-convergence discrimination
+# ---------------------------------------------------------------------------
+
+
+class TestExitIfPausedMidPhase:
+    """Pause-during-training must NOT be treated as phase completion.
+
+    Regression: prior to 2026-04-29 the test14 driver wrote a *_done.json
+    marker after every successful return from a phase runner — including
+    the case where ``RecallEarlyStopCallback`` had set
+    ``control.should_training_stop=True`` because of ``~/.training_pause``.
+    A paused phase looked indistinguishable from a converged one to
+    ``tstatus`` and to the resume-skip check.
+
+    The helper now infers "paused mid-phase" from the existing JSON state:
+    it fires when neither natural convergence (``stop_epoch is not None``)
+    nor full-budget exhaustion (``last_epoch >= num_epochs``) holds.  The
+    only other thing that can stop the trainer cleanly in test14 is the
+    pause flag, so the inference is exhaustive.
+    """
+
+    def test_no_action_on_natural_convergence(self, tmp_path):
+        """stop_epoch set ⇒ phase converged, helper is a no-op."""
+        from experiments.test14 import EpochProbeState, _exit_if_paused_mid_phase
+
+        probe_state = EpochProbeState(
+            stop_epoch=10,
+            epoch_log=[{"epoch": e} for e in range(1, 11)],
+        )
+        _exit_if_paused_mid_phase(probe_state, "during C, variant V4", 30, tmp_path)
+        assert not (tmp_path / "paused.json").exists()
+
+    def test_no_action_on_full_budget(self, tmp_path):
+        """epoch_log[-1].epoch >= num_epochs ⇒ phase ran full budget."""
+        from experiments.test14 import EpochProbeState, _exit_if_paused_mid_phase
+
+        probe_state = EpochProbeState(
+            stop_epoch=None,  # never converged
+            epoch_log=[{"epoch": e} for e in range(1, 31)],  # ran all 30
+        )
+        _exit_if_paused_mid_phase(probe_state, "during C, variant V4", 30, tmp_path)
+        assert not (tmp_path / "paused.json").exists()
+
+    def test_no_action_when_epoch_log_empty(self, tmp_path):
+        """Empty epoch_log ⇒ trainer never started; outer _check_pause handles it."""
+        from experiments.test14 import EpochProbeState, _exit_if_paused_mid_phase
+
+        probe_state = EpochProbeState()  # all defaults; empty epoch_log
+        _exit_if_paused_mid_phase(probe_state, "during A, variant V1", 30, tmp_path)
+        assert not (tmp_path / "paused.json").exists()
+
+    def test_raises_systemexit_when_halted_mid_phase(self, tmp_path):
+        """stop_epoch=None AND last_epoch < num_epochs ⇒ pause-halt."""
+        from experiments.test14 import EpochProbeState, _exit_if_paused_mid_phase
+
+        probe_state = EpochProbeState(
+            stop_epoch=None,
+            epoch_log=[{"epoch": 1}, {"epoch": 2}],  # halted at e2 of 30
+        )
+
+        with pytest.raises(SystemExit):
+            _exit_if_paused_mid_phase(probe_state, "during C, variant V4", 30, tmp_path)
+
+        marker = json.loads((tmp_path / "paused.json").read_text())
+        assert marker["stopped_after_phase"] == "during C, variant V4"
+        assert marker["stopped_after_epoch"] == 2
+        assert "timestamp" in marker

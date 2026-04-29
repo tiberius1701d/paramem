@@ -181,6 +181,50 @@ def marker_exists(run_dir: Path, marker_name: str) -> bool:
     return (run_dir / f"{marker_name}_done.json").exists()
 
 
+def _exit_if_paused_mid_phase(
+    probe_state: "EpochProbeState",
+    phase_label: str,
+    num_epochs: int,
+    run_dir: Path,
+) -> None:
+    """Halt cleanly when training was stopped mid-phase by the pause flag.
+
+    Inference rule (no extra state field needed): a phase has completed iff
+    the early-stop callback fired (``stop_epoch is not None``) OR the trainer
+    ran the full epoch budget.  Anything else means
+    ``RecallEarlyStopCallback`` set ``should_training_stop=True`` for a
+    reason that is NOT natural convergence — and in test14 the only such
+    reason is the ``~/.training_pause`` flag.
+
+    When this fires, the phase has NOT finished — partial checkpoints exist
+    on disk and the next tresume will pick them up via
+    ``_find_latest_checkpoint``.  Writes ``paused.json`` with a ``during X``
+    label (vs the boundary ``after X`` label written by ``_check_pause``)
+    so ``tstatus`` can show the user where training stopped.
+
+    No ``*_done.json`` marker is written; the caller's normal phase-end
+    code (final probe, save_adapter, _write_phase_done) MUST be skipped
+    when this raises.
+    """
+    if probe_state.stop_epoch is not None:
+        return  # natural convergence
+    if not probe_state.epoch_log:
+        return  # nothing started; outer _check_pause will handle it
+    last_epoch = probe_state.epoch_log[-1].get("epoch")
+    if last_epoch is None:
+        return
+    if last_epoch >= num_epochs:
+        return  # ran the full budget without convergence
+    logger.warning(
+        "Phase paused mid-training: %s at epoch %d — no done marker "
+        "written; checkpoint preserved for tresume.",
+        phase_label,
+        last_epoch,
+    )
+    write_paused_marker(run_dir, phase_label, after_epoch=last_epoch)
+    raise SystemExit(f"Training paused {phase_label} at epoch {last_epoch}")
+
+
 def write_paused_marker(run_dir: Path, after_phase: str, after_epoch: int | None = None) -> None:
     """Write paused.json at clean pause exit."""
     marker = {
@@ -1701,6 +1745,10 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                         raise SystemExit(f"Phase A OOM in variant {variant} — halting")
                     raise
 
+                _exit_if_paused_mid_phase(
+                    probe_a, f"during A, variant {variant}", args.num_epochs, run_dir
+                )
+
                 final_a = _safe_probe(model, tokenizer, keyed_a, registry_a, adapter_name_a)
                 _manifest_a = build_manifest_for(
                     model,
@@ -1786,6 +1834,13 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     disable_early_stop=disable_early_stop_b,
                 )
 
+                _exit_if_paused_mid_phase(
+                    probe_b,
+                    f"during B (extended), variant {variant}",
+                    getattr(args, "scaffold_resume_epochs", 30),
+                    run_dir,
+                )
+
                 final_b = _safe_probe(
                     model, tokenizer, scaffold_keyed, scaffold_registry, "journal"
                 )
@@ -1834,6 +1889,10 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     args=args,
                     phase_dir=v_dir / "B",
                     run_name=f"test14-pre-B-{variant}",
+                )
+
+                _exit_if_paused_mid_phase(
+                    probe_b, f"during B, variant {variant}", args.num_epochs, run_dir
                 )
 
                 final_b = _safe_probe(
@@ -1916,6 +1975,10 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 phase_dir=v_dir / "C",
                 run_name=f"test14-pre-C-{variant}",
                 resume_from_checkpoint=ckpt,
+            )
+
+            _exit_if_paused_mid_phase(
+                probe_c, f"during C, variant {variant}", args.num_epochs, run_dir
             )
 
             final_c = _safe_probe(model, tokenizer, fill_keyed, fill_registry, "journal")
@@ -2023,6 +2086,8 @@ def run_mode_scale(
                 raise SystemExit("Phase A OOM — halting; do not cascade into Phase B")
             raise
 
+        _exit_if_paused_mid_phase(probe_a, "during A (scale)", args.num_epochs, run_dir)
+
         final_a = _safe_probe(model, tokenizer, keyed_a, registry_a, "episodic")
         _manifest_a = build_manifest_for(
             model,
@@ -2074,6 +2139,8 @@ def run_mode_scale(
             phase_dir=run_dir / "B",
             run_name="test14-scale-B",
         )
+
+        _exit_if_paused_mid_phase(probe_b, "during B (scale)", args.num_epochs, run_dir)
 
         final_b = _safe_probe(model, tokenizer, scaffold_keyed, scaffold_registry, "journal")
         _manifest_b = build_manifest_for(
@@ -2145,6 +2212,8 @@ def run_mode_scale(
             run_name="test14-scale-C",
             resume_from_checkpoint=ckpt,
         )
+
+        _exit_if_paused_mid_phase(probe_c, "during C (scale)", args.num_epochs, run_dir)
 
         final_c = _safe_probe(model, tokenizer, fill_keyed, fill_registry, "journal")
         leaks = _leakage_count(final_c["per_key"])
@@ -2441,6 +2510,10 @@ def run_mode_multiround(
         fill_state.stop_epoch = early_state.stop_epoch
         fill_state.epoch_log = early_state.epoch_log
 
+        _exit_if_paused_mid_phase(
+            fill_state, f"during fill, round {round_label}", args.num_epochs, run_dir
+        )
+
         # Save post-fill adapter.
         _manifest_fill = build_manifest_for(
             model,
@@ -2722,6 +2795,8 @@ def run_smoke(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None
                 raise SystemExit("SMOKE Phase A OOM")
             raise
 
+        _exit_if_paused_mid_phase(probe_a, "during A (smoke)", args.num_epochs, smoke_dir)
+
         final_a = _safe_probe(model, tokenizer, keyed_a, registry_a, "episodic")
         save_adapter(model, smoke_dir / "A" / "adapter", "episodic")
         _write_phase_done(
@@ -2753,6 +2828,8 @@ def run_smoke(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None
             phase_dir=smoke_dir / "B",
             run_name="test14-smoke-B",
         )
+
+        _exit_if_paused_mid_phase(probe_b, "during B (smoke)", args.num_epochs, smoke_dir)
 
         final_b = _safe_probe(model, tokenizer, scaffold_keyed, scaffold_registry, "journal")
         save_adapter(model, smoke_dir / "B" / "adapter", "journal")
@@ -2793,6 +2870,8 @@ def run_smoke(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None
             phase_dir=smoke_dir / "C",
             run_name="test14-smoke-C",
         )
+
+        _exit_if_paused_mid_phase(probe_c, "during C (smoke)", args.num_epochs, smoke_dir)
 
         final_c = _safe_probe(model, tokenizer, fill_keyed, fill_registry, "journal")
         save_adapter(model, smoke_dir / "C" / "adapter", "journal")

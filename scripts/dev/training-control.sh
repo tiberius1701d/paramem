@@ -1126,7 +1126,11 @@ _show_test14_status() {
     fi
 
     if [[ "$mode" == "pre" ]]; then
-        # Show per-variant phase summary
+        # Show per-variant phase summary.  A *_done.json marker is the truth
+        # signal for completion — pause-during-phase no longer writes the
+        # marker, so its absence reliably means the phase did not converge.
+        # When progress.json exists without a *_done.json, render an
+        # in-flight indicator (epoch progress bar follows below).
         python3 - "$run_dir" <<'PYEOF' 2>/dev/null
 import json, sys, os
 run_dir = sys.argv[1]
@@ -1137,8 +1141,9 @@ for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5"):
     v_dir = os.path.join(run_dir, variant)
     if not os.path.isdir(v_dir):
         continue
-    any_done = False
+    any_state = False
     for phase in ("A", "B", "C"):
+        phase_dir = os.path.join(v_dir, phase)
         if phase == "A":
             done_marker = os.path.join(v_dir, "A", "A_done.json")
             reuse_marker = os.path.join(v_dir, "A", "phase_a_reused.json")
@@ -1149,13 +1154,32 @@ for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5"):
                 marker = reuse_marker
                 tag = " (reused)"
             else:
-                continue
+                marker = None
         else:
-            marker = os.path.join(v_dir, phase, f"{phase}_done.json")
-            if not os.path.exists(marker):
-                continue
+            done_path = os.path.join(phase_dir, f"{phase}_done.json")
+            marker = done_path if os.path.exists(done_path) else None
             tag = ""
-        any_done = True
+        if marker is None:
+            # No done marker: check for in-flight progress.
+            progress_path = os.path.join(phase_dir, "progress.json")
+            if os.path.exists(progress_path):
+                try:
+                    pg = json.load(open(progress_path))
+                    cur = pg.get("epoch", "?")
+                    total = pg.get("total_epochs") or pg.get("target_epoch") or "?"
+                    keys = pg.get("keys", "?")
+                    fr = pg.get("fill_rate")
+                    fr_str = f", fill={fr:.2f}" if isinstance(fr, (int, float)) else ""
+                    any_state = True
+                    print(
+                        f"  {variant}/{phase}:    \x1b[33m⏸ paused\x1b[0m  "
+                        f"epoch {cur}/{total}, n={keys}{fr_str}  "
+                        f"\x1b[2m(no done marker — incomplete)\x1b[0m"
+                    )
+                except Exception:
+                    pass
+            continue
+        any_state = True
         try:
             d = json.load(open(marker))
         except Exception:
@@ -1170,7 +1194,7 @@ for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5"):
                  f"wall={wall:.0f}s" if isinstance(wall, (int, float)) else None]
         summary = "  ".join(s for s in parts if s)
         print(f"  {variant}/{phase}:    \x1b[32m✓\x1b[0m {summary}{tag}")
-    if not any_done:
+    if not any_state:
         print(f"  {variant}:      \x1b[2mnot started\x1b[0m")
 if os.path.exists(os.path.join(run_dir, "pre_decision.json")):
     try:
@@ -1182,13 +1206,52 @@ if os.path.exists(os.path.join(run_dir, "pre_decision.json")):
         pass
 PYEOF
 
+        # In-flight phase: detect (variant, phase) pair with progress.json
+        # but no *_done.json, and render an epoch progress bar with ETA.
+        # This is the "tstatus is no longer misleading" fix — the user can
+        # see exactly where training was when it paused (or where it is
+        # currently working if the script is still running).
+        local current_var="" current_phase=""
+        for variant in V1 V2 V3 V3_extended V4 V5; do
+            local v_dir="$run_dir/$variant"
+            [[ -d "$v_dir" ]] || continue
+            for phase in A B C; do
+                local p_dir="$v_dir/$phase"
+                if [[ -f "$p_dir/progress.json" && ! -f "$p_dir/${phase}_done.json" ]]; then
+                    current_var="$variant"
+                    current_phase="$phase"
+                    break 2
+                fi
+            done
+        done
+        if [[ -n "$current_var" ]]; then
+            echo -e "  Current:    ${YELLOW}${current_var}/Phase ${current_phase}${RESET}"
+            _show_epoch_progress "$run_dir/$current_var/$current_phase" "${current_var}/${current_phase}"
+        fi
+
     elif [[ "$mode" == "scale" ]]; then
         python3 - "$run_dir" <<'PYEOF' 2>/dev/null
 import json, sys, os
 run_dir = sys.argv[1]
 for phase in ("A", "B", "C"):
-    marker = os.path.join(run_dir, phase, f"{phase}_done.json")
+    phase_dir = os.path.join(run_dir, phase)
+    marker = os.path.join(phase_dir, f"{phase}_done.json")
     if not os.path.exists(marker):
+        # In-flight (or paused without done): show progress instead.
+        progress_path = os.path.join(phase_dir, "progress.json")
+        if os.path.exists(progress_path):
+            try:
+                pg = json.load(open(progress_path))
+                cur = pg.get("epoch", "?")
+                total = pg.get("total_epochs") or pg.get("target_epoch") or "?"
+                keys = pg.get("keys", "?")
+                print(
+                    f"  {phase}:        \x1b[33m⏸ paused\x1b[0m  "
+                    f"epoch {cur}/{total}, n={keys}  "
+                    f"\x1b[2m(no done marker — incomplete)\x1b[0m"
+                )
+            except Exception:
+                pass
         continue
     try:
         d = json.load(open(marker))
@@ -1205,6 +1268,20 @@ for phase in ("A", "B", "C"):
     summary = "  ".join(s for s in parts if s)
     print(f"  {phase}:        \x1b[32m✓\x1b[0m {summary}")
 PYEOF
+
+        # In-flight epoch progress bar for scale (single A/B/C tree).
+        local current_phase=""
+        for phase in A B C; do
+            local p_dir="$run_dir/$phase"
+            if [[ -f "$p_dir/progress.json" && ! -f "$p_dir/${phase}_done.json" ]]; then
+                current_phase="$phase"
+                break
+            fi
+        done
+        if [[ -n "$current_phase" ]]; then
+            echo -e "  Current:    ${YELLOW}Phase ${current_phase}${RESET}"
+            _show_epoch_progress "$run_dir/$current_phase" "$current_phase"
+        fi
 
     elif [[ "$mode" == "multiround" ]]; then
         python3 - "$run_dir" <<'PYEOF' 2>/dev/null
@@ -1241,11 +1318,14 @@ for phase in ("P0", "P1", "P2", "P3"):
 PYEOF
     fi
 
-    # Paused marker
+    # Paused marker.  `stopped_after_phase` may be a phase-boundary label
+    # ("after C, variant V4") OR a mid-phase label ("during C, variant V4")
+    # written by `_exit_if_paused_mid_phase`; both render naturally.
     if [[ -f "$run_dir/paused.json" ]]; then
-        local after
+        local after epoch_at
         after=$(python3 -c "import json; print(json.load(open('$run_dir/paused.json')).get('stopped_after_phase','?'))" 2>/dev/null)
-        echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped after phase ${after} — tresume 14 to continue)${RESET}"
+        epoch_at=$(python3 -c "import json; v=json.load(open('$run_dir/paused.json')).get('stopped_after_epoch'); print('' if v is None else f' (epoch {v})')" 2>/dev/null)
+        echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped ${after}${epoch_at} — tresume 14 to continue)${RESET}"
     fi
 
     # Only show "Final: complete" when no test14 process is running.
