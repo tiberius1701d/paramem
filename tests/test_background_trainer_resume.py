@@ -46,9 +46,7 @@ def _make_stub_model(*adapter_names: str) -> MagicMock:
     attributes per-test.
     """
     model = MagicMock()
-    model.peft_config = {
-        name: MagicMock(target_modules=["q_proj"], r=4) for name in adapter_names
-    }
+    model.peft_config = {name: MagicMock(target_modules=["q_proj"], r=4) for name in adapter_names}
     return model
 
 

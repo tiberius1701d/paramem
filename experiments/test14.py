@@ -1842,10 +1842,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
         if not multi_seed_mode:
             return (v_dir / "C" / "C_done.json").exists()
         # Multi-seed: every requested seed must have its own sub-dir marker.
-        return all(
-            (v_dir / "C" / f"seed{s}" / "C_done.json").exists()
-            for s in requested_seeds
-        )
+        return all((v_dir / "C" / f"seed{s}" / "C_done.json").exists() for s in requested_seeds)
 
     for v_idx, variant in enumerate(variants_to_run):
         v_dir = run_dir / variant
