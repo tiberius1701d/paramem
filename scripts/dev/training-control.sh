@@ -462,9 +462,10 @@ training_resume() {
     #
     # Also auto-detect Phase A reuse: when --mode=pre and the run dir
     # contains V1/V2/V3 done markers, the same dir is the source for the
-    # extended-run variants (V3_extended/V4/V5).  Without this, V4/V5
-    # would fresh-train Phase A on resume because their phase_a_reused.json
-    # markers haven't been written yet — costs ~3 h per variant.
+    # extended-run variants (V3_extended/V4-V8).  Without this, the
+    # extended variants would fresh-train Phase A on resume because their
+    # phase_a_reused.json markers haven't been written yet — costs ~3 h
+    # per variant.
     if [[ "$test_num" == "14" ]]; then
         # run_config.json sits at <output_base>/<model>/<ts>/run_config.json
         # → depth 3 from each output_base.  Earlier -maxdepth 2 silently
@@ -490,6 +491,27 @@ training_resume() {
                 if [[ -n "$scale_run" ]]; then
                     extra_flags="$extra_flags --scale-run $scale_run"
                 fi
+            fi
+            # Multi-seed pass-through: when phase_c_seeds is set in
+            # run_config.json, propagate the same list to every resume so
+            # the per-(variant, seed) sub-dir layout stays consistent and
+            # resume picks up where each (variant, seed) unit left off.
+            local phase_c_seeds=$(python3 -c "
+import json
+v = json.load(open('$latest_dir')).get('phase_c_seeds')
+if v:
+    print(' '.join(str(s) for s in v))
+" 2>/dev/null)
+            if [[ -n "$phase_c_seeds" ]]; then
+                extra_flags="$extra_flags --phase-c-seeds $phase_c_seeds"
+            fi
+            local phase_c_num_epochs=$(python3 -c "
+import json
+v = json.load(open('$latest_dir')).get('phase_c_num_epochs')
+print(v if v is not None else '')
+" 2>/dev/null)
+            if [[ -n "$phase_c_num_epochs" ]]; then
+                extra_flags="$extra_flags --phase-c-num-epochs $phase_c_num_epochs"
             fi
         fi
     fi
@@ -1158,9 +1180,9 @@ def _phase_paused_here(variant: str, phase: str) -> bool:
     return f"during {phase}" in paused_label and f"variant {variant}" in paused_label
 
 # Render in deterministic order; include extended-run variants
-# (V3_extended / V4 / V5) when their dirs exist.  Phase A may be
+# (V3_extended / V4-V8) when their dirs exist.  Phase A may be
 # either a fresh A_done.json or a phase_a_reused.json marker.
-for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5"):
+for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5", "V6", "V7", "V8"):
     v_dir = os.path.join(run_dir, variant)
     if not os.path.isdir(v_dir):
         continue
@@ -1246,7 +1268,7 @@ PYEOF
         # see exactly where training was when it paused (or where it is
         # currently working if the script is still running).
         local current_var="" current_phase=""
-        for variant in V1 V2 V3 V3_extended V4 V5; do
+        for variant in V1 V2 V3 V3_extended V4 V5 V6 V7 V8; do
             local v_dir="$run_dir/$variant"
             [[ -d "$v_dir" ]] || continue
             for phase in A B C; do

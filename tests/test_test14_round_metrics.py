@@ -433,6 +433,8 @@ class TestLoadOrWriteRunConfig:
         variant: str = "V1",
         num_epochs: int = 30,
         rank: int = 8,
+        phase_c_seeds: list[int] | None = None,
+        phase_c_num_epochs: int | None = None,
     ) -> types.SimpleNamespace:
         return types.SimpleNamespace(
             mode=mode,
@@ -443,6 +445,8 @@ class TestLoadOrWriteRunConfig:
             rank=rank,
             smoke=False,
             scale_run=None,
+            phase_c_seeds=phase_c_seeds,
+            phase_c_num_epochs=phase_c_num_epochs,
         )
 
     def test_write_then_read_parity(self, tmp_path):
@@ -515,6 +519,27 @@ class TestLoadOrWriteRunConfig:
         cfg = load_or_write_run_config(tmp_path, args_second)
         # pre mode hard-caps at PRE_N_KEYS=100, not 999.
         assert cfg["n_keys"] == 100
+
+    def test_phase_c_seeds_persisted(self, tmp_path):
+        """phase_c_seeds and phase_c_num_epochs persist into run_config.json so
+        tresume can re-pass them on resume.  Required for the multi-seed batch
+        to survive a pause/resume cycle."""
+        from experiments.test14 import load_or_write_run_config
+
+        args = self._make_args("pre", phase_c_seeds=[42, 7, 1337], phase_c_num_epochs=50)
+        cfg = load_or_write_run_config(tmp_path, args)
+        assert cfg["phase_c_seeds"] == [42, 7, 1337]
+        assert cfg["phase_c_num_epochs"] == 50
+
+    def test_phase_c_seeds_default_none(self, tmp_path):
+        """When --phase-c-seeds is unset, the field is None (legacy single-seed
+        mode preserved)."""
+        from experiments.test14 import load_or_write_run_config
+
+        args = self._make_args("pre")
+        cfg = load_or_write_run_config(tmp_path, args)
+        assert cfg["phase_c_seeds"] is None
+        assert cfg["phase_c_num_epochs"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1069,3 +1094,106 @@ class TestExitIfPausedMidPhase:
         assert marker["stopped_after_phase"] == "during C, variant V4"
         assert marker["stopped_after_epoch"] == 2
         assert "timestamp" in marker
+
+
+# ---------------------------------------------------------------------------
+# aggregate_multi_seed_phase_c
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateMultiSeedPhaseC:
+    """Multi-seed aggregator reads per-(variant, seed) C_done.json files and
+    writes a multiseed_aggregate.json with mean / std / min / max per
+    variant.  This is the artefact the user inspects to decide whether the
+    multi-seed batch confirms or refutes the n=1 V3<V2<V1 ordering.
+    """
+
+    def _write_seed_done(
+        self,
+        run_dir: Path,
+        variant: str,
+        seed: int,
+        *,
+        stable: int | None,
+        first: int | None,
+        rate: float = 1.0,
+        leakage: int = 0,
+        wall: float = 6500.0,
+        num_epochs: int = 30,
+    ) -> None:
+        seed_dir = run_dir / variant / "C" / f"seed{seed}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        (seed_dir / "C_done.json").write_text(
+            json.dumps(
+                {
+                    "first_perfect_epoch": first,
+                    "stable_perfect_epoch": stable,
+                    "stop_epoch": stable,
+                    "final_recall": {"rate": rate, "exact_count": 20, "total": 20},
+                    "wall_seconds": wall,
+                    "placeholder_leakage_count": leakage,
+                    "phase_c_seed": seed,
+                    "num_epochs": num_epochs,
+                }
+            )
+        )
+
+    def test_aggregate_writes_per_variant_summary(self, tmp_path):
+        from experiments.test14 import aggregate_multi_seed_phase_c
+
+        # V3 with three converging seeds, tight cluster
+        for seed, stable in [(42, 20), (7, 21), (1337, 19)]:
+            self._write_seed_done(tmp_path, "V3", seed, stable=stable, first=stable - 2)
+        # V1 with three converging seeds, slightly slower
+        for seed, stable in [(42, 24), (7, 25), (1337, 23)]:
+            self._write_seed_done(tmp_path, "V1", seed, stable=stable, first=stable - 2)
+
+        agg = aggregate_multi_seed_phase_c(tmp_path, [42, 7, 1337])
+
+        assert (tmp_path / "multiseed_aggregate.json").exists()
+        assert "V3" in agg["variants"]
+        assert "V1" in agg["variants"]
+
+        v3 = agg["variants"]["V3"]
+        assert v3["summary"]["n_seeds"] == 3
+        assert v3["summary"]["n_converged"] == 3
+        assert v3["summary"]["stable_perfect_epoch"]["mean"] == 20.0
+        assert v3["summary"]["stable_perfect_epoch"]["min"] == 19
+        assert v3["summary"]["stable_perfect_epoch"]["max"] == 21
+
+        v1 = agg["variants"]["V1"]
+        assert v1["summary"]["stable_perfect_epoch"]["mean"] == 24.0
+
+        assert agg["phase_c_seeds"] == [42, 7, 1337]
+        # pooled std across both variants (6 values: 19,20,21,23,24,25) ≈ 2.16
+        assert "pooled_stable_perfect_std" in agg
+
+    def test_aggregate_handles_non_converging_variant(self, tmp_path):
+        """A variant with stable=None at all seeds reports n_converged=0 and
+        empty summary stats — V4-style failure mode shouldn't crash."""
+        from experiments.test14 import aggregate_multi_seed_phase_c
+
+        for seed in [42, 7, 1337]:
+            self._write_seed_done(tmp_path, "V4", seed, stable=None, first=29, num_epochs=30)
+
+        agg = aggregate_multi_seed_phase_c(tmp_path, [42, 7, 1337])
+
+        v4 = agg["variants"]["V4"]
+        assert v4["summary"]["n_seeds"] == 3
+        assert v4["summary"]["n_converged"] == 0
+        # empty stats dict for the all-None case
+        assert v4["summary"]["stable_perfect_epoch"]["n"] == 0
+
+    def test_aggregate_skips_missing_seeds(self, tmp_path):
+        """Variant with only some seeds completed (e.g. resume mid-batch) is
+        included; missing seeds simply don't contribute to summary."""
+        from experiments.test14 import aggregate_multi_seed_phase_c
+
+        # V3 only seed=42 done so far
+        self._write_seed_done(tmp_path, "V3", 42, stable=20, first=18)
+
+        agg = aggregate_multi_seed_phase_c(tmp_path, [42, 7, 1337])
+
+        v3 = agg["variants"]["V3"]
+        assert v3["summary"]["n_seeds"] == 1
+        assert v3["summary"]["stable_perfect_epoch"]["n"] == 1

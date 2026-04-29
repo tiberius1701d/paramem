@@ -23,6 +23,9 @@ from experiments.utils.scaffold import (
     V3_EXTENDED,
     V4,
     V5,
+    V6,
+    V7,
+    V8,
     VARIANT_BUILDERS,
     VARIANTS,
     build_fill_keyed,
@@ -31,6 +34,9 @@ from experiments.utils.scaffold import (
     build_v3_scaffold,
     build_v4_scaffold,
     build_v5_scaffold,
+    build_v6_scaffold,
+    build_v7_scaffold,
+    build_v8_scaffold,
 )
 
 
@@ -44,9 +50,13 @@ class TestScaffoldConstants:
         assert V3_EXTENDED in VARIANTS
         assert V4 in VARIANTS
         assert V5 in VARIANTS
+        assert V6 in VARIANTS
+        assert V7 in VARIANTS
+        assert V8 in VARIANTS
 
-    def test_variants_tuple_has_six_entries(self):
-        assert len(VARIANTS) == 6
+    def test_variants_tuple_has_nine_entries(self):
+        # V1, V2, V3, V3_extended, V4, V5, V6, V7, V8
+        assert len(VARIANTS) == 9
 
     def test_variant_builders_keys_match_variants(self):
         assert set(VARIANT_BUILDERS.keys()) == set(VARIANTS)
@@ -373,12 +383,12 @@ class TestBuildV4Scaffold:
 
 
 # ---------------------------------------------------------------------------
-# V5 scaffold
+# V5 scaffold — uniform long natural-language template
 # ---------------------------------------------------------------------------
 
 
 class TestBuildV5Scaffold:
-    """V5 builder produces deterministic random-hex Q/A per slot."""
+    """V5 builder produces uniform fluent-English Q/A across all slots."""
 
     def test_length(self):
         assert len(build_v5_scaffold(5)) == 5
@@ -392,58 +402,15 @@ class TestBuildV5Scaffold:
         for entry in build_v5_scaffold(5):
             assert set(entry.keys()) == {"key", "question", "answer"}
 
-    def test_question_is_16_hex_chars(self):
-        """Question field is exactly 16 lowercase hex characters."""
-        import re
+    def test_question_is_uniform_natural_language(self):
+        result = build_v5_scaffold(10)
+        questions = {e["question"] for e in result}
+        assert questions == {"What is the answer to this query?"}
 
-        for entry in build_v5_scaffold(5):
-            assert re.fullmatch(r"[0-9a-f]{16}", entry["question"]), (
-                f"Expected 16-char hex, got {entry['question']!r}"
-            )
-
-    def test_answer_is_16_hex_chars(self):
-        """Answer field is exactly 16 lowercase hex characters."""
-        import re
-
-        for entry in build_v5_scaffold(5):
-            assert re.fullmatch(r"[0-9a-f]{16}", entry["answer"]), (
-                f"Expected 16-char hex, got {entry['answer']!r}"
-            )
-
-    def test_deterministic_same_index_same_value(self):
-        """Same slot index always produces the same Q and A strings."""
-        r1 = build_v5_scaffold(10)
-        r2 = build_v5_scaffold(10)
-        assert r1 == r2
-
-    def test_deterministic_from_index_alone(self):
-        """Slot N produces the same string regardless of start_index offset."""
-        import hashlib
-
-        n = 7
-        expected_q = hashlib.sha256(f"V5-Q-{n}".encode()).hexdigest()[:16]
-        expected_a = hashlib.sha256(f"V5-A-{n}".encode()).hexdigest()[:16]
-        result = build_v5_scaffold(1, start_index=n)
-        assert result[0]["question"] == expected_q
-        assert result[0]["answer"] == expected_a
-
-    def test_q_and_a_differ_per_slot(self):
-        """Q and A strings are distinct for each slot (no aliasing)."""
-        result = build_v5_scaffold(5)
-        for entry in result:
-            assert entry["question"] != entry["answer"], f"Q and A should differ: {entry}"
-
-    def test_no_duplicate_q_values_across_slots(self):
-        """Each slot produces a distinct Q string (no cross-slot collision)."""
-        result = build_v5_scaffold(20)
-        questions = [e["question"] for e in result]
-        assert len(questions) == len(set(questions))
-
-    def test_no_duplicate_a_values_across_slots(self):
-        """Each slot produces a distinct A string."""
-        result = build_v5_scaffold(20)
-        answers = [e["answer"] for e in result]
-        assert len(answers) == len(set(answers))
+    def test_answer_is_uniform_natural_language(self):
+        result = build_v5_scaffold(10)
+        answers = {e["answer"] for e in result}
+        assert answers == {"The answer is currently unknown."}
 
     def test_no_duplicate_keys(self):
         result = build_v5_scaffold(50)
@@ -459,8 +426,159 @@ class TestBuildV5Scaffold:
         assert result[1]["key"] == "graph4"
 
     def test_variant_builders_dispatch(self):
-        """VARIANT_BUILDERS[V5] dispatches to build_v5_scaffold."""
         assert VARIANT_BUILDERS[V5](5) == build_v5_scaffold(5)
+
+
+# ---------------------------------------------------------------------------
+# V6 scaffold — uniform short non-natural sentinel
+# ---------------------------------------------------------------------------
+
+
+class TestBuildV6Scaffold:
+    """V6 builder produces uniform '<PLACEHOLDER>' across all slots."""
+
+    def test_length(self):
+        assert len(build_v6_scaffold(5)) == 5
+
+    def test_required_fields(self):
+        for entry in build_v6_scaffold(5):
+            assert set(entry.keys()) == {"key", "question", "answer"}
+
+    def test_question_uniform_placeholder_token(self):
+        result = build_v6_scaffold(10)
+        assert {e["question"] for e in result} == {"<PLACEHOLDER>"}
+
+    def test_answer_uniform_placeholder_token(self):
+        result = build_v6_scaffold(10)
+        assert {e["answer"] for e in result} == {"<PLACEHOLDER>"}
+
+    def test_no_duplicate_keys(self):
+        result = build_v6_scaffold(50)
+        keys = [e["key"] for e in result]
+        assert len(keys) == len(set(keys))
+
+    def test_start_index(self):
+        result = build_v6_scaffold(2, start_index=7)
+        assert result[0]["key"] == "graph7"
+
+    def test_variant_builders_dispatch(self):
+        assert VARIANT_BUILDERS[V6](5) == build_v6_scaffold(5)
+
+
+# ---------------------------------------------------------------------------
+# V7 scaffold — per-slot deterministic sha256 hex (was V5 in earlier naming)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildV7Scaffold:
+    """V7 builder produces deterministic random-hex Q/A per slot."""
+
+    def test_length(self):
+        assert len(build_v7_scaffold(5)) == 5
+
+    def test_key_format(self):
+        result = build_v7_scaffold(3)
+        assert result[0]["key"] == "graph1"
+        assert result[2]["key"] == "graph3"
+
+    def test_required_fields(self):
+        for entry in build_v7_scaffold(5):
+            assert set(entry.keys()) == {"key", "question", "answer"}
+
+    def test_question_is_16_hex_chars(self):
+        import re
+
+        for entry in build_v7_scaffold(5):
+            assert re.fullmatch(r"[0-9a-f]{16}", entry["question"]), (
+                f"Expected 16-char hex, got {entry['question']!r}"
+            )
+
+    def test_answer_is_16_hex_chars(self):
+        import re
+
+        for entry in build_v7_scaffold(5):
+            assert re.fullmatch(r"[0-9a-f]{16}", entry["answer"]), (
+                f"Expected 16-char hex, got {entry['answer']!r}"
+            )
+
+    def test_deterministic_same_index_same_value(self):
+        r1 = build_v7_scaffold(10)
+        r2 = build_v7_scaffold(10)
+        assert r1 == r2
+
+    def test_deterministic_from_index_alone(self):
+        """Slot N produces the same string regardless of start_index offset."""
+        import hashlib
+
+        n = 7
+        expected_q = hashlib.sha256(f"V7-Q-{n}".encode()).hexdigest()[:16]
+        expected_a = hashlib.sha256(f"V7-A-{n}".encode()).hexdigest()[:16]
+        result = build_v7_scaffold(1, start_index=n)
+        assert result[0]["question"] == expected_q
+        assert result[0]["answer"] == expected_a
+
+    def test_q_and_a_differ_per_slot(self):
+        result = build_v7_scaffold(5)
+        for entry in result:
+            assert entry["question"] != entry["answer"], f"Q and A should differ: {entry}"
+
+    def test_no_duplicate_q_values_across_slots(self):
+        result = build_v7_scaffold(20)
+        questions = [e["question"] for e in result]
+        assert len(questions) == len(set(questions))
+
+    def test_no_duplicate_a_values_across_slots(self):
+        result = build_v7_scaffold(20)
+        answers = [e["answer"] for e in result]
+        assert len(answers) == len(set(answers))
+
+    def test_no_duplicate_keys(self):
+        result = build_v7_scaffold(50)
+        keys = [e["key"] for e in result]
+        assert len(keys) == len(set(keys))
+
+    def test_zero_keys(self):
+        assert build_v7_scaffold(0) == []
+
+    def test_start_index(self):
+        result = build_v7_scaffold(2, start_index=3)
+        assert result[0]["key"] == "graph3"
+        assert result[1]["key"] == "graph4"
+
+    def test_variant_builders_dispatch(self):
+        assert VARIANT_BUILDERS[V7](5) == build_v7_scaffold(5)
+
+
+# ---------------------------------------------------------------------------
+# V8 scaffold — uniform long OOD hex (fallback variant)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildV8Scaffold:
+    """V8 builder produces a single shared hex string across all slots."""
+
+    def test_length(self):
+        assert len(build_v8_scaffold(5)) == 5
+
+    def test_required_fields(self):
+        for entry in build_v8_scaffold(5):
+            assert set(entry.keys()) == {"key", "question", "answer"}
+
+    def test_question_uniform_hex(self):
+        result = build_v8_scaffold(10)
+        assert {e["question"] for e in result} == {"a1b2c3d4e5f60718"}
+
+    def test_answer_uniform_hex(self):
+        result = build_v8_scaffold(10)
+        assert {e["answer"] for e in result} == {"a1b2c3d4e5f60718"}
+
+    def test_no_duplicate_keys(self):
+        result = build_v8_scaffold(50)
+        keys = [e["key"] for e in result]
+        assert len(keys) == len(set(keys))
+
+    def test_variant_builders_dispatch(self):
+        assert VARIANT_BUILDERS[V8](5) == build_v8_scaffold(5)
 
 
 # ---------------------------------------------------------------------------

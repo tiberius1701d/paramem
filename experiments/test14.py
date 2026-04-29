@@ -290,7 +290,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         dest="reuse_phase_a_from",
         help="Path to an existing 14a-pre run dir.  When set, Phase A is skipped for "
-        "new variants (V3_extended/V4/V5) and the V3 Phase A adapter from that run "
+        "new variants (V3_extended/V4-V8) and the V3 Phase A adapter from that run "
         "is loaded as the baseline reference.  Saves ~8h of redundant compute.",
     )
     parser.add_argument(
@@ -350,6 +350,34 @@ def parse_args() -> argparse.Namespace:
         "--smoke",
         action="store_true",
         help="Smoke-test mode: N=10, 3 epochs, V1 only. Overrides --mode.",
+    )
+    parser.add_argument(
+        "--phase-c-seeds",
+        "--phase_c_seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        dest="phase_c_seeds",
+        help=(
+            "Multi-seed Phase C sweep: run Phase C once per listed seed and "
+            "save results under <variant>/C/seed<N>/.  When unset, uses the "
+            "single-seed legacy layout (<variant>/C/) with seed=42.  Phase A "
+            "and Phase B are NOT seed-varied; only Phase C's HF Trainer seed "
+            "(optimizer / data shuffler) changes per run.  Example: "
+            "--phase-c-seeds 42 7 1337"
+        ),
+    )
+    parser.add_argument(
+        "--phase-c-num-epochs",
+        "--phase_c_num_epochs",
+        type=int,
+        default=None,
+        dest="phase_c_num_epochs",
+        help=(
+            "Override --num-epochs for Phase C only (Phase A and B stay at "
+            "--num-epochs).  Used for the V4/V7 extended-budget cells (50 "
+            "epochs) without affecting Phase A/B budgets."
+        ),
     )
     return parser.parse_args()
 
@@ -425,6 +453,8 @@ def load_or_write_run_config(run_dir: Path, args: argparse.Namespace) -> dict:
         "seed": 42,
         "scale_run": str(getattr(args, "scale_run", None) or ""),
         "smoke": bool(args.smoke),
+        "phase_c_seeds": list(args.phase_c_seeds) if args.phase_c_seeds else None,
+        "phase_c_num_epochs": args.phase_c_num_epochs,
         "created_at": int(time.time()),
     }
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -449,11 +479,14 @@ def _adapter_config(rank: int, lr: float = DEFAULT_LR) -> AdapterConfig:
     )
 
 
-def _training_config(num_epochs: int, rank: int = DEFAULT_RANK) -> TrainingConfig:
+def _training_config(num_epochs: int, rank: int = DEFAULT_RANK, seed: int = 42) -> TrainingConfig:
     """Return a standard TrainingConfig for Test 14.
 
     Note: learning rate lives on AdapterConfig (see ``_adapter_config``), not
     TrainingConfig — TrainingConfig has no ``learning_rate`` field.
+
+    Seed is parameterized so the multi-seed Phase C sweep can vary the HF
+    Trainer optimizer / data-shuffler seed across replication runs.
     """
     return TrainingConfig(
         batch_size=1,
@@ -465,7 +498,7 @@ def _training_config(num_epochs: int, rank: int = DEFAULT_RANK) -> TrainingConfi
         weight_decay=0.1,
         gradient_checkpointing=True,
         max_grad_norm=1.0,
-        seed=42,
+        seed=seed,
         save_strategy="epoch",
         save_total_limit=num_epochs,
     )
@@ -661,6 +694,8 @@ def run_phase_C_fill(
     phase_dir: Path,
     run_name: str = "test14-C-fill",
     resume_from_checkpoint: Path | None = None,
+    seed: int = 42,
+    num_epochs: int | None = None,
 ) -> tuple[object, dict, EpochProbeState, float]:
     """Run Phase C: fill.
 
@@ -668,8 +703,15 @@ def run_phase_C_fill(
     (fill + retention).  Early-stop fires on 3x 100% aggregate fill recall
     after epoch 10.
 
+    Args:
+        seed: HF Trainer seed for the multi-seed Phase C sweep (default 42).
+        num_epochs: Override args.num_epochs for this run (used for the V4/V7
+            extended-budget cells).  When None, falls back to args.num_epochs.
+
     Returns (model, metrics, probe_state, wall_seconds).
     """
+    epochs = num_epochs if num_epochs is not None else args.num_epochs
+
     examples = format_indexed_training(fill_keyed, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
@@ -687,14 +729,14 @@ def run_phase_C_fill(
         epoch_log_path=phase_dir / "epoch_log.json",
         first_perfect_log_path=phase_dir / "first_perfect_log.json",
         phase_name="Phase_C",
-        num_epochs=args.num_epochs,
+        num_epochs=epochs,
         pause_file=PAUSE_FILE,
         retention_keyed=retention_keyed if retention_keyed else None,
         retention_registry=retention_registry if retention_keyed else None,
     )
 
     adapter_cfg = _adapter_config(args.rank)
-    training_cfg = _training_config(args.num_epochs, rank=args.rank)
+    training_cfg = _training_config(epochs, rank=args.rank, seed=seed)
 
     t0 = time.time()
     metrics = train_adapter(
@@ -1428,7 +1470,7 @@ def decide_pre_winner(run_dir: Path, existing_winner: str | None = None) -> str 
     """Read per-variant C_done.json and apply winner rules.
 
     Scans ALL variant subdirectories present under ``run_dir`` — not just the
-    original three (V1/V2/V3) — so that V3_extended/V4/V5 are automatically
+    original three (V1/V2/V3) — so that V3_extended/V4-V8 are automatically
     included when their phase markers exist.
 
     Extended-run override rule
@@ -1462,7 +1504,7 @@ def decide_pre_winner(run_dir: Path, existing_winner: str | None = None) -> str 
     per_variant: dict = {}
 
     # Discover all variant dirs dynamically: any subdir that has a B/ and C/
-    # structure.  This includes V1/V2/V3 and any newly run V3_extended/V4/V5.
+    # structure.  This includes V1/V2/V3 and any newly run V3_extended/V4-V8.
     candidate_dirs = sorted(
         d for d in run_dir.iterdir() if d.is_dir() and (d / "C" / "C_done.json").exists()
     )
@@ -1613,15 +1655,126 @@ def decide_pre_winner(run_dir: Path, existing_winner: str | None = None) -> str 
 
 
 # ---------------------------------------------------------------------------
+# Multi-seed Phase C aggregator
+# ---------------------------------------------------------------------------
+
+
+def aggregate_multi_seed_phase_c(run_dir: Path, phase_c_seeds: list[int]) -> dict:
+    """Read per-(variant, seed) C_done.json and write multiseed_aggregate.json.
+
+    For each variant directory under ``run_dir``, looks for
+    ``<variant>/C/seed<N>/C_done.json`` for every seed in ``phase_c_seeds``.
+    Computes mean / std of ``stable_perfect_epoch`` and ``first_perfect_epoch``
+    across seeds, plus min / max ranges and final-recall consistency.
+
+    Outputs:
+        ``<run_dir>/multiseed_aggregate.json`` — full per-variant aggregate
+        with a per-seed list and pooled summary stats.
+
+    Returns:
+        The aggregate dict written to disk.
+    """
+    import statistics
+
+    aggregate: dict = {
+        "phase_c_seeds": list(phase_c_seeds),
+        "variants": {},
+    }
+
+    for v_dir in sorted(p for p in run_dir.iterdir() if p.is_dir()):
+        variant = v_dir.name
+        per_seed: list[dict] = []
+        for seed in phase_c_seeds:
+            done_path = v_dir / "C" / f"seed{seed}" / "C_done.json"
+            if not done_path.exists():
+                continue
+            try:
+                d = json.loads(done_path.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+            per_seed.append(
+                {
+                    "seed": seed,
+                    "first_perfect_epoch": d.get("first_perfect_epoch"),
+                    "stable_perfect_epoch": d.get("stable_perfect_epoch"),
+                    "stop_epoch": d.get("stop_epoch"),
+                    "final_recall_rate": d.get("final_recall", {}).get("rate"),
+                    "wall_seconds": d.get("wall_seconds"),
+                    "leakage": d.get("placeholder_leakage_count", 0),
+                    "num_epochs": d.get("num_epochs"),
+                }
+            )
+        if not per_seed:
+            continue
+
+        stable_eps = [
+            s["stable_perfect_epoch"] for s in per_seed if s["stable_perfect_epoch"] is not None
+        ]
+        first_eps = [
+            s["first_perfect_epoch"] for s in per_seed if s["first_perfect_epoch"] is not None
+        ]
+        n_converged = len(stable_eps)
+
+        summary: dict = {
+            "n_seeds": len(per_seed),
+            "n_converged": n_converged,
+            "stable_perfect_epoch": _summary_stats(stable_eps),
+            "first_perfect_epoch": _summary_stats(first_eps),
+            "all_seeds_no_leakage": all(s["leakage"] == 0 for s in per_seed),
+        }
+        # Optional: max final_recall consistency check
+        rates = [s["final_recall_rate"] for s in per_seed if s["final_recall_rate"] is not None]
+        if rates:
+            summary["final_recall_rate_min"] = min(rates)
+            summary["final_recall_rate_max"] = max(rates)
+
+        aggregate["variants"][variant] = {
+            "per_seed": per_seed,
+            "summary": summary,
+        }
+
+    # Pooled std across the converging variants — useful for the decision
+    # rule ("V_winner mean < V_baseline mean by more than pooled std").
+    all_stable: list[int] = []
+    for v_data in aggregate["variants"].values():
+        for s in v_data["per_seed"]:
+            if s["stable_perfect_epoch"] is not None:
+                all_stable.append(s["stable_perfect_epoch"])
+    if len(all_stable) >= 2:
+        aggregate["pooled_stable_perfect_std"] = round(statistics.pstdev(all_stable), 2)
+
+    out_path = run_dir / "multiseed_aggregate.json"
+    _safe_write_json(out_path, aggregate)
+    logger.info("Multi-seed aggregate written: %s", out_path)
+    return aggregate
+
+
+def _summary_stats(values: list[int]) -> dict:
+    """Compact summary stats for a list of integers (mean / std / min / max)."""
+    import statistics
+
+    if not values:
+        return {"n": 0}
+    return {
+        "n": len(values),
+        "mean": round(statistics.mean(values), 2),
+        "std": round(statistics.pstdev(values), 2) if len(values) > 1 else 0.0,
+        "min": min(values),
+        "max": max(values),
+        "median": round(statistics.median(values), 2),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Mode: pre (14a-pre)
 # ---------------------------------------------------------------------------
 
 
 def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None:
-    """Run 14a-pre: V1/V2/V3 head-to-head at N=100; optionally V3_extended/V4/V5.
+    """Run 14a-pre: V1/V2/V3 head-to-head at N=100; optionally V3_extended/V4-V8.
 
     When ``--reuse-phase-a-from PATH`` is set, Phase A is skipped for new
-    variants (V3_extended/V4/V5) and the V3 Phase A adapter from PATH is
+    variants (V3_extended/V4-V8) and the V3 Phase A adapter from PATH is
     loaded as the baseline.  V1/V2/V3 always run full Phase A when not yet
     complete.
 
@@ -1655,11 +1808,44 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
     # Original three variants always included; additional ones only when the
     # reuse source is provided (since they skip Phase A and rely on V3's adapter).
     original_variants = ("V1", "V2", "V3")
-    extended_variants = (V3_EXTENDED, "V4", "V5")
+    # V5 = uniform long natural template (renamed 2026-04-29 from V6c)
+    # V6 = uniform short <PLACEHOLDER> (renamed from V6a)
+    # V7 = per-slot sha256 hex (renamed from V5)
+    # V8 = uniform long OOD hex (renamed from V6b; fallback)
+    extended_variants = (V3_EXTENDED, "V4", "V5", "V6", "V7", "V8")
     if reuse_phase_a_from is not None:
         variants_to_run = original_variants + extended_variants
     else:
         variants_to_run = original_variants
+
+    # Single-variant filter: when --variant is explicitly set (not "auto"),
+    # restrict pre mode to just that variant.  Used for smoke tests and
+    # targeted re-runs without re-touching the other variants.
+    requested_variant = getattr(args, "variant", "auto")
+    if requested_variant != "auto":
+        if requested_variant not in variants_to_run:
+            raise SystemExit(
+                f"--variant={requested_variant!r} not available in current pre run; "
+                f"valid choices given the reuse source: {variants_to_run}"
+            )
+        variants_to_run = (requested_variant,)
+        logger.info("Pre mode restricted to a single variant: %s", requested_variant)
+
+    # In multi-seed mode the Phase C completion check is per-(variant, seed):
+    # legacy <variant>/C/C_done.json marks only the single-seed seed=42 run
+    # and must NOT cause the loop to skip the variant when additional seeds
+    # are still pending under <variant>/C/seed<N>/.
+    multi_seed_mode = args.phase_c_seeds is not None
+    requested_seeds = list(args.phase_c_seeds) if multi_seed_mode else [42]
+
+    def _phase_c_done(v_dir: Path) -> bool:
+        if not multi_seed_mode:
+            return (v_dir / "C" / "C_done.json").exists()
+        # Multi-seed: every requested seed must have its own sub-dir marker.
+        return all(
+            (v_dir / "C" / f"seed{s}" / "C_done.json").exists()
+            for s in requested_seeds
+        )
 
     for v_idx, variant in enumerate(variants_to_run):
         v_dir = run_dir / variant
@@ -1670,7 +1856,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 or (v_dir / "A" / "phase_a_reused.json").exists()
             )
             and (v_dir / "B" / "B_done.json").exists()
-            and (v_dir / "C" / "C_done.json").exists()
+            and _phase_c_done(v_dir)
         ):
             logger.info("Variant %s: all phases complete — skipping", variant)
             continue
@@ -1879,7 +2065,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     },
                 )
             else:
-                # Standard fresh scaffold build (V1/V2/V3/V4/V5).
+                # Standard fresh scaffold build (V1/V2/V3/V4-V8).
                 if isinstance(model, PeftModel):
                     model = model.base_model.model
                 model = create_adapter(model, _adapter_config(args.rank), "journal")
@@ -1937,39 +2123,57 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
         _check_pause(f"after B, variant {variant}", run_dir)
 
         # ----------------------------------------------------------------
-        # Phase C (fill)
+        # Phase C (fill) — multi-seed loop when --phase-c-seeds is set
         # ----------------------------------------------------------------
-        if not (v_dir / "C" / "C_done.json").exists():
-            # B1 fix: when Phase B is already done (B_done.json exists but C is
-            # not yet done) the journal adapter was saved to disk but has NOT
-            # been loaded in the current Python process.  switch_adapter() on a
-            # bare base model raises because there is no PeftModel wrapper.
-            # Reload from the saved B/adapter directory before entering Phase C.
-            if not isinstance(model, PeftModel):
-                b_journal_slot = resolve_adapter_slot(v_dir / "B" / "adapter", "journal", "")
-                if b_journal_slot is None:
-                    raise FileNotFoundError(
-                        f"Variant {variant}: journal adapter not found under "
-                        f"{v_dir / 'B' / 'adapter'}; cannot resume Phase C."
-                    )
-                with _adapter_slot_for_load(b_journal_slot) as _load_path:
-                    model = PeftModel.from_pretrained(
-                        model, str(_load_path), adapter_name="journal"
-                    )
-                logger.info(
-                    "Variant %s Phase C resume: loaded journal adapter from %s",
-                    variant,
-                    b_journal_slot,
+        # Backward compat: --phase-c-seeds unset → single Phase C at seed=42
+        # in legacy <variant>/C/ dir (matches the original Test 14 layout).
+        # Set → loop over each seed; output to <variant>/C/seed<N>/.
+        phase_c_seeds = args.phase_c_seeds if args.phase_c_seeds else [42]
+        multi_seed = args.phase_c_seeds is not None
+        phase_c_epochs = args.phase_c_num_epochs if args.phase_c_num_epochs else args.num_epochs
+
+        # Build fill / retention sets once — content is deterministic per
+        # variant, only the HF Trainer seed varies across iterations.
+        fill_keyed = build_fill_keyed(scaffold_keyed, qa_pool, fill_indices)
+        fill_registry = build_registry(fill_keyed)
+        retention_keyed = [scaffold_keyed[i] for i in range(fill_start)]
+        retention_registry = build_registry(retention_keyed)
+
+        for c_seed in phase_c_seeds:
+            c_dir = v_dir / "C" / f"seed{c_seed}" if multi_seed else v_dir / "C"
+
+            if (c_dir / "C_done.json").exists():
+                logger.info("Variant %s Phase C seed=%d: already done", variant, c_seed)
+                continue
+
+            _check_pause(f"before variant {variant} Phase C seed {c_seed}", run_dir)
+
+            # Ensure model starts each seed's Phase C from the post-Phase-B
+            # state (the saved B/adapter slot).  Unwrap any PeftModel from a
+            # prior iteration's Phase C, then reload the journal adapter
+            # from B.  This is idempotent on the first iteration (where the
+            # model is already a PeftModel from Phase B) — the unwrap +
+            # reload restores exactly the saved post-B weights.
+            if isinstance(model, PeftModel):
+                model = model.base_model.model
+            b_journal_slot = resolve_adapter_slot(v_dir / "B" / "adapter", "journal", "")
+            if b_journal_slot is None:
+                raise FileNotFoundError(
+                    f"Variant {variant}: journal adapter not found under "
+                    f"{v_dir / 'B' / 'adapter'}; cannot run Phase C."
                 )
+            with _adapter_slot_for_load(b_journal_slot) as _load_path:
+                model = PeftModel.from_pretrained(model, str(_load_path), adapter_name="journal")
+            logger.info(
+                "Variant %s Phase C seed=%d: loaded journal adapter from %s",
+                variant,
+                c_seed,
+                b_journal_slot,
+            )
             switch_adapter(model, "journal")
 
-            fill_keyed = build_fill_keyed(scaffold_keyed, qa_pool, fill_indices)
-            fill_registry = build_registry(fill_keyed)
-            retention_keyed = [scaffold_keyed[i] for i in range(fill_start)]
-            retention_registry = build_registry(retention_keyed)
-
-            # Resume from checkpoint if partial C run exists.
-            ckpt = _find_latest_checkpoint(v_dir / "C" / "adapter")
+            # Resume from checkpoint if partial C run exists for this seed.
+            ckpt = _find_latest_checkpoint(c_dir / "adapter")
 
             model, metrics_c, probe_c, wall_c = run_phase_C_fill(
                 model,
@@ -1980,13 +2184,18 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 retention_keyed,
                 retention_registry,
                 args=args,
-                phase_dir=v_dir / "C",
-                run_name=f"test14-pre-C-{variant}",
+                phase_dir=c_dir,
+                run_name=f"test14-pre-C-{variant}-seed{c_seed}",
                 resume_from_checkpoint=ckpt,
+                seed=c_seed,
+                num_epochs=phase_c_epochs,
             )
 
             _exit_if_paused_mid_phase(
-                probe_c, f"during C, variant {variant}", args.num_epochs, run_dir
+                probe_c,
+                f"during C, variant {variant}, seed {c_seed}",
+                phase_c_epochs,
+                run_dir,
             )
 
             final_c = _safe_probe(model, tokenizer, fill_keyed, fill_registry, "journal")
@@ -1996,47 +2205,73 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 tokenizer,
                 "journal",
                 registry_path=None,
-                keyed_pairs_path=v_dir / "C" / "keyed_pairs.json",
+                keyed_pairs_path=c_dir / "keyed_pairs.json",
                 key_count=len(fill_keyed),
             )
-            save_adapter(model, v_dir / "C" / "adapter", "journal", manifest=_manifest_c)
+            save_adapter(model, c_dir / "adapter", "journal", manifest=_manifest_c)
             _write_phase_done(
-                v_dir / "C",
+                c_dir,
                 "C_done.json",
                 fill_keyed,
                 fill_registry,
                 probe_c,
                 final_c,
                 extra={
-                    "condition": f"C_fill_{variant}",
+                    "condition": f"C_fill_{variant}_seed{c_seed}",
                     "train_loss": metrics_c.get("train_loss"),
                     "wall_seconds": round(wall_c, 1),
                     "placeholder_leakage_count": leaks,
+                    "phase_c_seed": c_seed,
+                    "num_epochs": phase_c_epochs,
                 },
             )
-        else:
-            logger.info("Variant %s Phase C: already done", variant)
 
         _check_pause(f"after C, variant {variant}", run_dir)
 
-    # All variants done — decide winner.  Pass existing_winner (from original
-    # V1/V2/V3 pass) so the extended-run override rule can be applied.
-    existing_results_path = run_dir / "results.json"
-    existing_winner: str | None = None
-    if existing_results_path.exists():
-        try:
-            existing_results = json.loads(existing_results_path.read_text())
-            existing_winner = existing_results.get("winner")
-        except Exception:  # noqa: BLE001
-            pass
+    # All variants done — decide winner.
+    if args.phase_c_seeds is not None:
+        # Multi-seed mode: aggregate across seeds.  decide_pre_winner only
+        # reads the legacy single-seed C_done.json layout; for multi-seed
+        # results we emit a per-variant aggregate (mean / std stable_perfect)
+        # and require the user to confirm the winner manually until the
+        # aggregator is wired into decide_pre_winner.
+        aggregate_multi_seed_phase_c(run_dir, args.phase_c_seeds)
+        save_results(
+            {
+                "mode": "pre",
+                "phase_c_seeds": list(args.phase_c_seeds),
+                "phase_c_num_epochs": (
+                    args.phase_c_num_epochs
+                    if args.phase_c_num_epochs is not None
+                    else args.num_epochs
+                ),
+                "winner": "pending_manual_review",
+                "run_dir": str(run_dir),
+            },
+            run_dir,
+            filename="results.json",
+        )
+        logger.info(
+            "14a-pre multi-seed complete; aggregate written to %s/multiseed_aggregate.json", run_dir
+        )
+    else:
+        # Legacy single-seed mode.
+        existing_results_path = run_dir / "results.json"
+        existing_winner: str | None = None
+        if existing_results_path.exists():
+            try:
+                existing_results = json.loads(existing_results_path.read_text())
+                existing_winner = existing_results.get("winner")
+            except Exception:  # noqa: BLE001
+                pass
 
-    winner = decide_pre_winner(run_dir, existing_winner=existing_winner)
-    logger.info("14a-pre complete. winner=%s", winner)
-    save_results(
-        {"mode": "pre", "winner": winner, "run_dir": str(run_dir)},
-        run_dir,
-        filename="results.json",
-    )
+        winner = decide_pre_winner(run_dir, existing_winner=existing_winner)
+        logger.info("14a-pre complete. winner=%s", winner)
+        save_results(
+            {"mode": "pre", "winner": winner, "run_dir": str(run_dir)},
+            run_dir,
+            filename="results.json",
+        )
 
 
 # ---------------------------------------------------------------------------

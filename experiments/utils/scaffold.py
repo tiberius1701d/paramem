@@ -1,9 +1,15 @@
 """Scaffold builders for Test 14 — content-free placeholder scaffolding.
 
-Five variants differ only in what placeholder text is used during the
+Variants differ only in what placeholder text is used during the
 scaffold-build phase (Phase B).  Phase C (fill) always uses real Q+A for
 all variants.  V3_extended is an orchestration-level concept (reuse V3 Phase
 B adapter + continue training) and shares the V3 builder.
+
+Variant numbering reflects multi-seed batch run order.  V1-V4 are the
+original 14a-pre cells (V1/V2/V3 plus V4 empty-Q/A); V5-V8 are the
+expanded uniform-axis probe added 2026-04-29 after the n=1 V1-V4
+results suggested a "shared transfer channel" mechanism worth
+testing.
 
 Variant definitions
 -------------------
@@ -15,13 +21,24 @@ V3 — uniform sentinel for both fields:
     question = "pending"  answer = "pending"
 V3_extended — same builder as V3; orchestration loads V3's existing Phase B
     adapter and trains for additional epochs.
-V4 — no JSON content scaffold:
-    target JSON contains only the ``key`` field; no ``question`` or ``answer``.
-    Tests whether the Q/A framing in V1/V2/V3 was load-bearing.
-V5 — random-byte placeholder (deterministic per slot):
-    question = sha256("V5-Q-{N}")[:16]  answer = sha256("V5-A-{N}")[:16]
-    Tests whether maximal per-slot uniqueness routes better than V3's uniform
-    sentinel.
+V4 — empty Q/A:
+    question = ""  answer = ""  (JSON shape preserved; content empty)
+V5 — uniform long natural-language template (most informative new variant):
+    question = "What is the answer to this query?"
+    answer   = "The answer is currently unknown."
+    Tests whether longer uniform natural beats V3's short uniform under
+    the shared-transfer-channel hypothesis.
+V6 — uniform short non-natural sentinel:
+    question = "<PLACEHOLDER>"  answer = "<PLACEHOLDER>"
+    Tests whether shorter than V3's "pending" is faster (isolates
+    length from naturalness within the uniform regime).
+V7 — random-byte placeholder (deterministic per slot):
+    question = sha256("V7-Q-{N}")[:16]  answer = sha256("V7-A-{N}")[:16]
+    Per-slot unique OOD tokens — upper bound of unique-OOD scaffold cost.
+V8 — uniform long OOD hex (same hex string for every slot, fallback):
+    question = answer = "a1b2c3d4e5f60718"  (single shared 16-char hex)
+    Long uniform OOD — disentangles length from naturalness within the
+    uniform regime.  Run only if V5/V6 results are ambiguous.
 
 All builders use ``f"graph{i}"`` keys (1-based, matching ``assign_keys``
 convention) so that registry / SimHash / probe / confusion-matrix tooling
@@ -38,11 +55,24 @@ V3 = "V3"
 V3_EXTENDED = "V3_extended"
 V4 = "V4"
 V5 = "V5"
+V6 = "V6"
+V7 = "V7"
+V8 = "V8"
 
-VARIANTS = (V1, V2, V3, V3_EXTENDED, V4, V5)
+VARIANTS = (V1, V2, V3, V3_EXTENDED, V4, V5, V6, V7, V8)
 
-# Placeholder strings used for leakage detection in phase results
-PLACEHOLDER_STRINGS = ("TBD-", "pending", "Question for slot")
+# Placeholder strings used for leakage detection in phase results.
+# Any of these substrings appearing in a recalled answer post-fill counts
+# as scaffold-content leakage into the trained Q+A binding.
+PLACEHOLDER_STRINGS = (
+    "TBD-",
+    "pending",
+    "Question for slot",
+    "What is the answer to this query",
+    "The answer is currently unknown",
+    "<PLACEHOLDER>",
+    "a1b2c3d4e5f60718",
+)
 
 
 def build_v1_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
@@ -143,18 +173,13 @@ def build_v4_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
 
 
 def build_v5_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
-    """Build a V5 scaffold: deterministic random-hex placeholders per slot.
+    """Build a V5 scaffold: uniform long natural-language template.
 
-    Each slot gets a unique 16-character hex string derived by hashing the
-    slot index:
-
-    - ``question = hashlib.sha256(b"V5-Q-{i}").hexdigest()[:16]``
-    - ``answer   = hashlib.sha256(b"V5-A-{i}").hexdigest()[:16]``
-
-    The strings are fully deterministic across runs: the same ``i`` always
-    produces the same string.  This tests whether maximal per-slot uniqueness
-    provides better discriminative signal than V3's uniform ``"pending"``
-    sentinel.
+    All slots share a fluent English question/answer template.  Tests
+    whether longer uniform natural placeholder beats V3's short uniform
+    sentinel under the shared-transfer-channel hypothesis.  Confounds
+    length and naturalness against V3 — V6 + V8 are needed to fully
+    disentangle if the result is ambiguous.
 
     Args:
         n_keys: Number of scaffold entries to generate.
@@ -166,9 +191,80 @@ def build_v5_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
     return [
         {
             "key": f"graph{i}",
-            "question": hashlib.sha256(f"V5-Q-{i}".encode()).hexdigest()[:16],
-            "answer": hashlib.sha256(f"V5-A-{i}".encode()).hexdigest()[:16],
+            "question": "What is the answer to this query?",
+            "answer": "The answer is currently unknown.",
         }
+        for i in range(start_index, start_index + n_keys)
+    ]
+
+
+def build_v6_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
+    """Build a V6 scaffold: uniform single short non-natural sentinel.
+
+    All slots share ``question="<PLACEHOLDER>"`` and ``answer="<PLACEHOLDER>"``.
+    Same uniformity as V3 with a shorter, less natural-language token —
+    isolates length from naturalness within the uniform regime.
+
+    Args:
+        n_keys: Number of scaffold entries to generate.
+        start_index: First slot index (default 1).
+
+    Returns:
+        List of dicts with ``key``, ``question``, ``answer``.
+    """
+    return [
+        {"key": f"graph{i}", "question": "<PLACEHOLDER>", "answer": "<PLACEHOLDER>"}
+        for i in range(start_index, start_index + n_keys)
+    ]
+
+
+def build_v7_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
+    """Build a V7 scaffold: deterministic random-hex placeholders per slot.
+
+    Each slot gets a unique 16-character hex string derived by hashing the
+    slot index:
+
+    - ``question = hashlib.sha256(b"V7-Q-{i}").hexdigest()[:16]``
+    - ``answer   = hashlib.sha256(b"V7-A-{i}").hexdigest()[:16]``
+
+    The strings are fully deterministic across runs: the same ``i`` always
+    produces the same string.  Falsifiable upper-bound check on the
+    per-slot-unique-OOD scaffold cost — if V7 converges within budget,
+    the shared-transfer-channel hypothesis is wrong.
+
+    Args:
+        n_keys: Number of scaffold entries to generate.
+        start_index: First slot index (default 1).
+
+    Returns:
+        List of dicts with ``key``, ``question``, ``answer``.
+    """
+    return [
+        {
+            "key": f"graph{i}",
+            "question": hashlib.sha256(f"V7-Q-{i}".encode()).hexdigest()[:16],
+            "answer": hashlib.sha256(f"V7-A-{i}".encode()).hexdigest()[:16],
+        }
+        for i in range(start_index, start_index + n_keys)
+    ]
+
+
+def build_v8_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
+    """Build a V8 scaffold: uniform long OOD hex (same hex for every slot).
+
+    All slots share ``question=answer="a1b2c3d4e5f60718"``.  Same length as
+    V7 but uniform across slots — disentangles length from naturalness
+    within the uniform regime.  Run only if V5/V6 results are ambiguous.
+
+    Args:
+        n_keys: Number of scaffold entries to generate.
+        start_index: First slot index (default 1).
+
+    Returns:
+        List of dicts with ``key``, ``question``, ``answer``.
+    """
+    return [
+        {"key": f"graph{i}", "question": "a1b2c3d4e5f60718", "answer": "a1b2c3d4e5f60718"}
         for i in range(start_index, start_index + n_keys)
     ]
 
@@ -182,6 +278,9 @@ VARIANT_BUILDERS = {
     V3_EXTENDED: build_v3_scaffold,
     V4: build_v4_scaffold,
     V5: build_v5_scaffold,
+    V6: build_v6_scaffold,
+    V7: build_v7_scaffold,
+    V8: build_v8_scaffold,
 }
 
 
