@@ -64,35 +64,6 @@ from paramem.utils.config import (
 logger = logging.getLogger(__name__)
 
 
-def _validate_staging_compat(*adapter_configs) -> None:
-    """Ensure all production adapter configs are weight-shape compatible with staging.
-
-    The `in_training` staging slot uses episodic_config as template. The
-    fingerprint captures ONLY the fields that determine LoRA tensor shapes:
-    rank (A/B matrix inner dim), target_modules (which layers get adapted),
-    and bias setting (whether bias tensors exist). alpha and dropout affect
-    training behavior but not tensor shapes, so they may differ across
-    adapters. A fingerprint mismatch means copy_adapter_weights would fail
-    at the parameter-set-equality check — we fail faster here.
-    """
-    reference = None
-    for cfg in adapter_configs:
-        if cfg is None:
-            continue
-        fingerprint = (
-            getattr(cfg, "rank", None),
-            tuple(sorted(getattr(cfg, "target_modules", []) or [])),
-            getattr(cfg, "bias", None),
-        )
-        if reference is None:
-            reference = fingerprint
-        elif fingerprint != reference:
-            raise ValueError(
-                f"Adapter configs incompatible for staging: {reference} vs {fingerprint}. "
-                "All production adapters must share rank, target_modules, and bias."
-            )
-
-
 @dataclass
 class CycleResult:
     """Results from a single consolidation cycle."""
@@ -3888,12 +3859,12 @@ class ConsolidationLoop:
             logger.info("Creating procedural adapter")
             self.model = create_adapter(self.model, self.procedural_config, "procedural")
 
-        # Staging adapter for on-the-fly training. Uses episodic config as
-        # the template. All production adapters MUST share the same rank,
-        # target_modules, and bias settings (the fields that determine LoRA
-        # tensor shapes). alpha and dropout may differ per adapter since
-        # they affect training behavior, not tensor shapes.
-        _validate_staging_compat(self.episodic_config, self.semantic_config, self.procedural_config)
+        # Staging adapter for on-the-fly training. Templated on episodic_config
+        # at startup; the BackgroundTrainer rebuilds the slot with the current
+        # job's tier config when shapes diverge (e.g. switching between an
+        # attn-only tier like episodic/semantic and procedural's attn+mlp).
+        # No uniform-shape constraint across production tiers — per-tier shape
+        # differences (procedural's MLP targeting) are the design.
         if "in_training" not in self.model.peft_config:
             logger.info("Creating in_training staging adapter")
             self.model = create_adapter(self.model, self.episodic_config, "in_training")

@@ -38,6 +38,41 @@ _WORKER_STOP = object()
 _RESUME_STATE_FILE = "resume_state.json"
 
 
+def _ensure_staging_shape_matches(model, target_config: AdapterConfig):
+    """Rebuild the ``in_training`` staging slot when its LoRA shape differs from *target_config*.
+
+    The slot is templated on ``episodic_config`` at startup
+    (``ConsolidationLoop._ensure_adapters``). Production tiers don't all
+    share the same shape — procedural targets ``attn+mlp`` while
+    episodic/semantic target ``attn``-only. A training job for procedural
+    needs the staging slot rebuilt to procedural's shape before
+    ``copy_adapter_weights`` can succeed; subsequent jobs that match the
+    current shape skip the rebuild (idempotent).
+
+    Args:
+        model: Live PeftModel with at least the ``in_training`` adapter.
+        target_config: The job's adapter config — staging shape must match.
+
+    Returns:
+        Possibly-rebound PeftModel (``create_adapter`` may rebind on the
+        re-add path; in practice the same instance is returned).
+    """
+    from paramem.models.loader import create_adapter
+
+    current = model.peft_config["in_training"]
+    current_modules = tuple(sorted(current.target_modules))
+    target_modules = tuple(sorted(target_config.target_modules))
+    if current_modules == target_modules and current.r == target_config.rank:
+        return model
+    logger.info(
+        "Rebuilding in_training staging slot: target_modules %s → %s",
+        list(current_modules),
+        list(target_modules),
+    )
+    model.delete_adapter("in_training")
+    return create_adapter(model, target_config, "in_training")
+
+
 def is_thermal_policy_active(
     mode: str,
     start: str,
@@ -917,6 +952,12 @@ class BackgroundTrainer:
             raise RuntimeError(
                 "in_training staging adapter not found — was ConsolidationLoop initialized?"
             )
+
+        # Lazy-rebuild: if this job's tier has a different LoRA shape than the
+        # current staging slot (e.g. procedural's attn+mlp vs episodic's
+        # attn-only), drop and recreate the slot. Idempotent for same-shape
+        # jobs (the common case).
+        self.model = _ensure_staging_shape_matches(self.model, job.adapter_config)
 
         # Compute fingerprints for this job and store them on self so the
         # epoch callback can write the state file without re-computing.

@@ -37,9 +37,18 @@ from paramem.utils.config import AdapterConfig, TrainingConfig
 
 
 def _make_stub_model(*adapter_names: str) -> MagicMock:
-    """Return a MagicMock that behaves like a minimal PeftModel."""
+    """Return a MagicMock that behaves like a minimal PeftModel.
+
+    Each adapter mock carries concrete ``target_modules`` and ``r`` so the
+    BG-trainer's lazy-rebuild check (``_ensure_staging_shape_matches``) sees
+    a shape matching ``_minimal_adapter_config()`` and skips the rebuild
+    path. Tests that actually need to exercise rebuild override these
+    attributes per-test.
+    """
     model = MagicMock()
-    model.peft_config = {name: MagicMock() for name in adapter_names}
+    model.peft_config = {
+        name: MagicMock(target_modules=["q_proj"], r=4) for name in adapter_names
+    }
     return model
 
 

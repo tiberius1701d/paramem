@@ -284,28 +284,84 @@ class TestStagingFlowContracts:
         assert bt.pause(timeout=0.1) is True
 
 
-class TestValidateStagingCompat:
-    def test_compatible_configs_pass(self):
-        from paramem.training.consolidation import _validate_staging_compat
+class TestEnsureStagingShapeMatches:
+    """Lazy-rebuild of the in_training staging slot when shape diverges.
 
-        c1 = MagicMock(rank=8, target_modules=["q_proj", "v_proj"], bias="none")
-        c2 = MagicMock(rank=8, target_modules=["q_proj", "v_proj"], bias="none")
-        _validate_staging_compat(c1, c2)
+    Replaces the prior TestValidateStagingCompat suite — the validator is
+    gone (the staging architecture no longer requires uniform shapes
+    across production tiers; rebuild on tier-shape transition handles the
+    heterogeneous case).
+    """
 
-    def test_incompatible_configs_raise(self):
-        from paramem.training.consolidation import _validate_staging_compat
+    def _make_model_with_staging(self, target_modules, rank=8):
+        """Build a stub PeftModel whose in_training slot has the given shape."""
+        peft_config = {"in_training": MagicMock(target_modules=list(target_modules), r=rank)}
+        return MagicMock(peft_config=peft_config)
 
-        c1 = MagicMock(rank=8, target_modules=["q_proj"], bias="none")
-        c2 = MagicMock(rank=8, target_modules=["q_proj", "v_proj"], bias="none")
-        with pytest.raises(ValueError, match="incompatible for staging"):
-            _validate_staging_compat(c1, c2)
+    def test_same_shape_is_noop(self, monkeypatch):
+        from paramem.server.background_trainer import _ensure_staging_shape_matches
 
-    def test_none_configs_skipped(self):
-        from paramem.training.consolidation import _validate_staging_compat
+        called = []
+        monkeypatch.setattr(
+            "paramem.models.loader.create_adapter",
+            lambda *a, **kw: called.append("create") or a[0],
+        )
+        model = self._make_model_with_staging(["q_proj", "v_proj"])
+        target = MagicMock(target_modules=["q_proj", "v_proj"], rank=8)
 
-        c1 = MagicMock(rank=8, target_modules=["q_proj"], bias="none")
-        # Should not raise on None (procedural may be disabled)
-        _validate_staging_compat(c1, None)
+        result = _ensure_staging_shape_matches(model, target)
+        assert result is model
+        assert called == [], "no rebuild expected when shapes match"
+        model.delete_adapter.assert_not_called()
+
+    def test_target_modules_mismatch_triggers_rebuild(self, monkeypatch):
+        from paramem.server.background_trainer import _ensure_staging_shape_matches
+
+        rebuilt_with = []
+
+        def _stub_create(model, cfg, name):
+            rebuilt_with.append((cfg.target_modules, name))
+            return model
+
+        monkeypatch.setattr("paramem.models.loader.create_adapter", _stub_create)
+        attn_only = ["q_proj", "v_proj", "k_proj", "o_proj"]
+        attn_mlp = [*attn_only, "gate_proj", "up_proj", "down_proj"]
+        model = self._make_model_with_staging(attn_only)
+        target = MagicMock(target_modules=attn_mlp, rank=8)
+
+        _ensure_staging_shape_matches(model, target)
+        model.delete_adapter.assert_called_once_with("in_training")
+        assert rebuilt_with == [(target.target_modules, "in_training")]
+
+    def test_rank_mismatch_triggers_rebuild(self, monkeypatch):
+        from paramem.server.background_trainer import _ensure_staging_shape_matches
+
+        rebuilt = []
+        monkeypatch.setattr(
+            "paramem.models.loader.create_adapter",
+            lambda m, cfg, name: rebuilt.append((cfg.rank, name)) or m,
+        )
+        model = self._make_model_with_staging(["q_proj", "v_proj"], rank=8)
+        target = MagicMock(target_modules=["q_proj", "v_proj"], rank=16)
+
+        _ensure_staging_shape_matches(model, target)
+        model.delete_adapter.assert_called_once_with("in_training")
+        assert rebuilt == [(16, "in_training")]
+
+    def test_module_order_irrelevant(self, monkeypatch):
+        """Module order must not matter — comparison is on sorted tuples."""
+        from paramem.server.background_trainer import _ensure_staging_shape_matches
+
+        called = []
+        monkeypatch.setattr(
+            "paramem.models.loader.create_adapter",
+            lambda *a, **kw: called.append("create") or a[0],
+        )
+        model = self._make_model_with_staging(["o_proj", "v_proj", "q_proj", "k_proj"])
+        target = MagicMock(target_modules=["q_proj", "v_proj", "k_proj", "o_proj"], rank=8)
+
+        _ensure_staging_shape_matches(model, target)
+        assert called == [], "rebuild not expected when modules differ only in order"
 
 
 class TestRunJobsErrorPath:
@@ -623,8 +679,13 @@ class TestMultiJobSequencing:
             lambda *a, **k: [],  # empty examples → early return, skips Trainer
         )
 
+        # Configure peft_config["in_training"] with a concrete target_modules list +
+        # rank so _ensure_staging_shape_matches sees a matching shape and skips
+        # the rebuild (the rebuild path is exercised in TestEnsureStagingShapeMatches).
+        attn_only = ["q_proj", "v_proj", "k_proj", "o_proj"]
         model = MagicMock()
-        model.peft_config = {"episodic": MagicMock(), "in_training": MagicMock()}
+        in_training_cfg = MagicMock(target_modules=list(attn_only), r=8)
+        model.peft_config = {"episodic": MagicMock(), "in_training": in_training_cfg}
 
         bt = BackgroundTrainer(
             model=model,
@@ -636,7 +697,7 @@ class TestMultiJobSequencing:
         job = TrainingJob(
             keyed_pairs=[{"k": 1}],
             adapter_name="episodic",
-            adapter_config=MagicMock(),
+            adapter_config=MagicMock(target_modules=list(attn_only), rank=8),
         )
         # Run the REAL _train_adapter (not a stub)
         bt._train_adapter(job)
@@ -698,8 +759,12 @@ class TestMultiJobSequencing:
             lambda **kwargs: MagicMock(),
         )
 
+        # in_training config carries concrete shape so _ensure_staging_shape_matches
+        # is a no-op (the rebuild path has its own dedicated tests).
+        attn_only = ["q_proj", "v_proj", "k_proj", "o_proj"]
         model = MagicMock()
-        model.peft_config = {"episodic": MagicMock(), "in_training": MagicMock()}
+        in_training_cfg = MagicMock(target_modules=list(attn_only), r=8)
+        model.peft_config = {"episodic": MagicMock(), "in_training": in_training_cfg}
 
         training_config = MagicMock()
         training_config.gradient_checkpointing = False
@@ -720,7 +785,7 @@ class TestMultiJobSequencing:
             output_dir=Path("/tmp"),
         )
 
-        adapter_config = MagicMock()
+        adapter_config = MagicMock(target_modules=list(attn_only), rank=8)
         adapter_config.learning_rate = 1e-4
         job = TrainingJob(
             keyed_pairs=[{"k": 1}],
