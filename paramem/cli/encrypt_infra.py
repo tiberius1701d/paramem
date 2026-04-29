@@ -29,7 +29,15 @@ from pathlib import Path
 
 from paramem.backup.age_envelope import is_age_envelope
 from paramem.backup.encryption import _atomic_write_bytes, envelope_encrypt_bytes, infra_paths
-from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, DAILY_PASSPHRASE_ENV_VAR
+from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
+
+# DAILY_KEY_PATH_DEFAULT is intentionally NOT imported as a local binding
+# here: tests monkeypatch ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT``
+# to redirect the daily key to a temp dir, and a local ``from ... import``
+# would freeze the original ``~/.config/paramem/daily_key.age`` value at
+# module load — letting tests pass on dev hosts (where the file exists)
+# while failing in CI (where it doesn't).  Always dereference via
+# ``key_store.DAILY_KEY_PATH_DEFAULT`` at call time.
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -126,7 +134,7 @@ def run(args: argparse.Namespace) -> int:
     int
         Exit code — 0 success, 1 fatal error, 2 partial success.
     """
-    from paramem.backup.key_store import daily_identity_loadable
+    from paramem.backup import key_store as _ks
 
     dry_run: bool = bool(args.dry_run)
     verbose: bool = bool(args.verbose)
@@ -135,7 +143,9 @@ def run(args: argparse.Namespace) -> int:
     # Gate: the daily identity must be loadable (unless --dry-run).
     # In dry-run mode we only enumerate; no encryption happens, so no key
     # is needed — but we still report whether a key would be required.
-    if not dry_run and not daily_identity_loadable(DAILY_KEY_PATH_DEFAULT):
+    # Dereference DAILY_KEY_PATH_DEFAULT through the module so tests that
+    # monkeypatch the attribute take effect (see import block above).
+    if not dry_run and not _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
         print(
             f"ERROR: the daily identity is not loadable.\n"
             f"  {DAILY_PASSPHRASE_ENV_VAR} must be set and "
