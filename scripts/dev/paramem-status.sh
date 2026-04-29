@@ -42,14 +42,126 @@ CYAN="\033[0;36m"
 DIM="\033[2m"
 
 # Check if server process is running
-server_pid=$(lsof -i :"$PARAMEM_SERVER_PORT" -t 2>/dev/null | head -1)
+# lsof exits 1 when nothing listens on the port; "|| true" prevents
+# set -o pipefail from aborting the script in the NOT RUNNING case.
+server_pid=$(lsof -i :"$PARAMEM_SERVER_PORT" -t 2>/dev/null | head -1 || true)
 
 echo -e "${BOLD}ParaMem Server${RESET}"
 echo "  ────────────────────────────────────────"
 
 if [[ -z "$server_pid" ]]; then
     echo -e "  Status:   ${RED}NOT RUNNING${RESET}"
-    echo -e "  Service:  $(systemctl --user is-active paramem-server 2>/dev/null || echo "unknown")"
+
+    # systemctl is-active exits non-zero for every non-active state (failed=3,
+    # inactive=3, etc.) while still writing the state name to stdout.  Capture
+    # via process substitution and fall back to "unknown" only when the output
+    # is empty (e.g. systemctl unavailable or the unit does not exist).
+    svc_state=$(systemctl --user is-active paramem-server 2>/dev/null || true)
+    svc_state="${svc_state:-unknown}"
+
+    # Only attempt journal scraping when the service is in a non-active state.
+    # Active means healthy and reachable — the pid check above handles that path.
+    if [[ "$svc_state" != "active" ]]; then
+        # Pull the journal for the unit's most recent invocation when the
+        # current systemd supports --invocation=-1 (preferred — narrowly
+        # scoped, immune to log noise from prior healthy cycles).  Older
+        # systemd versions silently ignore the flag and return an empty
+        # output, in which case we fall back to a broad time-bounded scan
+        # (last 6 hours, capped at 2000 lines — enough to cover any
+        # restart storm without scanning a multi-day journal).  All
+        # processing is done in bash; no python invocation here so
+        # failure rendering works even when python is broken.
+        journal_output=$(journalctl --user -u paramem-server.service --invocation=-1 --no-pager 2>/dev/null || true)
+        if [[ -z "$journal_output" ]]; then
+            journal_output=$(journalctl --user -u paramem-server.service --since '6 hours ago' -n 2000 --no-pager 2>/dev/null || true)
+        fi
+
+        # Detect whether systemd stopped restarting due to StartLimitBurst.
+        # The systemd message contains "start-limit-hit" (the D-Bus reason string)
+        # or the human-readable "Start request repeated too quickly".
+        burst_hit=false
+        if echo "$journal_output" | grep -qE "start-limit-hit|Start request repeated too quickly|stop-limit-hit"; then
+            burst_hit=true
+        fi
+
+        # Annotate the Service: line with a burst note when applicable.
+        if [[ "$burst_hit" == "true" ]]; then
+            echo -e "  Service:  ${svc_state} (StartLimitBurst hit — no further restarts)"
+        else
+            echo -e "  Service:  ${svc_state}"
+        fi
+
+        # Detect a FatalConfigError in the journal.  The token appears on the
+        # same line as the one-line summary in a Python traceback:
+        #   paramem.backup.types.FatalConfigError: <summary>
+        # Strip the journalctl timestamp/identifier prefix so only the message
+        # text is captured.  The prefix pattern is:
+        #   Mmm DD HH:MM:SS hostname service[PID]: <message>
+        # grep inside $() returns 1 on no-match; append "|| true" to prevent
+        # set -e from aborting when the pattern is absent from the journal.
+        fatal_line=$(echo "$journal_output" | grep "FatalConfigError:" | tail -1 || true)
+        if [[ -n "$fatal_line" ]]; then
+            # Strip the journal prefix (everything up to and including "]: ")
+            fatal_msg=$(echo "$fatal_line" | sed 's/^[A-Za-z]* [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]* [^[]*\[[0-9]*\]: //')
+
+            # Extract the summary: text after "FatalConfigError: " on the same line.
+            # Fall back to the next journal line when the summary is absent inline
+            # (defensive — not expected for Python tracebacks but handles edge cases).
+            reason=""
+            inline_after_token=$(echo "$fatal_msg" | sed 's/.*FatalConfigError: //')
+            if [[ -n "$inline_after_token" && "$inline_after_token" != "$fatal_msg" ]]; then
+                reason="$inline_after_token"
+            else
+                # No inline summary — look at the line immediately following
+                # the FatalConfigError: line in the full journal output.
+                reason=$(echo "$journal_output" | grep -A1 "FatalConfigError:" | tail -1 | sed 's/^[A-Za-z]* [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]* [^[]*\[[0-9]*\]: //' || true)
+            fi
+
+            # Extract the "Likely cause:" body — the line immediately after the
+            # "Likely cause:" heading.  Strip the journal prefix and leading whitespace.
+            # awk always exits 0 so no || true needed.
+            cause=$(echo "$journal_output" | awk '
+                /Likely cause:/ { capture=1; next }
+                capture && /[^ \t]/ { sub(/^[A-Za-z]* [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]* [^[]*\[[0-9]*\]: /, ""); gsub(/^[ \t]+/, ""); print; exit }
+                capture && /^[A-Za-z]* [ 0-9]/ { exit }
+            ')
+
+            # Extract the first "- <cmd>" bullet under the "Remediation:" heading.
+            # The command is the bullet text without the leading "- ".
+            remedy=$(echo "$journal_output" | awk '
+                /Remediation:/ { capture=1; next }
+                capture && /- / { sub(/^[A-Za-z]* [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]* [^[]*\[[0-9]*\]: /, ""); gsub(/^[ \t]*- /, ""); print; exit }
+                capture && /^[A-Za-z]* [ 0-9]/ { exit }
+            ')
+
+            # Extract the doc reference from "See <filename>" line.
+            doc_ref=$(echo "$journal_output" | grep "See SECURITY" | tail -1 | sed 's/^[A-Za-z]* [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [^ ]* [^[]*\[[0-9]*\]: //' | grep -o 'SECURITY[^ ]*' || true)
+
+            # Truncate Reason for narrow terminals so the value fits beside
+            # the "  Reason:   " label without wrapping.  Pull width from
+            # $COLUMNS (interactive shells) or tput; default 100 when neither
+            # is set.  Account for the 12-char label prefix.  Floor at 40
+            # so we never collapse to nothing on absurdly narrow terminals.
+            # Truncate at the last space before the cap and append " …" so
+            # the cut never lands mid-word.
+            term_width="${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}"
+            max_reason=$(( term_width - 14 ))
+            if (( max_reason < 40 )); then max_reason=40; fi
+            if [[ -n "$reason" && ${#reason} -gt $max_reason ]]; then
+                reason_trunc="${reason:0:$max_reason}"
+                reason="${reason_trunc% *} …"
+            fi
+
+            # Render extracted fields.  Omit any row whose value is empty.
+            [[ -n "$reason"  ]] && echo -e "  Reason:   ${YELLOW}${reason}${RESET}"
+            [[ -n "$cause"   ]] && echo -e "  Cause:    ${cause}"
+            [[ -n "$remedy"  ]] && echo -e "  Remedy:   ${CYAN}${remedy}${RESET}"
+            [[ -n "$doc_ref" ]] && echo -e "  Docs:     ${doc_ref}"
+        fi
+    else
+        echo -e "  Service:  ${svc_state}"
+    fi
+
     exit 0
 fi
 
