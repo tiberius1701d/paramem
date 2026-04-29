@@ -13,6 +13,67 @@ set -euo pipefail
 
 : "${PARAMEM_SERVER_PORT:=8420}"
 
+# --config: render the effective post-load ServerConfig as yaml.
+# Loads the operator's yaml through the same paramem.server.config.load_server_config
+# the live server uses, dumps the resolved dataclass tree (with merged factory
+# defaults, resolved paths, applied env-var interpolation). Source of truth for
+# "what's running" — bypasses the operator's mental model of the file and shows
+# what the loader actually decided.
+#
+# Usage:
+#   pstatus --config                    # loads configs/server.yaml
+#   pstatus --config <path/to/yaml>     # loads a specific yaml
+if [[ "${1:-}" == "--config" ]]; then
+    # Resolve the project root by climbing from this script's location up to
+    # the directory containing pyproject.toml (matches the loader's own logic).
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PROJECT_ROOT="$SCRIPT_DIR"
+    while [[ "$PROJECT_ROOT" != "/" && ! -f "$PROJECT_ROOT/pyproject.toml" ]]; do
+        PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+    done
+    CONFIG_PATH="${2:-$PROJECT_ROOT/configs/server.yaml}"
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+        echo "ERROR: config not found at $CONFIG_PATH" >&2
+        exit 2
+    fi
+    PYTHON_BIN="${PARAMEM_PYTHON:-/home/tiberius/miniforge3/envs/paramem/bin/python}"
+    cd "$PROJECT_ROOT"
+    exec "$PYTHON_BIN" - "$CONFIG_PATH" <<'PYEOF'
+"""Render the effective ServerConfig (post-load, post-merge) as yaml.
+
+Walks the dataclass tree, converts Path objects and dataclass instances
+to plain dict / str, and dumps via yaml.safe_dump.  Skips ``@property``
+attrs (adapter_dir, registry_dir, etc.) — those are computed, not
+configured, and surfacing them would conflate config with derivation.
+"""
+import sys
+from dataclasses import fields, is_dataclass
+from pathlib import Path
+
+import yaml
+
+from paramem.server.config import load_server_config
+
+cfg = load_server_config(sys.argv[1])
+
+
+def _to_plain(obj):
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return {f.name: _to_plain(getattr(obj, f.name)) for f in fields(obj)}
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    return obj
+
+
+print(f"# Effective ServerConfig loaded from {sys.argv[1]}")
+print(yaml.safe_dump(_to_plain(cfg), default_flow_style=False, sort_keys=False))
+PYEOF
+fi
+
 # --force-local: clear the deferred-mode hold and restart into local mode.
 # Intended for operator use when auto-reclaim has flagged an orphaned hold
 # (holder PID dead or no PID registered) and stopped looping.  Hits
