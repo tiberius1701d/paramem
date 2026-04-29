@@ -490,6 +490,44 @@ tts:
       # device: cpu            # per-voice override (default: inherit from tts.device)
 
 # ============================================================================
+# PROCESS
+# ============================================================================
+# systemd restart policy for the paramem-server service.
+#
+# Values are baked into a drop-in at
+#   ~/.config/systemd/user/paramem-server.service.d/restart.conf
+# by scripts/setup/server-restart-reconcile.sh, which runs automatically on
+# each server start via start-server.sh. The reconciler is idempotent — if
+# the drop-in already matches the desired state it does not call daemon-reload.
+#
+# on_failure:
+#   true  → Restart=on-failure (retry on crash or non-zero exit, not on
+#           intentional stop or config-refused exit, see permanent_failure_exit_codes)
+#   false → Restart=no (never retry — useful during active development)
+#
+# interval_seconds: seconds between restart attempts (RestartSec).
+#
+# max_attempts / window_seconds: systemd rate-limit gate. The service enters
+#   the failed state if it restarts more than max_attempts times within
+#   window_seconds. Default 3 / 60 means a third crash within one minute
+#   is treated as a terminal failure rather than retried endlessly.
+#   (StartLimitBurst / StartLimitIntervalSec)
+#
+# permanent_failure_exit_codes: exit codes that are NEVER retried even when
+#   on_failure is true. (RestartPreventExitStatus)
+#   Default [3] = FatalConfigError — raised by the encryption consistency gate
+#   (paramem.backup.encryption.assert_mode_consistency) when on-disk encryption
+#   state is inconsistent. Retrying a config error wastes cycles; the operator
+#   must fix the config manually.
+process:
+  restart:
+    on_failure: true
+    interval_seconds: 30        # RestartSec
+    max_attempts: 3             # StartLimitBurst
+    window_seconds: 60          # StartLimitIntervalSec
+    permanent_failure_exit_codes: [3]  # exit 3 = FatalConfigError; never retried
+
+# ============================================================================
 # VRAM
 # ============================================================================
 # Process-side memory safety net. Sets

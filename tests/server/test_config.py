@@ -16,6 +16,8 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from paramem.server.config import PathsConfig, load_server_config
 
 
@@ -393,3 +395,139 @@ class TestAdaptersFactoryDefaultMerge:
         # Procedural factory ships MLP-targeting + enabled=False.
         assert "gate_proj" in cfg.adapters.procedural.target_modules
         assert cfg.adapters.procedural.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# RestartConfig / ProcessConfig
+# ---------------------------------------------------------------------------
+
+
+class TestRestartConfigDefaults:
+    """RestartConfig() produces exactly the documented default values."""
+
+    def test_defaults(self):
+        """All fields match the documented safe defaults."""
+        from paramem.server.config import RestartConfig
+
+        r = RestartConfig()
+        assert r.on_failure is True
+        assert r.interval_seconds == 30
+        assert r.max_attempts == 3
+        assert r.window_seconds == 60
+        assert r.permanent_failure_exit_codes == [3]
+
+
+class TestRestartConfigValidators:
+    """__post_init__ raises ValueError with a field-naming message for bad values."""
+
+    def test_interval_seconds_zero_rejected(self):
+        """interval_seconds < 1 raises ValueError naming the field."""
+        from paramem.server.config import RestartConfig
+
+        with pytest.raises(ValueError, match="process.restart.interval_seconds"):
+            RestartConfig(interval_seconds=0)
+
+    def test_interval_seconds_negative_rejected(self):
+        """Negative interval_seconds raises ValueError."""
+        from paramem.server.config import RestartConfig
+
+        with pytest.raises(ValueError, match="process.restart.interval_seconds"):
+            RestartConfig(interval_seconds=-5)
+
+    def test_max_attempts_zero_rejected(self):
+        """max_attempts < 1 raises ValueError naming the field."""
+        from paramem.server.config import RestartConfig
+
+        with pytest.raises(ValueError, match="process.restart.max_attempts"):
+            RestartConfig(max_attempts=0)
+
+    def test_window_seconds_zero_rejected(self):
+        """window_seconds < 1 raises ValueError naming the field."""
+        from paramem.server.config import RestartConfig
+
+        with pytest.raises(ValueError, match="process.restart.window_seconds"):
+            RestartConfig(window_seconds=0)
+
+    def test_exit_code_above_255_rejected(self):
+        """Exit code > 255 raises ValueError naming the field."""
+        from paramem.server.config import RestartConfig
+
+        with pytest.raises(ValueError, match="process.restart.permanent_failure_exit_codes"):
+            RestartConfig(permanent_failure_exit_codes=[256])
+
+    def test_exit_code_negative_rejected(self):
+        """Negative exit code raises ValueError naming the field."""
+        from paramem.server.config import RestartConfig
+
+        with pytest.raises(ValueError, match="process.restart.permanent_failure_exit_codes"):
+            RestartConfig(permanent_failure_exit_codes=[-1])
+
+    def test_exit_code_boundary_values_accepted(self):
+        """Exit codes 0 and 255 are valid boundaries."""
+        from paramem.server.config import RestartConfig
+
+        r = RestartConfig(permanent_failure_exit_codes=[0, 255])
+        assert r.permanent_failure_exit_codes == [0, 255]
+
+
+class TestRestartConfigYamlLoader:
+    """load_server_config wires the process.restart sub-block correctly."""
+
+    def test_fixture_yaml_loads_restart_config(self):
+        """load_server_config(tests/fixtures/server.yaml) exposes fixture values."""
+        from pathlib import Path
+
+        from paramem.server.config import RestartConfig, load_server_config
+
+        cfg = load_server_config(Path("tests/fixtures/server.yaml"))
+        r = cfg.process.restart
+        # Values are the defaults — same as RestartConfig() — because the
+        # fixture mirrors the documented safe defaults.
+        assert r == RestartConfig()
+
+    def test_yaml_with_process_restart_overrides(self, tmp_path):
+        """Explicit process.restart fields in YAML override the defaults."""
+        from paramem.server.config import load_server_config
+
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            process:
+              restart:
+                on_failure: false
+                interval_seconds: 10
+                max_attempts: 5
+                window_seconds: 120
+                permanent_failure_exit_codes: [1, 3]
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        r = cfg.process.restart
+        assert r.on_failure is False
+        assert r.interval_seconds == 10
+        assert r.max_attempts == 5
+        assert r.window_seconds == 120
+        assert r.permanent_failure_exit_codes == [1, 3]
+
+    def test_process_without_restart_subblock_uses_default_restart(self, tmp_path):
+        """A YAML with only process: (no restart: sub-block) defaults to RestartConfig()."""
+        from paramem.server.config import RestartConfig, load_server_config
+
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            process:
+            """,
+        )
+        cfg = load_server_config(yaml_file)
+        assert cfg.process.restart == RestartConfig()
+
+    def test_absent_process_section_uses_default(self, tmp_path):
+        """No process: key at all → ProcessConfig() with RestartConfig() defaults."""
+        from paramem.server.config import RestartConfig, load_server_config
+
+        yaml_file = _write_yaml(tmp_path, "model: mistral\n")
+        cfg = load_server_config(yaml_file)
+        assert cfg.process.restart == RestartConfig()

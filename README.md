@@ -292,6 +292,14 @@ options. A short map of the top-level sections:
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
 
+The `process.restart` block controls the systemd restart policy baked into
+`~/.config/systemd/user/paramem-server.service.d/restart.conf` on each server
+start. Key knobs: `on_failure` (retry on crash vs. never), `max_attempts` /
+`window_seconds` (rate-limit gate), and `permanent_failure_exit_codes` (exit
+codes that are never retried — defaults to `[3]`, the `FatalConfigError` code
+raised by the encryption consistency gate). See `configs/server.yaml.example`
+for the full field reference.
+
 Operational invariant: consolidation has exactly one user-facing scheduling
 knob (`consolidation.refresh_cadence`). Everything else derives from it.
 Scheduling is owned by a systemd user timer (`paramem-consolidate.timer`)

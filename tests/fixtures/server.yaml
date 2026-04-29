@@ -501,6 +501,17 @@ tts:
       # device: cpu            # per-voice override (default: inherit from tts.device)
 
 # ============================================================================
+# PROCESS
+# ============================================================================
+process:
+  restart:
+    on_failure: true
+    interval_seconds: 30
+    max_attempts: 3
+    window_seconds: 60
+    permanent_failure_exit_codes: [3]
+
+# ============================================================================
 # VRAM
 # ============================================================================
 # Process-side memory safety net. Sets

@@ -40,6 +40,10 @@ fi
 # configs/server.yaml. Non-fatal: WARNs and continues if elevation is absent.
 bash scripts/setup/headless-boot.sh || echo "  Warning: headless-boot reconcile failed (non-fatal)"
 
+# Bake process.restart values from configs/server.yaml into the systemd
+# drop-in. Non-fatal: WARNs and continues so startup is never blocked.
+bash scripts/setup/server-restart-reconcile.sh || echo "  Warning: server-restart reconcile failed (non-fatal)"
+
 EXTRA_ARGS="${PARAMEM_EXTRA_ARGS:-}"
 
 if [ "${1:-}" = "--background" ]; then

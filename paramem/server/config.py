@@ -201,6 +201,61 @@ class SecurityConfig:
 
 
 @dataclass
+class RestartConfig:
+    """systemd restart policy for the paramem-server service.
+
+    Values flow through scripts/setup/server-restart-reconcile.sh into
+    a drop-in at ~/.config/systemd/user/paramem-server.service.d/restart.conf
+    on next server start. Changing values here without re-running the
+    reconciler (or restarting the service, which calls it) has no effect.
+
+    Fields map directly to systemd unit options:
+
+    - on_failure         → Restart=on-failure | no | always
+    - interval_seconds   → RestartSec=
+    - max_attempts       → StartLimitBurst=
+    - window_seconds     → StartLimitIntervalSec=
+    - permanent_failure_exit_codes → RestartPreventExitStatus= (space-joined)
+
+    Defaults are conservative: 3 retries / 60 s, with FatalConfigError
+    (exit 3) treated as permanent so a config refusal doesn't burn cycles.
+    """
+
+    on_failure: bool = True
+    interval_seconds: int = 30
+    max_attempts: int = 3
+    window_seconds: int = 60
+    permanent_failure_exit_codes: list[int] = field(default_factory=lambda: [3])
+
+    def __post_init__(self) -> None:
+        if self.interval_seconds < 1:
+            raise ValueError(
+                f"process.restart.interval_seconds must be >= 1; got {self.interval_seconds!r}"
+            )
+        if self.max_attempts < 1:
+            raise ValueError(
+                f"process.restart.max_attempts must be >= 1; got {self.max_attempts!r}"
+            )
+        if self.window_seconds < 1:
+            raise ValueError(
+                f"process.restart.window_seconds must be >= 1; got {self.window_seconds!r}"
+            )
+        for code in self.permanent_failure_exit_codes:
+            if not (0 <= code <= 255):
+                raise ValueError(
+                    "process.restart.permanent_failure_exit_codes entries must be in [0, 255];"
+                    f" got {code!r}"
+                )
+
+
+@dataclass
+class ProcessConfig:
+    """Process-level lifecycle policy. Currently just systemd restart behaviour."""
+
+    restart: RestartConfig = field(default_factory=RestartConfig)
+
+
+@dataclass
 class VramConfig:
     """Process-side VRAM safety net configuration.
 
@@ -881,6 +936,7 @@ class ServerConfig:
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     vram: VramConfig = field(default_factory=VramConfig)
+    process: ProcessConfig = field(default_factory=ProcessConfig)
 
     # Derived path accessors for backward compatibility
     @property
@@ -1098,6 +1154,15 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     vram_raw = raw.get("vram", {})
     if vram_raw:
         config.vram = VramConfig(**vram_raw)
+
+    # Process lifecycle (systemd restart policy; see ProcessConfig / RestartConfig).
+    process_raw = raw.get("process")
+    if process_raw is not None:
+        restart_raw = process_raw.get("restart")
+        if restart_raw is not None:
+            config.process = ProcessConfig(restart=RestartConfig(**restart_raw))
+        else:
+            config.process = ProcessConfig()
 
     agents_raw = raw.get("agents", {})
     config.ha_agent_id = agents_raw.get("ha_agent_id", "")
