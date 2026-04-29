@@ -59,6 +59,11 @@ scripts/deploy-ha.sh
 # Allowlist: small anonymized test fixtures that exercise the PDF chunker.
 !tests/fixtures/*.pdf
 
+# Test-fixture sandbox: tests/fixtures/server.yaml routes paths.* into here so
+# tests that don't override paths land in a gitignored location instead of
+# polluting the live store. Per-run subdirs are auto-created by ConsolidationLoop.
+tests/fixtures/sandbox/
+
 # LaTeX build artifacts
 paper/*.aux
 paper/*.bbl

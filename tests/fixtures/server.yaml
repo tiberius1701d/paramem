@@ -102,23 +102,28 @@ headless_boot: false
 
 server:
   host: "0.0.0.0"
-  port: 18420                   # +10000 vs production (8420) so a test instance can coexist with a live server
+  port: 8420                    # tests use TestClient (in-process ASGI) — no socket bound; matches example for fixture/example parity
   reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
   vram_safety_margin_mb: 200   # free VRAM to keep after loading all GPU components
 
 model: mistral  # mistral | gemma | qwen3b | gemma4
 
-debug: false  # ship-safe default — true writes plaintext fact copies to data/ha/sessions/*.jsonl
-              # and data/ha/debug/cycle_*/ on every consolidation. Flip true ONLY when actively
-              # debugging a deployment (see SECURITY.md §debug carve-outs).
+debug: true   # dev-test posture: full diagnostic artefacts (per-session graph dumps, cycle
+              # snapshots, JSONL transcripts) under paths.debug for failure triage. Safe because
+              # paths.* below all route into tests/fixtures/sandbox/ — no live-store pollution.
+              # Run-scoped under run_<id>/cycle_<N>/ so successive ConsolidationLoop instances
+              # do not clobber each other's artefacts.
 
 # --- Paths (mount points) ---
+# All paths route into a gitignored sandbox directory so tests that don't override paths
+# never write to the live store. Tests that need per-test isolation continue to use
+# pytest's tmp_path; the sandbox only catches tests that aren't path-aware.
 paths:
-  data: data/ha                 # persistent artifacts (adapters, registry, key_metadata)
-  sessions: data/ha/sessions    # conversation transcripts pending consolidation
-  simulate: data/ha/simulate    # encrypted JSON-store outputs when consolidation.mode = simulate
-  debug: data/ha/debug          # cycle snapshots, diagnostic output (only when debug=true)
-  prompts: configs/prompts      # extraction and voice prompt templates
+  data: tests/fixtures/sandbox/data/ha                # persistent artifacts (adapters, registry, key_metadata)
+  sessions: tests/fixtures/sandbox/data/ha/sessions    # conversation transcripts pending consolidation
+  simulate: tests/fixtures/sandbox/data/ha/simulate    # encrypted JSON-store outputs when consolidation.mode = simulate
+  debug: tests/fixtures/sandbox/data/ha/debug          # cycle snapshots, diagnostic output (debug=true)
+  prompts: configs/prompts                              # extraction and voice prompt templates (read-only, shared with live)
 
 adapters:
   episodic:
@@ -230,7 +235,7 @@ consolidation:
   extraction_max_tokens: 2048  # max output tokens for graph extraction
   extraction_stt_correction: true  # correct STT errors from assistant responses
   extraction_ha_validation: true  # validate locations against HA home context
-  extraction_noise_filter: ""  # SOTA provider for noise filtering ("" = disabled, ship default)
+  extraction_noise_filter: anthropic  # dev-test posture: exercise SOTA enrichment code paths. Cloud calls fall through gracefully when ANTHROPIC_API_KEY is unset.
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
   extraction_noise_filter_endpoint: ""  # custom endpoint for OpenAI-compatible providers ("" = use the provider's default endpoint)
   # --- Extraction-pipeline stages (all configurable) ---
@@ -304,13 +309,13 @@ consolidation:
   # consolidation. Captures cross-transcript second-order relations and resolves
   # entity coreference (same_as pairs) that per-transcript enrichment cannot see.
   # Reuses the extraction_noise_filter SOTA credentials — no new provider config.
-  graph_enrichment_enabled: false             # ship default — uses SOTA, needs an API key
+  graph_enrichment_enabled: true             # dev-test posture: exercise enrichment code paths
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
   # Mini-enrichment at interim-adapter rollover (sub-interval boundary,
   # default 12h). Amortises the 84h enrichment cost across the cycle.
   # Fires only when enough new triples have accumulated since the last pass.
-  graph_enrichment_interim_enabled: false    # ship default — companion to graph_enrichment_enabled
+  graph_enrichment_interim_enabled: true     # dev-test posture: exercise interim-rollover enrichment
   graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
 
 # --- Agents ---
@@ -322,29 +327,36 @@ consolidation:
 # The ${VAR} placeholders below document the surface; they are resolved at
 # load time.
 agents:
+  # Dev-test posture: SOTA agents enabled so escalation routing code paths are
+  # exercised. Cloud calls fall through gracefully when API keys are unset
+  # (the loader logs and skips). Tests that need real SOTA responses are
+  # marked `integration` and require keys.
   sota:
-    enabled: false
+    enabled: true
     provider: anthropic
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
     endpoint: ""
   sota_providers:
     anthropic:
-      enabled: false
+      enabled: true
       provider: anthropic
       model: claude-sonnet-4-6
       api_key: ${ANTHROPIC_API_KEY}
     openai:
-      enabled: false
+      enabled: true
       provider: openai
       model: gpt-4o-search-preview
       api_key: ${OPENAI_API_KEY}
     google:
-      enabled: false
+      enabled: true
       provider: google
       model: gemini-2.5-flash
       api_key: ${GOOGLE_API_KEY}
-  ha_agent_id: ""  # set to e.g. "conversation.groq" once HA token configured
+  # HA escalation kept off here: integration tests (scripts/dev/test-ha-pipeline.sh
+  # and friends) exercise HA against a real instance. Unit/contract tests stay off
+  # the HA path. Flip per-test if a unit test needs to assert HA routing.
+  ha_agent_id: ""
 
 # --- Tools ---
 tools:
@@ -473,14 +485,14 @@ stt:
   cpu_fallback_model: small  # multilingual CPU model for cloud-only mode (distil-* variants are English-only)
   device: cuda               # cuda, cpu, auto
   compute_type: int8         # int8, float16, float32
-  port: 19300                # +9000 vs production (10300) for test isolation
+  port: 10300                # tests use Wyoming clients in-process; matches example for fixture/example parity
   language: auto             # "auto" for multilingual detection, or fixed code (e.g. "en")
   beam_size: 5               # Whisper beam search width (higher = better, slower)
   vad_filter: true           # voice activity detection (trims silence)
 
 tts:
   enabled: false             # local TTS via Wyoming protocol (requires Piper / MMS-TTS model downloads)
-  port: 19301                # +9000 vs production (10301) for test isolation
+  port: 10301                # tests use Wyoming clients in-process; matches example for fixture/example parity
   device: cuda               # default device; per-voice override possible
   default_language: en
   language_confidence_threshold: 0.8  # Whisper detection probability to trust
