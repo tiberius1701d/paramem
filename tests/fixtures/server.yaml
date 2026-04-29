@@ -262,7 +262,7 @@ consolidation:
   #   "diagnostic" — log triples the gate WOULD drop, drop nothing
   #                  (use to measure false-positive rate on your corpus)
   #   "active"     — gate drops triples that fail role checking
-  extraction_role_aware_grounding: "off"   # quoted: bare off/on parse as YAML 1.1 booleans
+  extraction_role_aware_grounding: "active"   # quoted: bare off/on parse as YAML 1.1 booleans
   # Max concurrent interim adapters in VRAM. Together with refresh_cadence
   # this determines the derived full-consolidation period:
   #     full_cycle = refresh_cadence × max_interim_count

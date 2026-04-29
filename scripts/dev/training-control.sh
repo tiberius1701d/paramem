@@ -70,6 +70,22 @@ TEST_PGREP[13]="test13_journal_scaffold"
 TEST_PGREP["13b"]="test13b_retention_curve"
 TEST_PGREP[14]="test14"
 
+# TODO(probe): register experiments/dataset_probe.py for long runs (>60 min).
+# Planned registry values:
+#   TEST_SCRIPTS["probe"]="experiments/dataset_probe.py"
+#   TEST_OUTPUT_DIRS["probe"]="outputs/dataset_probe"
+#   TEST_PGREP["probe"]="dataset_probe"
+# Blocked on: probe's state.json shape differs from epoch-based tests
+# (uses processed_session_ids list + per-session diagnostics dir, not
+# last_completed_epoch). tstatus/tresume helpers branch on epoch fields
+# and would need a probe-aware code path: tresume must replay the
+# original CLI args (dataset, split, sample_strategy, sample_size, seed,
+# model, no_train, debug, role_aware_grounding) from the run's state
+# args_snapshot, not derive from registry. tstatus must report
+# "N/30 sessions done" instead of "epoch X/Y". Until that lands, run the
+# probe directly (`python experiments/dataset_probe.py …`) and rely on
+# its built-in --resume.
+
 # --- Colors (inherit from gpu-cooldown.sh, add extras) ---
 BLUE='\033[0;34m'
 

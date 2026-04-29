@@ -14,6 +14,9 @@ wandb/
 # External datasets (download manually, see README)
 data/external/
 
+# Test runtime artifacts (probe debug snapshots, etc.)
+tests/data/
+
 # Model weights
 *.ckpt
 *.safetensors

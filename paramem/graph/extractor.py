@@ -1944,7 +1944,7 @@ def _normalize_for_grounding(text: str) -> str:
     return (text or "").replace("_", " ").lower()
 
 
-def _extract_user_spans(transcript: str) -> str:
+def _extract_user_spans(transcript: str, *, speaker_name: str | None = None) -> str:
     """Concatenate the text of every ``[user]`` (or ``user:``) line.
 
     Production transcripts tag turns with ``[user]`` / ``[assistant]``
@@ -1953,11 +1953,26 @@ def _extract_user_spans(transcript: str) -> str:
     can verify a triple's substantive tokens come from the speaker
     themselves, not from an assistant or third-party turn.
 
+    When ``speaker_name`` is provided, lines whose lowercased form starts
+    with ``{speaker_name.lower()}:`` are also accepted as user turns.
+    This covers production-format transcripts rendered by
+    ``SessionBuffer._format_turns`` as ``{speaker_name}: {text}`` instead
+    of the legacy ``[user]`` / ``user:`` prefix.
+
     Lines that don't carry a recognised role prefix are conservatively
     dropped — the goal is high precision on "user said this", not
     inclusivity.  Mirrors the asymmetric extraction in
     :func:`_correct_entity_names` (which pulls ``[assistant]`` text).
     """
+    speaker_prefix: str | None = None
+    speaker_prefix_skip = 0
+    if speaker_name and speaker_name.lower() != "assistant":
+        speaker_prefix = speaker_name.lower() + ":"
+        # Skip by len(speaker_name)+1 (the colon) on the original-case line.
+        # Lowercasing can change byte length for some Unicode (Turkish İ, German
+        # ẞ); using original-case length keeps the slice index correct.
+        speaker_prefix_skip = len(speaker_name) + 1
+
     out: list[str] = []
     for line in (transcript or "").split("\n"):
         stripped = line.strip()
@@ -1967,6 +1982,8 @@ def _extract_user_spans(transcript: str) -> str:
             out.append(stripped[prefix_len:].lstrip())
         elif lower.startswith("user:"):
             out.append(stripped[len("user:") :].lstrip())
+        elif speaker_prefix and lower.startswith(speaker_prefix):
+            out.append(stripped[speaker_prefix_skip:].lstrip())
     return "\n".join(out)
 
 
@@ -2122,7 +2139,14 @@ def _drop_ungrounded_facts(
     transcript_norm = _normalize_for_grounding(original_transcript)
     user_norm: str | None = None
     if speaker_names:
-        user_norm = _normalize_for_grounding(_extract_user_spans(original_transcript))
+        # Production format from SessionBuffer._format_turns renders user turns as
+        # "{speaker_name}: {text}". Build the union of user spans across every
+        # configured speaker name; sorted iteration keeps user_norm reproducible
+        # regardless of set ordering.
+        spans: list[str] = []
+        for sn in sorted(s for s in speaker_names if s):
+            spans.append(_extract_user_spans(original_transcript, speaker_name=sn))
+        user_norm = _normalize_for_grounding("\n".join(spans))
 
     kept: list[dict] = []
     dropped: list[dict] = []

@@ -225,11 +225,17 @@ consolidation:
   # tokens to ground in the speaker's own [user] turns, not in [assistant]
   # turns. Closes the cascade: confabulated answer → extracted as fact →
   # trained into adapter weights.
-  #   "off"        — role-blind grounding (ship default, backward-compatible)
-  #   "diagnostic" — log triples the gate WOULD drop, drop nothing
-  #                  (use to measure false-positive rate on your corpus)
-  #   "active"     — gate drops triples that fail role checking
-  extraction_role_aware_grounding: "off"   # quoted: bare off/on parse as YAML 1.1 booleans
+  #   "off"        — role-blind grounding, no observability
+  #   "diagnostic" — production behaves identically to "off" (no drops),
+  #                  but every triple the gate WOULD drop is recorded under
+  #                  graph.diagnostics["role_aware_would_drop"]. With
+  #                  debug: true, snapshots persist. Zero production-
+  #                  behaviour cost. Ship default — collects per-corpus
+  #                  evidence so an operator can decide on "active" with
+  #                  data, not guesses.
+  #   "active"     — gate drops triples that fail role checking. Validate
+  #                  on a representative corpus in "diagnostic" first.
+  extraction_role_aware_grounding: "diagnostic"   # quoted: bare off/on parse as YAML 1.1 booleans
   # Max concurrent interim adapters in VRAM. Together with refresh_cadence
   # this determines the derived full-consolidation period:
   #     full_cycle = refresh_cadence × max_interim_count

@@ -132,11 +132,13 @@ def test_debug_disabled_by_default(example_config):
     assert example_config.debug is False
 
 
-def test_role_aware_grounding_off_by_default(example_config):
-    """Role-aware grounding gate defaults to "off" (role-blind, backward-compatible).
-    Operators measure false-positive rate via "diagnostic" before flipping to "active".
+def test_role_aware_grounding_diagnostic_by_default(example_config):
+    """Role-aware grounding gate defaults to "diagnostic" — production behaviour
+    is identical to "off" (no drops), but the gate records would-be drops under
+    graph.diagnostics["role_aware_would_drop"] so an operator can flip to "active"
+    on per-corpus evidence rather than guesses. Zero production-behaviour cost.
     """
-    assert example_config.consolidation.extraction_role_aware_grounding == "off"
+    assert example_config.consolidation.extraction_role_aware_grounding == "diagnostic"
 
 
 def test_episodic_adapter_config_builds(example_config):

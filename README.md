@@ -84,7 +84,7 @@ All experiments run on a single RTX 5070 Laptop (8 GB VRAM, 60 W TGP) using QLoR
 
 **Episodic adapter** holds recent facts with indexed keys for per-fact retrieval. **Semantic adapter** holds promoted, well-reinforced knowledge. **Procedural adapter** captures behavioral patterns and preferences (targets MLP layers in addition to attention for representational imprinting of persistent habits). Episodic + semantic target attention only — indexed-key retrieval is a routing problem. The knowledge graph is a transient processing layer — like the visual cortex, it structures input but doesn't store long-term memory. The adapters are the memory.
 
-Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/extractor.py`): local LLM extraction with speaker-name injection → anonymization (real → placeholder mapping) → leak guard + repair → SOTA enrichment with brace-binding protocol (cloud sees only placeholders, new entities must round-trip via `{Prefix_N}` tokens grounded in the transcript) → de-anonymization with residual-placeholder sweep → plausibility filter → transcript-grounding gate (drops SOTA world-knowledge inferences). A fallback path runs local plausibility + grounding on raw extraction if the primary chain empties out. All stages fall forward and are configurable under `consolidation:` in `server.yaml`.
+Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/extractor.py`): local LLM extraction with speaker-name injection → anonymization (real → placeholder mapping) → leak guard + repair → SOTA enrichment with brace-binding protocol (cloud sees only placeholders, new entities must round-trip via `{Prefix_N}` tokens grounded in the transcript) → de-anonymization with residual-placeholder sweep → plausibility filter → transcript-grounding gate (drops SOTA world-knowledge inferences). The grounding gate has an opt-in **role-aware mode** (`extraction_role_aware_grounding: diagnostic | active`) that additionally requires the object of any speaker-subject triple to ground in the speaker's own turns rather than the assistant's — the deterministic structural defense against the assistant-into-graph cascade. A fallback path runs local plausibility + grounding on raw extraction if the primary chain empties out. All stages fall forward and are configurable under `consolidation:` in `server.yaml`.
 
 At every **full consolidation** the cumulative merged graph then passes through a **graph-level SOTA enrichment** stage that per-transcript extraction cannot see: the SOTA model receives N-hop subgraphs (serialized as triples, chunked by focal entity) and emits cross-session second-order relations plus `same_as` pairs for entity coreference. Duplicates are contracted into canonical nodes under a token-subset / Jaro-Winkler safety gate; new edges are tagged `source="graph_enrichment"` and feed the downstream partition + training pipeline unchanged. A **mini-enrichment** pass also fires at each interim-adapter rollover (per sub-interval, default 12h) when enough new triples have accumulated since the last pass (`graph_enrichment_min_triples_floor`), amortising the SOTA cost across the 84h cycle instead of concentrating it at the final boundary. Both passes are budget-bound by `graph_enrichment_neighborhood_hops` and `graph_enrichment_max_entities_per_pass`.
 
@@ -468,6 +468,11 @@ python experiments/dataset_probe.py --dataset perltqa --no-train
 # Stratified LongMemEval sample (balanced across question types):
 python experiments/dataset_probe.py --dataset longmemeval \
     --sample-strategy stratified --sample-size 100 --sample-seed 42
+
+# Role-aware grounding gate diagnostics (persists per-session
+# graph.diagnostics["role_aware_would_drop"] under <run_dir>/debug/):
+python experiments/dataset_probe.py --dataset longmemeval --limit 30 \
+    --no-train --debug --role-aware-grounding diagnostic
 ```
 
 See `benchmarking.md` → "Extraction Probe Sweep" for paired LME/PerLTQA results.
