@@ -3388,6 +3388,17 @@ class ConsolidationLoop:
         # In the absence of a real encrypted backup dir we skip the load
         # and fall back to the live main adapters as the de-facto backup.
         # Production systems should implement the encrypted backup path (Step 7d).
+        #
+        # Each backup MUST be created from its source tier's config — the tiers
+        # have heterogeneous LoRA shapes (procedural targets attn+mlp,
+        # episodic/semantic target attn-only) so a single template can't serve
+        # all three. ``copy_adapter_weights`` checks parameter-set equality and
+        # would otherwise raise on procedural → procedural_backup.
+        tier_config_for_backup = {
+            "episodic": self.episodic_config,
+            "semantic": self.semantic_config,
+            "procedural": self.procedural_config or self.episodic_config,
+        }
         for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
             if backup_name not in self.model.peft_config:
                 # No backup available — copy main weights into backup slot.
@@ -3396,7 +3407,8 @@ class ConsolidationLoop:
                 if base_tier in self.model.peft_config:
                     from paramem.models.loader import copy_adapter_weights
 
-                    self.model = create_adapter(self.model, self.episodic_config, backup_name)
+                    backup_config = tier_config_for_backup[base_tier]
+                    self.model = create_adapter(self.model, backup_config, backup_name)
                     copy_adapter_weights(self.model, src=base_tier, dst=backup_name)
                     logger.info(
                         "consolidate_interim_adapters: created in-memory backup %s from %s",
