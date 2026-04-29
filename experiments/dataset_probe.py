@@ -55,11 +55,6 @@ from experiments.utils.test_harness import (  # noqa: E402
     model_output_dir,
     setup_logging,
 )
-from paramem.utils.config import (  # noqa: E402
-    AdapterConfig,
-    ConsolidationConfig,
-    TrainingConfig,
-)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -740,48 +735,44 @@ def main() -> None:
         logger.info("Loading base model: %s", model_cfg.model_id)
         model, tokenizer = load_base_model(model_cfg)
 
-        # --- 6. Build ConsolidationLoop ---
-        from paramem.training.consolidation import ConsolidationLoop
+        # --- 6. Build ConsolidationLoop via the canonical server factory ---
+        from paramem.server.config import load_server_config
+        from paramem.server.consolidation import create_consolidation_loop
 
-        # Probe is episodic-only: never trains or promotes to semantic. Reuse
-        # the same AdapterConfig in the semantic slot so staging-compat
-        # validation passes (rank/alpha must match across slots). Values
-        # match the legacy default.yaml episodic adapter exactly.
-        episodic_config = AdapterConfig(rank=8, alpha=16, learning_rate=1e-4, dropout=0.0)
-        semantic_config = episodic_config
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        cfg.model_name = args.model
 
-        # Probe training config. Values match the legacy default.yaml
-        # training block exactly except for gradient_accumulation_steps
-        # (set to 2 instead of the default.yaml value of 8 -- mirrors the
-        # original probe's explicit override).
-        consolidation_training = TrainingConfig(
-            batch_size=1,
-            gradient_accumulation_steps=2,
-            max_seq_length=512,
-            num_epochs=args.num_epochs,
-            warmup_ratio=0.1,
-            weight_decay=0.01,
-            gradient_checkpointing=True,
-            max_grad_norm=1.0,
-            seed=42,
-        )
+        # Episodic-only probe: rank/alpha/lr match legacy probe defaults.
+        # Use dataclasses.replace so episodic and semantic are independent
+        # objects (same values, no aliasing).
+        import dataclasses
 
-        # Indexed-key replay must be ON: the probe's whole point is to
-        # dry-run extraction → merge → QA → train → smoke.
-        consolidation_cfg = ConsolidationConfig(indexed_key_replay_enabled=True)
+        cfg.adapters.episodic.rank = 8
+        cfg.adapters.episodic.alpha = 16
+        cfg.adapters.episodic.learning_rate = 1e-4
+        cfg.adapters.semantic = dataclasses.replace(cfg.adapters.episodic)
+        cfg.adapters.procedural.enabled = False
 
-        loop = ConsolidationLoop(
+        cfg.consolidation.max_epochs = args.num_epochs
+
+        # --no-sota path: zero cloud cost for loop defaults. Per-call
+        # extract_session overrides (noise_filter=, plausibility_judge=) below
+        # continue to win regardless.
+        if args.no_sota:
+            cfg.consolidation.extraction_noise_filter = ""
+            cfg.consolidation.extraction_plausibility_judge = "off"
+
+        cfg.consolidation.indexed_key_replay = True
+
+        loop = create_consolidation_loop(
             model=model,
             tokenizer=tokenizer,
-            consolidation_config=consolidation_cfg,
-            training_config=consolidation_training,
-            episodic_adapter_config=episodic_config,
-            semantic_adapter_config=semantic_config,
-            procedural_adapter_config=None,
+            config=cfg,
+            state_provider=None,
             output_dir=run_dir,
-            persist_graph=False,
             save_cycle_snapshots=False,
-            prompts_dir=None,
+            persist_graph=False,
+            seed_state_from_disk=False,
         )
 
         # --- 7. Bind loader with dataset-specific kwargs ---

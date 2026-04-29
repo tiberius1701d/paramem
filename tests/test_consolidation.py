@@ -890,6 +890,7 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
         cfg.debug = False
         cfg.debug_dir = None
         cfg.prompts_dir = None
+        cfg.sanitization.cloud_scope = ["person"]
         return cfg
 
     def test_state_provider_supplies_cache_to_loop(self, tmp_path, monkeypatch):

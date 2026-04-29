@@ -50,12 +50,6 @@ import torch  # noqa: E402
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import BENCHMARK_MODELS, setup_logging  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
-from paramem.training.consolidation import ConsolidationLoop  # noqa: E402
-from paramem.utils.config import (  # noqa: E402
-    AdapterConfig,
-    ConsolidationConfig,
-    TrainingConfig,
-)
 
 setup_logging()
 logger = logging.getLogger("smoke_interim_rollover_live_gpu")
@@ -79,15 +73,6 @@ TRANSCRIPT_B = (
 )
 
 
-def _tier_cfg(rank: int = 8) -> AdapterConfig:
-    return AdapterConfig(
-        rank=rank,
-        alpha=2 * rank,
-        learning_rate=1e-4,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-    )
-
-
 def _count_enrichment_edges(graph: nx.MultiDiGraph) -> int:
     return sum(1 for _, _, d in graph.edges(data=True) if d.get("source") == "graph_enrichment")
 
@@ -107,43 +92,47 @@ def main() -> int:
     model, tokenizer = load_base_model(BENCHMARK_MODELS["mistral"])
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
 
-    training_cfg = TrainingConfig(
-        batch_size=1,
-        gradient_accumulation_steps=2,
-        max_seq_length=512,
-        num_epochs=10,
-        warmup_steps=5,
-        warmup_ratio=0.0,
-    )
-    consolidation_cfg = ConsolidationConfig(
-        indexed_key_replay_enabled=True,
-        promotion_threshold=3,
-    )
+    from paramem.server.config import load_server_config
+    from paramem.server.consolidation import create_consolidation_loop
 
-    loop = ConsolidationLoop(
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    cfg.model_name = "mistral"
+
+    for tier in (cfg.adapters.episodic, cfg.adapters.semantic, cfg.adapters.procedural):
+        tier.enabled = True
+        tier.rank = 8
+        tier.alpha = 16
+        tier.learning_rate = 1e-4
+        tier.target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+    cfg.consolidation.max_epochs = 10
+    cfg.consolidation.indexed_key_replay = True
+    cfg.consolidation.promotion_threshold = 3
+
+    cfg.consolidation.extraction_stt_correction = False
+    cfg.consolidation.extraction_ha_validation = False
+    # Anthropic SOTA for noise filter AND graph enrichment (same creds).
+    cfg.consolidation.extraction_noise_filter = "anthropic"
+    cfg.consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
+    cfg.consolidation.extraction_plausibility_judge = "off"
+    cfg.consolidation.extraction_verify_anonymization = False
+
+    # Interim-rollover mini-enrichment ON, small budgets to keep the smoke cheap.
+    cfg.consolidation.graph_enrichment_enabled = True
+    cfg.consolidation.graph_enrichment_neighborhood_hops = 1
+    cfg.consolidation.graph_enrichment_max_entities_per_pass = 400
+    cfg.consolidation.graph_enrichment_interim_enabled = True
+    cfg.consolidation.graph_enrichment_min_triples_floor = 1
+
+    loop = create_consolidation_loop(
         model=model,
         tokenizer=tokenizer,
-        consolidation_config=consolidation_cfg,
-        training_config=training_cfg,
-        episodic_adapter_config=_tier_cfg(),
-        semantic_adapter_config=_tier_cfg(),
-        procedural_adapter_config=_tier_cfg(),
-        wandb_config=None,
+        config=cfg,
+        state_provider=None,
         output_dir=OUTPUT_DIR,
-        extraction_stt_correction=False,
-        extraction_ha_validation=False,
-        # Anthropic SOTA for noise filter AND graph enrichment (same creds).
-        extraction_noise_filter="anthropic",
-        extraction_noise_filter_model="claude-sonnet-4-6",
-        extraction_plausibility_judge="off",  # skip the extra plausibility call
-        extraction_verify_anonymization=False,
-        # Interim-rollover mini-enrichment ON, small budgets to keep the
-        # smoke cheap.
-        graph_enrichment_enabled=True,
-        graph_enrichment_neighborhood_hops=1,
-        graph_enrichment_max_entities_per_pass=400,  # chunk_cap = ceil(623/400)=2
-        graph_enrichment_interim_enabled=True,
-        graph_enrichment_min_triples_floor=1,
+        save_cycle_snapshots=False,
+        persist_graph=False,
+        seed_state_from_disk=False,
     )
 
     # Preload Test 8's cumulative graph so the 10-node floor is crossed

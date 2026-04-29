@@ -28,6 +28,11 @@ def create_consolidation_loop(
     tokenizer,
     config: ServerConfig,
     state_provider=None,
+    *,
+    output_dir=None,
+    save_cycle_snapshots: bool | None = None,
+    persist_graph: bool | None = None,
+    seed_state_from_disk: bool = True,
 ) -> ConsolidationLoop:
     """Create a ConsolidationLoop configured for the server.
 
@@ -43,7 +48,28 @@ def create_consolidation_loop(
         ``guard_trial_state`` and raise ``TrialActiveError`` when a migration
         TRIAL is active.  Experiment scripts that do not pass ``state_provider``
         are unaffected (default ``None`` → guard is a no-op).
+    output_dir:
+        Override ``config.adapter_dir`` as the loop's output directory.
+        ``None`` (default) falls through to ``config.adapter_dir``, which
+        preserves production behaviour.
+    save_cycle_snapshots:
+        Override ``config.debug`` as the cycle-snapshot toggle.  ``None``
+        (default) falls through to ``config.debug``.
+    persist_graph:
+        Override the hardcoded ``False`` used for production (transient
+        graph, RAM-only).  ``None`` (default) resolves to ``False``.
+    seed_state_from_disk:
+        When ``False``, skip seeding key metadata and keyed-pairs QA from
+        disk.  Use for probe/experiment runs that must start from a clean
+        state rather than inheriting live-system data.  Default ``True``
+        preserves production behaviour.
     """
+    _output_dir = output_dir if output_dir is not None else config.adapter_dir
+    _save_cycle_snapshots = (
+        save_cycle_snapshots if save_cycle_snapshots is not None else config.debug
+    )
+    _persist_graph = persist_graph if persist_graph is not None else False
+
     loop = ConsolidationLoop(
         model=model,
         tokenizer=tokenizer,
@@ -54,13 +80,13 @@ def create_consolidation_loop(
         procedural_adapter_config=(
             config.procedural_adapter_config if config.adapters.procedural.enabled else None
         ),
-        output_dir=config.adapter_dir,
+        output_dir=_output_dir,
         graph_path=None,
         extraction_temperature=0.0,
         extraction_max_tokens=config.consolidation.extraction_max_tokens,
-        save_cycle_snapshots=config.debug,
-        snapshot_dir=config.debug_dir if config.debug else None,
-        persist_graph=False,
+        save_cycle_snapshots=_save_cycle_snapshots,
+        snapshot_dir=config.debug_dir if _save_cycle_snapshots else None,
+        persist_graph=_persist_graph,
         prompts_dir=config.prompts_dir,
         graph_config=config.graph_config,
         graph_enrichment_enabled=config.consolidation.graph_enrichment_enabled,
@@ -75,6 +101,16 @@ def create_consolidation_loop(
         # Empty list disables NER-scope filtering entirely (consolidation
         # then uses the primitive default {person, place}).
         extraction_pii_scope=set(config.sanitization.cloud_scope),
+        extraction_stt_correction=config.consolidation.extraction_stt_correction,
+        extraction_ha_validation=config.consolidation.extraction_ha_validation,
+        extraction_noise_filter=config.consolidation.extraction_noise_filter,
+        extraction_noise_filter_model=config.consolidation.extraction_noise_filter_model,
+        extraction_noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint,
+        extraction_ner_check=config.consolidation.extraction_ner_check,
+        extraction_ner_model=config.consolidation.extraction_ner_model,
+        extraction_plausibility_judge=config.consolidation.extraction_plausibility_judge,
+        extraction_plausibility_stage=config.consolidation.extraction_plausibility_stage,
+        extraction_verify_anonymization=config.consolidation.extraction_verify_anonymization,
         state_provider=state_provider,
     )
 
@@ -94,62 +130,64 @@ def create_consolidation_loop(
     # cycle on adoption.
     loop.full_consolidation_period_string = config.consolidation.consolidation_period_string
 
-    # Seed key metadata from disk (survives restarts)
-    metadata = _load_key_metadata(config.key_metadata_path)
-    if metadata:
-        loop.seed_key_metadata(metadata)
+    if seed_state_from_disk:
+        # Seed key metadata from disk (survives restarts)
+        metadata = _load_key_metadata(config.key_metadata_path)
+        if metadata:
+            loop.seed_key_metadata(metadata)
 
-    # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.  This
-    # populates the loop's in-memory QA store across restarts so
-    # consolidate_interim_adapters has the question/answer text it needs to
-    # re-derive each active key's tier from the cumulative graph.  Without
-    # the seed, a full cycle that runs before any in-process training has
-    # populated indexed_key_qa would log "no QA metadata for key X" for
-    # every active key and skip every per-tier rebuild — observably the
-    # gate fires forever because the rebuild never advances main slots'
-    # window_stamp.  Transparently decrypts age-wrapped content when the
-    # daily identity is loaded.
-    #
-    # Seed reads from the canonical store for the active mode (locked
-    # decision #2). Train mode reads from paths.adapters (where _save_adapters
-    # wrote canonical bytes); simulate mode reads from paths.simulate (where
-    # _save_keyed_pairs_for_router writes canonical bytes).
-    store_dir = (
-        config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
-    )
+        # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.  This
+        # populates the loop's in-memory QA store across restarts so
+        # consolidate_interim_adapters has the question/answer text it needs to
+        # re-derive each active key's tier from the cumulative graph.  Without
+        # the seed, a full cycle that runs before any in-process training has
+        # populated indexed_key_qa would log "no QA metadata for key X" for
+        # every active key and skip every per-tier rebuild — observably the
+        # gate fires forever because the rebuild never advances main slots'
+        # window_stamp.  Transparently decrypts age-wrapped content when the
+        # daily identity is loaded.
+        #
+        # Seed reads from the canonical store for the active mode (locked
+        # decision #2). Train mode reads from paths.adapters (where _save_adapters
+        # wrote canonical bytes); simulate mode reads from paths.simulate (where
+        # _save_keyed_pairs_for_router writes canonical bytes).
+        store_dir = (
+            config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
+        )
 
-    ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
-    if ep_kp_path.exists():
-        loop.seed_episodic_qa(json.loads(read_maybe_encrypted(ep_kp_path).decode("utf-8")))
+        ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
+        if ep_kp_path.exists():
+            loop.seed_episodic_qa(json.loads(read_maybe_encrypted(ep_kp_path).decode("utf-8")))
 
-    sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
-    if sem_kp_path.exists():
-        loop.seed_semantic_qa(json.loads(read_maybe_encrypted(sem_kp_path).decode("utf-8")))
+        sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
+        if sem_kp_path.exists():
+            loop.seed_semantic_qa(json.loads(read_maybe_encrypted(sem_kp_path).decode("utf-8")))
 
-    proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
-    if proc_kp_path.exists():
-        loop.seed_procedural_qa(json.loads(read_maybe_encrypted(proc_kp_path).decode("utf-8")))
+        proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
+        if proc_kp_path.exists():
+            loop.seed_procedural_qa(json.loads(read_maybe_encrypted(proc_kp_path).decode("utf-8")))
 
-    # Interim slots are training-only (locked decision #3) — always under
-    # paths.adapters regardless of mode. The simulate store has no interim
-    # concept by design.
-    for interim_dir in sorted(config.adapter_dir.glob("episodic_interim_*")):
-        if not interim_dir.is_dir():
-            continue
-        kp = interim_dir / "keyed_pairs.json"
-        if not kp.exists():
-            continue
-        try:
-            loop.seed_episodic_qa(json.loads(read_maybe_encrypted(kp).decode("utf-8")))
-        except Exception:
-            logger.exception(
-                "Failed to seed indexed_key_qa from interim slot %s — skipping",
-                interim_dir.name,
-            )
+        # Interim slots are training-only (locked decision #3) — always under
+        # paths.adapters regardless of mode. The simulate store has no interim
+        # concept by design.
+        for interim_dir in sorted(config.adapter_dir.glob("episodic_interim_*")):
+            if not interim_dir.is_dir():
+                continue
+            kp = interim_dir / "keyed_pairs.json"
+            if not kp.exists():
+                continue
+            try:
+                loop.seed_episodic_qa(json.loads(read_maybe_encrypted(kp).decode("utf-8")))
+            except Exception:
+                logger.exception(
+                    "Failed to seed indexed_key_qa from interim slot %s — skipping",
+                    interim_dir.name,
+                )
 
     # One-time startup WARN when the non-active store has stale keyed_pairs
     # from a previous mode. The startup path runs once per process so this
-    # does not spam logs.
+    # does not spam logs. Runs unconditionally — operator telemetry for
+    # detecting mode-switch drift, not a seeding side-effect.
     inactive_dir = (
         config.adapter_dir if config.consolidation.mode == "simulate" else config.simulate_dir
     )
