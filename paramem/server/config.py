@@ -211,11 +211,14 @@ class RestartConfig:
 
     Fields map directly to systemd unit options:
 
-    - on_failure         → Restart=on-failure | no | always
+    - on_failure         → Restart=on-failure (True) | no (False)
     - interval_seconds   → RestartSec=
     - max_attempts       → StartLimitBurst=
     - window_seconds     → StartLimitIntervalSec=
-    - permanent_failure_exit_codes → RestartPreventExitStatus= (space-joined)
+    - permanent_failure_exit_codes → RestartPreventExitStatus= (space-joined).
+      Must be non-empty: an empty list would render an unset value to
+      systemd, silently disabling the permanent-failure short-circuit and
+      re-introducing the retry-storm risk this knob exists to prevent.
 
     Defaults are conservative: 3 retries / 60 s, with FatalConfigError
     (exit 3) treated as permanent so a config refusal doesn't burn cycles.
@@ -239,6 +242,11 @@ class RestartConfig:
         if self.window_seconds < 1:
             raise ValueError(
                 f"process.restart.window_seconds must be >= 1; got {self.window_seconds!r}"
+            )
+        if not self.permanent_failure_exit_codes:
+            raise ValueError(
+                "process.restart.permanent_failure_exit_codes must not be empty; "
+                "include at least exit code 3 (FatalConfigError) to prevent retry storms"
             )
         for code in self.permanent_failure_exit_codes:
             if not (0 <= code <= 255):

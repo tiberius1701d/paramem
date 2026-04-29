@@ -36,11 +36,14 @@ try:
     r = cfg.process.restart
     restart_val = 'on-failure' if r.on_failure else 'no'
     codes = ' '.join(str(c) for c in r.permanent_failure_exit_codes)
-    print(f'RESTART={restart_val}')
-    print(f'RESTART_SEC={r.interval_seconds}')
-    print(f'START_LIMIT_BURST={r.max_attempts}')
-    print(f'START_LIMIT_INTERVAL={r.window_seconds}')
-    print(f'PREVENT_EXIT_STATUS={codes}')
+    # Shell-quote each value: the schema validators constrain the values
+    # to numerics, the literal 'on-failure'/'no', and integers, but quoting
+    # is cheap insurance against any future widening (e.g. a custom label).
+    print(f'RESTART=\"{restart_val}\"')
+    print(f'RESTART_SEC=\"{r.interval_seconds}\"')
+    print(f'START_LIMIT_BURST=\"{r.max_attempts}\"')
+    print(f'START_LIMIT_INTERVAL=\"{r.window_seconds}\"')
+    print(f'PREVENT_EXIT_STATUS=\"{codes}\"')
 except Exception as exc:
     sys.stderr.write(f'server-restart-reconcile: cannot read config: {exc}\n')
     sys.exit(1)
@@ -100,7 +103,12 @@ printf '%s\n' "${DESIRED}" > "${TMP}" && mv "${TMP}" "${DROPIN}" || {
 
 echo "  server-restart-reconcile: wrote ${DROPIN}"
 
-# Reload so systemd picks up the new drop-in.
+# Reload so systemd picks up the new drop-in.  When daemon-reload fails,
+# the on-disk drop-in and the running unit's view of restart policy
+# diverge silently until the next host boot — flag the journalctl
+# command so the operator can investigate without re-tracing the script.
 if ! systemctl --user daemon-reload 2>/dev/null; then
     echo "  Warning: server-restart-reconcile: daemon-reload failed (non-fatal)"
+    echo "           Running service uses the previous policy until next reload."
+    echo "           Investigate: journalctl --user -u paramem-server.service -n 50"
 fi

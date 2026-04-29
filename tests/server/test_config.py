@@ -469,6 +469,14 @@ class TestRestartConfigValidators:
         r = RestartConfig(permanent_failure_exit_codes=[0, 255])
         assert r.permanent_failure_exit_codes == [0, 255]
 
+    def test_empty_exit_codes_list_rejected(self):
+        """Empty list raises ValueError — would render an unset systemd value
+        and silently disable the permanent-failure short-circuit."""
+        from paramem.server.config import RestartConfig
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            RestartConfig(permanent_failure_exit_codes=[])
+
 
 class TestRestartConfigYamlLoader:
     """load_server_config wires the process.restart sub-block correctly."""
