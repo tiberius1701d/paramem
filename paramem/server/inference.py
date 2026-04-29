@@ -191,6 +191,7 @@ def handle_chat(
     speaker_id: str | None = None,
     language: str | None = None,
     known_entities: set[str] | None = None,
+    effective_mode: str | None = None,
 ) -> ChatResult:
     """Process a chat message via intent-keyed dispatch.
 
@@ -272,6 +273,7 @@ def handle_chat(
                 ha_client=ha_client,
                 speaker=speaker,
                 language=language,
+                effective_mode=effective_mode,
                 is_personal=True,
             )
 
@@ -600,6 +602,7 @@ def _probe_and_reason(
     speaker: str | None = None,
     language: str | None = None,
     is_personal: bool = False,
+    effective_mode: str | None = None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -646,7 +649,14 @@ def _probe_and_reason(
     # probing adapter weights. Blackbox-equivalent under perfect recall.
     # Reads from paths.simulate (locked decision #2 — simulate-mode reads/writes
     # use paths.simulate, not paths.adapters).
-    if config.consolidation.mode == "simulate":
+    #
+    # ``effective_mode`` overrides ``config.consolidation.mode`` when an
+    # active-store migration is in progress or interrupted. The source store
+    # stays authoritative until ALL tiers have cleared the 1.0 recall gate;
+    # this conditional makes inference fall back to the source mode for the
+    # whole pending window. Falls through to the yaml mode otherwise.
+    _active_mode = effective_mode if effective_mode else config.consolidation.mode
+    if _active_mode == "simulate":
         probe_results = probe_keys_from_disk(config.simulate_dir, keys_by_adapter)
     else:
         # One switch_adapter call per adapter group.

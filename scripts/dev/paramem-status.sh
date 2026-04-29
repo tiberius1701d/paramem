@@ -361,6 +361,18 @@ fields = {
     # log line. Legacy responses without this field fall back to "-" so the
     # renderer can print a dim placeholder rather than crash.
     "encryption": d.get("encryption") or "-",
+    # Active-store migration in progress / interrupted (operator flipped
+    # consolidation.mode in server.yaml). When True, inference falls back
+    # to ``effective_mode`` (== source_mode) until tier-by-tier rebuild
+    # clears the 1.0 recall gate.
+    "pending_rehydration": d.get("pending_rehydration", False),
+    "effective_mode": d.get("effective_mode") or "-",
+    "migration_completed_tiers": ",".join(
+        ((d.get("last_consolidation_result") or {}).get("completed_tiers") or [])
+    ) or "-",
+    "migration_failed_tiers": ",".join(
+        sorted((d.get("last_consolidation_result") or {}).get("failed_tiers") or {})
+    ) or "-",
 }
 # Scalar line
 print("|".join(str(fields[k]) for k in [
@@ -382,6 +394,8 @@ print("|".join(str(fields[k]) for k in [
     "hold_active", "hold_owner_pid", "hold_owner_alive", "hold_age",
     "hold_owner_hint",
     "encryption",
+    "pending_rehydration", "effective_mode",
+    "migration_completed_tiers", "migration_failed_tiers",
 ]))
 # Per-adapter spec lines: kind<TAB>rank<TAB>alpha<TAB>lr<TAB>target_kind
 for _kind, _spec in (d.get("adapter_specs") or {}).items():
@@ -468,6 +482,8 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     hold_active hold_owner_pid hold_owner_alive hold_age \
     hold_owner_hint \
     encryption \
+    pending_rehydration effective_mode \
+    migration_completed_tiers migration_failed_tiers \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
 health_lines=$(echo "$parsed" | awk '/^HLT\t/')
@@ -548,6 +564,23 @@ else
 fi
 
 echo -e "  Server:   ${mode_display}"
+
+# Active-store migration banner. Surfaces the in-flight or interrupted
+# state to operators. While pending, inference falls back to
+# ``effective_mode`` (== source_mode) so the system stays consistent with
+# the source store until tier-by-tier rebuild clears the 1.0 recall gate.
+# The migration runs on the next /consolidate call (or the scheduled tick).
+if [[ "$pending_rehydration" == "True" ]]; then
+    if [[ "$migration_completed_tiers" != "-" || "$migration_failed_tiers" != "-" ]]; then
+        progress="completed:[${migration_completed_tiers}]"
+        if [[ "$migration_failed_tiers" != "-" ]]; then
+            progress="${progress} failed:[${migration_failed_tiers}]"
+        fi
+    else
+        progress="not started — trigger via /consolidate"
+    fi
+    echo -e "  Rehydrate:${YELLOW}REHYDRATING${RESET} → effective_mode=${effective_mode} (${progress})"
+fi
 
 # GPU status
 if command -v nvidia-smi &>/dev/null; then

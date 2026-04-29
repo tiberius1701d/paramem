@@ -2150,6 +2150,10 @@ async def chat(request: ChatRequest):
                 sota_agent=_state.get("sota_agent"),
                 ha_client=_state.get("ha_client"),
                 language=detected_language,
+                # Active-store migration override: when a mode-switch is in
+                # progress or interrupted, the inference path falls back to
+                # the source mode's store. None == use config.consolidation.mode.
+                effective_mode=_state.get("effective_mode"),
             ),
         )
 
