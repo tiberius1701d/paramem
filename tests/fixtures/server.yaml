@@ -126,11 +126,13 @@ adapters:
     rank: 8
     alpha: 16
     learning_rate: 1.0e-4
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]   # attention-only: indexed-key retrieval is routing, not representation
   semantic:
     enabled: true
     rank: 8
     alpha: 16
     learning_rate: 1.0e-5
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]   # attention-only (same as episodic) — consolidated knowledge routing
   procedural:
     enabled: true       # behavioral patterns, routines, preferences (F5.6)
     rank: 8
@@ -230,6 +232,7 @@ consolidation:
   extraction_ha_validation: true  # validate locations against HA home context
   extraction_noise_filter: ""  # SOTA provider for noise filtering ("" = disabled, ship default)
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering
+  extraction_noise_filter_endpoint: ""  # custom endpoint for OpenAI-compatible providers ("" = use the provider's default endpoint)
   # --- Extraction-pipeline stages (all configurable) ---
   #
   # Plausibility filter — final quality gate on extracted facts.
