@@ -8,8 +8,10 @@ episodic and semantic adapters.
 import logging
 import os
 import random
+import secrets
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -150,6 +152,7 @@ class ConsolidationLoop:
         extraction_max_tokens: int = 2048,
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
+        run_id: str | None = None,
         persist_graph: bool = True,
         prompts_dir: str | Path | None = None,
         extraction_stt_correction: bool = True,
@@ -189,7 +192,20 @@ class ConsolidationLoop:
         self.procedural_config = procedural_adapter_config
         self.wandb_config = wandb_config
         self.save_cycle_snapshots = save_cycle_snapshots
-        self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
+        # Run ID identifies a single ConsolidationLoop construction so successive
+        # /consolidate calls (and parallel test workers) don't clobber each
+        # other's debug artifacts. Format: YYYYmmddTHHMMSSZ_<hex6> — sortable
+        # lexicographically, human-readable, sub-second-unique. Stdlib only.
+        if run_id is None:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            run_id = f"{ts}_{secrets.token_hex(3)}"
+        self.run_id = run_id
+        # Prefix snapshot_dir with run_<id> so cycle_<N> directories from this
+        # loop instance don't overwrite artifacts from previous runs. The
+        # downstream writers (_dump_session_graph, cycle snapshot, adapter
+        # checkpoints) all build paths from self.snapshot_dir, so the run
+        # prefix flows through automatically with no per-call-site change.
+        self.snapshot_dir = Path(snapshot_dir) / f"run_{self.run_id}" if snapshot_dir else None
         self.persist_graph = persist_graph
         self.prompts_dir = prompts_dir
         # Entity-level promotion requires a persistent graph for cross-restart
@@ -468,21 +484,30 @@ class ConsolidationLoop:
         """Build the full kwarg set passed to ``extract_graph``.
 
         Resolves each flag to the per-call override if given (not None), else
-        the loop-level default.  Single source of truth for every extraction
-        path.
+        the source-type-aware default below.  Single source of truth for every
+        extraction path.
 
-        ``source_type`` selects both prompt filenames:
+        ``source_type`` selects both prompt filenames AND the defaults of two
+        gates whose semantics are tied to dialogue content:
 
         * ``"transcript"`` (default) — dialogue system prompt
           (:data:`~paramem.graph.extractor.DEFAULT_SYSTEM_PROMPT_FILENAME`)
           and user template
           (:data:`~paramem.graph.extractor.DEFAULT_USER_PROMPT_FILENAME`).
+          ``stt_correction`` and ``ha_validation`` default to the loop-level
+          operator-configured values (typically ``True``).
         * ``"document"`` — document system prompt
           (:data:`~paramem.graph.extractor.DOCUMENT_SYSTEM_PROMPT_FILENAME`)
           and user template
           (:data:`~paramem.graph.extractor.DOCUMENT_USER_PROMPT_FILENAME`).
           Narrator binding is handled by the ``{speaker_context}`` slot in
           ``extraction_document.txt`` — no extra context string is needed.
+          ``stt_correction`` defaults to ``False`` (the input is already
+          written text — there is no STT artifact surface to correct), and
+          ``ha_validation`` defaults to ``False`` (Home Assistant entity
+          grounding is a dialogue-context concern).  Operators may still
+          override either explicitly via the per-call kwargs (e.g. when
+          ingesting an audiobook transcript through the document path).
         """
 
         def pick(name: str, fallback):
@@ -492,17 +517,21 @@ class ConsolidationLoop:
         if source_type == "document":
             system_prompt_filename = DOCUMENT_SYSTEM_PROMPT_FILENAME
             user_prompt_filename = DOCUMENT_USER_PROMPT_FILENAME
+            stt_correction_default = False
+            ha_validation_default = False
         else:
             system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
             user_prompt_filename = DEFAULT_USER_PROMPT_FILENAME
+            stt_correction_default = self.extraction_stt_correction
+            ha_validation_default = self.extraction_ha_validation
 
         return dict(
             temperature=self.extraction_temperature,
             max_tokens=self.extraction_max_tokens,
             prompts_dir=self.prompts_dir,
             ha_context=overrides.get("ha_context"),
-            stt_correction=pick("stt_correction", self.extraction_stt_correction),
-            ha_validation=pick("ha_validation", self.extraction_ha_validation),
+            stt_correction=pick("stt_correction", stt_correction_default),
+            ha_validation=pick("ha_validation", ha_validation_default),
             noise_filter=pick("noise_filter", self.extraction_noise_filter),
             noise_filter_model=pick("noise_filter_model", self.extraction_noise_filter_model),
             noise_filter_endpoint=pick(
@@ -600,11 +629,15 @@ class ConsolidationLoop:
         ``source_type`` mirrors the same parameter on ``_run_extract_graph``:
         ``"document"`` selects the written-document system prompt so the
         procedural extractor is not primed with dialogue-style few-shots.
+        It also flips the ``stt_correction`` default to ``False`` for the
+        same reason as ``_extraction_kwargs`` — written text has no STT
+        artefact surface.  Explicit ``stt_correction`` overrides still win.
         """
         from peft import PeftModel as _PeftModel
 
         self._disable_gradient_checkpointing()
-        stt = self.extraction_stt_correction if stt_correction is None else stt_correction
+        stt_default = False if source_type == "document" else self.extraction_stt_correction
+        stt = stt_default if stt_correction is None else stt_correction
         system_prompt_filename = (
             DOCUMENT_SYSTEM_PROMPT_FILENAME
             if source_type == "document"

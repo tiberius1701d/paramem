@@ -3019,6 +3019,10 @@ async def ingest_sessions(request: IngestSessionsRequest):
             "user",
             chunk.chunk,
             embedding=None,
+            # doc_title is persisted here (and in the registry record below)
+            # for observability and dedup only — extraction binds the narrator
+            # via build_speaker_context, so extract_session has no doc_title
+            # parameter by design.
             metadata={
                 "source_type": "document",
                 "doc_title": chunk.doc_title,
