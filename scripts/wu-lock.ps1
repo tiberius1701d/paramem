@@ -24,6 +24,13 @@ $PairNames = @(
     @('PauseFeatureUpdatesStartTime', 'PauseFeatureUpdatesEndTime'),
     @('PauseQualityUpdatesStartTime', 'PauseQualityUpdatesEndTime')
 )
+# UX/Settings pause keys above only block new update scans/downloads; they do
+# NOT stop Update Orchestrator (UsoSvc / MoUsoCoreWorker.exe) from rebooting
+# for already-installed updates during the Active Hours off-window.  The AU
+# policy NoAutoRebootWithLoggedOnUsers=1 is the kill-switch: USO honours it
+# regardless of Active Hours as long as a user is signed in.
+$AuPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+$AuPolicyName = 'NoAutoRebootWithLoggedOnUsers'
 
 function Set-PauseWindow {
     param([int]$Days)
@@ -35,15 +42,21 @@ function Set-PauseWindow {
         Set-ItemProperty -Path $RegPath -Name $pair[0] -Value $start.ToString($fmt) -Type String
         Set-ItemProperty -Path $RegPath -Name $pair[1] -Value $end.ToString($fmt)   -Type String
     }
-    Write-Output ("WU paused until {0}" -f $end.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))
+    if (-not (Test-Path $AuPolicyPath)) { New-Item -Path $AuPolicyPath -Force | Out-Null }
+    Set-ItemProperty -Path $AuPolicyPath -Name $AuPolicyName -Value 1 -Type DWord
+    Write-Output ("WU paused until {0}; auto-reboot blocked while signed in" -f $end.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))
 }
 
 function Clear-PauseWindow {
-    if (-not (Test-Path $RegPath)) { return }
-    foreach ($pair in $PairNames) {
-        foreach ($name in $pair) {
-            Remove-ItemProperty -Path $RegPath -Name $name -ErrorAction SilentlyContinue
+    if (Test-Path $RegPath) {
+        foreach ($pair in $PairNames) {
+            foreach ($name in $pair) {
+                Remove-ItemProperty -Path $RegPath -Name $name -ErrorAction SilentlyContinue
+            }
         }
+    }
+    if (Test-Path $AuPolicyPath) {
+        Remove-ItemProperty -Path $AuPolicyPath -Name $AuPolicyName -ErrorAction SilentlyContinue
     }
     Write-Output 'WU pause cleared'
 }
