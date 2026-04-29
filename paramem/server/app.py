@@ -234,6 +234,16 @@ class StatusResponse(BaseModel):
     keys_count: int
     pending_sessions: int
     consolidating: bool
+    # Active-store migration state. True when the operator flipped
+    # consolidation.mode (simulate↔train) and the per-tier migration is
+    # in progress or interrupted. Inference falls back to ``effective_mode``
+    # while this is True (the source store stays authoritative until the
+    # 1.0 recall gate has cleared every tier).
+    pending_rehydration: bool = False
+    # When ``pending_rehydration`` is True, the mode the inference path
+    # is actually using (== source_mode of the in-flight migration).
+    # Equals ``mode_config`` otherwise.
+    effective_mode: str | None = None
     last_consolidation: str | None
     # Structured error from the most recent failed consolidation, surfaced
     # so operators can see VRAM exhaustion without scraping journald.
@@ -1732,6 +1742,33 @@ async def lifespan(app: FastAPI):
                 _resume_state.get("total_epochs", 0),
             )
 
+    # Active-store migration detection. Triggered when the operator flips
+    # consolidation.mode in server.yaml: the on-disk state for the new mode's
+    # active store is empty/stale and needs to be rebuilt from the previous
+    # mode's store. The check is read-only at startup; the actual migration
+    # runs via the consolidation dispatcher (next /consolidate call) under
+    # the GPU lock. Inference falls back to ``source_mode`` while a
+    # migration is pending so the system stays consistent until ALL tiers
+    # have cleared the 1.0 recall gate.
+    from paramem.server.active_store_migration import detect_mode_switch
+
+    _migration_state = detect_mode_switch(config)
+    if _migration_state is not None:
+        _state["pending_rehydration"] = True
+        _state["effective_mode"] = _migration_state.source_mode
+        logger.warning(
+            "Active-store migration pending: %s; falling back to %s mode for "
+            "inference until tier-by-tier rebuild completes "
+            "(completed_tiers=%s, failed_tiers=%s). Trigger via /consolidate.",
+            _migration_state.direction,
+            _migration_state.source_mode,
+            _migration_state.completed_tiers or "[]",
+            list(_migration_state.failed_tiers.keys()) or "[]",
+        )
+    else:
+        _state["pending_rehydration"] = False
+        _state["effective_mode"] = config.consolidation.mode
+
     # --- Post-session queue: persistent queue for missed training triggers ---
     # Instantiate the queue in local mode so the chat handler can use it.
     # In cloud-only mode there is no model to train — skip.
@@ -2661,6 +2698,8 @@ async def status():
         preview=bool(_state.get("preview", False)),
         pending_documents=pending_documents,
         pending_transcripts=pending_transcripts,
+        pending_rehydration=bool(_state.get("pending_rehydration", False)),
+        effective_mode=_state.get("effective_mode"),
     )
 
 
@@ -5601,6 +5640,20 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     # existing profile at high confidence. Cheap — centroids are cached.
     _retro_claim_orphan_sessions()
 
+    # Active-store migration gate: when a mode-switch was detected at startup
+    # (or an in-progress migration was interrupted), every consolidation tick
+    # routes to the migration sync until all tiers have cleared the 1.0
+    # recall gate. This pre-empts the full/interim cycle gates because the
+    # active store is not yet coherent with the operator's yaml mode.
+    if _state.get("pending_rehydration", False):
+        logger.info("Scheduler tick: active-store migration pending — running migration")
+        _state["last_consolidation_error"] = None
+        _state["consolidating"] = True
+        event_loop = asyncio.get_running_loop()
+        future = event_loop.run_in_executor(None, _run_active_store_migration_sync)
+        future.add_done_callback(_scheduled_extract_done_callback)
+        return "started_migration"
+
     # Full-cycle gate: when the period has elapsed, route to full
     # consolidation regardless of whether sessions are pending. Pending
     # sessions wait one tick (~refresh_cadence) for their interim write —
@@ -6162,6 +6215,114 @@ def _run_full_consolidation_sync() -> None:
 
     bt.submit(_run_full_cycle, inference_fallback_adapter="episodic")
     logger.info("Full consolidation submitted to BG trainer")
+
+
+def _run_active_store_migration_sync() -> None:
+    """Execute the pending active-store migration on a worker thread.
+
+    Triggered by ``_maybe_trigger_scheduled_consolidation`` when
+    ``_state["pending_rehydration"]`` is True — meaning startup detection
+    (or an interrupted prior migration) saw a divergence between the
+    operator's yaml ``consolidation.mode`` and the on-disk active store.
+
+    Per-tier execution lives in ``active_store_migration.migrate``. The
+    train direction holds the GPU lock (training + recall probe drive the
+    model). The simulate direction is disk-only but we hold the lock anyway
+    for symmetry with the full-cycle code path. On all-tiers-done the
+    state file is removed and ``_state["pending_rehydration"]`` is cleared
+    via ``_finalize_migration``; otherwise the operator can re-trigger to
+    retry remaining tiers.
+    """
+    from paramem.server.active_store_migration import (
+        load_state,
+        migrate,
+    )
+    from paramem.server.background_trainer import BackgroundTrainer
+    from paramem.server.consolidation import create_consolidation_loop
+
+    config = _state["config"]
+    state = load_state(config.adapter_dir)
+    if state is None:
+        # Nothing to do — flag was set but state file is gone (already
+        # completed by another caller). Clear pending and return.
+        _state["pending_rehydration"] = False
+        _state["effective_mode"] = config.consolidation.mode
+        _state["consolidating"] = False
+        logger.info("Active-store migration: state file absent — clearing pending flag")
+        return
+
+    loop = _state.get("consolidation_loop")
+    if loop is None:
+        loop = create_consolidation_loop(
+            _state["model"],
+            _state["tokenizer"],
+            config,
+            state_provider=lambda: _state,
+        )
+        _state["consolidation_loop"] = loop
+        _state["model"] = loop.model
+
+    bt = BackgroundTrainer(
+        model=_state["model"],
+        tokenizer=_state["tokenizer"],
+        training_config=config.training_config,
+        output_dir=config.adapter_dir,
+        temp_limit=config.consolidation.training_temp_limit,
+        temp_check_interval=config.consolidation.training_temp_check_interval,
+        quiet_hours_mode=config.consolidation.quiet_hours_mode,
+        quiet_hours_start=config.consolidation.quiet_hours_start,
+        quiet_hours_end=config.consolidation.quiet_hours_end,
+    )
+    _state["background_trainer"] = bt
+
+    def _run_migration_on_worker() -> None:
+        """Run on the BG-trainer worker thread under the GPU lock."""
+        try:
+            updated = migrate(loop, config, state)
+        except Exception:
+            logger.exception("Active-store migration raised — leaving state file on disk")
+            _state["last_consolidation_result"] = {"status": "migration_error"}
+            _state["consolidating"] = False
+            return
+
+        # Pick up any PEFT rebinding inside migrate's create_adapter calls.
+        _state["model"] = loop.model
+
+        logger.info(
+            "Active-store migration done: direction=%s completed=%s failed=%s",
+            updated.direction,
+            updated.completed_tiers,
+            list(updated.failed_tiers.keys()),
+        )
+
+        def _finalize_migration() -> None:
+            loop.model.eval()
+            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+            _state["last_consolidation_result"] = {
+                "status": "migration_complete" if updated.all_tiers_done else "migration_partial",
+                "direction": updated.direction,
+                "completed_tiers": list(updated.completed_tiers),
+                "failed_tiers": dict(updated.failed_tiers),
+            }
+            if updated.all_tiers_done:
+                _state["pending_rehydration"] = False
+                _state["effective_mode"] = config.consolidation.mode
+                logger.info(
+                    "Active-store migration complete; effective_mode=%s",
+                    config.consolidation.mode,
+                )
+            # Partial completion: pending_rehydration stays True so a re-trigger
+            # picks up remaining tiers. effective_mode stays at source_mode.
+            _state["consolidating"] = False
+
+        aio_loop = _state.get("event_loop")
+        if aio_loop is not None and aio_loop.is_running():
+            aio_loop.call_soon_threadsafe(_finalize_migration)
+        else:
+            _finalize_migration()
+
+    bt.submit(_run_migration_on_worker, inference_fallback_adapter="episodic")
+    logger.info("Active-store migration submitted to BG trainer")
 
 
 # --- Speaker enrollment (utterance-driven) ---
