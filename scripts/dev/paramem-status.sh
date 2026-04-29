@@ -111,14 +111,24 @@ echo -e "${BOLD}ParaMem Server${RESET}"
 echo "  ────────────────────────────────────────"
 
 if [[ -z "$server_pid" ]]; then
-    echo -e "  Status:   ${RED}NOT RUNNING${RESET}"
-
     # systemctl is-active exits non-zero for every non-active state (failed=3,
     # inactive=3, etc.) while still writing the state name to stdout.  Capture
     # via process substitution and fall back to "unknown" only when the output
     # is empty (e.g. systemctl unavailable or the unit does not exist).
     svc_state=$(systemctl --user is-active paramem-server 2>/dev/null || true)
     svc_state="${svc_state:-unknown}"
+
+    # Distinguish "starting up" (service active, port not yet bound — model
+    # loading in progress) from "not running" (service stopped/failed).  The
+    # bind happens only after Mistral 7B + adapters + spaCy NER + speaker
+    # store + TTS load all complete, typically 10-30s after process launch.
+    if [[ "$svc_state" == "active" ]]; then
+        echo -e "  Status:   ${YELLOW}STARTING${RESET} (model loading; re-check in 10–30s)"
+        echo -e "  Service:  ${svc_state}"
+        exit 0
+    fi
+
+    echo -e "  Status:   ${RED}NOT RUNNING${RESET}"
 
     # Only attempt journal scraping when the service is in a non-active state.
     # Active means healthy and reachable — the pid check above handles that path.
@@ -504,17 +514,35 @@ fmt_device() {
 }
 
 # Mode display
+#
+# Three cloud_only states are distinguished by colour because they have
+# different privacy and operational semantics:
+#   - explicit (RED)      = operator hard-config (cloud_only=true OR --cloud-only).
+#                           Personal data EGRESSES to SOTA on every query;
+#                           auto-reclaim disabled; permanent until operator
+#                           changes config.
+#   - training (YELLOW)   = transient. BG-trainer holds the GPU; auto-reclaim
+#                           will revert to LOCAL when training finishes.
+#   - gpu_conflict (YELLOW) = transient. GPU was occupied at startup by another
+#                             process; auto-reclaim will revert when the
+#                             other process releases the GPU.
 if [[ "$mode" == "local" ]]; then
     mode_display="${GREEN}LOCAL${RESET} (GPU active)"
 elif [[ "$mode" == "cloud-only" ]]; then
-    reason_text=""
     case "$cloud_only_reason" in
-        explicit)     reason_text="explicit --cloud-only, auto-reclaim disabled" ;;
-        training)     reason_text="deferred for training, auto-reclaim enabled" ;;
-        gpu_conflict) reason_text="GPU occupied at startup, auto-reclaim enabled" ;;
-        *)            reason_text="unknown" ;;
+        explicit)
+            mode_display="${RED}CLOUD-ONLY${RESET} (hard config — cloud_only=true; personal data egresses to SOTA on every query)"
+            ;;
+        training)
+            mode_display="${YELLOW}CLOUD-ONLY${RESET} (transient — deferred for training, auto-reclaim enabled)"
+            ;;
+        gpu_conflict)
+            mode_display="${YELLOW}CLOUD-ONLY${RESET} (transient — GPU occupied at startup, auto-reclaim enabled)"
+            ;;
+        *)
+            mode_display="${YELLOW}CLOUD-ONLY${RESET} (unknown reason — investigate via journalctl)"
+            ;;
     esac
-    mode_display="${YELLOW}CLOUD-ONLY${RESET} (${reason_text})"
 else
     mode_display="${RED}${mode}${RESET}"
 fi
