@@ -1097,9 +1097,27 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     config.cloud_only = bool(raw.get("cloud_only", config.cloud_only))
     config.headless_boot = bool(raw.get("headless_boot", config.headless_boot))
 
-    # Paths — resolve relative paths against config file directory so they
-    # work regardless of the process's working directory at runtime.
-    config_dir = Path(path).resolve().parent.parent  # configs/ → project root
+    # Paths — resolve relative paths against the project root so they work
+    # regardless of (a) the process's working directory at runtime and
+    # (b) where in the tree the yaml file lives. The project root is the
+    # nearest ancestor of the yaml file containing ``pyproject.toml``;
+    # this works for both the production case (``configs/server.yaml``)
+    # and the test-fixture case (``tests/fixtures/server.yaml``) without
+    # the loader having to know which sub-directory the yaml lives in.
+    # Falls back to ``yaml_dir.parent.parent`` (the historical assumption
+    # that yamls live one level deep under the project root) when no
+    # ``pyproject.toml`` is found above the file — preserves legacy
+    # behaviour for yamls supplied from outside the repo tree.
+    yaml_dir = Path(path).resolve().parent
+    config_dir = yaml_dir
+    walker = yaml_dir
+    while walker != walker.parent:
+        if (walker / "pyproject.toml").exists():
+            config_dir = walker
+            break
+        walker = walker.parent
+    else:
+        config_dir = yaml_dir.parent  # legacy fallback
     paths_raw = raw.get("paths", {})
     if paths_raw:
         config.paths = PathsConfig(
