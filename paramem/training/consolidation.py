@@ -2819,7 +2819,53 @@ class ConsolidationLoop:
         # Step 6: Save adapter weights + manifest (new commit point).
         _save_adapter(self.model, self.output_dir / adapter_name, adapter_name, manifest=manifest)
         if self.procedural_config is not None and "procedural" in self.model.peft_config:
-            _save_adapter(self.model, self.output_dir / "procedural", "procedural")
+            # Mirror the interim flow for procedural: write tier-level kp +
+            # build manifest with kp reference + save with manifest. Without
+            # the kp the manifest's keyed_pairs_sha256 has nothing to point
+            # to; without the manifest the slot's meta.json is missing and
+            # the read-back path can't short-circuit base-model hashing on
+            # the next cycle.
+            proc_kp_path: Path | None = None
+            if self.procedural_simhash:
+                proc_pairs = [
+                    {
+                        "key": k,
+                        "question": self.indexed_key_qa[k]["question"],
+                        "answer": self.indexed_key_qa[k]["answer"],
+                    }
+                    for k in self.procedural_simhash
+                    if k in self.indexed_key_qa
+                ]
+                if proc_pairs:
+                    proc_dir = self.output_dir / "procedural"
+                    proc_dir.mkdir(parents=True, exist_ok=True)
+                    proc_kp_path = proc_dir / "keyed_pairs.json"
+                    _wi(proc_kp_path, _json.dumps(proc_pairs, indent=2).encode("utf-8"))
+
+            try:
+                proc_manifest = _build_manifest_for(
+                    self.model,
+                    self.tokenizer,
+                    "procedural",
+                    registry_path=None,
+                    keyed_pairs_path=proc_kp_path,
+                    key_count=len(self.indexed_key_registry) if self.indexed_key_registry else None,
+                    base_model_hash_cache=fingerprint_cache,
+                    registry_sha256_override=registry_sha256,
+                    window_stamp=stamp,
+                    adapter_root=self.output_dir,
+                )
+            except Exception:
+                logger.warning(
+                    "post_session_train: procedural manifest build failed — saving without manifest"
+                )
+                proc_manifest = None
+            _save_adapter(
+                self.model,
+                self.output_dir / "procedural",
+                "procedural",
+                manifest=proc_manifest,
+            )
 
         # Step 7: Save SimHash registries.
         interim_simhash = build_registry(all_interim_keyed)
