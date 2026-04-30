@@ -979,6 +979,86 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
         )
         assert loop_b.fingerprint_cache.get("sentinel") == "computed-by-cycle-1"
 
+    def test_manifest_readback_populates_state_cache(self, tmp_path, monkeypatch):
+        """build_manifest_for must populate _state['base_model_hash_cache'] via read-back.
+
+        When a matching meta.json is found on disk, the hash is obtained from
+        the manifest rather than from safetensors files.  The cache must still
+        be written so the second call avoids all disk I/O.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.adapters.manifest import (
+            MANIFEST_SCHEMA_VERSION,
+            AdapterManifest,
+            BaseModelFingerprint,
+            LoRAShape,
+            TokenizerFingerprint,
+            build_manifest_for,
+            write_manifest,
+        )
+
+        # Pre-write a slot with a known hash
+        adapter_root = tmp_path / "adapters"
+        slot = adapter_root / "episodic" / "20260421-000000"
+        slot.mkdir(parents=True)
+        expected_hash = "sha256:readback_sentinel"
+        m_on_disk = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name="episodic",
+            trained_at="2026-04-21T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/base", sha="abc123", hash=expected_hash),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/base", vocab_size=32000, merges_hash="m"
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=()),
+            registry_sha256="",
+            keyed_pairs_sha256="",
+            key_count=0,
+        )
+        write_manifest(slot, m_on_disk)
+
+        # Build a mock model matching the pre-written slot
+        model = MagicMock()
+        model.config._name_or_path = "hf/base"
+        model.config._commit_hash = "abc123"
+        peft_cfg = MagicMock()
+        peft_cfg.r = 8
+        peft_cfg.lora_alpha = 16
+        peft_cfg.lora_dropout = 0.0
+        peft_cfg.target_modules = []
+        model.peft_config = {"episodic": peft_cfg}
+
+        tokenizer = MagicMock()
+        tokenizer.name_or_path = "hf/base"
+        tokenizer.__len__ = lambda self: 32000
+        tokenizer.backend_tokenizer.to_str.return_value = "{}"
+        tokenizer.vocab_file = None
+
+        cache: dict = {}
+
+        with (
+            patch("paramem.adapters.manifest._hash_safetensors_files") as mock_hash,
+            patch("paramem.adapters.manifest._resolve_base_safetensors") as mock_resolve,
+        ):
+            manifest = build_manifest_for(
+                model,
+                tokenizer,
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                base_model_hash_cache=cache,
+                adapter_root=adapter_root,
+            )
+
+        # Read-back must have returned the hash
+        assert manifest.base_model.hash == expected_hash
+        # Cache must be populated so second call is instant
+        assert cache[id(model)] == expected_hash
+        # File-hash must NOT have been called
+        mock_hash.assert_not_called()
+        mock_resolve.assert_not_called()
+
 
 class TestFullCycleGateHelpers:
     """Helpers that decide whether the scheduled tick should run a full cycle.

@@ -450,6 +450,7 @@ def _migrate_tier_simulate_to_train(
             keyed_pairs_path=Path(config.adapter_dir) / tier / "keyed_pairs.json",
             key_count=len(keyed_pairs),
             base_model_hash_cache=fingerprint_cache,
+            adapter_root=Path(config.adapter_dir),
         )
     except Exception:
         logger.warning(

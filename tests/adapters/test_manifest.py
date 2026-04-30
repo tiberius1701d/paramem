@@ -32,6 +32,9 @@ from paramem.adapters.manifest import (
     ManifestNotFoundError,
     ManifestSchemaError,
     TokenizerFingerprint,
+    _hash_safetensors_files,
+    _lookup_hash_from_manifests,
+    _resolve_base_safetensors,
     build_manifest_for,
     find_live_slot,
     read_manifest,
@@ -287,32 +290,40 @@ class TestBuildManifestFor:
         assert m.keyed_pairs_sha256 == ""
 
     def test_cache_avoids_recompute(self, tmp_path: Path) -> None:
-        """Second call with same model + cache must not re-call state_dict."""
+        """Second call with same model + cache must return the cached hash.
+
+        The cache is populated on first call (via read-back or file-hash);
+        the second call must hit the cache and NOT invoke _resolve_base_safetensors
+        or _lookup_hash_from_manifests again.
+        """
         model = self._make_model()
         cache: dict = {}
 
-        build_manifest_for(
-            model,
-            self._make_tokenizer(),
-            "episodic",
-            registry_path=None,
-            keyed_pairs_path=None,
-            base_model_hash_cache=cache,
-        )
-        call_count_after_first = model.base_model.model.state_dict.call_count
+        with patch(
+            "paramem.adapters.manifest._resolve_base_safetensors", return_value=None
+        ) as mock_resolve:
+            build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                base_model_hash_cache=cache,
+            )
+            calls_after_first = mock_resolve.call_count
 
-        build_manifest_for(
-            model,
-            self._make_tokenizer(),
-            "episodic",
-            registry_path=None,
-            keyed_pairs_path=None,
-            base_model_hash_cache=cache,
-        )
-        call_count_after_second = model.base_model.model.state_dict.call_count
+            build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                base_model_hash_cache=cache,
+            )
+            calls_after_second = mock_resolve.call_count
 
-        assert call_count_after_second == call_count_after_first, (
-            "state_dict called again on second build — cache not used"
+        assert calls_after_second == calls_after_first, (
+            "_resolve_base_safetensors called again on second build — cache not used"
         )
 
     def test_synthesized_always_false(self, tmp_path: Path) -> None:
@@ -351,51 +362,67 @@ class TestBuildManifestFor:
         )
         assert m.key_count == 42
 
-    def test_bfloat16_state_dict_hashes_without_fallback(self, tmp_path: Path) -> None:
-        """Regression: numpy lacks bfloat16; build_manifest_for must still hash the weights.
+    def test_file_hash_returns_sha256_when_safetensors_resolved(self, tmp_path: Path) -> None:
+        """build_manifest_for returns a sha256 hash when safetensors files are resolved.
 
-        Pre-fix path returned UNKNOWN with a warning, leaving manifests that the
-        startup validator flagged as unknown_fields_in_manifest → PA routing disabled.
+        Replaces the old bfloat16 state_dict regression test: the new cold path
+        uses mmap file-hashing rather than state_dict walks, so this test patches
+        _resolve_base_safetensors to return a real file and verifies the hash format.
         """
+        import safetensors.torch
         import torch
 
-        model = self._make_model()
-        state = {
-            "layer.0.weight": torch.randn(4, 4, dtype=torch.bfloat16),
-            "layer.0.bias": torch.zeros(4, dtype=torch.bfloat16),
-        }
-        model.base_model.model.state_dict.return_value = state
+        weight_file = tmp_path / "model.safetensors"
+        safetensors.torch.save_file({"weight": torch.zeros(4, 4)}, str(weight_file))
 
-        m = build_manifest_for(
-            model,
-            self._make_tokenizer(),
-            "episodic",
-            registry_path=None,
-            keyed_pairs_path=None,
-        )
+        model = self._make_model()
+
+        with patch(
+            "paramem.adapters.manifest._resolve_base_safetensors",
+            return_value=[weight_file],
+        ):
+            m = build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+            )
+
         assert m.base_model.hash != UNKNOWN
         assert m.base_model.hash.startswith("sha256:")
         assert len(m.base_model.hash) == len("sha256:") + 64
 
-    def test_bfloat16_hash_is_deterministic(self, tmp_path: Path) -> None:
-        """Identical bfloat16 state dicts must produce identical hashes across calls."""
+    def test_file_hash_is_deterministic(self, tmp_path: Path) -> None:
+        """Identical safetensors files must produce identical hashes across model instances."""
+        import safetensors.torch
         import torch
 
         torch.manual_seed(0)
-        weight = torch.randn(8, 8, dtype=torch.bfloat16)
-        state = {"layer.0.weight": weight}
+        weight_file = tmp_path / "model.safetensors"
+        safetensors.torch.save_file({"weight": torch.randn(8, 8)}, str(weight_file))
 
         model_a = self._make_model()
-        model_a.base_model.model.state_dict.return_value = state
         model_b = self._make_model()
-        model_b.base_model.model.state_dict.return_value = state
 
-        m_a = build_manifest_for(
-            model_a, self._make_tokenizer(), "episodic", registry_path=None, keyed_pairs_path=None
-        )
-        m_b = build_manifest_for(
-            model_b, self._make_tokenizer(), "episodic", registry_path=None, keyed_pairs_path=None
-        )
+        with patch(
+            "paramem.adapters.manifest._resolve_base_safetensors",
+            return_value=[weight_file],
+        ):
+            m_a = build_manifest_for(
+                model_a,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+            )
+            m_b = build_manifest_for(
+                model_b,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+            )
         assert m_a.base_model.hash == m_b.base_model.hash
         assert m_a.base_model.hash != UNKNOWN
 
@@ -758,3 +785,527 @@ class TestWriteManifestAtomicWrite:
         assert not tmp_files, (
             f"Leftover .tmp files after write_manifest: {[str(p) for p in tmp_files]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 8. _hash_safetensors_files
+# ---------------------------------------------------------------------------
+
+
+class TestHashSafetensorsFiles:
+    def test_file_hash_pinned(self, tmp_path: Path) -> None:
+        """Hash of two safetensors files must equal SHA-256 of their concatenated bytes."""
+        import safetensors.torch
+        import torch
+
+        f1 = tmp_path / "shard1.safetensors"
+        f2 = tmp_path / "shard2.safetensors"
+        # Use deterministic tensors so reference hash is reproducible
+        torch.manual_seed(42)
+        safetensors.torch.save_file({"a": torch.ones(4)}, str(f1))
+        safetensors.torch.save_file({"b": torch.zeros(4)}, str(f2))
+
+        result = _hash_safetensors_files([f1, f2])
+
+        # Reference: SHA-256 of the concatenated raw bytes in order
+        expected = "sha256:" + hashlib.sha256(f1.read_bytes() + f2.read_bytes()).hexdigest()
+        assert result == expected
+
+    def test_single_file(self, tmp_path: Path) -> None:
+        """Single-file case matches direct SHA-256 of that file."""
+        import safetensors.torch
+        import torch
+
+        f = tmp_path / "model.safetensors"
+        safetensors.torch.save_file({"w": torch.eye(3)}, str(f))
+
+        result = _hash_safetensors_files([f])
+        expected = "sha256:" + hashlib.sha256(f.read_bytes()).hexdigest()
+        assert result == expected
+
+    def test_order_matters(self, tmp_path: Path) -> None:
+        """Swapping file order must produce a different hash."""
+        import safetensors.torch
+        import torch
+
+        f1 = tmp_path / "a.safetensors"
+        f2 = tmp_path / "b.safetensors"
+        safetensors.torch.save_file({"x": torch.ones(4)}, str(f1))
+        safetensors.torch.save_file({"y": torch.zeros(4)}, str(f2))
+
+        hash_ab = _hash_safetensors_files([f1, f2])
+        hash_ba = _hash_safetensors_files([f2, f1])
+        assert hash_ab != hash_ba
+
+
+# ---------------------------------------------------------------------------
+# 9. _lookup_hash_from_manifests
+# ---------------------------------------------------------------------------
+
+
+def _write_meta(base: Path, tier: str, slot_ts: str, manifest: AdapterManifest) -> Path:
+    """Write manifest to <base>/<tier>/<slot_ts>/meta.json, creating dirs."""
+    slot = base / tier / slot_ts
+    slot.mkdir(parents=True, exist_ok=True)
+    write_manifest(slot, manifest)
+    return slot
+
+
+def _make_manifest_with_base(
+    repo: str,
+    sha: str,
+    base_hash: str,
+    trained_at: str = "2026-04-21T00:00:00Z",
+) -> AdapterManifest:
+    return AdapterManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        name="episodic",
+        trained_at=trained_at,
+        base_model=BaseModelFingerprint(repo=repo, sha=sha, hash=base_hash),
+        tokenizer=TokenizerFingerprint(name_or_path="t", vocab_size=1, merges_hash="m"),
+        lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=()),
+        registry_sha256="reg",
+        keyed_pairs_sha256="kp",
+        key_count=1,
+    )
+
+
+class TestLookupHashFromManifests:
+    def test_returns_none_when_root_empty(self, tmp_path: Path) -> None:
+        """Empty adapter_root returns None without error."""
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        assert result is None
+
+    def test_returns_none_when_root_missing(self, tmp_path: Path) -> None:
+        """Non-existent adapter_root returns None without error."""
+        result = _lookup_hash_from_manifests(tmp_path / "nope", "hf/model", "abc123")
+        assert result is None
+
+    def test_returns_none_for_unknown_commit_sha(self, tmp_path: Path) -> None:
+        """UNKNOWN commit_sha always returns None (no reliable match key)."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/model", "abc123", "sha256:dead"),
+        )
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", UNKNOWN)
+        assert result is None
+
+    def test_returns_hash_on_match(self, tmp_path: Path) -> None:
+        """Returns base_model.hash from a slot matching (repo, sha)."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/model", "abc123", "sha256:cafecafe"),
+        )
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        assert result == "sha256:cafecafe"
+
+    def test_skips_unknown_slot_hash(self, tmp_path: Path) -> None:
+        """Slots whose base_model.hash == UNKNOWN are excluded from results."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/model", "abc123", UNKNOWN),
+        )
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        assert result is None
+
+    def test_repo_mismatch_returns_none(self, tmp_path: Path) -> None:
+        """A slot with matching sha but different repo does not match."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/OTHER", "abc123", "sha256:dead"),
+        )
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        assert result is None
+
+    def test_sha_mismatch_returns_none(self, tmp_path: Path) -> None:
+        """A slot with matching repo but different sha does not match."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/model", "DIFFERENT", "sha256:dead"),
+        )
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        assert result is None
+
+    def test_skips_pending_dir(self, tmp_path: Path) -> None:
+        """Slots inside .pending are skipped."""
+        pending = tmp_path / "episodic" / ".pending"
+        pending.mkdir(parents=True, exist_ok=True)
+        slot = pending / "20260421-000000"
+        slot.mkdir()
+        write_manifest(
+            slot,
+            _make_manifest_with_base("hf/model", "abc123", "sha256:cafecafe"),
+        )
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        assert result is None
+
+    def test_newest_trained_at_wins(self, tmp_path: Path) -> None:
+        """When multiple slots match, the one with the newest trained_at wins."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000001",
+            _make_manifest_with_base(
+                "hf/model",
+                "abc123",
+                "sha256:old",
+                trained_at="2026-04-20T00:00:00Z",
+            ),
+        )
+        _write_meta(
+            tmp_path,
+            "semantic",
+            "20260421-000002",
+            _make_manifest_with_base(
+                "hf/model",
+                "abc123",
+                "sha256:new",
+                trained_at="2026-04-21T00:00:00Z",
+            ),
+        )
+        result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        assert result == "sha256:new"
+
+    def test_disagreeing_hashes_warns_and_picks_newest(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Two matching slots with different hashes — warns and returns the newer hash."""
+        import logging
+
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000001",
+            _make_manifest_with_base(
+                "hf/model",
+                "abc123",
+                "sha256:older_hash",
+                trained_at="2026-04-19T00:00:00Z",
+            ),
+        )
+        _write_meta(
+            tmp_path,
+            "semantic",
+            "20260421-000002",
+            _make_manifest_with_base(
+                "hf/model",
+                "abc123",
+                "sha256:newer_hash",
+                trained_at="2026-04-21T00:00:00Z",
+            ),
+        )
+
+        # caplog.at_level alone does not capture in this project (log propagation
+        # is intercepted); attach the handler directly to the named logger.
+        named_logger = logging.getLogger("paramem.adapters.manifest")
+        named_logger.addHandler(caplog.handler)
+        try:
+            result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        finally:
+            named_logger.removeHandler(caplog.handler)
+
+        assert result == "sha256:newer_hash"
+        assert any(
+            "sha256:older_hash" in r.message and "sha256:newer_hash" in r.message
+            for r in caplog.records
+        ), f"Expected warn with both hashes; got: {[r.message for r in caplog.records]}"
+
+    def test_same_hash_across_slots_no_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Two matching slots with the SAME hash must NOT emit a warning."""
+        import logging
+
+        for ts in ("20260421-000001", "20260421-000002"):
+            _write_meta(
+                tmp_path,
+                "episodic",
+                ts,
+                _make_manifest_with_base("hf/model", "abc123", "sha256:consistent"),
+            )
+
+        named_logger = logging.getLogger("paramem.adapters.manifest")
+        named_logger.addHandler(caplog.handler)
+        try:
+            result = _lookup_hash_from_manifests(tmp_path, "hf/model", "abc123")
+        finally:
+            named_logger.removeHandler(caplog.handler)
+
+        assert result == "sha256:consistent"
+        warn_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warn_records, (
+            f"Unexpected warnings with matching hashes: {[r.message for r in warn_records]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 10. build_manifest_for — new warm/cold path integration
+# ---------------------------------------------------------------------------
+
+
+class TestBuildManifestForHashPaths:
+    """Tests for the read-back and file-hash paths in build_manifest_for."""
+
+    def _make_model(self, name: str = "hf/base", commit: str = "abc123") -> MagicMock:
+        model = MagicMock()
+        model.config._name_or_path = name
+        model.config._commit_hash = commit
+        peft_cfg = MagicMock()
+        peft_cfg.r = 8
+        peft_cfg.lora_alpha = 16
+        peft_cfg.lora_dropout = 0.0
+        peft_cfg.target_modules = ["q_proj", "v_proj"]
+        model.peft_config = {"episodic": peft_cfg}
+        return model
+
+    def _make_tokenizer(self) -> MagicMock:
+        tok = MagicMock()
+        tok.name_or_path = "hf/base"
+        tok.__len__ = lambda self: 32000
+        tok.backend_tokenizer.to_str.return_value = '{"model": "bpe"}'
+        tok.vocab_file = None
+        return tok
+
+    def test_manifest_readback_skips_file_hash(self, tmp_path: Path) -> None:
+        """When adapter_root has a matching slot, _hash_safetensors_files must NOT be called."""
+        # Pre-write a slot with known hash
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/base", "abc123", "sha256:from_readback"),
+        )
+
+        model = self._make_model(name="hf/base", commit="abc123")
+
+        with (
+            patch("paramem.adapters.manifest._hash_safetensors_files") as mock_hash,
+            patch("paramem.adapters.manifest._resolve_base_safetensors") as mock_resolve,
+        ):
+            m = build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                adapter_root=tmp_path,
+            )
+
+        assert m.base_model.hash == "sha256:from_readback"
+        mock_hash.assert_not_called()
+        mock_resolve.assert_not_called()
+
+    def test_readback_invalidates_on_repo_change(self, tmp_path: Path) -> None:
+        """Slot with repo='A' does not match model with _name_or_path='B'."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/OTHER", "abc123", "sha256:from_readback"),
+        )
+
+        model = self._make_model(name="hf/base", commit="abc123")
+
+        with patch(
+            "paramem.adapters.manifest._resolve_base_safetensors", return_value=None
+        ) as mock_resolve:
+            m = build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                adapter_root=tmp_path,
+            )
+
+        # Read-back missed (wrong repo), fell through to file-hash which also returned None
+        assert m.base_model.hash == UNKNOWN
+        mock_resolve.assert_called_once()
+
+    def test_unknown_commit_sha_skips_readback_but_allows_filehash(self, tmp_path: Path) -> None:
+        """Model with _commit_hash=None: read-back skipped, file-hash attempted."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/base", "abc123", "sha256:from_readback"),
+        )
+
+        # None commit hash → normalised to UNKNOWN in build_manifest_for
+        model = self._make_model(name="hf/base", commit=None)
+        model.config._commit_hash = None
+
+        with (
+            patch(
+                "paramem.adapters.manifest._resolve_base_safetensors", return_value=None
+            ) as mock_resolve,
+            patch("paramem.adapters.manifest._lookup_hash_from_manifests") as mock_lookup,
+        ):
+            m = build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                adapter_root=tmp_path,
+            )
+
+        # Read-back skipped (UNKNOWN sha)
+        mock_lookup.assert_not_called()
+        # File-hash attempted
+        mock_resolve.assert_called_once()
+        # No sources available → UNKNOWN
+        assert m.base_model.hash == UNKNOWN
+
+    def test_unknown_slot_hash_is_not_cached(self, tmp_path: Path) -> None:
+        """A slot whose base_model.hash == UNKNOWN is excluded; file-hash runs instead."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/base", "abc123", UNKNOWN),
+        )
+
+        model = self._make_model(name="hf/base", commit="abc123")
+
+        with patch(
+            "paramem.adapters.manifest._resolve_base_safetensors", return_value=None
+        ) as mock_resolve:
+            m = build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                adapter_root=tmp_path,
+            )
+
+        # UNKNOWN slot ignored → file-hash attempted
+        mock_resolve.assert_called_once()
+        # No sources found → UNKNOWN
+        assert m.base_model.hash == UNKNOWN
+
+    def test_no_sources_no_slots_yields_unknown(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Empty adapter_root + HF cache miss → base_hash UNKNOWN + one warning."""
+        import logging
+
+        model = self._make_model(name="hf/bogus_repo_xyz", commit="deadbeef")
+
+        # Attach handler directly — caplog.at_level alone won't capture in this project
+        named_logger = logging.getLogger("paramem.adapters.manifest")
+        named_logger.addHandler(caplog.handler)
+        try:
+            with patch("paramem.adapters.manifest._resolve_base_safetensors", return_value=None):
+                m = build_manifest_for(
+                    model,
+                    self._make_tokenizer(),
+                    "episodic",
+                    registry_path=None,
+                    keyed_pairs_path=None,
+                    adapter_root=tmp_path,
+                )
+        finally:
+            named_logger.removeHandler(caplog.handler)
+
+        assert m.base_model.hash == UNKNOWN
+        warn_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warn_msgs) >= 1, f"Expected at least one warning; got: {warn_msgs}"
+
+    def test_in_memory_cache_populated_by_readback(self, tmp_path: Path) -> None:
+        """The in-memory cache must be populated by the read-back path, not just file-hash."""
+        _write_meta(
+            tmp_path,
+            "episodic",
+            "20260421-000000",
+            _make_manifest_with_base("hf/base", "abc123", "sha256:readback_hash"),
+        )
+
+        model = self._make_model(name="hf/base", commit="abc123")
+        cache: dict = {}
+
+        with (
+            patch("paramem.adapters.manifest._hash_safetensors_files") as mock_hash,
+            patch("paramem.adapters.manifest._resolve_base_safetensors") as mock_resolve,
+        ):
+            m = build_manifest_for(
+                model,
+                self._make_tokenizer(),
+                "episodic",
+                registry_path=None,
+                keyed_pairs_path=None,
+                base_model_hash_cache=cache,
+                adapter_root=tmp_path,
+            )
+
+        assert m.base_model.hash == "sha256:readback_hash"
+        assert cache[id(model)] == "sha256:readback_hash"
+        mock_hash.assert_not_called()
+        mock_resolve.assert_not_called()
+
+    def test_multi_shard_order_uses_weight_map_not_filename_sort(self, tmp_path: Path) -> None:
+        """_resolve_base_safetensors: shard order comes from weight_map, not filename sort.
+
+        Fixture: two safetensors files where filename-sort order (a < b) differs
+        from weight_map order (b listed before a). The hash must match weight_map order.
+        """
+        import json as _json
+
+        import safetensors.torch
+        import torch
+
+        repo_dir = tmp_path / "model_repo"
+        repo_dir.mkdir()
+
+        # Create two shard files with different content so order distinguishes them
+        f_a = repo_dir / "a.safetensors"
+        f_b = repo_dir / "b.safetensors"
+        safetensors.torch.save_file({"weight_a": torch.ones(4)}, str(f_a))
+        safetensors.torch.save_file({"weight_b": torch.zeros(4)}, str(f_b))
+
+        # weight_map: b listed first, then a (opposite of filename-sort)
+        index = {
+            "metadata": {"total_size": 0},
+            "weight_map": {
+                "model.layer.0.weight": "b.safetensors",
+                "model.layer.1.weight": "a.safetensors",
+            },
+        }
+        (repo_dir / "model.safetensors.index.json").write_text(_json.dumps(index))
+
+        # _resolve_base_safetensors for a local dir returns sorted(*.safetensors)
+        # which would be [a, b]. But that path does NOT read the index.
+        # We test the HF-hub code path by patching try_to_load_from_cache.
+        from huggingface_hub.file_download import _CACHED_NO_EXIST
+
+        def _fake_cache(repo_id, filename, revision=None):
+            mapping = {
+                "model.safetensors.index.json": str(repo_dir / "model.safetensors.index.json"),
+                "b.safetensors": str(f_b),
+                "a.safetensors": str(f_a),
+            }
+            return mapping.get(filename, _CACHED_NO_EXIST)
+
+        with patch("huggingface_hub.try_to_load_from_cache", side_effect=_fake_cache):
+            # Use a fake non-local repo ID so the local-dir branch is skipped
+            paths = _resolve_base_safetensors("some_org/some_model", "rev1")
+
+        # weight_map order: b first, then a
+        assert paths is not None
+        assert paths == [f_b, f_a], f"Expected [b, a] from weight_map order but got {paths}"
+
+        # Confirm hash matches b-then-a concatenation
+        expected_hash = "sha256:" + hashlib.sha256(f_b.read_bytes() + f_a.read_bytes()).hexdigest()
+        actual_hash = _hash_safetensors_files(paths)
+        assert actual_hash == expected_hash

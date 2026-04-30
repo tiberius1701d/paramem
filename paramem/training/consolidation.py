@@ -2205,6 +2205,7 @@ class ConsolidationLoop:
                     base_model_hash_cache=fingerprint_cache,
                     registry_sha256_override=registry_sha256,
                     window_stamp=full_window_stamp,
+                    adapter_root=self.output_dir,
                 )
             except Exception:  # noqa: BLE001
                 return None
@@ -2809,6 +2810,7 @@ class ConsolidationLoop:
                 base_model_hash_cache=fingerprint_cache,
                 registry_sha256_override=registry_sha256,
                 window_stamp=stamp,
+                adapter_root=self.output_dir,
             )
         except Exception:
             logger.warning("post_session_train: manifest build failed — saving without manifest")

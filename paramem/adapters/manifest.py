@@ -49,6 +49,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import mmap
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -453,6 +454,207 @@ def resolve_adapter_slot(base_dir: Path, adapter_name: str, live_hash: str) -> P
 
 
 # ---------------------------------------------------------------------------
+# Private helpers for fast base-model hashing
+# ---------------------------------------------------------------------------
+
+
+def _resolve_base_safetensors(repo: str, commit_sha: str) -> "list[Path] | None":
+    """Resolve base-model ``*.safetensors`` paths in canonical order, or None.
+
+    For a local path (an existing directory on disk) the function returns a
+    sorted list of ``*.safetensors`` files found in that directory.
+    ``commit_sha`` may be ``UNKNOWN`` — file existence is the only requirement.
+
+    For an HF Hub repo ID the function resolves shards via
+    ``huggingface_hub.try_to_load_from_cache``.  Shard order comes from the
+    ``weight_map`` values in ``model.safetensors.index.json`` (preserving
+    first-seen insertion order, deduplicated).  Falls back to a single-file
+    ``model.safetensors`` when no index is found.
+
+    Returns ``None`` on any resolution failure (missing cache, unresolved
+    shards, unexpected errors).
+
+    Args:
+        repo: HuggingFace model ID or local directory path.
+        commit_sha: Commit hash or ``UNKNOWN``.  Used as ``revision`` for
+            HF Hub lookups; ignored for local-path repos.
+
+    Returns:
+        Ordered list of resolved ``Path`` objects, or ``None`` when
+        resolution fails.
+    """
+    local = Path(repo)
+    if local.is_dir():
+        files = sorted(local.glob("*.safetensors"))
+        return files if files else None
+
+    # HF Hub path
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        from huggingface_hub.file_download import _CACHED_NO_EXIST
+
+        revision = commit_sha if commit_sha != UNKNOWN else None
+
+        # Try multi-shard index first
+        index_path = try_to_load_from_cache(
+            repo,
+            "model.safetensors.index.json",
+            revision=revision,
+        )
+        index_found = (
+            index_path is not None
+            and index_path is not _CACHED_NO_EXIST
+            and Path(index_path).exists()
+        )
+        if index_found:
+            index_data = json.loads(Path(index_path).read_text(encoding="utf-8"))
+            weight_map = index_data.get("weight_map", {})
+            # Build ordered, deduplicated shard list from weight_map values
+            seen: set[str] = set()
+            shard_names: list[str] = []
+            for shard in weight_map.values():
+                if shard not in seen:
+                    seen.add(shard)
+                    shard_names.append(shard)
+            resolved: list[Path] = []
+            for shard in shard_names:
+                shard_path = try_to_load_from_cache(repo, shard, revision=revision)
+                if shard_path is None or shard_path is _CACHED_NO_EXIST:
+                    return None
+                p = Path(shard_path)
+                if not p.exists():
+                    return None
+                resolved.append(p)
+            return resolved if resolved else None
+
+        # Try single-file model
+        single = try_to_load_from_cache(repo, "model.safetensors", revision=revision)
+        if single is not None and single is not _CACHED_NO_EXIST:
+            p = Path(single)
+            if p.exists():
+                return [p]
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_resolve_base_safetensors: resolution failed for %r: %s", repo, exc)
+        return None
+
+
+def _hash_safetensors_files(paths: "list[Path]") -> str:
+    """SHA-256 the concatenation of safetensors files via mmap in given order.
+
+    Opens each file, maps it read-only, feeds 1-MiB chunks into a single
+    running ``hashlib.sha256`` digest, then closes the mmap and fd before
+    opening the next file.
+
+    Args:
+        paths: Ordered list of safetensors file paths to hash.
+
+    Returns:
+        ``"sha256:<64-char hex>"`` of the concatenated file bytes.
+
+    Raises:
+        OSError: When any file cannot be opened or mmap'd.
+    """
+    h = hashlib.sha256()
+    chunk_size = 1024 * 1024  # 1 MiB
+    for p in paths:
+        fd = p.open("rb")
+        try:
+            mm = mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                while True:
+                    chunk = mm.read(chunk_size)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            finally:
+                mm.close()
+        finally:
+            fd.close()
+    return "sha256:" + h.hexdigest()
+
+
+def _lookup_hash_from_manifests(
+    adapter_root: Path,
+    repo: str,
+    commit_sha: str,
+) -> "str | None":
+    """Walk *adapter_root* for a slot whose ``base_model`` matches *(repo, commit_sha)*.
+
+    Iterates one level of tier dirs under ``adapter_root`` (e.g.
+    ``episodic``, ``semantic``, ``procedural``, ``episodic_interim_*``),
+    then one more level for slot dirs, reading each ``meta.json``.  Slots
+    inside ``.pending`` are skipped.  Unreadable manifests are skipped with
+    a debug log.
+
+    Slots whose ``base_model.hash == UNKNOWN`` are excluded — re-emitting
+    ``UNKNOWN`` as a cache hit would permanently lock the cache to
+    ``UNKNOWN``.
+
+    When multiple matching slots disagree on ``base_model.hash``, a WARN
+    is logged with both values before returning the newest (by
+    ``trained_at`` ISO-8601 string comparison).
+
+    Args:
+        adapter_root: Root directory containing tier subdirs.
+        repo: Expected ``base_model.repo`` to match.
+        commit_sha: Expected ``base_model.sha`` to match.  ``UNKNOWN``
+            always returns ``None`` (no reliable match key).
+
+    Returns:
+        ``"sha256:<hex>"`` from a matching slot, or ``None`` when no
+        reliable match is found.
+    """
+    if commit_sha == UNKNOWN:
+        return None
+    if not adapter_root.is_dir():
+        return None
+
+    matches: list[tuple[str, str]] = []  # (trained_at, base_model_hash)
+    for tier_dir in adapter_root.iterdir():
+        if tier_dir.name.startswith("."):
+            continue
+        if not tier_dir.is_dir():
+            continue
+        for slot_dir in tier_dir.iterdir():
+            if slot_dir.name.startswith("."):
+                continue
+            if not slot_dir.is_dir():
+                continue
+            try:
+                manifest = read_manifest(slot_dir)
+            except (ManifestNotFoundError, ManifestSchemaError) as exc:
+                logger.debug("_lookup_hash_from_manifests: skipping %s: %s", slot_dir, exc)
+                continue
+            bm = manifest.base_model
+            if bm.repo != repo or bm.sha != commit_sha:
+                continue
+            if bm.hash == UNKNOWN:
+                continue
+            matches.append((manifest.trained_at, bm.hash))
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda x: x[0], reverse=True)  # newest trained_at first
+    newest_hash = matches[0][1]
+
+    # Warn if multiple distinct hashes found for same (repo, sha)
+    distinct_hashes = {h for _, h in matches}
+    if len(distinct_hashes) > 1:
+        logger.warning(
+            "_lookup_hash_from_manifests: disagreeing base_model.hash values for "
+            "repo=%r sha=%r — hashes found: %s; using newest (trained_at=%s)",
+            repo,
+            commit_sha,
+            sorted(distinct_hashes),
+            matches[0][0],
+        )
+
+    return newest_hash
+
+
+# ---------------------------------------------------------------------------
 # Manifest builder
 # ---------------------------------------------------------------------------
 
@@ -468,6 +670,7 @@ def build_manifest_for(
     base_model_hash_cache: "dict | None" = None,
     registry_sha256_override: "str | None" = None,
     window_stamp: str = "",
+    adapter_root: "Path | None" = None,
 ) -> AdapterManifest:
     """Build an :class:`AdapterManifest` for a live model/tokenizer.
 
@@ -475,9 +678,25 @@ def build_manifest_for(
     the training and server paths.  ``synthesized`` is always ``False``
     (reserved for the migration script).
 
-    The base-model weight hash is the most expensive operation (~10–20 s on
-    7B).  Pass *base_model_hash_cache* (a plain ``dict``) to amortise the
-    cost: the cache is keyed by ``id(model)`` and populated on first call.
+    The base-model weight hash is computed using three escalating strategies
+    (cheapest first):
+
+    1. **In-memory cache** (``base_model_hash_cache``): keyed by ``id(model)``,
+       populated on first call.  Resets on every process restart.
+    2. **Manifest read-back** (warm path): when ``adapter_root`` is given and
+       ``base_sha != UNKNOWN``, scans existing slot ``meta.json`` files under
+       *adapter_root* for a matching ``(base_model.repo, base_model.sha)``
+       entry.  The slots are already on disk from prior consolidations, so no
+       hashing work is needed.  ``UNKNOWN`` entries are ignored (re-emitting
+       UNKNOWN would permanently lock the cache).
+    3. **Source-safetensors mmap-hash** (cold path): resolves the base-model
+       ``*.safetensors`` files from disk (local path) or the HF Hub cache
+       (via ``try_to_load_from_cache``), then SHA-256s the concatenation via
+       mmap.  Much faster than the old in-memory ``state_dict`` walk (~8.5 min
+       for Mistral 7B) and survives process restarts.
+
+    If all three strategies fail, ``base_hash`` is set to ``UNKNOWN`` and a
+    warning is logged.  The old ``state_dict`` walk is not used.
 
     Args:
         model: A ``PeftModel`` (or base model) with a ``config`` attribute.
@@ -503,6 +722,15 @@ def build_manifest_for(
             paths.  Production writers pass the floored cadence boundary:
             ``current_interim_stamp(refresh_cadence)`` for interim slots,
             ``current_full_consolidation_stamp(period)`` for main slots.
+        adapter_root: Root directory of the adapter store (single path,
+            not a sequence).  When provided, enables the manifest read-back
+            warm path: existing ``meta.json`` files under this root are
+            scanned for a matching ``(base_model.repo, base_model.sha)``
+            entry before attempting the file-hash cold path.  Pass
+            ``self.output_dir`` from the consolidation loop or
+            ``Path(config.adapter_dir)`` from the migration helper.
+            Experiment callers should leave this ``None`` — they skip
+            read-back and get the file-hash speedup instead.
 
     Returns:
         A fully-populated :class:`AdapterManifest` with ``synthesized=False``.
@@ -521,35 +749,50 @@ def build_manifest_for(
         base_repo = getattr(config, "_name_or_path", UNKNOWN) or UNKNOWN
         base_sha = getattr(config, "_commit_hash", UNKNOWN) or UNKNOWN
 
-    # Weight hash — expensive, cache by model identity
+    # Weight hash — three strategies (cheapest first):
+    # 1. In-memory cache hit (amortises within one process lifetime).
+    # 2. Manifest read-back: scan existing meta.json files on disk.
+    # 3. Source safetensors mmap-hash (cold path; much faster than state_dict walk).
     cache_key = id(model)
     if base_model_hash_cache is not None and cache_key in base_model_hash_cache:
+        # Strategy 1: in-memory cache hit
         base_hash = base_model_hash_cache[cache_key]
     else:
-        try:
-            h = hashlib.sha256()
-            base_model_obj = model
-            # For PeftModel, hash the base model's state_dict
-            if hasattr(model, "base_model"):
-                base_model_obj = model.base_model.model
-            state = base_model_obj.state_dict() if hasattr(base_model_obj, "state_dict") else {}
-            for name in sorted(state.keys()):
-                tensor = state[name]
-                if hasattr(tensor, "cpu"):
-                    t = tensor.detach().cpu() if hasattr(tensor, "detach") else tensor.cpu()
-                    try:
-                        h.update(t.numpy().tobytes())
-                    except (TypeError, RuntimeError):
-                        # numpy lacks bfloat16/fp8 dtypes — hash raw storage bytes.
-                        # clone() guarantees offset=0 and storage size == nelement * itemsize.
-                        t = t.contiguous().clone() if hasattr(t, "clone") else t
-                        h.update(bytes(t.untyped_storage()))
+        base_hash = UNKNOWN
+
+        # Strategy 2: manifest read-back (warm path)
+        if adapter_root is not None and base_sha != UNKNOWN:
+            read_back = _lookup_hash_from_manifests(adapter_root, base_repo, base_sha)
+            if read_back is not None:
+                base_hash = read_back
+                logger.debug(
+                    "build_manifest_for: base_model hash from manifest read-back (%s)",
+                    base_hash[:20] + "…",
+                )
+
+        # Strategy 3: source safetensors mmap-hash (cold path)
+        if base_hash == UNKNOWN:
+            try:
+                paths = _resolve_base_safetensors(base_repo, base_sha)
+                if paths:
+                    base_hash = _hash_safetensors_files(paths)
+                    logger.debug(
+                        "build_manifest_for: base_model hash from safetensors files (%s)",
+                        base_hash[:20] + "…",
+                    )
                 else:
-                    h.update(bytes(tensor))
-            base_hash = "sha256:" + h.hexdigest()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("build_manifest_for: could not hash base model weights: %s", exc)
-            base_hash = UNKNOWN
+                    logger.warning(
+                        "build_manifest_for: could not resolve safetensors files for "
+                        "repo=%r sha=%r — base_model.hash will be UNKNOWN",
+                        base_repo,
+                        base_sha,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "build_manifest_for: safetensors hash failed for repo=%r: %s",
+                    base_repo,
+                    exc,
+                )
 
         if base_model_hash_cache is not None:
             base_model_hash_cache[cache_key] = base_hash
