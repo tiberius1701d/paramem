@@ -66,12 +66,22 @@ def _resolve_data_dir(args: argparse.Namespace) -> Path | None:
 def _resolve_simulate_dir(args: argparse.Namespace) -> Path | None:
     """Resolve the simulate-mode peer-storage root.
 
-    Symmetric to ``_resolve_data_dir``. Returns ``None`` when neither the
-    explicit override nor the config yields a path — callers treat that as
-    "no simulate store to consider".
+    Resolution order:
+    1. Explicit ``--simulate-dir`` wins.
+    2. If ``--data-dir`` is explicit but ``--simulate-dir`` is not, return
+       ``None`` ("no simulate store to consider"). An explicit data-dir
+       override must not implicitly fall through to the live config's
+       simulate path — that footgun corrupts test isolation and surprises
+       operators who scoped the rotation to a specific tree.
+    3. Otherwise fall through to the config's ``paths.simulate``.
+
+    Returns ``None`` when neither the explicit override nor the config
+    yields a path — callers treat that as "no simulate store to consider".
     """
     if getattr(args, "simulate_dir", None):
         return Path(args.simulate_dir).expanduser().resolve()
+    if getattr(args, "data_dir", None):
+        return None
     from paramem.server.config import load_server_config
 
     config_path = Path(args.config).expanduser().resolve()
@@ -259,10 +269,11 @@ def add_parser(subparsers) -> None:
         default=None,
         metavar="PATH",
         help=(
-            "Override the simulate-mode peer-storage directory. Defaults to "
-            "the server config's paths.simulate. Pass when --data-dir is "
-            "overridden too; rotation re-encrypts simulate keyed_pairs alongside "
-            "the train-mode store."
+            "Override the simulate-mode peer-storage directory. When --data-dir "
+            "is set, --simulate-dir defaults to None (simulate store untouched) "
+            "— pass it explicitly to rotate the simulate keyed_pairs alongside "
+            "the train-mode store. When neither --data-dir nor --simulate-dir "
+            "is given, falls through to the server config's paths.simulate."
         ),
     )
     p.add_argument(

@@ -137,9 +137,19 @@ class TestConsolidationIntegration:
     def _make_config(tmp_path):
         from paramem.server.config import PathsConfig, ServerConfig
 
+        # Override every path that ConsolidationLoop or its callees may
+        # write/read. PathsConfig defaults are RELATIVE ("data/ha", etc.) and
+        # resolve against cwd, so leaving any of debug/sessions/simulate at
+        # default routes test side-effects into the live data dir.
         config = ServerConfig()
-        config.paths = PathsConfig(data=tmp_path / "ha")
-        (tmp_path / "ha" / "adapters").mkdir(parents=True, exist_ok=True)
+        ha = tmp_path / "ha"
+        config.paths = PathsConfig(
+            data=ha,
+            sessions=ha / "sessions",
+            debug=ha / "debug",
+            simulate=ha / "simulate",
+        )
+        (ha / "adapters").mkdir(parents=True, exist_ok=True)
         return config
 
     @staticmethod

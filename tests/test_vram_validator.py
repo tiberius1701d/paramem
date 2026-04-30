@@ -758,9 +758,21 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
 
     config = ServerConfig(model_name="mistral")
     config.cloud_only = False
-    # Point the data directory at a fresh tmp so the security startup gate
-    # sees an empty (therefore consistent) store.
-    config.paths.data = tmp_path / "data"
+    # Point ALL data paths at a fresh tmp so the security startup gate
+    # sees an empty (therefore consistent) store. PathsConfig defaults are
+    # relative ("data/ha", "data/ha/simulate", etc.) and resolve against
+    # cwd — overriding only `data` leaves sessions/debug/simulate pointing
+    # at the LIVE store, where assert_mode_consistency finds age-encrypted
+    # files it cannot decrypt with the test's daily identity.
+    from paramem.server.config import PathsConfig
+
+    root = tmp_path / "data"
+    config.paths = PathsConfig(
+        data=root,
+        sessions=root / "sessions",
+        debug=root / "debug",
+        simulate=root / "simulate",
+    )
 
     saved_state = {
         key: server_app._state.get(key) for key in ("config", "cloud_only_startup", "defer_model")
