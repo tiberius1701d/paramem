@@ -1227,6 +1227,7 @@ def _phase_c_render_multiseed(variant, c_dir):
         return False
     completed = []
     in_flight = []
+    starting = []  # seed dir created but no probe has fired yet
     for sd_name in seed_subdirs:
         sd = os.path.join(c_dir, sd_name)
         done_p = os.path.join(sd, "C_done.json")
@@ -1254,6 +1255,11 @@ def _phase_c_render_multiseed(variant, c_dir):
                     })
                 except Exception:
                     pass
+            elif os.path.isdir(os.path.join(sd, "adapter")):
+                # Phase C just started for this seed but the first epoch's
+                # probe hasn't completed yet (5-7 min window).  HF Trainer
+                # has set up its output_dir; no progress.json written yet.
+                starting.append({"seed": sd_name.replace("seed", "")})
 
     n_target = len(configured_seeds) if configured_seeds else len(seed_subdirs)
     n_done = len(completed)
@@ -1279,7 +1285,7 @@ def _phase_c_render_multiseed(variant, c_dir):
         parts = [f"{n_done}/{n_target} seeds", stable_summary, first_summary]
         summary = "  ".join(p for p in parts if p)
         print(f"  {variant}/C:    {head_label} {summary}")
-    elif in_flight:
+    elif in_flight or starting:
         print(f"  {variant}/C:    \x1b[33m◐\x1b[0m 0/{n_target} seeds done")
     else:
         # Sub-dirs exist but nothing useful in them — show as starting
@@ -1307,6 +1313,19 @@ def _phase_c_render_multiseed(variant, c_dir):
         else:
             lbl = "\x1b[31m✗ stopped\x1b[0m"
         print(f"  {variant}/C/seed{seed_num}:    {lbl}  e{cur}/{total}{fr_str}")
+
+    # Per-seed "starting" detail: Phase C just entered, no probe yet.
+    # In-training train_adapter writes step-progress only into stdout
+    # (not into a file we can read), so we can't show step counts here.
+    for s in starting:
+        seed_num = s["seed"]
+        if is_running:
+            lbl = "\x1b[36m▶ starting\x1b[0m"
+            suffix = "\x1b[2m(first probe pending; ~5-7 min from Phase C entry)\x1b[0m"
+        else:
+            lbl = "\x1b[31m✗ stopped\x1b[0m"
+            suffix = "\x1b[2m(adapter dir created but no probe yet — likely crashed during setup)\x1b[0m"
+        print(f"  {variant}/C/seed{seed_num}:    {lbl}  {suffix}")
     return True
 
 
@@ -1425,16 +1444,27 @@ PYEOF
             [[ -d "$v_dir" ]] || continue
             for phase in A B C; do
                 local p_dir="$v_dir/$phase"
-                # Phase C multi-seed: iterate seed sub-dirs first.
+                # Phase C multi-seed: iterate seed sub-dirs first.  Prefer
+                # a seed with progress.json (active in-flight) over one
+                # that's only "starting" (adapter/ exists, no probe yet),
+                # so the progress bar locks onto the most informative target.
                 if [[ "$phase" == "C" && -d "$p_dir" ]]; then
                     local found_seed=""
+                    local starting_seed=""
                     for sd in "$p_dir"/seed*/; do
                         [[ -d "$sd" ]] || continue
-                        if [[ -f "$sd/progress.json" && ! -f "$sd/C_done.json" ]]; then
+                        if [[ -f "$sd/C_done.json" ]]; then
+                            continue
+                        fi
+                        if [[ -f "$sd/progress.json" ]]; then
                             found_seed=$(basename "$sd")
                             break
                         fi
+                        if [[ -d "$sd/adapter" && -z "$starting_seed" ]]; then
+                            starting_seed=$(basename "$sd")
+                        fi
                     done
+                    [[ -z "$found_seed" ]] && found_seed="$starting_seed"
                     if [[ -n "$found_seed" ]]; then
                         current_var="$variant"
                         current_phase="$phase"
