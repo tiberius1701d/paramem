@@ -224,7 +224,12 @@ def train_adapter(
     result = trainer.train(resume_from_checkpoint=ckpt_arg)
     metrics = result.metrics
 
-    model.save_pretrained(str(output_dir), selected_adapters=[adapter_name])
+    # PEFT's save_pretrained appends adapter_name to save_directory; pass the
+    # parent so the saved adapter lands at output_dir, not output_dir/adapter_name/.
+    # Caller's _training_output_dir constructs paths as parent/<adapter_name>;
+    # without this, infra_paths' rglob picks up unencrypted training-workspace
+    # safetensors and trips the startup mode-consistency check.
+    model.save_pretrained(str(output_dir.parent), selected_adapters=[adapter_name])
     tokenizer.save_pretrained(str(output_dir))
 
     logger.info("Training complete: %s", metrics)
