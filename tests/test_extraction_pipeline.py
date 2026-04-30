@@ -768,6 +768,44 @@ class TestSOTAEntityBindings:
         t = "Person_1 lives in City_1."
         assert _extract_sota_bindings(t, t) == {}
 
+    def test_extract_sota_bindings_punctuated_brace(self):
+        """SOTA can wrap the brace in surrounding punctuation, e.g.
+        '({Program_1}, value)'. The token boundary doesn't put the brace at
+        the start. inline_brace_re.findall on the new segment surfaces the
+        marker regardless of token alignment."""
+        from paramem.graph.extractor import _extract_sota_bindings
+
+        old = "Identified the platform in crisis worth €200M+ value."
+        new = "Identified the platform in crisis ({Program_1}, €200M+ value)."
+        bindings = _extract_sota_bindings(old, new)
+        # A binding for Program_1 must be recovered (semantic precision is
+        # imperfect when SOTA restructures, but a binding is recovered so the
+        # downstream fact survives instead of being dropped).
+        assert "Program_1" in bindings.values()
+
+    def test_extract_sota_bindings_multi_token_new(self):
+        """SOTA can restructure: replacing a multi-token old span with a
+        multi-token new segment that contains exactly one brace marker.
+        This covers the case where SOTA both un-anonymizes a pre-existing
+        placeholder AND introduces a new one in the same diff block."""
+        from paramem.graph.extractor import _extract_sota_bindings
+
+        old = "developed the system extensively"
+        new = "developed Honda's {Project_1} extensively"
+        bindings = _extract_sota_bindings(old, new)
+        assert "Project_1" in bindings.values()
+
+    def test_extract_sota_bindings_ambiguous_segment_skipped(self):
+        """When a single replace block contains multiple brace markers, the
+        binding cannot be disambiguated and we skip it for safety. Better
+        no-binding than a wrong-binding."""
+        from paramem.graph.extractor import _extract_sota_bindings
+
+        old = "the team scaled significantly"
+        new = "the team {Team_1} scaled to {Scale_1} significantly"
+        bindings = _extract_sota_bindings(old, new)
+        assert bindings == {}
+
     def test_strip_placeholder_braces(self):
         """Braces are removed from subject/object; other fields untouched."""
         from paramem.graph.extractor import _strip_placeholder_braces

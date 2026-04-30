@@ -2956,10 +2956,23 @@ def _extract_sota_bindings(old_transcript: str, new_transcript: str) -> dict[str
     """Recover SOTA-introduced placeholder bindings via token-level span diff.
 
     SOTA returns an updated transcript where newly-introduced entities are
-    marked as braced placeholders (`{Event_1}`) replacing the real span they
+    marked as braced placeholders (``{Event_1}``) replacing the real span they
     represent. This function aligns the two transcripts token-by-token and
-    reconstructs `{real_span: placeholder}` bindings for each replacement
-    whose new side is a single braced token.
+    reconstructs ``{real_span: placeholder}`` bindings for each replacement
+    block whose new segment contains exactly one brace marker.
+
+    Handles three observed SOTA output shapes:
+
+    * Clean replacement: ``Legend SAE Level 3 system → {Project_1}``.
+      Single-token new side, brace at token start.
+    * Punctuated brace: ``({Program_1},`` — brace embedded in a token with
+      surrounding punctuation. ``inline_brace_re.findall`` on the new
+      segment surfaces it regardless of token-boundary alignment.
+    * Restructured replacement: ``{Thing_5} laptop system →
+      Honda's {Project_1}``. SOTA un-anonymized + introduced + restructured.
+      The new segment is multi-token; we accept any segment that contains
+      exactly one brace marker. The recovered span may include surrounding
+      real text (which is fine — set-default into mapping is conservative).
 
     Returns bindings with real spans stripped of trailing punctuation.
     """
@@ -2969,6 +2982,7 @@ def _extract_sota_bindings(old_transcript: str, new_transcript: str) -> dict[str
     new_toks = new_transcript.split()
     matcher = difflib.SequenceMatcher(a=old_toks, b=new_toks)
     bindings: dict[str, str] = {}
+    inline_brace_re = re.compile(r"\{(\w+_\d+)\}")
     brace_token_re = re.compile(r"^\{(\w+_\d+)\}([.,;:!?)\]]*)$")
     # Hoist pattern compile out of the loop — recompiling per iteration is wasteful
     # and the None-vocab guard must be consistent across the entire diff pass.
@@ -2976,12 +2990,18 @@ def _extract_sota_bindings(old_transcript: str, new_transcript: str) -> dict[str
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "replace":
             continue
-        if j2 - j1 != 1:
+        new_segment = " ".join(new_toks[j1:j2])
+        # Find brace markers anywhere in the new segment, not just at token
+        # start. SOTA may emit `({Program_1},` (parens around the brace) or
+        # multi-token segments (e.g. when SOTA also un-anonymizes a pre-existing
+        # placeholder while introducing a new one).
+        marker_matches = inline_brace_re.findall(new_segment)
+        if len(marker_matches) != 1:
+            # 0 markers: this replace block isn't a binding event, skip.
+            # 2+ markers: ambiguous — can't tell which span maps to which
+            # placeholder, skip for safety.
             continue
-        m = brace_token_re.match(new_toks[j1])
-        if not m:
-            continue
-        placeholder = m.group(1)
+        placeholder = marker_matches[0]
         span = " ".join(old_toks[i1:i2]).rstrip(".,;:!?'\")]")
         # Defensive: skip placeholder→placeholder bindings. SOTA may brace a
         # pre-existing bare placeholder (e.g. `Person_2` → `{Person_2}`) as
