@@ -337,22 +337,26 @@ agents:
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
     endpoint: ""
+    timeout_seconds: 90.0
   sota_providers:
     anthropic:
       enabled: true
       provider: anthropic
       model: claude-sonnet-4-6
       api_key: ${ANTHROPIC_API_KEY}
+      timeout_seconds: 90.0
     openai:
       enabled: true
       provider: openai
       model: gpt-4o-search-preview
       api_key: ${OPENAI_API_KEY}
+      timeout_seconds: 90.0
     google:
       enabled: true
       provider: google
       model: gemini-2.5-flash
       api_key: ${GOOGLE_API_KEY}
+      timeout_seconds: 90.0
   # HA escalation kept off here: integration tests (scripts/dev/test-ha-pipeline.sh
   # and friends) exercise HA against a real instance. Unit/contract tests stay off
   # the HA path. Flip per-test if a unit test needs to assert HA routing.

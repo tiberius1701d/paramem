@@ -15,7 +15,7 @@ class AnthropicAgent(CloudAgent):
 
     def __init__(self, config: CloudAgentConfig):
         super().__init__(config)
-        self._client = anthropic.Anthropic(api_key=config.api_key, timeout=30.0)
+        self._client = anthropic.Anthropic(api_key=config.api_key, timeout=config.timeout_seconds)
 
     def call(
         self,

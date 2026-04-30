@@ -2767,6 +2767,12 @@ _DEFAULT_FILTER_MAX_TOKENS = 8192
 # Validator temperature: deterministic by default. Threaded all the way to the
 # provider call so Anthropic and OpenAI-compatible filters match exactly.
 _DEFAULT_FILTER_TEMPERATURE = 0.0
+# Per-call timeout for SOTA enrichment / plausibility. 30s was hit by Mistral 7B
+# resume content at max_tokens=8192 (response generation took >30s, ReadTimeout,
+# pipeline fell back to local-only and lost SOTA's contribution silently). 90s
+# matches CloudAgentConfig.timeout_seconds default. Operator can override via
+# the timeout_seconds parameter on the relevant call site.
+_DEFAULT_FILTER_TIMEOUT_SECONDS = 90.0
 
 
 def _filter_anthropic(
@@ -2776,6 +2782,7 @@ def _filter_anthropic(
     system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+    timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> str | None:
     try:
         import anthropic
@@ -2783,7 +2790,7 @@ def _filter_anthropic(
         logger.warning("anthropic SDK not installed — skipping SOTA filter")
         return None
     try:
-        client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
+        client = anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds)
         response = client.messages.create(
             model=filter_model,
             max_tokens=max_tokens,
@@ -2810,6 +2817,7 @@ def _filter_openai_compat(
     system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+    timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> str | None:
     try:
         import httpx
@@ -2832,7 +2840,7 @@ def _filter_openai_compat(
     }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=timeout_seconds) as client:
             resp = client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -2851,6 +2859,7 @@ def _sota_call(
     max_tokens: int,
     temperature: float,
     system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
+    timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> str | None:
     """Generic SOTA dispatch (anthropic native or any OpenAI-compatible host)."""
     if provider == "anthropic":
@@ -2861,6 +2870,7 @@ def _sota_call(
             system_prompt=system_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            timeout_seconds=timeout_seconds,
         )
     if provider in OPENAI_COMPAT_PROVIDERS:
         return _filter_openai_compat(
@@ -2872,6 +2882,7 @@ def _sota_call(
             system_prompt=system_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            timeout_seconds=timeout_seconds,
         )
     logger.warning("Unsupported SOTA provider '%s'", provider)
     return None
@@ -3020,6 +3031,7 @@ def _filter_with_sota(
     endpoint: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+    timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> tuple[list[dict] | None, str | None, str | None, dict]:
     """SOTA enrichment pass — coreference + compound splitting + safe reification.
 
@@ -3054,6 +3066,7 @@ def _filter_with_sota(
         max_tokens,
         temperature,
         system_prompt=_SOTA_ENRICHMENT_SYSTEM_PROMPT,
+        timeout_seconds=timeout_seconds,
     )
     if raw is None:
         return None, None, None, {"parse_path": "no_response"}
@@ -3123,6 +3136,7 @@ def _graph_enrich_with_sota(
     endpoint: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+    timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> tuple[list[dict], list[list[str]], str | None] | None:
     """SOTA graph-level enrichment pass over a pre-merged cumulative graph.
 
@@ -3166,6 +3180,7 @@ def _graph_enrich_with_sota(
         max_tokens,
         temperature,
         system_prompt=_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT,
+        timeout_seconds=timeout_seconds,
     )
     if raw is None:
         return None
@@ -3221,6 +3236,7 @@ def _plausibility_filter_with_sota(
     endpoint: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+    timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> tuple[list[dict] | None, str | None]:
     """SOTA plausibility filter — drops invalid relations only.
 
@@ -3244,6 +3260,7 @@ def _plausibility_filter_with_sota(
         max_tokens,
         temperature,
         system_prompt=_SOTA_PLAUSIBILITY_SYSTEM_PROMPT,
+        timeout_seconds=timeout_seconds,
     )
     return _parse_facts_response(raw, strict_array=True), raw
 

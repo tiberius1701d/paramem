@@ -110,7 +110,7 @@ class OpenAICompatAgent(CloudAgent):
         }
 
         try:
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(timeout=self.config.timeout_seconds) as client:
                 resp = client.post(self._endpoint, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
