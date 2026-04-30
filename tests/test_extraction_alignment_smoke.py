@@ -116,7 +116,7 @@ class TestAlignmentSmoke:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._local_plausibility_filter",
@@ -164,7 +164,7 @@ class TestAlignmentSmoke:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._local_plausibility_filter",
@@ -197,7 +197,7 @@ class TestAlignmentSmoke:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
         ):
             result = _sota_pipeline(

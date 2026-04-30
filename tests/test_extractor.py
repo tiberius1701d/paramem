@@ -138,5 +138,8 @@ class TestNormalizeExtraction:
         }
         normalized = _normalize_extraction(data)
         graph = SessionGraph.model_validate(normalized)
-        assert graph.entities[0].name == "User"
+        # Entity name preserves the model's literal output — no static
+        # title-casing. World-knowledge correction is the surface enrichment
+        # stage's job, not a destructive normalization here.
+        assert graph.entities[0].name == "user"
         assert graph.relations[0].relation_type == "factual"
