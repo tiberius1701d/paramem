@@ -11,7 +11,6 @@ from paramem.graph.schema_config import (
     anonymizer_placeholder_pattern,
     anonymizer_prefix_to_type,
     anonymizer_type_to_prefix,
-    entity_types,
     fallback_entity_type,
     fallback_relation_type,
     format_entity_types,
@@ -875,7 +874,13 @@ def _normalize_extraction(data: dict) -> dict:
             if isinstance(raw_type, list):
                 raw_type = raw_type[0] if raw_type else "concept"
             fb_etype = fallback_entity_type()
-            norm["entity_type"] = raw_type if raw_type in set(entity_types()) else fb_etype
+            # entity_type is open (no Literal enforcement) — accept any
+            # non-empty string so the model can emit rich types like
+            # "product", "certification", "program", "paper", etc.
+            # The schema YAML's entity_types list is a soft prior for
+            # prompt examples; it does not gate the value here.
+            type_str = str(raw_type).strip().lower() if raw_type else ""
+            norm["entity_type"] = type_str if type_str else fb_etype
             raw_attrs = ent.get("attributes", {})
             if not isinstance(raw_attrs, dict):
                 raw_attrs = {}
@@ -1812,25 +1817,24 @@ def _sota_pipeline(
 
     # Rebuild entity list from surviving + new relations.
     # Every relation endpoint must have a corresponding Entity record.
-    # Entity type inference uses anonymizer_prefix_to_type() from configs/schema.yaml.
-    # Safe fallback is "concept", never "person" — that would stamp locations,
-    # media, and free-text entities as persons, as confirmed by
-    # sim_20260415_160543/graph.json.
+    # Entity type inference: known prefixes (Person, Org, City, ...) use the
+    # configured anonymizer_prefix_to_type() mapping. Novel prefixes that SOTA
+    # introduces (Project_1, Program_1, Paper_1, Certification_1, ...) derive
+    # the type from the prefix itself — the prefix name IS the type name in
+    # SOTA's brace-binding protocol. entity_type is open (no Literal), so the
+    # derived type passes through.
     kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
     existing_names = {e.name for e in graph.entities}
     graph.entities = [e for e in graph.entities if e.name in kept_names]
+    closed_prefix_to_type = anonymizer_prefix_to_type()
     for name in kept_names - existing_names:
-        # Infer entity type from anonymizer placeholder prefix when available.
-        # Prefix-to-type mapping comes from anonymizer.prefixes in configs/schema.yaml
-        # (via anonymizer_prefix_to_type()). Safe fallback is "concept"
-        # (matches _normalize_extraction for unknown types).
-        # Never default to "person" — that stamps locations, media, devices, and
-        # free-text entities as persons.
         entity_type = "concept"
         placeholder = reverse_mapping.get(name)
         if placeholder:
             prefix = placeholder.split("_")[0].lower()
-            entity_type = anonymizer_prefix_to_type().get(prefix, "concept")
+            # Closed prefix → configured type. Novel prefix → use the prefix
+            # itself as the type. Empty prefix or no placeholder → "concept".
+            entity_type = closed_prefix_to_type.get(prefix) or prefix or "concept"
         graph.entities.append(Entity(name=name, entity_type=entity_type))
 
     graph.relations = kept_relations
