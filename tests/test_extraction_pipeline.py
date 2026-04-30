@@ -344,7 +344,10 @@ class TestSOTANoiseFilter:
                 "paramem.graph.extractor._anonymize_with_local_model",
                 return_value=(anon_facts, mapping, ""),
             ),
-            patch("paramem.graph.extractor._filter_with_sota", return_value=(None, None, None)),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(None, None, None, {}),
+            ),
         ):
             result = _sota_pipeline(graph, "transcript", None, None)
 
@@ -378,7 +381,7 @@ class TestSOTANoiseFilter:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, None),
+                return_value=(enriched_anon, None, None, {}),
             ),
         ):
             result = _sota_pipeline(graph, "transcript", None, None)
@@ -423,7 +426,7 @@ class TestSOTANoiseFilter:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, None),
+                return_value=(enriched_anon, None, None, {}),
             ),
         ):
             result = _sota_pipeline(graph, transcript, None, None)
@@ -662,7 +665,7 @@ class TestSOTANoiseFilter:
 
         def fake_filter(facts, *args, **kwargs):
             filter_calls.append(list(facts))
-            return facts, None, None
+            return facts, None, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -708,7 +711,7 @@ class TestSOTANoiseFilter:
 
         def fake_filter(facts, *args, **kwargs):
             filter_calls.append(list(facts))
-            return facts, None, None
+            return facts, None, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1464,7 +1467,7 @@ class TestPlausibilityAnon:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._plausibility_filter_with_sota",
@@ -1527,7 +1530,7 @@ class TestPlausibilityDeanon:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._local_plausibility_filter",
@@ -1595,7 +1598,7 @@ class TestResidualLeakDropsReferencingTriples:
 
         def fake_sota(facts, *args, **kwargs):
             sota_calls.append(list(facts))
-            return facts, None, None
+            return facts, None, None, {}
 
         # Mock repair to return anon_facts that STILL contain Ghost (residual leak)
         def fake_repair(
@@ -1728,7 +1731,7 @@ class TestAllDroppedSafetyNet:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_ungrounded, None, None),
+                return_value=(enriched_ungrounded, None, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._fallback_plausibility_on_raw",
@@ -1783,7 +1786,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
         ):
             result = _sota_pipeline(
@@ -1824,7 +1827,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
         ):
             result = _sota_pipeline(
@@ -1878,7 +1881,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, None),
+                return_value=(enriched_anon, None, None, {}),
             ),
         ):
             result = _sota_pipeline(
@@ -2074,7 +2077,7 @@ class TestExtractGraphNewKwargs:
 
         def fake_sota(facts, *args, **kwargs):
             sota_calls.append(list(facts))
-            return facts, None, None
+            return facts, None, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -2132,7 +2135,7 @@ class TestDiagnosticsKeys:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._local_plausibility_filter",
@@ -2175,7 +2178,7 @@ class TestDiagnosticsKeys:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None),
+                return_value=(anon_facts, None, None, {}),
             ),
         ):
             result = _sota_pipeline(

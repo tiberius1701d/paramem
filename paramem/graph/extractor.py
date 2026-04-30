@@ -870,7 +870,7 @@ def _normalize_extraction(data: dict) -> dict:
             raw_name = ent.get("name") or ent.get("entity", "unknown")
             if isinstance(raw_name, list):
                 raw_name = raw_name[0] if raw_name else "unknown"
-            norm["name"] = str(raw_name).strip().title()
+            norm["name"] = str(raw_name).strip()
             raw_type = ent.get("entity_type") or ent.get("type", "concept")
             if isinstance(raw_type, list):
                 raw_type = raw_type[0] if raw_type else "concept"
@@ -913,8 +913,8 @@ def _normalize_extraction(data: dict) -> dict:
                 raw_subj = raw_subj[0] if raw_subj else "unknown"
             if isinstance(raw_obj, list):
                 raw_obj = raw_obj[0] if raw_obj else "unknown"
-            subject = str(raw_subj).strip().title()
-            obj = str(raw_obj).strip().title()
+            subject = str(raw_subj).strip()
+            obj = str(raw_obj).strip()
 
             # Filter self-loops (e.g. "KIT studied at KIT")
             if subject.lower() == obj.lower():
@@ -967,7 +967,7 @@ def _correct_entity_names(graph: SessionGraph, transcript: str) -> SessionGraph:
             prefix_len = line.index("]") + 1 if "]" in line else line.index(":") + 1
             words = line[prefix_len:].split()
             for w in words:
-                clean = w.strip(".,!?;:'\"()").title()
+                clean = w.strip(".,!?;:'\"()")
                 if len(clean) >= 4:
                     assistant_tokens.add(clean)
 
@@ -1561,9 +1561,14 @@ def _sota_pipeline(
         known_placeholders = set(mapping.values())
         braced_transcript = _brace_placeholders_in_text(anon_transcript, known_placeholders)
         braced_facts = _brace_placeholders_in_facts(anon_facts, known_placeholders)
-        enriched_anon, updated_anon_transcript, _sota_raw = _filter_with_sota(
+        enriched_anon, updated_anon_transcript, _sota_raw, _sota_info = _filter_with_sota(
             braced_facts, api_key, provider, filter_model, braced_transcript, endpoint=endpoint
         )
+        # Persist SOTA-call telemetry: parse path, truncation flag, response size,
+        # salvage count. Lets us see truncation kill sites that were previously
+        # silent (strict-parse failure → legacy salvage of an unknown subset).
+        if _sota_info:
+            graph.diagnostics["sota_call_info"] = _sota_info
         anon_transcript = braced_transcript  # bindings diff is against what we sent
         if enriched_anon is None:
             logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
@@ -1751,6 +1756,7 @@ def _sota_pipeline(
             logger.warning("Deanon-stage plausibility call failed — keeping deanon facts")
 
     kept_relations = []
+    validation_dropped: list[dict] = []
     for fact in deanon_facts:
         try:
             kept_relations.append(
@@ -1762,8 +1768,24 @@ def _sota_pipeline(
                     confidence=float(fact.get("confidence", 1.0)),
                 )
             )
-        except Exception:
+        except Exception as exc:
+            validation_dropped.append(
+                {
+                    "subject": fact.get("subject", ""),
+                    "predicate": fact.get("predicate", ""),
+                    "object": fact.get("object", ""),
+                    "relation_type": fact.get("relation_type", ""),
+                    "reason": f"{type(exc).__name__}: {exc}"[:200],
+                }
+            )
             continue
+    if validation_dropped:
+        graph.diagnostics["pydantic_validation_dropped"] = validation_dropped
+        logger.warning(
+            "Dropped %d fact(s) at Relation schema validation "
+            "(commonly: relation_type outside Literal set)",
+            len(validation_dropped),
+        )
 
     # Step 4: Deterministic safety net for symmetric-predicate canonicalization.
     # The enrichment prompt asks the LLM to drop the inverse direction; this
@@ -2727,7 +2749,13 @@ _SOTA_PLAUSIBILITY_SYSTEM_PROMPT = (
 _SOTA_SYSTEM_PROMPT = _SOTA_ENRICHMENT_SYSTEM_PROMPT
 
 
-_DEFAULT_FILTER_MAX_TOKENS = 2048
+# Output budget for SOTA enrichment / plausibility / graph-enrich calls.
+# 2048 was hit by document-mode ingestion (resume produced ~6045 chars of
+# response and JSON parse failed mid-string). 8192 is provisional headroom;
+# truncation should be observable, not silent — see _filter_with_sota
+# diagnostics. Long-term, output budgeting + chunked invocation is the
+# durable answer (see plan Phase A0).
+_DEFAULT_FILTER_MAX_TOKENS = 8192
 # Validator temperature: deterministic by default. Threaded all the way to the
 # provider call so Anthropic and OpenAI-compatible filters match exactly.
 _DEFAULT_FILTER_TEMPERATURE = 0.0
@@ -2984,15 +3012,24 @@ def _filter_with_sota(
     endpoint: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
-) -> tuple[list[dict] | None, str | None, str | None]:
+) -> tuple[list[dict] | None, str | None, str | None, dict]:
     """SOTA enrichment pass — coreference + compound splitting + safe reification.
 
-    Returns `(facts, updated_transcript, raw_response)`. The raw response
-    string is surfaced so callers can persist it for diagnostics — crucial
-    when binding recovery fails and we need to see what SOTA actually emitted.
+    Returns ``(facts, updated_transcript, raw_response, info)``. ``info`` is
+    a dict with diagnostic flags the caller persists into ``graph.diagnostics``:
+
+    - ``parse_path``: ``"preferred"`` (strict JSON, dict with ``facts`` + ``updated_transcript``)
+      or ``"legacy_fallback"`` (response failed strict parse; bare-array salvage).
+    - ``response_truncated``: ``True`` when strict parse failed (typically max_tokens
+      hit; JSON ends mid-string). Salvaged facts may be a strict subset of what
+      the model intended to emit — a silent kill site historically.
+    - ``response_chars``: length of the raw response in characters, for sizing
+      decisions and budget tracking.
+    - ``preferred_fact_count`` / ``legacy_fact_count``: count after each parse path,
+      whichever ran. Lets us measure salvage rate when truncation hits.
 
     Legacy responses (bare JSON array, no transcript) are accepted — in that
-    case `updated_transcript` is None and callers must fall back to the
+    case ``updated_transcript`` is None and callers must fall back to the
     registry-based drop filter for any unresolved placeholders.
     """
     enrichment_prompt = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
@@ -3011,16 +3048,32 @@ def _filter_with_sota(
         system_prompt=_SOTA_ENRICHMENT_SYSTEM_PROMPT,
     )
     if raw is None:
-        return None, None, None
+        return None, None, None, {"parse_path": "no_response"}
+    info: dict = {"response_chars": len(raw)}
     # Preferred schema: {"facts": [...], "updated_transcript": "..."}
     try:
         parsed = json.loads(_extract_json_block(raw))
         if isinstance(parsed, dict) and isinstance(parsed.get("facts"), list):
-            return parsed["facts"], parsed.get("updated_transcript"), raw
+            info["parse_path"] = "preferred"
+            info["response_truncated"] = False
+            info["preferred_fact_count"] = len(parsed["facts"])
+            return parsed["facts"], parsed.get("updated_transcript"), raw, info
     except (json.JSONDecodeError, ValueError):
         pass
-    # Legacy: bare array. No transcript, no reification recovery.
-    return _parse_facts_response(raw), None, raw
+    # Legacy / salvage: strict parse failed. Most common cause is max_tokens
+    # truncation cutting JSON mid-string. Best-effort fact recovery only.
+    salvaged = _parse_facts_response(raw)
+    info["parse_path"] = "legacy_fallback"
+    info["response_truncated"] = True
+    info["legacy_fact_count"] = len(salvaged) if salvaged else 0
+    logger.warning(
+        "SOTA strict-parse failed; salvaged %d fact(s) via legacy fallback "
+        "(response_chars=%d, max_tokens=%d) — likely truncation",
+        info["legacy_fact_count"],
+        info["response_chars"],
+        max_tokens,
+    )
+    return salvaged, None, raw, info
 
 
 # ---------------------------------------------------------------------------
