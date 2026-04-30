@@ -133,12 +133,14 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "agents.sota.model": Tier.PIPELINE_ALTERING,
     "agents.sota.api_key": Tier.PIPELINE_ALTERING,
     "agents.sota.endpoint": Tier.PIPELINE_ALTERING,
+    "agents.sota.timeout_seconds": Tier.OPERATIONAL,
     # --- agents.sota_providers (wildcard for any provider name) ---
     "agents.sota_providers.*.enabled": Tier.PIPELINE_ALTERING,
     "agents.sota_providers.*.provider": Tier.PIPELINE_ALTERING,
     "agents.sota_providers.*.model": Tier.PIPELINE_ALTERING,
     "agents.sota_providers.*.api_key": Tier.PIPELINE_ALTERING,
     "agents.sota_providers.*.endpoint": Tier.PIPELINE_ALTERING,
+    "agents.sota_providers.*.timeout_seconds": Tier.OPERATIONAL,
     # --- agents.ha_agent_id ---
     "agents.ha_agent_id": Tier.PIPELINE_ALTERING,
     # --- tools ---

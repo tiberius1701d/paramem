@@ -15,9 +15,10 @@ class GoogleAgent(CloudAgent):
 
     def __init__(self, config: CloudAgentConfig):
         super().__init__(config)
+        # Google's HttpOptions takes timeout in milliseconds; CloudAgentConfig stores seconds.
         self._client = genai.Client(
             api_key=config.api_key,
-            http_options=genai.types.HttpOptions(timeout=30_000),
+            http_options=genai.types.HttpOptions(timeout=int(config.timeout_seconds * 1000)),
         )
 
     def call(

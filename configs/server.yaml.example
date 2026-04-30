@@ -301,22 +301,29 @@ agents:
     model: claude-sonnet-4-6
     api_key: ${ANTHROPIC_API_KEY}
     endpoint: ""
+    timeout_seconds: 90.0       # request timeout per call to this provider's API.
+                                # 30s was hit by document-mode SOTA enrichment at max_tokens=8192;
+                                # 90s gives substantial margin without being silly. Tune per provider —
+                                # cloud agents and SOTA enrichment both honour this value.
   sota_providers:
     anthropic:
       enabled: false
       provider: anthropic
       model: claude-sonnet-4-6
       api_key: ${ANTHROPIC_API_KEY}
+      timeout_seconds: 90.0
     openai:
       enabled: false
       provider: openai
       model: gpt-4o-search-preview
       api_key: ${OPENAI_API_KEY}
+      timeout_seconds: 90.0
     google:
       enabled: false
       provider: google
       model: gemini-2.5-flash
       api_key: ${GOOGLE_API_KEY}
+      timeout_seconds: 90.0
   ha_agent_id: ""  # set to e.g. "conversation.groq" once HA token configured
 
 # --- Tools ---
