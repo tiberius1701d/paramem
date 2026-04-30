@@ -1467,18 +1467,27 @@ def _write_phase_done(
 
 
 def decide_pre_winner(run_dir: Path, existing_winner: str | None = None) -> str | None:
-    """Read per-variant C_done.json and apply winner rules.
+    """Read per-variant C_done.json and apply legacy single-seed winner rules.
+
+    Scans the legacy single-seed layout (``<variant>/C/C_done.json``).
+    Multi-seed runs (--phase-c-seeds) bypass this function entirely:
+    ``run_mode_pre`` writes ``winner: pending_manual_review`` and emits
+    ``multiseed_aggregate.json`` for human review against the pooled-std
+    decision rule.  The function below is preserved for the legacy single-
+    seed code path used by the original 14a-pre runs.
 
     Scans ALL variant subdirectories present under ``run_dir`` — not just the
     original three (V1/V2/V3) — so that V3_extended/V4-V8 are automatically
     included when their phase markers exist.
 
-    Extended-run override rule
-    --------------------------
+    Extended-run override rule (single-seed only)
+    ----------------------------------------------
     When ``existing_winner`` is provided (the winner from the original V1/V2/V3
     pass), a new variant replaces it only if its Phase C ``stop_epoch`` is
     strictly ``<= 14``.  Otherwise the existing winner is preserved.  This
-    threshold is documented here and logged with the verdict.
+    threshold is documented here and logged with the verdict.  Note: the
+    multi-seed batch supersedes this rule; see the
+    "Multi-seed replication + V5–V8 expansion" section in benchmarking.md.
 
     Base pass criteria (same as original V1/V2/V3 rules)
     -----------------------------------------------------

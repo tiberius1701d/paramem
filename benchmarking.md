@@ -2316,13 +2316,21 @@ also stays deferred.
 **Script:** `experiments/test14.py`
 **Status (2026-04-29 update):** 14a-pre core **COMPLETE** (2026-04-26).
 Extended cells **partially complete at single seed**: V3_extended complete
-(e25, slower than V3); V4 complete (e29 first_perfect, no stable window in
-30 epochs); V5 started (Phase B e1) then stopped pending multi-seed
-re-design. **Provisional winner: V3** (stable_perfect e20 at n=1).
-**Going full-length on the optimization question**: a multi-seed
-replication batch + V6a/V6b/V6c uniform-axis variants is now planned
-(see "Multi-seed replication + V6 family" below). 14a (scale to N=500)
-and 14b (multi-round) remain gated on the multi-seed result.
+(e25, slower than V3); V4 complete (e29 first_perfect, no stable window
+in 30 epochs); V7 (originally launched as "V5" with sha256 placeholders)
+started Phase B e1 then stopped to fold into the multi-seed batch with
+the renamed labels.  **Provisional winner: V3** (stable_perfect e20 at
+n=1).
+
+**Multi-seed batch in flight (2026-04-30):** the new
+V5/V6/V7/V8 uniform-axis variants plus 3-seed replication of V1/V2/V3/V4
+are queued under run_config.json's `phase_c_seeds=[42, 7, 1337]` and
+`phase_c_num_epochs=50` (extended budget so V4/V7 can reach a finite
+`stable_perfect`).  V1 multi-seed complete: 3-seed mean
+stable_perfect=24.7 ±2.1 (vs n=1 = 24, within noise).  V2 paused
+mid-flight at seed=42 e13.  See "Multi-seed replication + V5–V8
+expansion" below for the full plan; 14a (scale to N=500) and 14b
+(multi-round) remain gated on the multi-seed result.
 
 ### What it tests
 
@@ -2508,7 +2516,8 @@ content-free scaffold pre-forms bindings, but less efficiently than a
 real-Q scaffold does at this seed — content-free production reuse
 trades off fill speed for deployment simplicity. Whether the gap holds
 at N=500 is what 14a tests next; whether the gap can be narrowed by a
-better uniform placeholder is what V6c probes.
+better uniform placeholder is what V5 (long uniform natural template)
+probes.
 
 **Per-field Q/A split** at fill convergence was clean across all three
 variants — `both/total = 1.00`, `q_only/total = 0.00`, no discriminator

@@ -1195,6 +1195,121 @@ def _phase_paused_here(variant: str, phase: str) -> bool:
     # Format: "during {phase}[ (extended|scale|...)], variant {variant}"
     return f"during {phase}" in paused_label and f"variant {variant}" in paused_label
 
+# Multi-seed mode detection: if run_config.json declares phase_c_seeds,
+# Phase C renders per-seed sub-dirs (<variant>/C/seed<N>/) and aggregates
+# the completed ones.  Backward-compat: when phase_c_seeds is unset OR no
+# seed sub-dirs exist, fall back to the legacy <variant>/C/C_done.json
+# layout.
+configured_seeds = []
+cfg_path = os.path.join(run_dir, "run_config.json")
+if os.path.exists(cfg_path):
+    try:
+        cfg = json.load(open(cfg_path))
+        configured_seeds = cfg.get("phase_c_seeds") or []
+    except Exception:
+        configured_seeds = []
+
+import statistics
+
+def _phase_c_render_multiseed(variant, c_dir):
+    """Render Phase C as a multi-seed aggregate row.
+
+    Returns True if any seed state was found (done or in-flight), False
+    if no seed sub-dirs exist (caller should fall back to legacy).
+    """
+    if not os.path.isdir(c_dir):
+        return False
+    seed_subdirs = sorted(
+        d for d in os.listdir(c_dir)
+        if d.startswith("seed") and os.path.isdir(os.path.join(c_dir, d))
+    )
+    if not seed_subdirs:
+        return False
+    completed = []
+    in_flight = []
+    for sd_name in seed_subdirs:
+        sd = os.path.join(c_dir, sd_name)
+        done_p = os.path.join(sd, "C_done.json")
+        if os.path.exists(done_p):
+            try:
+                d = json.load(open(done_p))
+                completed.append({
+                    "seed": sd_name.replace("seed", ""),
+                    "first": d.get("first_perfect_epoch"),
+                    "stable": d.get("stable_perfect_epoch"),
+                    "wall": d.get("wall_seconds"),
+                })
+            except Exception:
+                pass
+        else:
+            prog_p = os.path.join(sd, "progress.json")
+            if os.path.exists(prog_p):
+                try:
+                    pg = json.load(open(prog_p))
+                    in_flight.append({
+                        "seed": sd_name.replace("seed", ""),
+                        "epoch": pg.get("epoch"),
+                        "total": pg.get("total_epochs") or pg.get("target_epoch"),
+                        "fill_rate": pg.get("fill_rate"),
+                    })
+                except Exception:
+                    pass
+
+    n_target = len(configured_seeds) if configured_seeds else len(seed_subdirs)
+    n_done = len(completed)
+
+    # Build the variant-level header line.
+    if completed:
+        stables = [s["stable"] for s in completed if s["stable"] is not None]
+        firsts = [s["first"] for s in completed if s["first"] is not None]
+        stable_summary = ""
+        first_summary = ""
+        if stables:
+            mean_s = statistics.mean(stables)
+            std_s = statistics.pstdev(stables) if len(stables) > 1 else 0.0
+            stable_summary = (
+                f"stable=[{','.join(str(s) for s in stables)}] "
+                f"mean={mean_s:.1f}"
+                + (f" ±{std_s:.1f}" if len(stables) > 1 else "")
+            )
+        if firsts:
+            mean_f = statistics.mean(firsts)
+            first_summary = f"first mean={mean_f:.1f}"
+        head_label = "\x1b[32m✓\x1b[0m" if n_done >= n_target else "\x1b[33m◐\x1b[0m"
+        parts = [f"{n_done}/{n_target} seeds", stable_summary, first_summary]
+        summary = "  ".join(p for p in parts if p)
+        print(f"  {variant}/C:    {head_label} {summary}")
+    elif in_flight:
+        print(f"  {variant}/C:    \x1b[33m◐\x1b[0m 0/{n_target} seeds done")
+    else:
+        # Sub-dirs exist but nothing useful in them — show as starting
+        print(f"  {variant}/C:    \x1b[2m{n_target} seeds queued\x1b[0m")
+
+    # Per-seed in-flight detail line: classify each as paused/running/stopped.
+    for s in in_flight:
+        seed_num = s["seed"]
+        cur = s["epoch"]
+        total = s["total"]
+        fr = s["fill_rate"]
+        fr_str = f", fill={fr:.2f}" if isinstance(fr, (int, float)) else ""
+        # Pause attribution: paused.json says "during C, variant {v}, seed {s}"
+        is_paused_here = False
+        if paused_label.startswith("during "):
+            is_paused_here = (
+                f"during C" in paused_label
+                and f"variant {variant}" in paused_label
+                and f"seed {seed_num}" in paused_label
+            )
+        if is_paused_here:
+            lbl = "\x1b[33m⏸ paused\x1b[0m"
+        elif is_running:
+            lbl = "\x1b[36m▶ running\x1b[0m"
+        else:
+            lbl = "\x1b[31m✗ stopped\x1b[0m"
+        print(f"  {variant}/C/seed{seed_num}:    {lbl}  e{cur}/{total}{fr_str}")
+    return True
+
+
 # Render in deterministic order; include extended-run variants
 # (V3_extended / V4-V8) when their dirs exist.  Phase A may be
 # either a fresh A_done.json or a phase_a_reused.json marker.
@@ -1216,6 +1331,16 @@ for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5", "V6", "V7", "V8"):
                 tag = " (reused)"
             else:
                 marker = None
+        elif phase == "C":
+            # Multi-seed-aware Phase C rendering.  Tries seed sub-dirs first;
+            # falls back to legacy single-seed C_done.json when no seed
+            # sub-dirs exist.
+            if _phase_c_render_multiseed(variant, phase_dir):
+                any_state = True
+                continue
+            done_path = os.path.join(phase_dir, "C_done.json")
+            marker = done_path if os.path.exists(done_path) else None
+            tag = ""
         else:
             done_path = os.path.join(phase_dir, f"{phase}_done.json")
             marker = done_path if os.path.exists(done_path) else None
@@ -1276,29 +1401,65 @@ if os.path.exists(os.path.join(run_dir, "pre_decision.json")):
         print(f"  Decision:   winner={winner} reason={reason}")
     except Exception:
         pass
+if os.path.exists(os.path.join(run_dir, "multiseed_aggregate.json")):
+    try:
+        agg = json.load(open(os.path.join(run_dir, "multiseed_aggregate.json")))
+        seeds = agg.get("phase_c_seeds", [])
+        std = agg.get("pooled_stable_perfect_std")
+        std_str = f" pooled_std={std:.2f}" if std is not None else ""
+        print(f"  Aggregate:  seeds={seeds}{std_str}")
+    except Exception:
+        pass
 PYEOF
 
-        # In-flight phase: detect (variant, phase) pair with progress.json
-        # but no *_done.json, and render an epoch progress bar with ETA.
-        # This is the "tstatus is no longer misleading" fix — the user can
-        # see exactly where training was when it paused (or where it is
-        # currently working if the script is still running).
-        local current_var="" current_phase=""
+        # In-flight phase: detect (variant, phase[, seed]) tuple with
+        # progress.json but no *_done.json, and render an epoch progress
+        # bar with ETA.  Phase C in multi-seed mode lives under
+        # <variant>/C/seed<N>/, so the detector also descends into seed
+        # sub-dirs.  Whichever (variant, phase, seed) tuple is first found
+        # in deterministic order wins; subsequent ones surface in the
+        # per-seed lines emitted by _phase_c_render_multiseed.
+        local current_var="" current_phase="" current_seed=""
         for variant in V1 V2 V3 V3_extended V4 V5 V6 V7 V8; do
             local v_dir="$run_dir/$variant"
             [[ -d "$v_dir" ]] || continue
             for phase in A B C; do
                 local p_dir="$v_dir/$phase"
+                # Phase C multi-seed: iterate seed sub-dirs first.
+                if [[ "$phase" == "C" && -d "$p_dir" ]]; then
+                    local found_seed=""
+                    for sd in "$p_dir"/seed*/; do
+                        [[ -d "$sd" ]] || continue
+                        if [[ -f "$sd/progress.json" && ! -f "$sd/C_done.json" ]]; then
+                            found_seed=$(basename "$sd")
+                            break
+                        fi
+                    done
+                    if [[ -n "$found_seed" ]]; then
+                        current_var="$variant"
+                        current_phase="$phase"
+                        current_seed="$found_seed"
+                        break 2
+                    fi
+                fi
+                # Legacy single-seed C, or any A/B phase.
                 if [[ -f "$p_dir/progress.json" && ! -f "$p_dir/${phase}_done.json" ]]; then
                     current_var="$variant"
                     current_phase="$phase"
+                    current_seed=""
                     break 2
                 fi
             done
         done
         if [[ -n "$current_var" ]]; then
-            echo -e "  Current:    ${YELLOW}${current_var}/Phase ${current_phase}${RESET}"
-            _show_epoch_progress "$run_dir/$current_var/$current_phase" "${current_var}/${current_phase}"
+            local label_path="${current_var}/Phase ${current_phase}"
+            local progress_path="$run_dir/$current_var/$current_phase"
+            if [[ -n "$current_seed" ]]; then
+                label_path="${label_path}/${current_seed}"
+                progress_path="${progress_path}/${current_seed}"
+            fi
+            echo -e "  Current:    ${YELLOW}${label_path}${RESET}"
+            _show_epoch_progress "$progress_path" "${label_path}"
         fi
 
     elif [[ "$mode" == "scale" ]]; then
@@ -1416,12 +1577,49 @@ PYEOF
         echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped ${after}${epoch_at} — tresume 14 to continue)${RESET}"
     fi
 
-    # Only show "Final: complete" when no test14 process is running.
-    # results.json may exist (from an earlier 14a-pre completion) while a
-    # subsequent extended / scale / multiround run is mid-flight; in that
-    # case "complete" is misleading.
+    # "Final: complete" suppression rules:
+    # 1. results.json may exist from an earlier single-seed completion while
+    #    a subsequent extended/scale/multiround run is mid-flight; in that
+    #    case "complete" is misleading.
+    # 2. In multi-seed mode (run_config.json declares phase_c_seeds), the
+    #    legacy results.json reflects only the single-seed result, not the
+    #    multi-seed batch.  Suppress unless multiseed_aggregate.json shows
+    #    every variant has every requested seed done.
     if [[ -f "$run_dir/results.json" && -z "$running_flag" ]]; then
-        echo -e "  Final:      ${GREEN}complete${RESET}"
+        local has_multiseed=$(python3 -c "
+import json
+cfg=json.load(open('$run_dir/run_config.json'))
+print('1' if cfg.get('phase_c_seeds') else '')
+" 2>/dev/null)
+        if [[ -z "$has_multiseed" ]]; then
+            echo -e "  Final:      ${GREEN}complete${RESET}"
+        else
+            # Multi-seed: complete iff every variant×seed has C_done.json.
+            local multiseed_complete=$(python3 -c "
+import json, os
+cfg=json.load(open('$run_dir/run_config.json'))
+seeds=cfg.get('phase_c_seeds') or []
+for v in os.listdir('$run_dir'):
+    vdir=os.path.join('$run_dir', v)
+    if not os.path.isdir(vdir):
+        continue
+    cdir=os.path.join(vdir, 'C')
+    if not os.path.isdir(cdir):
+        continue
+    for s in seeds:
+        if not os.path.exists(os.path.join(cdir, f'seed{s}', 'C_done.json')):
+            print('')  # incomplete
+            break
+    else:
+        continue
+    break
+else:
+    print('1')
+" 2>/dev/null)
+            if [[ -n "$multiseed_complete" ]]; then
+                echo -e "  Final:      ${GREEN}multi-seed batch complete${RESET}"
+            fi
+        fi
     fi
 }
 
