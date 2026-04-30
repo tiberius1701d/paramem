@@ -222,3 +222,70 @@ class TestTrainAdapterResumeParam:
 
         assert isinstance(metrics, dict)
         assert "train_loss" in metrics
+
+
+class TestTrainAdapterSavePath:
+    """Regression: save_pretrained gets output_dir.parent so PEFT's auto-append
+    of the adapter name lands the weights at output_dir, not at
+    output_dir/adapter_name/. Without this, infra_paths' rglob picks up
+    unencrypted training-workspace safetensors and trips the startup
+    mode-consistency check.
+    """
+
+    @pytest.fixture()
+    def train_adapter_mocks(self, tmp_path):
+        with (
+            patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
+            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+        ):
+            mock_args = MagicMock()
+            mock_args_cls.return_value = mock_args
+            yield tmp_path
+
+    def test_save_pretrained_called_with_parent(self, train_adapter_mocks):
+        tmp_path = train_adapter_mocks
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+        # Mirror the production layout where _training_output_dir returns
+        # output_dir/<adapter_name> so PEFT auto-appending would double-nest.
+        out = tmp_path / "interim_20260430T1200" / "episodic_interim_20260430T1200"
+
+        train_adapter(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=_make_dataset(),
+            adapter_name="episodic_interim_20260430T1200",
+            training_config=_minimal_training_config(),
+            adapter_config=_minimal_adapter_config(),
+            output_dir=out,
+        )
+
+        # save_pretrained gets the parent so the appended adapter_name lands at out.
+        assert model.save_pretrained.called
+        save_args, save_kwargs = model.save_pretrained.call_args
+        save_dir = save_args[0] if save_args else save_kwargs.get("save_directory")
+        assert save_dir == str(out.parent)
+        # And the adapter_name is the one we asked PEFT to select.
+        selected = save_kwargs.get("selected_adapters") or save_args[1]
+        assert selected == ["episodic_interim_20260430T1200"]
+
+    def test_tokenizer_saved_to_output_dir(self, train_adapter_mocks):
+        """Tokenizer saves to output_dir directly (no auto-append behaviour)."""
+        tmp_path = train_adapter_mocks
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+        out = tmp_path / "cycle_5" / "episodic"
+
+        train_adapter(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=_make_dataset(),
+            adapter_name="episodic",
+            training_config=_minimal_training_config(),
+            adapter_config=_minimal_adapter_config(),
+            output_dir=out,
+        )
+
+        assert tokenizer.save_pretrained.called
+        tok_args, _ = tokenizer.save_pretrained.call_args
+        assert tok_args[0] == str(out)

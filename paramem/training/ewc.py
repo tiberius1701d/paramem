@@ -199,7 +199,9 @@ def train_adapter_ewc(
     result = trainer.train()
     metrics = result.metrics
 
-    model.save_pretrained(str(output_dir), selected_adapters=[adapter_name])
+    # PEFT appends adapter_name to save_directory; pass parent so weights
+    # land at output_dir (mirrors trainer.py:train_adapter).
+    model.save_pretrained(str(output_dir.parent), selected_adapters=[adapter_name])
     tokenizer.save_pretrained(str(output_dir))
 
     logger.info("EWC training complete: %s", metrics)
