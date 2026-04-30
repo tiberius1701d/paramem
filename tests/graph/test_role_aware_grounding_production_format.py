@@ -237,3 +237,154 @@ class TestDiagnosticModeRegression:
         assert dropped == []
         assert len(would_drop) == 1
         assert would_drop[0]["object"] == "Catalonia"
+
+
+class TestSyntheticFactExemption:
+    def test_synthetic_ungrounded_fact_is_kept(self):
+        """A synthetic fact whose object never appears in transcript is kept."""
+        transcript = _make_transcript([("user", "Hello there")])
+        facts = [
+            {
+                "subject": SPEAKER,
+                "predicate": "has_email",
+                "object": "alex@example.com",
+                "synthetic": True,
+            },
+        ]
+        kept, dropped, _ = _apply_grounding_gate(
+            facts,
+            transcript,
+            known_names={SPEAKER},
+            speaker_name=SPEAKER,
+            mode="off",
+        )
+        assert len(kept) == 1
+        assert kept[0]["object"] == "alex@example.com"
+        assert dropped == []
+
+    def test_synthetic_exempt_in_active_mode(self):
+        """Active mode also exempts synthetic facts."""
+        transcript = _make_transcript([("user", "Hello there")])
+        facts = [
+            {
+                "subject": SPEAKER,
+                "predicate": "has_phone",
+                "object": "+49 178 36 21 668",
+                "synthetic": True,
+            },
+        ]
+        kept, dropped, _ = _apply_grounding_gate(
+            facts,
+            transcript,
+            known_names={SPEAKER},
+            speaker_name=SPEAKER,
+            mode="active",
+        )
+        assert len(kept) == 1
+        assert dropped == []
+
+    def test_synthetic_exempt_in_diagnostic_mode(self):
+        """Diagnostic mode also exempts synthetic facts and never lists them
+        in would_drop."""
+        transcript = _make_transcript([("user", "Hello there")])
+        facts = [
+            {
+                "subject": SPEAKER,
+                "predicate": "has_linkedin",
+                "object": "linkedin.com/in/alex",
+                "synthetic": True,
+            },
+        ]
+        kept, dropped, would_drop = _apply_grounding_gate(
+            facts,
+            transcript,
+            known_names={SPEAKER},
+            speaker_name=SPEAKER,
+            mode="diagnostic",
+        )
+        assert len(kept) == 1
+        assert dropped == []
+        assert would_drop == []
+
+    def test_mixed_facts_only_extracted_gated(self):
+        """Mix of synthetic + extracted: synthetic kept, extracted gated."""
+        transcript = _make_transcript([("user", "I work at Acme")])
+        facts = [
+            # Synthetic: kept regardless of grounding.
+            {
+                "subject": SPEAKER,
+                "predicate": "has_email",
+                "object": "alex@example.com",
+                "synthetic": True,
+            },
+            # Extracted, grounded: kept.
+            {"subject": SPEAKER, "predicate": "works_at", "object": "Acme"},
+            # Extracted, ungrounded: dropped.
+            {"subject": SPEAKER, "predicate": "lives_in", "object": "Atlantis"},
+        ]
+        kept, dropped, _ = _apply_grounding_gate(
+            facts,
+            transcript,
+            known_names={SPEAKER},
+            speaker_name=SPEAKER,
+            mode="active",
+        )
+        kept_objects = {f["object"] for f in kept}
+        assert kept_objects == {"alex@example.com", "Acme"}
+        assert len(dropped) == 1
+        assert dropped[0]["object"] == "Atlantis"
+
+    def test_synthetic_falsey_values_not_exempt(self):
+        """Only literal ``True`` is exempt — falsey or missing means gated."""
+        transcript = _make_transcript([("user", "Hello there")])
+        facts = [
+            # Missing key — gated.
+            {"subject": SPEAKER, "predicate": "has_email", "object": "ungrounded@x.com"},
+            # synthetic=False — gated.
+            {
+                "subject": SPEAKER,
+                "predicate": "has_phone",
+                "object": "+1 555 0000",
+                "synthetic": False,
+            },
+            # synthetic="yes" (truthy non-True) — still gated; we want strict ``is True``.
+            {
+                "subject": SPEAKER,
+                "predicate": "has_url",
+                "object": "https://example.com",
+                "synthetic": "yes",
+            },
+        ]
+        kept, dropped, _ = _apply_grounding_gate(
+            facts,
+            transcript,
+            known_names={SPEAKER},
+            speaker_name=SPEAKER,
+            mode="active",
+        )
+        # All three should be ungrounded → dropped.
+        assert kept == []
+        assert len(dropped) == 3
+
+    def test_no_speaker_name_synthetic_still_exempt(self):
+        """When speaker_name is None, gate falls back to role-blind — synthetic
+        facts must still be exempt on that path too."""
+        transcript = "completely unrelated text"
+        facts = [
+            {
+                "subject": "Alice",
+                "predicate": "has_email",
+                "object": "alice@example.com",
+                "synthetic": True,
+            },
+        ]
+        kept, dropped, would_drop = _apply_grounding_gate(
+            facts,
+            transcript,
+            known_names=set(),
+            speaker_name=None,
+            mode="off",
+        )
+        assert len(kept) == 1
+        assert dropped == []
+        assert would_drop == []

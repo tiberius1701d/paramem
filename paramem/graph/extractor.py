@@ -2077,28 +2077,36 @@ def _apply_grounding_gate(
     ``speaker_name`` is required for ``diagnostic`` and ``active`` modes
     (it identifies whose turns count as ``[user]``).  When ``None`` the
     gate falls back to role-blind regardless of mode.
+
+    Facts with ``synthetic=True`` bypass grounding entirely (their objects
+    are pipeline-emitted scalars — emails, phones, URLs — not transcript
+    spans).
     """
     if mode not in _VALID_ROLE_AWARE_MODES:
         logger.warning("Unknown role_aware_grounding mode %r; falling back to 'off'", mode)
         mode = "off"
 
+    # Strict ``is True`` — no accidental bypass via stringly-typed flags.
+    synthetic_kept = [f for f in facts if f.get("synthetic") is True]
+    facts = [f for f in facts if f.get("synthetic") is not True]
+
     speaker_names = {speaker_name} if speaker_name else None
     if not speaker_names:
         # No speaker to anchor [user] spans against.  Behave as today.
         kept, dropped = _drop_ungrounded_facts(facts, transcript, known_names)
-        return kept, dropped, []
+        return synthetic_kept + kept, dropped, []
 
     if mode == "active":
         kept, dropped = _drop_ungrounded_facts(
             facts, transcript, known_names, speaker_names=speaker_names
         )
-        return kept, dropped, []
+        return synthetic_kept + kept, dropped, []
 
     # off or diagnostic: production result is the role-blind one.
     blind_kept, blind_dropped = _drop_ungrounded_facts(facts, transcript, known_names)
 
     if mode != "diagnostic":
-        return blind_kept, blind_dropped, []
+        return synthetic_kept + blind_kept, blind_dropped, []
 
     # Diagnostic: also run role-aware to compute *additional* would-drops.
     # Identity comparison is safe — _drop_ungrounded_facts doesn't copy facts.
@@ -2116,7 +2124,7 @@ def _apply_grounding_gate(
             len(blind_kept),
             len(blind_dropped),
         )
-    return blind_kept, blind_dropped, would_drop
+    return synthetic_kept + blind_kept, blind_dropped, would_drop
 
 
 def _drop_ungrounded_facts(
