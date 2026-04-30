@@ -84,9 +84,22 @@ class TestNormalizeExtraction:
         result = _normalize_extraction(data)
         assert result["relations"][0]["relation_type"] == "factual"
 
-    def test_invalid_entity_type_defaults_to_concept(self):
+    def test_novel_entity_type_passes_through(self):
+        # entity_type is open (no Literal enforcement). Model-emitted novel
+        # types like "widget", "product", "certification" pass through verbatim
+        # — the schema YAML's entity_types list is a soft prior for prompt
+        # examples, not a closed set.
         data = {
             "entities": [{"name": "X", "type": "widget"}],
+            "relations": [],
+        }
+        result = _normalize_extraction(data)
+        assert result["entities"][0]["entity_type"] == "widget"
+
+    def test_empty_entity_type_falls_back(self):
+        # Only missing/empty values fall back to the configured default.
+        data = {
+            "entities": [{"name": "X", "type": ""}],
             "relations": [],
         }
         result = _normalize_extraction(data)

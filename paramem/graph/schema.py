@@ -4,9 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from paramem.graph.schema_config import entity_types, relation_types
+from paramem.graph.schema_config import relation_types
 
-_EntityType = Literal[entity_types()]  # type: ignore[valid-type]
 _RelationType = Literal[relation_types()]  # type: ignore[valid-type]
 
 
@@ -14,7 +13,15 @@ class Entity(BaseModel):
     """A typed entity extracted from a session transcript."""
 
     name: str = Field(description="Canonical name of the entity")
-    entity_type: _EntityType = Field(description="Type of entity")
+    entity_type: str = Field(
+        description=(
+            "Entity type. Common values: person, place, organization, event, "
+            "preference, concept. Model may emit other types (product, "
+            "certification, program, paper, etc.); downstream code accepts "
+            "them. The schema YAML's entity_types list is a soft prior used "
+            "for prompt examples, not enforcement."
+        ),
+    )
     attributes: dict[str, str] = Field(
         default_factory=dict,
         description="Key-value attributes (e.g. age, role)",
