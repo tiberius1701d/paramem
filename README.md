@@ -122,7 +122,7 @@ Create a `.env` file in the project root. The server and experiment scripts load
 # .env
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 WANDB_API_KEY=<your wandb key>            # optional, for experiment tracking
-HF_DEACTIVATE_ASYNC_LOAD=1               # required on WSL2 for models >= 4B params
+# HF_DEACTIVATE_ASYNC_LOAD=1             # WSL2 dxg threaded-load workaround — see "Blackwell" note below
 
 # Server (required for HA integration)
 HA_URL=http://<your-ha-ip>:8123          # Home Assistant URL
@@ -227,6 +227,8 @@ export HF_DEACTIVATE_ASYNC_LOAD=1
 ```
 
 This forces sequential weight loading. Models load slightly slower but reliably. The issue is specific to WSL2's DirectX Graphics (dxg) layer — native Linux is unaffected.
+
+> **Note (2026-05):** This race no longer reproduced in our environment after updating to NVIDIA driver 596.36 (CUDA 13.2) on a Windows 11 host with `dxgkrnl.sys` 10.0.26100.8115 (KB5088467, 2026-04-14). Three cold loads of Mistral 7B in NF4 succeeded with the workaround disabled. The fix could live in either layer (Microsoft `dxgkrnl` or NVIDIA `libcuda`); we did not isolate it. The workaround may no longer be required on recent driver + Windows builds — try unsetting `HF_DEACTIVATE_ASYNC_LOAD` first, and only re-enable it if you still see `device not ready` on cold loads.
 
 **WSL2 Modern Standby (laptop GPUs):** Windows Modern Standby can power-cycle the GPU during idle periods, causing TDR BSOD (bugcheck 0x116) if a CUDA workload is active. The `acquire_gpu()` context manager in `experiments/utils/gpu_guard.py` prevents this by holding `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via a background PowerShell process for the duration of GPU workloads. This is automatic for all experiment scripts that use `acquire_gpu()`. A cooling pad is recommended for sustained workloads — the primary benefit is faster thermal recovery between runs rather than higher sustained clocks, as the TGP is the binding constraint under load.
 
