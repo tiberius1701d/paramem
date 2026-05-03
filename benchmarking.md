@@ -3194,7 +3194,7 @@ Outlines never worked in production — 0% success across all Tests 1-8 due to a
 
 ### v2: 7-stage privacy-aware pipeline (current)
 
-Anonymize → extract → SOTA enrich → deanonymize → residual sweep → grounding gate → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale.
+Extract → anonymize → leak-guard + repair → SOTA enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter → transcript-grounding gate. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by SOTA-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
 
 ## Extraction Probe Sweep (2026-04-17)
 
