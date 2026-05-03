@@ -30,6 +30,7 @@ def _make_graph(relations, entities=None):
             object=r[2],
             relation_type=r[3] if len(r) > 3 else "factual",
             confidence=r[4] if len(r) > 4 else 1.0,
+            speaker_id="Speaker0",
         )
         for r in relations
     ]

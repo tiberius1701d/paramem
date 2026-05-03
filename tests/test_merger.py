@@ -26,10 +26,18 @@ def session_graph_1():
         ],
         relations=[
             Relation(
-                subject="Alex", predicate="lives_in", object="Heilbronn", relation_type="factual"
+                subject="Alex",
+                predicate="lives_in",
+                object="Heilbronn",
+                relation_type="factual",
+                speaker_id="Speaker0",
             ),
             Relation(
-                subject="Alex", predicate="works_at", object="AutoMate", relation_type="factual"
+                subject="Alex",
+                predicate="works_at",
+                object="AutoMate",
+                relation_type="factual",
+                speaker_id="Speaker0",
             ),
         ],
     )
@@ -46,7 +54,11 @@ def session_graph_2():
         ],
         relations=[
             Relation(
-                subject="Alex", predicate="prefers", object="Python", relation_type="preference"
+                subject="Alex",
+                predicate="prefers",
+                object="Python",
+                relation_type="preference",
+                speaker_id="Speaker0",
             ),
         ],
     )
@@ -87,6 +99,7 @@ class TestPredicateNormalization:
                     predicate="works_at",
                     object="B",
                     relation_type="factual",
+                    speaker_id="Speaker0",
                 )
             ],
         )
@@ -103,6 +116,7 @@ class TestPredicateNormalization:
                     predicate="works at",
                     object="B",
                     relation_type="factual",
+                    speaker_id="Speaker0",
                 )
             ],
         )
@@ -175,7 +189,13 @@ class TestEdgeAggregation:
                 Entity(name="B", entity_type="place"),
             ],
             relations=[
-                Relation(subject="A", predicate="lives_in", object="B", relation_type="factual")
+                Relation(
+                    subject="A",
+                    predicate="lives_in",
+                    object="B",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
             ],
         )
         g2 = SessionGraph(
@@ -186,7 +206,13 @@ class TestEdgeAggregation:
                 Entity(name="B", entity_type="place"),
             ],
             relations=[
-                Relation(subject="A", predicate="lives_in", object="B", relation_type="factual")
+                Relation(
+                    subject="A",
+                    predicate="lives_in",
+                    object="B",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
             ],
         )
         merger.merge(g1)
@@ -207,8 +233,20 @@ class TestEdgeAggregation:
                 Entity(name="B", entity_type="organization"),
             ],
             relations=[
-                Relation(subject="A", predicate="works_at", object="B", relation_type="factual"),
-                Relation(subject="A", predicate="manages", object="B", relation_type="factual"),
+                Relation(
+                    subject="A",
+                    predicate="works_at",
+                    object="B",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                ),
+                Relation(
+                    subject="A",
+                    predicate="manages",
+                    object="B",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                ),
             ],
         )
         merger.merge(g1)

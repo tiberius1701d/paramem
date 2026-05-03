@@ -184,12 +184,14 @@ class TestExtractionPathParity:
                     predicate="lives_in",
                     object="Millfield",
                     relation_type="factual",
+                    speaker_id="Speaker0",
                 ),
                 Relation(
                     subject="Alex",
                     predicate="prefers",
                     object="Acme Radio",
                     relation_type="preference",
+                    speaker_id="Speaker0",
                 ),
             ],
         )
@@ -203,6 +205,7 @@ class TestExtractionPathParity:
                     predicate="listens_to",
                     object="The Kooks",
                     relation_type="preference",
+                    speaker_id="Speaker0",
                 ),
             ],
         )
@@ -365,6 +368,7 @@ class TestExtractionPathParity:
                     predicate="lives_in",
                     object="Millfield",
                     relation_type="factual",
+                    speaker_id="Speaker0",
                 ),
             ],
         )

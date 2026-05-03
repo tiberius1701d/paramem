@@ -31,6 +31,7 @@ def _make_graph_from_spec(
             object=o,
             relation_type="factual",
             confidence=1.0,
+            speaker_id="Speaker0",
         )
         for s, p, o in relations
     ]
