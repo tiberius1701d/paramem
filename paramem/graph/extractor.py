@@ -197,11 +197,7 @@ def _wait_for_gpu_ready(*, pre_settle_seconds: float = 10.0) -> None:
 # ---------------------------------------------------------------------------
 # Word-boundary substitution / matching helpers — replace fragile
 # ``re.sub(rf"\b{re.escape(name)}\b", ...)`` patterns on user-content text
-# with structural token walks.  The bounded internal placeholder grammars
-# (``_PLACEHOLDER_TOKEN_RE`` / ``_BRACED_PLACEHOLDER_RE`` etc.) keep their
-# regex form because they match strings we mint ourselves; these helpers
-# replace the regex sites that operate on free-form user transcripts /
-# LLM output, where the project rule rejects regex.
+# with structural token walks.
 # ---------------------------------------------------------------------------
 
 
@@ -1758,54 +1754,45 @@ def _sota_pipeline(
     # Skipped when _skip_sota=True (residual leak after repair with canonical mapping).
     updated_anon_transcript = None
     _sota_raw = None
+    sota_bindings: dict[str, str] = {}
     if _skip_sota:
-        # Skip SOTA — use filtered anon_facts as-is.
+        # Skip SOTA — use filtered anon_facts as-is. No new bindings since
+        # SOTA didn't run.
         enriched_anon = anon_facts
         logger.info(
             "Skipping SOTA enrichment (residual leak path); using %d fact(s)", len(anon_facts)
         )
     else:
-        # Brace every known placeholder at the SOTA boundary so the enricher sees a
-        # consistent `{Prefix_N}` convention throughout its input. SOTA continues the
-        # pattern for any new placeholders it introduces; we diff updated transcript
-        # vs input to recover their bindings.
-        known_placeholders = set(mapping.values())
-        braced_transcript = _brace_placeholders_in_text(anon_transcript, known_placeholders)
-        braced_facts = _brace_placeholders_in_facts(anon_facts, known_placeholders)
-        enriched_anon, updated_anon_transcript, _sota_raw, _sota_info = _filter_with_sota(
-            braced_facts,
+        # Send anon facts and transcript to SOTA as the local anonymizer
+        # produced them. The SOTA prompt's convention is "anonymizer
+        # placeholders are bare; only new entities introduced by SOTA use
+        # braced form (`{Prefix_N}`)". SOTA also returns explicit bindings
+        # for any braced placeholders it minted, so de-anonymization is
+        # pure dict substitution downstream — no transcript diff, no LLM
+        # call, no regex post-processing.
+        (
+            enriched_anon,
+            updated_anon_transcript,
+            sota_bindings,
+            _sota_raw,
+            _sota_info,
+        ) = _filter_with_sota(
+            anon_facts,
             api_key,
             provider,
             filter_model,
-            braced_transcript,
+            anon_transcript,
             endpoint=endpoint,
             max_tokens=max_tokens,
         )
-        # Persist SOTA-call telemetry: parse path, truncation flag, response size,
-        # salvage count. Lets us see truncation kill sites that were previously
-        # silent (strict-parse failure → legacy salvage of an unknown subset).
         if _sota_info:
             graph.diagnostics["sota_call_info"] = _sota_info
-        anon_transcript = braced_transcript  # bindings diff is against what we sent
         if enriched_anon is None:
             logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
             enriched_anon = anon_facts
 
         if not enriched_anon:
             logger.info("SOTA enrichment removed all relations")
-
-        # Step 2b: recover bindings for SOTA-introduced placeholders via transcript diff.
-        # SOTA must insert braced tokens (e.g. `{Event_1}`) in the updated transcript at
-        # the position of the span they represent. Ungrounded placeholders (those in
-        # facts but not in the updated transcript) are caught by the residual sweep below.
-        if updated_anon_transcript:
-            bindings = _extract_sota_bindings(anon_transcript, updated_anon_transcript)
-            for real_span, placeholder in bindings.items():
-                mapping.setdefault(real_span, placeholder)
-            if bindings:
-                logger.info("SOTA introduced %d new binding(s) via transcript diff", len(bindings))
-        # Strip braces from subject/object fields so downstream lookups use bare tokens.
-        enriched_anon = _strip_placeholder_braces(enriched_anon)
 
     # Step 3a: Plausibility on anonymized data (SOTA judge, stage="anon").
     # Only runs when: explicit SOTA provider, plausibility_stage=="anon", not _skip_sota,
@@ -1868,44 +1855,41 @@ def _sota_pipeline(
         graph.entities = []
         return graph
 
-    # Step 3b: De-anonymize — reverse the mapping for all surviving/new relations.
-    # Extended mapping from repair + SOTA bindings is already included in `mapping`.
-    reverse_mapping = {v: k for k, v in mapping.items()}
+    # Step 3b: De-anonymize via state-machine substitution.
+    #
+    # Uses the anonymizer mapping (real_name -> placeholder) plus SOTA's
+    # explicit ``new_entity_bindings`` (placeholder -> real_text) for any
+    # entities SOTA introduced. Pure dict substitution — no LLM call,
+    # no transcript diff, no regex. Replaces the previous regex chain
+    # (``_brace_placeholders_in_text/_in_facts`` + ``_extract_sota_bindings``
+    # + ``_strip_placeholder_braces`` + reverse-mapping substitution).
     from paramem.graph.schema import Entity, Relation
 
-    # Substring replacement via _substitute_whole_words: word-boundary
-    # anchored, longest-placeholder-first internally to prevent partial
-    # matches.  Handles composite strings like "Person_2's cousin" →
-    # "David's cousin" — the apostrophe is not a word character so the
-    # placeholder match terminates correctly at "Person_2".
-    _reverse_mapping = {
-        k: v for k, v in reverse_mapping.items() if isinstance(k, str) and isinstance(v, str) and k
+    # Reverse anonymizer mapping (placeholder -> real_name). Used by the
+    # entity-rebuild loop later to derive entity_type from the placeholder
+    # prefix.
+    reverse_mapping = {
+        v: k
+        for k, v in mapping.items()
+        if isinstance(k, str) and isinstance(v, str) and k
     }
 
-    def _deanonymize_field(value: str) -> str:
-        return _substitute_whole_words(value, _reverse_mapping)
-
-    deanon_facts = []
-    for fact in enriched_anon:
-        if not isinstance(fact, dict):
-            continue
-        deanon_facts.append(
-            {
-                **fact,
-                "subject": _deanonymize_field(fact.get("subject", "")),
-                "object": _deanonymize_field(fact.get("object", "")),
-            }
-        )
-
-    # Step 3c: Deterministic placeholder sweep — drop any fact where SOTA invented a
-    # placeholder or de-anon couldn't resolve one. Either case would ship a
-    # literal "Person_3" string into the adapter.
-    deanon_facts, dropped_facts = _strip_residual_placeholders(deanon_facts)
+    deanon_input_count = len(enriched_anon)
+    deanon_facts, dropped_facts = _apply_bindings(enriched_anon, mapping, sota_bindings)
     if dropped_facts:
         graph.diagnostics["residual_dropped_facts"] = dropped_facts
         logger.warning(
-            "Dropped %d fact(s) with residual placeholder strings post-de-anon.",
+            "Dropped %d fact(s) with residual placeholders post-substitution "
+            "(missing SOTA binding or anonymizer leak).",
             len(dropped_facts),
+        )
+    deanon_dropped = deanon_input_count - len(deanon_facts)
+    if deanon_dropped:
+        logger.info(
+            "De-anon: %d → %d facts (%d dropped)",
+            deanon_input_count,
+            len(deanon_facts),
+            deanon_dropped,
         )
 
     # Step 3d: Grounding gate — every surviving fact's subject and object must be
@@ -2427,6 +2411,77 @@ def _drop_ungrounded_facts(
 
         kept.append(f)
     return kept, dropped
+
+
+def _apply_bindings(
+    facts: list[dict],
+    mapping: dict[str, str],
+    sota_bindings: dict[str, str],
+) -> tuple[list[dict], list[dict]]:
+    """De-anonymize facts via state-machine substitution.
+
+    Combines two substitution sources into one pass:
+
+    * **Anonymizer mapping** (``mapping`` arg) — ``real_name -> placeholder``
+      from the local anonymizer pass. Reversed here; substituted via word-
+      boundary token walk so apostrophes / punctuation around bare tokens
+      don't break (``Person_2's cousin`` -> ``Tobias's cousin``).
+    * **SOTA bindings** (``sota_bindings`` arg) — ``placeholder_name -> real_text``
+      that SOTA emitted alongside its enriched facts. The braced literal
+      ``{Event_1}`` is matched and replaced directly (string substitution);
+      no diff against the updated transcript, no LLM call.
+
+    Facts whose subject or object still contains a placeholder pattern after
+    substitution are dropped via the existing residual sweep. Causes:
+      1. SOTA introduced a braced placeholder but omitted its binding.
+      2. SOTA emitted a bare placeholder that was never in the anonymizer
+         mapping (anonymizer leak).
+      3. Composite strings where one of multiple placeholders couldn't be
+         resolved.
+
+    Returns ``(kept_facts, dropped_facts)``.
+
+    Replaces the previous LLM-based deanon attempt that crashed on the
+    largest chunk's prompt with ``device not ready`` (VRAM exhaustion on
+    Mistral 7B at 8 GiB). Also replaces the regex-based binding recovery
+    (``_extract_sota_bindings``) which produced bogus mappings under
+    multi-token replace blocks (bug 5).
+    """
+    # Map braced literal -> real_text. SOTA's contract: binding key omits braces.
+    braced_map: dict[str, str] = {
+        f"{{{k}}}": v
+        for k, v in sota_bindings.items()
+        if isinstance(k, str) and isinstance(v, str) and k and v
+    }
+    # Map bare placeholder -> real_name (reversed anonymizer mapping).
+    bare_map: dict[str, str] = {
+        ph: real
+        for real, ph in mapping.items()
+        if isinstance(ph, str) and isinstance(real, str) and ph and real
+    }
+
+    substituted: list[dict] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        subj = str(f.get("subject", ""))
+        obj = str(f.get("object", ""))
+        # Step 1: substitute braced SOTA placeholders (literal string match —
+        # the braces make these unambiguous, no word-boundary needed).
+        for braced, real in braced_map.items():
+            if braced in subj:
+                subj = subj.replace(braced, real)
+            if braced in obj:
+                obj = obj.replace(braced, real)
+        # Step 2: substitute bare anonymizer placeholders (word-boundary so
+        # apostrophes and surrounding punctuation work).
+        subj = _substitute_whole_words(subj, bare_map)
+        obj = _substitute_whole_words(obj, bare_map)
+        substituted.append({**f, "subject": subj, "object": obj})
+
+    # Residual sweep catches unresolved placeholders (missing binding, anon
+    # leak, etc.). Reuses existing tested helper.
+    return _strip_residual_placeholders(substituted)
 
 
 def _strip_residual_placeholders(
@@ -3124,134 +3179,6 @@ def _parse_facts_response(raw: str | None, strict_array: bool = False) -> list[d
         return None
 
 
-_BRACED_PLACEHOLDER_RE = re.compile(r"\{(\w+_\d+)\}")
-# Match a bare placeholder token not already wrapped in braces (defensive: lets
-# _brace_placeholders_in_text be idempotent even on accidentally-pre-braced input).
-_BARE_PLACEHOLDER_RE = re.compile(r"(?<!\{)\b(\w+_\d+)\b(?!\})")
-
-
-def _brace_placeholders_in_text(text: str, placeholders: set[str]) -> str:
-    """Wrap each occurrence of known placeholder tokens in braces.
-
-    Applied at the SOTA boundary so the enricher sees a consistent
-    `{Prefix_N}` convention for every placeholder — both ours and any it
-    introduces. Bare tokens not in `placeholders` are left untouched (real
-    entity names with incidental digits like `user_42`).
-    """
-    if not text or not placeholders:
-        return text
-
-    def _wrap(m: re.Match) -> str:
-        return f"{{{m.group(1)}}}" if m.group(1) in placeholders else m.group(0)
-
-    return _BARE_PLACEHOLDER_RE.sub(_wrap, text)
-
-
-def _brace_placeholders_in_facts(facts: list[dict], placeholders: set[str]) -> list[dict]:
-    """Wrap subject/object placeholder tokens in braces (SOTA-facing form)."""
-    out = []
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
-        copy = dict(f)
-        for key in ("subject", "object"):
-            val = str(copy.get(key, ""))
-            if val in placeholders:
-                copy[key] = f"{{{val}}}"
-        out.append(copy)
-    return out
-
-
-def _extract_sota_bindings(old_transcript: str, new_transcript: str) -> dict[str, str]:
-    """Recover SOTA-introduced placeholder bindings via token-level span diff.
-
-    SOTA returns an updated transcript where newly-introduced entities are
-    marked as braced placeholders (``{Event_1}``) replacing the real span they
-    represent. This function aligns the two transcripts token-by-token and
-    reconstructs ``{real_span: placeholder}`` bindings for each replacement
-    block whose new segment contains exactly one brace marker.
-
-    Handles three observed SOTA output shapes:
-
-    * Clean replacement: ``Legend SAE Level 3 system → {Project_1}``.
-      Single-token new side, brace at token start.
-    * Punctuated brace: ``({Program_1},`` — brace embedded in a token with
-      surrounding punctuation. ``inline_brace_re.findall`` on the new
-      segment surfaces it regardless of token-boundary alignment.
-    * Restructured replacement: ``{Thing_5} laptop system →
-      Honda's {Project_1}``. SOTA un-anonymized + introduced + restructured.
-      The new segment is multi-token; we accept any segment that contains
-      exactly one brace marker. The recovered span may include surrounding
-      real text (which is fine — set-default into mapping is conservative).
-
-    Returns bindings with real spans stripped of trailing punctuation.
-    """
-    import difflib
-
-    old_toks = old_transcript.split()
-    new_toks = new_transcript.split()
-    matcher = difflib.SequenceMatcher(a=old_toks, b=new_toks)
-    bindings: dict[str, str] = {}
-    inline_brace_re = re.compile(r"\{(\w+_\d+)\}")
-    brace_token_re = re.compile(r"^\{(\w+_\d+)\}([.,;:!?)\]]*)$")
-    # Hoist pattern compile out of the loop — recompiling per iteration is wasteful
-    # and the None-vocab guard must be consistent across the entire diff pass.
-    _pat = anonymizer_placeholder_pattern()
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag != "replace":
-            continue
-        new_segment = " ".join(new_toks[j1:j2])
-        # Find brace markers anywhere in the new segment, not just at token
-        # start. SOTA may emit `({Program_1},` (parens around the brace) or
-        # multi-token segments (e.g. when SOTA also un-anonymizes a pre-existing
-        # placeholder while introducing a new one).
-        marker_matches = inline_brace_re.findall(new_segment)
-        if len(marker_matches) != 1:
-            # 0 markers: this replace block isn't a binding event, skip.
-            # 2+ markers: ambiguous — can't tell which span maps to which
-            # placeholder, skip for safety.
-            continue
-        placeholder = marker_matches[0]
-        span = " ".join(old_toks[i1:i2]).rstrip(".,;:!?'\")]")
-        # Defensive: skip placeholder→placeholder bindings. SOTA may brace a
-        # pre-existing bare placeholder (e.g. `Person_2` → `{Person_2}`) as
-        # "normalisation". The diff would record `span=Person_2` → placeholder
-        # `Person_2`. Adding that to the mapping (as `mapping["Person_2"] =
-        # "Person_2"`) would corrupt the reverse lookup — a later pair like
-        # `{Li Ming: Person_2}` gets overwritten, breaking de-anonymization.
-        # Reject both braced spans and bare-placeholder spans.
-        if (
-            brace_token_re.match(span)
-            or not span
-            or (_pat is not None and _pat.match(span))
-            or span == placeholder
-        ):
-            continue
-        if placeholder not in bindings.values():
-            bindings[span] = placeholder
-    return bindings
-
-
-def _strip_placeholder_braces(facts: list[dict]) -> list[dict]:
-    """Remove enclosing braces from placeholder references anywhere in subject/object.
-
-    Handles both exact-match (`{Event_1}` → `Event_1`) and inline occurrences
-    (`attended {Event_1}` → `attended Event_1`). Downstream de-anonymization
-    looks up bare placeholder tokens in the reverse mapping.
-    """
-    inline_brace_re = re.compile(r"\{(\w+_\d+)\}")
-    out: list[dict] = []
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
-        copy = dict(f)
-        for key in ("subject", "object"):
-            val = str(copy.get(key, ""))
-            copy[key] = inline_brace_re.sub(r"\1", val)
-        out.append(copy)
-    return out
-
-
 def _filter_with_sota(
     anon_facts: list[dict],
     api_key: str,
@@ -3262,11 +3189,21 @@ def _filter_with_sota(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
-) -> tuple[list[dict] | None, str | None, str | None, dict]:
+) -> tuple[list[dict] | None, str | None, dict[str, str], str | None, dict]:
     """SOTA enrichment pass — coreference + compound splitting + safe reification.
 
-    Returns ``(facts, updated_transcript, raw_response, info)``. ``info`` is
-    a dict with diagnostic flags the caller persists into ``graph.diagnostics``:
+    Returns ``(facts, updated_transcript, new_entity_bindings, raw_response, info)``.
+
+    ``new_entity_bindings`` maps each new braced placeholder SOTA introduced
+    (without braces, e.g. ``"Event_1"``) to the exact transcript span it stands
+    for. Empty dict when SOTA introduced no new entities or used the legacy
+    response shape that lacked the field. SOTA already knows the binding at
+    the moment it mints each placeholder, so emitting it explicitly removes
+    the entire transcript-diff reconstruction problem the previous pipeline
+    used to do post-hoc.
+
+    ``info`` is a dict with diagnostic flags the caller persists into
+    ``graph.diagnostics``:
 
     - ``parse_path``: ``"preferred"`` (strict JSON, dict with ``facts`` + ``updated_transcript``)
       or ``"legacy_fallback"`` (response failed strict parse; bare-array salvage).
@@ -3277,10 +3214,14 @@ def _filter_with_sota(
       decisions and budget tracking.
     - ``preferred_fact_count`` / ``legacy_fact_count``: count after each parse path,
       whichever ran. Lets us measure salvage rate when truncation hits.
+    - ``new_entity_bindings_count``: number of SOTA-introduced placeholders for
+      which the response carried an explicit binding. Useful to spot when the
+      model omits the field (legacy-shape responses surface as 0).
 
-    Legacy responses (bare JSON array, no transcript) are accepted — in that
-    case ``updated_transcript`` is None and callers must fall back to the
-    registry-based drop filter for any unresolved placeholders.
+    Legacy responses (bare JSON array, or dict missing ``new_entity_bindings``)
+    are accepted — in that case bindings is ``{}`` and any braced placeholders
+    in the facts will fail substitution downstream and the corresponding facts
+    will be dropped by the residual sweep / grounding gate.
     """
     enrichment_prompt = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
     prompt = enrichment_prompt.format(
@@ -3299,16 +3240,26 @@ def _filter_with_sota(
         timeout_seconds=timeout_seconds,
     )
     if raw is None:
-        return None, None, None, {"parse_path": "no_response"}
+        return None, None, {}, None, {"parse_path": "no_response"}
     info: dict = {"response_chars": len(raw)}
-    # Preferred schema: {"facts": [...], "updated_transcript": "..."}
+    # Preferred schema:
+    # {"facts": [...], "updated_transcript": "...", "new_entity_bindings": {...}}
     try:
         parsed = json.loads(_extract_json_block(raw))
         if isinstance(parsed, dict) and isinstance(parsed.get("facts"), list):
+            bindings_raw = parsed.get("new_entity_bindings") or {}
+            bindings: dict[str, str] = {}
+            if isinstance(bindings_raw, dict):
+                bindings = {
+                    str(k): str(v)
+                    for k, v in bindings_raw.items()
+                    if isinstance(k, str) and isinstance(v, str) and k and v
+                }
             info["parse_path"] = "preferred"
             info["response_truncated"] = False
             info["preferred_fact_count"] = len(parsed["facts"])
-            return parsed["facts"], parsed.get("updated_transcript"), raw, info
+            info["new_entity_bindings_count"] = len(bindings)
+            return parsed["facts"], parsed.get("updated_transcript"), bindings, raw, info
     except (json.JSONDecodeError, ValueError):
         pass
     # Legacy / salvage: strict parse failed. Most common cause is max_tokens
@@ -3317,6 +3268,7 @@ def _filter_with_sota(
     info["parse_path"] = "legacy_fallback"
     info["response_truncated"] = True
     info["legacy_fact_count"] = len(salvaged) if salvaged else 0
+    info["new_entity_bindings_count"] = 0
     logger.warning(
         "SOTA strict-parse failed; salvaged %d fact(s) via legacy fallback "
         "(response_chars=%d, max_tokens=%d) — likely truncation",
@@ -3324,7 +3276,7 @@ def _filter_with_sota(
         info["response_chars"],
         max_tokens,
     )
-    return salvaged, None, raw, info
+    return salvaged, None, {}, raw, info
 
 
 # ---------------------------------------------------------------------------
