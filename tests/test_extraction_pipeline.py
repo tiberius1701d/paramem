@@ -611,7 +611,7 @@ class TestSOTANoiseFilter:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(None, None, None, {}),
+                return_value=(None, None, {}, None, {}),
             ),
         ):
             result = _sota_pipeline(graph, "transcript", None, None)
@@ -646,7 +646,7 @@ class TestSOTANoiseFilter:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, None, {}),
+                return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
             result = _sota_pipeline(graph, "transcript", None, None)
@@ -691,7 +691,7 @@ class TestSOTANoiseFilter:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, None, {}),
+                return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
             result = _sota_pipeline(graph, transcript, None, None)
@@ -930,7 +930,7 @@ class TestSOTANoiseFilter:
 
         def fake_filter(facts, *args, **kwargs):
             filter_calls.append(list(facts))
-            return facts, None, None, {}
+            return facts, None, {}, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -976,7 +976,7 @@ class TestSOTANoiseFilter:
 
         def fake_filter(facts, *args, **kwargs):
             filter_calls.append(list(facts))
-            return facts, None, None, {}
+            return facts, None, {}, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1014,89 +1014,135 @@ class TestSOTANoiseFilter:
         assert stats == {"inverted": 1, "dropped": 0}
 
 
-class TestSOTAEntityBindings:
-    def test_extract_sota_bindings_basic(self):
-        """Braced placeholders in the updated transcript yield real-span bindings."""
-        from paramem.graph.extractor import _extract_sota_bindings
+class TestApplyBindings:
+    """Unit tests for the state-machine de-anonymization helper that replaces
+    the previous LLM-based deanon attempt and the regex-based binding
+    recovery (``_extract_sota_bindings``).
 
-        old = "Person_1 organized a community fitness event at the local gym."
-        new = "Person_1 organized {Event_1} at {Location_1}."
-        bindings = _extract_sota_bindings(old, new)
-        assert "a community fitness event" in bindings
-        assert bindings["a community fitness event"] == "Event_1"
-        assert bindings["the local gym"] == "Location_1"
+    The LLM-deanon caused VRAM exhaustion on the largest chunk's prompt
+    (mapping + 2 transcripts + facts JSON). The redesign moves binding
+    knowledge into SOTA's response (``new_entity_bindings``) and reduces
+    deanon to pure dict substitution — no LLM call, no transcript
+    reconstruction, no regex."""
 
-    def test_extract_sota_bindings_no_changes(self):
-        """Identical transcripts produce no bindings."""
-        from paramem.graph.extractor import _extract_sota_bindings
-
-        t = "Person_1 lives in City_1."
-        assert _extract_sota_bindings(t, t) == {}
-
-    def test_extract_sota_bindings_punctuated_brace(self):
-        """SOTA can wrap the brace in surrounding punctuation, e.g.
-        '({Program_1}, value)'. The token boundary doesn't put the brace at
-        the start. inline_brace_re.findall on the new segment surfaces the
-        marker regardless of token alignment."""
-        from paramem.graph.extractor import _extract_sota_bindings
-
-        old = "Identified the platform in crisis worth €200M+ value."
-        new = "Identified the platform in crisis ({Program_1}, €200M+ value)."
-        bindings = _extract_sota_bindings(old, new)
-        # A binding for Program_1 must be recovered (semantic precision is
-        # imperfect when SOTA restructures, but a binding is recovered so the
-        # downstream fact survives instead of being dropped).
-        assert "Program_1" in bindings.values()
-
-    def test_extract_sota_bindings_multi_token_new(self):
-        """SOTA can restructure: replacing a multi-token old span with a
-        multi-token new segment that contains exactly one brace marker.
-        This covers the case where SOTA both un-anonymizes a pre-existing
-        placeholder AND introduces a new one in the same diff block."""
-        from paramem.graph.extractor import _extract_sota_bindings
-
-        old = "developed the system extensively"
-        new = "developed Honda's {Project_1} extensively"
-        bindings = _extract_sota_bindings(old, new)
-        assert "Project_1" in bindings.values()
-
-    def test_extract_sota_bindings_ambiguous_segment_skipped(self):
-        """When a single replace block contains multiple brace markers, the
-        binding cannot be disambiguated and we skip it for safety. Better
-        no-binding than a wrong-binding."""
-        from paramem.graph.extractor import _extract_sota_bindings
-
-        old = "the team scaled significantly"
-        new = "the team {Team_1} scaled to {Scale_1} significantly"
-        bindings = _extract_sota_bindings(old, new)
-        assert bindings == {}
-
-    def test_strip_placeholder_braces(self):
-        """Braces are removed from subject/object; other fields untouched."""
-        from paramem.graph.extractor import _strip_placeholder_braces
+    def test_substitutes_anonymizer_placeholders(self):
+        """Bare anonymizer placeholders (Person_1, Org_1) substitute via
+        the reversed mapping."""
+        from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "{Event_1}", "predicate": "located_at", "object": "{Location_1}"},
-            {"subject": "Person_1", "predicate": "organized", "object": "{Event_1}"},
+            {"subject": "Person_1", "predicate": "works_at", "object": "Org_1",
+             "relation_type": "factual", "confidence": 1.0},
         ]
-        out = _strip_placeholder_braces(facts)
-        assert out[0]["subject"] == "Event_1"
-        assert out[0]["object"] == "Location_1"
-        assert out[1]["subject"] == "Person_1"
-        assert out[1]["object"] == "Event_1"
+        mapping = {"Alice": "Person_1", "Acme": "Org_1"}
+        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        assert dropped == []
+        assert kept[0]["subject"] == "Alice"
+        assert kept[0]["object"] == "Acme"
 
-    def test_strip_placeholder_braces_inline(self):
-        """Inline braced tokens inside longer strings are also stripped."""
-        from paramem.graph.extractor import _strip_placeholder_braces
+    def test_substitutes_braced_sota_bindings(self):
+        """SOTA-introduced braced placeholders ({Event_1}) substitute via
+        explicit bindings without needing transcript reconstruction."""
+        from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "attended", "object": "meeting at {Event_1}"},
-            {"subject": "{Person_2}'s cousin", "predicate": "visited", "object": "home"},
+            {"subject": "Person_1", "predicate": "attended", "object": "{Event_1}",
+             "relation_type": "factual", "confidence": 1.0},
         ]
-        out = _strip_placeholder_braces(facts)
-        assert out[0]["object"] == "meeting at Event_1"
-        assert out[1]["subject"] == "Person_2's cousin"
+        mapping = {"Alice": "Person_1"}
+        bindings = {"Event_1": "the agile transformation workshop"}
+        kept, dropped = _apply_bindings(facts, mapping, bindings)
+        assert dropped == []
+        assert kept[0]["subject"] == "Alice"
+        assert kept[0]["object"] == "the agile transformation workshop"
 
+    def test_substitutes_compound_objects(self):
+        """Bare placeholder embedded in literal text — `Org_1 Hungary`
+        becomes `Acme Hungary` (the failure mode that bug 5 produced
+        bogus bindings for under the old regex pipeline)."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {"subject": "Person_1", "predicate": "based_in", "object": "Org_1 Hungary",
+             "relation_type": "factual", "confidence": 1.0},
+        ]
+        mapping = {"Alice": "Person_1", "Acme": "Org_1"}
+        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        assert dropped == []
+        assert kept[0]["object"] == "Acme Hungary"
+
+    def test_drops_facts_with_unresolved_placeholders(self):
+        """Facts whose subject/object retain a placeholder pattern after
+        substitution get dropped (residual sweep). Causes: SOTA emitted a
+        braced placeholder without including it in bindings, anonymizer
+        leak, etc."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {"subject": "Person_1", "predicate": "knows", "object": "Person_99",
+             "relation_type": "social", "confidence": 1.0},
+            {"subject": "Person_1", "predicate": "attended", "object": "{Event_1}",
+             "relation_type": "factual", "confidence": 1.0},
+        ]
+        mapping = {"Alice": "Person_1"}
+        # No binding for Event_1; no mapping for Person_99.
+        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        assert kept == []
+        assert len(dropped) == 2
+
+    def test_handles_apostrophes_at_word_boundary(self):
+        """`Person_2's cousin` substitutes Person_2 cleanly without breaking
+        on the apostrophe (existing _substitute_whole_words behaviour)."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {"subject": "Person_1", "predicate": "visited", "object": "Person_2's cousin",
+             "relation_type": "social", "confidence": 1.0},
+        ]
+        mapping = {"Alice": "Person_1", "Bob": "Person_2"}
+        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        assert dropped == []
+        assert kept[0]["object"] == "Bob's cousin"
+
+    def test_mixed_bare_and_braced_in_same_fact(self):
+        """A single fact with both a bare anonymizer placeholder and a
+        braced SOTA placeholder substitutes both."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {"subject": "Person_1", "predicate": "led", "object": "{Event_1} at Org_1",
+             "relation_type": "factual", "confidence": 1.0},
+        ]
+        mapping = {"Alice": "Person_1", "Acme": "Org_1"}
+        bindings = {"Event_1": "the workshop"}
+        kept, dropped = _apply_bindings(facts, mapping, bindings)
+        assert dropped == []
+        assert kept[0]["subject"] == "Alice"
+        assert kept[0]["object"] == "the workshop at Acme"
+
+    def test_empty_inputs_return_empty(self):
+        from paramem.graph.extractor import _apply_bindings
+
+        kept, dropped = _apply_bindings([], {}, {})
+        assert kept == []
+        assert dropped == []
+
+    def test_preserves_other_fact_fields(self):
+        """relation_type, confidence, and any extra fields pass through."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {"subject": "Person_1", "predicate": "knows", "object": "Person_2",
+             "relation_type": "social", "confidence": 0.7, "synthetic": False},
+        ]
+        mapping = {"Alice": "Person_1", "Bob": "Person_2"}
+        kept, _ = _apply_bindings(facts, mapping, sota_bindings={})
+        assert kept[0]["relation_type"] == "social"
+        assert kept[0]["confidence"] == 0.7
+        assert kept[0]["synthetic"] is False
+
+
+class TestResidualSweepCatchesEmbeddedPlaceholders:
     def test_strip_residual_placeholders_catches_bare_and_composite(self):
         """Residual sweep drops facts with any placeholder-shaped token, bare or composite."""
         from paramem.graph.extractor import _strip_residual_placeholders
@@ -1770,7 +1816,7 @@ class TestPlausibilityAnon:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None, {}),
+                return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._plausibility_filter_with_sota",
@@ -1833,7 +1879,7 @@ class TestPlausibilityDeanon:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None, {}),
+                return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._local_plausibility_filter",
@@ -1901,7 +1947,7 @@ class TestResidualLeakDropsReferencingTriples:
 
         def fake_sota(facts, *args, **kwargs):
             sota_calls.append(list(facts))
-            return facts, None, None, {}
+            return facts, None, {}, None, {}
 
         # Mock repair to return anon_facts that STILL contain Ghost (residual leak)
         def fake_repair(
@@ -2034,7 +2080,7 @@ class TestAllDroppedSafetyNet:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_ungrounded, None, None, {}),
+                return_value=(enriched_ungrounded, None, {}, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._fallback_plausibility_on_raw",
@@ -2089,7 +2135,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None, {}),
+                return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
             result = _sota_pipeline(
@@ -2130,7 +2176,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None, {}),
+                return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
             result = _sota_pipeline(
@@ -2184,7 +2230,7 @@ class TestEntityTypePreservation:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_anon, None, None, {}),
+                return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
             result = _sota_pipeline(
@@ -2385,7 +2431,7 @@ class TestExtractGraphNewKwargs:
 
         def fake_sota(facts, *args, **kwargs):
             sota_calls.append(list(facts))
-            return facts, None, None, {}
+            return facts, None, {}, None, {}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -2443,7 +2489,7 @@ class TestDiagnosticsKeys:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None, {}),
+                return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
                 "paramem.graph.extractor._local_plausibility_filter",
@@ -2486,7 +2532,7 @@ class TestDiagnosticsKeys:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(anon_facts, None, None, {}),
+                return_value=(anon_facts, None, {}, None, {}),
             ),
         ):
             result = _sota_pipeline(

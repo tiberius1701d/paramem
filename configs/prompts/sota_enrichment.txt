@@ -50,12 +50,29 @@ You may introduce new placeholder entities (e.g. `{{Event_1}}`, `{{Topic_1}}`, `
 Pre-existing placeholders from the anonymizer are BARE (`Person_1`, `City_1`). Leave them bare in your output. Only placeholders YOU introduce use braced form (`{{Event_1}}`, `{{Topic_1}}`).
 
 ## Output format
-Return ONLY a JSON object with exactly two keys:
+Return ONLY a JSON object with exactly three keys:
 - `"facts"`: array of facts. Each has subject, predicate, object, relation_type, confidence. New placeholders appear in braced form `{{Event_1}}`.
 - `"updated_transcript"`: the anonymized transcript with your new braced placeholders substituted in place of the spans they represent. All other text verbatim.
+- `"new_entity_bindings"`: dict mapping each NEW braced placeholder you introduced (without braces, e.g. `"Event_1"`) to the EXACT real-text span from the transcript it replaced (e.g. `"agile transformation workshop"`). Required for every placeholder appearing in `facts` that you minted yourself. Pre-existing bare placeholders (Person_1, City_1, ...) are NOT included — those mappings are already known by the caller. Empty `{{}}` if you introduced no new entities.
+
+Why bindings: the caller does pure-substitution de-anonymization downstream. It needs to know what real text each `{{Event_1}}`-style placeholder stands for. The transcript is too long for token-level diff to be safe, and you (the writer) already know the binding at the moment you mint the placeholder.
+
+POSITIVE example output (excerpt):
+{{
+  "facts": [
+    {{"subject": "Person_1", "predicate": "led", "object": "{{Event_1}}", "relation_type": "factual", "confidence": 1.0}},
+    {{"subject": "Person_1", "predicate": "works_at", "object": "Org_1", "relation_type": "factual", "confidence": 1.0}}
+  ],
+  "updated_transcript": "...Person_1 led {{Event_1}} at Org_1...",
+  "new_entity_bindings": {{
+    "Event_1": "the agile transformation initiative"
+  }}
+}}
+
+Notice: `Org_1` (anonymizer-introduced, bare) is NOT in `new_entity_bindings`. `{{Event_1}}` (you introduced it) IS, with its exact transcript text as the value.
 
 Set confidence to 0.9 for coreference-resolved facts, 0.8 for inferred facts. Keep original confidence for unchanged facts.
-If no facts survive, return `{{"facts": [], "updated_transcript": "..."}}` with the transcript unchanged.
+If no facts survive, return `{{"facts": [], "updated_transcript": "...", "new_entity_bindings": {{}} }}` with the transcript unchanged.
 
 Conversation transcript (anonymized):
 {transcript}
