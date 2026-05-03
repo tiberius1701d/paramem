@@ -786,6 +786,7 @@ def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypa
                     object="Acme",
                     relation_type="factual",
                     confidence=1.0,
+                    speaker_id="Speaker0",
                 )
             ],
             summary="Alice works at Acme.",

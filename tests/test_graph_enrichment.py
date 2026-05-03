@@ -892,8 +892,20 @@ class TestInterimEnrichmentHook:
                 Entity(name="B", entity_type="person"),
             ],
             relations=[
-                Relation(subject="A", predicate="knows", object="B", relation_type="social"),
-                Relation(subject="B", predicate="knows", object="A", relation_type="social"),
+                Relation(
+                    subject="A",
+                    predicate="knows",
+                    object="B",
+                    relation_type="social",
+                    speaker_id="Speaker0",
+                ),
+                Relation(
+                    subject="B",
+                    predicate="knows",
+                    object="A",
+                    relation_type="social",
+                    speaker_id="Speaker0",
+                ),
             ],
         )
 

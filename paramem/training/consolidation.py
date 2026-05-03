@@ -517,6 +517,7 @@ class ConsolidationLoop:
             verify_anonymization=pick("verify_anonymization", self.extraction_verify_anonymization),
             role_aware_grounding=pick("role_aware_grounding", self.extraction_role_aware_grounding),
             pii_scope=pick("pii_scope", self.extraction_pii_scope),
+            speaker_id=overrides.get("speaker_id", ""),
             system_prompt_filename=system_prompt_filename,
             user_prompt_filename=user_prompt_filename,
         )
@@ -595,6 +596,7 @@ class ConsolidationLoop:
         speaker_name: str | None = None,
         stt_correction: bool | None = None,
         source_type: str = "transcript",
+        speaker_id: str = "",
     ):
         """Single entry-point to ``extract_procedural_graph`` with adapter guard.
 
@@ -604,6 +606,9 @@ class ConsolidationLoop:
         It also flips the ``stt_correction`` default to ``False`` for the
         same reason as ``_extraction_kwargs`` — written text has no STT
         artefact surface.  Explicit ``stt_correction`` overrides still win.
+
+        ``speaker_id`` is stamped onto every ``Relation`` produced by the
+        procedural extractor as provenance.
         """
         from peft import PeftModel as _PeftModel
 
@@ -625,6 +630,7 @@ class ConsolidationLoop:
             prompts_dir=self.prompts_dir,
             stt_correction=stt,
             speaker_name=speaker_name,
+            speaker_id=speaker_id,
             system_prompt_filename=system_prompt_filename,
             user_prompt_filename=user_prompt_filename,
         )
@@ -693,6 +699,7 @@ class ConsolidationLoop:
             noise_filter_model=noise_filter_model,
             noise_filter_endpoint=noise_filter_endpoint,
             speaker_name=speaker_name,
+            speaker_id=speaker_id,
             ner_check=ner_check,
             ner_model=ner_model,
             plausibility_judge=plausibility_judge,
@@ -738,6 +745,7 @@ class ConsolidationLoop:
                 speaker_name=speaker_name,
                 stt_correction=stt_correction,
                 source_type=source_type,
+                speaker_id=speaker_id,
             )
             procedural_rels.extend(
                 {
@@ -1327,6 +1335,7 @@ class ConsolidationLoop:
             session_id,
             source_type=source_type,
             speaker_name=speaker_name,
+            speaker_id=speaker_id,
         )
 
         result.entities_extracted = len(session_graph.entities)
@@ -1375,6 +1384,7 @@ class ConsolidationLoop:
                 session_id,
                 speaker_name=speaker_name,
                 source_type=source_type,
+                speaker_id=speaker_id,
             )
             procedural_rels.extend(
                 {

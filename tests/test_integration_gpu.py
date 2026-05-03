@@ -173,6 +173,7 @@ class TestSOTAFullFlow:
                     object="Millfield",
                     relation_type="factual",
                     confidence=1.0,
+                    speaker_id="Speaker0",
                 ),
             ],
         )

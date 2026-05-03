@@ -508,6 +508,7 @@ def extract_procedural_graph(
     prompts_dir: str | Path | None = None,
     stt_correction: bool = True,
     speaker_name: str | None = None,
+    speaker_id: str = "",
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
 ) -> SessionGraph:
@@ -522,6 +523,9 @@ def extract_procedural_graph(
             so the model uses the real name as the subject of every extracted
             preference instead of the ``SPEAKER_NAME`` slot. Mirrors
             the same parameter on ``extract_graph``.
+        speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
+            ``Relation`` extracted in this pass as provenance. Defaults to
+            ``""`` for backward compatibility; callers should always supply.
         stt_correction: Correct entity names from the assistant response turn.
             This is a no-op when
             ``user_prompt_filename=DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME``
@@ -579,6 +583,10 @@ def extract_procedural_graph(
         data["session_id"] = session_id
         data["timestamp"] = datetime.now(timezone.utc).isoformat()
         data = _normalize_extraction(data)
+        # Stamp speaker_id onto every relation dict before schema validation.
+        # Relation.speaker_id is mandatory; the LLM output never includes it.
+        for rel_dict in data.get("relations", []):
+            rel_dict.setdefault("speaker_id", speaker_id)
         graph = SessionGraph.model_validate(data)
     except Exception as exc:
         logger.warning("Procedural extraction failed (%s), returning empty", exc)
@@ -615,6 +623,7 @@ def extract_graph(
     noise_filter_model: str = "claude-sonnet-4-6",
     noise_filter_endpoint: str | None = None,
     speaker_name: str | None = None,
+    speaker_id: str = "",
     ner_check: bool = False,
     ner_model: str = "en_core_web_sm",
     plausibility_judge: str = "auto",
@@ -657,6 +666,10 @@ def extract_graph(
         plausibility_stage: When to run plausibility ("deanon"=after de-anon,
             "anon"=on anonymized data with SOTA judge).
         verify_anonymization: Run forward-path privacy guard before SOTA (default True).
+        speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
+            ``Relation`` produced by this extraction pass as provenance.
+            Defaults to ``""`` for backward compatibility; callers should
+            supply the session's speaker ID.
         system_prompt_filename: Filename of the system prompt within the prompts
             directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
             (``"extraction_system.txt"``); pass
@@ -681,7 +694,7 @@ def extract_graph(
     logger.debug("Raw extraction output: %s", raw_output[:500])
 
     try:
-        graph = _parse_extraction(raw_output, session_id)
+        graph = _parse_extraction(raw_output, session_id, speaker_id=speaker_id)
     except Exception as exc:
         logger.warning(
             "Extraction parsing failed (%s), returning empty graph",
@@ -719,6 +732,7 @@ def extract_graph(
             plausibility_stage=plausibility_stage,
             verify_anonymization=verify_anonymization,
             speaker_name=speaker_name,
+            speaker_id=speaker_id,
             role_aware_grounding=role_aware_grounding,
             pii_scope=pii_scope,
             max_tokens=max_tokens,
@@ -950,7 +964,7 @@ def _generate_extraction(
     )
 
 
-def _parse_extraction(raw_output: str, session_id: str) -> SessionGraph:
+def _parse_extraction(raw_output: str, session_id: str, speaker_id: str = "") -> SessionGraph:
     """Parse raw model output into a SessionGraph.
 
     Handles non-standard field names, array-valued fields, and other
@@ -958,6 +972,13 @@ def _parse_extraction(raw_output: str, session_id: str) -> SessionGraph:
     emit a bare JSON array of fact dicts instead of the expected
     ``{"entities": [...], "relations": [...]}`` envelope; that case is
     rewrapped here so downstream normalization can proceed.
+
+    Args:
+        raw_output: Raw model output string.
+        session_id: Session identifier for the graph.
+        speaker_id: Speaker store ID stamped onto every relation as provenance.
+            Defaults to ``""`` for backward compatibility; callers should
+            supply the session's speaker ID.
     """
     json_str = _extract_json_block(raw_output)
     data = json.loads(json_str)
@@ -967,14 +988,17 @@ def _parse_extraction(raw_output: str, session_id: str) -> SessionGraph:
         # walks ``relations`` and infers the entity set from subject/object.
         data = {"relations": data, "entities": []}
     elif not isinstance(data, dict):
-        raise ValueError(
-            f"Unexpected extraction payload type: {type(data).__name__}"
-        )
+        raise ValueError(f"Unexpected extraction payload type: {type(data).__name__}")
 
     data["session_id"] = session_id
     data["timestamp"] = datetime.now(timezone.utc).isoformat()
 
     data = _normalize_extraction(data)
+
+    # Stamp speaker_id onto every relation dict before schema validation.
+    # Relation.speaker_id is mandatory; the LLM output never includes it.
+    for rel_dict in data.get("relations", []):
+        rel_dict.setdefault("speaker_id", speaker_id)
 
     graph = SessionGraph.model_validate(data)
     logger.info(
@@ -1139,6 +1163,11 @@ def _normalize_extraction(data: dict) -> dict:
             raw_type = rel.get("relation_type") or rel.get("type", "factual")
             fb_rtype = fallback_relation_type()
             norm["relation_type"] = raw_type if raw_type in set(relation_types()) else fb_rtype
+            # Preserve speaker_id if already present (stamped upstream).
+            # Production code stamps it after _normalize_extraction; round-trip
+            # paths (tests, restore flows) may supply it in the raw dict.
+            if "speaker_id" in rel:
+                norm["speaker_id"] = rel["speaker_id"]
             normalized_relations.append(norm)
         data["relations"] = normalized_relations
 
@@ -1448,6 +1477,7 @@ def _fallback_plausibility_on_raw(
     reason: str,
     *,
     speaker_name: str | None = None,
+    speaker_id: str = "",
     role_aware_grounding: str = "off",
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
 ) -> SessionGraph:
@@ -1464,6 +1494,11 @@ def _fallback_plausibility_on_raw(
     4. If non-empty, run local plausibility filter; keep raw on None return.
     5. Rebuild Relations, canonicalize symmetric predicates, filter entities.
     6. Record fallback_path in diagnostics.
+
+    Args:
+        speaker_id: Speaker store ID stamped onto every reconstructed
+            ``Relation`` as provenance. Defaults to ``""`` for backward
+            compatibility; callers should supply the session's speaker ID.
 
     Returns the modified graph in-place (graph.relations / graph.entities replaced).
     """
@@ -1535,6 +1570,7 @@ def _fallback_plausibility_on_raw(
                     object=fact.get("object", ""),
                     relation_type=fact.get("relation_type", "factual"),
                     confidence=float(fact.get("confidence", 1.0)),
+                    speaker_id=speaker_id,
                 )
             )
         except Exception:
@@ -1569,6 +1605,7 @@ def _sota_pipeline(
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
     speaker_name: str | None = None,
+    speaker_id: str = "",
     role_aware_grounding: str = "off",
     pii_scope: set[str] | frozenset[str] | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
@@ -1641,6 +1678,7 @@ def _sota_pipeline(
             tokenizer,
             "anon_failed",
             speaker_name=speaker_name,
+            speaker_id=speaker_id,
             role_aware_grounding=role_aware_grounding,
             max_tokens=max_tokens,
         )
@@ -1746,6 +1784,7 @@ def _sota_pipeline(
                     tokenizer,
                     "anon_leaked_noncanonical",
                     speaker_name=speaker_name,
+                    speaker_id=speaker_id,
                     role_aware_grounding=role_aware_grounding,
                     max_tokens=max_tokens,
                 )
@@ -1869,9 +1908,7 @@ def _sota_pipeline(
     # entity-rebuild loop later to derive entity_type from the placeholder
     # prefix.
     reverse_mapping = {
-        v: k
-        for k, v in mapping.items()
-        if isinstance(k, str) and isinstance(v, str) and k
+        v: k for k, v in mapping.items() if isinstance(k, str) and isinstance(v, str) and k
     }
 
     deanon_input_count = len(enriched_anon)
@@ -1973,6 +2010,7 @@ def _sota_pipeline(
                     object=fact.get("object", ""),
                     relation_type=fact.get("relation_type", "factual"),
                     confidence=float(fact.get("confidence", 1.0)),
+                    speaker_id=speaker_id,
                 )
             )
         except Exception as exc:
@@ -2014,6 +2052,7 @@ def _sota_pipeline(
             tokenizer,
             "all_dropped",
             speaker_name=speaker_name,
+            speaker_id=speaker_id,
             role_aware_grounding=role_aware_grounding,
             max_tokens=max_tokens,
         )

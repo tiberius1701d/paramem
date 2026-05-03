@@ -47,6 +47,7 @@ class TestEntity:
                 predicate="p",
                 object="B",
                 relation_type=rtype,
+                speaker_id="Speaker0",
             )
             assert rel.relation_type == rtype
 
@@ -58,6 +59,7 @@ class TestRelation:
             predicate="lives_in",
             object="Heilbronn",
             relation_type="factual",
+            speaker_id="Speaker0",
         )
         assert rel.subject == "Alex"
         assert rel.predicate == "lives_in"
@@ -70,6 +72,7 @@ class TestRelation:
             object="Python",
             relation_type="preference",
             confidence=0.8,
+            speaker_id="Speaker0",
         )
         assert rel.confidence == 0.8
 
@@ -81,6 +84,7 @@ class TestRelation:
             object="B",
             relation_type="factual",
             confidence=99.9,
+            speaker_id="Speaker0",
         )
         assert rel.confidence == 99.9
 
@@ -92,6 +96,7 @@ class TestRelation:
                 object="B",
                 relation_type="factual",
                 confidence=-0.5,
+                speaker_id="Speaker0",
             )
 
     def test_invalid_relation_type(self):
@@ -101,6 +106,7 @@ class TestRelation:
                 predicate="p",
                 object="B",
                 relation_type="unknown",
+                speaker_id="Speaker0",
             )
 
 
@@ -125,6 +131,7 @@ class TestSessionGraph:
                     predicate="lives_in",
                     object="Heilbronn",
                     relation_type="factual",
+                    speaker_id="Speaker0",
                 )
             ],
             summary="Alex lives in Heilbronn.",

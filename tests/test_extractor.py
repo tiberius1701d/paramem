@@ -59,6 +59,7 @@ class TestSessionGraphFromJson:
                     "object": "Heilbronn",
                     "relation_type": "factual",
                     "confidence": 1.0,
+                    "speaker_id": "Speaker0",
                 },
             ],
             "summary": "Alex lives in Heilbronn.",
@@ -149,6 +150,7 @@ class TestNormalizeExtraction:
                     "predicate": "prefers",
                     "object": "black coffee",
                     "confidence": 1.0,
+                    "speaker_id": "Speaker0",
                 }
             ],
         }

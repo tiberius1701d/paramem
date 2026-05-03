@@ -158,6 +158,7 @@ def _make_mixed_graph():
                 object="Acme Corp",
                 relation_type="factual",
                 confidence=1.0,
+                speaker_id="Speaker0",
             ),
             Relation(
                 subject="Alice",
@@ -165,6 +166,7 @@ def _make_mixed_graph():
                 object="Berlin",
                 relation_type="factual",
                 confidence=1.0,
+                speaker_id="Speaker0",
             ),
         ],
     )
