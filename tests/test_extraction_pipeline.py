@@ -240,6 +240,97 @@ class TestExtractJsonBlock:
         with pytest.raises(ValueError):
             _extract_json_block("no json here")
 
+    def test_string_value_with_closing_brace(self):
+        """Regression: string values containing `}` must not break the parser.
+        The previous brace-counting walk truncated at the first `}` it saw,
+        regardless of whether that `}` was inside a quoted string. Real local
+        Mistral output for one of the resume chunks reliably hit this and
+        produced empty graphs in two consecutive consolidation runs."""
+        text = 'Sure, here: {"object": "Code: }"} trailing'
+        result = json.loads(_extract_json_block(text))
+        assert result == {"object": "Code: }"}
+
+    def test_string_value_with_opening_brace(self):
+        """Same regression, opposite direction: `{` inside a string value
+        (e.g. anonymizer placeholder forms) must not inflate depth."""
+        text = '{"facts": [{"object": "Acme {Org_1} Berlin"}]}'
+        result = json.loads(_extract_json_block(text))
+        assert result["facts"][0]["object"] == "Acme {Org_1} Berlin"
+
+    def test_string_value_with_unbalanced_braces(self):
+        """A pathological case: string contains an unmatched `}` and the
+        outer JSON is still well-formed. Must parse cleanly."""
+        text = '{"a": "value with } and { braces"}'
+        result = json.loads(_extract_json_block(text))
+        assert result == {"a": "value with } and { braces"}
+
+    def test_preamble_then_object_with_brace_in_string(self):
+        """LLM output often has prose preamble then JSON. Combination of
+        preamble + string-with-brace was the actual production failure."""
+        text = '''Here are the extracted facts:
+
+{"entities": [{"name": "x", "label": "Has } in label"}]}'''
+        result = json.loads(_extract_json_block(text))
+        assert result["entities"][0]["label"] == "Has } in label"
+
+    def test_truncated_json_raises(self):
+        """Genuinely malformed (incomplete) JSON should still raise — we
+        do not want silent salvage of partial structures."""
+        with pytest.raises(ValueError):
+            _extract_json_block('{"a": "unfinished')
+
+    def test_truncated_envelope_does_not_fall_through_to_inner_object(self):
+        """Regression: a truncated outer envelope (e.g. cut at max_tokens
+        mid-relation) used to silently match the first inner sub-object,
+        producing an empty graph downstream. The parser must raise instead.
+
+        Reproduces the production middle-session bug where Mistral 7B
+        emitted ~6000 chars of valid JSON-prefix that opened with
+        ``{"entities": [{"name": "Tobias", ...``, then got cut off
+        mid-string at ``"object": "consumer hardware`` because the chunker
+        produced a chunk too large for the old 2048-token budget. The
+        previous parser's left-to-right fall-through would have returned
+        the inner Tobias entity dict, _normalize_extraction would not find
+        ``entities``/``relations`` keys, and the SessionGraph would end up
+        empty — masking the truncation.
+        """
+        truncated = (
+            '{"entities": [\n'
+            '  {"name": "Tobias", "entity_type": "person", "attributes": {}},\n'
+            '  {"name": "Independent Germany", "entity_type": "place", "attributes": {}}\n'
+            '],\n'
+            '"relations": [\n'
+            '  {"subject": "Tobias", "predicate": "works_with", "object": "consumer hardware'
+        )
+        with pytest.raises(ValueError, match="(?i)truncated"):
+            _extract_json_block(truncated)
+
+
+class TestParseExtractionShapes:
+    """Regression: local Mistral occasionally emits unexpected JSON shapes
+    (bare list of facts instead of {"entities": ..., "relations": ...}).
+    Previous behaviour: TypeError from `data["session_id"] = ...` because
+    `data` was a list. New behaviour: rewrap as a relations payload."""
+
+    def test_bare_list_of_relations(self):
+        from paramem.graph.extractor import _parse_extraction
+
+        raw = (
+            '[{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", '
+            '"relation_type": "factual", "confidence": 1.0}]'
+        )
+        g = _parse_extraction(raw, "session1")
+        assert len(g.relations) == 1
+        assert g.relations[0].subject == "Alice"
+        assert g.relations[0].object == "Berlin"
+
+    def test_empty_list(self):
+        from paramem.graph.extractor import _parse_extraction
+
+        g = _parse_extraction("[]", "session1")
+        assert len(g.relations) == 0
+        assert len(g.entities) == 0
+
 
 # --- SOTA Noise Filter ---
 
