@@ -6,6 +6,10 @@ examples to produce natural QA from any (subject, predicate, object) triple.
 """
 
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from paramem.graph.schema import Entity
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,66 @@ def partition_relations(
     proc_ids = {id(r) for r in procedural}
     episodic = [r for r in relations if id(r) not in proc_ids]
     return episodic, procedural
+
+
+def _flatten_entity_attributes(
+    entities: "list[Entity]",
+    *,
+    exclude_pairs: "set[tuple[str, str]] | None" = None,
+) -> list[dict]:
+    """Project ``Entity.attributes`` into the canonical relation-dict shape.
+
+    Internal projection used by :func:`generate_qa_from_graph`.  The graph's
+    knowledge lives in two surfaces — relations and entity attributes — and
+    both must reach the QA generator.  This helper converts the attribute
+    surface into the relation-dict shape, so the QA generator's input is the
+    union of "real" relations and "projected" attributes.
+
+    One projected relation is emitted per (entity, attribute_key) pair:
+
+        {
+            "subject": entity.name,
+            "predicate": "has_<normalised_key>",
+            "object": str(attr_val),
+            "relation_type": "attribute",
+        }
+
+    Predicate normalisation: attribute keys are lower-cased and
+    spaces/dashes replaced with underscores (``"phone number"`` →
+    ``"has_phone_number"``).
+
+    Pairs whose ``(subject, predicate)`` already appears in ``exclude_pairs``
+    are skipped — prevents duplicate keying when an explicit ``has_<key>``
+    relation was already extracted.  Pairs with ``None`` or whitespace-only
+    values are skipped.  Input entities are not mutated.
+    """
+    _exclude = exclude_pairs if exclude_pairs is not None else set()
+    result: list[dict] = []
+    for entity in entities:
+        if not entity.attributes:
+            continue
+        for raw_key, attr_val in entity.attributes.items():
+            # Skip empty values
+            if attr_val is None:
+                continue
+            val_str = str(attr_val).strip()
+            if not val_str:
+                continue
+            # Normalise predicate: lowercase + spaces/dashes → underscores
+            norm_key = raw_key.lower().replace(" ", "_").replace("-", "_")
+            predicate = f"has_{norm_key}"
+            pair = (entity.name, predicate)
+            if pair in _exclude:
+                continue
+            result.append(
+                {
+                    "subject": entity.name,
+                    "predicate": predicate,
+                    "object": val_str,
+                    "relation_type": "attribute",
+                }
+            )
+    return result
 
 
 # Few-shot examples covering diverse predicate types.
@@ -281,6 +345,64 @@ def generate_qa_from_relations(
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
+
+
+def generate_qa_from_graph(
+    session_graph,
+    *,
+    procedural_enabled: bool,
+    model=None,
+    tokenizer=None,
+) -> tuple[list[dict], list[dict]]:
+    """Convert a ``SessionGraph`` into ``(episodic_qa, procedural_relations)``.
+
+    Single entry point for graph → keyed-QA-pair distillation.  The graph
+    holds knowledge in two surfaces — ``.relations`` and ``.entities[*].attributes``
+    — and both must reach the QA generator.  This function unifies them: it
+    reads relations directly, projects entity attributes into the same
+    relation-dict shape via :func:`_flatten_entity_attributes`, partitions the
+    union by ``relation_type`` (``preference`` → procedural, everything else →
+    episodic), and mints QA pairs for the episodic side via the LLM-based
+    generator.
+
+    Procedural relations are returned as raw relation dicts (the procedural
+    adapter trains on relation-shaped input, not on QA pairs, in the live
+    consolidation flow).
+
+    Args:
+        session_graph: The freshly extracted ``SessionGraph`` for one session.
+        procedural_enabled: ``True`` if the procedural adapter is enabled —
+            controls whether ``preference`` relations route to the procedural
+            return slot or stay episodic.
+        model: Base model for LLM-based QA generation.  ``None`` falls through
+            to the template fallback (used by unit tests).
+        tokenizer: Tokenizer matching ``model``.
+
+    Returns:
+        ``(episodic_qa, procedural_relations)`` — the same shape the call
+        sites in ``ConsolidationLoop.extract_session`` and
+        ``ConsolidationLoop.run_cycle`` expect.
+    """
+    relation_dicts: list[dict] = [
+        {
+            "subject": r.subject,
+            "predicate": r.predicate,
+            "object": r.object,
+            "relation_type": r.relation_type,
+        }
+        for r in session_graph.relations
+    ]
+    exclude_pairs = {(r["subject"], r["predicate"]) for r in relation_dicts}
+    projected = _flatten_entity_attributes(session_graph.entities, exclude_pairs=exclude_pairs)
+    if projected:
+        logger.info("Projected %d entity attribute(s) into the QA-gen input set", len(projected))
+    relation_dicts.extend(projected)
+
+    episodic_relations, procedural_relations = partition_relations(
+        relation_dicts, procedural_enabled=procedural_enabled
+    )
+    episodic_qa = generate_qa_from_relations(episodic_relations, model=model, tokenizer=tokenizer)
+    return episodic_qa, procedural_relations
 
 
 def _run_qa_generation(relations: list[dict], model, tokenizer) -> list[dict]:

@@ -31,6 +31,7 @@ from paramem.graph.extractor import (
 )
 from paramem.graph.merger import GraphMerger, _normalize_predicate
 from paramem.graph.qa_generator import (
+    generate_qa_from_graph,
     generate_qa_from_relations,
     partition_relations,
 )
@@ -718,21 +719,15 @@ class ConsolidationLoop:
             self.merger.save_graph(snapshot_graph, encrypted=False)
 
         # --- GENERATE EPISODIC QA ---
-        session_relations = [
-            {
-                "subject": r.subject,
-                "predicate": r.predicate,
-                "object": r.object,
-                "relation_type": r.relation_type,
-            }
-            for r in session_graph.relations
-        ]
-
-        episodic_relations, procedural_rels = partition_relations(
-            session_relations, procedural_enabled=self.procedural_config is not None
-        )
-        episodic_qa = generate_qa_from_relations(
-            episodic_relations, model=self.model, tokenizer=self.tokenizer
+        # Single entry point for graph → keyed-QA distillation.  Reads both
+        # session_graph.relations and entity.attributes, projects attributes
+        # into the relation-dict shape, partitions by relation_type, and mints
+        # QA pairs for the episodic side.
+        episodic_qa, procedural_rels = generate_qa_from_graph(
+            session_graph,
+            procedural_enabled=self.procedural_config is not None,
+            model=self.model,
+            tokenizer=self.tokenizer,
         )
 
         # --- PROCEDURAL: separate extraction pass ---
@@ -1360,19 +1355,16 @@ class ConsolidationLoop:
             new_promotions = []
 
         # --- 4. GENERATE QA PAIRS ---
-        # Episodic: only relations from the *current session's* extraction
-        # (replay pool provides continuity with past sessions)
-        session_relations = [
-            {
-                "subject": r.subject,
-                "predicate": r.predicate,
-                "object": r.object,
-                "relation_type": r.relation_type,
-            }
-            for r in session_graph.relations
-        ]
-        episodic_relations, procedural_rels = partition_relations(
-            session_relations, procedural_enabled=self.procedural_config is not None
+        # Single entry point: graph → (episodic_qa, procedural_rels).  Reads
+        # both session_graph.relations and entity.attributes, projects
+        # attributes into the relation-dict shape, partitions by relation_type,
+        # and mints QA pairs for the episodic side.  Replay pool below
+        # provides continuity with past sessions.
+        episodic_qa, procedural_rels = generate_qa_from_graph(
+            session_graph,
+            procedural_enabled=self.procedural_config is not None,
+            model=self.model,
+            tokenizer=self.tokenizer,
         )
 
         # Mirror extract_session(): run the dedicated procedural prompt so
@@ -1393,12 +1385,6 @@ class ConsolidationLoop:
                 }
                 for r in proc_graph.relations
             )
-
-        episodic_qa = generate_qa_from_relations(
-            episodic_relations,
-            model=self.model,
-            tokenizer=self.tokenizer,
-        )
 
         # Apply same dedup as server path (identical policy across all paths).
         episodic_qa = self.dedup_episodic(episodic_qa)
