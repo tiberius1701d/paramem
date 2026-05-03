@@ -332,6 +332,44 @@ class TestParseExtractionShapes:
         assert len(g.entities) == 0
 
 
+class TestPipelineMaxTokensThreading:
+    """Verify the single ``extraction_max_tokens`` config flows through the
+    entire LLM pipeline (local extract → anonymize → SOTA enrich → deanon →
+    plausibility) instead of each stage carrying its own hardcoded budget."""
+
+    def test_sota_pipeline_signature_accepts_max_tokens(self):
+        """Stage 1: _sota_pipeline accepts max_tokens kwarg (the entry point
+        from extract_graph)."""
+        import inspect
+
+        from paramem.graph.extractor import _sota_pipeline
+
+        sig = inspect.signature(_sota_pipeline)
+        assert "max_tokens" in sig.parameters
+
+    def test_extract_graph_default_matches_filter_default(self):
+        """The single-budget invariant: extract_graph and the SOTA-side
+        filter calls must share the same default. Otherwise a user who
+        sets only the loop-level config would get inconsistent budgets
+        across stages."""
+        import inspect
+
+        from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, extract_graph
+
+        default = inspect.signature(extract_graph).parameters["max_tokens"].default
+        assert default == _DEFAULT_FILTER_MAX_TOKENS
+
+    def test_fallback_plausibility_threads_max_tokens(self):
+        """The all_dropped / anon_failed fallback path also accepts max_tokens
+        so the whole pipeline runs on one budget — including degraded paths."""
+        import inspect
+
+        from paramem.graph.extractor import _fallback_plausibility_on_raw
+
+        sig = inspect.signature(_fallback_plausibility_on_raw)
+        assert "max_tokens" in sig.parameters
+
+
 # --- SOTA Noise Filter ---
 
 
@@ -2171,14 +2209,19 @@ class TestExtractGraphNewKwargs:
         sig = inspect.signature(extract_graph)
         assert sig.parameters["temperature"].default == 0.0
 
-    def test_extract_graph_default_max_tokens_2048(self):
-        """D17: extract_graph default max_tokens is 2048 (was 1024)."""
+    def test_extract_graph_default_max_tokens_matches_filter_default(self):
+        """extract_graph default max_tokens matches the unified filter
+        constant (currently 8192). The single-budget invariant: the entry
+        point and downstream filter calls must default to the same value
+        so a missing config doesn't produce inconsistent budgets across
+        stages. Was 2048 historically; bumped after a resume chunk
+        truncated mid-string at the old budget."""
         import inspect
 
-        from paramem.graph.extractor import extract_graph
+        from paramem.graph.extractor import _DEFAULT_FILTER_MAX_TOKENS, extract_graph
 
         sig = inspect.signature(extract_graph)
-        assert sig.parameters["max_tokens"].default == 2048
+        assert sig.parameters["max_tokens"].default == _DEFAULT_FILTER_MAX_TOKENS
 
     def test_verify_anonymization_false_skips_guard(self):
         """D18: verify_anonymization=False skips the forward-path privacy guard."""

@@ -620,7 +620,7 @@ class ConsolidationScheduleConfig:
     # set this to a small value to skip the full validated budget when
     # testing layout/encryption invariants rather than recall quality.
     max_epochs: int | None = None
-    extraction_max_tokens: int = 2048  # max output tokens for graph extraction
+    extraction_max_tokens: int = 8192  # output token budget — single value governs every LLM call in the extraction pipeline (local extract, anonymize, SOTA enrich, deanon, plausibility)
     extraction_stt_correction: bool = True  # correct STT errors from assistant responses
     extraction_ha_validation: bool = True  # validate locations against HA home context
     extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)
