@@ -370,6 +370,142 @@ class TestPipelineMaxTokensThreading:
         assert "max_tokens" in sig.parameters
 
 
+class TestWaitForGpuReady:
+    """Cover the WSL2 cloud-idle → local-LLM wake helper added after the
+    May 2 production crash where a 62s SOTA cloud round-trip left the GPU
+    in a low-power state and the next CUDA op hit "device not ready"."""
+
+    def test_no_op_when_cuda_unavailable(self):
+        """In CPU-only test environments, the helper must be a no-op (and not
+        raise on missing torch.cuda)."""
+        from unittest.mock import patch
+
+        import paramem.graph.extractor as extractor
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = False
+        with patch.dict("sys.modules", {"torch": fake_torch}):
+            extractor._wait_for_gpu_ready()  # must not raise
+        assert not fake_torch.zeros.called
+
+    def test_passes_through_when_gpu_ready(self):
+        """Happy path: pre-settle sleep runs once, probe succeeds on first
+        attempt, no retry sleeps."""
+        from unittest.mock import patch
+
+        import paramem.graph.extractor as extractor
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.graph.extractor.time.sleep") as sleep_mock,
+        ):
+            extractor._wait_for_gpu_ready()
+        fake_torch.cuda.synchronize.assert_called()
+        fake_torch.zeros.assert_called()
+        # Exactly one pre-settle sleep on the happy path.
+        assert sleep_mock.call_count == 1
+
+    def test_pre_settle_skipped_when_zero(self):
+        """``pre_settle_seconds=0`` skips the unconditional sleep — useful
+        when the caller knows the GPU was just used (e.g. mid-pipeline)."""
+        from unittest.mock import patch
+
+        import paramem.graph.extractor as extractor
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.graph.extractor.time.sleep") as sleep_mock,
+        ):
+            extractor._wait_for_gpu_ready(pre_settle_seconds=0)
+        sleep_mock.assert_not_called()
+
+    def test_retries_on_device_not_ready(self):
+        """When the first probe raises 'device not ready', helper waits and
+        retries; succeeds on subsequent attempt."""
+        from unittest.mock import patch
+
+        import paramem.graph.extractor as extractor
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        # Two failures, then success.
+        fake_torch.zeros.side_effect = [
+            RuntimeError("CUDA driver error: device not ready"),
+            RuntimeError("CUDA driver error: device not ready"),
+            None,
+        ]
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.graph.extractor.time.sleep") as sleep_mock,
+        ):
+            extractor._wait_for_gpu_ready(pre_settle_seconds=0)
+        assert fake_torch.zeros.call_count == 3
+        # Two retry sleeps between three attempts (pre-settle disabled).
+        assert sleep_mock.call_count == 2
+
+    def test_raises_on_allocator_corruption(self):
+        """Allocator-corruption markers are terminal — no retry, raise so
+        the caller surfaces a server-restart-required signal."""
+        from unittest.mock import patch
+
+        import paramem.graph.extractor as extractor
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.zeros.side_effect = RuntimeError(
+            "INTERNAL ASSERT FAILED at CUDACachingAllocator.cpp:419"
+        )
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.graph.extractor.time.sleep") as sleep_mock,
+            pytest.raises(RuntimeError, match="(?i)INTERNAL ASSERT|allocator"),
+        ):
+            extractor._wait_for_gpu_ready(pre_settle_seconds=0)
+        assert fake_torch.zeros.call_count == 1
+        sleep_mock.assert_not_called()
+
+    def test_raises_after_exhausting_retries(self):
+        """If 'device not ready' persists across all retries, the final
+        exception is raised so the caller knows the GPU is truly stuck."""
+        from unittest.mock import patch
+
+        import paramem.graph.extractor as extractor
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.zeros.side_effect = RuntimeError("CUDA driver error: device not ready")
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.graph.extractor.time.sleep"),
+            pytest.raises(RuntimeError, match="(?i)device not ready"),
+        ):
+            extractor._wait_for_gpu_ready(pre_settle_seconds=0)
+        assert fake_torch.zeros.call_count == 3
+
+    def test_unrelated_runtime_error_propagates(self):
+        """A non-WSL-related RuntimeError (e.g. genuine OOM) should not be
+        swallowed by the wake helper — let the caller see real bugs."""
+        from unittest.mock import patch
+
+        import paramem.graph.extractor as extractor
+
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.zeros.side_effect = RuntimeError("CUDA out of memory")
+        with (
+            patch.dict("sys.modules", {"torch": fake_torch}),
+            patch("paramem.graph.extractor.time.sleep") as sleep_mock,
+            pytest.raises(RuntimeError, match="out of memory"),
+        ):
+            extractor._wait_for_gpu_ready(pre_settle_seconds=0)
+        assert fake_torch.zeros.call_count == 1
+        sleep_mock.assert_not_called()
+
+
 # --- SOTA Noise Filter ---
 
 
