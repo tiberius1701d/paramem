@@ -790,10 +790,22 @@ def _parse_extraction(raw_output: str, session_id: str) -> SessionGraph:
     """Parse raw model output into a SessionGraph.
 
     Handles non-standard field names, array-valued fields, and other
-    model output quirks via _normalize_extraction.
+    model output quirks via _normalize_extraction. Local models occasionally
+    emit a bare JSON array of fact dicts instead of the expected
+    ``{"entities": [...], "relations": [...]}`` envelope; that case is
+    rewrapped here so downstream normalization can proceed.
     """
     json_str = _extract_json_block(raw_output)
     data = json.loads(json_str)
+
+    if isinstance(data, list):
+        # Bare list of facts — wrap as a relations payload. _normalize_extraction
+        # walks ``relations`` and infers the entity set from subject/object.
+        data = {"relations": data, "entities": []}
+    elif not isinstance(data, dict):
+        raise ValueError(
+            f"Unexpected extraction payload type: {type(data).__name__}"
+        )
 
     data["session_id"] = session_id
     data["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -811,42 +823,62 @@ def _parse_extraction(raw_output: str, session_id: str) -> SessionGraph:
 
 
 def _extract_json_block(text: str) -> str:
-    """Extract JSON from model output, handling markdown code blocks."""
-    # Try markdown code blocks
+    """Extract a JSON object/array from model output.
+
+    Handles markdown code-fence wrappers and uses Python's stdlib JSON decoder
+    for the actual structure walk so braces inside string values do not throw
+    off boundary detection (the previous naive ``{``/``}`` counter
+    miscounted ``"object": "Code: }"`` as a closing brace).
+
+    Truncation discipline: this function tries to parse from the **first**
+    JSON-start character (``{`` or ``[``) only. It does NOT fall through to
+    inner sub-objects on failure, because doing so silently masks truncation:
+    a model whose output was cut at ``max_tokens`` mid-string emits a valid
+    inner sub-object ``{"name": "x", ...}`` even though the outer envelope
+    ``{"entities": [...], "relations": [...]}`` never closed. Falling through
+    would parse that inner object and downstream code would treat it as the
+    full extraction (returning an empty graph). Instead we raise here so the
+    caller surfaces a parse failure and the operator sees a real signal.
+    """
+    # Strip markdown code-fence wrappers if present.
+    src = text
     for marker in ("```json", "```"):
-        if marker in text:
-            start = text.index(marker) + len(marker)
-            # Find closing ``` — fall through to brace matching if missing
-            closing = text.find("```", start)
+        if marker in src:
+            start = src.index(marker) + len(marker)
+            closing = src.find("```", start)
             if closing != -1:
-                return text[start:closing].strip()
+                src = src[start:closing].strip()
+                break
 
-    # Fall back to finding raw JSON by brace/bracket matching
-    # Try object first, then array
-    brace_start = text.find("{")
-    bracket_start = text.find("[")
-
-    # Use whichever comes first
-    if brace_start == -1 and bracket_start == -1:
+    # Locate the first JSON-start character — that IS the start of the
+    # intended JSON value. Anything before it is preamble (prose); anything
+    # at or after it is JSON we must parse from here.
+    brace = src.find("{")
+    bracket = src.find("[")
+    if brace < 0 and bracket < 0:
         raise ValueError("No JSON found in model output")
-
-    if bracket_start != -1 and (brace_start == -1 or bracket_start < brace_start):
-        # Array — match [ ]
-        open_char, close_char = "[", "]"
-        start = bracket_start
+    if brace < 0:
+        start = bracket
+    elif bracket < 0:
+        start = brace
     else:
-        # Object — match { }
-        open_char, close_char = "{", "}"
-        start = brace_start
+        start = min(brace, bracket)
 
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == open_char:
-            depth += 1
-        elif text[i] == close_char:
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
+    decoder = json.JSONDecoder()
+    try:
+        _, end = decoder.raw_decode(src, start)
+    except json.JSONDecodeError as exc:
+        # Truncation surfaces here ("Unterminated string starting at",
+        # "Expecting ',' delimiter", etc.). Raise with a clear message so the
+        # extractor's try/except block logs "parsing failed" rather than
+        # silently producing an empty graph.
+        raise ValueError(
+            f"Truncated or malformed JSON in model output (offset {start}, "
+            f"len {len(src)}, decoder said: {exc.msg}). Likely cause: "
+            f"max_tokens hit mid-generation. Bump extraction_max_tokens or "
+            f"reduce input chunk size."
+        ) from exc
+    return src[start:end]
 
     raise ValueError("Unbalanced braces in model output")
 
@@ -2913,7 +2945,7 @@ def _parse_facts_response(raw: str | None, strict_array: bool = False) -> list[d
                     return validated[key]
         logger.warning("SOTA response unexpected format: %s", type(validated).__name__)
         return None
-    except (json.JSONDecodeError, ValueError) as e:
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
         logger.warning("SOTA response parse failed: %s", e)
         return None
 

@@ -35,7 +35,10 @@ class TestExtractJsonBlock:
             _extract_json_block("no json here")
 
     def test_unbalanced_braces_raises(self):
-        with pytest.raises(ValueError, match="Unbalanced"):
+        # Parser uses json.raw_decode now; "{unclosed" is treated as
+        # malformed/truncated JSON, raising ValueError with a "truncated"
+        # message rather than the legacy "Unbalanced" wording.
+        with pytest.raises(ValueError, match="(?i)truncated|malformed"):
             _extract_json_block("{unclosed")
 
 
