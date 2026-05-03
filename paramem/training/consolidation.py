@@ -120,7 +120,7 @@ class ConsolidationLoop:
         output_dir: str | Path = "outputs/phase3",
         graph_path: Optional[str | Path] = None,
         extraction_temperature: float = 0.0,
-        extraction_max_tokens: int = 2048,
+        extraction_max_tokens: int = 8192,
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
         run_id: str | None = None,

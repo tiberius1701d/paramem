@@ -26,6 +26,28 @@ _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "configs" 
 
 _DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Output valid JSON only."
 
+# Single output-token budget for every LLM call in the extraction pipeline:
+# local extraction, anonymization, SOTA enrichment, plausibility (local +
+# cloud), graph-level enrichment. Threaded through extract_graph →
+# _sota_pipeline → all sub-functions so a single
+# ``ConsolidationLoop.extraction_max_tokens`` (server.yaml
+# ``consolidation.extraction_max_tokens``) governs the whole chain.
+#
+# 8192 is sized for Mistral 7B against ~1500-word document chunks (the local
+# chunker's max). Empirical worst-case observed output for a dense resume
+# chunk was ~2200 tokens; 8192 gives ~3.7× headroom. If the chunker contract
+# changes, revisit jointly with that change.
+_DEFAULT_FILTER_MAX_TOKENS = 8192
+# Validator temperature: deterministic by default. Threaded all the way to the
+# provider call so Anthropic and OpenAI-compatible filters match exactly.
+_DEFAULT_FILTER_TEMPERATURE = 0.0
+# Per-call timeout for SOTA enrichment / plausibility. 30s was hit by Mistral 7B
+# resume content at max_tokens=8192 (response generation took >30s, ReadTimeout,
+# pipeline fell back to local-only and lost SOTA's contribution silently). 90s
+# matches CloudAgentConfig.timeout_seconds default. Operator can override via
+# the timeout_seconds parameter on the relevant call site.
+_DEFAULT_FILTER_TIMEOUT_SECONDS = 90.0
+
 
 # ---------------------------------------------------------------------------
 # Word-boundary substitution / matching helpers — replace fragile
@@ -442,7 +464,7 @@ def extract_graph(
     transcript: str,
     session_id: str,
     temperature: float = 0.0,
-    max_tokens: int = 2048,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     prompts_dir: str | Path | None = None,
     validate: bool = True,
     ha_context: dict | None = None,
@@ -558,6 +580,7 @@ def extract_graph(
             speaker_name=speaker_name,
             role_aware_grounding=role_aware_grounding,
             pii_scope=pii_scope,
+            max_tokens=max_tokens,
         )
 
     return graph
@@ -1285,6 +1308,7 @@ def _fallback_plausibility_on_raw(
     *,
     speaker_name: str | None = None,
     role_aware_grounding: str = "off",
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
 ) -> SessionGraph:
     """Fallback pipeline path: run local plausibility + grounding on raw (unanonymized) facts.
 
@@ -1348,7 +1372,7 @@ def _fallback_plausibility_on_raw(
             transcript,
             model,
             tokenizer,
-            max_tokens=_DEFAULT_FILTER_MAX_TOKENS,
+            max_tokens=max_tokens,
             temperature=_DEFAULT_FILTER_TEMPERATURE,
         )
         if filtered is not None:
@@ -1406,6 +1430,7 @@ def _sota_pipeline(
     speaker_name: str | None = None,
     role_aware_grounding: str = "off",
     pii_scope: set[str] | frozenset[str] | None = None,
+    max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
@@ -1461,7 +1486,7 @@ def _sota_pipeline(
     # Step 1: Anonymize facts AND transcript via local model in one call —
     # mapping is total over everything that will reach the SOTA stage.
     anon_facts, mapping, anon_transcript = _anonymize_with_local_model(
-        graph, model, tokenizer, transcript=transcript
+        graph, model, tokenizer, transcript=transcript, max_tokens=max_tokens
     )
     if anon_facts is None:
         logger.warning("Anonymization failed — falling back to raw plausibility")
@@ -1474,6 +1499,7 @@ def _sota_pipeline(
             "anon_failed",
             speaker_name=speaker_name,
             role_aware_grounding=role_aware_grounding,
+            max_tokens=max_tokens,
         )
     if not anon_facts:
         logger.info("Anonymization produced 0 facts — skipping SOTA pipeline")
@@ -1578,6 +1604,7 @@ def _sota_pipeline(
                     "anon_leaked_noncanonical",
                     speaker_name=speaker_name,
                     role_aware_grounding=role_aware_grounding,
+                    max_tokens=max_tokens,
                 )
 
     # Step 2: SOTA enrichment — coreference + compound splitting + safe reification.
@@ -1599,7 +1626,13 @@ def _sota_pipeline(
         braced_transcript = _brace_placeholders_in_text(anon_transcript, known_placeholders)
         braced_facts = _brace_placeholders_in_facts(anon_facts, known_placeholders)
         enriched_anon, updated_anon_transcript, _sota_raw, _sota_info = _filter_with_sota(
-            braced_facts, api_key, provider, filter_model, braced_transcript, endpoint=endpoint
+            braced_facts,
+            api_key,
+            provider,
+            filter_model,
+            braced_transcript,
+            endpoint=endpoint,
+            max_tokens=max_tokens,
         )
         # Persist SOTA-call telemetry: parse path, truncation flag, response size,
         # salvage count. Lets us see truncation kill sites that were previously
@@ -1648,7 +1681,7 @@ def _sota_pipeline(
                 filter_model=pv_info["model_id"],
                 anon_transcript=anon_transcript,
                 endpoint=pv_info.get("endpoint"),
-                max_tokens=_DEFAULT_FILTER_MAX_TOKENS,
+                max_tokens=max_tokens,
                 temperature=_DEFAULT_FILTER_TEMPERATURE,
             )
             if plaus_facts is not None:
@@ -1769,7 +1802,7 @@ def _sota_pipeline(
             transcript,  # original real-name transcript — intentional, see docstring
             model,
             tokenizer,
-            max_tokens=_DEFAULT_FILTER_MAX_TOKENS,
+            max_tokens=max_tokens,
             temperature=_DEFAULT_FILTER_TEMPERATURE,
         )
         if filtered_deanon is not None:
@@ -1845,6 +1878,7 @@ def _sota_pipeline(
             "all_dropped",
             speaker_name=speaker_name,
             role_aware_grounding=role_aware_grounding,
+            max_tokens=max_tokens,
         )
 
     # Rebuild entity list from surviving + new relations.
@@ -2793,22 +2827,9 @@ _SOTA_PLAUSIBILITY_SYSTEM_PROMPT = (
 _SOTA_SYSTEM_PROMPT = _SOTA_ENRICHMENT_SYSTEM_PROMPT
 
 
-# Output budget for SOTA enrichment / plausibility / graph-enrich calls.
-# 2048 was hit by document-mode ingestion (resume produced ~6045 chars of
-# response and JSON parse failed mid-string). 8192 is provisional headroom;
-# truncation should be observable, not silent — see _filter_with_sota
-# diagnostics. Long-term, output budgeting + chunked invocation is the
-# durable answer (see plan Phase A0).
-_DEFAULT_FILTER_MAX_TOKENS = 8192
-# Validator temperature: deterministic by default. Threaded all the way to the
-# provider call so Anthropic and OpenAI-compatible filters match exactly.
-_DEFAULT_FILTER_TEMPERATURE = 0.0
-# Per-call timeout for SOTA enrichment / plausibility. 30s was hit by Mistral 7B
-# resume content at max_tokens=8192 (response generation took >30s, ReadTimeout,
-# pipeline fell back to local-only and lost SOTA's contribution silently). 90s
-# matches CloudAgentConfig.timeout_seconds default. Operator can override via
-# the timeout_seconds parameter on the relevant call site.
-_DEFAULT_FILTER_TIMEOUT_SECONDS = 90.0
+# _DEFAULT_FILTER_MAX_TOKENS / _DEFAULT_FILTER_TEMPERATURE /
+# _DEFAULT_FILTER_TIMEOUT_SECONDS are defined at the top of this module —
+# they need to precede the extract_graph signature that references them.
 
 
 def _filter_anthropic(
