@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +48,150 @@ _DEFAULT_FILTER_TEMPERATURE = 0.0
 # matches CloudAgentConfig.timeout_seconds default. Operator can override via
 # the timeout_seconds parameter on the relevant call site.
 _DEFAULT_FILTER_TIMEOUT_SECONDS = 90.0
+
+
+# ---------------------------------------------------------------------------
+# WSL2 GPU wake helper — covers the post-cloud-call → next-GPU-op gap.
+#
+# Background: WSL2 + RTX 5070 + Modern Standby lets the GPU enter a low-power
+# state after ~60s of idle. A SOTA cloud round-trip is a typical trigger
+# (anonymization completes → cloud SOTA call takes 30–90s → next local-LLM
+# call hits "device not ready" before the driver is fully back). Once that
+# first op fails, PyTorch's allocator bookkeeping is corrupted with
+# ``INTERNAL ASSERT FAILED in CUDACachingAllocator`` and no retry can
+# recover — only a server restart will. The strategy is therefore to PREVENT
+# the first attempt from failing via a wall-clock settle on detection.
+#
+# The same pattern (different trigger — post-training-pass instead of
+# post-cloud-idle) is documented in ``paramem/server/gates.py``
+# ``_settle_cuda_and_load_adapter``. Constants here are aligned with that
+# helper but tuned for the cloud-idle path.
+# ---------------------------------------------------------------------------
+
+# Markers indicating PyTorch's CUDA allocator is corrupted. Mirrored from
+# ``gates.py:_CUDA_TERMINAL_MARKERS``.
+_CUDA_TERMINAL_MARKERS: tuple[str, ...] = ("INTERNAL ASSERT FAILED", "CUDACachingAllocator")
+# Up to 3 attempts (1 + 2 retries). Beyond that, server restart is needed.
+_GPU_WAKE_RETRY_COUNT: int = 3
+# 5s wall-clock settle per retry. Empirically a 60s idle gap surfaced
+# "device not ready" once; 5s × 2 retries (10s total) covers the WSL2
+# driver wake-up latency observed on this host.
+_GPU_WAKE_SETTLE_SECONDS: float = 5.0
+
+
+def _vram_snapshot(label: str) -> None:
+    """Log GPU memory state for telemetry around major pipeline calls.
+
+    Used to localise VRAM-pressure-induced crashes in the SOTA pipeline.
+    Output is grep-friendly:
+    ``VRAM <label>: alloc=NNNN MiB reserved=NNNN MiB peak=NNNN MiB``.
+
+    Resets peak after reading so each window's contribution is visible
+    on the next snapshot. No-op when CUDA is unavailable.
+    """
+    try:
+        import torch
+    except ImportError:
+        return
+    try:
+        if not torch.cuda.is_available():
+            return
+    except Exception:  # noqa: BLE001 — MagicMock test stubs may raise
+        return
+    try:
+        alloc_mib = torch.cuda.memory_allocated() / (1024 * 1024)
+        reserved_mib = torch.cuda.memory_reserved() / (1024 * 1024)
+        peak_mib = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        torch.cuda.reset_peak_memory_stats()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("VRAM snapshot %s: query failed: %s", label, exc)
+        return
+    logger.info(
+        "VRAM %s: alloc=%.0f MiB reserved=%.0f MiB peak=%.0f MiB",
+        label,
+        alloc_mib,
+        reserved_mib,
+        peak_mib,
+    )
+
+
+def _wait_for_gpu_ready(*, pre_settle_seconds: float = 10.0) -> None:
+    """Settle the GPU before a CUDA op that follows a long idle gap.
+
+    The WSL2 driver needs wall-clock time after a long idle to be safely
+    callable again — ``torch.cuda.synchronize`` returns too quickly to
+    cover the gap (documented in ``gates.py:_settle_cuda_and_load_adapter``,
+    same root behaviour, different trigger). A trivial ``torch.zeros``
+    probe alone is also insufficient: it succeeds on a sleepy driver, but
+    the next real ``model.generate`` still crashes. We therefore sleep
+    unconditionally for ``pre_settle_seconds`` first, then probe to catch
+    the residual cases where the driver still isn't ready.
+
+    On "device not ready" from the probe: additional wall-clock retries
+    (up to ``_GPU_WAKE_RETRY_COUNT`` total attempts × ``_GPU_WAKE_SETTLE_SECONDS``).
+    On allocator-corruption markers: bail immediately — retries cannot
+    recover.
+
+    No-op when CUDA is unavailable (CPU-only test environments). The
+    settle is also skipped when ``pre_settle_seconds <= 0``.
+
+    Default ``pre_settle_seconds=10.0`` matches
+    ``gates.py:_MOUNT_INITIAL_SETTLE_SECONDS`` — empirically required after
+    a heavy GPU pass + cloud-idle gap.
+
+    Raises ``RuntimeError`` if the GPU is still not ready after retries.
+    """
+    try:
+        import torch
+    except ImportError:
+        return
+    if not torch.cuda.is_available():
+        return
+
+    # Pre-emptive settle. Cheap (10s wall-clock) compared to a corrupted-
+    # allocator restart cycle (~30s server boot + lost cycle).
+    if pre_settle_seconds > 0:
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pre-probe CUDA settle failed: %s", exc)
+        time.sleep(pre_settle_seconds)
+
+    last_exc: BaseException | None = None
+    for attempt in range(_GPU_WAKE_RETRY_COUNT):
+        try:
+            torch.cuda.synchronize()
+            torch.zeros(1, device="cuda")
+            if attempt > 0:
+                logger.info(
+                    "GPU wake recovered on attempt %d/%d",
+                    attempt + 1,
+                    _GPU_WAKE_RETRY_COUNT,
+                )
+            return
+        except RuntimeError as exc:
+            msg = str(exc)
+            if any(m in msg for m in _CUDA_TERMINAL_MARKERS):
+                logger.error(
+                    "GPU wake: CUDA allocator corruption detected — "
+                    "server restart required to recover: %s",
+                    msg,
+                )
+                raise
+            if "device not ready" not in msg.lower():
+                raise
+            last_exc = exc
+            if attempt < _GPU_WAKE_RETRY_COUNT - 1:
+                logger.warning(
+                    "GPU wake attempt %d/%d: 'device not ready' — settling %ss",
+                    attempt + 1,
+                    _GPU_WAKE_RETRY_COUNT,
+                    _GPU_WAKE_SETTLE_SECONDS,
+                )
+                time.sleep(_GPU_WAKE_SETTLE_SECONDS)
+    assert last_exc is not None
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -1485,9 +1630,11 @@ def _sota_pipeline(
 
     # Step 1: Anonymize facts AND transcript via local model in one call —
     # mapping is total over everything that will reach the SOTA stage.
+    _vram_snapshot(f"sota_pipeline_entry session={graph.session_id}")
     anon_facts, mapping, anon_transcript = _anonymize_with_local_model(
         graph, model, tokenizer, transcript=transcript, max_tokens=max_tokens
     )
+    _vram_snapshot(f"after_anonymize session={graph.session_id}")
     if anon_facts is None:
         logger.warning("Anonymization failed — falling back to raw plausibility")
         graph.diagnostics["anonymize"] = "failed"
@@ -1684,6 +1831,11 @@ def _sota_pipeline(
                 max_tokens=max_tokens,
                 temperature=_DEFAULT_FILTER_TEMPERATURE,
             )
+            # Cloud round-trip can take 30–90s during which the WSL2 GPU
+            # goes idle and the next local CUDA op fails with
+            # "device not ready". Wake + settle before the deanon-stage
+            # local plausibility filter that follows below.
+            _wait_for_gpu_ready()
             if plaus_facts is not None:
                 pre_plaus = len(enriched_anon)
                 enriched_anon = plaus_facts
@@ -1797,6 +1949,7 @@ def _sota_pipeline(
         and model is not None
         and tokenizer is not None
     ):
+        _vram_snapshot(f"before_plausibility_deanon session={graph.session_id}")
         filtered_deanon = _local_plausibility_filter(
             deanon_facts,
             transcript,  # original real-name transcript — intentional, see docstring
