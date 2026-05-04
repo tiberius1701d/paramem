@@ -194,7 +194,8 @@ consolidation:
   # overkill on future base models. Once recall-driven early-stop ships,
   # this becomes the upper bound; until then it is the fixed budget.
   # max_epochs: null
-  extraction_max_tokens: 8192  # single output-token budget for every LLM call in the extraction pipeline (local extract, anonymize, SOTA enrich, deanon, plausibility); 8192 sized for ~1500-word document chunks
+  extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, SOTA enrich, deanon; 8192 sized for ~1500-word document chunks
+  extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
   extraction_stt_correction: true  # correct STT errors from assistant responses
   extraction_ha_validation: true  # validate locations against HA home context
   extraction_noise_filter: ""  # SOTA provider for noise filtering ("" = disabled, ship default)

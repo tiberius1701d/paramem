@@ -342,6 +342,7 @@ def test_consolidation_extraction_kwargs_threads_pii_scope():
     ns = SimpleNamespace(
         extraction_temperature=0.0,
         extraction_max_tokens=2048,
+        extraction_plausibility_max_tokens=1024,
         prompts_dir=None,
         extraction_stt_correction=True,
         extraction_ha_validation=True,

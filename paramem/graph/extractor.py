@@ -648,6 +648,7 @@ def extract_graph(
     speaker_id: str,
     temperature: float = 0.0,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     prompts_dir: str | Path | None = None,
     validate: bool = True,
     ha_context: dict | None = None,
@@ -773,6 +774,7 @@ def extract_graph(
             role_aware_grounding=role_aware_grounding,
             pii_scope=pii_scope,
             max_tokens=max_tokens,
+            plausibility_max_tokens=plausibility_max_tokens,
         )
 
     return graph
@@ -1660,6 +1662,7 @@ def _fallback_plausibility_on_raw(
     speaker_id: str,
     role_aware_grounding: str = "off",
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
 ) -> SessionGraph:
     """Fallback pipeline path: run local plausibility + grounding on raw (unanonymized) facts.
 
@@ -1728,7 +1731,7 @@ def _fallback_plausibility_on_raw(
             transcript,
             model,
             tokenizer,
-            max_tokens=max_tokens,
+            max_tokens=plausibility_max_tokens,
             temperature=_DEFAULT_FILTER_TEMPERATURE,
         )
         if filtered is not None:
@@ -1789,6 +1792,7 @@ def _sota_pipeline(
     role_aware_grounding: str = "off",
     pii_scope: set[str] | frozenset[str] | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
@@ -1861,6 +1865,7 @@ def _sota_pipeline(
             speaker_id=speaker_id,
             role_aware_grounding=role_aware_grounding,
             max_tokens=max_tokens,
+            plausibility_max_tokens=plausibility_max_tokens,
         )
     if not anon_facts:
         logger.info("Anonymization produced 0 facts — skipping SOTA pipeline")
@@ -2004,6 +2009,7 @@ def _sota_pipeline(
                     speaker_id=speaker_id,
                     role_aware_grounding=role_aware_grounding,
                     max_tokens=max_tokens,
+                    plausibility_max_tokens=plausibility_max_tokens,
                 )
 
     # Step 2: SOTA enrichment — coreference + compound splitting + safe reification.
@@ -2208,7 +2214,7 @@ def _sota_pipeline(
             transcript,  # original real-name transcript — intentional, see docstring
             model,
             tokenizer,
-            max_tokens=max_tokens,
+            max_tokens=plausibility_max_tokens,
             temperature=_DEFAULT_FILTER_TEMPERATURE,
         )
         if filtered_deanon is not None:
@@ -2287,6 +2293,7 @@ def _sota_pipeline(
             speaker_id=speaker_id,
             role_aware_grounding=role_aware_grounding,
             max_tokens=max_tokens,
+            plausibility_max_tokens=plausibility_max_tokens,
         )
 
     # Rebuild entity list from surviving + new relations.

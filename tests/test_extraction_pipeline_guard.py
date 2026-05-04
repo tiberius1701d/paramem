@@ -106,6 +106,7 @@ def _extraction_kwargs_namespace():
     return SimpleNamespace(
         extraction_temperature=0.0,
         extraction_max_tokens=2048,
+        extraction_plausibility_max_tokens=1024,
         prompts_dir=None,
         extraction_stt_correction=True,
         extraction_ha_validation=True,
@@ -275,11 +276,11 @@ def test_run_extract_graph_threads_positional_args(monkeypatch):
     ns.prompts_dir = "/custom/prompts"
     ns.extraction_noise_filter = "claude"
 
-    ConsolidationLoop._run_extract_graph(ns, "tobias lives here", "s042", speaker_id="Speaker0")
+    ConsolidationLoop._run_extract_graph(ns, "alex lives here", "s042", speaker_id="Speaker0")
 
     assert captured["model"] is model_sentinel
     assert captured["tokenizer"] is tokenizer_sentinel
-    assert captured["transcript"] == "tobias lives here"
+    assert captured["transcript"] == "alex lives here"
     assert captured["session_id"] == "s042"
     assert captured["kwargs"]["prompts_dir"] == "/custom/prompts"
     assert captured["kwargs"]["noise_filter"] == "claude"
@@ -581,17 +582,17 @@ def test_run_extract_procedural_graph_threads_positional_args(monkeypatch):
 
     ConsolidationLoop._run_extract_procedural_graph(
         ns,
-        "tobias prefers coffee",
+        "alex prefers coffee",
         "s042",
         speaker_id="Speaker0",
-        speaker_name="Tobias",
+        speaker_name="Alex",
         stt_correction=False,
     )
 
     assert captured["model"] is model_sentinel
-    assert captured["transcript"] == "tobias prefers coffee"
+    assert captured["transcript"] == "alex prefers coffee"
     assert captured["session_id"] == "s042"
-    assert captured["kwargs"]["speaker_name"] == "Tobias"
+    assert captured["kwargs"]["speaker_name"] == "Alex"
     assert captured["kwargs"]["stt_correction"] is False
     assert captured["kwargs"]["prompts_dir"] == "/custom/prompts"
 

@@ -264,17 +264,99 @@ def chunk_markdown_file(path: Path, *, min_tokens: int = 200) -> list[DocumentCh
     ]
 
 
-def chunk_pdf_file(path: Path, *, min_tokens: int = 200) -> list[DocumentChunk]:
+def _split_into_sentences(text: str) -> list[str]:
+    """Greedy sentence split on ``.``/``!``/``?`` (followed by space or EOL).
+
+    Trailing closing-quote / bracket characters after the terminator are
+    tolerated.  Whitespace-only fragments are filtered out.  This is a
+    deliberate-no-regex implementation: we walk tokens once and break the
+    accumulator at every token whose stripped form ends with one of the
+    terminators.  Fallback for pathological text with no terminators: a
+    single-element list.
+    """
+    sentences: list[str] = []
+    current: list[str] = []
+    for token in (text or "").split():
+        current.append(token)
+        # Strip trailing closers before testing the terminator so '"hi."' splits.
+        bare = token.rstrip("\"')]}»")
+        if bare.endswith((".", "!", "?")):
+            sentences.append(" ".join(current))
+            current = []
+    if current:
+        sentences.append(" ".join(current))
+    return [s for s in sentences if s.strip()]
+
+
+def _coalesce_to_max_tokens(
+    sentences: list[str], *, max_tokens: int, overlap_tokens: int = 0
+) -> list[str]:
+    """Greedy-merge sentences into chunks ≤ ``max_tokens`` words.
+
+    When adding the next sentence would exceed ``max_tokens``, emit the
+    accumulated chunk and start a new one.  If ``overlap_tokens > 0``, the
+    last ``overlap_tokens`` words of the just-emitted chunk are carried
+    into the next chunk's prefix — preserves cross-chunk context for any
+    sentence that straddles a chunk boundary in the source.
+
+    Sentences longer than ``max_tokens`` themselves are kept whole (no
+    mid-sentence cut); the chunk for that sentence will exceed the cap.
+    The caller treats the cap as a target, not a hard ceiling.
+    """
+    if max_tokens <= 0:
+        return [" ".join(sentences)] if sentences else []
+    chunks: list[str] = []
+    current: list[str] = []
+    current_count = 0
+    for sent in sentences:
+        s_count = len(sent.split())
+        if current and current_count + s_count > max_tokens:
+            chunks.append(" ".join(current))
+            if overlap_tokens > 0:
+                tail = (" ".join(current)).split()[-overlap_tokens:]
+                current = [" ".join(tail), sent] if tail else [sent]
+                current_count = len(tail) + s_count
+            else:
+                current = [sent]
+                current_count = s_count
+        else:
+            current.append(sent)
+            current_count += s_count
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def chunk_pdf_file(
+    path: Path,
+    *,
+    min_tokens: int = 200,
+    max_tokens: int = 1500,
+    overlap_tokens: int = 0,
+) -> list[DocumentChunk]:
     """Chunk a PDF file using ``pypdf`` page-level extraction.
 
     Reads each page with :meth:`pypdf.PageObject.extract_text`, coalesces
-    consecutive short pages (below ``min_tokens`` words) into larger chunks,
-    and rejects image-only PDFs via an average-chars-per-page heuristic.
+    consecutive short pages (below ``min_tokens`` words) into larger sections,
+    and then splits any section above ``max_tokens`` words at sentence
+    boundaries (so a chunk never cuts mid-sentence — important for SOTA
+    enrichment context that depends on resolving "scaling teams from 15
+    to 100+ engineers" as one fact, not two halves).
+
+    Image-only PDFs are rejected via an average-chars-per-page heuristic.
 
     Args:
         path: Path to the ``.pdf`` file.
-        min_tokens: Minimum word count per emitted chunk.  Short consecutive
+        min_tokens: Minimum word count per emitted section.  Short consecutive
             pages are merged until this threshold is met.  Defaults to 200.
+        max_tokens: Approximate word-count ceiling per emitted chunk.
+            Sections above this size are split at sentence boundaries.  A
+            single sentence longer than ``max_tokens`` is kept whole — the
+            chunk will exceed the cap rather than cut mid-sentence.
+            Defaults to 1500.
+        overlap_tokens: When splitting a section, copy this many trailing
+            words of the just-emitted chunk into the next chunk's prefix.
+            Useful for preserving cross-chunk references.  Defaults to 0.
 
     Returns:
         List of :class:`DocumentChunk` instances.
@@ -342,6 +424,20 @@ def chunk_pdf_file(path: Path, *, min_tokens: int = 200) -> list[DocumentChunk]:
     if not sections:
         raise EmptyDocumentError(f"PDF contains no extractable text after filtering: {path}")
 
+    # Apply max_tokens cap with sentence-aware splitting: oversize sections
+    # are broken at sentence boundaries so SOTA enrichment never sees a
+    # truncated antecedent.
+    final_sections: list[str] = []
+    for section in sections:
+        if _word_count(section) <= max_tokens:
+            final_sections.append(section)
+            continue
+        sentences = _split_into_sentences(section)
+        split_chunks = _coalesce_to_max_tokens(
+            sentences, max_tokens=max_tokens, overlap_tokens=overlap_tokens
+        )
+        final_sections.extend(split_chunks)
+
     source_path_str = str(path.resolve())
     doc_title = path.stem
     return [
@@ -351,7 +447,7 @@ def chunk_pdf_file(path: Path, *, min_tokens: int = 200) -> list[DocumentChunk]:
             source_path=source_path_str,
             doc_title=doc_title,
         )
-        for i, section_text in enumerate(sections)
+        for i, section_text in enumerate(final_sections)
     ]
 
 

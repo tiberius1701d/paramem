@@ -25,6 +25,8 @@ from paramem.graph.document_chunker import (
     EmptyDocumentError,
     ScannedPdfRejectedError,
     UnsupportedFormatError,
+    _coalesce_to_max_tokens,
+    _split_into_sentences,
     chunk_document,
     chunk_markdown_file,
     chunk_pdf_file,
@@ -479,3 +481,86 @@ class TestChunkDocumentDispatch:
         path.write_bytes(b"%PDF-1.4 fake")
         chunks = chunk_document(path)
         assert len(chunks) >= 1
+
+
+class TestSplitIntoSentences:
+    def test_splits_on_period_question_exclaim(self):
+        text = "First sentence. Second sentence! Third one? Fourth"
+        out = _split_into_sentences(text)
+        assert out == ["First sentence.", "Second sentence!", "Third one?", "Fourth"]
+
+    def test_handles_quoted_terminator(self):
+        text = 'He said "hello." She left.'
+        out = _split_into_sentences(text)
+        assert out == ['He said "hello."', "She left."]
+
+    def test_empty_input(self):
+        assert _split_into_sentences("") == []
+        assert _split_into_sentences("   ") == []
+
+    def test_no_terminators_returns_single(self):
+        out = _split_into_sentences("words without any terminator")
+        assert out == ["words without any terminator"]
+
+
+class TestCoalesceToMaxTokens:
+    def test_packs_under_cap_into_one_chunk(self):
+        sentences = ["A.", "B.", "C."]
+        out = _coalesce_to_max_tokens(sentences, max_tokens=10)
+        assert out == ["A. B. C."]
+
+    def test_splits_at_sentence_boundary_when_cap_exceeded(self):
+        # Each sentence ~5 words; cap=10 means two sentences per chunk.
+        sentences = [
+            "one two three four five.",
+            "six seven eight nine ten.",
+            "eleven twelve thirteen fourteen fifteen.",
+            "sixteen seventeen eighteen nineteen twenty.",
+        ]
+        out = _coalesce_to_max_tokens(sentences, max_tokens=10)
+        assert len(out) == 2
+        assert "one two three four five." in out[0]
+        assert "six seven eight nine ten." in out[0]
+        assert "eleven" in out[1]
+        assert "sixteen" in out[1]
+
+    def test_overlap_carries_trailing_words(self):
+        sentences = ["a b c d e.", "f g h i j.", "k l m."]
+        out = _coalesce_to_max_tokens(sentences, max_tokens=5, overlap_tokens=2)
+        # First chunk: "a b c d e." (5 words, fills cap)
+        # Second chunk gets last 2 words of first as overlap prefix: "d e."
+        assert out[0] == "a b c d e."
+        assert out[1].startswith("d e.")
+
+    def test_oversize_sentence_kept_whole(self):
+        sentences = ["one two three four five six seven eight nine ten."]
+        out = _coalesce_to_max_tokens(sentences, max_tokens=5)
+        # Cap=5 but sentence is 10 words; never cut mid-sentence.
+        assert out == ["one two three four five six seven eight nine ten."]
+
+
+class TestPdfChunkerMaxTokens:
+    def test_section_above_max_tokens_is_split_at_sentence_boundary(self, tmp_path, monkeypatch):
+        """Long page split into multiple chunks, never cutting mid-sentence."""
+        # Build a single long page (>1500 words), each sentence ~6 words.
+        sentences = [f"This is sentence number {i}." for i in range(400)]
+        page = " ".join(sentences)
+        fake = _fake_reader([page])
+        monkeypatch.setattr("paramem.graph.document_chunker.pypdf.PdfReader", lambda path: fake)
+        path = tmp_path / "big.pdf"
+        path.write_bytes(b"%PDF-1.4 fake")
+        chunks = chunk_pdf_file(path, min_tokens=200, max_tokens=500)
+        # Should produce multiple chunks; each ≤ ~500 words; no mid-sentence cuts.
+        assert len(chunks) > 1
+        for c in chunks:
+            # No chunk should end mid-sentence.
+            assert c.text.rstrip().endswith((".", "!", "?"))
+
+    def test_section_under_max_tokens_passes_through(self, tmp_path, monkeypatch):
+        page = "Short content. Just a little. " * 30
+        fake = _fake_reader([page])
+        monkeypatch.setattr("paramem.graph.document_chunker.pypdf.PdfReader", lambda path: fake)
+        path = tmp_path / "small.pdf"
+        path.write_bytes(b"%PDF-1.4 fake")
+        chunks = chunk_pdf_file(path, min_tokens=50, max_tokens=1500)
+        assert len(chunks) == 1
