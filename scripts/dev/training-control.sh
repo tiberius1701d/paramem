@@ -10,7 +10,7 @@
 #   source ~/.local/bin/training-control.sh
 #
 #   training_pause       # Signal: stop after current cycle/checkpoint
-#   training_resume [N]  # Launch test N (8, 9, 10, 10b, 11, 13). Default: 8.
+#   training_resume [N]  # Launch test N (8, 9, 10, 10b, 11, 13, 13b, 14, 14s).
 #   training_status      # Show pause state + GPU + progress for all tests
 #
 # Recommended aliases (add to ~/.bashrc):
@@ -41,8 +41,113 @@ PROJECT_DIR="$HOME/projects/paramem"
 PARAMEM_SERVER_PORT=8420
 PYTHON_BIN="$HOME/miniforge3/envs/paramem/bin/python"
 
-# Test registry: script name, output dir, pgrep pattern
-declare -A TEST_SCRIPTS TEST_OUTPUT_DIRS TEST_PGREP
+# ============================================================================
+# AUTHORING GUIDE — adding a new test or a probe within an existing test set
+# ============================================================================
+#
+# Naming convention
+# -----------------
+#   - **Bare number** (8, 13, 14):  a top-level "test set".  Owns its own
+#     output dir and script; runs phases sequentially; finalized result is
+#     a multi-phase artifact in `outputs/<test_name>/<model>/<run_ts>/`.
+#   - **Suffixed letter** (10b, 13b, 14s):  a peer test that shares scope
+#     with a bare-number sibling.  Two flavors:
+#       * "b" suffix (10b, 13b):  separate experiment with its own script
+#         and output dir, but methodologically related to the sibling.
+#       * "s" suffix (14s):       a probe / smoke that lives INSIDE the
+#         sibling's run dir — reuses Phase A/B artifacts, runs only a
+#         restricted slice of Phase C.
+#
+# The two cases are equally valid; pick by whether the new work needs its
+# own run dir (fresh experiment) or wants to ride an existing one (probe).
+#
+# Invariants every entry MUST honor (this is the user-facing contract)
+# --------------------------------------------------------------------
+# 1. `tpause` writes ~/.training_pause.  Every test script MUST check this
+#    at every epoch boundary (and at phase boundaries) and exit cleanly
+#    after writing `paused.json` to its run dir.  No mid-step kills.
+# 2. `tresume <N>` clears the pause flag, loads the latest checkpoint, and
+#    continues from where the script stopped.  The script MUST accept
+#    `--resume` and reconstruct state from on-disk markers — never from
+#    persisted CLI snapshots that can drift across re-launches.
+# 3. Finalized results are preserved on re-launch.  The script SHOULD
+#    skip-on-done at every level (phase done-marker, per-(variant, seed)
+#    `*_done.json`).  Inserting a new test/probe MUST NOT cause a re-run
+#    of finalized data — only the explicitly-named new scope executes.
+# 4. Run-config drift is auto-migrated, not silently overwritten.  When
+#    a script-level config (e.g., LR scheduler) differs from a finalized
+#    result's persisted config, the old result is renamed aside (a tag
+#    suffix preserving provenance), not deleted; the new run lands fresh
+#    in the canonical name.
+#
+# Adding a brand-new test set (own script + own output dir)
+# ---------------------------------------------------------
+# 1. Drop the script at `experiments/<test_name>.py`.
+# 2. Add four registry rows below:
+#       TEST_SCRIPTS[N]      = "experiments/<test_name>.py"
+#       TEST_OUTPUT_DIRS[N]  = "outputs/<test_name>"
+#       TEST_PGREP[N]        = "<test_name>"        # specific enough to
+#                                                    match only this script
+#       (TEST_EXTRA_FLAGS[N] = ""                   # leave unset; the
+#                                                    script reads its own
+#                                                    run_config.json)
+# 3. Add `N` to `_find_running_test`'s iteration order (broader patterns
+#    later — see "ordering rule" below).
+# 4. Add `N` to `training_status`'s per-test loop.
+# 5. Add `N` to the "Valid:" message in `training_resume` and to this
+#    file-header `Usage` block.
+# 6. The script itself must implement the four invariants above.
+#
+# Inserting a probe / smoke within an existing test set (peer entry)
+# ------------------------------------------------------------------
+# A probe is a single-(variant, seed) experiment that reuses an existing
+# run dir's Phase A/B and runs only a restricted Phase C scope.  Pattern:
+#       TEST_SCRIPTS["Ns"]      = TEST_SCRIPTS[N]            # same script
+#       TEST_OUTPUT_DIRS["Ns"]  = TEST_OUTPUT_DIRS[N]        # same dir
+#       TEST_PGREP["Ns"]        = "<test_name>.*<distinguisher>"
+#       TEST_EXTRA_FLAGS["Ns"]  = "--mode=... --variant ... --phase-c-seeds ..."
+#
+# The probe's scope flags live in TEST_EXTRA_FLAGS, NOT in the run_dir's
+# `run_config.json` — the persisted config belongs to the broader test set
+# and must not be contaminated by a probe's narrower scope.  When
+# TEST_EXTRA_FLAGS is set, `training_resume` uses those flags verbatim and
+# skips the run_config-derived passthrough; the script still receives
+# `--resume`, so tpause/tresume cycles continue from preserved checkpoints.
+#
+# Distinguisher pattern
+# ---------------------
+# The peer's TEST_PGREP must match a substring of argv that the broader
+# sibling does not pass (e.g., `--variant V3` for 14s, where bare 14
+# never passes `--variant`).  This is what lets `_find_running_test`
+# attribute the live PID to the right entry.
+#
+# Ordering rule for `_find_running_test`
+# --------------------------------------
+# Iterate with more-specific patterns FIRST.  When a peer test is running,
+# its PID's argv matches BOTH the peer's narrow pgrep AND the broader
+# sibling's loose pgrep; the iteration must hit the peer first or the
+# attribution is wrong.  Convention: suffixed entries (Ns, Nb, ...) come
+# before the bare number N in the iteration order.
+#
+# Status display
+# --------------
+# A peer test sharing a run dir does NOT need its own per-test status
+# block — the per-(variant, seed) progress is already visible in the
+# sibling's status block.  The top-of-output "RUNNING (test Ns)" header
+# (driven by `_find_running_test`) tells the user which entry is active.
+# Add a separate status block only when the peer has its own run dir.
+#
+# Concurrency
+# -----------
+# Only one test runs at a time (8 GB VRAM).  `training_resume` checks
+# `_find_running_test` and refuses to launch if anything is active —
+# whether bare or peer.  This is enforced at the registry level; the
+# script doesn't need its own mutex.
+#
+# ============================================================================
+
+# Test registry: script name, output dir, pgrep pattern, optional fixed flags.
+declare -A TEST_SCRIPTS TEST_OUTPUT_DIRS TEST_PGREP TEST_EXTRA_FLAGS
 TEST_SCRIPTS[8]="experiments/test8_large_scale.py"
 TEST_SCRIPTS[9]="experiments/test9_natural_recall.py"
 TEST_SCRIPTS[10]="experiments/test10_grokking.py"
@@ -51,6 +156,11 @@ TEST_SCRIPTS[11]="experiments/test11_adapter_extraction.py"
 TEST_SCRIPTS[13]="experiments/test13_journal_scaffold.py"
 TEST_SCRIPTS["13b"]="experiments/test13b_retention_curve.py"
 TEST_SCRIPTS[14]="experiments/test14.py"
+# 14s = single-(variant, seed) smoke that probes a Phase C config without
+# touching the broader multi-seed sequence.  Shares run dir with test 14
+# so it can reuse Phase A and Phase B from V3.  Currently configured for
+# the V3/seed42 apples-to-apples validation at linear+B50+decay=600.
+TEST_SCRIPTS["14s"]="experiments/test14.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
@@ -60,6 +170,7 @@ TEST_OUTPUT_DIRS[11]="outputs/test11_adapter_extraction"
 TEST_OUTPUT_DIRS[13]="outputs/test13_journal_scaffold"
 TEST_OUTPUT_DIRS["13b"]="outputs/test13b_retention_curve"
 TEST_OUTPUT_DIRS[14]="outputs/test14_pre"
+TEST_OUTPUT_DIRS["14s"]="outputs/test14_pre"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
@@ -69,6 +180,15 @@ TEST_PGREP[11]="test11_adapter_extraction"
 TEST_PGREP[13]="test13_journal_scaffold"
 TEST_PGREP["13b"]="test13b_retention_curve"
 TEST_PGREP[14]="test14"
+# 14s is distinguished from 14 by its --variant flag — the broader
+# multi-seed never passes --variant.  Checked before 14 in the iteration
+# order so the more-specific match wins.
+TEST_PGREP["14s"]="test14.*--variant V3"
+
+# Smoke flags for 14s.  Hardcoded here rather than persisted to
+# run_config.json so the smoke remains an explicit, repeatable probe and
+# does not contaminate the persisted multi-seed config.
+TEST_EXTRA_FLAGS["14s"]="--mode=pre --variant V3 --phase-c-seeds 42 --phase-c-num-epochs 50 --lr-scheduler-type linear --phase-c-decay-steps 600"
 
 # TODO(probe): register experiments/dataset_probe.py for long runs (>60 min).
 # Planned registry values:
@@ -227,14 +347,29 @@ _release_server_gpu() {
 
 _find_running_test() {
     # Returns the test number of the currently running test, or empty.
-    # Pattern requires "python" in front of the script name so stray shells
-    # with the string in a heredoc/argv (e.g. inline analysis scripts, or
-    # zombie wrappers) don't register as a running test.
-    for t in 8 9 10 10b 11 13 13b 14; do
-        if pgrep -f "python[^ ]* .*${TEST_PGREP[$t]}" >/dev/null 2>&1; then
-            echo "$t"
-            return
-        fi
+    # ``pgrep -f`` matches against the full argv, so unrelated shells whose
+    # argv contains the script name as a literal string (e.g. a watcher
+    # running ``until ! pgrep -f "python.*test14"``) would falsely register.
+    # Filter the candidate PIDs by ``ps -o comm=`` and accept only those
+    # whose executable name starts with ``python`` — that's the actual
+    # training process, never a shell wrapper.
+    #
+    # Iteration order: more-specific patterns first.  Variant tests
+    # (14s, 13b, 10b) share their script with a broader sibling (14, 13,
+    # 10) and must be checked first so a running variant doesn't get
+    # mis-attributed to the broader entry.
+    for t in 8 9 10b 10 11 13b 13 14s 14; do
+        [[ -z "${TEST_PGREP[$t]:-}" ]] && continue
+        local pids
+        pids=$(pgrep -f "${TEST_PGREP[$t]}" 2>/dev/null)
+        for pid in $pids; do
+            local comm
+            comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+            if [[ "$comm" == python* ]]; then
+                echo "$t"
+                return
+            fi
+        done
     done
 }
 
@@ -403,7 +538,7 @@ training_resume() {
 
     # Validate test number
     if [[ -z "${TEST_SCRIPTS[$test_num]}" ]]; then
-        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14."
+        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s."
         return 1
     fi
 
@@ -472,17 +607,19 @@ training_resume() {
         log_file="$PROJECT_DIR/${TEST_OUTPUT_DIRS[$test_num]}/training.log"
     fi
 
-    # Test 14: detect mode from latest run_config.json so tresume 14 after a
-    # pause resumes the correct mode (pre/scale/multiround) rather than
-    # defaulting to --mode=pre regardless of where the run stopped.
-    #
-    # Also auto-detect Phase A reuse: when --mode=pre and the run dir
-    # contains V1/V2/V3 done markers, the same dir is the source for the
-    # extended-run variants (V3_extended/V4-V8).  Without this, the
-    # extended variants would fresh-train Phase A on resume because their
-    # phase_a_reused.json markers haven't been written yet — costs ~3 h
-    # per variant.
-    if [[ "$test_num" == "14" ]]; then
+    # Test 14 family (14, 14s, future probe variants): all run
+    # experiments/test14.py.  When TEST_EXTRA_FLAGS[$test_num] is set, the
+    # entry is a variant probe (e.g., 14s smoke) — use those flags
+    # verbatim and skip the run_config-derived passthrough so the variant
+    # doesn't inherit the broader sibling's scope.  --resume still applies,
+    # so checkpoint continuation works through tpause/tresume cycles.
+    if [[ "$test_num" == "14" || "$test_num" == "14s" ]] && [[ -n "${TEST_EXTRA_FLAGS[$test_num]:-}" ]]; then
+        extra_flags="${TEST_EXTRA_FLAGS[$test_num]}"
+    elif [[ "$test_num" == "14" ]]; then
+        # Bare test 14: detect mode from latest run_config.json so tresume 14
+        # after a pause resumes the correct mode (pre/scale/multiround)
+        # rather than defaulting to --mode=pre regardless of where the run
+        # stopped.
         # run_config.json sits at <output_base>/<model>/<ts>/run_config.json
         # → depth 3 from each output_base.  Earlier -maxdepth 2 silently
         # missed everything.
@@ -491,11 +628,23 @@ training_resume() {
             local run_dir=$(dirname "$latest_dir")
             local mode_value=$(python3 -c "import json; print(json.load(open('$latest_dir')).get('mode','pre'))" 2>/dev/null)
             extra_flags="--mode=$mode_value"
-            # Phase A reuse pass-through: --mode=pre + V3 baseline already
-            # in this run dir = extended-run pattern.  Pass the run dir
-            # back through --reuse-phase-a-from so V4/V5 skip Phase A.
-            if [[ "$mode_value" == "pre" && -f "$run_dir/V3/A/A_done.json" ]]; then
-                extra_flags="$extra_flags --reuse-phase-a-from $run_dir"
+            # Phase A reuse pass-through: read from run_config.json, do NOT
+            # infer from disk state.  Inferring (e.g., "V3/A/A_done.json
+            # exists") silently expanded the variant set to V3_extended/
+            # V4-V8 on every tresume, which violates "tresume continues
+            # exactly the paused work."  When the field is null/missing
+            # in run_config.json, original variants (V1/V2/V3) run only;
+            # the user can pass --reuse-phase-a-from on an explicit later
+            # launch to add extended variants on top.
+            if [[ "$mode_value" == "pre" ]]; then
+                local reuse_phase_a_from=$(python3 -c "
+import json
+v = json.load(open('$latest_dir')).get('reuse_phase_a_from')
+print(v if v else '')
+" 2>/dev/null)
+                if [[ -n "$reuse_phase_a_from" ]]; then
+                    extra_flags="$extra_flags --reuse-phase-a-from $reuse_phase_a_from"
+                fi
             fi
             # 14b multiround binds to a specific 14a (scale) run via
             # scale_run.  The path is persisted in run_config.json on
@@ -528,6 +677,29 @@ print(v if v is not None else '')
 " 2>/dev/null)
             if [[ -n "$phase_c_num_epochs" ]]; then
                 extra_flags="$extra_flags --phase-c-num-epochs $phase_c_num_epochs"
+            fi
+            # lr_scheduler_type pass-through: when set in run_config.json,
+            # keep it across every resume so apples-to-apples conditions are
+            # preserved.
+            local lr_scheduler_type=$(python3 -c "
+import json
+v = json.load(open('$latest_dir')).get('lr_scheduler_type')
+print(v if v else '')
+" 2>/dev/null)
+            if [[ -n "$lr_scheduler_type" ]]; then
+                extra_flags="$extra_flags --lr-scheduler-type $lr_scheduler_type"
+            fi
+            # phase_c_decay_steps pass-through: 300 (default) decouples LR
+            # decay from num_train_epochs; 0 falls back to budget-coupled
+            # decay (the original bug, retained for reproducing the
+            # historical numbers).
+            local phase_c_decay_steps=$(python3 -c "
+import json
+v = json.load(open('$latest_dir')).get('phase_c_decay_steps')
+print(v if v is not None else '')
+" 2>/dev/null)
+            if [[ -n "$phase_c_decay_steps" ]]; then
+                extra_flags="$extra_flags --phase-c-decay-steps $phase_c_decay_steps"
             fi
         fi
     fi
@@ -708,10 +880,22 @@ _show_test_status() {
             fi
             return
         fi
+        # A peer test (e.g., 14s smoke) shares the run dir with bare test 14.
+        # When the peer is running, the running seed's progress is visible
+        # inside this block — so treat the peer as "running for test 14"
+        # for status-display purposes.  Detected via shared TEST_OUTPUT_DIRS.
         local is_running=""
         local running_flag=""
-        if [[ "$running_test" == "$test_num" ]]; then
-            is_running=" ${GREEN}RUNNING${RESET}"
+        local same_run_dir="0"
+        if [[ -n "$running_test" ]] && [[ "${TEST_OUTPUT_DIRS[$running_test]:-}" == "${TEST_OUTPUT_DIRS[$test_num]:-}" ]]; then
+            same_run_dir="1"
+        fi
+        if [[ "$running_test" == "$test_num" ]] || [[ "$same_run_dir" == "1" ]]; then
+            if [[ "$running_test" == "$test_num" ]]; then
+                is_running=" ${GREEN}RUNNING${RESET}"
+            else
+                is_running=" ${DIM}(peer ${running_test} active)${RESET} ${GREEN}RUNNING${RESET}"
+            fi
             running_flag="1"
         fi
         echo ""
@@ -1172,7 +1356,7 @@ _show_test14_status() {
         # (paused.json names this phase), or ✗ stopped (no process and no
         # paused marker — a crash).
         python3 - "$run_dir" "$running_flag" <<'PYEOF' 2>/dev/null
-import json, sys, os
+import json, re, sys, os
 run_dir = sys.argv[1]
 is_running = bool(sys.argv[2]) if len(sys.argv) > 2 else False
 
@@ -1209,6 +1393,43 @@ if os.path.exists(cfg_path):
     except Exception:
         configured_seeds = []
 
+# A seed dir is canonical only when its name is exactly ``seed<N>``.  Migrated
+# dirs (``seed42_linearLR``, ``seed42_b50``, ``seed42_linear_dbudget``) are
+# legacy artifacts kept for provenance — they must not count toward the
+# done/in-flight tallies for the configured seed list.
+_SEED_NAME_RE = re.compile(r"^seed(\d+)$")
+_configured_seed_set = set(int(s) for s in configured_seeds) if configured_seeds else None
+
+def _is_canonical_seed_dir(name: str) -> bool:
+    m = _SEED_NAME_RE.match(name)
+    if not m:
+        return False
+    if _configured_seed_set is None:
+        return True
+    return int(m.group(1)) in _configured_seed_set
+
+# Identify the single seed/phase that is actually being trained.  ``is_running``
+# (test-level PID flag) tells us a python.test14 process exists, but the per-
+# seed rendering needs to know WHICH seed.  We pick the progress.json with the
+# most recent mtime — HF Trainer's epoch-end probe rewrites it every cycle, so
+# the active seed always has the freshest mtime by a wide margin.  Stale
+# progress.json files from prior sessions (paused, abandoned, crashed) lose.
+def _active_progress_path() -> str:
+    best_path, best_mtime = "", -1.0
+    for dirpath, _dirs, files in os.walk(run_dir):
+        if "progress.json" not in files:
+            continue
+        p = os.path.join(dirpath, "progress.json")
+        try:
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if m > best_mtime:
+            best_path, best_mtime = p, m
+    return best_path
+
+active_progress = _active_progress_path() if is_running else ""
+
 import statistics
 
 def _phase_c_render_multiseed(variant, c_dir):
@@ -1221,7 +1442,7 @@ def _phase_c_render_multiseed(variant, c_dir):
         return False
     seed_subdirs = sorted(
         d for d in os.listdir(c_dir)
-        if d.startswith("seed") and os.path.isdir(os.path.join(c_dir, d))
+        if _is_canonical_seed_dir(d) and os.path.isdir(os.path.join(c_dir, d))
     )
     if not seed_subdirs:
         return False
@@ -1292,23 +1513,26 @@ def _phase_c_render_multiseed(variant, c_dir):
         print(f"  {variant}/C:    \x1b[2m{n_target} seeds queued\x1b[0m")
 
     # Per-seed in-flight detail line: classify each as paused/running/stopped.
+    # "running" is awarded only to the seed whose progress.json has the most
+    # recent mtime (computed once as ``active_progress``).  Other in-flight
+    # seeds are stale artifacts from prior sessions — render as ✗ stopped.
     for s in in_flight:
         seed_num = s["seed"]
         cur = s["epoch"]
         total = s["total"]
         fr = s["fill_rate"]
         fr_str = f", fill={fr:.2f}" if isinstance(fr, (int, float)) else ""
-        # Pause attribution: paused.json says "during C, variant {v}, seed {s}"
+        seed_progress_path = os.path.join(c_dir, f"seed{seed_num}", "progress.json")
         is_paused_here = False
         if paused_label.startswith("during "):
             is_paused_here = (
-                f"during C" in paused_label
+                "during C" in paused_label
                 and f"variant {variant}" in paused_label
                 and f"seed {seed_num}" in paused_label
             )
         if is_paused_here:
             lbl = "\x1b[33m⏸ paused\x1b[0m"
-        elif is_running:
+        elif is_running and seed_progress_path == active_progress:
             lbl = "\x1b[36m▶ running\x1b[0m"
         else:
             lbl = "\x1b[31m✗ stopped\x1b[0m"
@@ -1317,9 +1541,29 @@ def _phase_c_render_multiseed(variant, c_dir):
     # Per-seed "starting" detail: Phase C just entered, no probe yet.
     # In-training train_adapter writes step-progress only into stdout
     # (not into a file we can read), so we can't show step counts here.
+    # Without progress.json we can't compare mtimes, so attribute via the
+    # adapter dir's mtime instead.
     for s in starting:
         seed_num = s["seed"]
-        if is_running:
+        adapter_dir = os.path.join(c_dir, f"seed{seed_num}", "adapter")
+        try:
+            adapter_mtime = os.path.getmtime(adapter_dir)
+        except OSError:
+            adapter_mtime = -1.0
+        active_mtime = -1.0
+        if active_progress and os.path.exists(active_progress):
+            try:
+                active_mtime = os.path.getmtime(active_progress)
+            except OSError:
+                pass
+        # If no progress.json exists anywhere yet, the only signal is "is_running"
+        # plus a recent adapter dir.  Otherwise, only mark "starting" when this
+        # seed's adapter mtime is newer than the active progress.json (i.e.,
+        # we're between Phase C entry and first probe).
+        is_starting_here = is_running and (
+            not active_progress or adapter_mtime >= active_mtime
+        )
+        if is_starting_here:
             lbl = "\x1b[36m▶ starting\x1b[0m"
             suffix = "\x1b[2m(first probe pending; ~5-7 min from Phase C entry)\x1b[0m"
         else:
@@ -1378,7 +1622,7 @@ for variant in ("V1", "V2", "V3", "V3_extended", "V4", "V5", "V6", "V7", "V8"):
                     if _phase_paused_here(variant, phase):
                         label = "\x1b[33m⏸ paused\x1b[0m"
                         suffix = "\x1b[2m(no done marker — incomplete)\x1b[0m"
-                    elif is_running:
+                    elif is_running and progress_path == active_progress:
                         label = "\x1b[36m▶ running\x1b[0m"
                         suffix = ""
                     else:
@@ -1431,65 +1675,41 @@ if os.path.exists(os.path.join(run_dir, "multiseed_aggregate.json")):
         pass
 PYEOF
 
-        # In-flight phase: detect (variant, phase[, seed]) tuple with
-        # progress.json but no *_done.json, and render an epoch progress
-        # bar with ETA.  Phase C in multi-seed mode lives under
-        # <variant>/C/seed<N>/, so the detector also descends into seed
-        # sub-dirs.  Whichever (variant, phase, seed) tuple is first found
-        # in deterministic order wins; subsequent ones surface in the
-        # per-seed lines emitted by _phase_c_render_multiseed.
-        local current_var="" current_phase="" current_seed=""
-        for variant in V1 V2 V3 V3_extended V4 V5 V6 V7 V8; do
-            local v_dir="$run_dir/$variant"
-            [[ -d "$v_dir" ]] || continue
-            for phase in A B C; do
-                local p_dir="$v_dir/$phase"
-                # Phase C multi-seed: iterate seed sub-dirs first.  Prefer
-                # a seed with progress.json (active in-flight) over one
-                # that's only "starting" (adapter/ exists, no probe yet),
-                # so the progress bar locks onto the most informative target.
-                if [[ "$phase" == "C" && -d "$p_dir" ]]; then
-                    local found_seed=""
-                    local starting_seed=""
-                    for sd in "$p_dir"/seed*/; do
-                        [[ -d "$sd" ]] || continue
-                        if [[ -f "$sd/C_done.json" ]]; then
-                            continue
-                        fi
-                        if [[ -f "$sd/progress.json" ]]; then
-                            found_seed=$(basename "$sd")
-                            break
-                        fi
-                        if [[ -d "$sd/adapter" && -z "$starting_seed" ]]; then
-                            starting_seed=$(basename "$sd")
-                        fi
-                    done
-                    [[ -z "$found_seed" ]] && found_seed="$starting_seed"
-                    if [[ -n "$found_seed" ]]; then
-                        current_var="$variant"
-                        current_phase="$phase"
-                        current_seed="$found_seed"
-                        break 2
-                    fi
+        # In-flight phase: locate the (variant, phase[, seed]) currently being
+        # trained by picking the progress.json with the most recent mtime.
+        # The training process rewrites that file on every epoch-end probe,
+        # so its mtime is the freshest by a wide margin.  Stale progress.json
+        # files from prior sessions (paused, abandoned, crashed) lose this
+        # comparison automatically.  Skipped entirely when the test isn't
+        # running — without a live process, there is no "current" cycle.
+        if [[ -n "$running_flag" ]]; then
+            local active_progress
+            active_progress=$(find "$run_dir" -name progress.json -printf '%T@ %p\n' 2>/dev/null \
+                | sort -rn | head -1 | awk '{print $2}')
+            if [[ -n "$active_progress" ]]; then
+                # Strip $run_dir/ prefix and /progress.json suffix to recover
+                # the relative path, then split into variant/phase[/seed].
+                local rel="${active_progress#$run_dir/}"
+                rel="${rel%/progress.json}"
+                local current_var="${rel%%/*}"
+                local rest="${rel#*/}"
+                local current_phase="${rest%%/*}"
+                local current_seed=""
+                if [[ "$rest" == */* ]]; then
+                    current_seed="${rest#*/}"
                 fi
-                # Legacy single-seed C, or any A/B phase.
-                if [[ -f "$p_dir/progress.json" && ! -f "$p_dir/${phase}_done.json" ]]; then
-                    current_var="$variant"
-                    current_phase="$phase"
-                    current_seed=""
-                    break 2
+                # Skip rendering if the phase already has a *_done.json marker
+                # (e.g., legacy C/C_done.json plus a fresh seed42/progress.json
+                # from a re-run — the seed dir is what's active, not the phase).
+                local progress_dir="$run_dir/$current_var/$current_phase"
+                [[ -n "$current_seed" ]] && progress_dir="$progress_dir/$current_seed"
+                if [[ ! -f "$progress_dir/${current_phase}_done.json" ]]; then
+                    local label_path="${current_var}/Phase ${current_phase}"
+                    [[ -n "$current_seed" ]] && label_path="${label_path}/${current_seed}"
+                    echo -e "  Current:    ${YELLOW}${label_path}${RESET}"
+                    _show_epoch_progress "$progress_dir" "${label_path}"
                 fi
-            done
-        done
-        if [[ -n "$current_var" ]]; then
-            local label_path="${current_var}/Phase ${current_phase}"
-            local progress_path="$run_dir/$current_var/$current_phase"
-            if [[ -n "$current_seed" ]]; then
-                label_path="${label_path}/${current_seed}"
-                progress_path="${progress_path}/${current_seed}"
             fi
-            echo -e "  Current:    ${YELLOW}${label_path}${RESET}"
-            _show_epoch_progress "$progress_path" "${label_path}"
         fi
 
     elif [[ "$mode" == "scale" ]]; then
@@ -1504,6 +1724,24 @@ if os.path.exists(paused_path):
         paused_label = json.load(open(paused_path)).get("stopped_after_phase", "") or ""
     except Exception:
         paused_label = ""
+
+# Identify the active progress.json by mtime (see pre-mode helper for rationale).
+def _active_progress_path() -> str:
+    best_path, best_mtime = "", -1.0
+    for dirpath, _dirs, files in os.walk(run_dir):
+        if "progress.json" not in files:
+            continue
+        p = os.path.join(dirpath, "progress.json")
+        try:
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if m > best_mtime:
+            best_path, best_mtime = p, m
+    return best_path
+
+active_progress = _active_progress_path() if is_running else ""
+
 for phase in ("A", "B", "C"):
     phase_dir = os.path.join(run_dir, phase)
     marker = os.path.join(phase_dir, f"{phase}_done.json")
@@ -1519,7 +1757,7 @@ for phase in ("A", "B", "C"):
                 if paused_label.startswith("during ") and f"during {phase}" in paused_label:
                     label = "\x1b[33m⏸ paused\x1b[0m"
                     suffix = "\x1b[2m(no done marker — incomplete)\x1b[0m"
-                elif is_running:
+                elif is_running and progress_path == active_progress:
                     label = "\x1b[36m▶ running\x1b[0m"
                     suffix = ""
                 else:
