@@ -2740,9 +2740,9 @@ async def gpu_release():
     a server already in cloud-only returns 200 immediately.
 
     During an in-flight consolidation cycle the server returns 503; the
-    caller may retry. Mid-cycle release would corrupt extraction state
-    (the cycle re-extracts on next start, but losing partial-cycle work
-    is wasteful and exits via SIGUSR1 had the same flaw).
+    caller may retry. Mid-cycle release would corrupt extraction state:
+    the cycle re-extracts on next start, but losing partial-cycle work is
+    wasteful (the older SIGUSR1-exit release path had the same flaw).
 
     On success the response is synchronous — by the time the POST returns,
     the model is unloaded and ``_state["mode"]`` is ``"cloud-only"``. The
@@ -5749,7 +5749,7 @@ def _scheduled_extract_done_callback(future):
 
     exc = future.exception()
     if exc:
-        logger.exception("Scheduled extraction failed: %s", exc)
+        logger.error("Scheduled extraction failed: %s", exc, exc_info=exc)
         if isinstance(exc, VramExhausted):
             phase = exc.args[0] if exc.args else "unknown"
             _state["last_consolidation_error"] = {

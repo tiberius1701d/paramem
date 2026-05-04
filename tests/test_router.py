@@ -31,12 +31,27 @@ def _make_pair(
     subject: str,
     obj: str,
     *,
-    speaker_id: str | None = None,
+    speaker_id: str = "",
+    question: str = "Q?",
+    answer: str = "A.",
+    source_predicate: str = "related_to",
+    first_seen_cycle: int = 1,
 ) -> dict:
-    pair = {"key": key, "source_subject": subject, "source_object": obj}
-    if speaker_id is not None:
-        pair["speaker_id"] = speaker_id
-    return pair
+    """Return a full-schema keyed pair for use in router tests.
+
+    All eight canonical fields are included so ``read_keyed_pairs`` schema
+    validation passes when the router loads the fixture file.
+    """
+    return {
+        "key": key,
+        "question": question,
+        "answer": answer,
+        "source_subject": subject,
+        "source_predicate": source_predicate,
+        "source_object": obj,
+        "speaker_id": speaker_id,
+        "first_seen_cycle": first_seen_cycle,
+    }
 
 
 def _make_ha_match(

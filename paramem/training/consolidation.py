@@ -803,6 +803,23 @@ class ConsolidationLoop:
         procedural_rels = self.dedup_procedural(procedural_rels)
 
         self.last_session_graph = session_graph
+
+        # Release PyTorch's CUDA cache pool back to the WSL2 dxg layer at every
+        # session boundary.  PyTorch's caching allocator retains freed blocks
+        # (``reserved`` − ``allocated``); on this 8 GiB laptop, after a session's
+        # plausibility-filter peak, that retained pool can hold ~700-1500 MiB
+        # which dxg counts as in-use.  Without this, multi-session cycles
+        # accumulate host-side residency until ``dxgkio_make_resident`` fails
+        # with ENOMEM on the next session's first growth — the dxg crash class
+        # we measured on 2026-05-04.
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
         return episodic_qa, procedural_rels
 
     def train_adapters(
@@ -964,8 +981,10 @@ class ConsolidationLoop:
                 "question": kp["question"],
                 "answer": kp["answer"],
                 "source_subject": kp.get("source_subject", ""),
+                "source_predicate": kp.get("source_predicate", ""),
                 "source_object": kp.get("source_object", ""),
                 "speaker_id": kp.get("speaker_id", ""),
+                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
             }
         self._indexed_next_index += len(new_keyed)
 
@@ -1035,9 +1054,10 @@ class ConsolidationLoop:
                     "question": qa["question"],
                     "answer": qa["answer"],
                     "source_subject": qa.get("source_subject", ""),
-                    "source_object": qa.get("source_object", ""),
                     "source_predicate": qa.get("source_predicate", ""),
+                    "source_object": qa.get("source_object", ""),
                     "speaker_id": rel_speaker,
+                    "first_seen_cycle": self.cycle_count,
                 }
             )
 
@@ -1169,8 +1189,10 @@ class ConsolidationLoop:
                 "question": kp["question"],
                 "answer": kp["answer"],
                 "source_subject": kp.get("source_subject", ""),
+                "source_predicate": kp.get("source_predicate", ""),
                 "source_object": kp.get("source_object", ""),
                 "speaker_id": kp.get("speaker_id", ""),
+                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
             }
         self._indexed_next_index += len(new_keyed)
 
@@ -1265,9 +1287,10 @@ class ConsolidationLoop:
                 "question": qa["question"],
                 "answer": qa["answer"],
                 "source_subject": qa.get("source_subject", ""),
-                "source_object": qa.get("source_object", ""),
                 "source_predicate": qa.get("source_predicate", ""),
+                "source_object": qa.get("source_object", ""),
                 "speaker_id": rel_speaker,
+                "first_seen_cycle": self.cycle_count,
             }
             new_keyed.append(keyed)
 
@@ -1598,8 +1621,10 @@ class ConsolidationLoop:
                 "question": kp["question"],
                 "answer": kp["answer"],
                 "source_subject": kp.get("source_subject", ""),
+                "source_predicate": kp.get("source_predicate", ""),
                 "source_object": kp.get("source_object", ""),
                 "speaker_id": kp.get("speaker_id", ""),
+                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
             }
         self._indexed_next_index += len(new_keyed)
 
@@ -1841,9 +1866,10 @@ class ConsolidationLoop:
                 "question": qa["question"],
                 "answer": qa["answer"],
                 "source_subject": qa.get("source_subject", ""),
-                "source_object": qa.get("source_object", ""),
                 "source_predicate": qa.get("source_predicate", ""),
+                "source_object": qa.get("source_object", ""),
                 "speaker_id": rel_speaker,
+                "first_seen_cycle": self.cycle_count,
             }
             new_keyed.append(keyed)
 
@@ -2202,7 +2228,6 @@ class ConsolidationLoop:
                 :meth:`post_session_train`.
         """
         import hashlib as _hashlib
-        import json as _json
 
         from paramem.adapters.manifest import build_manifest_for
         from paramem.server.interim_adapter import current_full_consolidation_stamp
@@ -2219,39 +2244,26 @@ class ConsolidationLoop:
             payload = self.indexed_key_registry.save_bytes()
             registry_sha256 = _hashlib.sha256(payload).hexdigest()
 
-        # I5 Step 3: Write keyed_pairs.json into each adapter-kind dir.  Must
-        # be byte-identical to ``_save_keyed_pairs_for_router._write_keyed_pairs``
-        # because that helper runs after this method and would otherwise
-        # invalidate the manifest hash with a re-write.
+        # I5 Step 3: Write keyed_pairs.json into each adapter-kind dir.  Routes
+        # through keyed_pairs_io.write_keyed_pairs so the canonical schema is
+        # enforced by construction — identical bytes to
+        # ``_save_keyed_pairs_for_router._write_keyed_pairs`` (both delegate to
+        # the same facade), so the manifest hash remains valid across re-writes.
         def _write_kp(adapter_name: str, simhash_registry: dict) -> "Path | None":
             if not simhash_registry:
                 return None
-            pairs: list[dict] = []
-            for key in simhash_registry:
-                qa = self.indexed_key_qa.get(key) if self.indexed_key_qa else None
-                if qa is None:
-                    continue
-                entry = {
-                    "key": key,
-                    "question": qa["question"],
-                    "answer": qa["answer"],
-                }
-                for meta_key in (
-                    "source_subject",
-                    "source_object",
-                    "source_predicate",
-                    "speaker_id",
-                ):
-                    if meta_key in qa:
-                        entry[meta_key] = qa[meta_key]
-                pairs.append(entry)
-            from paramem.backup.encryption import write_infra_bytes as _wi
+            pairs: list[dict] = [
+                self.indexed_key_qa[key]
+                for key in simhash_registry
+                if self.indexed_key_qa and key in self.indexed_key_qa
+            ]
+            if not pairs:
+                return None
+            from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
 
             adapter_dir = self.output_dir / adapter_name
-            adapter_dir.mkdir(parents=True, exist_ok=True)
-            payload = _json.dumps(pairs, indent=2).encode("utf-8")
             kp_path = adapter_dir / "keyed_pairs.json"
-            _wi(kp_path, payload)
+            _wkp(kp_path, pairs)
             return kp_path
 
         def _build(name: str, kp_path: "Path | None") -> "object | None":
@@ -2723,13 +2735,14 @@ class ConsolidationLoop:
         # Collect all existing keys for this interim adapter so we can rebuild
         # the full training set (avoids catastrophic forgetting — same pattern
         # as _run_indexed_key_episodic's full-replay approach).
+        # Pass the full qa_info dict through so all canonical metadata fields
+        # (source_subject, source_predicate, source_object, speaker_id,
+        # first_seen_cycle) survive into the written keyed_pairs.json.
         existing_interim_keyed: list[dict] = []
         for k in self.indexed_key_registry.keys_for_adapter(adapter_name):
             qa_info = self.indexed_key_qa.get(k)
             if qa_info is not None:
-                existing_interim_keyed.append(
-                    {"key": k, "question": qa_info["question"], "answer": qa_info["answer"]}
-                )
+                existing_interim_keyed.append(qa_info)
 
         all_interim_keyed = existing_interim_keyed + new_keyed
 
@@ -2810,8 +2823,10 @@ class ConsolidationLoop:
                 "question": kp["question"],
                 "answer": kp["answer"],
                 "source_subject": kp.get("source_subject", ""),
+                "source_predicate": kp.get("source_predicate", ""),
                 "source_object": kp.get("source_object", ""),
                 "speaker_id": kp.get("speaker_id", speaker_id),
+                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
             }
             new_key_ids.append(k)
         self._indexed_next_index += len(new_keyed)
@@ -2831,7 +2846,6 @@ class ConsolidationLoop:
         # won't match → slot is latent, harmless.  Full recovery requires
         # a new consolidation cycle.
         import hashlib as _hashlib
-        import json as _json
 
         from paramem.adapters.manifest import build_manifest_for as _build_manifest_for
         from paramem.models.loader import save_adapter as _save_adapter
@@ -2846,16 +2860,23 @@ class ConsolidationLoop:
 
         # Step 3: Write keyed_pairs.json inside the interim adapter subdir so
         # the router can index entity→key mappings without loading the adapter.
-        interim_pairs = [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in all_interim_keyed
-        ]
-        from paramem.backup.encryption import write_infra_bytes as _wi
+        # Route through the facade so all canonical metadata fields are
+        # preserved — using stripped dicts here was the bug that left the
+        # router's entity and speaker indexes empty after post-session train.
+        #
+        # Pull from indexed_key_qa rather than all_interim_keyed: assign_keys
+        # returns dicts without first_seen_cycle, so using new_keyed directly
+        # would fail facade validation.  indexed_key_qa was populated with all
+        # 8 canonical fields in step 7 above.
+        from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
 
+        all_interim_keys = [kp["key"] for kp in all_interim_keyed]
+        all_interim_keyed_full = [
+            self.indexed_key_qa[k] for k in all_interim_keys if k in self.indexed_key_qa
+        ]
         interim_dir = self.output_dir / adapter_name
-        interim_dir.mkdir(parents=True, exist_ok=True)
         kp_path = interim_dir / "keyed_pairs.json"
-        _wi(kp_path, _json.dumps(interim_pairs, indent=2).encode("utf-8"))
+        _wkp(kp_path, all_interim_keyed_full)
 
         # Step 5: Build manifest with pre-computed registry_sha256.  The
         # interim slot's window IS the cadence boundary stamp — same value
@@ -2891,19 +2912,16 @@ class ConsolidationLoop:
             proc_kp_path: Path | None = None
             if self.procedural_simhash:
                 proc_pairs = [
-                    {
-                        "key": k,
-                        "question": self.indexed_key_qa[k]["question"],
-                        "answer": self.indexed_key_qa[k]["answer"],
-                    }
+                    self.indexed_key_qa[k]
                     for k in self.procedural_simhash
                     if k in self.indexed_key_qa
                 ]
                 if proc_pairs:
+                    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
+
                     proc_dir = self.output_dir / "procedural"
-                    proc_dir.mkdir(parents=True, exist_ok=True)
                     proc_kp_path = proc_dir / "keyed_pairs.json"
-                    _wi(proc_kp_path, _json.dumps(proc_pairs, indent=2).encode("utf-8"))
+                    _wkp(proc_kp_path, proc_pairs)
 
             try:
                 proc_manifest = _build_manifest_for(

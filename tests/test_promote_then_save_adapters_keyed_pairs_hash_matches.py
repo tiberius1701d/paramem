@@ -96,14 +96,20 @@ def _make_loop(tmp_path: Path) -> ConsolidationLoop:
             "question": "Where does Alice live?",
             "answer": "London.",
             "source_subject": "Alice",
+            "source_predicate": "lives_in",
             "source_object": "London",
+            "speaker_id": "",
+            "first_seen_cycle": 0,
         },
         "graph2": {
             "key": "graph2",
             "question": "What is Alice's job?",
             "answer": "Engineer.",
             "source_subject": "Alice",
+            "source_predicate": "works_as",
             "source_object": "engineer",
+            "speaker_id": "",
+            "first_seen_cycle": 0,
         },
     }
 
@@ -135,7 +141,10 @@ def _fake_promote(loop: ConsolidationLoop) -> list[str]:
             "question": "What is Alice's job?",
             "answer": "Engineer.",
             "source_subject": "Alice",
+            "source_predicate": "works_as",
             "source_object": "engineer",
+            "speaker_id": "",
+            "first_seen_cycle": 0,
         }
 
     return ["graph2"]

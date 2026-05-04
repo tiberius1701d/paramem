@@ -246,8 +246,13 @@ class GraphMerger:
     def _resolve_entity(self, entity: Entity) -> str:
         """Resolve an entity name to its canonical form in the graph.
 
-        Two-tier resolution, short-circuits on first hit:
+        Three-tier resolution for speaker entities, two-tier for object entities,
+        short-circuits on first hit:
 
+        0. **Speaker-ID match** (speaker entities only) — if ``entity.speaker_id``
+           is set, scan graph nodes for one whose stored ``speaker_id`` attribute
+           matches.  This collapses name changes across sessions (e.g. "Speaker0"
+           session 1 → "Alex" session 2) without creating a duplicate node.
         1. **Exact normalized** — ``name.strip().lower()`` match.
         2. **Fuzzy** — ``rapidfuzz.token_sort_ratio`` at ``similarity_threshold``,
            same ``entity_type`` only.
@@ -255,6 +260,18 @@ class GraphMerger:
         Returns the canonical node name from the graph, or ``entity.name`` when
         no match is found (new node to be inserted).
         """
+        # Tier 0: speaker_id-based resolution (speaker entities only).
+        if entity.speaker_id is not None:
+            for node, node_data in self.graph.nodes(data=True):
+                if node_data.get("speaker_id") == entity.speaker_id:
+                    logger.debug(
+                        "Speaker-ID matched '%s' -> '%s' (speaker_id=%s)",
+                        entity.name,
+                        node,
+                        entity.speaker_id,
+                    )
+                    return node
+
         normalized = _normalize_name(entity.name)
 
         # Tier 1: Exact match on normalized names
@@ -293,7 +310,13 @@ class GraphMerger:
         session_id: str,
         timestamp: str,
     ) -> None:
-        """Insert or update an entity node."""
+        """Insert or update an entity node.
+
+        When ``entity.speaker_id`` is set (i.e. the entity represents a
+        speaker), the ``speaker_id`` value is stored in the graph node so
+        that :meth:`_resolve_entity` can find the node by speaker identity
+        across sessions even when the display name changes.
+        """
         if canonical in self.graph:
             node = self.graph.nodes[canonical]
             node["recurrence_count"] = node.get("recurrence_count", 0) + 1
@@ -306,9 +329,11 @@ class GraphMerger:
             existing_attrs = node.get("attributes", {})
             existing_attrs.update(entity.attributes)
             node["attributes"] = existing_attrs
+            # Update speaker_id if this entity now has one (disclosure event).
+            if entity.speaker_id is not None and node.get("speaker_id") is None:
+                node["speaker_id"] = entity.speaker_id
         else:
-            self.graph.add_node(
-                canonical,
+            node_kwargs: dict = dict(
                 entity_type=entity.entity_type,
                 attributes=dict(entity.attributes),
                 first_seen=session_id,
@@ -316,6 +341,9 @@ class GraphMerger:
                 recurrence_count=1,
                 sessions=[session_id],
             )
+            if entity.speaker_id is not None:
+                node_kwargs["speaker_id"] = entity.speaker_id
+            self.graph.add_node(canonical, **node_kwargs)
 
     def _upsert_relation(
         self,

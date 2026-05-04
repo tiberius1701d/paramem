@@ -222,15 +222,37 @@ class TestSimulatedTrainingResult:
 class TestProbeKeysFromDisk:
     """probe_keys_from_disk reads keyed_pairs.json matching the grouped-probe shape."""
 
+    @staticmethod
+    def _full_pair(key: str, question: str, answer: str, **extras) -> dict:
+        """Build a canonical keyed pair with all eight required fields.
+
+        Tests that only care about key/question/answer can rely on the defaults
+        for the remaining five fields.  The strict ``read_keyed_pairs`` reader
+        rejects any entry missing a field, so every fixture that goes through
+        the facade must supply all eight.
+        """
+        return {
+            "key": key,
+            "question": question,
+            "answer": answer,
+            "source_subject": extras.get("source_subject", "Subject"),
+            "source_predicate": extras.get("source_predicate", "related_to"),
+            "source_object": extras.get("source_object", "Object"),
+            "speaker_id": extras.get("speaker_id", ""),
+            "first_seen_cycle": extras.get("first_seen_cycle", 1),
+        }
+
     def _write_pairs(self, path, pairs):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(pairs))
+        """Write *pairs* via the canonical facade, creating parent dirs."""
+        from paramem.training.keyed_pairs_io import write_keyed_pairs
+
+        write_keyed_pairs(path, pairs)
 
     def test_reads_episodic_from_subdir(self, tmp_path):
         """Canonical layout: episodic keyed_pairs lives under episodic/ subdir."""
         self._write_pairs(
             tmp_path / "episodic" / "keyed_pairs.json",
-            [{"key": "graph1", "question": "Q1?", "answer": "A1."}],
+            [self._full_pair("graph1", "Q1?", "A1.")],
         )
         results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1"]})
         assert results["graph1"]["question"] == "Q1?"
@@ -241,7 +263,7 @@ class TestProbeKeysFromDisk:
         """Legacy fallback: reads top-level keyed_pairs.json when canonical path is absent."""
         self._write_pairs(
             tmp_path / "keyed_pairs.json",
-            [{"key": "graph1", "question": "Q1?", "answer": "A1."}],
+            [self._full_pair("graph1", "Q1?", "A1.")],
         )
         # Canonical path does NOT exist — fallback must activate.
         assert not (tmp_path / "episodic" / "keyed_pairs.json").exists()
@@ -251,7 +273,7 @@ class TestProbeKeysFromDisk:
     def test_reads_semantic_from_subdir(self, tmp_path):
         self._write_pairs(
             tmp_path / "semantic" / "keyed_pairs.json",
-            [{"key": "graph5", "question": "Q5?", "answer": "A5."}],
+            [self._full_pair("graph5", "Q5?", "A5.")],
         )
         results = probe_keys_from_disk(tmp_path, {"semantic": ["graph5"]})
         assert results["graph5"]["answer"] == "A5."
@@ -259,7 +281,7 @@ class TestProbeKeysFromDisk:
     def test_reads_procedural_from_subdir(self, tmp_path):
         self._write_pairs(
             tmp_path / "procedural" / "keyed_pairs.json",
-            [{"key": "proc3", "question": "Q?", "answer": "Tea."}],
+            [self._full_pair("proc3", "Q?", "Tea.")],
         )
         results = probe_keys_from_disk(tmp_path, {"procedural": ["proc3"]})
         assert results["proc3"]["answer"] == "Tea."
@@ -271,7 +293,7 @@ class TestProbeKeysFromDisk:
     def test_missing_key_returns_none(self, tmp_path):
         self._write_pairs(
             tmp_path / "episodic" / "keyed_pairs.json",
-            [{"key": "graph1", "question": "Q1?", "answer": "A1."}],
+            [self._full_pair("graph1", "Q1?", "A1.")],
         )
         results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1", "graph999"]})
         assert results["graph1"] is not None
@@ -290,7 +312,7 @@ class TestProbeKeysFromDisk:
     def test_raw_output_is_json_with_fields(self, tmp_path):
         self._write_pairs(
             tmp_path / "episodic" / "keyed_pairs.json",
-            [{"key": "graph1", "question": "Q?", "answer": "A."}],
+            [self._full_pair("graph1", "Q?", "A.")],
         )
         results = probe_keys_from_disk(tmp_path, {"episodic": ["graph1"]})
         raw = json.loads(results["graph1"]["raw_output"])
@@ -315,7 +337,6 @@ class TestProbeKeysFromDisk:
             wrap_daily_identity,
             write_daily_key_file,
         )
-        from paramem.server.consolidation import _atomic_json_write
 
         ident = mint_daily_identity()
         key_path = tmp_path / "daily_key.age"
@@ -325,10 +346,12 @@ class TestProbeKeysFromDisk:
         _clear_daily_identity_cache()
 
         kp_path = tmp_path / "episodic" / "keyed_pairs.json"
-        _atomic_json_write(
-            [{"key": "graph7", "question": "Q7?", "answer": "A7."}],
-            kp_path,
-        )
+        # Write through the facade so the entry passes strict schema validation
+        # on read; _atomic_json_write is retired as a write path since it
+        # doesn't normalise the schema.
+        from paramem.training.keyed_pairs_io import write_keyed_pairs
+
+        write_keyed_pairs(kp_path, [self._full_pair("graph7", "Q7?", "A7.")])
         # Confirm the on-disk file is an age envelope, not plaintext.
         assert kp_path.read_bytes()[:22].startswith(b"age-encryption.org/v1")
 

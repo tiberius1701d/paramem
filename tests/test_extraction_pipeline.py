@@ -287,21 +287,21 @@ class TestExtractJsonBlock:
 
         Reproduces the production middle-session bug where Mistral 7B
         emitted ~6000 chars of valid JSON-prefix that opened with
-        ``{"entities": [{"name": "Tobias", ...``, then got cut off
+        ``{"entities": [{"name": "Alex", ...``, then got cut off
         mid-string at ``"object": "consumer hardware`` because the chunker
         produced a chunk too large for the old 2048-token budget. The
         previous parser's left-to-right fall-through would have returned
-        the inner Tobias entity dict, _normalize_extraction would not find
+        the inner entity dict, _normalize_extraction would not find
         ``entities``/``relations`` keys, and the SessionGraph would end up
         empty — masking the truncation.
         """
         truncated = (
             '{"entities": [\n'
-            '  {"name": "Tobias", "entity_type": "person", "attributes": {}},\n'
+            '  {"name": "Alex", "entity_type": "person", "attributes": {}},\n'
             '  {"name": "Independent Germany", "entity_type": "place", "attributes": {}}\n'
             "],\n"
             '"relations": [\n'
-            '  {"subject": "Tobias", "predicate": "works_with", "object": "consumer hardware'
+            '  {"subject": "Alex", "predicate": "works_with", "object": "consumer hardware'
         )
         with pytest.raises(ValueError, match="(?i)truncated"):
             _extract_json_block(truncated)
@@ -1346,14 +1346,26 @@ class TestRoleAwareGroundingGate:
         assert "i love it" in out
         assert "great city" not in out
 
-    def test_extract_user_spans_drops_unprefixed_lines(self):
+    def test_extract_user_spans_inherits_role_until_transition(self):
+        """State-machine semantics: an untagged line after ``[user]`` stays
+        in user role; an untagged line after ``[assistant]`` stays in
+        assistant role.  Pre-marker content (no role established) is
+        dropped."""
         from paramem.graph.extractor import _extract_user_spans
 
-        t = "[user] tagged line\nuntagged line\n[assistant] also tagged"
+        t = (
+            "pre-marker noise\n"
+            "[user] tagged line\n"
+            "untagged user continuation\n"
+            "[assistant] also tagged\n"
+            "untagged assistant continuation"
+        )
         out = _extract_user_spans(t)
         assert "tagged line" in out
-        assert "untagged line" not in out
-        assert "also tagged" not in out
+        assert "untagged user continuation" in out  # inherits [user]
+        assert "pre-marker noise" not in out  # no role established yet
+        assert "also tagged" not in out  # assistant
+        assert "untagged assistant continuation" not in out  # inherits [assistant]
 
     def test_speaker_subject_object_in_user_kept(self):
         """Triple grounded in [user] turn passes role-aware gate."""
@@ -2686,3 +2698,282 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         assert config.consolidation.extraction_verify_anonymization is True
         assert config.consolidation.extraction_ner_check is False
         assert config.consolidation.extraction_ner_model == "en_core_web_sm"
+
+
+# ---------------------------------------------------------------------------
+# Bug A — speaker bare-first-name seeding
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSpeakerNameInMapping:
+    """Unit tests for _ensure_speaker_name_in_mapping (Bug A fix).
+
+    Verifies that the speaker's display name is added to the anonymizer
+    mapping when it is absent, preventing the forward-path verifier from
+    flagging bare first-name occurrences as residual leaks.
+    """
+
+    def test_speaker_already_in_mapping_noop(self):
+        """No change when speaker_name is already a key."""
+        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+
+        mapping = {"Alex": "Person_1"}
+        result = _ensure_speaker_name_in_mapping(mapping, "Alex")
+        assert result == {"Alex": "Person_1"}
+
+    def test_none_speaker_name_noop(self):
+        """Returns mapping unchanged when speaker_name is None."""
+        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+
+        mapping = {"Alex Smith": "Person_1"}
+        result = _ensure_speaker_name_in_mapping(mapping, None)
+        assert result == {"Alex Smith": "Person_1"}
+
+    def test_empty_speaker_name_noop(self):
+        """Returns mapping unchanged when speaker_name is empty string."""
+        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+
+        mapping = {"Alex Smith": "Person_1"}
+        result = _ensure_speaker_name_in_mapping(mapping, "")
+        assert result == {"Alex Smith": "Person_1"}
+
+    def test_bare_first_name_reuses_full_name_placeholder(self):
+        """Bare first name is seeded with the SAME placeholder as the full-name key.
+
+        Scenario: anonymizer mapped 'Alex Rivera → Person_1' but left
+        'Alex' (bare first name) out of the mapping.  After
+        _stamp_speaker_entity renames the entity to 'Alex', the verifier
+        flags it.  The fix must reuse Person_1 (not allocate Person_2) so
+        both forms de-anonymize to the same person.
+        """
+        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+
+        mapping = {"Alex Rivera": "Person_1"}
+        result = _ensure_speaker_name_in_mapping(mapping, "Alex")
+        assert "Alex" in result, "bare first name must be added to mapping"
+        assert result["Alex"] == "Person_1", (
+            "bare first name must reuse the same placeholder as the full-name key"
+        )
+        # Original key must be preserved.
+        assert result["Alex Rivera"] == "Person_1"
+
+    def test_fresh_placeholder_when_no_full_name_key(self):
+        """Fresh Person_N allocated when no full-name key shares the prefix."""
+        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+
+        mapping = {"Alice": "Person_1"}
+        result = _ensure_speaker_name_in_mapping(mapping, "Bob")
+        assert "Bob" in result, "speaker name must be added when absent"
+        ph = result["Bob"]
+        assert ph.startswith("Person_"), f"fresh placeholder must use Person_ prefix, got {ph!r}"
+        # Must not collide with existing placeholder.
+        assert ph != "Person_1"
+
+    def test_does_not_mutate_input(self):
+        """Input mapping is not mutated — a new dict is returned."""
+        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+
+        original = {"Alex Smith": "Person_1"}
+        _ensure_speaker_name_in_mapping(original, "Alex")
+        assert "Alex" not in original, "input mapping must not be mutated"
+
+    def test_speaker_name_in_mapping_after_call_prevents_verifier_flag(self):
+        """After seeding, verify_anonymization_completeness no longer flags the bare first name.
+
+        This is the end-to-end regression test for Bug A:
+        - Graph entity renamed to 'Alex' (bare first name) by _stamp_speaker_entity.
+        - Anonymizer mapped 'Alex Smith → Person_1' but not 'Alex'.
+        - After _ensure_speaker_name_in_mapping, 'Alex' → 'Person_1' is in the mapping.
+        - Anonymized transcript and facts contain 'Person_1', not 'Alex'.
+        - Verifier returns no leaks.
+        """
+        from paramem.graph.extractor import (
+            _ensure_speaker_name_in_mapping,
+            verify_anonymization_completeness,
+        )
+
+        graph = _make_graph(
+            [("Alex", "works_at", "Google")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Google", entity_type="organization"),
+            ],
+        )
+        mapping = {"Alex Smith": "Person_1", "Google": "Org_1"}
+        mapping = _ensure_speaker_name_in_mapping(mapping, "Alex")
+
+        # After seeding, 'Alex' → 'Person_1' is in the mapping.
+        assert mapping.get("Alex") == "Person_1"
+
+        anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Org_1"}]
+        anon_transcript = "Person_1 works at Org_1."
+        leaked = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
+        assert leaked == [], (
+            f"verifier must not flag leaks after speaker-name seeding, got {leaked!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug B — mapping gap recovery for model-omitted entries
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverMissingPlaceholderMappings:
+    """Unit tests for _recover_missing_placeholder_mappings (Bug B fix).
+
+    Verifies that placeholder tokens present in anonymized facts but absent
+    from the returned mapping are recovered by matching against the original
+    relations so de-anonymization can restore the real name.
+    """
+
+    def test_recovers_missing_product_placeholder(self):
+        """Product_1 in anon_facts but absent from mapping → recovered from original.
+
+        Scenario: anonymizer produced 'Product_1' in anonymized_facts for the
+        original 'Honda', but forgot to include 'Honda → Product_1' in the
+        mapping.  Gap recovery must add it.
+        """
+        from paramem.graph.extractor import _recover_missing_placeholder_mappings
+
+        # Original relation has Honda as subject.
+        original_relations = [
+            Relation(
+                subject="Honda",
+                predicate="manufactures",
+                object="Legend SAE Level 3 System",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            )
+        ]
+        anon_facts = [
+            {
+                "subject": "Product_1",
+                "predicate": "manufactures",
+                "object": "Legend SAE Level 3 System",
+            }
+        ]
+        mapping = {}  # anonymizer forgot to include Honda → Product_1
+        result = _recover_missing_placeholder_mappings(mapping, anon_facts, original_relations)
+        assert "Honda" in result, "gap recovery must add the original real name as a key"
+        assert result["Honda"] == "Product_1", (
+            f"recovered value must be the placeholder, got {result['Honda']!r}"
+        )
+
+    def test_already_covered_placeholder_not_duplicated(self):
+        """Placeholder already in mapping.values() is not added again."""
+        from paramem.graph.extractor import _recover_missing_placeholder_mappings
+
+        original_relations = [
+            Relation(
+                subject="Alice",
+                predicate="knows",
+                object="Bob",
+                relation_type="social",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            )
+        ]
+        anon_facts = [{"subject": "Person_1", "predicate": "knows", "object": "Person_2"}]
+        mapping = {"Alice": "Person_1", "Bob": "Person_2"}  # both already covered
+        result = _recover_missing_placeholder_mappings(mapping, anon_facts, original_relations)
+        assert result == mapping, "no new entries must be added when mapping is already complete"
+
+    def test_object_field_placeholder_recovered(self):
+        """Placeholder in the object field is recovered, not just the subject."""
+        from paramem.graph.extractor import _recover_missing_placeholder_mappings
+
+        original_relations = [
+            Relation(
+                subject="Alice",
+                predicate="works_at",
+                object="Acme Corp",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            )
+        ]
+        anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Org_1"}]
+        mapping = {"Alice": "Person_1"}  # Acme Corp → Org_1 missing
+        result = _recover_missing_placeholder_mappings(mapping, anon_facts, original_relations)
+        assert "Acme Corp" in result, "object-field gap must be recovered"
+        assert result["Acme Corp"] == "Org_1"
+
+    def test_empty_inputs_return_unchanged_mapping(self):
+        """Empty anon_facts or empty original_relations returns mapping unchanged."""
+        from paramem.graph.extractor import _recover_missing_placeholder_mappings
+
+        mapping = {"Alice": "Person_1"}
+        assert _recover_missing_placeholder_mappings(mapping, [], []) == mapping
+        assert _recover_missing_placeholder_mappings(mapping, [], [None]) == mapping  # type: ignore[list-item]
+
+    def test_does_not_mutate_input(self):
+        """Input mapping is not mutated — a new dict is returned."""
+        from paramem.graph.extractor import _recover_missing_placeholder_mappings
+
+        original_relations = [
+            Relation(
+                subject="Honda",
+                predicate="manufactures",
+                object="Legend",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            )
+        ]
+        anon_facts = [{"subject": "Product_1", "predicate": "manufactures", "object": "Legend"}]
+        original_mapping = {}
+        _recover_missing_placeholder_mappings(original_mapping, anon_facts, original_relations)
+        assert original_mapping == {}, "input mapping must not be mutated"
+
+    def test_apply_bindings_resolves_recovered_placeholder(self):
+        """End-to-end: Product_1 in object field de-anonymizes correctly after gap recovery.
+
+        This is the regression test for Bug B:
+        - anon_facts has object "software development for Product_1's Legend SAE Level 3 system"
+        - mapping initially missing Honda → Product_1
+        - after gap recovery, mapping has Honda → Product_1
+        - _apply_bindings reverses the mapping: Product_1 → Honda
+        - the object field becomes "software development for Honda's Legend SAE Level 3 system"
+        """
+        from paramem.graph.extractor import _apply_bindings, _recover_missing_placeholder_mappings
+
+        original_relations = [
+            Relation(
+                subject="Alex Rivera",
+                predicate="led",
+                object="software development for Honda's Legend SAE Level 3 system",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            )
+        ]
+        # After anonymization the subject is Person_1 and object has Product_1.
+        # BUT the mapping is missing Honda → Product_1 (anonymizer bug).
+        anon_facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "led",
+                "object": "software development for Product_1's Legend SAE Level 3 system",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            }
+        ]
+        mapping = {"Alex Rivera": "Person_1"}  # Honda → Product_1 missing
+
+        recovered_mapping = _recover_missing_placeholder_mappings(
+            mapping, anon_facts, original_relations
+        )
+        assert "Honda" in recovered_mapping, (
+            "gap recovery must add Honda → Product_1 to the mapping"
+        )
+
+        kept, dropped = _apply_bindings(anon_facts, recovered_mapping, sota_bindings={})
+        assert dropped == [], f"no facts must be dropped after gap recovery, got {dropped!r}"
+        assert len(kept) == 1
+        assert "Honda" in kept[0]["object"], (
+            f"de-anonymization must restore 'Honda' in object, got {kept[0]['object']!r}"
+        )
+        assert "Product_1" not in kept[0]["object"], (
+            "placeholder must be fully replaced in object field"
+        )

@@ -144,3 +144,58 @@ class TestLegacyAndSpeakerPrefixCoexist:
         transcript = "user: only once please"
         result = _extract_user_spans(transcript, speaker_name="user")
         assert result.splitlines() == ["only once please"]
+
+
+class TestStateMachineContinuation:
+    """Lines inherit the role of the preceding marker until the next transition."""
+
+    def test_document_chunk_one_prefix_then_body(self):
+        """SessionBuffer._format_turns prefixes the first line of a document
+        chunk with ``{speaker}:`` and lets the document's natural newlines
+        carry through.  All body lines must be captured under the user role."""
+        transcript = (
+            "Alex: Alex Rivera\n"
+            "Senior Engineering Leader\n"
+            "Germany\n"
+            "Engineering leader with 20+ years of experience\n"
+            "scaling teams from 15 to 100+ engineers"
+        )
+        result = _extract_user_spans(transcript, speaker_name="Alex")
+        assert "Alex Rivera" in result
+        assert "Senior Engineering Leader" in result
+        assert "Germany" in result
+        assert "20+ years of experience" in result
+        assert "100+ engineers" in result
+
+    def test_multi_line_user_turn_captures_continuation(self):
+        """A user turn with embedded newlines must capture every line, not
+        just the first one bearing the marker."""
+        transcript = "user: line one\nline two\nline three\nassistant: hi"
+        result = _extract_user_spans(transcript)
+        lines = result.splitlines()
+        assert lines == ["line one", "line two", "line three"]
+
+    def test_assistant_block_continuation_excluded(self):
+        """Lines after an assistant marker stay in the assistant role until
+        the next user transition — they must not leak into user_norm."""
+        transcript = (
+            "Alex: my question\n"
+            "assistant: long reply line one\n"
+            "long reply line two\n"
+            "Alex: follow-up"
+        )
+        result = _extract_user_spans(transcript, speaker_name="Alex")
+        assert "my question" in result
+        assert "follow-up" in result
+        assert "long reply line one" not in result
+        assert "long reply line two" not in result
+
+    def test_pre_marker_content_dropped(self):
+        """No role established → no capture.  Preserves the no-context-no-trust
+        invariant for unmarked-prefix sessions."""
+        transcript = "system header\nmore header\n[user] real user content\n[assistant] reply"
+        result = _extract_user_spans(transcript)
+        assert "system header" not in result
+        assert "more header" not in result
+        assert "real user content" in result
+        assert "reply" not in result

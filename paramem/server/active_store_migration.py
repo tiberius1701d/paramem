@@ -267,7 +267,10 @@ def _migrate_tier_train_to_simulate(
     if not source_kp.exists():
         raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
 
-    keyed_pairs = json.loads(read_maybe_encrypted(source_kp).decode("utf-8"))
+    from paramem.training.keyed_pairs_io import read_keyed_pairs as _rkp
+    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
+
+    keyed_pairs = _rkp(source_kp)
     if not keyed_pairs:
         raise _TierSkipped(f"empty keyed_pairs.json at {source_kp}")
 
@@ -275,10 +278,10 @@ def _migrate_tier_train_to_simulate(
     target_dir.mkdir(parents=True, exist_ok=True)
     target_kp = target_dir / "keyed_pairs.json"
 
-    # Atomic-ish write + probe. write_infra_bytes uses _atomic_write_bytes
-    # internally so a crash mid-write doesn't leave a partial file.
-    payload = json.dumps(keyed_pairs).encode("utf-8")
-    write_infra_bytes(target_kp, payload)
+    # Atomic-ish write + probe. write_keyed_pairs delegates to write_infra_bytes
+    # which uses _atomic_write_bytes internally, so a crash mid-write doesn't
+    # leave a partial file.
+    _wkp(target_kp, keyed_pairs)
 
     # Probe via the existing simulate-mode disk-probe harness. Same call
     # shape as the inference dispatcher uses (paramem/server/inference.py:650).
@@ -379,7 +382,9 @@ def _migrate_tier_simulate_to_train(
     if not source_kp.exists():
         raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
 
-    keyed_pairs = json.loads(read_maybe_encrypted(source_kp).decode("utf-8"))
+    from paramem.training.keyed_pairs_io import read_keyed_pairs as _rkp
+
+    keyed_pairs = _rkp(source_kp)
     if not keyed_pairs:
         raise _TierSkipped(f"empty keyed_pairs.json at {source_kp}")
 
@@ -466,9 +471,10 @@ def _migrate_tier_simulate_to_train(
     )
 
     # Step 7b: write the canonical tier-level keyed_pairs.json.
+    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
+
     kp_path = Path(config.adapter_dir) / tier / "keyed_pairs.json"
-    kp_path.parent.mkdir(parents=True, exist_ok=True)
-    write_infra_bytes(kp_path, json.dumps(keyed_pairs, indent=2).encode("utf-8"))
+    _wkp(kp_path, keyed_pairs)
 
     # Step 7c: delete source (target is now authoritative + probe-confirmed).
     source_kp.unlink()

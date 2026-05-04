@@ -364,3 +364,137 @@ class TestPersistence:
         m.merge(sg1)
         m.merge(sg2)
         assert m.graph.number_of_nodes() == 1
+
+
+class TestSpeakerIdDedup:
+    """Merger deduplicates speaker entities by speaker_id, not by name."""
+
+    def test_same_speaker_id_different_names_collapse(self):
+        """Two sessions for the same speaker (same speaker_id, different display
+        names) must produce a single graph node, not two separate nodes."""
+        m = GraphMerger(similarity_threshold=85.0)
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Speaker0",
+                    entity_type="person",
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[
+                Relation(
+                    subject="Speaker0",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        # Session 2: speaker disclosed their name as "Alex"
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_last_name": "Kim"},
+                    speaker_id="Speaker0",
+                ),
+                Entity(name="Berlin", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+
+        # Must collapse to a single person node — no "Speaker0" + "Alex" split.
+        person_nodes = [n for n, d in m.graph.nodes(data=True) if d.get("entity_type") == "person"]
+        assert len(person_nodes) == 1, (
+            f"Expected 1 person node, got {len(person_nodes)}: {person_nodes}"
+        )
+
+    def test_speaker_node_stores_speaker_id(self):
+        """After merging a speaker entity the graph node must carry speaker_id."""
+        m = GraphMerger(similarity_threshold=85.0)
+        sg = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        m.merge(sg)
+        assert m.graph.nodes["Alex"].get("speaker_id") == "Speaker0"
+
+    def test_non_speaker_entities_still_dedup_by_name(self):
+        """Object entities (speaker_id=None) must still dedup by name (regression)."""
+        m = GraphMerger(similarity_threshold=85.0)
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[Entity(name="Berlin", entity_type="place")],
+            relations=[],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[Entity(name="Berlin", entity_type="place")],
+            relations=[],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+        assert m.graph.number_of_nodes() == 1
+        assert m.graph.nodes["Berlin"]["recurrence_count"] == 2
+
+    def test_speaker_attributes_merged_from_later_session(self):
+        """Attributes from a later session (e.g. has_last_name disclosure) must
+        be merged into the existing speaker node."""
+        m = GraphMerger(similarity_threshold=85.0)
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"role": "engineer"},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_last_name": "Kim"},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+        attrs = m.graph.nodes["Alex"]["attributes"]
+        assert attrs.get("role") == "engineer"
+        assert attrs.get("has_last_name") == "Kim"

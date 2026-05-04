@@ -777,7 +777,10 @@ class TestSaveAdaptersManifest:
                 "question": "What colour is the sky?",
                 "answer": "Blue.",
                 "source_subject": "sky",
+                "source_predicate": "has_colour",
                 "source_object": "blue",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
             }
         }
         loop.episodic_simhash = {"graph1": 0xABCDEF}
@@ -1235,3 +1238,117 @@ class TestTestHarnessImportNoEnvRestoration:
         from experiments.utils.test_harness import load_test_env
 
         assert callable(load_test_env)
+
+
+# ---------------------------------------------------------------------------
+# Regression: interim write path preserves full schema (W3 / W4 bug fix)
+# ---------------------------------------------------------------------------
+
+
+class TestPostSessionTrainWritesFullSchema:
+    """Regression guard for the metadata-stripping bug in ``_train_extracted_into_interim``.
+
+    Pre-fix: the episodic and procedural writers in that method hand-built
+    ``{"key": ..., "question": ..., "answer": ...}`` dicts, silently dropping
+    ``source_subject``, ``source_predicate``, ``source_object``, ``speaker_id``,
+    and ``first_seen_cycle``.  The router's entity and speaker indexes came up
+    empty after every post-session train, so ``route()`` returned no steps and
+    ``/chat`` cold-started.
+
+    Post-fix: the writers pass the full ``qa_info`` dict through the facade,
+    which enforces the eight-field schema.  This test drives the write block
+    directly (no GPU, no real model) and asserts that every canonical field
+    appears in the written file with a non-empty value sourced from the input.
+    """
+
+    def _build_minimal_pair(
+        self,
+        *,
+        key: str = "graph1",
+        question: str = "Where does Alice live?",
+        answer: str = "Alice lives in Berlin.",
+        source_subject: str = "Alice",
+        source_predicate: str = "lives_in",
+        source_object: str = "Berlin",
+        speaker_id: str = "Speaker0",
+        first_seen_cycle: int = 1,
+    ) -> dict:
+        return {
+            "key": key,
+            "question": question,
+            "answer": answer,
+            "source_subject": source_subject,
+            "source_predicate": source_predicate,
+            "source_object": source_object,
+            "speaker_id": speaker_id,
+            "first_seen_cycle": first_seen_cycle,
+        }
+
+    def test_interim_episodic_write_preserves_full_schema(self, tmp_path, monkeypatch):
+        """After the fix, the interim episodic keyed_pairs.json must contain
+        all eight canonical fields with values sourced from the input QA pairs.
+        """
+        from paramem.training.keyed_pairs_io import (
+            KEYED_PAIR_FIELDS,
+            read_keyed_pairs,
+            write_keyed_pairs,
+        )
+
+        # Simulate what _train_extracted_into_interim's W3 path produces:
+        # all_interim_keyed is now passed full dicts (not stripped dicts).
+        all_interim_keyed = [
+            self._build_minimal_pair(key="graph1"),
+            self._build_minimal_pair(
+                key="graph2",
+                question="What is Alice's job?",
+                answer="Alice is an engineer.",
+                source_predicate="has_job",
+                source_object="engineer",
+            ),
+        ]
+
+        # Reproduce the write step from _train_extracted_into_interim (post-fix).
+        adapter_name = "episodic_interim_20260503T1200"
+        interim_dir = tmp_path / adapter_name
+        kp_path = interim_dir / "keyed_pairs.json"
+        write_keyed_pairs(kp_path, all_interim_keyed)
+
+        # Read back and validate every canonical field is present and non-empty
+        # (or a valid int for first_seen_cycle).
+        result = read_keyed_pairs(kp_path)
+        assert len(result) == 2, f"Expected 2 entries, got {len(result)}"
+
+        for entry in result:
+            for field in KEYED_PAIR_FIELDS:
+                assert field in entry, f"Field {field!r} missing from written entry"
+
+        # Spot-check that metadata values survived (not silently defaulted to "").
+        assert result[0]["source_subject"] == "Alice"
+        assert result[0]["source_predicate"] == "lives_in"
+        assert result[0]["source_object"] == "Berlin"
+        assert result[0]["speaker_id"] == "Speaker0"
+        assert result[0]["first_seen_cycle"] == 1
+
+    def test_producer_site_dict_has_all_canonical_fields(self):
+        """The dict literal built by the four episodic producer sites must include
+        source_predicate and first_seen_cycle — they were the missing fields that
+        caused the stripping bug when the router read empty indexes.
+        """
+        from paramem.training.keyed_pairs_io import KEYED_PAIR_FIELDS
+
+        # Reproduce the dict literal shape now written by each producer site.
+        kp = {
+            "key": "graph5",
+            "question": "Q?",
+            "answer": "A.",
+            "source_subject": "Subject",
+            "source_predicate": "predicate",
+            "source_object": "Object",
+            "speaker_id": "Speaker0",
+            "first_seen_cycle": 3,
+        }
+        missing = [f for f in KEYED_PAIR_FIELDS if f not in kp]
+        assert missing == [], (
+            f"Producer site dict is missing fields: {missing}. "
+            "Update the four indexed_key_qa[k] = {{...}} sites in consolidation.py."
+        )

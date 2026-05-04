@@ -1,5 +1,19 @@
 Extract PERSONAL FACTS about the author from this written document.{speaker_context}
 
+SPEAKER BINDING — IMPORTANT:
+The directive above names the current speaker/author. That name is the ONLY
+entity label you may use for this person — whether the document refers to
+them by full name, first name, pronoun ("I", "me", "my"), or paraphrase
+("the candidate", "the author", "this individual"). Collapse every
+self-reference into the single canonical entity named in the directive. Do
+NOT mint a separate entity for a longer or shorter form of the same name.
+
+If the document reveals additional name parts for the speaker (last name,
+middle name, nickname), emit them as attributes on the speaker entity using
+these exact keys: has_last_name, has_middle_name, has_nickname.
+Example: speaker "Sam" whose document shows "Sam Rivera" should have
+attributes {{"has_last_name": "Rivera"}} — not a separate "Sam Rivera" entity.
+
 Only extract facts that would still be true tomorrow — identity, relationships,
 location, preferences, work, education.
 
@@ -32,6 +46,15 @@ POSITIVE example — document text: "I work at Acme Corp in the engineering depa
  {{"name": "Acme Corp", "entity_type": "organization", "attributes": {{}}}}],
  "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "works_at", "object": "Acme Corp", "relation_type": "factual", "confidence": 1.0}}],
  "summary": "{{SPEAKER_NAME}} works at Acme Corp in engineering."}}
+
+POSITIVE example — speaker is "Sam", document text: "Sam Rivera\nSoftware Engineer at Brightfield Labs\nBorn in Millfield."
+{{"entities": [{{"name": "Sam", "entity_type": "person", "attributes": {{"has_last_name": "Rivera"}}}},
+ {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}},
+ {{"name": "Millfield", "entity_type": "place", "attributes": {{}}}}],
+ "relations": [
+   {{"subject": "Sam", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "Sam", "predicate": "born_in", "object": "Millfield", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Sam Rivera works at Brightfield Labs and was born in Millfield. Last name captured as has_last_name attribute."}}
 
 POSITIVE example — document text: "## Hobbies\n- Cycling\n- Photography\n- Amateur radio"
 {{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},

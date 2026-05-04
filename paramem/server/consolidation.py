@@ -155,17 +155,37 @@ def create_consolidation_loop(
             config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
         )
 
+        from paramem.training.keyed_pairs_io import read_keyed_pairs
+
         ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
         if ep_kp_path.exists():
-            loop.seed_episodic_qa(json.loads(read_maybe_encrypted(ep_kp_path).decode("utf-8")))
+            try:
+                loop.seed_episodic_qa(read_keyed_pairs(ep_kp_path))
+            except Exception:
+                logger.exception(
+                    "Failed to seed indexed_key_qa from episodic store %s — skipping",
+                    ep_kp_path,
+                )
 
         sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
         if sem_kp_path.exists():
-            loop.seed_semantic_qa(json.loads(read_maybe_encrypted(sem_kp_path).decode("utf-8")))
+            try:
+                loop.seed_semantic_qa(read_keyed_pairs(sem_kp_path))
+            except Exception:
+                logger.exception(
+                    "Failed to seed indexed_key_qa from semantic store %s — skipping",
+                    sem_kp_path,
+                )
 
         proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
         if proc_kp_path.exists():
-            loop.seed_procedural_qa(json.loads(read_maybe_encrypted(proc_kp_path).decode("utf-8")))
+            try:
+                loop.seed_procedural_qa(read_keyed_pairs(proc_kp_path))
+            except Exception:
+                logger.exception(
+                    "Failed to seed indexed_key_qa from procedural store %s — skipping",
+                    proc_kp_path,
+                )
 
         # Interim slots are training-only (locked decision #3) — always under
         # paths.adapters regardless of mode. The simulate store has no interim
@@ -177,7 +197,7 @@ def create_consolidation_loop(
             if not kp.exists():
                 continue
             try:
-                loop.seed_episodic_qa(json.loads(read_maybe_encrypted(kp).decode("utf-8")))
+                loop.seed_episodic_qa(read_keyed_pairs(kp))
             except Exception:
                 logger.exception(
                     "Failed to seed indexed_key_qa from interim slot %s — skipping",
@@ -722,19 +742,14 @@ def _write_keyed_pairs(
     simhash_registry: dict,
     path: Path,
 ) -> None:
-    """Write keyed_pairs.json for keys in the given SimHash registry."""
-    pairs = []
-    for key in simhash_registry:
-        if key in indexed_key_qa:
-            qa = indexed_key_qa[key]
-            entry = {
-                "key": key,
-                "question": qa["question"],
-                "answer": qa["answer"],
-            }
-            for meta_key in ("source_subject", "source_object", "source_predicate", "speaker_id"):
-                if meta_key in qa:
-                    entry[meta_key] = qa[meta_key]
-            pairs.append(entry)
+    """Write keyed_pairs.json for keys in the given SimHash registry.
 
-    _atomic_json_write(pairs, path)
+    Delegates to :func:`paramem.training.keyed_pairs_io.write_keyed_pairs`
+    so the canonical schema is enforced by construction.  Every entry in
+    *indexed_key_qa* must carry all eight canonical fields before this
+    function is called — a missing field raises ``KeyError`` at write time.
+    """
+    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
+
+    pairs = [indexed_key_qa[k] for k in simhash_registry if k in indexed_key_qa]
+    _wkp(path, pairs)

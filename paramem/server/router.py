@@ -216,11 +216,11 @@ class QueryRouter:
     def _load_keyed_pairs(self, adapter_name: str, path: Path) -> None:
         """Index entities from a keyed_pairs.json file.  Transparently
         decrypts age-wrapped content when the daily identity is loaded."""
-        from paramem.backup.encryption import read_maybe_encrypted
+        from paramem.training.keyed_pairs_io import read_keyed_pairs
 
         try:
-            pairs = json.loads(read_maybe_encrypted(path).decode("utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            pairs = read_keyed_pairs(path)
+        except (json.JSONDecodeError, ValueError, OSError, UnicodeDecodeError) as e:
             logger.warning("Failed to load %s: %s", path, e)
             return
 
