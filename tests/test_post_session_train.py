@@ -166,6 +166,7 @@ class TestFirstCallCreatesInterimAdapter:
             result = loop.post_session_train(
                 "Hello world transcript",
                 "conv-001",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -203,7 +204,12 @@ class TestFirstCallCreatesInterimAdapter:
             patch("paramem.models.loader.save_adapter"),
         ):
             loop.post_session_train(
-                "Transcript", "conv-001", schedule="every 2h", max_interim_count=4, stamp=stamp
+                "Transcript",
+                "conv-001",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
             )
 
         assert f"episodic_interim_{stamp}" in loop.model.peft_config
@@ -240,6 +246,7 @@ class TestSecondCallReusesAdapter:
             loop.post_session_train(
                 "Second conversation",
                 "conv-002",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -290,6 +297,7 @@ class TestStampRolloverCreatesNewAdapter:
             result = loop.post_session_train(
                 "Rollover transcript",
                 "conv-003",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=new_stamp,
@@ -320,6 +328,7 @@ class TestZeroFactsIsNoop:
             result = loop.post_session_train(
                 "Empty transcript",
                 "conv-004",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp="20260418T1430",
@@ -338,7 +347,12 @@ class TestZeroFactsIsNoop:
 
         with patch.object(loop, "extract_session", return_value=([], [])):
             loop.post_session_train(
-                "Empty", "conv-005", schedule="every 2h", max_interim_count=4, stamp="20260418T1430"
+                "Empty",
+                "conv-005",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp="20260418T1430",
             )
 
         assert len(loop.indexed_key_registry) == initial_len
@@ -375,7 +389,12 @@ class TestTrainingFailureKeepsRegistryClean:
             loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
             with pytest.raises(RuntimeError, match="Simulated training failure"):
                 loop.post_session_train(
-                    "Transcript", "conv-006", schedule="every 2h", max_interim_count=4, stamp=stamp
+                    "Transcript",
+                    "conv-006",
+                    speaker_id="Speaker0",
+                    schedule="every 2h",
+                    max_interim_count=4,
+                    stamp=stamp,
                 )
 
         # Registry must be unchanged after the training error.
@@ -407,7 +426,12 @@ class TestTrainingFailureKeepsRegistryClean:
             loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
             with pytest.raises(RuntimeError):
                 loop.post_session_train(
-                    "Transcript", "conv-007", schedule="every 2h", max_interim_count=4, stamp=stamp
+                    "Transcript",
+                    "conv-007",
+                    speaker_id="Speaker0",
+                    schedule="every 2h",
+                    max_interim_count=4,
+                    stamp=stamp,
                 )
 
         assert not registry_path.exists()
@@ -430,7 +454,11 @@ class TestMaxInterimCountZeroQueues:
             patch("paramem.training.trainer.train_adapter") as mock_train,
         ):
             result = loop.post_session_train(
-                "Transcript", "conv-008", schedule="every 2h", max_interim_count=0
+                "Transcript",
+                "conv-008",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=0,
             )
 
         assert result["mode"] == "queued"
@@ -447,10 +475,18 @@ class TestMaxInterimCountZeroQueues:
 
         with patch.object(loop, "extract_session", return_value=(qa, [])):
             loop.post_session_train(
-                "Transcript A", "conv-009a", schedule="every 2h", max_interim_count=0
+                "Transcript A",
+                "conv-009a",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=0,
             )
             loop.post_session_train(
-                "Transcript B", "conv-009b", schedule="every 2h", max_interim_count=0
+                "Transcript B",
+                "conv-009b",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=0,
             )
 
         # Both extractions accumulated.
@@ -462,7 +498,11 @@ class TestMaxInterimCountZeroQueues:
 
         with patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])):
             loop.post_session_train(
-                "Transcript", "conv-010", schedule="every 2h", max_interim_count=0
+                "Transcript",
+                "conv-010",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=0,
             )
 
         assert len(loop.indexed_key_registry) == 0
@@ -506,7 +546,12 @@ class TestRegisterAfterSuccessNotBefore:
         ):
             loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
             loop.post_session_train(
-                "Transcript", "conv-011", schedule="every 2h", max_interim_count=4, stamp=stamp
+                "Transcript",
+                "conv-011",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
             )
 
         # Registry must have been empty when train_adapter was called.
@@ -538,7 +583,12 @@ class TestRegisterAfterSuccessNotBefore:
         ):
             loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
             result = loop.post_session_train(
-                "Transcript", "conv-012", schedule="every 2h", max_interim_count=4, stamp=stamp
+                "Transcript",
+                "conv-012",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
             )
 
         # Two facts extracted → two keys registered.
@@ -623,6 +673,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             loop.post_session_train(
                 "Transcript with prefs",
                 "conv-p-001",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -661,6 +712,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             loop.post_session_train(
                 "Transcript no prefs",
                 "conv-p-002",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -698,6 +750,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             loop.post_session_train(
                 "Transcript",
                 "conv-p-003",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -808,6 +861,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 loop.post_session_train(
                     "Transcript",
                     "conv-p-004",
+                    speaker_id="Speaker0",
                     schedule="every 2h",
                     max_interim_count=4,
                     stamp=stamp,
@@ -871,6 +925,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 loop.post_session_train(
                     "Transcript",
                     "conv-p-005",
+                    speaker_id="Speaker0",
                     schedule="every 2h",
                     max_interim_count=4,
                     stamp=stamp,
@@ -914,6 +969,7 @@ class TestTrainingOutputDirUniqueness:
             loop.post_session_train(
                 "Transcript",
                 session_id,
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -1000,7 +1056,7 @@ class TestTrainingOutputDirUniqueness:
             # Temporarily patch _run_indexed_key_procedural to capture the stamp.
             original_proc = loop._run_indexed_key_procedural
 
-            def _proc_capture(rels, speaker_id=""):
+            def _proc_capture(rels, speaker_id):
                 # Record the output dir that would be used (via _training_output_dir).
                 captured_dirs.append(str(loop._training_output_dir("procedural")))
 
@@ -1009,6 +1065,7 @@ class TestTrainingOutputDirUniqueness:
                 loop.post_session_train(
                     "Transcript with prefs",
                     "conv-d-004",
+                    speaker_id="Speaker0",
                     schedule="every 2h",
                     max_interim_count=4,
                     stamp=stamp,
@@ -1075,7 +1132,12 @@ class TestRegistryLastWriteOrder:
             patch.object(KeyRegistry, "save_from_bytes", side_effect=_record_save_from_bytes),
         ):
             loop.post_session_train(
-                "Transcript", "conv-i5-001", schedule="every 2h", max_interim_count=4, stamp=stamp
+                "Transcript",
+                "conv-i5-001",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
             )
 
         # save_adapter must precede save_from_bytes (registry is the commit signal).
@@ -1123,6 +1185,7 @@ class TestRegistryLastWriteOrder:
                 loop.post_session_train(
                     "Transcript",
                     "conv-i5-002",
+                    speaker_id="Speaker0",
                     schedule="every 2h",
                     max_interim_count=4,
                     stamp=stamp,
@@ -1357,6 +1420,7 @@ class TestManifestWrittenPostSession:
             result = loop.post_session_train(
                 "Transcript",
                 "conv-manifest-001",
+                speaker_id="Speaker0",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,

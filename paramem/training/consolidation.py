@@ -65,6 +65,38 @@ from paramem.utils.config import (
 logger = logging.getLogger(__name__)
 
 
+def _require_speaker_id(overrides: dict) -> str:
+    """Return the speaker_id from the overrides dict, raising if absent or empty.
+
+    ``_extraction_kwargs`` calls this so that a forgotten or empty
+    ``speaker_id`` surfaces as a clear ``ValueError`` rather than silently
+    propagating ``""`` into the extraction chain and being accepted by the
+    Pydantic schema.  Every caller of ``_run_extract_graph`` passes
+    ``speaker_id`` explicitly through ``extract_session`` / ``run_cycle`` /
+    server paths, so a missing value is always a programming error.
+
+    Args:
+        overrides: The ``**overrides`` dict forwarded to ``_extraction_kwargs``.
+
+    Returns:
+        The non-empty speaker_id string.
+
+    Raises:
+        ValueError: If ``speaker_id`` is absent from *overrides* or is an
+            empty string.
+    """
+    speaker_id = overrides.get("speaker_id", "")
+    if not speaker_id:
+        raise ValueError(
+            "_extraction_kwargs: speaker_id is required but was absent or empty. "
+            "Every caller must supply a real speaker ID (e.g. the SpeakerStore "
+            "anonymous-group ID for sessions without a named speaker). "
+            "Passing an empty string silently corrupts Relation.speaker_id and "
+            "breaks per-speaker preference scoping."
+        )
+    return speaker_id
+
+
 @dataclass
 class CycleResult:
     """Results from a single consolidation cycle."""
@@ -480,6 +512,13 @@ class ConsolidationLoop:
           grounding is a dialogue-context concern).  Operators may still
           override either explicitly via the per-call kwargs (e.g. when
           ingesting an audiobook transcript through the document path).
+
+        ``speaker_id`` is **required** in *overrides* and must be a non-empty
+        string.  Callers that have no named speaker must pass the
+        SpeakerStore anonymous-group ID (e.g. ``"Speaker0"``).  An absent or
+        empty value raises :exc:`ValueError` via :func:`_require_speaker_id`
+        so the omission surfaces at call time rather than silently corrupting
+        every ``Relation.speaker_id`` downstream.
         """
 
         def pick(name: str, fallback):
@@ -517,7 +556,7 @@ class ConsolidationLoop:
             verify_anonymization=pick("verify_anonymization", self.extraction_verify_anonymization),
             role_aware_grounding=pick("role_aware_grounding", self.extraction_role_aware_grounding),
             pii_scope=pick("pii_scope", self.extraction_pii_scope),
-            speaker_id=overrides.get("speaker_id", ""),
+            speaker_id=_require_speaker_id(overrides),
             system_prompt_filename=system_prompt_filename,
             user_prompt_filename=user_prompt_filename,
         )
@@ -593,10 +632,10 @@ class ConsolidationLoop:
         self,
         session_transcript: str,
         session_id: str,
+        speaker_id: str,
         speaker_name: str | None = None,
         stt_correction: bool | None = None,
         source_type: str = "transcript",
-        speaker_id: str = "",
     ):
         """Single entry-point to ``extract_procedural_graph`` with adapter guard.
 
@@ -608,7 +647,8 @@ class ConsolidationLoop:
         artefact surface.  Explicit ``stt_correction`` overrides still win.
 
         ``speaker_id`` is stamped onto every ``Relation`` produced by the
-        procedural extractor as provenance.
+        procedural extractor as provenance. Required — callers must always
+        supply a real speaker ID.
         """
         from peft import PeftModel as _PeftModel
 
@@ -650,7 +690,7 @@ class ConsolidationLoop:
         self,
         session_transcript: str,
         session_id: str,
-        speaker_id: str = "",
+        speaker_id: str,
         speaker_name: str | None = None,
         ha_context: dict | None = None,
         stt_correction: bool | None = None,
@@ -675,7 +715,8 @@ class ConsolidationLoop:
             session_transcript: Raw session text (conversation transcript or
                 document chunk).
             session_id: Unique identifier for this session.
-            speaker_id: Speaker identifier for preference scoping.
+            speaker_id: Speaker identifier for preference scoping. Required —
+                callers must always supply a real speaker ID.
             speaker_name: Real speaker name injected via ``{speaker_context}``
                 in the user template for narrator binding.
             source_type: ``"transcript"`` (default) for voice/chat sessions;
@@ -768,12 +809,18 @@ class ConsolidationLoop:
         self,
         all_episodic_qa: list[dict],
         all_procedural_relations: list[dict],
-        speaker_id: str = "",
+        speaker_id: str,
     ) -> dict:
         """Train all adapters once on accumulated QA pairs (blocking).
 
         Called after all sessions have been extracted.
         Returns dict with train losses per adapter.
+
+        Args:
+            all_episodic_qa: Deduplicated episodic QA pairs for this cycle.
+            all_procedural_relations: Deduplicated procedural relations.
+            speaker_id: Fallback speaker scope for procedural contradiction
+                detection. Required — callers must always supply a real ID.
 
         Note: this method trains AND saves.  The server consolidation path
         (paramem/server/consolidation.py train branch) uses
@@ -814,7 +861,7 @@ class ConsolidationLoop:
         self,
         all_episodic_qa: list[dict],
         all_procedural_relations: list[dict],
-        speaker_id: str = "",
+        speaker_id: str,
     ) -> dict:
         """Train all adapters without saving to disk.
 
@@ -835,6 +882,7 @@ class ConsolidationLoop:
             Deduplicated procedural relations for this cycle.
         speaker_id:
             Fallback speaker scope for procedural contradiction detection.
+            Required — callers must always supply a real speaker ID.
 
         Returns
         -------
@@ -870,7 +918,7 @@ class ConsolidationLoop:
         self,
         all_episodic_qa: list[dict],
         all_procedural_relations: list[dict],
-        speaker_id: str = "",
+        speaker_id: str,
     ) -> dict:
         """Mirror train_adapters without weight updates or adapter saves.
 
@@ -947,7 +995,7 @@ class ConsolidationLoop:
     def _simulate_indexed_key_procedural(
         self,
         procedural_relations: list[dict],
-        speaker_id: str = "",
+        speaker_id: str,
     ) -> None:
         """Simulate counterpart of _run_indexed_key_procedural.
 
@@ -955,6 +1003,11 @@ class ConsolidationLoop:
         parametric recall), applies the same contradiction retirement, and
         registers new keys. No deferred-mutation discipline needed because
         there is no train call that can fail.
+
+        Args:
+            procedural_relations: Pre-filtered preference relations.
+            speaker_id: Fallback speaker scope for contradiction keying.
+                Required — callers must always supply a real speaker ID.
         """
         if not procedural_relations:
             return
@@ -1020,7 +1073,7 @@ class ConsolidationLoop:
         self,
         all_episodic_qa: list[dict],
         all_procedural_relations: list[dict],
-        speaker_id: str = "",
+        speaker_id: str,
     ) -> list[tuple[str, list[dict]]]:
         """Prepare keyed pairs for background training without training.
 
@@ -1029,6 +1082,12 @@ class ConsolidationLoop:
 
         State is snapshotted before preparation. Call rollback_preparation()
         if training fails to restore pre-preparation state.
+
+        Args:
+            all_episodic_qa: Deduplicated episodic QA pairs for this cycle.
+            all_procedural_relations: Deduplicated procedural relations.
+            speaker_id: Fallback speaker scope for procedural contradiction
+                detection. Required — callers must always supply a real ID.
         """
         # Snapshot mutable state for rollback on training failure
         import copy
@@ -1290,7 +1349,7 @@ class ConsolidationLoop:
         self,
         session_transcript: str,
         session_id: str,
-        speaker_id: str = "",
+        speaker_id: str,
         speaker_name: str | None = None,
         source_type: str = "transcript",
     ) -> CycleResult:
@@ -1306,7 +1365,8 @@ class ConsolidationLoop:
         Args:
             session_transcript: The raw session transcript text.
             session_id: Unique identifier for this session.
-            speaker_id: Speaker identifier for preference scoping.
+            speaker_id: Speaker identifier for preference scoping. Required —
+                callers must always supply a real speaker ID.
             source_type: ``"transcript"`` (default) or ``"document"``. Passed
                 through to the extractor to select the appropriate system prompt.
 
@@ -1720,7 +1780,7 @@ class ConsolidationLoop:
     def _run_indexed_key_procedural(
         self,
         procedural_relations: list[dict],
-        speaker_id: str = "",
+        speaker_id: str,
     ) -> Optional[float]:
         """Train procedural adapter on preference/habit relations.
 
@@ -1740,6 +1800,11 @@ class ConsolidationLoop:
         ``procedural_sp_index`` are deferred until **after**
         ``train_adapter`` returns successfully.  If training raises, shared
         state is left unchanged so the caller can safely retry or skip.
+
+        Args:
+            procedural_relations: Pre-filtered preference relations.
+            speaker_id: Fallback speaker scope for contradiction keying.
+                Required — callers must always supply a real speaker ID.
         """
         if not procedural_relations:
             return None
@@ -2352,7 +2417,7 @@ class ConsolidationLoop:
         session_transcript: str,
         session_id: str,
         *,
-        speaker_id: str = "",
+        speaker_id: str,
         speaker_name: str | None = None,
         ha_context: dict | None = None,
         schedule: str = "",
@@ -2401,6 +2466,7 @@ class ConsolidationLoop:
             session_transcript: Raw transcript text for this conversation.
             session_id: Unique conversation identifier (used by the extraction pipeline).
             speaker_id: Speaker identifier for key ownership and preference scoping.
+                Required — callers must always supply a real speaker ID.
             speaker_name: Human-readable speaker name for extraction personalisation.
             ha_context: Optional Home Assistant context dict for location validation.
             schedule: Consolidation schedule string (e.g. ``"every 2h"``, ``"03:00"``).
@@ -2453,7 +2519,7 @@ class ConsolidationLoop:
         procedural_rels: list[dict],
         *,
         run_label: str,
-        speaker_id: str = "",
+        speaker_id: str,
         schedule: str = "",
         max_interim_count: int = 7,
         stamp: str | None = None,
@@ -2483,7 +2549,8 @@ class ConsolidationLoop:
                 ``"tick-<stamp>"`` for batch calls from the scheduled tick.
             speaker_id: Default speaker tag for QA pairs missing one; also
                 passed through to ``_run_indexed_key_procedural`` for
-                contradiction scoping.
+                contradiction scoping. Required — callers must always supply
+                a real speaker ID.
             schedule: Consolidation refresh-cadence string (used to compute
                 the sub-interval stamp when *stamp* is not provided).
             max_interim_count: Cap on concurrent interim adapters in VRAM.

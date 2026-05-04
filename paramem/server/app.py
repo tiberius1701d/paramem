@@ -5819,6 +5819,10 @@ def _extract_and_start_training():
             session_ids.append(session_id)
 
             if not session_speaker_id:
+                logger.warning(
+                    "Skipping session %s: no speaker_id — cannot attribute extraction",
+                    session_id,
+                )
                 continue
 
             if loop.shutdown_requested:

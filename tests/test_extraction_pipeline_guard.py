@@ -140,7 +140,11 @@ def test_extraction_kwargs_match_extract_graph_signature(source_type):
     from paramem.training.consolidation import ConsolidationLoop
 
     ns = _extraction_kwargs_namespace()
-    helper_keys = set(ConsolidationLoop._extraction_kwargs(ns, source_type=source_type).keys())
+    helper_keys = set(
+        ConsolidationLoop._extraction_kwargs(
+            ns, source_type=source_type, speaker_id="Speaker0"
+        ).keys()
+    )
     extractor_params = set(inspect.signature(extract_graph).parameters) - _EXTRACTOR_POSITIONAL
 
     unknown = helper_keys - extractor_params
@@ -159,11 +163,14 @@ def test_procedural_kwargs_match_extract_procedural_graph_signature():
 
     # Mirror the inline kwargs shape inside _run_extract_procedural_graph.
     # If that helper ever diverges, update this set alongside.
+    # speaker_id is passed as a keyword arg from call_kwargs (even though it is
+    # a required positional-or-keyword param in the extractor signature).
     procedural_keys = {
         "max_tokens",
         "prompts_dir",
         "stt_correction",
         "speaker_name",
+        "speaker_id",
         "system_prompt_filename",
         "user_prompt_filename",
     }
@@ -218,7 +225,7 @@ def test_run_extract_graph_wraps_peft_model_in_disable_adapter(monkeypatch):
         "paramem.training.consolidation.extract_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_graph(ns, "transcript", "s001")
+    ConsolidationLoop._run_extract_graph(ns, "transcript", "s001", speaker_id="Speaker0")
 
     fake_peft.disable_adapter.assert_called_once()
 
@@ -236,7 +243,7 @@ def test_run_extract_graph_skips_disable_adapter_for_plain_model(monkeypatch):
         "paramem.training.consolidation.extract_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_graph(ns, "transcript", "s001")
+    ConsolidationLoop._run_extract_graph(ns, "transcript", "s001", speaker_id="Speaker0")
 
     plain_model.disable_adapter.assert_not_called()
 
@@ -268,7 +275,7 @@ def test_run_extract_graph_threads_positional_args(monkeypatch):
     ns.prompts_dir = "/custom/prompts"
     ns.extraction_noise_filter = "claude"
 
-    ConsolidationLoop._run_extract_graph(ns, "tobias lives here", "s042")
+    ConsolidationLoop._run_extract_graph(ns, "tobias lives here", "s042", speaker_id="Speaker0")
 
     assert captured["model"] is model_sentinel
     assert captured["tokenizer"] is tokenizer_sentinel
@@ -464,7 +471,7 @@ def test_run_extract_procedural_graph_wraps_peft_model_in_disable_adapter(monkey
         "paramem.training.consolidation.extract_procedural_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_procedural_graph(ns, "transcript", "s001")
+    ConsolidationLoop._run_extract_procedural_graph(ns, "transcript", "s001", speaker_id="Speaker0")
 
     fake_peft.disable_adapter.assert_called_once()
 
@@ -482,7 +489,7 @@ def test_run_extract_procedural_graph_skips_disable_adapter_for_plain_model(monk
         "paramem.training.consolidation.extract_procedural_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_procedural_graph(ns, "transcript", "s001")
+    ConsolidationLoop._run_extract_procedural_graph(ns, "transcript", "s001", speaker_id="Speaker0")
 
     plain_model.disable_adapter.assert_not_called()
 
@@ -573,7 +580,12 @@ def test_run_extract_procedural_graph_threads_positional_args(monkeypatch):
     ns.prompts_dir = "/custom/prompts"
 
     ConsolidationLoop._run_extract_procedural_graph(
-        ns, "tobias prefers coffee", "s042", speaker_name="Tobias", stt_correction=False
+        ns,
+        "tobias prefers coffee",
+        "s042",
+        speaker_id="Speaker0",
+        speaker_name="Tobias",
+        stt_correction=False,
     )
 
     assert captured["model"] is model_sentinel
@@ -626,7 +638,7 @@ def test_run_extract_graph_threads_source_type(monkeypatch):
 
     ns = _loop_ns_with_model(MagicMock())
     ConsolidationLoop._run_extract_graph(
-        ns, "some document text", "doc-001", source_type="document"
+        ns, "some document text", "doc-001", source_type="document", speaker_id="Speaker0"
     )
 
     got_system = captured["kwargs"].get("system_prompt_filename")
@@ -702,7 +714,7 @@ def test_run_extract_procedural_graph_threads_source_type_document(monkeypatch):
 
     ns = _loop_ns_for_procedural()
     ConsolidationLoop._run_extract_procedural_graph(
-        ns, "some document text", "doc-001", source_type="document"
+        ns, "some document text", "doc-001", speaker_id="Speaker0", source_type="document"
     )
 
     got_system = captured["kwargs"].get("system_prompt_filename")
@@ -741,7 +753,7 @@ def test_run_extract_procedural_graph_threads_source_type_transcript(monkeypatch
 
     ns = _loop_ns_for_procedural()
     ConsolidationLoop._run_extract_procedural_graph(
-        ns, "some transcript text", "s001", source_type="transcript"
+        ns, "some transcript text", "s001", speaker_id="Speaker0", source_type="transcript"
     )
 
     got_system = captured["kwargs"].get("system_prompt_filename")
@@ -806,7 +818,9 @@ def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypa
         "paramem.training.consolidation.extract_graph",
         lambda *a, **kw: _fake_session_graph("sess-A"),
     )
-    ConsolidationLoop._run_extract_graph(ns_main, "transcript text", "sess-A")
+    ConsolidationLoop._run_extract_graph(
+        ns_main, "transcript text", "sess-A", speaker_id="Speaker0"
+    )
 
     main_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "graph_snapshot.json"
     assert main_path.exists(), f"episodic dump missing at {main_path}"
@@ -824,7 +838,9 @@ def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypa
         "paramem.training.consolidation.extract_procedural_graph",
         lambda *a, **kw: _fake_session_graph("sess-A"),
     )
-    ConsolidationLoop._run_extract_procedural_graph(ns_proc, "transcript text", "sess-A")
+    ConsolidationLoop._run_extract_procedural_graph(
+        ns_proc, "transcript text", "sess-A", speaker_id="Speaker0"
+    )
 
     proc_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
     assert proc_path.exists(), f"procedural dump missing at {proc_path}"
@@ -854,7 +870,7 @@ def test_dump_session_graph_short_circuits_when_debug_off(monkeypatch, tmp_path)
     # save_cycle_snapshots=False — default in _loop_ns_with_model.
     ns = _loop_ns_with_model(MagicMock())
     ns.snapshot_dir = tmp_path  # set, but gate is on save_cycle_snapshots
-    ConsolidationLoop._run_extract_graph(ns, "t", "s001")
+    ConsolidationLoop._run_extract_graph(ns, "t", "s001", speaker_id="Speaker0")
     assert not (tmp_path / "cycle_0").exists(), "dump fired despite save_cycle_snapshots=False"
 
     # snapshot_dir=None — equally short-circuits.
@@ -862,4 +878,92 @@ def test_dump_session_graph_short_circuits_when_debug_off(monkeypatch, tmp_path)
     ns2.save_cycle_snapshots = True
     ns2.snapshot_dir = None
     # Would raise AttributeError on `None / "cycle_X"` if the gate didn't fire.
-    ConsolidationLoop._run_extract_graph(ns2, "t", "s002")
+    ConsolidationLoop._run_extract_graph(ns2, "t", "s002", speaker_id="Speaker0")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2a regression: no speaker_id empty-string defaults
+# ---------------------------------------------------------------------------
+
+
+_SPEAKER_ID_DEFAULT_PATTERN = re.compile(r'speaker_id:\s*str\s*=\s*""')
+
+_SPEAKER_ID_DEFAULT_FILES = (
+    "paramem/graph/extractor.py",
+    "paramem/training/consolidation.py",
+)
+
+
+def test_no_speaker_id_empty_string_defaults():
+    """Regression guard: ``speaker_id: str = ""`` must not appear in the
+    extraction or consolidation modules.
+
+    The empty-string default is a soft seam that lets a caller omit
+    speaker_id and silently propagate ``""`` into the extraction chain.
+    Pydantic accepts ``""`` as a valid string, so the schema does not catch
+    the omission — only this test does.
+
+    To verify the guard works: temporarily add ``speaker_id: str = ""`` to
+    either file, run this test, and confirm it fails.  Then revert.
+
+    Phase 1 (commit 1b7eba2) left the defaults intentionally as a deferred
+    cleanup; Phase 2a removes them (this test is the gating CI assertion).
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    offenders: list[tuple[str, int, str]] = []
+
+    for rel in _SPEAKER_ID_DEFAULT_FILES:
+        py_file = repo_root / rel
+        try:
+            text = py_file.read_text()
+        except FileNotFoundError:
+            offenders.append((rel, 0, "<file not found>"))
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if _SPEAKER_ID_DEFAULT_PATTERN.search(line):
+                offenders.append((rel, lineno, line.strip()))
+
+    assert not offenders, (
+        "speaker_id empty-string default found — Phase 2a regression.\n"
+        "Every caller must supply a non-empty speaker_id; the SpeakerStore\n"
+        "anonymous-group ID covers the no-named-speaker case.\n"
+        "Offending lines:\n"
+        + "\n".join(f"  {path}:{lineno} — {src}" for path, lineno, src in offenders)
+    )
+
+
+def test_extraction_kwargs_raises_on_missing_speaker_id():
+    """``_extraction_kwargs`` must raise ``ValueError`` when ``speaker_id``
+    is absent from the overrides dict.
+
+    This enforces the contract at the extraction chokepoint: a caller that
+    forgets to pass speaker_id gets an immediate, clear error instead of
+    silently stamping ``""`` onto every Relation it produces.
+    """
+    import pytest
+
+    from paramem.training.consolidation import ConsolidationLoop
+
+    ns = _extraction_kwargs_namespace()
+    with pytest.raises(ValueError, match="speaker_id is required"):
+        ConsolidationLoop._extraction_kwargs(ns)
+
+
+def test_extraction_kwargs_raises_on_empty_speaker_id():
+    """``_extraction_kwargs`` must raise ``ValueError`` when ``speaker_id``
+    is explicitly passed as an empty string.
+
+    An empty string is semantically indistinguishable from a missing value
+    from the schema's perspective (Pydantic accepts both), so the guard must
+    treat it the same way as an absent key.
+    """
+    import pytest
+
+    from paramem.training.consolidation import ConsolidationLoop
+
+    ns = _extraction_kwargs_namespace()
+    with pytest.raises(ValueError, match="speaker_id is required"):
+        ConsolidationLoop._extraction_kwargs(ns, speaker_id="")

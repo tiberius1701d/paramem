@@ -131,6 +131,7 @@ class TestAlignmentSmoke:
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
                 MagicMock(),
+                speaker_id="Speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -179,6 +180,7 @@ class TestAlignmentSmoke:
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
                 MagicMock(),
+                speaker_id="Speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -206,6 +208,7 @@ class TestAlignmentSmoke:
                 _SMOKE_TRANSCRIPT,
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="off",
             )
 

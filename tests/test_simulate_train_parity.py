@@ -196,7 +196,7 @@ class TestSimulatedTrainingResult:
 
     def test_returns_simulated_flag(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
-        result = loop.simulated_training([], [])
+        result = loop.simulated_training([], [], speaker_id="Speaker0")
         assert result == {"simulated": True}
         # cycle_count incremented even when no work
         assert loop.cycle_count == 1
@@ -213,6 +213,7 @@ class TestSimulatedTrainingResult:
                 }
             ],
             [],
+            speaker_id="Speaker0",
         )
         assert loop.cycle_count == 1
         assert "graph1" in loop.indexed_key_qa

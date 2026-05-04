@@ -273,7 +273,7 @@ class TestExtractionPathParity:
             captured["episodic_qa"] = episodic_qa
             return None
 
-        def _capture_procedural(self_, procedural_relations, speaker_id=""):
+        def _capture_procedural(self_, procedural_relations, speaker_id):
             captured["procedural_rels"] = procedural_relations
             return None
 
