@@ -2693,13 +2693,36 @@ spread signature is robust at n=1 but the underlying mechanism (no
 scaffold weight invested) needs corroboration via the next-step
 multi-seed batch.
 
-### Multi-seed replication + V5–V8 expansion (planned, ~58 h GPU)
+### Multi-seed replication + V5–V8 expansion (planned, ~12 h V1/V2/V3 + ~58 h V5–V8)
 
 The next experiment block extends the existing 14a-pre run rather than
 starting a new run dir. **Variant numbering reflects the multi-seed
 batch run order**: V1–V4 keep their original meanings; V5–V8 are new
 cells (renamed 2026-04-29 from a working V6a/V6b/V6c label set, and
 the previously-unstarted SHA per-slot variant moved from V5 to V7).
+
+**LR scheduler — apples-to-apples config validated 2026-05-04.** An
+earlier attempt at this batch (linear scheduler, B50 budget, HF stock
+auto-decay) produced V3/seed42 `stable_perfect=27` vs V3 ref's `20` —
+a 7-epoch shift caused by HF's stock linear scheduler scaling decay
+over `num_train_epochs`, so per-step LR at any given epoch differs by
+total budget. Diagnosed and fixed by introducing `lr_decay_steps` as a
+TrainingConfig override (`paramem/training/trainer.py::_FixedDecayTrainer`)
+and `--phase-c-decay-steps` on the experiment CLI. Validated config:
+
+> `--lr-scheduler-type linear --phase-c-num-epochs 50 --phase-c-decay-steps 600`
+
+The 600-step decay window matches V3 ref's stock-linear trajectory at
+B30 (30 epochs × 20 steps/epoch); the B50 budget gives 20 epochs of
+LR=0 headroom for slow seeds. Single-seed validation smoke
+(V3/seed42, registered as `tresume 14s`) locked at `stable_perfect=20`
+in 89 min wall — matching V3 ref exactly. Two configs were ruled out
+during the diagnostic: `constant_with_warmup` (LR=peak forever
+oscillates around the SimHash threshold) and `decay=300` (decay window
+ends at e15, freezes the model at fill≈0.35 before first_perfect can
+land). See `scripts/dev/test14_reproduce.md` for the full diagnostic
+and reproduction commands.
+
 The block addresses two questions in parallel:
 
 1. **Is the V3 < V2 < V1 ordering real or n=1 noise?** Replicate Phase C
@@ -2751,17 +2774,25 @@ deviation across seeds (lower-bound 95% CI gap). Marginal improvements
 inside the noise envelope retain V3 for production simplicity. If V5
 wins clearly, it ships as the production scaffold.
 
-**Implementation deliverables (in progress):**
-- `experiments/utils/scaffold.py` — V5/V6/V7/V8 builders added; V7
-  reuses the per-slot-sha256 logic that previously lived under the
-  V5 name (renamed to match run order); VARIANTS, VARIANT_BUILDERS,
-  PLACEHOLDER_STRINGS updated. Tests in `tests/test_scaffold.py`
-  cover all four new builders.
-- `experiments/test14.py` — `--phase-c-seeds` flag (multi-seed Phase C
-  loop with `<variant>/C/seed<N>/` sub-dir convention) — pending.
-- `scripts/dev/training-control.sh` — V5–V8 added to the per-variant
-  rendering and in-flight detection; per-seed status surfacing pending.
-- Tests for multi-seed resume — pending.
+**Implementation status:**
+- `experiments/utils/scaffold.py` — V5/V6/V7/V8 builders, tests in
+  `tests/test_scaffold.py`. Done.
+- `experiments/test14.py` — `--phase-c-seeds`, `--phase-c-num-epochs`,
+  `--lr-scheduler-type`, `--phase-c-decay-steps` flags wired through
+  `_training_config`. Auto-migration of stale Phase C results on
+  `lr_scheduler_type` or `lr_decay_steps` mismatch in
+  `_migrate_stale_phase_c`. `reuse_phase_a_from` persisted in
+  `run_config.json` so resume is faithful (no silent scope expansion).
+  Done.
+- `paramem/training/trainer.py` — `_FixedDecayTrainer` subclass
+  decouples LR decay from `num_train_epochs`. Done.
+- `scripts/dev/training-control.sh` — multi-seed resume passthrough
+  (phase_c_seeds, phase_c_num_epochs, lr_scheduler_type,
+  phase_c_decay_steps), per-seed status with mtime-based active
+  attribution, peer-test registry pattern (TEST_EXTRA_FLAGS) used by
+  `tresume 14s` smoke. Done.
+- Tests for multi-seed resume — covered by
+  `tests/test_test14_round_metrics.py` (47 tests pass).
 
 ### Edge-device motivation (2026-04-29)
 
