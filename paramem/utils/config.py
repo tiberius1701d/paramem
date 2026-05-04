@@ -52,6 +52,12 @@ class TrainingConfig:
     warmup_ratio: float = 0.1
     warmup_steps: int = 0  # If > 0, overrides warmup_ratio
     lr_scheduler_type: str = "linear"  # HF default; use "constant" for grokking
+    # When set, the LR scheduler decays over this many steps regardless of
+    # num_train_epochs. Steps past it sit at the scheduler's tail value
+    # (LR=0 for "linear"). Decouples decay shape from training budget so
+    # early-stop on a recall metric dominates the run length without the
+    # budget bleeding into the per-step LR trajectory.
+    lr_decay_steps: int | None = None
     weight_decay: float = 0.01
     gradient_checkpointing: bool = True
     max_grad_norm: float = 1.0

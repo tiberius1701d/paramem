@@ -379,6 +379,38 @@ def parse_args() -> argparse.Namespace:
             "epochs) without affecting Phase A/B budgets."
         ),
     )
+    parser.add_argument(
+        "--lr-scheduler-type",
+        "--lr_scheduler_type",
+        choices=["linear", "constant", "constant_with_warmup", "cosine"],
+        default="linear",
+        dest="lr_scheduler_type",
+        help=(
+            "LR scheduler.  Default 'linear', paired with "
+            "--phase-c-decay-steps to decouple the decay window from "
+            "num_train_epochs.  'constant_with_warmup' was tried "
+            "2026-05-03 and rejected: LR=peak forever oscillated weights "
+            "across the SimHash threshold (V1 seed=42 stable_perfect=32 "
+            "vs linear ref 25)."
+        ),
+    )
+    parser.add_argument(
+        "--phase-c-decay-steps",
+        "--phase_c_decay_steps",
+        type=int,
+        default=600,
+        dest="phase_c_decay_steps",
+        help=(
+            "Number of optimizer steps over which the Phase C LR "
+            "scheduler decays.  Default 600 = 30 epochs × 20 steps/"
+            "epoch, matching the V3 reference's stock-linear LR "
+            "trajectory.  Steps past this sit at the tail value (LR=0 "
+            "for 'linear'); the run ends earlier via recall-based "
+            "early stop.  Set to 0 to disable and fall back to HF's "
+            "budget-coupled decay (the original bug; retained for "
+            "reproducibility)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -455,6 +487,16 @@ def load_or_write_run_config(run_dir: Path, args: argparse.Namespace) -> dict:
         "smoke": bool(args.smoke),
         "phase_c_seeds": list(args.phase_c_seeds) if args.phase_c_seeds else None,
         "phase_c_num_epochs": args.phase_c_num_epochs,
+        "lr_scheduler_type": getattr(args, "lr_scheduler_type", None),
+        "phase_c_decay_steps": getattr(args, "phase_c_decay_steps", None),
+        # Persisted so resume is faithful to first-launch scope.  Inferring
+        # from disk (e.g., presence of V3/A/A_done.json) silently expands the
+        # variant set to V3_extended/V4-V8 on tresume, which was the wrong
+        # default — a tpause/tresume must continue exactly the work that was
+        # paused, not bring in extra variants.  When None, only original
+        # variants (V1/V2/V3) run; an explicit later launch can pass
+        # --reuse-phase-a-from to add extended variants on top.
+        "reuse_phase_a_from": getattr(args, "reuse_phase_a_from", None),
         "created_at": int(time.time()),
     }
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -479,7 +521,13 @@ def _adapter_config(rank: int, lr: float = DEFAULT_LR) -> AdapterConfig:
     )
 
 
-def _training_config(num_epochs: int, rank: int = DEFAULT_RANK, seed: int = 42) -> TrainingConfig:
+def _training_config(
+    num_epochs: int,
+    rank: int = DEFAULT_RANK,
+    seed: int = 42,
+    lr_scheduler_type: str | None = None,
+    lr_decay_steps: int | None = None,
+) -> TrainingConfig:
     """Return a standard TrainingConfig for Test 14.
 
     Note: learning rate lives on AdapterConfig (see ``_adapter_config``), not
@@ -487,8 +535,16 @@ def _training_config(num_epochs: int, rank: int = DEFAULT_RANK, seed: int = 42) 
 
     Seed is parameterized so the multi-seed Phase C sweep can vary the HF
     Trainer optimizer / data-shuffler seed across replication runs.
+
+    ``lr_scheduler_type`` overrides the TrainingConfig default when set.
+
+    ``lr_decay_steps``, when set, decouples the LR decay window from
+    ``num_train_epochs`` (HF's stock schedulers compute decay from the
+    auto-derived total step count = ``len(dataloader) * num_train_epochs``).
+    Used at Phase C to keep per-step LR invariant to total budget so
+    early-stop on recall dominates the run length.
     """
-    return TrainingConfig(
+    cfg_kwargs: dict = dict(
         batch_size=1,
         gradient_accumulation_steps=2,
         max_seq_length=1024,
@@ -502,6 +558,11 @@ def _training_config(num_epochs: int, rank: int = DEFAULT_RANK, seed: int = 42) 
         save_strategy="epoch",
         save_total_limit=num_epochs,
     )
+    if lr_scheduler_type is not None:
+        cfg_kwargs["lr_scheduler_type"] = lr_scheduler_type
+    if lr_decay_steps is not None and lr_decay_steps > 0:
+        cfg_kwargs["lr_decay_steps"] = lr_decay_steps
+    return TrainingConfig(**cfg_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +649,11 @@ def run_phase_A_fresh(
     )
 
     adapter_cfg = _adapter_config(args.rank)
-    training_cfg = _training_config(args.num_epochs, rank=args.rank)
+    training_cfg = _training_config(
+        args.num_epochs,
+        rank=args.rank,
+        lr_scheduler_type=getattr(args, "lr_scheduler_type", None),
+    )
 
     t0 = time.time()
     metrics = train_adapter(
@@ -653,7 +718,11 @@ def run_phase_B_scaffold(
     )
 
     adapter_cfg = _adapter_config(args.rank)
-    training_cfg = _training_config(args.num_epochs, rank=args.rank)
+    training_cfg = _training_config(
+        args.num_epochs,
+        rank=args.rank,
+        lr_scheduler_type=getattr(args, "lr_scheduler_type", None),
+    )
 
     t0 = time.time()
     metrics = train_adapter(
@@ -736,7 +805,13 @@ def run_phase_C_fill(
     )
 
     adapter_cfg = _adapter_config(args.rank)
-    training_cfg = _training_config(epochs, rank=args.rank, seed=seed)
+    training_cfg = _training_config(
+        epochs,
+        rank=args.rank,
+        seed=seed,
+        lr_scheduler_type=getattr(args, "lr_scheduler_type", None),
+        lr_decay_steps=getattr(args, "phase_c_decay_steps", None),
+    )
 
     t0 = time.time()
     metrics = train_adapter(
@@ -1377,7 +1452,11 @@ def run_phase_B_scaffold_resume(
     # Use _adapter_config and _training_config, matching the existing scaffold
     # build pattern in run_phase_B_scaffold.
     adapter_cfg = _adapter_config(args.rank)
-    training_cfg = _training_config(num_epochs, rank=args.rank)
+    training_cfg = _training_config(
+        num_epochs,
+        rank=args.rank,
+        lr_scheduler_type=getattr(args, "lr_scheduler_type", None),
+    )
 
     t0 = time.time()
     metrics = train_adapter(
@@ -1853,8 +1932,74 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
         # Multi-seed: every requested seed must have its own sub-dir marker.
         return all((v_dir / "C" / f"seed{s}" / "C_done.json").exists() for s in requested_seeds)
 
+    target_lr = getattr(args, "lr_scheduler_type", None) or "linear"
+    target_decay = getattr(args, "phase_c_decay_steps", None)
+    if target_decay == 0:
+        target_decay = None
+
+    def _migrate_stale_phase_c(v_dir: Path) -> None:
+        """Rename per-seed Phase C dirs aside when their saved scheduler
+        config differs from this run's target.
+
+        Mismatch is on either ``lr_scheduler_type`` or ``lr_decay_steps``
+        — both shape the LR trajectory, so a difference in either makes
+        the existing result not apples-to-apples with the new target.
+
+        A migrated dir lands at ``<seed_dir>_<tag>[_N]/`` (numeric
+        suffix on collision) so the original artifacts stay intact for
+        provenance.  No-op when there is no ``C_done.json`` yet
+        (in-flight runs are left alone — their checkpoint resume
+        continues normally).  Pre-2026-05-03 ``C_done.json`` files don't
+        carry these fields; we treat that as the historical default
+        (``linear``, no fixed decay = budget-coupled).
+        """
+        if multi_seed_mode:
+            seed_dirs = [(v_dir / "C" / f"seed{s}", s) for s in requested_seeds]
+        else:
+            seed_dirs = [(v_dir / "C", None)]
+        for seed_dir, seed_label in seed_dirs:
+            done = seed_dir / "C_done.json"
+            if not done.exists():
+                continue
+            try:
+                payload = json.loads(done.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            existing_lr = payload.get("lr_scheduler_type") or "linear"
+            existing_decay = payload.get("lr_decay_steps")
+            if existing_lr == target_lr and existing_decay == target_decay:
+                continue
+            decay_tag = f"d{existing_decay}" if existing_decay else "dbudget"
+            tag = f"{existing_lr}_{decay_tag}"
+            migrate_target = seed_dir.with_name(f"{seed_dir.name}_{tag}")
+            suffix = 0
+            while migrate_target.exists():
+                suffix += 1
+                migrate_target = seed_dir.with_name(f"{seed_dir.name}_{tag}_{suffix}")
+            seed_dir.rename(migrate_target)
+            seed_desc = f"seed={seed_label}" if seed_label is not None else "single-seed"
+            logger.info(
+                "Variant %s %s: migrated stale Phase C result "
+                "(lr_scheduler_type=%s, lr_decay_steps=%s) to %s; "
+                "will run fresh with %s / decay=%s",
+                v_dir.name,
+                seed_desc,
+                existing_lr,
+                existing_decay,
+                migrate_target.name,
+                target_lr,
+                target_decay,
+            )
+
     for v_idx, variant in enumerate(variants_to_run):
         v_dir = run_dir / variant
+
+        # Auto-migrate any Phase C results that were produced under a
+        # different LR scheduler than this run wants.  Runs before the
+        # variant-level skip-check so a scheduler mismatch unblocks the
+        # variant for a fresh re-run.
+        if v_dir.exists():
+            _migrate_stale_phase_c(v_dir)
 
         if (
             (
@@ -2229,6 +2374,8 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     "placeholder_leakage_count": leaks,
                     "phase_c_seed": c_seed,
                     "num_epochs": phase_c_epochs,
+                    "lr_scheduler_type": (getattr(args, "lr_scheduler_type", None) or "linear"),
+                    "lr_decay_steps": (getattr(args, "phase_c_decay_steps", None) or None),
                 },
             )
 
@@ -2743,7 +2890,11 @@ def run_mode_multiround(
         examples = format_indexed_training(swap_keyed, tokenizer, max_length=1024)
         dataset = IndexedDataset(examples)
         adapter_cfg = _adapter_config(args.rank)
-        training_cfg = _training_config(args.num_epochs, rank=args.rank)
+        training_cfg = _training_config(
+            args.num_epochs,
+            rank=args.rank,
+            lr_scheduler_type=getattr(args, "lr_scheduler_type", None),
+        )
 
         t0 = time.time()
         fill_metrics = train_adapter(
@@ -3301,6 +3452,12 @@ def main() -> None:
             cfg = load_or_write_run_config(run_dir, args)
         args.num_epochs = cfg.get("num_epochs", args.num_epochs)
         args.rank = cfg.get("rank", args.rank)
+        # Persisted lr_scheduler_type wins over the default (None) but loses
+        # to an explicit CLI value — so a tresume launch with a hardcoded
+        # --lr-scheduler-type flag overrides whatever was frozen at first
+        # launch (intentional: 14c/14d/14e re-runs need this).
+        if args.lr_scheduler_type is None:
+            args.lr_scheduler_type = cfg.get("lr_scheduler_type")
     else:
         cfg = {}
 

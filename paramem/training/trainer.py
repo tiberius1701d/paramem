@@ -81,6 +81,28 @@ class LossEarlyStoppingCallback(TrainerCallback):
             self._below_count = 0
 
 
+class _FixedDecayTrainer(Trainer):
+    """Trainer that decays LR over a fixed step count instead of the budget.
+
+    HF's stock schedulers compute their decay window from
+    ``num_training_steps`` (= ``len(dataloader) * num_train_epochs``). When
+    ``lr_decay_steps`` is set, this subclass substitutes that value so the
+    LR trajectory at any given step is invariant to ``num_train_epochs``.
+    Steps past ``lr_decay_steps`` sit at the scheduler's tail (LR=0 for
+    ``linear``); training continues so an early-stopping callback can
+    decide when to halt.
+    """
+
+    def __init__(self, *args, lr_decay_steps: Optional[int] = None, **kwargs):
+        self._lr_decay_steps = lr_decay_steps
+        super().__init__(*args, **kwargs)
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if self._lr_decay_steps is not None:
+            num_training_steps = self._lr_decay_steps
+        return super().create_scheduler(num_training_steps, optimizer)
+
+
 class GracefulShutdownCallback(TrainerCallback):
     """Stop training cleanly when a shutdown flag is set.
 
@@ -204,13 +226,18 @@ def train_adapter(
     if callbacks_extra:
         callbacks.extend(callbacks_extra)
 
-    trainer = Trainer(
+    trainer_cls = _FixedDecayTrainer if training_config.lr_decay_steps is not None else Trainer
+    trainer_kwargs = {}
+    if training_config.lr_decay_steps is not None:
+        trainer_kwargs["lr_decay_steps"] = training_config.lr_decay_steps
+    trainer = trainer_cls(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=default_data_collator,
         callbacks=callbacks,
+        **trainer_kwargs,
     )
 
     logger.info(
