@@ -154,6 +154,7 @@ class ConsolidationLoop:
         graph_path: Optional[str | Path] = None,
         extraction_temperature: float = 0.0,
         extraction_max_tokens: int = 8192,
+        extraction_plausibility_max_tokens: int = 8192,
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
         run_id: str | None = None,
@@ -221,6 +222,7 @@ class ConsolidationLoop:
 
         self.extraction_temperature = extraction_temperature
         self.extraction_max_tokens = extraction_max_tokens
+        self.extraction_plausibility_max_tokens = extraction_plausibility_max_tokens
 
         # Extraction pipeline flags — the SOTA enrichment chain (anonymize →
         # noise-filter → plausibility → de-anonymize → NER). Loop-level defaults
@@ -539,6 +541,7 @@ class ConsolidationLoop:
         return dict(
             temperature=self.extraction_temperature,
             max_tokens=self.extraction_max_tokens,
+            plausibility_max_tokens=self.extraction_plausibility_max_tokens,
             prompts_dir=self.prompts_dir,
             ha_context=overrides.get("ha_context"),
             stt_correction=pick("stt_correction", stt_correction_default),

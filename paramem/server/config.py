@@ -620,10 +620,19 @@ class ConsolidationScheduleConfig:
     # set this to a small value to skip the full validated budget when
     # testing layout/encryption invariants rather than recall quality.
     max_epochs: int | None = None
-    # Output token budget — single value governs every LLM call in the
-    # extraction pipeline (local extract, anonymize, SOTA enrich, deanon,
-    # plausibility) and every direct response across modes.
+    # Output token budget — drives every LLM call in the extraction pipeline
+    # (local extract, anonymize, SOTA enrich, deanon) and every direct
+    # response across modes.
     extraction_max_tokens: int = 8192
+    # Plausibility-stage cap, separately configurable so an operator can
+    # tighten it under VRAM pressure without dragging SOTA enrichment down
+    # too. Default tracks the unified ``extraction_max_tokens`` budget —
+    # observed PII-attribute capture (email/phone/linkedin) is more reliable
+    # at the larger cap. Tighten (e.g. to 4096) only when the WSL2 host
+    # headroom forces a trade-off; KV-cache savings:
+    # (extraction_max_tokens − plausibility) × ~131 KB/token of peak ceiling
+    # reduction on the worst-case generation.
+    extraction_plausibility_max_tokens: int = 8192
     extraction_stt_correction: bool = True  # correct STT errors from assistant responses
     extraction_ha_validation: bool = True  # validate locations against HA home context
     extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)
