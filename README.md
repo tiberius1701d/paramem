@@ -332,16 +332,25 @@ ParaMem owns memory (speaker identification, entity routing, adapter recall, con
 
 ### GPU Lifecycle
 
-The server shares the GPU with ML workloads:
+The server shares the GPU with ML workloads.  Release is brokered by
+`gpu_guard` (machine-level arbitration, config-driven consumers).
+ParaMem registers as the ``paramem-server`` consumer in
+``~/.config/gpu-guard/config.toml``:
 
-- **SIGUSR1** → switch to cloud-only mode (model unloaded from VRAM)
-- **Auto-reclaim** → periodically checks if GPU is free, reloads model
-- **Startup guard** → if GPU is occupied at startup, starts in cloud-only mode
-- **`--cloud-only`** → explicit flag to skip model loading
+- **`POST /gpu/release`** → in-process unload, switch to cloud-only.
+  Default release primitive used by `gpu_guard` and other workloads.
+  Synchronous; idempotent; returns 503 mid-consolidation so the caller
+  can retry.
+- **SIGUSR1** → graceful exit (snapshot + `os._exit(1)` → systemd
+  restart).  Alternate release primitive, retained for callers that
+  prefer signal semantics over HTTP.
+- **Auto-reclaim** → periodically checks if GPU is free, reloads model.
+- **Startup guard** → if GPU is occupied at startup, starts in cloud-only mode.
+- **`--cloud-only`** → explicit flag to skip model loading.
 
 ```bash
-# Release GPU for a training run
-kill -SIGUSR1 $(pidof python -m paramem.server.app)
+# Release GPU for a training run (preferred)
+curl -X POST http://localhost:8420/gpu/release
 
 # Server auto-reclaims when GPU is free (default: 10min polling)
 ```

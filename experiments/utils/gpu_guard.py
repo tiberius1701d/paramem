@@ -61,15 +61,14 @@ def release_server_gpu(port: int = 8420, timeout: int = 30) -> bool:
     """Ask the paramem server to release the GPU and wait for it to switch to cloud-only.
 
     Thin wrapper around ``release_consumer_gpu_by_name`` for backward
-    compatibility with V1 callers.
-
-    The ``port`` argument is intentionally unused — the port lives in
+    compatibility with V1 callers — the actual release primitive (HTTP
+    POST ``/gpu/release`` by default) is configured in
     ``~/.config/gpu-guard/config.toml`` under ``[consumers.paramem-server]``.
-    It is kept in the signature for source compatibility with callers that
-    pass it explicitly (e.g. ``paramem/utils/gpu_hold.py``).
 
     Args:
-        port: Ignored.  Port is read from the TOML config.
+        port: Ignored.  Kept in the signature so legacy V1 call sites
+            that passed it positionally still type-check.  The port now
+            lives in the TOML config.
         timeout: Maximum seconds to wait for the server to become idle.
 
     Returns:
