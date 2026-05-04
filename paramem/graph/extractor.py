@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from paramem.graph.schema import SessionGraph
+from paramem.graph.schema import Entity, SessionGraph
 from paramem.graph.schema_config import (
     anonymizer_placeholder_pattern,
     anonymizer_prefix_to_type,
@@ -84,7 +84,14 @@ def _vram_snapshot(label: str) -> None:
 
     Used to localise VRAM-pressure-induced crashes in the SOTA pipeline.
     Output is grep-friendly:
-    ``VRAM <label>: alloc=NNNN MiB reserved=NNNN MiB peak=NNNN MiB``.
+    ``VRAM <label>: alloc=NNNN MiB reserved=NNNN MiB peak=NNNN MiB
+                   smi_used=NNNN MiB smi_free=NNNN MiB``.
+
+    The ``smi_*`` fields query ``nvidia-smi`` so the gap between
+    PyTorch's accounted-for memory and the host-visible total surfaces
+    dxg/host-side allocations that the WSL2 paravirt layer holds outside
+    of PyTorch's view — that gap is what crashed us under
+    ``dxgkio_make_resident`` ENOMEM.
 
     Resets peak after reading so each window's contribution is visible
     on the next snapshot. No-op when CUDA is unavailable.
@@ -106,12 +113,35 @@ def _vram_snapshot(label: str) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.debug("VRAM snapshot %s: query failed: %s", label, exc)
         return
+    smi_used = smi_free = -1.0
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if out.returncode == 0:
+            parts = out.stdout.strip().split(",")
+            smi_used = float(parts[0].strip())
+            smi_free = float(parts[1].strip())
+    except Exception:  # noqa: BLE001
+        pass
     logger.info(
-        "VRAM %s: alloc=%.0f MiB reserved=%.0f MiB peak=%.0f MiB",
+        "VRAM %s: alloc=%.0f MiB reserved=%.0f MiB peak=%.0f MiB "
+        "smi_used=%.0f MiB smi_free=%.0f MiB",
         label,
         alloc_mib,
         reserved_mib,
         peak_mib,
+        smi_used,
+        smi_free,
     )
 
 
@@ -588,6 +618,9 @@ def extract_procedural_graph(
         for rel_dict in data.get("relations", []):
             rel_dict.setdefault("speaker_id", speaker_id)
         graph = SessionGraph.model_validate(data)
+        # Bind speaker Entity and fold any split-name duplicates.
+        if speaker_name:
+            graph = _stamp_speaker_entity(graph, speaker_name=speaker_name, speaker_id=speaker_id)
     except Exception as exc:
         logger.warning("Procedural extraction failed (%s), returning empty", exc)
         return SessionGraph(
@@ -693,7 +726,12 @@ def extract_graph(
     logger.debug("Raw extraction output: %s", raw_output[:500])
 
     try:
-        graph = _parse_extraction(raw_output, session_id, speaker_id=speaker_id)
+        graph = _parse_extraction(
+            raw_output,
+            session_id,
+            speaker_id=speaker_id,
+            speaker_name=speaker_name,
+        )
     except Exception as exc:
         logger.warning(
             "Extraction parsing failed (%s), returning empty graph",
@@ -963,7 +1001,12 @@ def _generate_extraction(
     )
 
 
-def _parse_extraction(raw_output: str, session_id: str, speaker_id: str) -> SessionGraph:
+def _parse_extraction(
+    raw_output: str,
+    session_id: str,
+    speaker_id: str,
+    speaker_name: str | None = None,
+) -> SessionGraph:
     """Parse raw model output into a SessionGraph.
 
     Handles non-standard field names, array-valued fields, and other
@@ -972,11 +1015,21 @@ def _parse_extraction(raw_output: str, session_id: str, speaker_id: str) -> Sess
     ``{"entities": [...], "relations": [...]}`` envelope; that case is
     rewrapped here so downstream normalization can proceed.
 
+    After schema validation, :func:`_stamp_speaker_entity` is called to:
+    - Stamp ``speaker_id`` on the entity whose name matches ``speaker_name``.
+    - Fold any duplicate speaker-named entity (e.g. "Alex Morgan" alongside
+      "Alex") into the canonical one and rewrite all affected relation
+      subjects/objects.
+
     Args:
         raw_output: Raw model output string.
         session_id: Session identifier for the graph.
         speaker_id: Speaker store ID stamped onto every relation as provenance.
             Required — callers must always supply the session's speaker ID.
+        speaker_name: Real display name of the speaker (e.g. "Alex" or
+            "Speaker0").  When provided, the speaker Entity is identified and
+            its ``speaker_id`` field is set.  When ``None`` the post-processing
+            step is skipped.
     """
     json_str = _extract_json_block(raw_output)
     data = json.loads(json_str)
@@ -999,12 +1052,141 @@ def _parse_extraction(raw_output: str, session_id: str, speaker_id: str) -> Sess
         rel_dict.setdefault("speaker_id", speaker_id)
 
     graph = SessionGraph.model_validate(data)
+
+    # Post-process: bind speaker Entity and fold any split-name duplicates.
+    if speaker_name:
+        graph = _stamp_speaker_entity(graph, speaker_name=speaker_name, speaker_id=speaker_id)
+
     logger.info(
         "Extracted graph: %d entities, %d relations (session=%s)",
         len(graph.entities),
         len(graph.relations),
         session_id,
     )
+    return graph
+
+
+def _stamp_speaker_entity(
+    graph: SessionGraph,
+    *,
+    speaker_name: str,
+    speaker_id: str,
+) -> SessionGraph:
+    """Stamp ``speaker_id`` on the canonical speaker Entity and fold duplicates.
+
+    Two tasks are performed on the parsed :class:`~paramem.graph.schema.SessionGraph`:
+
+    1. **Stamp** — find the entity whose ``name`` matches ``speaker_name``
+       (case-insensitive) and set its ``speaker_id`` to ``speaker_id``.  If no
+       exact match is found, the entity whose name starts with the
+       ``speaker_name`` prefix is treated as the canonical entity (e.g. "Alex"
+       found as prefix of "Alex Morgan" — only when the speaker's display name
+       is the first-name part of a longer name the model emitted).
+
+    2. **Fold** — if the model emitted a *second* entity whose name is a
+       longer form of the speaker's name (e.g. speaker_name="Alex" and model
+       also emitted "Alex Morgan"), fold the duplicate into the canonical
+       entity: merge attributes, rewrite every relation whose subject or object
+       matched the duplicate name to the canonical name, and remove the
+       duplicate from the entity list.
+
+    Any entity whose name matches ``speaker_id`` exactly (opaque IDs like
+    "Speaker0") is also treated as a speaker alias and folded.
+
+    This post-processor is a defensive measure against the model ignoring the
+    prompt's "collapse self-references" instruction.  It is idempotent — if
+    the model obeyed the prompt perfectly only task 1 fires (no duplicates to
+    fold).
+
+    Args:
+        graph: Parsed :class:`~paramem.graph.schema.SessionGraph` after
+            schema validation.
+        speaker_name: Canonical display name of the speaker as passed to the
+            extraction prompt (e.g. ``"Alex"`` or ``"Speaker0"``).
+        speaker_id: Speaker store ID to stamp onto the canonical entity.
+
+    Returns:
+        Updated ``SessionGraph`` with ``speaker_id`` set on the canonical
+        speaker Entity and any duplicate entities removed.
+    """
+    if not graph.entities:
+        return graph
+
+    speaker_name_lower = speaker_name.lower()
+    speaker_id_lower = speaker_id.lower()
+
+    # Identify the canonical entity: exact name match first, then prefix match.
+    canonical: Entity | None = None
+    for ent in graph.entities:
+        if ent.name.lower() == speaker_name_lower:
+            canonical = ent
+            break
+
+    if canonical is None:
+        # Fallback: entity whose name starts with speaker_name (full-name variants).
+        # Do NOT rename canonical.name to speaker_name here — relations still
+        # reference the longer form, and the privacy verifier would then flag
+        # the bare display name as a leak when it appears as a substring of
+        # email/URL tokens (e.g. "alex" inside "alex.smith@example.com"
+        # — the dot is a regex word boundary). The graph identity is
+        # speaker_id (stamped below), not the name string; rendering layers
+        # can resolve display names via SpeakerStore.get_name() at render time.
+        for ent in graph.entities:
+            if ent.name.lower().startswith(speaker_name_lower + " "):
+                canonical = ent
+                break
+
+    if canonical is None:
+        # No match at all — nothing to stamp or fold.
+        return graph
+
+    # Stamp speaker_id.
+    canonical.speaker_id = speaker_id
+
+    # Collect alias names: any entity that is a longer form of the speaker name
+    # or matches the opaque speaker_id, excluding the canonical entity itself.
+    alias_names: set[str] = set()
+    for ent in graph.entities:
+        if ent is canonical:
+            continue
+        name_lower = ent.name.lower()
+        # Full-name variant (e.g. "Alex Morgan" when canonical is "Alex")
+        if name_lower.startswith(speaker_name_lower + " ") or name_lower.startswith(
+            speaker_name_lower + "-"
+        ):
+            alias_names.add(ent.name)
+        # Opaque speaker_id entity (e.g. "Speaker0" entity alongside "Alex")
+        elif name_lower == speaker_id_lower:
+            alias_names.add(ent.name)
+
+    if not alias_names:
+        return graph
+
+    # Merge attributes from all alias entities into canonical.
+    alias_map: dict[str, str] = {}  # alias_name -> canonical.name
+    entities_to_remove: set[str] = set()
+    for ent in graph.entities:
+        if ent.name in alias_names:
+            canonical.attributes.update(ent.attributes)
+            alias_map[ent.name] = canonical.name
+            entities_to_remove.add(ent.name)
+            logger.info(
+                "Speaker entity fold: '%s' → '%s' (speaker_id=%s)",
+                ent.name,
+                canonical.name,
+                speaker_id,
+            )
+
+    # Rewrite relation subjects/objects that referenced alias names.
+    for rel in graph.relations:
+        if rel.subject in alias_map:
+            rel.subject = alias_map[rel.subject]
+        if rel.object in alias_map:
+            rel.object = alias_map[rel.object]
+
+    # Remove folded entity objects.
+    graph.entities = [e for e in graph.entities if e.name not in entities_to_remove]
+
     return graph
 
 
@@ -1691,10 +1873,47 @@ def _sota_pipeline(
     mapping, norm_stats = _normalize_anonymization_mapping(mapping)
     if norm_stats["dropped"]:
         graph.diagnostics["mapping_ambiguous_dropped"] = norm_stats["dropped"]
-    # Fall back to mechanical replacement if the model didn't return an
-    # anonymized transcript (older anonymization prompt or partial response).
-    if not anon_transcript:
-        anon_transcript = _anonymize_transcript(transcript, mapping)
+
+    # Bug A fix: guarantee the speaker's display name is in the mapping so the
+    # forward-path verifier does not flag bare first-name occurrences as leaks.
+    # The extended mapping is propagated into anon_transcript via the
+    # re-anonymization step below so every form of the name is replaced before
+    # the verifier sees the output.
+    if speaker_name:
+        mapping = _ensure_speaker_name_in_mapping(mapping, speaker_name)
+
+    # Bug B fix: recover forward-mapping entries the anonymizer emitted in
+    # anonymized_facts but forgot to include in the returned mapping dict.
+    # Without this, Product_1-style placeholders have no reverse entry and are
+    # dropped by the residual sweep at de-anonymization time.
+    mapping = _recover_missing_placeholder_mappings(mapping, anon_facts, graph.relations)
+
+    # (Re-)build anonymized transcript AND facts from the ORIGINAL transcript
+    # and relations using the now-complete mapping.  This covers three cases:
+    # 1. LLM did not return an anonymized transcript (backward-compat fallback).
+    # 2. Bug A extension added a new speaker-name entry — bare first-name tokens
+    #    that the LLM left in the transcript or in fact subject/object fields
+    #    must now be replaced before the verifier runs.
+    # 3. Bug B extension added recovered Product_N-style entries — those entries
+    #    already appear correctly in anon_facts (the LLM used Product_1 there);
+    #    the transcript rebuild ensures any original name remaining in the
+    #    transcript is also replaced.
+    # Always running _anonymize_transcript is safe: it is idempotent when the
+    # LLM already produced a clean transcript (placeholders are not word-chars
+    # and therefore not matched as keys by _substitute_whole_words).
+    anon_transcript = _anonymize_transcript(transcript, mapping)
+    # Apply the (potentially extended) mapping to fact subject/object fields to
+    # ensure no bare real-name tokens remain after Bug A seeding.
+    anon_facts = [
+        {
+            **f,
+            "subject": _substitute_whole_words(str(f.get("subject", "")), mapping),
+            "object": _substitute_whole_words(str(f.get("object", "")), mapping),
+        }
+        if isinstance(f, dict)
+        else f
+        for f in anon_facts
+    ]
 
     # Forward-path privacy guard: verify no real name leaked past anonymization
     # before sending anything to the cloud. On leak, attempt deterministic
@@ -1927,6 +2146,21 @@ def _sota_pipeline(
             deanon_dropped,
         )
 
+    # Step 3c+: Route scalar-valued objects (URLs, emails, phone numbers,
+    # DOIs, version-tagged tool names like "ROS2") off the relation surface
+    # and onto Entity.attributes of the subject.  Scalars are verbatim
+    # identifiers, not paraphrasable concept phrases — they fail the
+    # grounding gate's whole-word alpha-token rule because their alpha
+    # portion is concatenated with digits in the transcript
+    # ("username1234", "ROS2").  Routing them to attributes mirrors the
+    # email/phone/linkedin path the local extractor already populates and
+    # which the QA generator's _flatten_entity_attributes mints into keyed
+    # pairs without grounding.  The projection is applied after the entity
+    # rebuild step below so the subject entity survives pruning.
+    scalar_facts, deanon_facts = _partition_scalar_facts(deanon_facts)
+    if scalar_facts:
+        graph.diagnostics["scalar_facts_projected"] = len(scalar_facts)
+
     # Step 3d: Grounding gate — every surviving fact's subject and object must be
     # grounded in the original transcript OR be a known real-name from the mapping.
     # Catches SOTA world-knowledge inferences (e.g. inferring "CIA" from a
@@ -2063,7 +2297,11 @@ def _sota_pipeline(
     # the type from the prefix itself — the prefix name IS the type name in
     # SOTA's brace-binding protocol. entity_type is open (no Literal), so the
     # derived type passes through.
-    kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
+    kept_names = (
+        {r.subject for r in kept_relations}
+        | {r.object for r in kept_relations}
+        | {str(f.get("subject", "")) for f in scalar_facts if str(f.get("subject", "")).strip()}
+    )
     existing_names = {e.name for e in graph.entities}
     graph.entities = [e for e in graph.entities if e.name in kept_names]
     closed_prefix_to_type = anonymizer_prefix_to_type()
@@ -2077,6 +2315,10 @@ def _sota_pipeline(
             entity_type = closed_prefix_to_type.get(prefix) or prefix or "concept"
         graph.entities.append(Entity(name=name, entity_type=entity_type))
 
+    # Project scalar-object facts onto subject Entity.attributes (see
+    # _partition_scalar_facts call above for rationale).
+    _project_scalar_facts_to_attributes(graph, scalar_facts)
+
     graph.relations = kept_relations
 
     added = len(kept_relations) - original_count
@@ -2087,6 +2329,249 @@ def _sota_pipeline(
         added,
     )
     return graph
+
+
+def _next_placeholder_index(mapping: dict, prefix: str) -> int:
+    """Return the next free placeholder index for ``prefix`` within ``mapping``.
+
+    Scans the mapping VALUES for existing ``Prefix_N`` tokens and returns
+    ``max(N) + 1``.  Used by the speaker-name seeding and gap-recovery
+    helpers to allocate non-colliding placeholder indices.
+
+    Args:
+        mapping: Current ``{real_name: placeholder}`` mapping (canonical form).
+        prefix: Capitalised placeholder prefix, e.g. ``"Person"``.
+
+    Returns:
+        Integer index (≥ 1) that is not yet used by any mapping value.
+    """
+    max_n = 0
+    for v in mapping.values():
+        if not isinstance(v, str):
+            continue
+        if v.startswith(f"{prefix}_"):
+            tail = v.split("_")[-1]
+            if tail.isdigit():
+                max_n = max(max_n, int(tail))
+    return max_n + 1
+
+
+def _ensure_speaker_name_in_mapping(
+    mapping: dict,
+    speaker_name: str | None,
+) -> dict:
+    """Guarantee that the speaker's display name is covered by the anonymizer mapping.
+
+    Bug A fix: the local anonymizer maps the full-name form (e.g.
+    ``Alex Rivera → Person_1``) but leaves the bare first name (``Alex``)
+    out of the mapping.  After :func:`_stamp_speaker_entity` renames the graph
+    entity to the display name (``Alex``), the forward-path privacy verifier
+    finds ``Alex`` in the transcript and flags it as a leak — triggering the
+    residual-leak path, skipping SOTA enrichment, and ultimately dropping two
+    facts that contain ``Product_1`` (which can only be resolved via the full
+    SOTA enrichment path).
+
+    This function is called once per pipeline run, AFTER
+    :func:`_normalize_anonymization_mapping`, BEFORE the first
+    :func:`verify_anonymization_completeness` call.  It extends the mapping
+    in-place-safe fashion (returns a new dict) so the verifier and all
+    downstream steps see a complete mapping that covers every form the speaker's
+    name can take.
+
+    Resolution strategy (in priority order):
+    1. ``speaker_name`` already a key → no-op (mapping is complete).
+    2. A key in ``mapping`` starts with ``speaker_name + " "`` (full-name
+       variant, e.g. ``"Alex Rivera"``) → reuse its placeholder so both
+       the bare and full forms map to the *same* ``Person_N`` token.
+       De-anonymization then consistently produces the full name at every site.
+    3. No existing key covers ``speaker_name`` → allocate a fresh ``Person_N``
+       placeholder (type-safe: speakers are always persons).
+
+    Args:
+        mapping: Canonical ``{real_name: placeholder}`` mapping as returned
+            by :func:`_normalize_anonymization_mapping`.
+        speaker_name: Display name of the speaker (e.g. ``"Alex"`` or
+            ``"Sam"``) as passed to :func:`_sota_pipeline`.  When ``None``
+            or empty, the mapping is returned unchanged.
+
+    Returns:
+        Potentially-extended mapping (new dict; input is not mutated).
+    """
+    if not speaker_name:
+        return mapping
+    if speaker_name in mapping:
+        return mapping
+
+    new_mapping = dict(mapping)
+    speaker_lower = speaker_name.lower()
+
+    # Strategy 2: reuse the placeholder of any full-name key that starts with
+    # the speaker's first name (e.g. "Alex Rivera" when speaker is "Alex").
+    for key, placeholder in mapping.items():
+        if not isinstance(key, str):
+            continue
+        if key.lower().startswith(speaker_lower + " "):
+            new_mapping[speaker_name] = placeholder
+            logger.debug(
+                "Speaker-name seeding: %r reuses placeholder %r from full-name key %r",
+                speaker_name,
+                placeholder,
+                key,
+            )
+            return new_mapping
+
+    # Strategy 3: allocate a fresh Person_N placeholder.
+    person_prefix = anonymizer_type_to_prefix().get("person", "Person")
+    fresh_placeholder = f"{person_prefix}_{_next_placeholder_index(new_mapping, person_prefix)}"
+    new_mapping[speaker_name] = fresh_placeholder
+    logger.debug(
+        "Speaker-name seeding: %r allocated fresh placeholder %r",
+        speaker_name,
+        fresh_placeholder,
+    )
+    return new_mapping
+
+
+def _recover_missing_placeholder_mappings(
+    mapping: dict,
+    anon_facts: list[dict],
+    original_relations: list,
+) -> dict:
+    """Recover anonymizer mapping entries that the model emitted in facts but omitted from mapping.
+
+    Bug B fix: the local anonymizer may produce placeholder tokens in
+    ``anonymized_facts`` (e.g. ``Product_1``) without including the corresponding
+    forward mapping entry (e.g. ``Honda → Product_1``).  When this happens the
+    reverse mapping used at de-anonymization time has no entry for ``Product_1``,
+    so the placeholder survives the residual sweep and the fact is dropped.
+
+    This function is called once per pipeline run, after
+    :func:`_anonymize_with_local_model` and after
+    :func:`_normalize_anonymization_mapping`.  It scans each ``anon_fact``
+    field (subject, object) for placeholder-shaped tokens that are absent from
+    ``mapping.values()`` and tries to recover the original value by comparing
+    against the corresponding ``original_relations`` entry.
+
+    Matching strategy:
+    - Primary: positional (anon_facts[i] ↔ original_relations[i]).  The
+      anonymizer is expected to preserve fact order.
+    - The comparison is field-by-field: when anon_fact's ``subject`` is a
+      bare placeholder not in ``mapping.values()`` and original_relation's
+      ``subject`` is not a placeholder, add ``original → placeholder`` to the
+      recovered mapping.
+
+    Only bare placeholder tokens (matching :data:`_PLACEHOLDER_TOKEN_RE`)
+    that are NOT already covered by ``mapping.values()`` are recovered.
+    Braced SOTA-style tokens (``{Prefix_N}``) are intentionally skipped —
+    those belong to the SOTA enrichment path and are handled separately.
+
+    Args:
+        mapping: Canonical ``{real_name: placeholder}`` mapping as returned
+            by :func:`_normalize_anonymization_mapping` (and extended by
+            :func:`_ensure_speaker_name_in_mapping`).
+        anon_facts: Anonymized fact dicts returned by
+            :func:`_anonymize_with_local_model`.
+        original_relations: The ``graph.relations`` list BEFORE anonymization
+            (list of :class:`~paramem.graph.schema.Relation` objects).
+
+    Returns:
+        Potentially-extended mapping (new dict; input is not mutated).
+    """
+    if not anon_facts or not original_relations:
+        return mapping
+
+    # Set of placeholder token strings already covered — no need to recover.
+    covered_placeholders: set[str] = {
+        str(v).lower() for v in mapping.values() if isinstance(v, str) and v
+    }
+
+    # Bare placeholder pattern (no braces, no anchoring) — finds embedded
+    # tokens like "Product_1" inside "software for Product_1's Legend system".
+    _bare_ph_re = re.compile(r"\b([A-Z][A-Za-z]*_\d+)\b")
+
+    recovered: dict[str, str] = {}
+    for i, anon_fact in enumerate(anon_facts):
+        if not isinstance(anon_fact, dict):
+            continue
+        if i >= len(original_relations):
+            break
+        orig = original_relations[i]
+        orig_subj = getattr(orig, "subject", "") or ""
+        orig_obj = getattr(orig, "object", "") or ""
+        anon_subj = str(anon_fact.get("subject", ""))
+        anon_obj = str(anon_fact.get("object", ""))
+
+        for anon_val, orig_val in ((anon_subj, orig_subj), (anon_obj, orig_obj)):
+            if not anon_val or not orig_val:
+                continue
+            # Find all bare placeholders in the anon field.
+            ph_tokens = _bare_ph_re.findall(anon_val)
+            if not ph_tokens:
+                continue
+            for ph_token in ph_tokens:
+                if ph_token.lower() in covered_placeholders:
+                    continue
+                # The original field must not already contain this placeholder.
+                if ph_token in orig_val:
+                    continue
+                # Two recovery strategies:
+                #
+                # Case A — whole-field placeholder: the entire anon_val IS the
+                # placeholder (e.g. anon_val="Org_1", orig_val="Acme Corp").
+                # The original field is recovered directly.
+                if anon_val.strip() == ph_token and orig_val not in mapping:
+                    recovered[orig_val] = ph_token
+                    covered_placeholders.add(ph_token.lower())
+                    logger.debug(
+                        "Gap recovery (whole-field): %r → %r (position %d)",
+                        orig_val,
+                        ph_token,
+                        i,
+                    )
+                    break
+                #
+                # Case B — embedded placeholder: ph_token appears inside a
+                # compound anon_val (e.g. "software for Product_1's Legend").
+                # Recover the original word by finding the word in orig_val that
+                # is absent from anon_val, is not itself a placeholder, and when
+                # substituted into anon_val in place of ph_token reconstructs
+                # orig_val exactly.
+                orig_words = re.findall(r"\b[\w]+\b", orig_val)
+                anon_words = set(re.findall(r"\b[\w]+\b", anon_val))
+                candidates = [
+                    w
+                    for w in orig_words
+                    if w not in anon_words
+                    and not re.match(r"^[A-Z][A-Za-z]*_\d+$", w)
+                    and w not in mapping
+                ]
+                for candidate in candidates:
+                    # Verify: replacing ph_token with candidate in anon_val
+                    # produces the original field (whole-word replacement).
+                    reconstructed = _substitute_whole_words(anon_val, {ph_token: candidate})
+                    if reconstructed == orig_val:
+                        recovered[candidate] = ph_token
+                        covered_placeholders.add(ph_token.lower())
+                        logger.debug(
+                            "Gap recovery (embedded): %r → %r (position %d, verified)",
+                            candidate,
+                            ph_token,
+                            i,
+                        )
+                        break
+
+    if not recovered:
+        return mapping
+
+    logger.info(
+        "Mapping gap recovery: added %d missing entr%s: %s",
+        len(recovered),
+        "y" if len(recovered) == 1 else "ies",
+        list(recovered.items())[:5],
+    )
+    new_mapping = dict(mapping)
+    new_mapping.update(recovered)
+    return new_mapping
 
 
 def _repair_anonymization_leaks(
@@ -2211,24 +2696,28 @@ def _normalize_for_grounding(text: str) -> str:
 
 
 def _extract_user_spans(transcript: str, *, speaker_name: str | None = None) -> str:
-    """Concatenate the text of every ``[user]`` (or ``user:``) line.
+    """Concatenate every line of user-authored content from ``transcript``.
 
-    Production transcripts tag turns with ``[user]`` / ``[assistant]``
-    line prefixes (also ``user:`` / ``assistant:`` colon form).  This
-    helper isolates the user-authored content so role-aware grounding
-    can verify a triple's substantive tokens come from the speaker
-    themselves, not from an assistant or third-party turn.
+    Walks lines as a state machine: a role-prefix line (``[user]`` /
+    ``user:`` / ``[assistant]`` / ``assistant:`` / ``{speaker_name}:``)
+    sets the current role, and **subsequent unmarked lines inherit it
+    until the next role transition**.  Pre-marker content is dropped
+    (state starts as ``None``), preserving the no-context-no-trust
+    invariant: when no role can be established for a line, it is not
+    treated as user content.
 
-    When ``speaker_name`` is provided, lines whose lowercased form starts
-    with ``{speaker_name.lower()}:`` are also accepted as user turns.
-    This covers production-format transcripts rendered by
-    ``SessionBuffer._format_turns`` as ``{speaker_name}: {text}`` instead
-    of the legacy ``[user]`` / ``user:`` prefix.
+    For a single-turn document chunk, ``SessionBuffer._format_turns``
+    prepends a one-time ``{speaker_name}: `` to the first line and the
+    rest of the document follows with its natural line breaks.  The
+    state machine catches the first line as a role transition into
+    ``user`` and inherits that role across the body.  This also fixes
+    multi-line user turns in real dialogue (``user: line one\\nline
+    two``) which the previous per-line predicate silently truncated.
 
-    Lines that don't carry a recognised role prefix are conservatively
-    dropped — the goal is high precision on "user said this", not
-    inclusivity.  Mirrors the asymmetric extraction in
-    :func:`_correct_entity_names` (which pulls ``[assistant]`` text).
+    The asymmetric mirror is :func:`_correct_entity_names` (assistant
+    blocks).  ``speaker_name`` of ``"assistant"`` is ignored — that
+    label is reserved for the model marker and never accepted as a user
+    speaker.
     """
     speaker_prefix: str | None = None
     speaker_prefix_skip = 0
@@ -2240,17 +2729,149 @@ def _extract_user_spans(transcript: str, *, speaker_name: str | None = None) -> 
         speaker_prefix_skip = len(speaker_name) + 1
 
     out: list[str] = []
+    current_role: str | None = None  # no role established → no capture
     for line in (transcript or "").split("\n"):
         stripped = line.strip()
         lower = stripped.lower()
+        text_after: str
         if lower.startswith("[user]"):
+            current_role = "user"
             prefix_len = stripped.index("]") + 1
-            out.append(stripped[prefix_len:].lstrip())
+            text_after = stripped[prefix_len:].lstrip()
+        elif lower.startswith("[assistant]"):
+            current_role = "assistant"
+            prefix_len = stripped.index("]") + 1
+            text_after = stripped[prefix_len:].lstrip()
         elif lower.startswith("user:"):
-            out.append(stripped[len("user:") :].lstrip())
+            current_role = "user"
+            text_after = stripped[len("user:") :].lstrip()
+        elif lower.startswith("assistant:"):
+            current_role = "assistant"
+            text_after = stripped[len("assistant:") :].lstrip()
         elif speaker_prefix and lower.startswith(speaker_prefix):
-            out.append(stripped[speaker_prefix_skip:].lstrip())
+            current_role = "user"
+            text_after = stripped[speaker_prefix_skip:].lstrip()
+        else:
+            # Unmarked line — inherit the current role.
+            text_after = stripped
+        if current_role == "user" and text_after:
+            out.append(text_after)
     return "\n".join(out)
+
+
+def _is_scalar_value(value: str) -> bool:
+    """True iff ``value`` is a verbatim identifier rather than a content phrase.
+
+    Scalars belong on ``Entity.attributes`` (alongside email/phone/linkedin
+    extracted by the local extractor), where the QA generator's
+    :func:`_flatten_entity_attributes` mints keyed pairs without grounding.
+    Routing them through the grounding gate as relations is wrong: the
+    gate's whole-word alpha-token rule rejects values whose alpha portion
+    lives concatenated with digits in the source transcript
+    (``username1234``, ``ROS2``, ``H100``), even though the scalar is
+    verbatim in the text.
+
+    Detection is structural — no regex.  Recognised shapes:
+
+    * **Phone**: ≥7 digits, characters drawn only from
+      ``digits + " +()-."``.  Spaces are permitted only inside this class
+      (phone numbers are the one multi-token scalar).
+    * **Email**: contains ``@`` and a ``.`` after the ``@``, no whitespace.
+    * **URL with scheme**: starts with ``http://`` / ``https://`` /
+      ``ftp://``.
+    * **URL without scheme**: contains ``/`` and the part before the
+      first ``/`` looks like a domain (alphanumeric + dots/dashes,
+      contains at least one ``.``).
+    * **DOI**: starts with ``10.`` and contains ``/``.
+    * **Version-tagged identifier**: contains both letters and digits,
+      no spaces, characters drawn only from ``alnum + "/-_+."``
+      (e.g. ``ROS2``, ``H100``, ``IPv6``, ``ROS2/Gazebo``, ``x86_64``).
+    """
+    s = (value or "").strip()
+    if not s:
+        return False
+    digit_count = sum(c.isdigit() for c in s)
+    # Phone: ≥7 digits, only phone-shaped chars (the only multi-token scalar).
+    if digit_count >= 7 and all(c.isdigit() or c in "+()-. " for c in s):
+        return True
+    # After the phone exemption, multi-word means content phrase.
+    if any(c.isspace() for c in s):
+        return False
+    # Email: "@" with a domain ending in a TLD-like dot suffix.
+    if "@" in s:
+        domain = s.rsplit("@", 1)[-1]
+        if "." in domain and len(domain) > 2:
+            return True
+    lower = s.lower()
+    # URL with scheme.
+    if lower.startswith(("http://", "https://", "ftp://")):
+        return True
+    # URL without scheme: domain.tld[/path].
+    if "/" in s:
+        head = s.split("/", 1)[0]
+        if "." in head and head.replace(".", "").replace("-", "").isalnum():
+            return True
+    # DOI.
+    if s.startswith("10.") and "/" in s and digit_count > 0:
+        return True
+    # Version-tagged identifier.
+    if digit_count > 0 and any(c.isalpha() for c in s):
+        if all(c.isalnum() or c in "/-_+." for c in s):
+            return True
+    return False
+
+
+def _partition_scalar_facts(facts: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split facts by object-shape into ``(scalar, non_scalar)``.
+
+    Scalars are projected onto ``Entity.attributes`` of the subject and
+    bypass the grounding gate; non-scalars run the gate as concept-level
+    claims.  Facts already marked ``synthetic=True`` are passed through
+    untouched (they bypass the gate via the legacy synthetic path).
+    """
+    scalar: list[dict] = []
+    non_scalar: list[dict] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            non_scalar.append(f)
+            continue
+        if f.get("synthetic") is True:
+            non_scalar.append(f)
+            continue
+        if _is_scalar_value(str(f.get("object", ""))):
+            scalar.append(f)
+        else:
+            non_scalar.append(f)
+    return scalar, non_scalar
+
+
+def _project_scalar_facts_to_attributes(graph: SessionGraph, scalar_facts: list[dict]) -> None:
+    """Fold scalar-object facts onto ``Entity.attributes`` of the subject.
+
+    Mutates ``graph.entities`` in place: ensures every scalar-fact subject
+    has an ``Entity`` record (creating one with type ``"concept"`` when
+    missing), then sets ``entity.attributes[<key>] = object``.  ``<key>``
+    is the relation predicate with a leading ``has_`` stripped so the QA
+    generator's :func:`_flatten_entity_attributes` (which re-prefixes
+    attribute keys with ``has_`` when minting projected relations) does
+    not produce ``has_has_<key>``.
+    """
+    if not scalar_facts:
+        return
+    name_to_entity = {e.name: e for e in graph.entities}
+    for f in scalar_facts:
+        subj = str(f.get("subject", "")).strip()
+        pred = str(f.get("predicate", "")).strip()
+        obj = str(f.get("object", "")).strip()
+        if not (subj and pred and obj):
+            continue
+        ent = name_to_entity.get(subj)
+        if ent is None:
+            ent = Entity(name=subj, entity_type="concept")
+            graph.entities.append(ent)
+            name_to_entity[subj] = ent
+        attr_key = pred.removeprefix("has_") if pred.startswith("has_") else pred
+        ent.attributes[attr_key] = obj
 
 
 def _entity_is_grounded(entity: str, transcript_norm: str, known_names: set[str]) -> bool:
@@ -2462,7 +3083,7 @@ def _apply_bindings(
     * **Anonymizer mapping** (``mapping`` arg) — ``real_name -> placeholder``
       from the local anonymizer pass. Reversed here; substituted via word-
       boundary token walk so apostrophes / punctuation around bare tokens
-      don't break (``Person_2's cousin`` -> ``Tobias's cousin``).
+      don't break (``Person_2's cousin`` -> ``Alex's cousin``).
     * **SOTA bindings** (``sota_bindings`` arg) — ``placeholder_name -> real_text``
       that SOTA emitted alongside its enriched facts. The braced literal
       ``{Event_1}`` is matched and replaced directly (string substitution);
@@ -3503,6 +4124,7 @@ def _local_plausibility_filter(
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
+    _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
     prompt = plaus_prompt.format(
         facts_json=json.dumps(facts, indent=2),
@@ -3517,7 +4139,33 @@ def _local_plausibility_filter(
         tokenize=False,
         add_generation_prompt=True,
     )
-    raw = generate_answer(
-        model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
+    # Token count is the actual KV-cache driver, not character count.
+    try:
+        token_count = len(tokenizer(formatted, add_special_tokens=False)["input_ids"])
+    except Exception:  # noqa: BLE001
+        token_count = -1
+    logger.info(
+        "plaus_filter prompt: chars=%d tokens=%d max_new_tokens=%d",
+        len(formatted),
+        token_count,
+        max_tokens,
     )
+    _vram_snapshot("plaus_filter_pre_generate")
+    try:
+        raw = generate_answer(
+            model,
+            tokenizer,
+            formatted,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "plaus_filter generate_answer raised %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        _vram_snapshot("plaus_filter_post_generate_error")
+        raise
+    _vram_snapshot("plaus_filter_post_generate")
     return _parse_facts_response(raw, strict_array=True)

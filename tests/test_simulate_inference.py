@@ -52,19 +52,51 @@ from paramem.server.router import Intent, RoutingPlan, RoutingStep
 # ---------------------------------------------------------------------------
 
 
-def _write_keyed_pairs(path: Path, pairs: list[dict]) -> None:
-    """Write *pairs* to *path* as JSON, creating parent directories.
+def _full_pair(
+    key: str,
+    question: str,
+    answer: str,
+    *,
+    source_subject: str = "Alex",
+    source_predicate: str = "related_to",
+    source_object: str = "Unknown",
+    speaker_id: str = "spk-test",
+    first_seen_cycle: int = 1,
+) -> dict:
+    """Build a canonical keyed pair with all eight required fields.
 
-    Mirrors the ``_write_pairs`` helper in
-    ``tests/test_simulate_train_parity.py:224-226``.
+    Tests that only care about a subset of fields can rely on the defaults
+    for the remainder.  The facade enforces the full schema on every write,
+    so this helper centralises default-filling instead of duplicating it
+    across every call site.
+    """
+    return {
+        "key": key,
+        "question": question,
+        "answer": answer,
+        "source_subject": source_subject,
+        "source_predicate": source_predicate,
+        "source_object": source_object,
+        "speaker_id": speaker_id,
+        "first_seen_cycle": first_seen_cycle,
+    }
+
+
+def _write_keyed_pairs(path: Path, pairs: list[dict]) -> None:
+    """Write *pairs* to *path* via the canonical facade, creating parent dirs.
+
+    Delegates to :func:`paramem.training.keyed_pairs_io.write_keyed_pairs`
+    so the full eight-field schema is enforced at write time.  Call sites that
+    previously passed three-field dicts must now use :func:`_full_pair` to
+    supply the missing fields.
 
     Args:
         path: Absolute path to the target ``keyed_pairs.json`` file.
-        pairs: List of keyed-pair dicts, each with at least ``key``,
-            ``question``, and ``answer`` fields.
+        pairs: List of keyed-pair dicts, each with all eight canonical fields.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(pairs))
+    from paramem.training.keyed_pairs_io import write_keyed_pairs
+
+    write_keyed_pairs(path, pairs)
 
 
 def _simulate_config(tmp_path: Path):
@@ -223,12 +255,12 @@ class TestSimulateInferenceEndToEnd:
         _write_keyed_pairs(
             config.simulate_dir / "episodic" / "keyed_pairs.json",
             [
-                {
-                    "key": "graph1",
-                    "question": "Where does Alex live?",
-                    "answer": "Heilbronn.",
-                    "source_subject": "Alex",
-                }
+                _full_pair(
+                    "graph1",
+                    "Where does Alex live?",
+                    "Heilbronn.",
+                    source_subject="Alex",
+                )
             ],
         )
         # adapters directory intentionally left absent — simulate mode must NOT
@@ -447,12 +479,12 @@ class TestSimulateInferenceEndToEnd:
         _write_keyed_pairs(
             config.simulate_dir / tier / "keyed_pairs.json",
             [
-                {
-                    "key": key,
-                    "question": f"Question for {tier}?",
-                    "answer": answer_token,
-                    "source_subject": "Alex",
-                }
+                _full_pair(
+                    key,
+                    f"Question for {tier}?",
+                    answer_token,
+                    source_subject="Alex",
+                )
             ],
         )
 
@@ -513,24 +545,24 @@ class TestSimulateInferenceEndToEnd:
         _write_keyed_pairs(
             config.adapter_dir / "episodic" / "keyed_pairs.json",
             [
-                {
-                    "key": "graph1",
-                    "question": "Where does Alex live?",
-                    "answer": "WRONG-from-adapters",
-                    "source_subject": "Alex",
-                }
+                _full_pair(
+                    "graph1",
+                    "Where does Alex live?",
+                    "WRONG-from-adapters",
+                    source_subject="Alex",
+                )
             ],
         )
         # Real data in simulate store — MUST be read in simulate mode.
         _write_keyed_pairs(
             config.simulate_dir / "episodic" / "keyed_pairs.json",
             [
-                {
-                    "key": "graph1",
-                    "question": "Where does Alex live?",
-                    "answer": "CORRECT-from-simulate",
-                    "source_subject": "Alex",
-                }
+                _full_pair(
+                    "graph1",
+                    "Where does Alex live?",
+                    "CORRECT-from-simulate",
+                    source_subject="Alex",
+                )
             ],
         )
 
@@ -596,12 +628,12 @@ class TestSimulateInferenceEndToEnd:
         _write_keyed_pairs(
             config.simulate_dir / "episodic" / "keyed_pairs.json",
             [
-                {
-                    "key": "graph1",
-                    "question": "Where does Alex live?",
-                    "answer": "DECOY-from-simulate",
-                    "source_subject": "Alex",
-                }
+                _full_pair(
+                    "graph1",
+                    "Where does Alex live?",
+                    "DECOY-from-simulate",
+                    source_subject="Alex",
+                )
             ],
         )
 

@@ -807,9 +807,9 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        from paramem.backup.encryption import read_maybe_encrypted as _rme
+        from paramem.training.keyed_pairs_io import read_keyed_pairs
 
-        keyed_pairs = json.loads(_rme(keyed_pairs_path).decode("utf-8"))
+        keyed_pairs = read_keyed_pairs(keyed_pairs_path)
         if not keyed_pairs:
             return GateResult(
                 gate=3,

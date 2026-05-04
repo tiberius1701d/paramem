@@ -1,5 +1,19 @@
 Extract PERSONAL FACTS about the speaker from this conversation transcript.{speaker_context}
 
+SPEAKER BINDING — IMPORTANT:
+The directive above names the current speaker. That name is the ONLY entity
+label you may use for the speaker — whether the transcript refers to them by
+full name, first name, pronoun ("I", "me", "my", "we"), or paraphrase ("the
+candidate", "the author", "this individual"). Collapse every self-reference
+into the single canonical entity named in the directive. Do NOT mint a
+separate entity for a longer or shorter form of the same name.
+
+If the transcript reveals additional name parts for the speaker (last name,
+middle name, nickname), emit them as attributes on the speaker entity using
+these exact keys: has_last_name, has_middle_name, has_nickname.
+Example: speaker "Alex" whose full name is "Alex Morgan" should have
+attributes {{"has_last_name": "Morgan"}} — not a separate "Alex Morgan" entity.
+
 Only extract facts that would still be true tomorrow — identity, relationships,
 location, preferences, work, education.
 
@@ -41,6 +55,12 @@ Predicate examples (use these exact forms when they apply):
 {predicate_examples}
 - If none fit, create a new snake_case predicate (e.g. "competed_in")
 
+POSITIVE example — speaker is "Alex", transcript: "[user] My full name is Alex Morgan. I work at Brightfield Labs."
+{{"entities": [{{"name": "Alex", "entity_type": "person", "attributes": {{"has_last_name": "Morgan"}}}},
+ {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
+ "relations": [{{"subject": "Alex", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Alex Morgan works at Brightfield Labs. Last name captured as has_last_name attribute; no separate full-name entity."}}
+
 POSITIVE example — transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
 {{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Frankfurt", "entity_type": "place", "attributes": {{}}}}],
@@ -81,6 +101,17 @@ Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
 speaker's real identifier (e.g. "Alice", "Speaker7") via the directive above.
 Never emit the literal strings "{{SPEAKER_NAME}}", "SPEAKER_NAME", or
 "Speaker_Name" in your output.
+
+NEGATIVE example — speaker is "Jordan", transcript: "[user] My name is Jordan Wells and I live in Millbrook."
+BAD output (two entities for the same speaker):
+{{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Jordan Wells", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}], ...}}
+CORRECT output (single entity, last name as attribute):
+{{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{"has_last_name": "Wells"}}}},
+ {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}],
+ "relations": [{{"subject": "Jordan", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Jordan Wells lives in Millbrook."}}
 
 NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."
 Extract: NONE — asking about weather in a location is curiosity, not a personal fact about where the speaker lives.

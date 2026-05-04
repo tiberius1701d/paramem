@@ -4,8 +4,12 @@ import json
 
 import pytest
 
-from paramem.graph.extractor import _extract_json_block, _normalize_extraction
-from paramem.graph.schema import SessionGraph
+from paramem.graph.extractor import (
+    _extract_json_block,
+    _normalize_extraction,
+    _stamp_speaker_entity,
+)
+from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
 class TestExtractJsonBlock:
@@ -161,3 +165,119 @@ class TestNormalizeExtraction:
         # stage's job, not a destructive normalization here.
         assert graph.entities[0].name == "user"
         assert graph.relations[0].relation_type == "factual"
+
+
+class TestStampSpeakerEntity:
+    """Unit tests for _stamp_speaker_entity post-processor."""
+
+    def _make_graph(self, entities, relations=None):
+        """Helper: build a minimal SessionGraph."""
+        return SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=entities,
+            relations=relations or [],
+        )
+
+    def test_stamps_speaker_id_on_matching_entity(self):
+        """Entity whose name matches speaker_name receives speaker_id."""
+        graph = self._make_graph(
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Berlin", entity_type="place"),
+            ]
+        )
+        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
+        alex = next(e for e in result.entities if e.name == "Alex")
+        assert alex.speaker_id == "Speaker0"
+        berlin = next(e for e in result.entities if e.name == "Berlin")
+        assert berlin.speaker_id is None
+
+    def test_folds_full_name_duplicate_into_first_name_canonical(self):
+        """When the model emits both 'Alex' and 'Alex Morgan', fold 'Alex Morgan'
+        into 'Alex', merge attributes, and rewrite relations."""
+        graph = self._make_graph(
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(
+                    name="Alex Morgan",
+                    entity_type="person",
+                    attributes={"has_last_name": "Morgan"},
+                ),
+                Entity(name="Brightfield Labs", entity_type="organization"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex Morgan",
+                    predicate="works_at",
+                    object="Brightfield Labs",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                ),
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                ),
+            ],
+        )
+        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
+
+        # Only one speaker entity should remain.
+        names = [e.name for e in result.entities]
+        assert "Alex" in names
+        assert "Alex Morgan" not in names, f"Duplicate not folded; entities: {names}"
+
+        # The canonical entity has the last name merged in and speaker_id set.
+        alex = next(e for e in result.entities if e.name == "Alex")
+        assert alex.speaker_id == "Speaker0"
+        assert alex.attributes.get("has_last_name") == "Morgan"
+
+        # The relation originally referencing "Alex Morgan" now references "Alex".
+        works_at = next(r for r in result.relations if r.predicate == "works_at")
+        assert works_at.subject == "Alex"
+
+    def test_no_match_returns_graph_unchanged(self):
+        """When speaker_name is not found among entities, return unchanged."""
+        graph = self._make_graph(entities=[Entity(name="Berlin", entity_type="place")])
+        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
+        assert len(result.entities) == 1
+        assert result.entities[0].speaker_id is None
+
+    def test_empty_entities_list(self):
+        """Empty entity list does not raise."""
+        graph = self._make_graph(entities=[])
+        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
+        assert result.entities == []
+
+    def test_idempotent_when_no_duplicates(self):
+        """When there is no full-name duplicate, only stamping occurs — no fold."""
+        graph = self._make_graph(
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Berlin", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
+        assert len(result.entities) == 2
+        assert len(result.relations) == 1
+        alex = next(e for e in result.entities if e.name == "Alex")
+        assert alex.speaker_id == "Speaker0"
+
+    def test_case_insensitive_name_match(self):
+        """Name matching is case-insensitive (speaker_name='alex', entity='Alex')."""
+        graph = self._make_graph(entities=[Entity(name="Alex", entity_type="person")])
+        result = _stamp_speaker_entity(graph, speaker_name="alex", speaker_id="Speaker0")
+        alex = next(e for e in result.entities if e.name == "Alex")
+        assert alex.speaker_id == "Speaker0"

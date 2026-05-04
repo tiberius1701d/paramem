@@ -96,15 +96,38 @@ def _make_enriched_registry(n: int, tmp_path: Path) -> Path:
 
 
 def _make_trial_adapter(tmp_path: Path, with_keyed_pairs: bool = True) -> Path:
-    """Create a minimal trial adapter directory with placeholder files."""
+    """Create a minimal trial adapter directory with placeholder files.
+
+    keyed_pairs.json uses the full eight-field schema required by
+    ``read_keyed_pairs`` so gate 3 can read and validate the file before
+    attempting adapter mount.
+    """
     d = tmp_path / "trial_adapter"
     d.mkdir(parents=True, exist_ok=True)
     (d / "adapter_config.json").write_text("{}")
     (d / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
     if with_keyed_pairs:
         keyed_pairs = [
-            {"key": "graph1", "question": "What is Q1?", "answer": "A1"},
-            {"key": "graph2", "question": "What is Q2?", "answer": "A2"},
+            {
+                "key": "graph1",
+                "question": "What is Q1?",
+                "answer": "A1",
+                "source_subject": "Q1",
+                "source_predicate": "is_a",
+                "source_object": "A1",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            {
+                "key": "graph2",
+                "question": "What is Q2?",
+                "answer": "A2",
+                "source_subject": "Q2",
+                "source_predicate": "is_a",
+                "source_object": "A2",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
         ]
         (d / "keyed_pairs.json").write_text(json.dumps(keyed_pairs))
     return d
@@ -961,7 +984,25 @@ class TestGate3KindSubdirLayout:
     """
 
     def _keyed_pairs_content(self) -> str:
-        return json.dumps([{"key": "graph1", "question": "Q1?", "answer": "A1"}])
+        """Return a full-schema keyed_pairs.json content string.
+
+        All eight canonical fields are included so ``read_keyed_pairs``
+        validation passes when gate 3 reads the fixture file.
+        """
+        return json.dumps(
+            [
+                {
+                    "key": "graph1",
+                    "question": "Q1?",
+                    "answer": "A1",
+                    "source_subject": "Q1",
+                    "source_predicate": "is_a",
+                    "source_object": "A1",
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                }
+            ]
+        )
 
     def test_find_keyed_pairs_top_level(self, tmp_path):
         """Top-level keyed_pairs.json is found by _find_keyed_pairs."""

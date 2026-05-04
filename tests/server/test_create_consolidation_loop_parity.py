@@ -298,7 +298,7 @@ def test_factory_skips_seeding_when_seed_state_from_disk_false(tmp_path, monkeyp
 def test_factory_seeds_from_disk_by_default(tmp_path, monkeypatch):
     """Production callers (no explicit seed_state_from_disk) get the
     historical seeding behaviour. A sentinel keyed_pairs.json under the
-    adapter dir triggers seed_episodic_qa.
+    adapter dir triggers seed_episodic_qa with the parsed pair list.
     """
     from paramem.server import consolidation as server_consolidation
     from paramem.server.config import load_server_config
@@ -306,8 +306,21 @@ def test_factory_seeds_from_disk_by_default(tmp_path, monkeypatch):
     adapters_dir = tmp_path / "adapters"
     ep_dir = adapters_dir / "episodic"
     ep_dir.mkdir(parents=True)
-    ep_payload = {"k1": {"question": "Who is Q?", "answer": "A person."}}
-    (ep_dir / "keyed_pairs.json").write_text(json.dumps(ep_payload))
+    # keyed_pairs.json must be a JSON array with full-schema entries so
+    # read_keyed_pairs passes validation and seeds the loop.
+    ep_pairs = [
+        {
+            "key": "graph1",
+            "question": "Who is Q?",
+            "answer": "A person.",
+            "source_subject": "Q",
+            "source_predicate": "is_a",
+            "source_object": "person",
+            "speaker_id": "Speaker0",
+            "first_seen_cycle": 1,
+        }
+    ]
+    (ep_dir / "keyed_pairs.json").write_text(json.dumps(ep_pairs))
 
     loop_instance = MagicMock()
 
@@ -328,4 +341,4 @@ def test_factory_seeds_from_disk_by_default(tmp_path, monkeypatch):
         # seed_state_from_disk defaults to True
     )
 
-    loop_instance.seed_episodic_qa.assert_called_once_with(ep_payload)
+    loop_instance.seed_episodic_qa.assert_called_once_with(ep_pairs)

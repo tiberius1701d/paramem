@@ -82,6 +82,24 @@ def _write_adapter_slot_dir(adapter_dir: Path, tier: str, slot_ts: str) -> Path:
     return slot_dir
 
 
+def _full_pair(key: str, question: str = "Q?", answer: str = "A.") -> dict:
+    """Return a full-schema keyed pair for migration test fixtures.
+
+    All eight canonical fields are populated so ``read_keyed_pairs`` schema
+    validation passes when the production code reads the fixture file.
+    """
+    return {
+        "key": key,
+        "question": question,
+        "answer": answer,
+        "source_subject": "Subject",
+        "source_predicate": "related_to",
+        "source_object": "Object",
+        "speaker_id": "Speaker0",
+        "first_seen_cycle": 1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # State model
 # ---------------------------------------------------------------------------
@@ -217,9 +235,7 @@ class TestMigrateTierTrainToSimulate:
     def _setup_tier(self, tmp_path, tier="episodic", keyed_pairs=None):
         cfg = _make_config(tmp_path, mode="simulate")
         if keyed_pairs is None:
-            keyed_pairs = [
-                {"key": f"g{i}", "question": f"q{i}", "answer": f"a{i}"} for i in range(3)
-            ]
+            keyed_pairs = [_full_pair(f"g{i}", f"q{i}?", f"a{i}.") for i in range(3)]
         _write_adapter_kp(cfg.adapter_dir, tier, keyed_pairs)
         return cfg, keyed_pairs
 
@@ -290,7 +306,7 @@ class TestMigrateOrchestrator:
             _write_adapter_kp(
                 cfg.adapter_dir,
                 tier,
-                [{"key": f"{tier}_g1", "question": "q", "answer": "a"}],
+                [_full_pair(f"{tier}_g1")],
             )
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
 
@@ -322,7 +338,7 @@ class TestMigrateOrchestrator:
             _write_adapter_kp(
                 cfg.adapter_dir,
                 tier,
-                [{"key": f"{tier}_g1", "question": "q", "answer": "a"}],
+                [_full_pair(f"{tier}_g1")],
             )
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
         with patch("paramem.training.indexed_memory.probe_keys_from_disk") as probe:
@@ -340,7 +356,7 @@ class TestMigrateOrchestrator:
             _write_adapter_kp(
                 cfg.adapter_dir,
                 tier,
-                [{"key": f"{tier}_g1", "question": "q", "answer": "a"}],
+                [_full_pair(f"{tier}_g1")],
             )
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
         state.completed_tiers = ["episodic"]  # already done from a prior partial run
@@ -392,9 +408,7 @@ class TestMigrateTierSimulateToTrain:
 
     def test_disabled_tier_skipped(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
-        _write_simulate_kp(
-            cfg.simulate_dir, "procedural", [{"key": "p1", "question": "q", "answer": "a"}]
-        )
+        _write_simulate_kp(cfg.simulate_dir, "procedural", [_full_pair("p1")])
         loop = self._make_loop()
         loop.procedural_config = None  # operator disabled procedural
         with pytest.raises(_TierSkipped, match="not enabled"):
@@ -402,7 +416,7 @@ class TestMigrateTierSimulateToTrain:
 
     def test_happy_path_orchestration(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
-        keyed_pairs = [{"key": f"g{i}", "question": "q", "answer": "a"} for i in range(2)]
+        keyed_pairs = [_full_pair(f"g{i}", "q?", "a.") for i in range(2)]
         _write_simulate_kp(cfg.simulate_dir, "episodic", keyed_pairs)
         loop = self._make_loop()
         # 1.0 recall on probe
@@ -436,7 +450,7 @@ class TestMigrateTierSimulateToTrain:
 
     def test_probe_failure_rolls_back(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
-        keyed_pairs = [{"key": f"g{i}", "question": "q", "answer": "a"} for i in range(3)]
+        keyed_pairs = [_full_pair(f"g{i}", "q?", "a.") for i in range(3)]
         _write_simulate_kp(cfg.simulate_dir, "episodic", keyed_pairs)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 0.66  # below 1.0 → rollback
