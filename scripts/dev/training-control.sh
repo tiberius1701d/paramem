@@ -313,8 +313,11 @@ _server_mode() {
 
 _release_server_gpu() {
     # Restart the server in cloud-only mode to fully free CUDA context.
-    # SIGUSR1 unloads the model but the CUDA context retains VRAM.
-    # A full process restart is the only way to reclaim all GPU memory.
+    # We deliberately full-restart instead of using the in-process
+    # POST /gpu/release path (gpu_guard's default release primitive):
+    # the restart is what lets us set PARAMEM_EXTRA_ARGS=--defer-model
+    # before the server re-launches, so it comes back without loading
+    # the model at all.
     local pid=$(_server_pid)
     if [[ -z "$pid" ]]; then
         return 1
