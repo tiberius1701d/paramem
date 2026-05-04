@@ -910,7 +910,7 @@ class TestInterimEnrichmentHook:
         )
 
         with patch.object(loop, "_run_extract_graph", return_value=sg):
-            loop.extract_session("ignored-transcript", "s1")
+            loop.extract_session("ignored-transcript", "s1", speaker_id="Speaker0")
 
         assert loop._triples_since_last_enrichment == 2
 
@@ -973,6 +973,7 @@ class TestInterimEnrichmentHook:
             loop.post_session_train(
                 session_transcript="t",
                 session_id="s1",
+                speaker_id="Speaker0",
                 schedule="12h",
                 max_interim_count=7,
                 stamp="20260420T1200",
@@ -1009,6 +1010,7 @@ class TestInterimEnrichmentHook:
             loop.post_session_train(
                 session_transcript="t",
                 session_id="s1",
+                speaker_id="Speaker0",
                 schedule="12h",
                 max_interim_count=7,
                 stamp="20260420T1200",
@@ -1049,6 +1051,7 @@ class TestInterimEnrichmentHook:
             loop.post_session_train(
                 session_transcript="t",
                 session_id="s1",
+                speaker_id="Speaker0",
                 schedule="12h",
                 max_interim_count=7,
                 stamp="20260420T1200",
@@ -1086,6 +1089,7 @@ class TestInterimEnrichmentHook:
             result = loop.post_session_train(
                 session_transcript="t",
                 session_id="s1",
+                speaker_id="Speaker0",
                 schedule="12h",
                 max_interim_count=7,
                 stamp="20260420T1200",
@@ -1141,6 +1145,7 @@ class TestInterimEnrichmentHook:
         result = loop.post_session_train(
             session_transcript="t",
             session_id="s1",
+            speaker_id="Speaker0",
             schedule="12h",
             max_interim_count=1,
             stamp=current_stamp,

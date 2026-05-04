@@ -503,12 +503,12 @@ def extract_procedural_graph(
     tokenizer,
     transcript: str,
     session_id: str,
+    speaker_id: str,
     temperature: float = 0.0,
     max_tokens: int = 1024,
     prompts_dir: str | Path | None = None,
     stt_correction: bool = True,
     speaker_name: str | None = None,
-    speaker_id: str = "",
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
 ) -> SessionGraph:
@@ -524,8 +524,8 @@ def extract_procedural_graph(
             preference instead of the ``SPEAKER_NAME`` slot. Mirrors
             the same parameter on ``extract_graph``.
         speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
-            ``Relation`` extracted in this pass as provenance. Defaults to
-            ``""`` for backward compatibility; callers should always supply.
+            ``Relation`` extracted in this pass as provenance. Required —
+            callers must always supply a real speaker ID.
         stt_correction: Correct entity names from the assistant response turn.
             This is a no-op when
             ``user_prompt_filename=DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME``
@@ -612,6 +612,7 @@ def extract_graph(
     tokenizer,
     transcript: str,
     session_id: str,
+    speaker_id: str,
     temperature: float = 0.0,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     prompts_dir: str | Path | None = None,
@@ -623,7 +624,6 @@ def extract_graph(
     noise_filter_model: str = "claude-sonnet-4-6",
     noise_filter_endpoint: str | None = None,
     speaker_name: str | None = None,
-    speaker_id: str = "",
     ner_check: bool = False,
     ner_model: str = "en_core_web_sm",
     plausibility_judge: str = "auto",
@@ -668,8 +668,7 @@ def extract_graph(
         verify_anonymization: Run forward-path privacy guard before SOTA (default True).
         speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
             ``Relation`` produced by this extraction pass as provenance.
-            Defaults to ``""`` for backward compatibility; callers should
-            supply the session's speaker ID.
+            Required — callers must always supply the session's speaker ID.
         system_prompt_filename: Filename of the system prompt within the prompts
             directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
             (``"extraction_system.txt"``); pass
@@ -964,7 +963,7 @@ def _generate_extraction(
     )
 
 
-def _parse_extraction(raw_output: str, session_id: str, speaker_id: str = "") -> SessionGraph:
+def _parse_extraction(raw_output: str, session_id: str, speaker_id: str) -> SessionGraph:
     """Parse raw model output into a SessionGraph.
 
     Handles non-standard field names, array-valued fields, and other
@@ -977,8 +976,7 @@ def _parse_extraction(raw_output: str, session_id: str, speaker_id: str = "") ->
         raw_output: Raw model output string.
         session_id: Session identifier for the graph.
         speaker_id: Speaker store ID stamped onto every relation as provenance.
-            Defaults to ``""`` for backward compatibility; callers should
-            supply the session's speaker ID.
+            Required — callers must always supply the session's speaker ID.
     """
     json_str = _extract_json_block(raw_output)
     data = json.loads(json_str)
@@ -1477,7 +1475,7 @@ def _fallback_plausibility_on_raw(
     reason: str,
     *,
     speaker_name: str | None = None,
-    speaker_id: str = "",
+    speaker_id: str,
     role_aware_grounding: str = "off",
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
 ) -> SessionGraph:
@@ -1497,8 +1495,8 @@ def _fallback_plausibility_on_raw(
 
     Args:
         speaker_id: Speaker store ID stamped onto every reconstructed
-            ``Relation`` as provenance. Defaults to ``""`` for backward
-            compatibility; callers should supply the session's speaker ID.
+            ``Relation`` as provenance. Required — callers must always supply
+            the session's speaker ID.
 
     Returns the modified graph in-place (graph.relations / graph.entities replaced).
     """
@@ -1596,6 +1594,7 @@ def _sota_pipeline(
     transcript: str,
     model,
     tokenizer,
+    speaker_id: str,
     provider: str = "anthropic",
     filter_model: str = "claude-sonnet-4-6",
     endpoint: str | None = None,
@@ -1605,7 +1604,6 @@ def _sota_pipeline(
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
     speaker_name: str | None = None,
-    speaker_id: str = "",
     role_aware_grounding: str = "off",
     pii_scope: set[str] | frozenset[str] | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,

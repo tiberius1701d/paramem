@@ -360,17 +360,19 @@ def test_consolidation_extraction_kwargs_threads_pii_scope():
     )
 
     # Loop-level default propagates when no override is given.
-    kwargs = ConsolidationLoop._extraction_kwargs(ns)
+    kwargs = ConsolidationLoop._extraction_kwargs(ns, speaker_id="Speaker0")
     assert kwargs["pii_scope"] == {"person", "place", "organization"}
 
     # Per-call override wins over the loop-level default.
-    overridden = ConsolidationLoop._extraction_kwargs(ns, pii_scope={"person"})
+    overridden = ConsolidationLoop._extraction_kwargs(
+        ns, pii_scope={"person"}, speaker_id="Speaker0"
+    )
     assert overridden["pii_scope"] == {"person"}
 
     # None at the loop level is honoured (callers downstream interpret
     # this as "use the primitive default").  Distinct from set().
     ns.extraction_pii_scope = None
-    kwargs = ConsolidationLoop._extraction_kwargs(ns)
+    kwargs = ConsolidationLoop._extraction_kwargs(ns, speaker_id="Speaker0")
     assert kwargs["pii_scope"] is None
 
 

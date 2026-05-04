@@ -597,6 +597,7 @@ class TestRunExtractGraphHelper:
         graph = loop._run_extract_graph(
             "[user] My name is Alex. I live in Millfield.\n[assistant] Nice to meet you, Alex.",
             "gap_a_session",
+            speaker_id="Speaker0",
         )
 
         assert isinstance(graph, SessionGraph)

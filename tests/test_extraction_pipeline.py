@@ -268,9 +268,9 @@ class TestExtractJsonBlock:
     def test_preamble_then_object_with_brace_in_string(self):
         """LLM output often has prose preamble then JSON. Combination of
         preamble + string-with-brace was the actual production failure."""
-        text = '''Here are the extracted facts:
+        text = """Here are the extracted facts:
 
-{"entities": [{"name": "x", "label": "Has } in label"}]}'''
+{"entities": [{"name": "x", "label": "Has } in label"}]}"""
         result = json.loads(_extract_json_block(text))
         assert result["entities"][0]["label"] == "Has } in label"
 
@@ -299,7 +299,7 @@ class TestExtractJsonBlock:
             '{"entities": [\n'
             '  {"name": "Tobias", "entity_type": "person", "attributes": {}},\n'
             '  {"name": "Independent Germany", "entity_type": "place", "attributes": {}}\n'
-            '],\n'
+            "],\n"
             '"relations": [\n'
             '  {"subject": "Tobias", "predicate": "works_with", "object": "consumer hardware'
         )
@@ -320,7 +320,7 @@ class TestParseExtractionShapes:
             '[{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", '
             '"relation_type": "factual", "confidence": 1.0}]'
         )
-        g = _parse_extraction(raw, "session1")
+        g = _parse_extraction(raw, "session1", speaker_id="Speaker0")
         assert len(g.relations) == 1
         assert g.relations[0].subject == "Alice"
         assert g.relations[0].object == "Berlin"
@@ -328,7 +328,7 @@ class TestParseExtractionShapes:
     def test_empty_list(self):
         from paramem.graph.extractor import _parse_extraction
 
-        g = _parse_extraction("[]", "session1")
+        g = _parse_extraction("[]", "session1", speaker_id="Speaker0")
         assert len(g.relations) == 0
         assert len(g.entities) == 0
 
@@ -528,7 +528,7 @@ class TestSOTANoiseFilter:
         )
         # No ANTHROPIC_API_KEY → skips gracefully
         with patch.dict("os.environ", {}, clear=True):
-            result = _sota_pipeline(graph, "transcript", None, None)
+            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
             # Should return original graph unchanged
             assert len(result.relations) == 1
 
@@ -581,7 +581,12 @@ class TestSOTANoiseFilter:
         ):
             # Transcript "Alex lives in Millfield" grounds both entities.
             result = _sota_pipeline(
-                graph, "Alex lives in Millfield", None, None, plausibility_judge="off"
+                graph,
+                "Alex lives in Millfield",
+                None,
+                None,
+                speaker_id="Speaker0",
+                plausibility_judge="off",
             )
         # With plausibility_judge="off", fallback runs grounding + sweep only.
         # Both entities ARE in the transcript → relation survives.
@@ -615,7 +620,7 @@ class TestSOTANoiseFilter:
                 return_value=(None, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None)
+            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
 
         # Enrichment failed → anon_facts used → de-anonymized to real names
         assert len(result.relations) == 1
@@ -650,7 +655,7 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None)
+            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
 
         # Both enriched relations survive and get de-anonymized
         assert len(result.relations) == 2
@@ -695,7 +700,7 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, transcript, None, None)
+            result = _sota_pipeline(graph, transcript, None, None, speaker_id="Speaker0")
 
         # Composite strings must be de-anonymized, not dropped
         subjects = {r.subject for r in result.relations}
@@ -941,7 +946,9 @@ class TestSOTANoiseFilter:
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
-            result = _sota_pipeline(graph, "Alex lives in Millfield.", None, None)
+            result = _sota_pipeline(
+                graph, "Alex lives in Millfield.", None, None, speaker_id="Speaker0"
+            )
 
         assert len(filter_calls) == 1, "SOTA was not called after repair"
         # The call payload must not contain any real name.
@@ -987,7 +994,9 @@ class TestSOTANoiseFilter:
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
-            result = _sota_pipeline(graph, "Alex mentioned something.", None, None)
+            result = _sota_pipeline(
+                graph, "Alex mentioned something.", None, None, speaker_id="Speaker0"
+            )
 
         # The hallucinated triple is dropped during repair.
         # After repair anon_facts is empty → grounding_gate="no_input", no facts survive.
@@ -1032,8 +1041,13 @@ class TestApplyBindings:
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "works_at", "object": "Org_1",
-             "relation_type": "factual", "confidence": 1.0},
+            {
+                "subject": "Person_1",
+                "predicate": "works_at",
+                "object": "Org_1",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
         ]
         mapping = {"Alice": "Person_1", "Acme": "Org_1"}
         kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
@@ -1047,8 +1061,13 @@ class TestApplyBindings:
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "attended", "object": "{Event_1}",
-             "relation_type": "factual", "confidence": 1.0},
+            {
+                "subject": "Person_1",
+                "predicate": "attended",
+                "object": "{Event_1}",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
         ]
         mapping = {"Alice": "Person_1"}
         bindings = {"Event_1": "the agile transformation workshop"}
@@ -1064,8 +1083,13 @@ class TestApplyBindings:
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "based_in", "object": "Org_1 Hungary",
-             "relation_type": "factual", "confidence": 1.0},
+            {
+                "subject": "Person_1",
+                "predicate": "based_in",
+                "object": "Org_1 Hungary",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
         ]
         mapping = {"Alice": "Person_1", "Acme": "Org_1"}
         kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
@@ -1080,10 +1104,20 @@ class TestApplyBindings:
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "knows", "object": "Person_99",
-             "relation_type": "social", "confidence": 1.0},
-            {"subject": "Person_1", "predicate": "attended", "object": "{Event_1}",
-             "relation_type": "factual", "confidence": 1.0},
+            {
+                "subject": "Person_1",
+                "predicate": "knows",
+                "object": "Person_99",
+                "relation_type": "social",
+                "confidence": 1.0,
+            },
+            {
+                "subject": "Person_1",
+                "predicate": "attended",
+                "object": "{Event_1}",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
         ]
         mapping = {"Alice": "Person_1"}
         # No binding for Event_1; no mapping for Person_99.
@@ -1097,8 +1131,13 @@ class TestApplyBindings:
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "visited", "object": "Person_2's cousin",
-             "relation_type": "social", "confidence": 1.0},
+            {
+                "subject": "Person_1",
+                "predicate": "visited",
+                "object": "Person_2's cousin",
+                "relation_type": "social",
+                "confidence": 1.0,
+            },
         ]
         mapping = {"Alice": "Person_1", "Bob": "Person_2"}
         kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
@@ -1111,8 +1150,13 @@ class TestApplyBindings:
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "led", "object": "{Event_1} at Org_1",
-             "relation_type": "factual", "confidence": 1.0},
+            {
+                "subject": "Person_1",
+                "predicate": "led",
+                "object": "{Event_1} at Org_1",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
         ]
         mapping = {"Alice": "Person_1", "Acme": "Org_1"}
         bindings = {"Event_1": "the workshop"}
@@ -1133,8 +1177,14 @@ class TestApplyBindings:
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
-            {"subject": "Person_1", "predicate": "knows", "object": "Person_2",
-             "relation_type": "social", "confidence": 0.7, "synthetic": False},
+            {
+                "subject": "Person_1",
+                "predicate": "knows",
+                "object": "Person_2",
+                "relation_type": "social",
+                "confidence": 0.7,
+                "synthetic": False,
+            },
         ]
         mapping = {"Alice": "Person_1", "Bob": "Person_2"}
         kept, _ = _apply_bindings(facts, mapping, sota_bindings={})
@@ -1829,6 +1879,7 @@ class TestPlausibilityAnon:
                 "Alex lives in Millfield.",
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="claude",
                 plausibility_stage="anon",
             )
@@ -1892,6 +1943,7 @@ class TestPlausibilityDeanon:
                 "Alex lives in Millfield.",
                 MagicMock(),
                 MagicMock(),
+                speaker_id="Speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -1981,6 +2033,7 @@ class TestResidualLeakDropsReferencingTriples:
                 transcript,
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="off",
             )
 
@@ -2031,7 +2084,7 @@ class TestAnonFailureFallback:
                 side_effect=fake_fallback,
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None)
+            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
 
         assert fallback_calls == ["anon_failed"], (
             "fallback must be triggered with reason=anon_failed"
@@ -2094,6 +2147,7 @@ class TestAllDroppedSafetyNet:
                 "Alex lives in Millfield.",
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="off",
             )
 
@@ -2144,6 +2198,7 @@ class TestEntityTypePreservation:
                 "Alex lives in Frankfurt and listens to Music.",
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="off",
             )
 
@@ -2185,6 +2240,7 @@ class TestEntityTypePreservation:
                 "Alex was born in Germany.",
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="off",
             )
 
@@ -2239,6 +2295,7 @@ class TestEntityTypePreservation:
                 "Alex visited China.",
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="off",
             )
 
@@ -2273,6 +2330,7 @@ class TestFallbackPlausibilityOnRawHelper:
             "Alex works at Acme.",
             None,
             None,
+            speaker_id="Speaker0",
             reason="test_residual",
         )
         # City_1 is a placeholder token → the fact should be swept
@@ -2292,7 +2350,12 @@ class TestFallbackPlausibilityOnRawHelper:
             ],
         )
         result = _fallback_plausibility_on_raw(
-            graph, "Alex lives in Millfield.", None, None, reason="anon_failed"
+            graph,
+            "Alex lives in Millfield.",
+            None,
+            None,
+            speaker_id="Speaker0",
+            reason="anon_failed",
         )
         assert result.diagnostics.get("fallback_path") == "anon_failed"
 
@@ -2369,6 +2432,7 @@ class TestExtractGraphNewKwargs:
                 None,
                 "transcript",
                 "sess1",
+                speaker_id="Speaker0",
                 noise_filter="anthropic",
                 ner_check=True,
                 ner_model="en_core_web_trf",
@@ -2451,6 +2515,7 @@ class TestExtractGraphNewKwargs:
                 "Alex lives in Millfield.",
                 None,
                 None,
+                speaker_id="Speaker0",
                 verify_anonymization=False,
                 plausibility_judge="off",
             )
@@ -2502,6 +2567,7 @@ class TestDiagnosticsKeys:
                 "Alex lives in Millfield.",
                 MagicMock(),
                 MagicMock(),
+                speaker_id="Speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -2541,6 +2607,7 @@ class TestDiagnosticsKeys:
                 "Alex lives in Millfield.",
                 None,
                 None,
+                speaker_id="Speaker0",
                 plausibility_judge="off",
             )
 

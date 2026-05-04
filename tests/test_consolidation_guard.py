@@ -92,7 +92,7 @@ class TestRunCycleGuard:
             side_effect=AssertionError("should not be called — guard must raise first"),
         ):
             with pytest.raises(TrialActiveError):
-                loop.run_cycle("some transcript", "session-1")
+                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
 
     def test_run_cycle_proceeds_when_live(self):
         """run_cycle does NOT block when state_provider returns LIVE state.
@@ -114,7 +114,7 @@ class TestRunCycleGuard:
         ):
             # Guard should pass; RuntimeError from extract (not TrialActiveError).
             with pytest.raises(RuntimeError, match="extract called"):
-                loop.run_cycle("some transcript", "session-1")
+                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
 
     def test_run_cycle_proceeds_when_no_state_provider(self):
         """run_cycle is unaffected when state_provider is None (experiment path)."""
@@ -131,7 +131,7 @@ class TestRunCycleGuard:
         ):
             # No TrialActiveError; RuntimeError from extract is expected.
             with pytest.raises(RuntimeError, match="extract called"):
-                loop.run_cycle("some transcript", "session-1")
+                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
 
 
 class TestEndpointGuards:
@@ -230,7 +230,7 @@ class TestReplayLoopGuard:
             side_effect=AssertionError("should not reach extraction"),
         ):
             with pytest.raises(TrialActiveError):
-                loop.run_cycle("transcript", "session-x")
+                loop.run_cycle("transcript", "session-x", speaker_id="Speaker0")
 
         # Verify state_provider is stored and callable.
         assert loop.state_provider is not None, "state_provider must not be None"
@@ -260,4 +260,4 @@ class TestReplayLoopGuard:
             side_effect=AssertionError("should not reach extraction — guard must fire first"),
         ):
             with pytest.raises(TrialActiveError):
-                loop.run_cycle("some transcript", "session-1")
+                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
