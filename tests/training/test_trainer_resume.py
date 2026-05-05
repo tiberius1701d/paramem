@@ -242,12 +242,19 @@ class TestTrainAdapterSavePath:
             mock_args_cls.return_value = mock_args
             yield tmp_path
 
-    def test_save_pretrained_called_with_parent(self, train_adapter_mocks):
+    def test_trainer_does_not_save_canonical_adapter(self, train_adapter_mocks):
+        """``train_adapter`` is responsible only for training.
+
+        The canonical encrypted slot-dir save is the orchestrator's job
+        (``ConsolidationLoop._save_adapters`` → ``atomic_save_adapter`` →
+        ``_encrypt_adapter_safetensors``).  Writing here would duplicate
+        the canonical save AND leave a plaintext
+        ``adapter_model.safetensors`` inside ``data/ha/adapters/`` which
+        trips the next boot's encryption mode-consistency check.
+        """
         tmp_path = train_adapter_mocks
         model = _make_peft_model()
         tokenizer = _make_tokenizer()
-        # Mirror the production layout where _training_output_dir returns
-        # output_dir/<adapter_name> so PEFT auto-appending would double-nest.
         out = tmp_path / "interim_20260430T1200" / "episodic_interim_20260430T1200"
 
         train_adapter(
@@ -260,32 +267,10 @@ class TestTrainAdapterSavePath:
             output_dir=out,
         )
 
-        # save_pretrained gets the parent so the appended adapter_name lands at out.
-        assert model.save_pretrained.called
-        save_args, save_kwargs = model.save_pretrained.call_args
-        save_dir = save_args[0] if save_args else save_kwargs.get("save_directory")
-        assert save_dir == str(out.parent)
-        # And the adapter_name is the one we asked PEFT to select.
-        selected = save_kwargs.get("selected_adapters") or save_args[1]
-        assert selected == ["episodic_interim_20260430T1200"]
-
-    def test_tokenizer_saved_to_output_dir(self, train_adapter_mocks):
-        """Tokenizer saves to output_dir directly (no auto-append behaviour)."""
-        tmp_path = train_adapter_mocks
-        model = _make_peft_model()
-        tokenizer = _make_tokenizer()
-        out = tmp_path / "cycle_5" / "episodic"
-
-        train_adapter(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=_make_dataset(),
-            adapter_name="episodic",
-            training_config=_minimal_training_config(),
-            adapter_config=_minimal_adapter_config(),
-            output_dir=out,
+        assert not model.save_pretrained.called, (
+            "train_adapter must not write the canonical adapter — that's "
+            "the orchestrator's job (atomic_save_adapter)"
         )
-
-        assert tokenizer.save_pretrained.called
-        tok_args, _ = tokenizer.save_pretrained.call_args
-        assert tok_args[0] == str(out)
+        assert not tokenizer.save_pretrained.called, (
+            "train_adapter must not write the tokenizer — that's the orchestrator's job"
+        )

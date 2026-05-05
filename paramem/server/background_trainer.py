@@ -26,6 +26,9 @@ from transformers import (
     default_data_collator,
 )
 
+from paramem.training.encrypted_checkpoint_callback import (
+    EncryptCheckpointCallback as _EncryptCheckpointCallback,
+)
 from paramem.training.indexed_memory import format_indexed_training
 from paramem.utils.config import AdapterConfig, TrainingConfig
 
@@ -293,51 +296,6 @@ class _PauseForInferenceCallback(TrainerCallback):
         if self._trainer._shutdown_requested:
             logger.info("Shutdown requested — stopping after epoch %d", epoch)
             control.should_training_stop = True
-
-
-class _EncryptCheckpointCallback(TrainerCallback):
-    """Wrap each HF-written checkpoint file in the age envelope after save.
-
-    Fires on ``on_save`` — HF has just finished writing a ``checkpoint-<step>/``
-    directory inside ``args.output_dir``. We walk every ``checkpoint-*`` subdir
-    and encrypt any plaintext files we find, leaving already-wrapped files
-    alone. No-op when Security is OFF.
-
-    Also guards at ``on_train_begin``: ``load_best_model_at_end=True`` bypasses
-    our decrypt-to-shm resume path (HF reads the on-disk checkpoint directly
-    at end-of-training) and would fail on age-wrapped files. We refuse to
-    start under that combination rather than silently corrupt the run.
-    """
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        from paramem.backup import key_store as _ks
-
-        if getattr(args, "load_best_model_at_end", False) and _ks.daily_identity_loadable(
-            _ks.DAILY_KEY_PATH_DEFAULT
-        ):
-            raise RuntimeError(
-                "load_best_model_at_end=True is incompatible with Security ON: "
-                "HF reads checkpoint files directly at end-of-training, "
-                "bypassing the decrypt-to-shm path. Either disable "
-                "load_best_model_at_end or unset PARAMEM_DAILY_PASSPHRASE."
-            )
-
-    def on_save(self, args, state, control, **kwargs):
-        from paramem.backup import key_store as _ks
-        from paramem.backup.checkpoint_shard import encrypt_checkpoint_dir
-
-        if not _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-            return
-        output_dir = Path(args.output_dir)
-        for ckpt in output_dir.glob("checkpoint-*"):
-            if not ckpt.is_dir():
-                continue
-            try:
-                n = encrypt_checkpoint_dir(ckpt)
-                if n > 0:
-                    logger.debug("Encrypted %d checkpoint files in %s", n, ckpt)
-            except Exception:
-                logger.exception("Failed to encrypt checkpoint files in %s", ckpt)
 
 
 class BackgroundTrainer:
