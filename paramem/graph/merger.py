@@ -325,9 +325,18 @@ class GraphMerger:
             if session_id not in sessions:
                 sessions.append(session_id)
             node["sessions"] = sessions
-            # Merge attributes (new values overwrite old)
+            # Merge attributes — only non-empty values are stored. Empty
+            # strings and "N/A"/"None"/"Unknown" placeholders that one
+            # chunk's LLM emitted for missing data are dropped: they neither
+            # overwrite an existing real value nor introduce a noisy
+            # placeholder key into the cumulative graph (a known LLM-
+            # compliance failure mode where the extractor enumerates every
+            # advertised attribute key even when the source has no value).
             existing_attrs = node.get("attributes", {})
-            existing_attrs.update(entity.attributes)
+            for k, v in entity.attributes.items():
+                if _attr_value_is_empty(v):
+                    continue
+                existing_attrs[k] = v
             node["attributes"] = existing_attrs
             # Update speaker_id if this entity now has one (disclosure event).
             if entity.speaker_id is not None and node.get("speaker_id") is None:
@@ -335,7 +344,9 @@ class GraphMerger:
         else:
             node_kwargs: dict = dict(
                 entity_type=entity.entity_type,
-                attributes=dict(entity.attributes),
+                attributes={
+                    k: v for k, v in entity.attributes.items() if not _attr_value_is_empty(v)
+                },
                 first_seen=session_id,
                 last_seen=session_id,
                 recurrence_count=1,
@@ -580,6 +591,26 @@ class GraphMerger:
             self.graph.number_of_edges(),
         )
         return self.graph
+
+
+def _attr_value_is_empty(value) -> bool:
+    """True iff an entity-attribute value carries no information.
+
+    Treats the empty string, the literal placeholder strings ``"N/A"`` /
+    ``"n/a"`` / ``"None"`` / ``"null"`` (case-insensitive), and ``None``
+    as empty.  Used by the attribute-merge step so a non-empty value
+    captured in one chunk is never overwritten by an LLM-emitted
+    placeholder from another chunk that happened to lack the data.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return True
+        if stripped.lower() in ("n/a", "none", "null", "unknown"):
+            return True
+    return False
 
 
 def _normalize_name(name: str) -> str:

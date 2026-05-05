@@ -208,29 +208,35 @@ class TestHAContextValidation:
 
 class TestExtractJsonBlock:
     def test_object(self):
-        text = 'Some text {"key": "value"} more text'
+        # Envelope-keyed dict — `entities` triggers acceptance.
+        text = 'Some text {"entities": [], "relations": []} more text'
         result = json.loads(_extract_json_block(text))
-        assert result == {"key": "value"}
+        assert result == {"entities": [], "relations": []}
 
     def test_array(self):
-        text = 'Some text [{"a": 1}, {"b": 2}] more text'
+        # Plausibility-shape: list of fact dicts (have ``subject`` key).
+        text = 'Some text [{"subject": "Alex", "predicate": "likes", "object": "yoga"}] more text'
         result = json.loads(_extract_json_block(text))
-        assert result == [{"a": 1}, {"b": 2}]
+        assert result[0]["subject"] == "Alex"
 
     def test_array_before_object(self):
-        text = '[1, 2] {"key": "value"}'
+        # First candidate `[1, 2]` is a list of scalars (no ``subject`` key
+        # in a dict element) — rejected as not-an-envelope.  Walk continues
+        # to the dict envelope.  Documents that bare-scalar lists are not
+        # accepted as envelopes (they would be truncation-survivors).
+        text = '[1, 2] {"entities": []}'
         result = json.loads(_extract_json_block(text))
-        assert result == [1, 2]
+        assert result == {"entities": []}
 
     def test_markdown_code_block(self):
-        text = '```json\n{"key": "value"}\n```'
+        text = '```json\n{"facts": []}\n```'
         result = json.loads(_extract_json_block(text))
-        assert result == {"key": "value"}
+        assert result == {"facts": []}
 
     def test_nested_object(self):
-        text = '{"outer": {"inner": 1}}'
+        text = '{"entities": [], "relations": [], "outer": {"inner": 1}}'
         result = json.loads(_extract_json_block(text))
-        assert result == {"outer": {"inner": 1}}
+        assert result == {"entities": [], "relations": [], "outer": {"inner": 1}}
 
     def test_empty_array(self):
         text = "Result: []"
@@ -247,9 +253,9 @@ class TestExtractJsonBlock:
         regardless of whether that `}` was inside a quoted string. Real local
         Mistral output for one of the resume chunks reliably hit this and
         produced empty graphs in two consecutive consolidation runs."""
-        text = 'Sure, here: {"object": "Code: }"} trailing'
+        text = 'Sure, here: {"facts": [{"object": "Code: }"}]} trailing'
         result = json.loads(_extract_json_block(text))
-        assert result == {"object": "Code: }"}
+        assert result["facts"][0]["object"] == "Code: }"
 
     def test_string_value_with_opening_brace(self):
         """Same regression, opposite direction: `{` inside a string value
@@ -261,9 +267,9 @@ class TestExtractJsonBlock:
     def test_string_value_with_unbalanced_braces(self):
         """A pathological case: string contains an unmatched `}` and the
         outer JSON is still well-formed. Must parse cleanly."""
-        text = '{"a": "value with } and { braces"}'
+        text = '{"facts": [{"a": "value with } and { braces"}]}'
         result = json.loads(_extract_json_block(text))
-        assert result == {"a": "value with } and { braces"}
+        assert result["facts"][0]["a"] == "value with } and { braces"
 
     def test_preamble_then_object_with_brace_in_string(self):
         """LLM output often has prose preamble then JSON. Combination of

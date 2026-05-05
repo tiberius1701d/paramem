@@ -14,36 +14,95 @@ from paramem.graph.schema import Entity, Relation, SessionGraph
 
 class TestExtractJsonBlock:
     def test_json_in_code_block(self):
-        text = 'Some text\n```json\n{"key": "value"}\n```\nMore text'
+        text = 'Some text\n```json\n{"entities": [], "relations": []}\n```\nMore text'
         result = _extract_json_block(text)
-        assert json.loads(result) == {"key": "value"}
+        assert json.loads(result) == {"entities": [], "relations": []}
 
     def test_json_in_plain_code_block(self):
-        text = 'Some text\n```\n{"key": "value"}\n```'
+        text = 'Some text\n```\n{"facts": []}\n```'
         result = _extract_json_block(text)
-        assert json.loads(result) == {"key": "value"}
+        assert json.loads(result) == {"facts": []}
 
     def test_raw_json(self):
-        text = 'Here is the result: {"key": "value"} done.'
+        text = 'Here is the result: {"entities": [], "relations": []} done.'
         result = _extract_json_block(text)
-        assert json.loads(result) == {"key": "value"}
+        assert json.loads(result) == {"entities": [], "relations": []}
 
     def test_nested_json(self):
-        text = '{"outer": {"inner": "value"}}'
+        text = (
+            '{"entities": [{"name": "Alex", "entity_type": "person", '
+            '"attributes": {}}], "relations": []}'
+        )
         result = _extract_json_block(text)
         parsed = json.loads(result)
-        assert parsed["outer"]["inner"] == "value"
+        assert parsed["entities"][0]["name"] == "Alex"
 
     def test_no_json_raises(self):
         with pytest.raises(ValueError, match="No JSON found"):
             _extract_json_block("no json here")
 
     def test_unbalanced_braces_raises(self):
-        # Parser uses json.raw_decode now; "{unclosed" is treated as
-        # malformed/truncated JSON, raising ValueError with a "truncated"
-        # message rather than the legacy "Unbalanced" wording.
-        with pytest.raises(ValueError, match="(?i)truncated|malformed"):
+        # Parser walks every `{` candidate; "{unclosed" never closes so
+        # raw_decode fails for the only candidate.  Surfaces as the "no
+        # parseable JSON" path with a max_tokens-truncation hint.
+        with pytest.raises(ValueError, match="(?i)no parseable JSON"):
             _extract_json_block("{unclosed")
+
+    def test_skips_brace_quoted_placeholder_in_preamble(self):
+        """SOTA's preamble narration sometimes references placeholder names
+        in brace notation like ``{Topic_1}`` — the parser must skip past
+        those and find the real envelope further down."""
+        text = (
+            "I'll introduce:\n"
+            "- `{Topic_1}` = Mechanical Engineering\n"
+            "- `{City_1}` = Duisburg\n\n"
+            "```json\n"
+            '{"facts": [{"subject": "Person_1", "predicate": "studied", "object": "{Topic_1}"}]}\n'
+            "```"
+        )
+        result = _extract_json_block(text)
+        parsed = json.loads(result)
+        assert "facts" in parsed
+        assert parsed["facts"][0]["subject"] == "Person_1"
+
+    def test_skips_brace_placeholder_when_no_code_fence(self):
+        """Same case but without a code-fence — the parser must walk through
+        ``{Topic_1}`` (raw_decode raises, skip), then ``{City_1}`` (skip),
+        then find the real ``{"facts": …}`` envelope."""
+        text = (
+            "I'll introduce {Topic_1} for the degree field and {City_1} for "
+            "the university city. Here are the enriched facts:\n"
+            '{"facts": [{"subject": "Person_1", "predicate": "lives_in", "object": "Germany"}]}'
+        )
+        result = _extract_json_block(text)
+        parsed = json.loads(result)
+        assert "facts" in parsed
+
+    def test_rejects_inner_subobject_when_outer_envelope_truncated(self):
+        """Truncation discipline: a model cut at max_tokens mid-string
+        emits a valid inner sub-object even though the outer envelope
+        never closes.  The parser MUST reject the inner sub-object so
+        the truncation surfaces as a real parse failure."""
+        # Outer envelope opens but never closes; inner sub-object is fine.
+        text = (
+            '{"entities": [{"name": "Alex", "entity_type": "person", '
+            '"attributes": {}}, {"name": "Bob"'
+        )
+        with pytest.raises(ValueError, match="(?i)envelope keys|no parseable JSON"):
+            _extract_json_block(text)
+
+    def test_accepts_plausibility_empty_list(self):
+        """Plausibility legitimately returns ``[]`` when all facts were
+        filtered.  The parser must accept lists (even empty) as valid
+        envelopes."""
+        result = _extract_json_block("[]")
+        assert json.loads(result) == []
+
+    def test_accepts_plausibility_nonempty_list(self):
+        text = '[{"subject": "Alex", "predicate": "lives_in", "object": "Berlin"}]'
+        result = _extract_json_block(text)
+        parsed = json.loads(result)
+        assert parsed[0]["subject"] == "Alex"
 
 
 class TestSessionGraphFromJson:
