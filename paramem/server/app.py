@@ -37,6 +37,7 @@ from pydantic import BaseModel
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
+from paramem.server import calibrate as calibrate_module
 from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import TTSConfig, load_server_config
 from paramem.server.ha_graph import HAEntityGraph
@@ -2870,6 +2871,32 @@ async def debug_assign_orphans(speaker_id: str | None = None):
                         f.write(json.dumps(turn) + "\n")
     logger.info("debug/assign-orphans: %d sessions → speaker %s (%s)", claimed, sname, sid)
     return {"status": "ok", "claimed": claimed, "speaker": sname, "speaker_id": sid}
+
+
+# --------------------------------------------------------------------------
+# Calibration endpoints — opt-in dev tool for live prompt iteration.
+# Gated by consolidation.calibrate_endpoint_enabled (default False).
+# Each endpoint is a thin wrapper around the existing pipeline helper for
+# that stage — injection of prompts/params, capture of output.  Stages
+# are stop points: the calibration client chains them, and "skip stage X"
+# means don't call X's endpoint.  No call modifies weights or writes
+# production data on disk.  See paramem/server/calibrate.py.
+# --------------------------------------------------------------------------
+
+
+@app.post("/calibrate/extract")
+async def calibrate_extract_route(req: calibrate_module.CalibrateExtractRequest):
+    return calibrate_module.calibrate_extract(_state, req)
+
+
+@app.post("/calibrate/anonymize")
+async def calibrate_anonymize_route(req: calibrate_module.CalibrateAnonymizeRequest):
+    return calibrate_module.calibrate_anonymize(_state, req)
+
+
+@app.post("/calibrate/plausibility")
+async def calibrate_plausibility_route(req: calibrate_module.CalibratePlausibilityRequest):
+    return calibrate_module.calibrate_plausibility(_state, req)
 
 
 @app.post("/scheduled-tick", response_model=ConsolidateResponse)

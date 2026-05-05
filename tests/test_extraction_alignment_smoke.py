@@ -107,13 +107,13 @@ class TestAlignmentSmoke:
 
         # Plausibility filter drops the known-bad predicates
         def fake_plaus_filter(facts, transcript, model, tokenizer, **kwargs):
-            return [f for f in facts if f.get("predicate") not in _KNOWN_BAD_PREDICATES]
+            return [f for f in facts if f.get("predicate") not in _KNOWN_BAD_PREDICATES], ""
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor._anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript),
+                return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -156,13 +156,13 @@ class TestAlignmentSmoke:
 
         def fake_plaus_filter(facts, transcript, model, tokenizer, **kwargs):
             # Drop 2 known-bad facts
-            return [f for f in facts if f.get("predicate") not in _KNOWN_BAD_PREDICATES]
+            return [f for f in facts if f.get("predicate") not in _KNOWN_BAD_PREDICATES], ""
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor._anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript),
+                return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -196,7 +196,7 @@ class TestAlignmentSmoke:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor._anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript),
+                return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",

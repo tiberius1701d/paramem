@@ -48,7 +48,7 @@ _GRANDFATHERED_FILES = frozenset(
     }
 )
 
-_FORBIDDEN_CALL = re.compile(r"\bextract(?:_procedural)?_graph\s*\(")
+_FORBIDDEN_CALL_NAMES = frozenset({"extract_graph", "extract_procedural_graph"})
 
 
 def _is_allowed(rel: str) -> bool:
@@ -59,6 +59,41 @@ def _is_allowed(rel: str) -> bool:
     return any(rel.startswith(p) for p in _ALLOWED_PREFIXES)
 
 
+def _find_forbidden_call_sites(py_file: Path) -> list[tuple[int, str]]:
+    """Return ``(lineno, source)`` for every direct call to a forbidden
+    extractor name in ``py_file``.
+
+    Uses :mod:`ast` so the guard counts actual call sites, not strings
+    that happen to contain ``extract_graph(`` (docstrings, comments,
+    function definitions, log messages, …).  An ``ast.Call`` whose
+    ``func`` is an ``ast.Name`` matching the whitelist is the canonical
+    "direct call" we forbid.  Attribute calls like
+    ``self._run_extract_graph(...)`` are different syntax and not caught
+    here — by design, they are the routed-through pattern we encourage.
+    """
+    import ast
+
+    try:
+        text = py_file.read_text()
+    except UnicodeDecodeError:
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    lines = text.splitlines()
+    out: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _FORBIDDEN_CALL_NAMES
+        ):
+            line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+            out.append((node.lineno, line.strip()))
+    return out
+
+
 def test_no_direct_extract_graph_calls_outside_whitelist():
     repo_root = Path(__file__).resolve().parent.parent
     offenders: list[tuple[str, int, str]] = []
@@ -67,19 +102,8 @@ def test_no_direct_extract_graph_calls_outside_whitelist():
         rel = py_file.relative_to(repo_root).as_posix()
         if _is_allowed(rel):
             continue
-        try:
-            text = py_file.read_text()
-        except UnicodeDecodeError:
-            continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            # Skip comments and import statements — only flag call sites.
-            stripped = line.lstrip()
-            if stripped.startswith("#"):
-                continue
-            if stripped.startswith(("import ", "from ")):
-                continue
-            if _FORBIDDEN_CALL.search(line):
-                offenders.append((rel, lineno, line.strip()))
+        for lineno, src in _find_forbidden_call_sites(py_file):
+            offenders.append((rel, lineno, src))
 
     assert not offenders, (
         "Direct extract_graph/extract_procedural_graph calls found outside the "
@@ -650,6 +674,52 @@ def test_run_extract_graph_threads_source_type(monkeypatch):
     assert got_user == DOCUMENT_USER_PROMPT_FILENAME, (
         f"Expected user_prompt_filename={DOCUMENT_USER_PROMPT_FILENAME!r}, got {got_user!r}"
     )
+
+
+def test_run_extract_graph_honors_prompt_filename_overrides(monkeypatch):
+    """Explicit ``user_prompt_filename`` / ``system_prompt_filename`` overrides
+    passed via ``_run_extract_graph(...)`` MUST win over the source-type
+    defaults.
+
+    Regression guard for the silent-override-drop bug fixed in
+    paramem/training/consolidation.py::_extraction_kwargs (formerly
+    returned the locally-computed source-type defaults unconditionally,
+    bypassing the ``pick`` helper that handles every other override).
+
+    Without this, calibration probes (which inject ``calib_*.txt``
+    variants via overrides) silently get the production prompt — making
+    every "candidate vs baseline" diff a same-prompt comparison.
+    """
+    from unittest.mock import MagicMock
+
+    from paramem.training.consolidation import ConsolidationLoop
+
+    captured = {}
+
+    def spy(model, tokenizer, transcript, session_id, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr("paramem.training.consolidation.extract_graph", spy)
+
+    ns = _loop_ns_with_model(MagicMock())
+    ConsolidationLoop._run_extract_graph(
+        ns,
+        "transcript text",
+        "calib-001",
+        source_type="transcript",
+        speaker_id="Speaker0",
+        # Operator-supplied calibration overrides.
+        user_prompt_filename="calib_extraction.txt",
+        system_prompt_filename="calib_extraction_system.txt",
+    )
+
+    assert captured["kwargs"]["user_prompt_filename"] == "calib_extraction.txt", (
+        "user_prompt_filename override was dropped — production prompt "
+        "would have been used. See _extraction_kwargs in "
+        "paramem/training/consolidation.py."
+    )
+    assert captured["kwargs"]["system_prompt_filename"] == "calib_extraction_system.txt"
 
 
 def test_extraction_document_prompt_present():

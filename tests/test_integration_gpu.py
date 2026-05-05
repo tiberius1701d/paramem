@@ -177,13 +177,14 @@ class TestSOTAFullFlow:
                 ),
             ],
         )
-        result, mapping, anon_transcript = _anonymize_with_local_model(graph, model, tokenizer)
+        result, mapping, anon_transcript, raw = _anonymize_with_local_model(graph, model, tokenizer)
         # Mistral may or may not produce valid anonymization
         # Just verify no crash and correct return types
         if result is not None:
             assert isinstance(result, list)
             assert isinstance(mapping, dict)
             assert isinstance(anon_transcript, str)
+        assert isinstance(raw, str)
 
 
 # --- 4. get_home_context ---

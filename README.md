@@ -243,6 +243,96 @@ This forces sequential weight loading. Models load slightly slower but reliably.
 7. **Promote:** Well-reinforced facts move from episodic to semantic adapter
 8. **Decay:** Unreinforced facts fade after configurable window
 
+## Prompt Engineering
+
+The extraction pipeline's behaviour is shaped almost entirely by the prompt
+files under `configs/prompts/`. This section captures the principles that
+govern those files and the calibration loop used to iterate on them. **Read
+this before editing any prompt** — most of the principles below were learned
+empirically and contradict natural intuition about how to write LLM prompts.
+
+### Principles
+
+**Few-shot examples carry the schema.** A prompt does not need to declare
+the entity-type or relation-type taxonomy verbatim. Listing them via
+template slots like `{entity_types}` was empirically harmful: it implicitly
+licensed Mistral 7B to extend the closed set with new type names —
+`phone_number`, `software`, `library`, `degree`, `acronym`, etc. — 23
+invented types in one run on a CV transcript. The same prompt with no
+taxonomy slot and only few-shot examples produced **0 invented types**.
+Mistral treats explicit lists as "you can add to this"; examples anchor a
+closed set without needing a rule.
+
+**Verbatim prose rules compete with examples for the model's attention
+budget.** When a prompt mixes a long rule block with few-shot examples, the
+rules dilute the example signal — measurably. On the same input, removing
+50+ lines of declarative prose ("INTENT MATTERS:", "USE THE ASSISTANT'S
+RESPONSE", "PLAUSIBILITY:", etc.) and keeping only ~30 lines of examples
+flipped contact-attribute capture (`email` / `phone` / `linkedin`) on the
+speaker entity from absent → reliable.
+
+**Closed-set vs. open-set fields behave differently in examples.** The
+model treats fields differently based on whether the prompt examples
+enumerate alternatives:
+
+- `entity_type` — examples show only `person`, `organization`, `place`,
+  `concept` and `preference`. Mistral stays inside this set on novel
+  inputs (closed-set behaviour).
+- `predicate` and attribute keys — examples show a handful of verbs
+  (`works_at`, `lives_in`, `owns`, `sister_lives_in`) and attribute keys
+  (`last_name`, `email`, `phone`, `linkedin`). On novel content Mistral
+  coins reasonable new ones (`worked_for`, `led`, `delivered`,
+  `country_of_residence`) — open-set behaviour.
+
+This split is the contract: closed-set fields are constrained by example
+exhaustiveness; open-set fields are filled by demonstration of shape. The
+QA generator (`paramem/graph/qa_generator.py`) auto-prefixes attribute keys
+with `has_` so the prompt should emit bare keys (`email`, not `has_email`).
+
+### Calibration loop
+
+Don't iterate prompts blindly. The calibration tool
+(`scripts/dev/calibrate_prompts.py`) probes each pipeline phase live
+against the running server with operator-supplied variants, captures the
+per-phase trace (`paramem/graph/phase_trace.py`), and renders a
+baseline-vs-candidate diff per phase. Workflow:
+
+1. Drop a `calib_<original>.txt` variant next to the production prompt
+   under `configs/prompts/`.
+2. Run `python scripts/dev/calibrate_prompts.py --input <fixture>
+   --baseline auto --stop-phase <phase>` (use `--stop-phase` to skip
+   downstream phases when iterating on early stages — saves compute at
+   ~50–70 s per skipped phase).
+3. Read the per-phase diff in stdout (raw output deltas, parsed-summary
+   changes per phase) and the dump JSON under
+   `data/ha/debug/calibration/<ts>/`.
+4. Promote the variant to production only when the per-phase diff confirms
+   the targeted improvement without regressions on other phases.
+
+The calibration endpoint is gated by
+`consolidation.calibrate_endpoint_enabled` in `configs/server.yaml`
+(default OFF — it loads the live model and would race against scheduled
+consolidation in production).
+
+### Editing checklist
+
+Before editing any file under `configs/prompts/`:
+
+1. **Pick a measurable target.** What signal in the per-phase trace are you
+   trying to move? "Tobias = `person` at `local_extract`", "contact attrs
+   on the speaker entity at `local_extract`", "no invented entity_types at
+   `local_extract`" — single-sentence targets that succeed.
+2. **Write the variant as a `calib_<original>.txt` file.** Don't edit the
+   production prompt directly until calibration confirms the change.
+3. **Run the calibration probe.** Read the per-phase diff. If the targeted
+   phase moved correctly and downstream phases didn't regress, promote.
+4. **Don't add a verbatim taxonomy slot or a long prose rule** unless a
+   per-phase calibration measurement justifies it. The empirical record is
+   that they make Mistral 7B worse, not better.
+
+The phase-trace and calibration-loop machinery is documented inline in
+`paramem/graph/phase_trace.py` and `paramem/server/calibrate.py`.
+
 ## Server Deployment
 
 ParaMem includes a REST server for persistent deployment. The server keeps the model loaded in VRAM, serves chat inference, runs daily consolidation, and escalates non-memory queries to Home Assistant's conversation agent.

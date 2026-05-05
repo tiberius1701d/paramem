@@ -1,106 +1,28 @@
 Extract PERSONAL FACTS about the speaker from this conversation transcript.{speaker_context}
 
-SPEAKER BINDING — IMPORTANT:
-The directive above names the current speaker. That name is the ONLY entity
-label you may use for the speaker — whether the transcript refers to them by
-full name, first name, pronoun ("I", "me", "my", "we"), or paraphrase ("the
-candidate", "the author", "this individual"). Collapse every self-reference
-into the single canonical entity named in the directive. Do NOT mint a
-separate entity for a longer or shorter form of the same name.
+In the examples below, `{{SPEAKER_NAME}}` is a SLOT — at runtime it is substituted with the speaker's real identifier from the directive above. Never emit the literal string `{{SPEAKER_NAME}}` in your output.
 
-If the transcript reveals additional name parts for the speaker (last name,
-middle name, nickname), emit them as attributes on the speaker entity using
-these exact keys: has_last_name, has_middle_name, has_nickname.
-Example: speaker "Alex" whose full name is "Alex Morgan" should have
-attributes {{"has_last_name": "Morgan"}} — not a separate "Alex Morgan" entity.
 
-Only extract facts that would still be true tomorrow — identity, relationships,
-location, preferences, work, education.
-
-Rules:
-- INTENT MATTERS: Extract personal facts the speaker states about themselves —
-  whether the turn is a statement OR a question that contains an embedded
-  factual claim. Standalone curiosity questions ("What's the weather in
-  Bahamas?", "What's the nearest airport?") are NOT facts — they reveal
-  nothing the speaker is claiming about themselves. But a question turn
-  that ALSO contains a self-claim ("My car is a Volvo V70. How often
-  should I change the tires?", "I have a dog. What food do you recommend?")
-  carries an embedded fact — extract it. The shape to look for is
-  "I/my/our/we + concrete attribute" anywhere in the turn, regardless of
-  whether the turn ends in a question mark.
-- USE THE ASSISTANT'S RESPONSE to correct entity names. If the speaker says
-  "Frankford" but the assistant responds with "Frankfurt", use "Frankfurt" — the
-  assistant has access to correct spellings.
-- PLAUSIBILITY: If an extracted name sounds acoustically wrong in context
-  (e.g. "Mute Supermix" in a music context — likely "YouTube Supermix"), discard
-  it rather than store a wrong fact.
-- The subject of every relation must be a NAMED person, never "User" or "Assistant"
-- Discard extractions where the object is a placeholder ("Unknown", "None"),
-  a system identifier (containing dots like "media_player.sonos_office"), or
-  not a meaningful personal fact
-- Consider the full conversation holistically — cross-reference user statements
-  with assistant responses for the most accurate entity names
-- Entity types: {entity_types}
-- IMPORTANT: Never label a named person, place, or organization as "concept". Use "concept" only for abstract things with no fit (e.g. a field of study like "quantum computing").
-- Relation types: {relation_types}
-- Tag preferences correctly: if the speaker uses or prefers something (music
-  service, food, hobby), set relation_type to "preference", not "factual"
-- predicate: snake_case verb phrase — consistent, reusable across sessions
-- confidence: 1.0 for explicit facts, 0.7 for implied/inferred
-- Resolve implied relationships from possessives and kinship terms:
-  "my wife/husband X" = married_to, "my son/daughter X" = parent_of,
-  "my brother/sister X" = sibling_of, "my/our dog/cat X" = has_pet
-
-Predicate examples (use these exact forms when they apply):
-{predicate_examples}
-- If none fit, create a new snake_case predicate (e.g. "competed_in")
-
-POSITIVE example — speaker is "Alex", transcript: "[user] My full name is Alex Morgan. I work at Brightfield Labs."
-{{"entities": [{{"name": "Alex", "entity_type": "person", "attributes": {{"has_last_name": "Morgan"}}}},
+POSITIVE example — speaker is "Alex", transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
+{{"entities": [{{"name": "Alex", "entity_type": "person", "attributes": {{"last_name": "Morgan", "email": "alex.morgan@example.com", "phone": "+1 555 123 4567", "linkedin": "linkedin.com/in/alex-morgan"}}}},
  {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
  "relations": [{{"subject": "Alex", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Alex Morgan works at Brightfield Labs. Last name captured as has_last_name attribute; no separate full-name entity."}}
+ "summary": "Alex Morgan works at Brightfield Labs."}}
+
 
 POSITIVE example — transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
 {{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Frankfurt", "entity_type": "place", "attributes": {{}}}}],
  "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}}'s sister lives in Frankfurt (name corrected from assistant response)."}}
+ "summary": "{{SPEAKER_NAME}}'s sister lives in Frankfurt."}}
 
-POSITIVE example — transcript: "[user] I enjoy reading science fiction."
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
- {{"name": "Science Fiction", "entity_type": "preference", "attributes": {{}}}}],
- "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Science Fiction", "relation_type": "preference", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}} enjoys reading science fiction."}}
-
-POSITIVE example — transcript: "[user] I work at Siemens in the R&D group."
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
- {{"name": "Siemens", "entity_type": "organization", "attributes": {{}}}}],
- "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}} works at Siemens in R&D."}}
-
-POSITIVE example — transcript: "[user] Our wedding anniversary is on June 14th."
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
- {{"name": "Wedding Anniversary", "entity_type": "event", "attributes": {{"date": "June 14"}}}}],
- "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "celebrates", "object": "Wedding Anniversary", "relation_type": "temporal", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}}'s wedding anniversary is June 14."}}
 
 POSITIVE example — transcript: "[user] How often do I have to change my tires for my car? My car is a Volvo V70."
 {{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Volvo V70", "entity_type": "concept", "attributes": {{}}}}],
  "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "owns", "object": "Volvo V70", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}} owns a Volvo V70. Tire-change-frequency question is curiosity, not a fact."}}
+ "summary": "{{SPEAKER_NAME}} owns a Volvo V70."}}
 
-POSITIVE example — transcript: "[user] I have a dog named Rex. What food do you recommend?"
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
- {{"name": "Rex", "entity_type": "concept", "attributes": {{}}}}],
- "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "has_pet", "object": "Rex", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}} has a dog named Rex. Food-recommendation request is not a fact."}}
-
-Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
-speaker's real identifier (e.g. "Alice", "Speaker7") via the directive above.
-Never emit the literal strings "{{SPEAKER_NAME}}", "SPEAKER_NAME", or
-"Speaker_Name" in your output.
 
 NEGATIVE example — speaker is "Jordan", transcript: "[user] My name is Jordan Wells and I live in Millbrook."
 BAD output (two entities for the same speaker):
@@ -108,19 +30,19 @@ BAD output (two entities for the same speaker):
  {{"name": "Jordan Wells", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}], ...}}
 CORRECT output (single entity, last name as attribute):
-{{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{"has_last_name": "Wells"}}}},
+{{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{"last_name": "Wells"}}}},
  {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}],
  "relations": [{{"subject": "Jordan", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}],
  "summary": "Jordan Wells lives in Millbrook."}}
 
+
 NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."
-Extract: NONE — asking about weather in a location is curiosity, not a personal fact about where the speaker lives.
+Extract: NONE — curiosity question, no personal fact.
+
 
 NEGATIVE example — transcript: "[user] Play some music. [assistant] Playing on media_player.living_room."
-Extract: NONE — device commands are not personal facts. Do not extract system entity IDs.
+Extract: NONE — device command, no personal fact. Do not extract system entity IDs.
 
-NEGATIVE example — transcript: "[user] What time is it? [assistant] 14:23."
-Extract: NONE — no personal facts.
 
 Transcript:
 {transcript}

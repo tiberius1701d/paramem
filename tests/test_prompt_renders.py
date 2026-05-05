@@ -63,20 +63,21 @@ class TestExtractionPromptRender:
         ]
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
-    def test_every_entity_type_in_rendered_output(self):
-        _, prompt = load_extraction_prompts()
-        rendered = prompt.format(
-            transcript="sample",
-            speaker_context="",
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
-        )
-        for t in entity_types():
-            assert t in rendered, f"Entity type {t!r} missing from rendered extraction prompt"
+    def test_example_entity_types_are_within_schema(self):
+        """Inverse of the old "every type must appear" check.
 
-    def test_every_relation_type_in_rendered_output(self):
-        """Every relation type from schema must appear in the rendered extraction prompt."""
+        The new examples-only architecture (README → Prompt Engineering)
+        deliberately drops the ``{entity_types}`` slot — verbatim
+        taxonomy listings empirically license Mistral 7B to extend the
+        closed set with invented type names.  Schema coverage is now
+        carried by the few-shot examples.
+
+        The remaining invariant — guarded here — is that every
+        ``entity_type: "<X>"`` literal that appears in the prompt examples
+        must be a value in the schema's allowed set.  Catches off-list
+        drift if someone authors an example with
+        ``entity_type: "phone_number"`` etc.
+        """
         _, prompt = load_extraction_prompts()
         rendered = prompt.format(
             transcript="sample",
@@ -85,8 +86,37 @@ class TestExtractionPromptRender:
             predicate_examples=format_predicate_examples(),
             relation_types=format_relation_types(),
         )
-        for rt in relation_types():
-            assert rt in rendered, f"Relation type {rt!r} missing from rendered extraction prompt"
+        allowed = set(entity_types())
+        used = set(re.findall(r'"entity_type":\s*"([^"]+)"', rendered))
+        # The {SPEAKER_NAME} placeholder substitution leaves no entity_type
+        # tokens — every match in the rendered output is an example literal.
+        offenders = used - allowed
+        assert not offenders, (
+            f"Off-schema entity_types in prompt examples: {sorted(offenders)}. "
+            f"Allowed: {sorted(allowed)}. "
+            f"Add the new type to configs/schema.yaml or correct the example."
+        )
+
+    def test_example_relation_types_are_within_schema(self):
+        """Inverse of the old "every relation_type must appear" check —
+        same rationale as :meth:`test_example_entity_types_are_within_schema`.
+        """
+        _, prompt = load_extraction_prompts()
+        rendered = prompt.format(
+            transcript="sample",
+            speaker_context="",
+            entity_types=format_entity_types(),
+            predicate_examples=format_predicate_examples(),
+            relation_types=format_relation_types(),
+        )
+        allowed = set(relation_types())
+        used = set(re.findall(r'"relation_type":\s*"([^"]+)"', rendered))
+        offenders = used - allowed
+        assert not offenders, (
+            f"Off-schema relation_types in prompt examples: {sorted(offenders)}. "
+            f"Allowed: {sorted(allowed)}. "
+            f"Add the new type to configs/schema.yaml or correct the example."
+        )
 
 
 class TestProceduralPromptRender:

@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.schema import Entity, SessionGraph
 from paramem.graph.schema_config import (
     anonymizer_placeholder_pattern,
@@ -143,6 +144,33 @@ def _vram_snapshot(label: str) -> None:
         smi_used,
         smi_free,
     )
+
+
+def _summarise_graph(graph: SessionGraph) -> dict:
+    """Compact, JSON-serialisable view of a SessionGraph for phase traces.
+
+    The full graph is large and largely redundant across phases; the
+    summary captures what changes between phases — entity names + types
+    + speaker_id markers, and relation triples.  Calibration consumers
+    diff these dicts to see exactly what each phase produced or mutated.
+    """
+    return {
+        "entity_count": len(graph.entities),
+        "relation_count": len(graph.relations),
+        "entity_names": [e.name for e in graph.entities],
+        "entity_types": {e.name: e.entity_type for e in graph.entities},
+        "speaker_entities": [
+            {
+                "name": e.name,
+                "entity_type": e.entity_type,
+                "speaker_id": e.speaker_id,
+                "attributes": dict(e.attributes) if e.attributes else {},
+            }
+            for e in graph.entities
+            if e.speaker_id
+        ],
+        "triples": [[r.subject, r.predicate, r.object] for r in graph.relations],
+    }
 
 
 def _wait_for_gpu_ready(*, pre_settle_seconds: float = 10.0) -> None:
@@ -433,7 +461,20 @@ Transcript:
 
 
 def _load_prompt(filename: str, default: str, prompts_dir: Path | None = None) -> str:
-    """Load a prompt file, falling back to hardcoded default."""
+    """Load a prompt file, falling back to hardcoded default.
+
+    Single chokepoint for ALL prompt loading in the extraction pipeline
+    (extraction.txt, extraction_system.txt, extraction_document.txt,
+    anonymization.txt, sota_enrichment.txt, sota_plausibility.txt, …).
+
+    Before editing any file under ``configs/prompts/`` — or adding a new
+    template slot here — read **README.md → Prompt Engineering**.  That
+    section documents the empirical rules that govern these files
+    (few-shot examples carry the schema; verbatim taxonomy slots like
+    ``{entity_types}`` are anti-patterns; long prose rules dilute the
+    example signal).  The principles were learned the hard way and
+    contradict natural intuition about LLM prompting.
+    """
     search_dirs = []
     if prompts_dir:
         search_dirs.append(Path(prompts_dir))
@@ -453,6 +494,9 @@ def load_extraction_prompts(
     user_filename: str = DEFAULT_USER_PROMPT_FILENAME,
 ) -> tuple[str, str]:
     """Load extraction prompts from a directory, with hardcoded fallbacks.
+
+    Before editing the prompts this function loads, read **README.md →
+    Prompt Engineering** for the empirical principles that govern them.
 
     Args:
         prompts_dir: Directory containing the prompt files.  Falls back to
@@ -503,6 +547,9 @@ def load_procedural_prompt(
     user_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
 ) -> tuple[str, str]:
     """Load procedural extraction prompts.
+
+    Before editing the prompts this function loads, read **README.md →
+    Prompt Engineering** for the empirical principles that govern them.
 
     Args:
         prompts_dir: Directory containing the prompt files.  Falls back to
@@ -667,6 +714,7 @@ def extract_graph(
     pii_scope: set[str] | frozenset[str] | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
+    stop_phase: str | None = None,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -677,6 +725,16 @@ def extract_graph(
     4. SOTA pipeline (anonymize → enrich → plausibility → de-anonymize, configurable)
 
     All filters fail gracefully — extraction result is preserved on any failure.
+
+    ``stop_phase`` (calibration only): when set to a name from
+    :data:`paramem.graph.phase_trace.PHASE_NAMES`, the pipeline returns
+    immediately after that phase completes — saves compute when the
+    operator only needs to inspect the early phases of the trace.  Phases
+    that don't fire under the current configuration (e.g. an
+    ``anonymize_verify`` skipped because ``verify_anonymization=False``)
+    cannot serve as stop points; the pipeline continues until a firing
+    phase matches.  Default ``None`` runs the full pipeline (production
+    behaviour unchanged).
 
     Args:
         temperature: Sampling temperature for extraction (default 0.0 for determinism).
@@ -713,71 +771,132 @@ def extract_graph(
             :data:`DOCUMENT_USER_PROMPT_FILENAME`
             (``"extraction_document.txt"``) for written-document sources.
     """
-    raw_output = _generate_extraction(
-        model,
-        tokenizer,
-        transcript,
-        temperature,
-        max_tokens,
-        prompts_dir,
-        speaker_name,
-        system_prompt_filename=system_prompt_filename,
-        user_prompt_filename=user_prompt_filename,
-    )
-    logger.debug("Raw extraction output: %s", raw_output[:500])
+    # Validate stop_phase against the canonical whitelist before any
+    # work happens.  Catches typos early ("anonymise" vs "anonymize")
+    # rather than running the full pipeline and silently never matching.
+    if stop_phase is not None:
+        from paramem.graph.phase_trace import PHASE_NAMES as _PHASE_NAMES
 
-    try:
-        graph = _parse_extraction(
-            raw_output,
-            session_id,
-            speaker_id=speaker_id,
-            speaker_name=speaker_name,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Extraction parsing failed (%s), returning empty graph",
-            exc,
-        )
-        return SessionGraph(
+        if stop_phase not in _PHASE_NAMES:
+            raise ValueError(
+                f"stop_phase {stop_phase!r} is not a valid phase name. Valid: {list(_PHASE_NAMES)}"
+            )
+
+    # Open the extraction trace.  phase_trace() calls reachable from
+    # any helper in this scope append to the same trace via contextvar;
+    # the trace survives every `graph = ...` rebinding inside.  At the
+    # end (any return path), trace.attach_to(graph) materialises the
+    # records on the final graph's diagnostics.
+    with extraction_trace() as trace:
+        graph = SessionGraph(
             session_id=session_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
+        try:
+            # Phase 1 — local Mistral extract.  Raw output is the canonical
+            # isolation point for the extraction prompt (calibration /
+            # debugging diffs prompt variants by comparing this raw_output,
+            # before any downstream phase has had a chance to mutate the
+            # result).
+            with phase_trace("local_extract") as t:
+                raw_output = _generate_extraction(
+                    model,
+                    tokenizer,
+                    transcript,
+                    temperature,
+                    max_tokens,
+                    prompts_dir,
+                    speaker_name,
+                    system_prompt_filename=system_prompt_filename,
+                    user_prompt_filename=user_prompt_filename,
+                )
+                t.set_raw(raw_output)
+                logger.debug("Raw extraction output: %s", raw_output[:500])
+                try:
+                    graph = _parse_extraction(
+                        raw_output,
+                        session_id,
+                        speaker_id=speaker_id,
+                        speaker_name=speaker_name,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Extraction parsing failed (%s), returning empty graph",
+                        exc,
+                    )
+                    t.set_outcome("failed", reason=f"{type(exc).__name__}: {exc}")
+                    t.set_parsed({"entity_count": 0, "relation_count": 0})
+                    return graph
+                t.set_parsed(_summarise_graph(graph))
+            if stop_phase == "local_extract":
+                return graph
 
-    if not graph.relations:
-        return graph
+            if not graph.relations:
+                return graph
 
-    # Pass 2: correct STT entity names from assistant responses
-    if stt_correction:
-        graph = _correct_entity_names(graph, transcript)
+            # Phase 2 — STT correction (pure-Python; no LLM call).
+            if stt_correction:
+                with phase_trace("stt_correction") as t:
+                    before = _summarise_graph(graph)
+                    graph = _correct_entity_names(graph, transcript)
+                    after = _summarise_graph(graph)
+                    t.set_parsed(
+                        {
+                            "before": before,
+                            "after": after,
+                            "renamed_entities": [
+                                e for e in after["entity_names"] if e not in before["entity_names"]
+                            ],
+                        }
+                    )
+                if stop_phase == "stt_correction":
+                    return graph
 
-    # Pass 3: validate location facts against HA home context
-    if ha_validation and ha_context:
-        graph = _validate_with_ha_context(graph, ha_context)
+            # Phase 3 — HA validation (pure-Python; no LLM call).
+            if ha_validation and ha_context:
+                with phase_trace("ha_validation") as t:
+                    before = _summarise_graph(graph)
+                    graph = _validate_with_ha_context(graph, ha_context)
+                    after = _summarise_graph(graph)
+                    t.set_parsed({"before": before, "after": after})
+                if stop_phase == "ha_validation":
+                    return graph
 
-    # Pass 4: SOTA pipeline (anonymize → enrich → plausibility filter → de-anonymize)
-    if validate and noise_filter and graph.relations:
-        graph = _sota_pipeline(
-            graph,
-            transcript,
-            model,
-            tokenizer,
-            provider=noise_filter,
-            filter_model=noise_filter_model,
-            endpoint=noise_filter_endpoint,
-            ner_check=ner_check,
-            ner_model=ner_model,
-            plausibility_judge=plausibility_judge,
-            plausibility_stage=plausibility_stage,
-            verify_anonymization=verify_anonymization,
-            speaker_name=speaker_name,
-            speaker_id=speaker_id,
-            role_aware_grounding=role_aware_grounding,
-            pii_scope=pii_scope,
-            max_tokens=max_tokens,
-            plausibility_max_tokens=plausibility_max_tokens,
-        )
+            # Phase 4 — SOTA pipeline.  Each sub-phase (anonymize,
+            # anonymize_verify, anonymize_repair, sota_enrich,
+            # anon_plausibility, deanon, grounding_gate,
+            # deanon_plausibility) records its own block via phase_trace
+            # from inside _sota_pipeline.  ``stop_phase`` is forwarded so
+            # _sota_pipeline can short-circuit at any sub-phase boundary.
+            if validate and noise_filter and graph.relations:
+                graph = _sota_pipeline(
+                    graph,
+                    transcript,
+                    model,
+                    tokenizer,
+                    provider=noise_filter,
+                    filter_model=noise_filter_model,
+                    endpoint=noise_filter_endpoint,
+                    ner_check=ner_check,
+                    ner_model=ner_model,
+                    plausibility_judge=plausibility_judge,
+                    plausibility_stage=plausibility_stage,
+                    verify_anonymization=verify_anonymization,
+                    speaker_name=speaker_name,
+                    speaker_id=speaker_id,
+                    role_aware_grounding=role_aware_grounding,
+                    pii_scope=pii_scope,
+                    max_tokens=max_tokens,
+                    plausibility_max_tokens=plausibility_max_tokens,
+                    stop_phase=stop_phase,
+                )
 
-    return graph
+            return graph
+        finally:
+            # Materialise the trace on whatever graph we're about to
+            # return — covers every return path including early returns
+            # on parse failure and empty-relations short-circuit.
+            trace.attach_to(graph)
 
 
 def extract_and_anonymize_for_cloud(
@@ -861,7 +980,7 @@ def extract_and_anonymize_for_cloud(
         return "", {}
 
     try:
-        anon_facts, mapping, anon_transcript = _anonymize_with_local_model(
+        anon_facts, mapping, anon_transcript, _raw = _anonymize_with_local_model(
             graph, model, tokenizer, transcript=transcript
         )
     except Exception:
@@ -1803,7 +1922,7 @@ def _fallback_plausibility_on_raw(
 
     # Step 4: local plausibility filter (uses real names)
     if raw_facts and model is not None and tokenizer is not None:
-        filtered = _local_plausibility_filter(
+        filtered, _raw = _local_plausibility_filter(
             raw_facts,
             transcript,
             model,
@@ -1870,6 +1989,7 @@ def _sota_pipeline(
     pii_scope: set[str] | frozenset[str] | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    stop_phase: str | None = None,
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
@@ -1922,12 +2042,29 @@ def _sota_pipeline(
 
     original_count = len(graph.relations)
 
-    # Step 1: Anonymize facts AND transcript via local model in one call —
-    # mapping is total over everything that will reach the SOTA stage.
+    # Phase 4 — anonymize.  Mistral runs the anonymizer prompt; emits
+    # mapping + anonymized facts + anonymized transcript.  Phase trace
+    # captures the raw model JSON so calibration can diff prompt
+    # variants on the anonymizer in isolation.
     _vram_snapshot(f"sota_pipeline_entry session={graph.session_id}")
-    anon_facts, mapping, anon_transcript = _anonymize_with_local_model(
-        graph, model, tokenizer, transcript=transcript, max_tokens=max_tokens
-    )
+    with phase_trace("anonymize") as t:
+        anon_facts, mapping, anon_transcript, anon_raw = _anonymize_with_local_model(
+            graph, model, tokenizer, transcript=transcript, max_tokens=max_tokens
+        )
+        t.set_raw(anon_raw)
+        t.set_parsed(
+            {
+                "mapping": dict(mapping) if mapping else {},
+                "mapping_size": len(mapping) if mapping else 0,
+                "anon_facts_count": len(anon_facts) if anon_facts else 0,
+                "anon_transcript_len": len(anon_transcript or ""),
+                "parse_ok": anon_facts is not None,
+            }
+        )
+        if anon_facts is None:
+            t.set_outcome("failed", reason="anonymization parse failed")
+        elif not anon_facts:
+            t.set_outcome("no_input", reason="anonymization produced 0 facts")
     _vram_snapshot(f"after_anonymize session={graph.session_id}")
     if anon_facts is None:
         logger.warning("Anonymization failed — falling back to raw plausibility")
@@ -1950,6 +2087,12 @@ def _sota_pipeline(
         graph.diagnostics["anonymize"] = "ok"
         graph.relations = []
         graph.entities = []
+        return graph
+    if stop_phase == "anonymize":
+        # Calibration short-circuit: anonymize completed; downstream
+        # phases (verify, repair, sota_enrich, …) are skipped.  graph.relations
+        # remains the local-extract output; the anonymize result lives in
+        # graph.diagnostics["phases"][anonymize].parsed.
         return graph
     # Canonicalize mapping direction before any downstream use.
     mapping, norm_stats = _normalize_anonymization_mapping(mapping)
@@ -2089,49 +2232,78 @@ def _sota_pipeline(
                     plausibility_max_tokens=plausibility_max_tokens,
                 )
 
-    # Step 2: SOTA enrichment — coreference + compound splitting + safe reification.
-    # Skipped when _skip_sota=True (residual leak after repair with canonical mapping).
+    # Phase — sota_enrich.  Cloud (Anthropic by default) runs the
+    # enrichment prompt; emits enriched facts + new_entity_bindings +
+    # updated_anon_transcript.  Skipped (outcome="skipped") when
+    # _skip_sota=True (residual leak after repair with canonical mapping).
     updated_anon_transcript = None
     _sota_raw = None
     sota_bindings: dict[str, str] = {}
-    if _skip_sota:
-        # Skip SOTA — use filtered anon_facts as-is. No new bindings since
-        # SOTA didn't run.
-        enriched_anon = anon_facts
-        logger.info(
-            "Skipping SOTA enrichment (residual leak path); using %d fact(s)", len(anon_facts)
-        )
-    else:
-        # Send anon facts and transcript to SOTA as the local anonymizer
-        # produced them. The SOTA prompt's convention is "anonymizer
-        # placeholders are bare; only new entities introduced by SOTA use
-        # braced form (`{Prefix_N}`)". SOTA also returns explicit bindings
-        # for any braced placeholders it minted, so de-anonymization is
-        # pure dict substitution downstream — no transcript diff, no LLM
-        # call, no regex post-processing.
-        (
-            enriched_anon,
-            updated_anon_transcript,
-            sota_bindings,
-            _sota_raw,
-            _sota_info,
-        ) = _filter_with_sota(
-            anon_facts,
-            api_key,
-            provider,
-            filter_model,
-            anon_transcript,
-            endpoint=endpoint,
-            max_tokens=max_tokens,
-        )
-        if _sota_info:
-            graph.diagnostics["sota_call_info"] = _sota_info
-        if enriched_anon is None:
-            logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
+    with phase_trace("sota_enrich") as t:
+        if _skip_sota:
+            # Skip SOTA — use filtered anon_facts as-is. No new bindings since
+            # SOTA didn't run.
             enriched_anon = anon_facts
-
-        if not enriched_anon:
-            logger.info("SOTA enrichment removed all relations")
+            t.set_outcome("skipped", reason="residual leak after repair")
+            t.set_parsed(
+                {
+                    "input_count": len(anon_facts),
+                    "output_count": len(anon_facts),
+                    "new_bindings_count": 0,
+                }
+            )
+            logger.info(
+                "Skipping SOTA enrichment (residual leak path); using %d fact(s)",
+                len(anon_facts),
+            )
+        else:
+            # Send anon facts and transcript to SOTA as the local anonymizer
+            # produced them. The SOTA prompt's convention is "anonymizer
+            # placeholders are bare; only new entities introduced by SOTA use
+            # braced form (`{Prefix_N}`)". SOTA also returns explicit bindings
+            # for any braced placeholders it minted, so de-anonymization is
+            # pure dict substitution downstream — no transcript diff, no LLM
+            # call, no regex post-processing.
+            (
+                enriched_anon,
+                updated_anon_transcript,
+                sota_bindings,
+                _sota_raw,
+                _sota_info,
+            ) = _filter_with_sota(
+                anon_facts,
+                api_key,
+                provider,
+                filter_model,
+                anon_transcript,
+                endpoint=endpoint,
+                max_tokens=max_tokens,
+            )
+            t.set_raw(_sota_raw or "")
+            if _sota_info:
+                graph.diagnostics["sota_call_info"] = _sota_info
+                t.add("sota_call_info", _sota_info)
+            if enriched_anon is None:
+                logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
+                enriched_anon = anon_facts
+                t.set_outcome("failed", reason="SOTA call failed or unparseable")
+            t.set_parsed(
+                {
+                    "input_count": len(anon_facts),
+                    "output_count": len(enriched_anon) if enriched_anon else 0,
+                    "new_bindings_count": len(sota_bindings or {}),
+                    "new_bindings": dict(sota_bindings) if sota_bindings else {},
+                    "updated_anon_transcript_len": len(updated_anon_transcript or ""),
+                }
+            )
+            if not enriched_anon:
+                logger.info("SOTA enrichment removed all relations")
+    if stop_phase == "sota_enrich":
+        # Calibration short-circuit: SOTA enrichment block recorded,
+        # downstream (anon_plausibility, deanon, grounding_gate,
+        # deanon_plausibility) skipped.  graph.relations stays at the
+        # local-extract output; enrichment result is in phases[sota_enrich].
+        return graph
 
     # Step 3a: Plausibility on anonymized data (SOTA judge, stage="anon").
     # Only runs when: explicit SOTA provider, plausibility_stage=="anon", not _skip_sota,
@@ -2144,46 +2316,70 @@ def _sota_pipeline(
         and not _skip_sota
         and enriched_anon
     ):
-        pv_info = _PLAUSIBILITY_VALIDATORS[plausibility_judge]
-        pv_key = os.environ.get(pv_info["key_env"], "")
-        if pv_key:
-            plaus_facts, plaus_raw = _plausibility_filter_with_sota(
-                enriched_anon,
-                pv_key,
-                provider=pv_info["provider"],
-                filter_model=pv_info["model_id"],
-                anon_transcript=anon_transcript,
-                endpoint=pv_info.get("endpoint"),
-                max_tokens=max_tokens,
-                temperature=_DEFAULT_FILTER_TEMPERATURE,
-            )
-            # Cloud round-trip can take 30–90s during which the WSL2 GPU
-            # goes idle and the next local CUDA op fails with
-            # "device not ready". Wake + settle before the deanon-stage
-            # local plausibility filter that follows below.
-            _wait_for_gpu_ready()
-            if plaus_facts is not None:
-                pre_plaus = len(enriched_anon)
-                enriched_anon = plaus_facts
-                dropped_plaus = pre_plaus - len(enriched_anon)
-                graph.diagnostics["plausibility"] = "anon"
-                graph.diagnostics["plausibility_dropped"] = dropped_plaus
-                graph.diagnostics["plausibility_judge_actual"] = plausibility_judge
-                if plaus_raw:
-                    graph.diagnostics["sota_plausibility_raw_response"] = plaus_raw
-                logger.info(
-                    "Anon-stage plausibility (%s): %d → %d facts (%d dropped)",
+        with phase_trace("anon_plausibility") as t:
+            pv_info = _PLAUSIBILITY_VALIDATORS[plausibility_judge]
+            pv_key = os.environ.get(pv_info["key_env"], "")
+            if not pv_key:
+                t.set_outcome("skipped", reason=f"no API key for {plausibility_judge!r}")
+                logger.warning(
+                    "Anon-stage plausibility: no API key for %r — skipping",
                     plausibility_judge,
-                    pre_plaus,
-                    len(enriched_anon),
-                    dropped_plaus,
                 )
             else:
-                logger.warning("Anon-stage plausibility call failed — keeping enriched facts")
-        else:
-            logger.warning(
-                "Anon-stage plausibility: no API key for %r — skipping", plausibility_judge
-            )
+                plaus_facts, plaus_raw = _plausibility_filter_with_sota(
+                    enriched_anon,
+                    pv_key,
+                    provider=pv_info["provider"],
+                    filter_model=pv_info["model_id"],
+                    anon_transcript=anon_transcript,
+                    endpoint=pv_info.get("endpoint"),
+                    max_tokens=max_tokens,
+                    temperature=_DEFAULT_FILTER_TEMPERATURE,
+                )
+                # Cloud round-trip can take 30–90s during which the WSL2 GPU
+                # goes idle and the next local CUDA op fails with
+                # "device not ready". Wake + settle before the deanon-stage
+                # local plausibility filter that follows below.
+                _wait_for_gpu_ready()
+                t.set_raw(plaus_raw or "")
+                if plaus_facts is not None:
+                    pre_plaus = len(enriched_anon)
+                    enriched_anon = plaus_facts
+                    dropped_plaus = pre_plaus - len(enriched_anon)
+                    graph.diagnostics["plausibility"] = "anon"
+                    graph.diagnostics["plausibility_dropped"] = dropped_plaus
+                    graph.diagnostics["plausibility_judge_actual"] = plausibility_judge
+                    if plaus_raw:
+                        graph.diagnostics["sota_plausibility_raw_response"] = plaus_raw
+                    t.set_parsed(
+                        {
+                            "judge": plausibility_judge,
+                            "input_count": pre_plaus,
+                            "kept_count": len(enriched_anon),
+                            "dropped_count": dropped_plaus,
+                        }
+                    )
+                    logger.info(
+                        "Anon-stage plausibility (%s): %d → %d facts (%d dropped)",
+                        plausibility_judge,
+                        pre_plaus,
+                        len(enriched_anon),
+                        dropped_plaus,
+                    )
+                else:
+                    t.set_outcome("failed", reason="plausibility call returned None")
+                    t.set_parsed(
+                        {
+                            "judge": plausibility_judge,
+                            "input_count": len(enriched_anon),
+                            "kept_count": len(enriched_anon),
+                            "dropped_count": 0,
+                        }
+                    )
+                    logger.warning("Anon-stage plausibility call failed — keeping enriched facts")
+        if stop_phase == "anon_plausibility":
+            # Calibration short-circuit after the optional anon-stage judge.
+            return graph
 
     # Empty-check guard (compare L1019-1028): if enriched_anon is empty after
     # anon-stage plausibility (or was already empty), return early.
@@ -2211,23 +2407,41 @@ def _sota_pipeline(
         v: k for k, v in mapping.items() if isinstance(k, str) and isinstance(v, str) and k
     }
 
-    deanon_input_count = len(enriched_anon)
-    deanon_facts, dropped_facts = _apply_bindings(enriched_anon, mapping, sota_bindings)
-    if dropped_facts:
-        graph.diagnostics["residual_dropped_facts"] = dropped_facts
-        logger.warning(
-            "Dropped %d fact(s) with residual placeholders post-substitution "
-            "(missing SOTA binding or anonymizer leak).",
-            len(dropped_facts),
+    # Phase — deanon.  Pure dict substitution restoring real names from
+    # placeholders.  No LLM call; raw_output stays None.  Dropped facts
+    # (those with residual unresolved placeholders) land in parsed for
+    # calibration inspection.
+    with phase_trace("deanon") as t:
+        deanon_input_count = len(enriched_anon)
+        deanon_facts, dropped_facts = _apply_bindings(enriched_anon, mapping, sota_bindings)
+        if dropped_facts:
+            graph.diagnostics["residual_dropped_facts"] = dropped_facts
+            logger.warning(
+                "Dropped %d fact(s) with residual placeholders post-substitution "
+                "(missing SOTA binding or anonymizer leak).",
+                len(dropped_facts),
+            )
+        deanon_dropped = deanon_input_count - len(deanon_facts)
+        if deanon_dropped:
+            logger.info(
+                "De-anon: %d → %d facts (%d dropped)",
+                deanon_input_count,
+                len(deanon_facts),
+                deanon_dropped,
+            )
+        t.set_parsed(
+            {
+                "input_count": deanon_input_count,
+                "output_count": len(deanon_facts),
+                "dropped_count": deanon_dropped,
+                "dropped_facts": dropped_facts,
+            }
         )
-    deanon_dropped = deanon_input_count - len(deanon_facts)
-    if deanon_dropped:
-        logger.info(
-            "De-anon: %d → %d facts (%d dropped)",
-            deanon_input_count,
-            len(deanon_facts),
-            deanon_dropped,
-        )
+    if stop_phase == "deanon":
+        # Calibration short-circuit: deanon recorded.  graph.relations
+        # remains the local-extract output; deanonymized facts list is
+        # in phases[deanon].parsed.
+        return graph
 
     # Step 3c+: Route scalar-valued objects (URLs, emails, phone numbers,
     # DOIs, version-tagged tool names like "ROS2") off the relation surface
@@ -2244,28 +2458,45 @@ def _sota_pipeline(
     if scalar_facts:
         graph.diagnostics["scalar_facts_projected"] = len(scalar_facts)
 
-    # Step 3d: Grounding gate — every surviving fact's subject and object must be
-    # grounded in the original transcript OR be a known real-name from the mapping.
-    # Catches SOTA world-knowledge inferences (e.g. inferring "CIA" from a
-    # transcript that only mentions "Langley") — those entities are dropped because
-    # they never existed in the user's actual words.
-    known_real_names = set(mapping.keys())
-    deanon_facts, ungrounded, would_drop = _apply_grounding_gate(
-        deanon_facts,
-        transcript,
-        known_real_names,
-        speaker_name=speaker_name,
-        mode=role_aware_grounding,
-    )
-    if ungrounded:
-        graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
-        logger.warning(
-            "Dropped %d fact(s) with entities ungrounded in the transcript "
-            "(likely SOTA world-knowledge inference).",
-            len(ungrounded),
+    # Phase — grounding_gate.  Every surviving fact's subject and object
+    # must be grounded in the original transcript OR be a known real-name
+    # from the mapping.  Catches SOTA world-knowledge inferences (e.g.
+    # inferring "CIA" from a transcript that only mentions "Langley") —
+    # those entities are dropped because they never existed in the user's
+    # actual words.  Pure-Python; raw_output=None.
+    with phase_trace("grounding_gate") as t:
+        pre_gate = len(deanon_facts)
+        known_real_names = set(mapping.keys())
+        deanon_facts, ungrounded, would_drop = _apply_grounding_gate(
+            deanon_facts,
+            transcript,
+            known_real_names,
+            speaker_name=speaker_name,
+            mode=role_aware_grounding,
         )
-    if would_drop:
-        graph.diagnostics["role_aware_would_drop"] = would_drop
+        if ungrounded:
+            graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
+            logger.warning(
+                "Dropped %d fact(s) with entities ungrounded in the transcript "
+                "(likely SOTA world-knowledge inference).",
+                len(ungrounded),
+            )
+        if would_drop:
+            graph.diagnostics["role_aware_would_drop"] = would_drop
+        t.set_parsed(
+            {
+                "input_count": pre_gate,
+                "output_count": len(deanon_facts),
+                "ungrounded_dropped_count": len(ungrounded) if ungrounded else 0,
+                "ungrounded_facts": ungrounded if ungrounded else [],
+                "role_aware_would_drop": would_drop if would_drop else [],
+                "mode": role_aware_grounding,
+            }
+        )
+    if stop_phase == "grounding_gate":
+        # Calibration short-circuit: grounding_gate recorded.  Plausibility
+        # filter and the kept_relations rebuild are skipped.
+        return graph
 
     if _sota_raw:
         graph.diagnostics["sota_raw_response"] = _sota_raw
@@ -2285,34 +2516,58 @@ def _sota_pipeline(
         and model is not None
         and tokenizer is not None
     ):
-        _vram_snapshot(f"before_plausibility_deanon session={graph.session_id}")
-        filtered_deanon = _local_plausibility_filter(
-            deanon_facts,
-            transcript,  # original real-name transcript — intentional, see docstring
-            model,
-            tokenizer,
-            max_tokens=plausibility_max_tokens,
-            temperature=_DEFAULT_FILTER_TEMPERATURE,
-        )
-        if filtered_deanon is not None:
-            pre_deanon = len(deanon_facts)
-            deanon_facts = filtered_deanon
-            dropped_deanon = pre_deanon - len(deanon_facts)
-            graph.diagnostics["plausibility"] = "deanon"
-            graph.diagnostics["plausibility_dropped"] = (
-                graph.diagnostics.get("plausibility_dropped", 0) + dropped_deanon
+        with phase_trace("deanon_plausibility") as t:
+            _vram_snapshot(f"before_plausibility_deanon session={graph.session_id}")
+            filtered_deanon, plaus_raw = _local_plausibility_filter(
+                deanon_facts,
+                transcript,  # original real-name transcript — intentional, see docstring
+                model,
+                tokenizer,
+                max_tokens=plausibility_max_tokens,
+                temperature=_DEFAULT_FILTER_TEMPERATURE,
             )
-            graph.diagnostics["plausibility_judge_actual"] = (
-                plausibility_judge if plausibility_judge != "auto" else "local"
-            )
-            logger.info(
-                "Deanon-stage plausibility (local): %d → %d facts (%d dropped)",
-                pre_deanon,
-                len(deanon_facts),
-                dropped_deanon,
-            )
-        else:
-            logger.warning("Deanon-stage plausibility call failed — keeping deanon facts")
+            t.set_raw(plaus_raw)
+            if filtered_deanon is not None:
+                pre_deanon = len(deanon_facts)
+                deanon_facts = filtered_deanon
+                dropped_deanon = pre_deanon - len(deanon_facts)
+                graph.diagnostics["plausibility"] = "deanon"
+                graph.diagnostics["plausibility_dropped"] = (
+                    graph.diagnostics.get("plausibility_dropped", 0) + dropped_deanon
+                )
+                graph.diagnostics["plausibility_judge_actual"] = (
+                    plausibility_judge if plausibility_judge != "auto" else "local"
+                )
+                t.set_parsed(
+                    {
+                        "judge": plausibility_judge if plausibility_judge != "auto" else "local",
+                        "input_count": pre_deanon,
+                        "kept_count": len(deanon_facts),
+                        "dropped_count": dropped_deanon,
+                    }
+                )
+                logger.info(
+                    "Deanon-stage plausibility (local): %d → %d facts (%d dropped)",
+                    pre_deanon,
+                    len(deanon_facts),
+                    dropped_deanon,
+                )
+            else:
+                t.set_outcome("failed", reason="plausibility parse returned None")
+                t.set_parsed(
+                    {
+                        "judge": plausibility_judge if plausibility_judge != "auto" else "local",
+                        "input_count": len(deanon_facts),
+                        "kept_count": len(deanon_facts),
+                        "dropped_count": 0,
+                    }
+                )
+                logger.warning("Deanon-stage plausibility call failed — keeping deanon facts")
+        if stop_phase == "deanon_plausibility":
+            # Calibration short-circuit: skip the kept_relations rebuild.
+            # graph.relations stays at the local-extract output; the
+            # plausibility-filtered deanon facts are in phases[deanon_plausibility].
+            return graph
 
     kept_relations = []
     validation_dropped: list[dict] = []
@@ -3600,6 +3855,10 @@ def load_anonymization_prompt() -> str:
     Both the local-model and cloud-extractor anonymization paths read through
     this helper so a `configs/prompts/anonymization.txt` override applies to
     both — no silent divergence.
+
+    Before editing ``configs/prompts/anonymization.txt``, read
+    **README.md → Prompt Engineering** for the empirical principles that
+    govern these files.
     """
     return _load_prompt("anonymization.txt", _DEFAULT_ANONYMIZATION_PROMPT)
 
@@ -3611,16 +3870,18 @@ def _anonymize_with_local_model(
     transcript: str = "",
     max_tokens: int = _DEFAULT_ANONYMIZER_MAX_TOKENS,
     temperature: float = _DEFAULT_ANONYMIZER_TEMPERATURE,
-) -> tuple[list[dict] | None, dict, str]:
+) -> tuple[list[dict] | None, dict, str, str]:
     """Anonymize extracted facts AND transcript using the local model.
 
-    Returns (anonymized_facts, mapping, anonymized_transcript) on success or
-    (None, {}, "") on failure. The mapping is total over both inputs by
-    contract — every real name appearing in either facts or transcript MUST
-    be a value in the mapping, so the reverse mapping is total too.
+    Returns ``(anonymized_facts, mapping, anonymized_transcript, raw_output)``
+    on success or ``(None, {}, "", raw_output)`` on parse failure. The mapping
+    is total over both inputs by contract — every real name appearing in
+    either facts or transcript MUST be a value in the mapping, so the
+    reverse mapping is total too.
 
-    Backward-compat: if `transcript` is empty, an empty anonymized transcript
-    is returned. Existing callers (older tests) still work.
+    The raw model output is the fourth element so the calibration phase
+    trace can record it without re-running the call.  An empty string is
+    returned only when the model did not produce a response at all.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -3668,15 +3929,16 @@ def _anonymize_with_local_model(
                     data["anonymized_facts"],
                     normalized,
                     data.get("anonymized_transcript", ""),
+                    raw,
                 )
             # Backward-compat: old schema with "anonymized" key (facts only)
             if "anonymized" in data:
-                return data["anonymized"], normalized, ""
+                return data["anonymized"], normalized, "", raw
         logger.warning("Anonymization returned unexpected format")
-        return None, {}, ""
+        return None, {}, "", raw
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Anonymization parse failed: %s", e)
-        return None, {}, ""
+        return None, {}, "", raw
 
 
 # Public provider metadata — single source of truth, reused by callers
@@ -3790,12 +4052,30 @@ def _filter_anthropic(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
+    top_p: float | None = None,
+    top_k: int | None = None,
 ) -> str | None:
+    """Call Anthropic with a single user message; return raw text or ``None``
+    on transport / SDK failure.
+
+    ``top_p`` / ``top_k`` are optional sampling overrides used by the
+    calibration tool to probe SOTA non-determinism.  Anthropic's API does
+    not accept a ``seed`` parameter so seed-based reproducibility cannot
+    be requested at this layer; the calibration tool reports
+    ``params_effective.seed=null`` for SOTA stages so the operator knows
+    it was dropped.  Both default to ``None`` — production paths
+    preserve current temperature-only sampling behaviour.
+    """
     try:
         import anthropic
     except ImportError:
         logger.warning("anthropic SDK not installed — skipping SOTA filter")
         return None
+    extra_kwargs: dict = {}
+    if top_p is not None:
+        extra_kwargs["top_p"] = top_p
+    if top_k is not None:
+        extra_kwargs["top_k"] = top_k
     try:
         client = anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds)
         response = client.messages.create(
@@ -3804,6 +4084,7 @@ def _filter_anthropic(
             temperature=temperature,
             system=system_prompt,
             messages=[{"role": "user", "content": prompt}],
+            **extra_kwargs,
         )
         return "".join(b.text for b in response.content if hasattr(b, "text"))
     except Exception as e:
@@ -3964,6 +4245,10 @@ def _filter_with_sota(
     are accepted — in that case bindings is ``{}`` and any braced placeholders
     in the facts will fail substitution downstream and the corresponding facts
     will be dropped by the residual sweep / grounding gate.
+
+    Before editing ``configs/prompts/sota_enrichment.txt``, read
+    **README.md → Prompt Engineering** for the empirical principles that
+    govern these files.
     """
     enrichment_prompt = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
     prompt = enrichment_prompt.format(
@@ -4087,6 +4372,10 @@ def _graph_enrich_with_sota(
         ``None`` when the SOTA call fails or the response cannot be parsed.
         ``new_relations`` is a list of relation dicts; ``same_as_pairs`` is a
         list of ``[canonical, variant]`` pairs.
+
+    Before editing ``configs/prompts/sota_graph_enrichment.txt``, read
+    **README.md → Prompt Engineering** for the empirical principles that
+    govern these files.
     """
     enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", _DEFAULT_GRAPH_ENRICHMENT_PROMPT)
     try:
@@ -4169,6 +4458,10 @@ def _plausibility_filter_with_sota(
 
     Returns `(facts, raw_response)`. Raw response is preserved so callers
     can inspect the judge's verdict when questioning drop decisions.
+
+    Before editing ``configs/prompts/sota_plausibility.txt``, read
+    **README.md → Prompt Engineering** for the empirical principles that
+    govern these files.
     """
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
     prompt = plaus_prompt.format(
@@ -4196,14 +4489,22 @@ def _local_plausibility_filter(
     tokenizer,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
-) -> list[dict] | None:
+) -> tuple[list[dict] | None, str]:
     """Local-model plausibility filter — drops invalid relations only.
 
     Same prompt as the SOTA plausibility filter, executed by a local model.
     Caller decides what data to pass: anonymized facts (placeholder strings)
     or de-anonymized facts (real names). The prompt is stage-agnostic.
 
-    Returns the filtered list or None on parse failure (caller falls back).
+    Returns ``(filtered_list, raw_output)``.  ``filtered_list`` is ``None``
+    on parse failure (caller falls back).  The raw model output is the
+    second element so calibration can capture it via phase_trace without
+    re-running the call; an empty string indicates no raw response was
+    obtained.
+
+    Before editing ``configs/prompts/sota_plausibility.txt``, read
+    **README.md → Prompt Engineering** for the empirical principles that
+    govern these files.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -4252,4 +4553,4 @@ def _local_plausibility_filter(
         _vram_snapshot("plaus_filter_post_generate_error")
         raise
     _vram_snapshot("plaus_filter_post_generate")
-    return _parse_facts_response(raw, strict_array=True)
+    return _parse_facts_response(raw, strict_array=True), raw

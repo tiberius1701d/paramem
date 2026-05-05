@@ -560,8 +560,14 @@ class ConsolidationLoop:
             role_aware_grounding=pick("role_aware_grounding", self.extraction_role_aware_grounding),
             pii_scope=pick("pii_scope", self.extraction_pii_scope),
             speaker_id=_require_speaker_id(overrides),
-            system_prompt_filename=system_prompt_filename,
-            user_prompt_filename=user_prompt_filename,
+            # Prompt-filename overrides flow through ``pick`` so calibration
+            # callers can swap in a calib_-prefixed variant.  The
+            # source-type-derived value is the fallback when no override is
+            # supplied — production paths (no overrides) preserve their
+            # current behaviour exactly.
+            system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
+            user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),
+            stop_phase=overrides.get("stop_phase"),
         )
 
     def _dump_session_graph(self, graph: SessionGraph, session_id: str, kind: str) -> None:
