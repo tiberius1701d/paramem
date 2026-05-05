@@ -214,7 +214,18 @@ def train_adapter(
     if training_config.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    callbacks = []
+    from paramem.training.encrypted_checkpoint_callback import EncryptCheckpointCallback
+
+    # EncryptCheckpointCallback wraps every HF-written ``checkpoint-<step>/``
+    # file in the age envelope on ``on_save``.  Without it, HF Trainer leaves
+    # plaintext ``adapter_model.safetensors`` files inside ``args.output_dir``
+    # — which the consolidation flow places under ``data/ha/adapters/`` —
+    # and the next server boot's mode-consistency check (which expects
+    # every infra file to be encrypted-or-plaintext consistently with the
+    # rest) fires and refuses startup.  No-op when Security is OFF.  Same
+    # callback :class:`BackgroundTrainer` already uses for its own HF
+    # Trainer; sharing it keeps both code paths posture-consistent.
+    callbacks: list = [EncryptCheckpointCallback()]
     if training_config.early_stopping:
         callbacks.append(
             LossEarlyStoppingCallback(
@@ -251,13 +262,13 @@ def train_adapter(
     result = trainer.train(resume_from_checkpoint=ckpt_arg)
     metrics = result.metrics
 
-    # PEFT's save_pretrained appends adapter_name to save_directory; pass the
-    # parent so the saved adapter lands at output_dir, not output_dir/adapter_name/.
-    # Caller's _training_output_dir constructs paths as parent/<adapter_name>;
-    # without this, infra_paths' rglob picks up unencrypted training-workspace
-    # safetensors and trips the startup mode-consistency check.
-    model.save_pretrained(str(output_dir.parent), selected_adapters=[adapter_name])
-    tokenizer.save_pretrained(str(output_dir))
+    # No final save here.  ``train_adapter`` is responsible only for training;
+    # the canonical encrypted slot-dir save is the orchestrator's job
+    # (``ConsolidationLoop._save_adapters`` → :func:`atomic_save_adapter` →
+    # :func:`_encrypt_adapter_safetensors`).  Writing here would duplicate
+    # the canonical save AND leave a plaintext ``adapter_model.safetensors``
+    # inside ``data/ha/adapters/`` which trips the next boot's
+    # mode-consistency check.
 
     logger.info("Training complete: %s", metrics)
     return metrics
