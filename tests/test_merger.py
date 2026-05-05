@@ -498,3 +498,115 @@ class TestSpeakerIdDedup:
         attrs = m.graph.nodes["Alex"]["attributes"]
         assert attrs.get("role") == "engineer"
         assert attrs.get("has_last_name") == "Kim"
+
+
+class TestEmptyAttributeValueDoesNotOverwrite:
+    """A non-empty attribute value captured in one chunk must NOT be
+    overwritten by an LLM-emitted empty / "N/A" / "Unknown" placeholder
+    from a later chunk. This is a known LLM-compliance failure mode where
+    the extractor enumerates every advertised attribute key even when the
+    source has no value for it."""
+
+    def test_empty_string_does_not_overwrite(self):
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_email": "alex@example.com"},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_email": ""},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+        assert m.graph.nodes["Alex"]["attributes"]["has_email"] == "alex@example.com"
+
+    def test_na_placeholder_does_not_overwrite(self):
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_phone": "+1 555 123 4567"},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_phone": "N/A"},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+        assert m.graph.nodes["Alex"]["attributes"]["has_phone"] == "+1 555 123 4567"
+
+    def test_real_value_supersedes_existing_empty(self):
+        """Reverse direction: if first chunk emits empty, second chunk
+        emits real value, the real value wins."""
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_email": "N/A"},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"has_email": "alex@example.com"},
+                    speaker_id="Speaker0",
+                )
+            ],
+            relations=[],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+        assert m.graph.nodes["Alex"]["attributes"]["has_email"] == "alex@example.com"

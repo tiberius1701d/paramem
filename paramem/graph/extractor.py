@@ -1192,23 +1192,54 @@ def _stamp_speaker_entity(
     return graph
 
 
+_JSON_ENVELOPE_KEYS = frozenset(
+    (
+        # Local extractor / SOTA enrichment / procedural envelopes
+        "facts",
+        "entities",
+        "relations",
+        "new_entity_bindings",
+        "summary",
+        # Anonymizer envelope — `{"anonymized": [...], "mapping": {...}}`
+        "anonymized",
+        "mapping",
+    )
+)
+
+
 def _extract_json_block(text: str) -> str:
-    """Extract a JSON object/array from model output.
+    """Extract a JSON object/array envelope from model output.
 
-    Handles markdown code-fence wrappers and uses Python's stdlib JSON decoder
-    for the actual structure walk so braces inside string values do not throw
-    off boundary detection (the previous naive ``{``/``}`` counter
-    miscounted ``"object": "Code: }"`` as a closing brace).
+    Handles three real-world failure modes the model produces:
 
-    Truncation discipline: this function tries to parse from the **first**
-    JSON-start character (``{`` or ``[``) only. It does NOT fall through to
-    inner sub-objects on failure, because doing so silently masks truncation:
-    a model whose output was cut at ``max_tokens`` mid-string emits a valid
-    inner sub-object ``{"name": "x", ...}`` even though the outer envelope
-    ``{"entities": [...], "relations": [...]}`` never closed. Falling through
-    would parse that inner object and downstream code would treat it as the
-    full extraction (returning an empty graph). Instead we raise here so the
-    caller surfaces a parse failure and the operator sees a real signal.
+    1. **Code-fenced output**: ``\\`\\`\\`json\\n{...}\\n\\`\\`\\``` — the
+       fence is stripped before scanning.
+    2. **Prose preamble with brace-quoted placeholder names**: SOTA
+       sometimes narrates "I'll introduce ``{Topic_1}`` for the degree
+       field" *before* emitting the JSON envelope.  The literal
+       ``{Topic_1}`` is not parseable JSON (unquoted key) — a naive
+       "first ``{``" parser would fail there and miss the real envelope
+       further down.
+    3. **Truncated outer envelope**: a model cut at ``max_tokens`` mid-
+       string emits a valid *inner* sub-object ``{"name": "x", ...}``
+       even though the outer envelope never closed.  Returning that
+       inner object would silently produce an empty graph downstream.
+
+    Algorithm: walk every ``{`` / ``[`` position in the text and try
+    ``raw_decode`` from each.  Accept the first candidate that yields
+    either a non-empty list, or a dict with at least one envelope key
+    (``facts`` / ``entities`` / ``relations`` / ``new_entity_bindings``
+    / ``summary``).  Inner sub-objects without envelope keys are
+    skipped so truncation surfaces as a parse failure rather than a
+    silently empty graph.  Preamble noise (``{Topic_1}``) is skipped
+    automatically because it raises ``JSONDecodeError`` immediately.
+
+    Error messages distinguish three fail modes:
+    a. ``saw_decode_success_no_envelope=True`` → JSON parsed but no
+       envelope keys → likely outer-envelope truncation.
+    b. ``last_exc is not None`` → some ``{`` / ``[`` candidates existed
+       but none parsed → likely all garbage / prose / corruption.
+    c. No candidates at all → no JSON in the response.
     """
     # Strip markdown code-fence wrappers if present.
     src = text
@@ -1220,37 +1251,83 @@ def _extract_json_block(text: str) -> str:
                 src = src[start:closing].strip()
                 break
 
-    # Locate the first JSON-start character — that IS the start of the
-    # intended JSON value. Anything before it is preamble (prose); anything
-    # at or after it is JSON we must parse from here.
-    brace = src.find("{")
-    bracket = src.find("[")
-    if brace < 0 and bracket < 0:
-        raise ValueError("No JSON found in model output")
-    if brace < 0:
-        start = bracket
-    elif bracket < 0:
-        start = brace
-    else:
-        start = min(brace, bracket)
-
     decoder = json.JSONDecoder()
-    try:
-        _, end = decoder.raw_decode(src, start)
-    except json.JSONDecodeError as exc:
-        # Truncation surfaces here ("Unterminated string starting at",
-        # "Expecting ',' delimiter", etc.). Raise with a clear message so the
-        # extractor's try/except block logs "parsing failed" rather than
-        # silently producing an empty graph.
-        raise ValueError(
-            f"Truncated or malformed JSON in model output (offset {start}, "
-            f"len {len(src)}, decoder said: {exc.msg}). Likely cause: "
-            f"max_tokens hit mid-generation. Bump extraction_max_tokens or "
-            f"reduce input chunk size."
-        ) from exc
-    return src[start:end]
+    last_exc: json.JSONDecodeError | None = None
+    last_offset = -1
+    saw_decode_success_no_envelope = False
+    src_len = len(src)
+    pos = 0
+    while pos < src_len:
+        next_brace = src.find("{", pos)
+        next_bracket = src.find("[", pos)
+        if next_brace < 0 and next_bracket < 0:
+            break
+        if next_brace < 0:
+            candidate = next_bracket
+        elif next_bracket < 0:
+            candidate = next_brace
+        else:
+            candidate = min(next_brace, next_bracket)
+        last_offset = candidate
+        try:
+            value, end = decoder.raw_decode(src, candidate)
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            # Skip past the failing opener and keep looking.
+            pos = candidate + 1
+            continue
+        # raw_decode succeeded — check whether this is the envelope or
+        # narrative noise / a truncated inner sub-object.
+        # Acceptance rules — both designed to surface truncation rather
+        # than silently consume a sub-structure of a truncated envelope:
+        #   • dict: must carry an envelope key (entities / relations /
+        #     facts / new_entity_bindings / summary). Rejects naked
+        #     entity / relation dicts that survive a truncated outer
+        #     envelope.
+        #   • list: must be empty (plausibility's "all dropped" output)
+        #     OR have first element shaped like a fact (subject /
+        #     predicate / object key present). Rejects an entity list
+        #     that survives a truncated outer envelope — its elements
+        #     have ``name`` / ``entity_type``, not ``subject``.
+        if isinstance(value, dict):
+            is_envelope = bool(set(value.keys()) & _JSON_ENVELOPE_KEYS)
+        elif isinstance(value, list):
+            if not value:
+                is_envelope = True
+            else:
+                first = value[0]
+                is_envelope = isinstance(first, dict) and (
+                    "subject" in first or "predicate" in first or "object" in first
+                )
+        else:
+            is_envelope = False
+        if is_envelope:
+            return src[candidate:end]
+        saw_decode_success_no_envelope = True
+        pos = end
 
-    raise ValueError("Unbalanced braces in model output")
+    if saw_decode_success_no_envelope:
+        # Some JSON parsed cleanly but none had envelope keys — most
+        # likely the outer envelope was truncated at ``max_tokens`` and
+        # only inner sub-objects survived.
+        raise ValueError(
+            "Parsed JSON values found in model output but none have "
+            "envelope keys (entities/relations/facts/new_entity_bindings/"
+            "summary; non-empty list also accepted). Likely cause: outer "
+            f"envelope truncated at max_tokens (response length {src_len}). "
+            "Bump extraction_max_tokens or reduce input chunk size."
+        )
+    if last_exc is not None:
+        # Candidates existed but none parsed — could be prose-only output,
+        # severely malformed JSON, or a single oversized envelope that hit
+        # max_tokens before its first ``{`` even closed.
+        raise ValueError(
+            f"No parseable JSON in model output (last error at offset "
+            f"{last_offset}: {last_exc.msg}; response length {src_len}). "
+            f"Possible causes: max_tokens hit before envelope closed, "
+            f"or model emitted prose without a JSON envelope."
+        )
+    raise ValueError("No JSON found in model output")
 
 
 # Fallbacks resolved per-call via schema_config.
