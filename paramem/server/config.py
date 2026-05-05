@@ -633,6 +633,12 @@ class ConsolidationScheduleConfig:
     # (extraction_max_tokens − plausibility) × ~131 KB/token of peak ceiling
     # reduction on the worst-case generation.
     extraction_plausibility_max_tokens: int = 8192
+    # Calibration endpoint — POST /calibrate/{extract,anonymize,plausibility}
+    # exposes per-stage prompt iteration against the same Mistral instance the
+    # production cycle uses. Default OFF — opt-in dev tool, never live in
+    # production. Server short-circuits with 503 when a real consolidation
+    # cycle is running so calibration calls cannot race against the model.
+    calibrate_endpoint_enabled: bool = False
     extraction_stt_correction: bool = True  # correct STT errors from assistant responses
     extraction_ha_validation: bool = True  # validate locations against HA home context
     extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)

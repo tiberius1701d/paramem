@@ -234,6 +234,7 @@ consolidation:
   # max_epochs: null
   extraction_max_tokens: 2048  # max output tokens for graph extraction
   extraction_plausibility_max_tokens: 1024  # plausibility-stage cap (test fixture: smaller-than-prod)
+  calibrate_endpoint_enabled: false  # opt-in dev tool; off in tests by default
   extraction_stt_correction: true  # correct STT errors from assistant responses
   extraction_ha_validation: true  # validate locations against HA home context
   extraction_noise_filter: anthropic  # dev-test posture: exercise SOTA enrichment code paths. Cloud calls fall through gracefully when ANTHROPIC_API_KEY is unset.

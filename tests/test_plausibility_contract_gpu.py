@@ -102,7 +102,7 @@ def test_plausibility_prompt_llm_compliance(loaded_model, fixture_data):
         for f in labeled_facts
     ]
 
-    survivors = _local_plausibility_filter(judge_input, transcript, model, tokenizer)
+    survivors, _raw = _local_plausibility_filter(judge_input, transcript, model, tokenizer)
     assert survivors is not None, "Judge returned None (parse failure) — check raw output"
 
     survivor_keys = {_fact_key(f) for f in survivors}

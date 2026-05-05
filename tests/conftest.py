@@ -29,3 +29,24 @@ def _isolate_paramem_security_env(monkeypatch):
     other tests isolated.
     """
     monkeypatch.delenv("PARAMEM_DAILY_PASSPHRASE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _extraction_trace_scope():
+    """Auto-wrap every test in an :func:`extraction_trace` scope.
+
+    The phase-trace contract (:mod:`paramem.graph.phase_trace`) requires
+    every :func:`phase_trace` call to fire inside an active
+    :func:`extraction_trace` — production runs through ``extract_graph``
+    which establishes that scope.  Tests that exercise pipeline
+    internals (``_sota_pipeline``, ``_anonymize_with_local_model``, etc.)
+    directly would otherwise trip the "outside an active trace" guard.
+
+    The fixture is no-op when nesting (``extraction_trace`` is
+    re-entrant by design — see its docstring), so tests that wrap their
+    own scope remain correct.
+    """
+    from paramem.graph.phase_trace import extraction_trace
+
+    with extraction_trace():
+        yield

@@ -114,3 +114,11 @@ docs/
 !tests/fixtures/docs/
 f52_spec.md
 f52_architecture.md
+
+# Calibration variant prompts (operator-side iteration; never committed).
+# The calibrate_prompts.py tool reads these via --prompt-prefix calib_;
+# production prompts (no prefix) stay tracked.
+configs/prompts/calib_*.txt
+
+# Calibration tool dump dirs.
+data/ha/debug/calibration/
