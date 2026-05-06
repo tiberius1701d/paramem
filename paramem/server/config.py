@@ -568,7 +568,7 @@ class IntentConfig:
 
 @dataclass
 class VoiceConfig:
-    prompt_file: str = "configs/prompts/ha_voice.txt"
+    prompt_file: str = "configs/prompts/pa_voice.txt"
     system_prompt: str = ""
     greeting_interval_hours: int = 24  # hours between greetings per speaker (0 = disabled)
 

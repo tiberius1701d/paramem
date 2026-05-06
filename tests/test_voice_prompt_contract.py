@@ -20,7 +20,7 @@ import pytest
 
 from paramem.server.config import VoiceConfig
 
-PROMPT_FILE = Path("configs/prompts/ha_voice.txt")
+PROMPT_FILE = Path("configs/prompts/pa_voice.txt")
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def prompt_text() -> str:
     return PROMPT_FILE.read_text()
 
 
-class TestHaVoicePromptFile:
+class TestPaVoicePromptFile:
     def test_confabulation_primer_removed(self, prompt_text: str):
         """The specific primer that caused the 2026-04-21 regression must
         not come back under any casing."""
