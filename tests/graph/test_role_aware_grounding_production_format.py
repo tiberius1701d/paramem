@@ -1,9 +1,10 @@
 """Contract tests for _apply_grounding_gate with production-format transcripts.
 
-SessionBuffer._format_turns renders user turns as "{speaker_name}: {text}"
-and model turns as "{Role}: {text}" (e.g. "Assistant: {text}").  These tests
-verify that the role-aware grounding gate correctly distinguishes user-supplied
-facts from assistant-supplied facts when given that format.
+SessionBuffer._format_turns renders every turn with explicit
+``[user]`` / ``[assistant]`` markers — the same format the extraction
+prompt's few-shots use.  These tests verify that the role-aware
+grounding gate correctly distinguishes user-supplied facts from
+assistant-supplied facts when given that format.
 
 No model loading; CPU-only.
 """
@@ -17,10 +18,8 @@ def _make_transcript(pairs: list[tuple[str, str]]) -> str:
     """Build a transcript in production format from (role, text) pairs."""
     lines = []
     for role, text in pairs:
-        if role == "user":
-            lines.append(f"{SPEAKER}: {text}")
-        else:
-            lines.append(f"Assistant: {text}")
+        marker = "[user]" if role == "user" else "[assistant]"
+        lines.append(f"{marker} {text}")
     return "\n".join(lines)
 
 
