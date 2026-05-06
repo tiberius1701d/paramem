@@ -244,42 +244,53 @@ class GraphMerger:
         return self.graph
 
     def _resolve_entity(self, entity: Entity) -> str:
-        """Resolve an entity name to its canonical form in the graph.
+        """Resolve an entity to its canonical NetworkX node key.
 
-        Three-tier resolution for speaker entities, two-tier for object entities,
-        short-circuits on first hit:
+        Speaker entities are first-class graph roots: when
+        ``entity.speaker_id`` is set, the canonical key **is** the
+        speaker_id (an immutable system identifier such as
+        ``"Speaker0"``).  Display name lives at
+        ``node_data["attributes"]["name"]``.  This is the architecture
+        documented in :class:`paramem.graph.schema.Entity` —
+        ``speaker_id`` is the canonical graph identity; ``name`` is a
+        mutable display attribute.
 
-        0. **Speaker-ID match** (speaker entities only) — if ``entity.speaker_id``
-           is set, scan graph nodes for one whose stored ``speaker_id`` attribute
-           matches.  This collapses name changes across sessions (e.g. "Speaker0"
-           session 1 → "Alex" session 2) without creating a duplicate node.
-        1. **Exact normalized** — ``name.strip().lower()`` match.
-        2. **Fuzzy** — ``rapidfuzz.token_sort_ratio`` at ``similarity_threshold``,
-           same ``entity_type`` only.
+        Two enrolled speakers who share a display name (e.g. both
+        ``"Alex"``) keep separate graph nodes because their
+        ``speaker_id`` values differ by construction.  Name changes
+        across sessions for the same speaker (e.g. anonymous
+        ``Speaker0`` → disclosed ``Alex``) collapse onto the same
+        speaker_id node.  Third-party mentions (no ``speaker_id``)
+        live in the **name namespace** which is disjoint from speaker
+        IDs by construction (speaker IDs follow ``Speaker_N``).
 
-        Returns the canonical node name from the graph, or ``entity.name`` when
-        no match is found (new node to be inserted).
+        Resolution rules:
+
+        * **Speaker entity** (``entity.speaker_id`` set) — canonical key
+          IS the speaker_id.  No name-based matching; no fuzzy match.
+          The display name is stored as a mutable attribute downstream.
+        * **Non-speaker entity** (``entity.speaker_id is None``) —
+          two-tier name resolution:
+
+          1. Exact normalised name match.
+          2. Fuzzy ``rapidfuzz.token_sort_ratio`` at
+             ``similarity_threshold``, same ``entity_type`` only.
+
+          Returns the existing canonical key on a hit, or
+          ``entity.name`` (a new node) on a miss.
         """
-        # Tier 0: speaker_id-based resolution (speaker entities only).
+        # Speaker entities: canonical key IS the speaker_id.
         if entity.speaker_id is not None:
-            for node, node_data in self.graph.nodes(data=True):
-                if node_data.get("speaker_id") == entity.speaker_id:
-                    logger.debug(
-                        "Speaker-ID matched '%s' -> '%s' (speaker_id=%s)",
-                        entity.name,
-                        node,
-                        entity.speaker_id,
-                    )
-                    return node
+            return entity.speaker_id
 
         normalized = _normalize_name(entity.name)
 
-        # Tier 1: Exact match on normalized names
+        # Tier 1: Exact match on normalised names (non-speaker entities).
         for node in self.graph.nodes:
             if _normalize_name(node) == normalized:
                 return node
 
-        # Tier 2: Fuzzy match
+        # Tier 2: Fuzzy match (non-speaker entities).
         fuzzy_best: str | None = None
         fuzzy_score: float = 0.0
         for node in self.graph.nodes:
@@ -312,11 +323,21 @@ class GraphMerger:
     ) -> None:
         """Insert or update an entity node.
 
-        When ``entity.speaker_id`` is set (i.e. the entity represents a
-        speaker), the ``speaker_id`` value is stored in the graph node so
-        that :meth:`_resolve_entity` can find the node by speaker identity
-        across sessions even when the display name changes.
+        Speaker entities (``entity.speaker_id`` set) are keyed by
+        ``speaker_id`` (see :meth:`_resolve_entity`).  The display name
+        from ``entity.name`` is stored as a mutable attribute under
+        ``attributes["name"]`` so consumers that need a human-readable
+        label can read it without ever using the NetworkX node ID for
+        display.  Anonymous→disclosed name change (``"Speaker0"`` →
+        ``"Alex"``) updates ``attributes["name"]`` on the existing
+        ``speaker_id``-keyed node — no separate node is created.
+
+        Non-speaker entities are keyed by name; ``attributes["name"]``
+        is not written because the node ID is already the display
+        name.
         """
+        is_speaker = entity.speaker_id is not None
+
         if canonical in self.graph:
             node = self.graph.nodes[canonical]
             node["recurrence_count"] = node.get("recurrence_count", 0) + 1
@@ -337,22 +358,35 @@ class GraphMerger:
                 if _attr_value_is_empty(v):
                     continue
                 existing_attrs[k] = v
+            # Speaker entity: refresh the display ``name`` attribute if
+            # the latest session carries one.  Older sessions may have
+            # used an anonymous id (e.g. ``"Speaker0"``); a later
+            # disclosure (``"Alex"``) updates the stored display name.
+            if is_speaker and entity.name and not _attr_value_is_empty(entity.name):
+                existing_attrs["name"] = entity.name
             node["attributes"] = existing_attrs
-            # Update speaker_id if this entity now has one (disclosure event).
-            if entity.speaker_id is not None and node.get("speaker_id") is None:
+            # Speaker_id should already be set on this node (it WAS the
+            # canonical key).  Defensive: if a legacy node from before
+            # this refactor lacks the field, populate it.
+            if is_speaker and node.get("speaker_id") is None:
                 node["speaker_id"] = entity.speaker_id
         else:
+            attributes = {k: v for k, v in entity.attributes.items() if not _attr_value_is_empty(v)}
+            # Speaker entity: stash the display name on the node so it
+            # is recoverable without keeping the node ID in display
+            # space.  Non-speaker entities skip this — their node ID IS
+            # the display name.
+            if is_speaker and entity.name and not _attr_value_is_empty(entity.name):
+                attributes["name"] = entity.name
             node_kwargs: dict = dict(
                 entity_type=entity.entity_type,
-                attributes={
-                    k: v for k, v in entity.attributes.items() if not _attr_value_is_empty(v)
-                },
+                attributes=attributes,
                 first_seen=session_id,
                 last_seen=session_id,
                 recurrence_count=1,
                 sessions=[session_id],
             )
-            if entity.speaker_id is not None:
+            if is_speaker:
                 node_kwargs["speaker_id"] = entity.speaker_id
             self.graph.add_node(canonical, **node_kwargs)
 

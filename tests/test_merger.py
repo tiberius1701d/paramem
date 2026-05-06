@@ -387,7 +387,7 @@ class TestSpeakerIdDedup:
                 Relation(
                     subject="Speaker0",
                     predicate="lives_in",
-                    object="Berlin",
+                    object="Portland",
                     relation_type="factual",
                     speaker_id="Speaker0",
                 )
@@ -404,13 +404,13 @@ class TestSpeakerIdDedup:
                     attributes={"has_last_name": "Kim"},
                     speaker_id="Speaker0",
                 ),
-                Entity(name="Berlin", entity_type="place"),
+                Entity(name="Portland", entity_type="place"),
             ],
             relations=[
                 Relation(
                     subject="Alex",
                     predicate="lives_in",
-                    object="Berlin",
+                    object="Portland",
                     relation_type="factual",
                     speaker_id="Speaker0",
                 )
@@ -425,8 +425,15 @@ class TestSpeakerIdDedup:
             f"Expected 1 person node, got {len(person_nodes)}: {person_nodes}"
         )
 
-    def test_speaker_node_stores_speaker_id(self):
-        """After merging a speaker entity the graph node must carry speaker_id."""
+    def test_speaker_node_keyed_by_speaker_id(self):
+        """Speaker entity is keyed by ``speaker_id`` in the graph; the
+        display name moves to ``attributes["name"]``.
+
+        This is the architectural invariant from
+        :class:`paramem.graph.schema.Entity`: ``speaker_id`` is the
+        canonical graph identity; ``name`` is a mutable display
+        attribute.
+        """
         m = GraphMerger(similarity_threshold=85.0)
         sg = SessionGraph(
             session_id="s1",
@@ -441,7 +448,11 @@ class TestSpeakerIdDedup:
             relations=[],
         )
         m.merge(sg)
-        assert m.graph.nodes["Alex"].get("speaker_id") == "Speaker0"
+        # Node key IS the speaker_id, NOT the display name.
+        assert "Speaker0" in m.graph.nodes
+        assert "Alex" not in m.graph.nodes
+        assert m.graph.nodes["Speaker0"]["speaker_id"] == "Speaker0"
+        assert m.graph.nodes["Speaker0"]["attributes"]["name"] == "Alex"
 
     def test_non_speaker_entities_still_dedup_by_name(self):
         """Object entities (speaker_id=None) must still dedup by name (regression)."""
@@ -449,19 +460,19 @@ class TestSpeakerIdDedup:
         sg1 = SessionGraph(
             session_id="s1",
             timestamp="2026-01-01T00:00:00Z",
-            entities=[Entity(name="Berlin", entity_type="place")],
+            entities=[Entity(name="Portland", entity_type="place")],
             relations=[],
         )
         sg2 = SessionGraph(
             session_id="s2",
             timestamp="2026-01-02T00:00:00Z",
-            entities=[Entity(name="Berlin", entity_type="place")],
+            entities=[Entity(name="Portland", entity_type="place")],
             relations=[],
         )
         m.merge(sg1)
         m.merge(sg2)
         assert m.graph.number_of_nodes() == 1
-        assert m.graph.nodes["Berlin"]["recurrence_count"] == 2
+        assert m.graph.nodes["Portland"]["recurrence_count"] == 2
 
     def test_speaker_attributes_merged_from_later_session(self):
         """Attributes from a later session (e.g. has_last_name disclosure) must
@@ -495,9 +506,12 @@ class TestSpeakerIdDedup:
         )
         m.merge(sg1)
         m.merge(sg2)
-        attrs = m.graph.nodes["Alex"]["attributes"]
+        # Speaker entity is keyed by speaker_id; display name lives in
+        # attributes alongside the merged role / last_name.
+        attrs = m.graph.nodes["Speaker0"]["attributes"]
         assert attrs.get("role") == "engineer"
         assert attrs.get("has_last_name") == "Kim"
+        assert attrs.get("name") == "Alex"
 
 
 class TestEmptyAttributeValueDoesNotOverwrite:
@@ -539,7 +553,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
         )
         m.merge(sg1)
         m.merge(sg2)
-        assert m.graph.nodes["Alex"]["attributes"]["has_email"] == "alex@example.com"
+        assert m.graph.nodes["Speaker0"]["attributes"]["has_email"] == "alex@example.com"
 
     def test_na_placeholder_does_not_overwrite(self):
         from paramem.graph.merger import GraphMerger
@@ -573,7 +587,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
         )
         m.merge(sg1)
         m.merge(sg2)
-        assert m.graph.nodes["Alex"]["attributes"]["has_phone"] == "+1 555 123 4567"
+        assert m.graph.nodes["Speaker0"]["attributes"]["has_phone"] == "+1 555 123 4567"
 
     def test_real_value_supersedes_existing_empty(self):
         """Reverse direction: if first chunk emits empty, second chunk
@@ -609,4 +623,123 @@ class TestEmptyAttributeValueDoesNotOverwrite:
         )
         m.merge(sg1)
         m.merge(sg2)
-        assert m.graph.nodes["Alex"]["attributes"]["has_email"] == "alex@example.com"
+        assert m.graph.nodes["Speaker0"]["attributes"]["has_email"] == "alex@example.com"
+
+
+class TestMultiUserNameCollision:
+    """Two distinct disclosed speakers with the same display name must NOT
+    collapse into one graph node.
+
+    This is the multi-user PA case: Speaker0 (Alex Walker) and
+    Speaker1 (a different Alex) both enrol with display name
+    ``Alex``.  Without a guard, ``_resolve_entity`` Tier 1 (exact
+    name match) returns Speaker0's node when Speaker1's entity arrives,
+    and ``_upsert_entity`` happily folds Speaker1's facts into
+    Speaker0's node — corrupting both speakers' graphs.
+
+    Tier 0 (positive speaker_id match) was already in place; this
+    class guards the missing NEGATIVE: name collision across distinct
+    ``speaker_id`` values must produce two separate nodes.
+    """
+
+    def _build_speaker_session(
+        self,
+        session_id: str,
+        speaker_id: str,
+        last_name: str,
+        place: str,
+    ) -> SessionGraph:
+        return SessionGraph(
+            session_id=session_id,
+            timestamp="2026-05-06T00:00:00Z",
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"last_name": last_name},
+                    speaker_id=speaker_id,
+                ),
+                Entity(name=place, entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object=place,
+                    relation_type="factual",
+                    speaker_id=speaker_id,
+                ),
+            ],
+        )
+
+    def test_two_speakers_same_first_name_get_separate_nodes(self):
+        """Two enrolled speakers both named "Alex" must produce two
+        graph nodes with their own attributes and relations.
+        """
+        m = GraphMerger(similarity_threshold=85.0)
+        m.merge(self._build_speaker_session("s001", "Speaker0", "Walker", "Portland"))
+        m.merge(self._build_speaker_session("s002", "Speaker1", "Schmidt", "Munich"))
+
+        # Two speaker nodes — separate identities.
+        speaker_nodes = [
+            (node, data)
+            for node, data in m.graph.nodes(data=True)
+            if data.get("speaker_id") in {"Speaker0", "Speaker1"}
+        ]
+        speaker_ids = {data["speaker_id"] for _, data in speaker_nodes}
+        assert speaker_ids == {"Speaker0", "Speaker1"}, (
+            f"Expected separate nodes for Speaker0 and Speaker1, got "
+            f"speaker_ids={speaker_ids} on nodes "
+            f"{[(n, d.get('speaker_id'), d.get('attributes', {})) for n, d in speaker_nodes]}"
+        )
+
+        # Each carries its own last_name — no cross-contamination.
+        by_sid = {data["speaker_id"]: (node, data) for node, data in speaker_nodes}
+        speaker0_node, speaker0_data = by_sid["Speaker0"]
+        speaker1_node, speaker1_data = by_sid["Speaker1"]
+        assert speaker0_data["attributes"].get("last_name") == "Walker", (
+            f"Speaker0's last_name attribute corrupted: got {speaker0_data['attributes']!r}"
+        )
+        assert speaker1_data["attributes"].get("last_name") == "Schmidt", (
+            f"Speaker1's last_name attribute corrupted: got {speaker1_data['attributes']!r}"
+        )
+
+        # Each speaker's lives_in relation points to the right place.
+        s0_neighbors = list(m.graph.successors(speaker0_node))
+        s1_neighbors = list(m.graph.successors(speaker1_node))
+        assert "Portland" in s0_neighbors and "Munich" not in s0_neighbors
+        assert "Munich" in s1_neighbors and "Portland" not in s1_neighbors
+
+    def test_third_party_mention_with_speaker_id_unset_is_separate(self):
+        """A later session emits a third-party ``"Alex"`` entity with
+        ``speaker_id`` unset (he's not the speaker of that session).
+
+        The name namespace and the speaker-ID namespace are disjoint by
+        construction: speaker IDs follow the ``Speaker_N`` pattern
+        produced by the speaker pool, so a display name like
+        ``"Alex"`` will never collide with a speaker_id-keyed node.
+        The third-party Alex becomes a separate node keyed by
+        ``"Alex"``; Speaker0's node remains keyed by ``"Speaker0"``
+        with its own attributes intact.
+        """
+        m = GraphMerger(similarity_threshold=85.0)
+        m.merge(self._build_speaker_session("s001", "Speaker0", "Walker", "Portland"))
+        third_party = SessionGraph(
+            session_id="s002",
+            timestamp="2026-05-06T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person", attributes={}),
+            ],
+            relations=[],
+        )
+        m.merge(third_party)
+
+        # Speaker0 is keyed by speaker_id, third-party Alex by name —
+        # disjoint namespaces, two separate nodes.
+        assert "Speaker0" in m.graph.nodes
+        assert "Alex" in m.graph.nodes
+        assert m.graph.nodes["Speaker0"]["speaker_id"] == "Speaker0"
+        assert m.graph.nodes["Alex"].get("speaker_id") is None
+        # Speaker0's last_name attribute is untouched by the third-party
+        # merge (different node, different namespace).
+        assert m.graph.nodes["Speaker0"]["attributes"]["last_name"] == "Walker"

@@ -538,6 +538,13 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
 
     Uses the graph merger's node metadata: nodes where last_seen == session_id
     were active in this specific session (not the cumulative graph).
+
+    A QA pair's ``source_subject`` / ``source_object`` carry the entity's
+    display name (e.g. ``"Alex"``).  Speaker entities are keyed in the
+    cumulative graph by ``speaker_id`` (e.g. ``"Speaker0"``) with the
+    display name stored at ``attributes["name"]``.  The matching set
+    therefore includes both the node ID AND the ``attributes["name"]``
+    value (when set) so display-name-driven QA pairs continue to match.
     """
     # Find entities that appeared in this session
     session_entities = set()
@@ -545,6 +552,9 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
         node_data = loop.merger.graph.nodes[node]
         if node_data.get("last_seen") == session_id:
             session_entities.add(node.lower())
+            display_name = (node_data.get("attributes") or {}).get("name")
+            if isinstance(display_name, str) and display_name:
+                session_entities.add(display_name.lower())
 
     if not session_entities:
         return
