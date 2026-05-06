@@ -68,6 +68,23 @@ class TrainingConfig:
     early_stopping_threshold: float = 0.01
     early_stopping_floor: int = 10
     early_stopping_patience: int = 2
+    # Recall-based early stopping (separate from loss-based above).
+    # When True, ConsolidationLoop wires RecallEarlyStopCallback at every
+    # production train_adapter call site (via _maybe_make_recall_callback).
+    # Probes the staged adapter at epoch boundaries and fires
+    # control.should_training_stop after `recall_window` consecutive
+    # 100%-recall probes past `early_stopping_floor` (reused as
+    # signal_from_epoch).  Validated at multi-seed for N=100 by Test
+    # 14; untested at N=500+; ship default-OFF.
+    recall_early_stopping: bool = False
+    recall_window: int = 3
+    # Probe cadence — system-wide.  3× cheaper than =1 at production
+    # scale.  Smaller cycles still probe every `recall_probe_every_n_epochs`
+    # epochs.  ``signal_from_epoch`` (=``early_stopping_floor`` above)
+    # gates when the stop signal can fire; ``probe_from_epoch`` is
+    # hardcoded to 1 in production wiring (probe from start, signal
+    # gated by the floor).
+    recall_probe_every_n_epochs: int = 3
 
 
 @dataclass

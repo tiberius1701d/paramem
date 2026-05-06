@@ -1526,6 +1526,16 @@ class ConsolidationLoop:
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
 
+        recall_cb = self._maybe_make_recall_callback(
+            keyed_pairs=episodic_keyed,
+            adapter_name="episodic",
+            output_dir=self._training_output_dir("episodic"),
+            phase_name=f"phase4-episodic-cycle{self.cycle_count}",
+        )
+        extra_cbs = list(self._shutdown_callbacks)
+        if recall_cb is not None:
+            extra_cbs.append(recall_cb)
+
         metrics = train_adapter(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -1536,7 +1546,7 @@ class ConsolidationLoop:
             wandb_config=self.wandb_config,
             output_dir=self._training_output_dir("episodic"),
             run_name=f"phase4-indexed-episodic-cycle{self.cycle_count}",
-            callbacks_extra=self._shutdown_callbacks,
+            callbacks_extra=extra_cbs,
         )
 
         # Update episodic SimHash registry from ground-truth QA
@@ -1766,6 +1776,16 @@ class ConsolidationLoop:
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
 
+        recall_cb = self._maybe_make_recall_callback(
+            keyed_pairs=all_procedural,
+            adapter_name="procedural",
+            output_dir=self._training_output_dir("procedural"),
+            phase_name=f"phase4-procedural-cycle{self.cycle_count}",
+        )
+        extra_cbs = list(self._shutdown_callbacks)
+        if recall_cb is not None:
+            extra_cbs.append(recall_cb)
+
         # train_adapter may raise — shared state must not have been mutated yet.
         metrics = train_adapter(
             model=self.model,
@@ -1777,7 +1797,7 @@ class ConsolidationLoop:
             wandb_config=self.wandb_config,
             output_dir=self._training_output_dir("procedural"),
             run_name=f"phase4-indexed-procedural-cycle{self.cycle_count}",
-            callbacks_extra=self._shutdown_callbacks,
+            callbacks_extra=extra_cbs,
         )
 
         # Training succeeded — apply all deferred mutations atomically.
@@ -2585,6 +2605,16 @@ class ConsolidationLoop:
 
         from paramem.training.trainer import train_adapter as _train_adapter
 
+        recall_cb = self._maybe_make_recall_callback(
+            keyed_pairs=all_interim_keyed,
+            adapter_name=adapter_name,
+            output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
+            phase_name=f"interim-{adapter_name}-{run_label}",
+        )
+        extra_cbs = list(self._shutdown_callbacks)
+        if recall_cb is not None:
+            extra_cbs.append(recall_cb)
+
         _train_adapter(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -2598,7 +2628,7 @@ class ConsolidationLoop:
             # always produce distinct directories.
             output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
             run_name=f"interim-{adapter_name}-{run_label}",
-            callbacks_extra=self._shutdown_callbacks,
+            callbacks_extra=extra_cbs,
         )
 
         # --- 6b. Train procedural main adapter (I1) ---
@@ -3426,6 +3456,17 @@ class ConsolidationLoop:
                 if examples:
                     dataset = self._indexed_dataset(examples)
                     self._enable_gradient_checkpointing()
+                    # Fresh recall callback per tier — _signaled_stop and
+                    # epoch_log do not leak across tiers.
+                    recall_cb = self._maybe_make_recall_callback(
+                        keyed_pairs=job.keyed_pairs,
+                        adapter_name=tier,
+                        output_dir=self.output_dir / "consolidation_refresh" / tier,
+                        phase_name=f"consolidate-{tier}",
+                    )
+                    extra_cbs = list(self._shutdown_callbacks)
+                    if recall_cb is not None:
+                        extra_cbs.append(recall_cb)
                     _train_adapter_fn(
                         model=self.model,
                         tokenizer=self.tokenizer,
@@ -3436,7 +3477,7 @@ class ConsolidationLoop:
                         wandb_config=self.wandb_config,
                         output_dir=self.output_dir / "consolidation_refresh" / tier,
                         run_name=f"consolidate-{tier}",
-                        callbacks_extra=self._shutdown_callbacks,
+                        callbacks_extra=extra_cbs,
                     )
                     logger.info(
                         "consolidate_interim_adapters: trained %s on %d keys",
@@ -3863,6 +3904,86 @@ class ConsolidationLoop:
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
+
+    def _maybe_make_recall_callback(
+        self,
+        keyed_pairs: list[dict],
+        *,
+        adapter_name: str,
+        output_dir,
+        phase_name: str,
+    ):
+        """Construct a RecallEarlyStopCallback when configured.
+
+        Returns None when ``training_config.recall_early_stopping`` is
+        False or when ``keyed_pairs`` is empty (probing an empty set is
+        a no-op).
+
+        The probe target is the unmodified ``keyed_pairs`` list — the
+        same per-tier full-replay set that ``format_indexed_training``
+        consumes.  This is the convergence gate — only safe if the
+        caller passes the FULL active-key set for ``adapter_name``,
+        not an incremental delta.
+
+        Production-reachable callers (must pass full per-tier active set):
+          - ConsolidationLoop._run_indexed_key_episodic    (this file:1529)
+          - ConsolidationLoop._run_indexed_key_procedural  (this file:1770)
+          - ConsolidationLoop._train_extracted_into_interim (this file:2588)
+          - ConsolidationLoop.consolidate_interim_adapters (this file:3429)
+          - active_store_migration._migrate_tier_simulate_to_train
+            (paramem/server/active_store_migration.py:420)
+
+        A new production-reachable caller MUST call this helper; the
+        AST structural test in tests/test_consolidation_recall_early_stop.py
+        enforces the contract and will fail at PR-CI if violated.
+
+        Args:
+            keyed_pairs: The full per-tier active key list (the training
+                target).
+            adapter_name: The adapter slot being trained (matches the
+                ``adapter_name`` arg passed to ``train_adapter``).
+            output_dir: HF Trainer ``output_dir`` for this call.
+                ``progress.json`` and ``epoch_log.json`` are written
+                alongside (parent of HF's ``checkpoint-N/`` tree).
+            phase_name: Label for ``progress.json`` ("phase4-episodic",
+                "interim-episodic-tickXY", "consolidate-episodic",
+                "migrate-episodic", etc.).
+        """
+        if not self.training_config.recall_early_stopping:
+            return None
+        if not keyed_pairs:
+            return None
+        from pathlib import Path
+
+        from paramem.training.early_stop import (
+            EarlyStopPolicy,
+            RecallEarlyStopCallback,
+            _EarlyStopState,
+        )
+        from paramem.training.indexed_memory import build_registry
+
+        output_dir = Path(output_dir)
+        policy = EarlyStopPolicy(
+            probe_from_epoch=1,
+            signal_from_epoch=self.training_config.early_stopping_floor,
+            window=self.training_config.recall_window,
+            probe_every_n_epochs=self.training_config.recall_probe_every_n_epochs,
+        )
+        return RecallEarlyStopCallback(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            target_keyed=keyed_pairs,
+            target_registry=build_registry(keyed_pairs),
+            adapter_name=adapter_name,
+            policy=policy,
+            state_out=_EarlyStopState(),
+            progress_path=output_dir / "progress.json",
+            epoch_log_path=output_dir / "epoch_log.json",
+            first_perfect_log_path=None,  # production has no per-key log
+            phase_name=phase_name,
+            num_epochs=self.training_config.num_epochs,
+            pause_file=None,  # production pause via gpu_lock_sync, not file
+        )
 
 
 def run_multi_session(

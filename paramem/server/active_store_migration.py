@@ -417,6 +417,16 @@ def _migrate_tier_simulate_to_train(
 
     # Step 5: train. Output dir under a migration-scoped subdir so checkpoint
     # debris doesn't pollute the main slot layout.
+    recall_cb = loop._maybe_make_recall_callback(
+        keyed_pairs=keyed_pairs,
+        adapter_name=tier,
+        output_dir=Path(config.adapter_dir) / "active_store_migration" / tier,
+        phase_name=f"migrate-{tier}",
+    )
+    extra_cbs = list(loop._shutdown_callbacks)
+    if recall_cb is not None:
+        extra_cbs.append(recall_cb)
+
     _train_adapter(
         model=loop.model,
         tokenizer=loop.tokenizer,
@@ -427,7 +437,7 @@ def _migrate_tier_simulate_to_train(
         wandb_config=loop.wandb_config,
         output_dir=Path(config.adapter_dir) / "active_store_migration" / tier,
         run_name=f"migrate-simulate-to-train-{tier}",
-        callbacks_extra=loop._shutdown_callbacks,
+        callbacks_extra=extra_cbs,
     )
 
     # Step 6: recall probe at threshold=1.0 (stricter than 0.95 default).

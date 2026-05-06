@@ -191,9 +191,23 @@ consolidation:
   # Unset (or null) → use the validated 30-epoch default from the Test 1-8
   # campaign. Lower this only with empirical recall-vs-epochs evidence on
   # your specific base model — 30 was validated on Mistral 7B and may be
-  # overkill on future base models. Once recall-driven early-stop ships,
-  # this becomes the upper bound; until then it is the fixed budget.
+  # overkill on future base models. With recall_early_stopping=true, this
+  # becomes the upper bound and training stops earlier when the staged
+  # adapter has memorized the training set; with the flag off, this is
+  # the fixed budget.
   # max_epochs: null
+  # Recall-based early stopping. Default OFF; flip to true after one
+  # clean cycle on your deployment to start saving training wall time.
+  # See plan-recall-early-stop-online.md for the rollout plan and
+  # benchmarking.md "Early Stopping Exploration" for the validation
+  # evidence (Test 14: N=100 multi-seed, all 9 cells stopped cleanly
+  # between e18-e26 with 1.0 final recall).
+  recall_early_stopping: false
+  recall_window: 3                  # consecutive 100%-recall probes required
+  recall_probe_every_n_epochs: 3    # probe cadence (3× cheaper than =1 at N=500+)
+  recall_signal_from_epoch: 20      # earliest epoch the stop signal can fire
+                                    # (Test 14 cells stopped e18-e26; 20 is the
+                                    # conservative floor inside that band)
   extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, SOTA enrich, deanon; 8192 sized for ~1500-word document chunks
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
   calibrate_endpoint_enabled: false  # opt-in dev tool: POST /calibrate/{extract,anonymize,plausibility} for prompt iteration against the live Mistral instance. Off in production; 503 returned while a real consolidation cycle is running.

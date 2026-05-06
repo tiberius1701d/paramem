@@ -332,6 +332,13 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 """Return a temp directory path."""
                 return tmp_path / adapter_name
 
+            def _maybe_make_recall_callback(self, keyed_pairs, **_kwargs):
+                """No-op stub — recall_early_stopping=False on the bare
+                TrainingConfig() so the helper would return None anyway,
+                but we stub it explicitly to insulate the duck-typed
+                stub from the helper's inner imports."""
+                return None
+
         stub = _LoopStub()
         stub._run_indexed_key_procedural = ConsolidationLoop._run_indexed_key_procedural.__get__(
             stub

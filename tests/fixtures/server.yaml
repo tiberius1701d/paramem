@@ -229,9 +229,16 @@ consolidation:
   # Unset (or null) → use the validated 30-epoch default from the Test 1-8
   # campaign. Lower this only with empirical recall-vs-epochs evidence on
   # your specific base model — 30 was validated on Mistral 7B and may be
-  # overkill on future base models. Once recall-driven early-stop ships,
-  # this becomes the upper bound; until then it is the fixed budget.
+  # overkill on future base models. With recall_early_stopping=true, this
+  # becomes the upper bound; with the flag off, this is the fixed budget.
   # max_epochs: null
+  # Recall-based early stopping — flipped ON 2026-05-06 for the first
+  # production cycle.  signal_from_epoch=20 is a conservative floor
+  # given Test 14's multi-seed cells stopped between e18-e26.
+  recall_early_stopping: true
+  recall_window: 3
+  recall_probe_every_n_epochs: 3
+  recall_signal_from_epoch: 20
   extraction_max_tokens: 8192  # output-token budget — must match server.yaml.example to avoid silent truncation in simulate-mode probes (gated by tests/server/test_config_parity.py)
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap — must match server.yaml.example (parity-gated)
   calibrate_endpoint_enabled: false  # opt-in dev tool; off in tests by default
