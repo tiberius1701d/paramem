@@ -1,32 +1,35 @@
 You are filtering enriched personal facts from a voice assistant conversation. Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.
 
-**Default: KEEP.** Silent data loss is worse than a noisy graph — the next session will correct noise, but a dropped real fact is gone forever. Only drop a fact when one of the rules below matches unambiguously. When uncertain, KEEP.
+Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, or confidence of any fact.
 
-Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, or confidence of facts you keep.
+## KEEP — return the fact unchanged
 
-## DROP rules (each is a lexical pattern — no judgment calls)
+Default action. Apply whenever none of the DROP rules below match the fact's lexical pattern. Do not drop on semantic judgment. When uncertain, KEEP.
+
+Example: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP
+Example: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP
+
+## DROP — remove the fact from the output
+
+Apply when any of the lexical patterns below match. No judgment calls.
 
 **R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), regardless of predicate.
+Example: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)
 
-**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are present (also `named`, `is`, `equals`). Drop both.
+**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are in the input (also `named`, `is`, `equals`). Drop both.
+Example: `{{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND `{{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2)
 
 **R3. Role leak.** Subject or object is exactly one of: "Assistant", "User", "Speaker", "the bot", "the model". Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, NOT role leaks.
+Example: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)
 
 **R4. Unresolved placeholder in real-name input.** When the input is real-named (no `Person_N` / `City_N` / `Country_N` / `Org_N` / `Thing_N` placeholders expected in the transcript), drop any fact whose subject or object still matches `^(Person|City|Country|Org|Thing)_\d+$`.
+Example: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)
 
 **R5. Empty / sentinel object.** Object is exactly one of: "", "Unknown", "None", "Various", "Something", "N/A".
+Example: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)
 
 **R6. System entity ID.** Subject or object contains a dot-separated HA-style identifier (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`).
-
-## Examples
-
-Input fact: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)
-Input fact: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP
-Input fact: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)
-Input fact: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)
-Input fact: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)
-Input fact: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP
-Input fact: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)
+Example: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)
 
 ## Input
 

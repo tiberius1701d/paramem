@@ -135,12 +135,27 @@ class TestPlausibilityPromptContract:
         """The prompt uses a KEEP-by-default model. Regressing to DROP-by-default
         silently discards valid facts — a data-loss bug that only surfaces
         during a full extraction sweep. This assertion guards that semantic flip.
+
+        The contract is structural, not literal: the KEEP section must
+        appear before DROP, and the KEEP section body must declare a
+        default-disposition (i.e. KEEP applies unless a DROP rule matches).
+        Surface wording — "Default: KEEP", "Default action", etc. — is
+        free to evolve; the structural ordering and semantic claim are not.
         """
         tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
-        assert "default: keep" in tmpl.lower(), (
-            "Plausibility prompt must declare 'Default: KEEP' disposition. "
-            "Removing or inverting this causes silent data loss — dropped facts "
-            "cannot be recovered from subsequent sessions."
+        lower = tmpl.lower()
+        keep_idx = lower.find("## keep")
+        drop_idx = lower.find("## drop")
+        assert keep_idx >= 0, "Plausibility prompt missing '## KEEP' section header."
+        assert drop_idx >= 0, "Plausibility prompt missing '## DROP' section header."
+        assert keep_idx < drop_idx, (
+            "KEEP section must precede DROP section — order encodes default disposition."
+        )
+        keep_section = lower[keep_idx:drop_idx]
+        assert "default" in keep_section, (
+            "KEEP section must declare default disposition (e.g. 'Default action', "
+            "'Default: KEEP'). Removing this primes the model to drop on judgment, "
+            "causing silent data loss."
         )
 
     def test_inline_default_matches_file(self):
