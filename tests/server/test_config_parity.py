@@ -104,3 +104,144 @@ def test_operator_yaml_keys_subset_of_example():
         "them from your local server.yaml, or land them in the example "
         "first."
     )
+
+
+# ---------------------------------------------------------------------------
+# Value-parity gate (CI-required)
+#
+# The structural test above guards key drift.  It does NOT guard *value*
+# drift — and that's exactly how `extraction_max_tokens` was 8192 in
+# production but 2048 in the test fixture for months without anyone
+# noticing (until the simulate-mode probe surfaced the truncation in May
+# 2026).  This second gate enforces VALUE equality on every leaf, with
+# an explicit allowlist of paths where divergence is intentional.
+#
+# The allowlist is the single, reviewable decision surface for "this
+# field is allowed to diverge between the shipped operator default and
+# the test fixture's posture".  Adding a path requires writing why.
+# ---------------------------------------------------------------------------
+
+
+_ALLOWED_VALUE_DIVERGENCE = frozenset(
+    {
+        # --- Test-mode posture: fixture intentionally exercises code paths
+        # that the example ships disabled for ship-safety. ----------------
+        "agents.sota.enabled",  # cloud agent ON in tests, OFF in shipped default
+        "agents.sota_providers.anthropic.enabled",
+        "agents.sota_providers.google.enabled",
+        "agents.sota_providers.openai.enabled",
+        "consolidation.extraction_noise_filter",  # SOTA noise filter ON in tests
+        "consolidation.graph_enrichment_enabled",  # graph-tier SOTA ON in tests
+        "consolidation.graph_enrichment_interim_enabled",
+        "consolidation.extraction_role_aware_grounding",  # 'active' in tests
+        "debug",  # tests want full diagnostic artefacts
+        "sanitization.cloud_mode",  # tests anonymize-and-send; example blocks
+        # --- Sandbox-rooted paths: every path the fixture writes to must
+        # live under tests/fixtures/sandbox/ so a test run can't clobber
+        # production data. ------------------------------------------------
+        "paths.data",
+        "paths.debug",
+        "paths.sessions",
+        "paths.simulate",
+    }
+)
+
+
+def _leaf_items(yaml_path: Path) -> dict[str, object]:
+    """Walk YAML into a dict of dotted-path → leaf value."""
+    with yaml_path.open() as f:
+        data = yaml.safe_load(f) or {}
+
+    out: dict[str, object] = {}
+
+    def _walk(node, prefix: str) -> None:
+        if not isinstance(node, dict):
+            out[prefix] = node
+            return
+        for key, value in node.items():
+            child = f"{prefix}.{key}" if prefix else key
+            _walk(value, child)
+
+    _walk(data, "")
+    return out
+
+
+def test_pipeline_critical_values_match():
+    """Every leaf must hold the same value in example and fixture, except
+    for paths in :data:`_ALLOWED_VALUE_DIVERGENCE`.
+
+    This is the gate that catches drifts like
+    ``extraction_max_tokens=2048`` in the fixture vs ``8192`` in the
+    example — the kind of drift that silently truncates the SOTA
+    extraction chain during simulate-mode prompt-engineering iteration
+    and produces lower-quality output than production.
+
+    To allow a new divergence: add the path to
+    :data:`_ALLOWED_VALUE_DIVERGENCE` with a comment explaining why.
+    """
+    example = _leaf_items(EXAMPLE)
+    fixture = _leaf_items(FIXTURE)
+
+    shared_keys = example.keys() & fixture.keys()
+    diffs = {
+        path: (example[path], fixture[path])
+        for path in shared_keys
+        if example[path] != fixture[path]
+    }
+    unexpected = {
+        path: vals for path, vals in diffs.items() if path not in _ALLOWED_VALUE_DIVERGENCE
+    }
+
+    if unexpected:
+        side_by_side = "\n".join(
+            f"  {path}\n    {EXAMPLE.name}: {ex_val!r}\n    {FIXTURE.name}: {fx_val!r}"
+            for path, (ex_val, fx_val) in sorted(unexpected.items())
+        )
+        raise AssertionError(
+            f"Unexpected value drift between {EXAMPLE} and {FIXTURE}:\n\n"
+            f"{side_by_side}\n\n"
+            "Either align the two files (preferred) or, if the divergence "
+            "is intentional, add the path to _ALLOWED_VALUE_DIVERGENCE in "
+            f"{Path(__file__).relative_to(Path.cwd())} with a one-line "
+            "comment justifying why the values must differ."
+        )
+
+
+def test_allowlist_does_not_cover_paths_that_already_match():
+    """Hygiene: an allowlist entry that no longer corresponds to an
+    actual divergence is dead weight — the original reason for the
+    entry is gone.  Drop it so the next reviewer doesn't have to
+    re-derive intent.
+    """
+    example = _leaf_items(EXAMPLE)
+    fixture = _leaf_items(FIXTURE)
+
+    matching_paths = {
+        path for path in example.keys() & fixture.keys() if example[path] == fixture[path]
+    }
+    stale = sorted(_ALLOWED_VALUE_DIVERGENCE & matching_paths)
+
+    assert not stale, (
+        "These paths are listed in _ALLOWED_VALUE_DIVERGENCE but their "
+        "values now match in both files — the divergence was resolved "
+        "and the allowlist entry is stale:\n  "
+        + "\n  ".join(stale)
+        + "\n\nRemove these entries from _ALLOWED_VALUE_DIVERGENCE."
+    )
+
+
+def test_allowlist_only_lists_real_paths():
+    """Hygiene: an allowlist entry pointing at a path that doesn't exist
+    in either file is a typo or a stale reference to a removed setting.
+    """
+    example = _leaf_items(EXAMPLE)
+    fixture = _leaf_items(FIXTURE)
+    known_paths = example.keys() | fixture.keys()
+    phantom = sorted(_ALLOWED_VALUE_DIVERGENCE - known_paths)
+
+    assert not phantom, (
+        "_ALLOWED_VALUE_DIVERGENCE references paths that don't exist "
+        f"in either {EXAMPLE} or {FIXTURE}:\n  "
+        + "\n  ".join(phantom)
+        + "\n\nFix the typo or remove the stale entry."
+    )
