@@ -20,7 +20,7 @@ Usage::
     # Full pipeline on the resume's chunk 0, baseline + candidate compared:
     python scripts/dev/calibrate_prompts.py \\
         --input ingest/resume.pdf --chunk 0 \\
-        --speaker Tobias --speaker-id Speaker0 \\
+        --speaker Alex --speaker-id Speaker0 \\
         --stages extract,anonymize,enrich,plausibility \\
         --baseline auto --prompt-prefix calib_
 
@@ -551,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--server", default="http://localhost:8420")
     parser.add_argument("--input", required=True)
     parser.add_argument("--source-type", choices=["transcript", "document"], default=None)
-    parser.add_argument("--speaker", default="Tobias")
+    parser.add_argument("--speaker", default="Alex")
     parser.add_argument("--speaker-id", default="Speaker0")
     parser.add_argument(
         "--stages",

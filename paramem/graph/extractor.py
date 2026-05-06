@@ -2828,7 +2828,7 @@ def _build_anonymization_mapping(
         if speaker_entity_placeholder is not None:
             # Speaker is in graph.entities but under a different
             # surface form (e.g. anonymous "Speaker0" → display
-            # "Tobias").  Reuse that placeholder so every form maps
+            # "Alex").  Reuse that placeholder so every form maps
             # consistently.
             mapping[speaker_name] = speaker_entity_placeholder
         else:

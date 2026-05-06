@@ -15,7 +15,7 @@ class Entity(BaseModel):
     When the entity represents a speaker, ``speaker_id`` is populated with
     the speaker store's stable system ID (e.g. ``Speaker0``) and that ID is
     the canonical graph identity — ``name`` is a mutable display attribute
-    that can change (anonymous "Speaker0" → disclosed "Tobias") without
+    that can change (anonymous "Speaker0" → disclosed "Alex") without
     re-keying the graph. For non-speaker entities (places, organisations,
     concepts), ``speaker_id`` stays ``None`` and identity is ``name``.
     """
