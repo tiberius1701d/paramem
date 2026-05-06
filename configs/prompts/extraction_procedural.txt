@@ -1,24 +1,11 @@
 Extract PREFERENCES, HABITS, and ROUTINES of the speaker from this conversation transcript.{speaker_context}
 
-Only extract behavioral patterns — what the speaker likes, uses, prefers, avoids,
-or does regularly. These are things that reflect how the speaker lives, not
-factual information about who they are.
+Two hard rules:
+- Every relation MUST set `relation_type` to `"preference"`.
+- A preference originates ONLY from the speaker's own utterances. Assistant turns are spelling-and-disambiguation context, NOT a source. If only the assistant said it, do NOT extract it.
 
-Rules:
-- ATTRIBUTION: Preferences originate ONLY from the speaker's own utterances.
-  The assistant's responses serve as spelling and disambiguation context for
-  entity names — never as a source of preferences. If only the assistant
-  said it, do not extract it. Asking the assistant for a recommendation is
-  not the same as expressing a preference.
-- The subject of every relation must be a NAMED person, never "User" or "Assistant"
-- All relations must have relation_type "preference"
-- USE THE ASSISTANT'S RESPONSE to correct entity names from speech recognition errors
-- Discard implausible names and system identifiers (media_player.sonos_office)
-- A single instance of an action (e.g. "Play Queen") is a weak signal —
-  repeated patterns across conversations are stronger evidence
-- Entity types: {entity_types}
-- predicate: snake_case verb phrase — use these when they apply:
-{predicate_examples}
+In the examples below, `{{SPEAKER_NAME}}` is a SLOT — at runtime it is substituted with the speaker's real identifier from the directive above. Never emit the literal string `{{SPEAKER_NAME}}` in your output.
+
 
 POSITIVE example — transcript: "[user] Play some jazz. [user] Play jazz again."
 {{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
@@ -26,22 +13,36 @@ POSITIVE example — transcript: "[user] Play some jazz. [user] Play jazz again.
  "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "listens_to", "object": "Jazz", "relation_type": "preference", "confidence": 0.8}}],
  "summary": "{{SPEAKER_NAME}} listens to jazz (requested multiple times)."}}
 
-Note: `{{SPEAKER_NAME}}` above is a SLOT — it will be substituted with the
-speaker's real identifier (e.g. "Alice", "Speaker7") via the directive above.
-Never emit the literal strings "{{SPEAKER_NAME}}", "SPEAKER_NAME", or
-"Speaker_Name" in your output.
 
-NEGATIVE example — transcript: "[user] Play some music. [assistant] Playing on Office Speaker."
-Extract: NONE — a generic play command without a specific preference.
+POSITIVE example — transcript: "[user] I love hiking on weekends."
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Hiking", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "enjoys", "object": "Hiking", "relation_type": "preference", "confidence": 0.95}}],
+ "summary": "{{SPEAKER_NAME}} enjoys hiking on weekends."}}
+
+
+POSITIVE example — transcript: "[user] I usually do yoga in the mornings before breakfast."
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Yoga", "entity_type": "preference", "attributes": {{}}}}],
+ "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "practices", "object": "Yoga", "relation_type": "preference", "confidence": 0.9}}],
+ "summary": "{{SPEAKER_NAME}} practices yoga in the mornings before breakfast."}}
+
+
+NEGATIVE example — transcript: "[user] Play some music. [assistant] Playing on media_player.living_room."
+Extract: NONE — generic command without a specific preference. Do NOT extract system entity IDs.
+
 
 NEGATIVE example — transcript: "[user] What time is it? [assistant] 14:23."
-Extract: NONE — no preferences expressed.
+Extract: NONE — no preference expressed.
+
 
 NEGATIVE example — transcript: "[user] My birthday is on March 4th. What do you recommend if I want to celebrate? [assistant] I suggest planning a celebration with friends or family, perhaps organizing an event in your hometown."
 Extract: NONE — the user asked the assistant for a recommendation. The assistant SUGGESTED the celebration; the user did not state a preference. Asking for a recommendation is not the same as expressing one. The birthday itself is a factual claim, not a preference (handled by the factual extractor).
 
+
 NEGATIVE example — transcript: "[user] What hobbies should I try? [assistant] Based on your routine you might enjoy gardening or model building."
 Extract: NONE — assistant suggestions in response to advice queries are not preferences. A preference requires the user to express it themselves (e.g. "I love gardening", "I do woodworking every Sunday").
+
 
 Transcript:
 {transcript}
