@@ -31,6 +31,13 @@ Output:
 {{"anonymized": [{{"subject": "Person_1", "predicate": "works_at", "object": "Org_1", "relation_type": "factual", "confidence": 1.0}}],
   "mapping": {{"Charlie": "Person_1", "Siemens": "Org_1"}}}}
 
+POSITIVE example — compound product/system name maps to Thing_N:
+facts: [{{"subject": "Sam", "predicate": "uses", "object": "iPhone 15 Pro", "relation_type": "factual", "confidence": 1.0}}]
+Transcript: "[user] I switched to the iPhone 15 Pro last month."
+Output:
+{{"anonymized": [{{"subject": "Person_1", "predicate": "uses", "object": "Thing_1", "relation_type": "factual", "confidence": 1.0}}],
+  "mapping": {{"Sam": "Person_1", "iPhone 15 Pro": "Thing_1"}}}}
+
 NEGATIVE example — mapping direction reversed:
 WRONG: {{"mapping": {{"Person_1": "Alice", "City_1": "Berlin"}}}}
 RIGHT: {{"mapping": {{"Alice": "Person_1", "Berlin": "City_1"}}}}
@@ -40,6 +47,14 @@ NEGATIVE example — common noun anonymized:
 Given facts where a fact object is "Dog" but the transcript clearly says "my dog":
 WRONG: {{"mapping": {{"Dog": "Thing_1"}}}}
 "dog" is a common noun, not an identifying name. Do NOT add it to the mapping. The fact subject/object stays as "Dog" verbatim.
+
+NEGATIVE example — self-mapped placeholder:
+WRONG: {{"mapping": {{"Project_1": "Project_1", "Program_1": "Program_1"}}}}
+Every mapping KEY must be a real name copied verbatim from the input facts (or a name you derived from the transcript context). Never use a placeholder shape (Person_N / City_N / Country_N / Org_N / Thing_N) as the KEY. Self-mapped entries are dropped at canonicalisation, taking their facts with them. If the input fact object is a descriptive phrase rather than an identifying name (e.g. "delivery from quarterly cycles to continuous deployment"), leave it VERBATIM in the anonymized fact and DO NOT add an entry to mapping.
+
+NEGATIVE example — non-schema prefix:
+WRONG: {{"mapping": {{"Acme Whisper": "Project_1"}}}}
+Only Person, City, Country, Org, and Thing prefixes are configured. A product/system name that isn't a Person/City/Country/Org maps to Thing_N. The example would be RIGHT as: {{"mapping": {{"Acme Whisper": "Thing_1"}}}}.
 
 Facts to anonymize:
 {facts_json}

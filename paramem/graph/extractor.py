@@ -1772,47 +1772,47 @@ _DEFAULT_PLAUSIBILITY_PROMPT = (
     "You are filtering enriched personal facts from a voice assistant conversation. "  # noqa: E501
     "Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.\n"  # noqa: E501
     "\n"
-    "**Default: KEEP.** Silent data loss is worse than a noisy graph — the next session will correct noise, "  # noqa: E501
-    "but a dropped real fact is gone forever. Only drop a fact when one of the rules below matches unambiguously. "  # noqa: E501
-    "When uncertain, KEEP.\n"
+    "Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, or confidence of any fact.\n"  # noqa: E501
     "\n"
-    "Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, "  # noqa: E501
-    "or confidence of facts you keep.\n"
+    "## KEEP — return the fact unchanged\n"
     "\n"
-    "## DROP rules (each is a lexical pattern — no judgment calls)\n"
+    "Default action. Apply whenever none of the DROP rules below match the fact's lexical pattern. "  # noqa: E501
+    "Do not drop on semantic judgment. When uncertain, KEEP.\n"
     "\n"
-    "**R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), "  # noqa: E501
-    "regardless of predicate.\n"
+    'Example: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP\n'  # noqa: E501
+    'Example: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP\n'  # noqa: E501
     "\n"
-    "**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are present "  # noqa: E501
+    "## DROP — remove the fact from the output\n"
+    "\n"
+    "Apply when any of the lexical patterns below match. No judgment calls.\n"
+    "\n"
+    "**R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), regardless of predicate.\n"  # noqa: E501
+    'Example: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)\n'  # noqa: E501
+    "\n"
+    "**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are in the input "  # noqa: E501
     "(also `named`, `is`, `equals`). Drop both.\n"
+    'Example: `{{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND '
+    '`{{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2)\n'  # noqa: E501
     "\n"
     "**R3. Role leak.** Subject or object is exactly one of: "
     '"Assistant", "User", "Speaker", "the bot", "the model". '
-    'Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, '  # noqa: E501
-    "NOT role leaks.\n"
+    'Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, NOT role leaks.\n'  # noqa: E501
+    'Example: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)\n'  # noqa: E501
     "\n"
     "**R4. Unresolved placeholder in real-name input.** When the input is real-named "  # noqa: E501
     "(no `Person_N` / `City_N` / `Country_N` / `Org_N` / `Thing_N` placeholders expected in the transcript), "  # noqa: E501
     "drop any fact whose subject or object still matches "
     r"`^(Person|City|Country|Org|Thing)_\d+$`."  # noqa: E501
     "\n"
+    'Example: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)\n'  # noqa: E501
     "\n"
     "**R5. Empty / sentinel object.** Object is exactly one of: "
     '"", "Unknown", "None", "Various", "Something", "N/A".\n'
+    'Example: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)\n'  # noqa: E501
     "\n"
     "**R6. System entity ID.** Subject or object contains a dot-separated HA-style identifier "  # noqa: E501
     "(e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`).\n"
-    "\n"
-    "## Examples\n"
-    "\n"
-    'Input fact: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)\n'  # noqa: E501
-    'Input fact: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP\n'  # noqa: E501
-    'Input fact: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)\n'  # noqa: E501
-    'Input fact: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)\n'  # noqa: E501
-    'Input fact: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)\n'  # noqa: E501
-    'Input fact: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP\n'  # noqa: E501
-    'Input fact: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)\n'  # noqa: E501
+    'Example: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)\n'  # noqa: E501
     "\n"
     "## Input\n"
     "\n"

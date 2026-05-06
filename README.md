@@ -263,13 +263,40 @@ taxonomy slot and only few-shot examples produced **0 invented types**.
 Mistral treats explicit lists as "you can add to this"; examples anchor a
 closed set without needing a rule.
 
-**Verbatim prose rules compete with examples for the model's attention
-budget.** When a prompt mixes a long rule block with few-shot examples, the
-rules dilute the example signal — measurably. On the same input, removing
-50+ lines of declarative prose ("INTENT MATTERS:", "USE THE ASSISTANT'S
-RESPONSE", "PLAUSIBILITY:", etc.) and keeping only ~30 lines of examples
+**Declarative text stays minimal and concise — few-shot examples do the
+hard work.** A prompt is a short headline (one sentence — what the model
+is doing), a brief imperative core (the load-bearing structural rules —
+schema fields, output shape), then the body: POSITIVE examples for the
+right shape, NEGATIVE examples (`WRONG: ... → RIGHT: ...`) for the failure
+modes you actually observe. Long declarative prose ("INTENT MATTERS:",
+"PLAUSIBILITY:", "USE THE ASSISTANT'S RESPONSE", taxonomy bullets)
+competes with examples for the model's attention budget; on Mistral 7B,
+removing 50+ lines of such prose and keeping ~30 lines of examples
 flipped contact-attribute capture (`email` / `phone` / `linkedin`) on the
-speaker entity from absent → reliable.
+speaker entity from absent → reliable. The principle generalizes:
+
+- **Multi-task prompts split into labelled sections** (`## KEEP` /
+  `## DROP`, `## Part 1 — RELATIONS` / `## Part 2 — SAME_AS`) with each
+  section's POSITIVE + NEGATIVE block co-located. Labels prime
+  attention; the imperatives stay one sentence; the examples teach. On
+  `sota_plausibility.txt`, splitting eliminated chunk-1 over-generation
+  (1 input fact → 51 invented facts in the unified version → 0 in the
+  split version).
+
+- **Load-bearing structural contracts go at the top, not in §6.** When
+  the downstream pipeline depends on a schema field, a brace-binding
+  requirement, or a token like `[ESCALATE]` that the router parses, put
+  it under the headline with its own POSITIVE + NEGATIVE pair. On
+  `sota_enrichment.txt`, hoisting the brace-binding contract for
+  newly-minted entities from §6 → section 1 doubled the binding emission
+  rate (6 → 16 per session) and recovered 41 personal facts per CV chunk
+  that had been silently dropped at the deanon residual sweep.
+
+- **NEGATIVE examples teach harder edges than POSITIVE alone.** Add them
+  for the failure modes you observe, not hypothetical ones. On
+  `sota_graph_enrichment.txt`, a single `WRONG: (Alice, ..., "12 months")
+  — literal value, not a graph node` NEGATIVE eliminated phantom-node
+  introduction (2 violations → 0) without changing anything else.
 
 **Closed-set vs. open-set fields behave differently in examples.** The
 model treats fields differently based on whether the prompt examples
@@ -319,7 +346,7 @@ consolidation in production).
 Before editing any file under `configs/prompts/`:
 
 1. **Pick a measurable target.** What signal in the per-phase trace are you
-   trying to move? "Tobias = `person` at `local_extract`", "contact attrs
+   trying to move? "Alex = `person` at `local_extract`", "contact attrs
    on the speaker entity at `local_extract`", "no invented entity_types at
    `local_extract`" — single-sentence targets that succeed.
 2. **Write the variant as a `calib_<original>.txt` file.** Don't edit the
@@ -329,6 +356,14 @@ Before editing any file under `configs/prompts/`:
 4. **Don't add a verbatim taxonomy slot or a long prose rule** unless a
    per-phase calibration measurement justifies it. The empirical record is
    that they make Mistral 7B worse, not better.
+5. **Inline-default parity is part of the contract.** Every prompt file
+   has a hardcoded fallback in `paramem/graph/extractor.py`
+   (`_DEFAULT_*_PROMPT` constants) that takes over when `configs/prompts/`
+   is missing (frozen container deployments).
+   `tests/test_prompts_contract.py::test_inline_default_matches_file`
+   enforces byte-for-byte parity. When you edit a prompt file, update
+   the matching inline default in the same commit — otherwise the test
+   goes red and operators with no `configs/prompts/` get a stale prompt.
 
 The phase-trace and calibration-loop machinery is documented inline in
 `paramem/graph/phase_trace.py` and `paramem/server/calibrate.py`.

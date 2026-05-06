@@ -1,60 +1,66 @@
-You are operating over a pre-merged, cross-transcript knowledge graph.
-The triples below were extracted from multiple conversations and merged
-into a single cumulative graph. Your task has two parts:
+You are operating over a pre-merged, cross-transcript knowledge graph. The triples below were extracted from multiple conversations and merged into one cumulative graph. Emit two outputs: (1) second-order RELATIONS implied by the input but not present in it, and (2) SAME_AS pairs for nodes that refer to the same real-world entity under different surface forms.
 
-1. **Second-order relations** — identify cross-session relations that are
-   implied by co-presence but were never explicitly stated. Examples:
-   if Alice works_at Acme and Bob works_at Acme, emit colleague_of(Alice, Bob).
-   If Alice lives_in Portland and Bob lives_in Portland, emit neighbor_of only
-   if additional evidence (same street, same building) supports it — do not
-   infer purely from city co-presence.
+Required for both outputs:
+- `subject` / `object` / `canonical` / `variant` must be exact node names from the input graph.
+- `relation_type` ∈ {{factual, temporal, preference, social}}; use `social` for interpersonal relations, `factual` otherwise.
+- Confidence ≥ 0.7. Emit nothing rather than guess.
 
-2. **same_as pairs** — identify nodes that refer to the same real-world entity
-   under different surface forms (e.g. "Alice" / "Alicia", "Bob Smith" / "Robert Smith",
-   "ACME Corp" / "Acme Corporation"). Emit as [canonical, variant] pairs where
-   canonical is the more complete or specific form (e.g. "Yang Ming" is more
-   complete than "Mr. Yang" or "Ming"; prefer full name over honorific-only
-   or given-name-only variants).
 
-Rules for relations:
-- Only emit relations you are confident about (confidence >= 0.7).
-- Do NOT emit relations already present in the input triples.
-- Do NOT hallucinate connections between entities that merely share a graph.
-- **Avoid bare `knows(A, B)` unless the input triples provide direct
-  evidence of acquaintance (e.g. an explicit interaction, shared
-  activity, or stated relationship). Graph co-presence alone is not
-  evidence.** Prefer a more specific predicate (colleague_of, friend_of,
-  classmate_of, family_of, neighbor_of) when justified. If no
-  specific predicate is justified, emit nothing rather than `knows`.
-- For symmetric predicates (colleague_of, friend_of, neighbor_of, sibling_of,
-  married_to, knows), emit only ONE direction: the one where subject < object
-  lexicographically.
-- relation_type must be one of: factual, temporal, preference, social.
-  Use "social" for interpersonal relations, "factual" for all others.
-- subject and object must be strings that appear as nodes in the input graph.
+## Part 1 — RELATIONS
 
-Rules for same_as:
-- **Do NOT merge two person entities whose family-name (surname) tokens
-  differ.** E.g. "Zhang Min" and "Wang Min" are NOT the same person even
-  though they share "Min" — different surnames mean different people.
-  Merge only when one name is a clear subset/variant of the other:
-  honorific + name ("Mr. Yang" ↔ "Yang Ming"), nickname ↔ full name
-  ("Alice" ↔ "Alicia Smith"), given-name ↔ full name ("Ming" ↔ "Yang Ming"),
-  or formal ↔ informal ("Robert" ↔ "Bob Smith").
-- **Emit each same_as pair exactly once.** Do not repeat the same
-  logical pair (even in reversed order or with slight surface-form
-  variation) across the list.
-- Strip honorifics (Mr., Mrs., Ms., Dr., Prof., Professor) when
-  judging whether two names refer to the same person — the honorific
-  is not part of the identity.
-- Only emit same_as when you have reasonable evidence (shared
-  attributes, overlapping relations, compatible roles). Never merge
-  purely because two names sound similar.
+Emit cross-session relations that are implied by shared context but not already in the input. For symmetric predicates emit ONE direction only: lexicographic-min subject wins.
 
-Input triples (JSON):
+POSITIVE — input has `works_at(Alice, Acme)` AND `works_at(Bob, Acme)`:
+→ EMIT `colleague_of(Alice, Bob)` — symmetric, lexicographic-min subject.
+
+POSITIVE — input has `attended(Alice, Stanford)`, `attended(Bob, Stanford)`, AND `study_partner_of(Alice, Bob)`:
+→ EMIT `classmate_of(Alice, Bob)` — supported by both shared institution AND an explicit interaction triple.
+
+NEGATIVE — input has only `lives_in(Alice, Portland)` AND `lives_in(Bob, Portland)`:
+→ EMIT NOTHING. City co-presence alone is not evidence of `neighbor_of` — would need same street or building.
+
+NEGATIVE — input has only `attended(Alice, Stanford)` AND `attended(Bob, Stanford)`:
+→ DO NOT emit `knows(Alice, Bob)`. Graph co-presence alone is not evidence of acquaintance. Prefer a specific predicate (colleague_of, classmate_of, friend_of, family_of, neighbor_of); if none is justified, emit nothing.
+
+NEGATIVE — input already contains `colleague_of(Alice, Bob)`:
+→ DO NOT re-emit `colleague_of(Bob, Alice)` — symmetric pair, single direction only. DO NOT re-emit any input triple.
+
+NEGATIVE — input has triples about Alice's program work but no node named `"€200M+"`, `"12 months"`, or `"Independent"`:
+→ DO NOT emit `(Alice, managed_program_value_of, "€200M+")`, `(Alice, recovered_schedule_delay_of, "12 months")`, or `(Alice, currently_employed_at, "Independent")`. Literal values (amounts, durations, dates, percentages, bare adjectives) are NOT graph nodes. The `subject` and `object` of every emitted relation must be a string that already appears as a node in the input graph — verbatim. If no existing node captures the fact, emit nothing rather than minting a new one. Session-level extraction handles literal values as attributes; this pass does not.
+
+
+## Part 2 — SAME_AS pairs
+
+Emit `[canonical, variant]` pairs where canonical is the more complete or specific form. Strip honorifics (Mr., Mrs., Ms., Dr., Prof., Professor) when judging identity. Emit each logical pair exactly once.
+
+POSITIVE — graph has `Mr. Yang` and `Yang Ming`:
+→ `["Yang Ming", "Mr. Yang"]` — full name canonical; honorific stripped before comparison.
+
+POSITIVE — graph has `Robert Smith` and `Bob Smith` (same surname, formal/informal of given name):
+→ `["Robert Smith", "Bob Smith"]` — formal canonical, informal variant.
+
+POSITIVE — graph has `Alice` and `Alicia Smith` AND both share role / employer attributes in the input:
+→ `["Alicia Smith", "Alice"]` — full name canonical; nickname → full name. Evidence comes from shared attributes, not from the names alone.
+
+NEGATIVE — graph has `Zhang Min` and `Wang Min`:
+→ DO NOT MERGE. Different surname tokens → different people, even when the given-name token matches.
+
+NEGATIVE — graph has `Sara` and `Sarah` with no shared attributes or relations:
+→ DO NOT MERGE. Sounds similar but no evidence of shared identity. Phonetic similarity alone is insufficient.
+
+NEGATIVE — pair `[Yang Ming, Mr. Yang]` already emitted earlier in this same response:
+→ DO NOT also emit `[Mr. Yang, Yang Ming]` or any minor surface variant. One logical pair, one entry.
+
+
+## Input triples
+
 {triples_json}
 
-Return ONLY valid JSON with this schema:
+
+## Output
+
+Return ONLY a JSON object:
+```
 {{
   "relations": [
     {{"subject": "...", "predicate": "...", "object": "...", "relation_type": "...", "confidence": 0.0}}
@@ -63,5 +69,6 @@ Return ONLY valid JSON with this schema:
     ["canonical_name", "variant_name"]
   ]
 }}
+```
 
-Both "relations" and "same_as" may be empty lists. No other keys. No commentary outside the JSON block.
+Both arrays may be empty. No other keys, no commentary outside the JSON block.
