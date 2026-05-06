@@ -2283,12 +2283,14 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
         multi_seed = args.phase_c_seeds is not None
         phase_c_epochs = args.phase_c_num_epochs if args.phase_c_num_epochs else args.num_epochs
 
-        # Build fill / retention sets once — content is deterministic per
-        # variant, only the HF Trainer seed varies across iterations.
+        # Build fill set once — content is deterministic per variant,
+        # only the HF Trainer seed varies across iterations.  Phase C
+        # retention column was dropped 2026-05-06: it measured
+        # placeholder erasure (trivially zero by design) and is not
+        # comparable to Test 13's real-answer retention metric.  See
+        # benchmarking.md "Multi-seed result (2026-05-06)".
         fill_keyed = build_fill_keyed(scaffold_keyed, qa_pool, fill_indices)
         fill_registry = build_registry(fill_keyed)
-        retention_keyed = [scaffold_keyed[i] for i in range(fill_start)]
-        retention_registry = build_registry(retention_keyed)
 
         for c_seed in phase_c_seeds:
             c_dir = v_dir / "C" / f"seed{c_seed}" if multi_seed else v_dir / "C"
@@ -2326,14 +2328,37 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
             # Resume from checkpoint if partial C run exists for this seed.
             ckpt = _find_latest_checkpoint(c_dir / "adapter")
 
+            # Single-seed → multi-seed transition: legacy runs wrote
+            # checkpoints to <v_dir>/C/adapter/, but multi-seed mode reads
+            # from <v_dir>/C/seed<N>/adapter/.  Warn so the user can
+            # manually move the legacy dir into seed42/ if they want to
+            # continue from those weights — silently starting fresh has
+            # already cost a full V1/seed42 cycle once.
+            if (
+                multi_seed
+                and ckpt is None
+                and c_seed == phase_c_seeds[0]
+                and _find_latest_checkpoint(v_dir / "C" / "adapter") is not None
+            ):
+                logger.warning(
+                    "Variant %s seed=%d: legacy single-seed checkpoints exist "
+                    "under %s but multi-seed mode reads from %s — starting "
+                    "fresh.  Move them manually if you want to resume from "
+                    "the prior single-seed run.",
+                    variant,
+                    c_seed,
+                    v_dir / "C" / "adapter",
+                    c_dir / "adapter",
+                )
+
             model, metrics_c, probe_c, wall_c = run_phase_C_fill(
                 model,
                 tokenizer,
                 scaffold_keyed,
                 fill_keyed,
                 fill_registry,
-                retention_keyed,
-                retention_registry,
+                None,  # retention_keyed dropped 2026-05-06
+                None,  # retention_registry dropped 2026-05-06
                 args=args,
                 phase_dir=c_dir,
                 run_name=f"test14-pre-C-{variant}-seed{c_seed}",
@@ -2590,9 +2615,7 @@ def run_mode_scale(
 
         fill_keyed = build_fill_keyed(scaffold_keyed, qa_pool, fill_indices)
         fill_registry = build_registry(fill_keyed)
-        # Retention for scale: unused keys below fill_start.
-        retention_keyed = [scaffold_keyed[i] for i in range(fill_start)]
-        retention_registry = build_registry(retention_keyed)
+        # Phase C retention column dropped 2026-05-06; see pre-mode comment.
 
         ckpt = _find_latest_checkpoint(run_dir / "C" / "adapter")
 
@@ -2602,8 +2625,8 @@ def run_mode_scale(
             scaffold_keyed,
             fill_keyed,
             fill_registry,
-            retention_keyed,
-            retention_registry,
+            None,
+            None,
             args=args,
             phase_dir=run_dir / "C",
             run_name="test14-scale-C",
@@ -3261,8 +3284,7 @@ def run_smoke(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None
 
         fill_keyed = build_fill_keyed(scaffold_keyed, qa_pool, fill_indices)
         fill_registry = build_registry(fill_keyed)
-        retention_keyed = [scaffold_keyed[i] for i in range(fill_start)]
-        retention_registry = build_registry(retention_keyed)
+        # Phase C retention column dropped 2026-05-06; see pre-mode comment.
 
         model, metrics_c, probe_c, wall_c = run_phase_C_fill(
             model,
@@ -3270,8 +3292,8 @@ def run_smoke(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None
             scaffold_keyed,
             fill_keyed,
             fill_registry,
-            retention_keyed,
-            retention_registry,
+            None,
+            None,
             args=args,
             phase_dir=smoke_dir / "C",
             run_name="test14-smoke-C",
