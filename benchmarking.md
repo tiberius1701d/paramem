@@ -416,27 +416,37 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
    A single Trainer call with callback-based probing reaches 100%. This is a
    training methodology issue, not an adapter capacity issue.
 
-#### Status (2026-05-06)
+#### Status (2026-05-07)
 
 - **Closed:** loss-based early stopping. No threshold is both safe and useful
   given the ~10–15 epoch gap between loss convergence and the recall phase
-  transition. Production keeps the fixed 30-epoch budget.
-- **Shipped (experiment scripts):** recall-probing early stopping in
-  `experiments/utils/early_stop.py` — `EarlyStopPolicy` + `RecallEarlyStopCallback`
-  fire `control.should_training_stop` after `window` consecutive 100%
-  probes past `signal_from_epoch`. Test 14's multi-seed batch ran on this
-  callback (default policy: `probe_from_epoch=1, signal_from_epoch=10,
-  window=3`); all 9 (V1/V2/V3 × 3 seeds) cells terminated cleanly between
-  e18 and e26 inside the 50-epoch budget. Test 13b uses the same callback's
-  optional retention probe path. Test 15 uses a sibling
-  `RecallProbeCallback` in *observational mode* — records
-  `stable_perfect_epoch` but does not terminate, so cross-seed retention
-  comparison runs on identical optimizer-step counts per phase.
-- **Open (production):** wire `RecallEarlyStopCallback` into
-  `BackgroundTrainer` so production consolidation cycles benefit from
-  the same per-epoch recall gate. Currently the per-cycle `n_epochs`
-  budget is the sole stop condition. Promotion gated on Test 13b
-  validation + 500-key validation (see `feedback_resumable_training.md`).
+  transition. The fixed-budget setting remains correct when the recall gate
+  is OFF.
+- **Shipped (experiment scripts):** recall-probing early stopping at
+  `paramem/training/early_stop.py` (lifted from `experiments/utils/early_stop.py`,
+  which is now a re-export shim) — `EarlyStopPolicy` +
+  `RecallEarlyStopCallback` fire `control.should_training_stop` after
+  `window` consecutive 100% probes past `signal_from_epoch`. Test 14's
+  multi-seed batch ran on this callback (policy:
+  `probe_from_epoch=1, signal_from_epoch=10, window=3`); all 9
+  (V1/V2/V3 × 3 seeds) cells terminated cleanly between e18 and e26
+  inside the 50-epoch budget. Test 13b uses the same callback's optional
+  retention probe path. Test 15 uses a sibling `RecallProbeCallback` in
+  *observational mode*.
+- **Shipped (production):** `ConsolidationLoop._maybe_make_recall_callback`
+  constructs the callback at every production-reachable `train_adapter`
+  call site (4 in `paramem/training/consolidation.py`: lines 1529, 1770,
+  2588, 3429; 1 in `paramem/server/active_store_migration.py:420`).
+  Gated by `consolidation.recall_early_stopping` in `server.yaml` —
+  default OFF in `configs/server.yaml.example`. Four YAML knobs:
+  `recall_early_stopping`, `recall_window`, `recall_probe_every_n_epochs`,
+  `recall_signal_from_epoch`. Validated by a live smoke on Mistral 7B
+  with N=5 keys (stop fired at epoch 16, recall 5/5, gradient_checkpointing
+  state preserved, 4 min wall). A structural AST test
+  (`tests/test_consolidation_recall_early_stop.py:Class F`) scans both
+  production modules at PR-CI and asserts the helper appears in the
+  same `FunctionDef` body as every `train_adapter` call — the gate that
+  prevents architectural-mismatch regressions of the v1 class.
 
 ---
 

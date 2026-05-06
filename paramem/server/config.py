@@ -620,6 +620,38 @@ class ConsolidationScheduleConfig:
     # set this to a small value to skip the full validated budget when
     # testing layout/encryption invariants rather than recall quality.
     max_epochs: int | None = None
+    # Recall-based early stopping (default OFF — see plan-recall-early-stop-online-v3.md).
+    # When True, ConsolidationLoop wires RecallEarlyStopCallback at every
+    # production train_adapter call site (via _maybe_make_recall_callback).
+    # Probes the staged adapter at epoch boundaries and fires
+    # control.should_training_stop after `recall_window` consecutive
+    # 100%-recall probes past `early_stopping_floor` (TrainingConfig field;
+    # currently 10 by default, 20 in the production fixture).
+    # Validated at multi-seed for N=100 (Test 14: 9 cells stopped cleanly
+    # e18-e26); untested at N=500+.  Flip after the first clean cycle.
+    recall_early_stopping: bool = False
+    # Consecutive 100%-recall probes required to fire the stop signal.
+    # Test 14's validated default.  Lower (e.g. 2) for noisier
+    # convergence curves; higher for tighter stop semantics.
+    recall_window: int = 3
+    # Probe cadence — system-wide.  Default 3 → probe every 3 epochs;
+    # 3× cheaper than =1 at production scale (~N=500+).  Smaller cycles
+    # still probe every 3 epochs from epoch 1.
+    # If episodic and procedural cycles have very different epoch
+    # budgets, this default is conservatively tuned for episodic;
+    # procedural may probe at slightly worse signal-to-cost.
+    recall_probe_every_n_epochs: int = 3
+    # Signal floor — earliest epoch the recall callback can fire the
+    # stop signal.  Maps to TrainingConfig.early_stopping_floor (which
+    # the experiment-side loss-based callback also uses; recall path
+    # reuses the same field as ``signal_from_epoch``).  Default 20 is
+    # the conservative production posture — Test 14's multi-seed cells
+    # all stopped between e18 and e26, so 20 sits inside the empirical
+    # band without firing too early on outlier seeds.  Test 14's
+    # research default was 10; that value remains in
+    # ``TrainingConfig.early_stopping_floor`` for direct-construction
+    # contexts that don't go through the YAML.
+    recall_signal_from_epoch: int = 20
     # Output token budget — drives every LLM call in the extraction pipeline
     # (local extract, anonymize, SOTA enrich, deanon) and every direct
     # response across modes.
@@ -1052,6 +1084,10 @@ class ServerConfig:
             gradient_checkpointing=VALIDATED_TRAINING_CONFIG.gradient_checkpointing,
             max_grad_norm=VALIDATED_TRAINING_CONFIG.max_grad_norm,
             seed=VALIDATED_TRAINING_CONFIG.seed,
+            early_stopping_floor=self.consolidation.recall_signal_from_epoch,
+            recall_early_stopping=self.consolidation.recall_early_stopping,
+            recall_window=self.consolidation.recall_window,
+            recall_probe_every_n_epochs=self.consolidation.recall_probe_every_n_epochs,
         )
 
     @property

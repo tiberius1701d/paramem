@@ -724,10 +724,18 @@ class TestRecallEarlyStopCallbackStateachine:
             # probe_from_epoch=1, every 3 → probed at epochs 1, 4, 7
             assert mock_eval.call_count == 3
 
-    def test_gradient_checkpointing_reenabled_after_probe(self, tmp_path):
-        """model.gradient_checkpointing_enable() must be called after each probe epoch."""
+    def test_gradient_checkpointing_reenabled_after_probe_when_args_says_on(self, tmp_path):
+        """When args.gradient_checkpointing=True, the probe re-enables it.
+
+        evaluate_indexed_recall disables checkpointing during generation; the
+        callback must restore the pre-probe state.  Restoration is gated on
+        ``args.gradient_checkpointing`` so a trainer constructed with
+        checkpointing OFF doesn't get it silently flipped back on.
+        """
         cb, state_out, model = _make_callback(tmp_path, total=2)
         perfect = _make_recall_result(2, 2)
+        args = MagicMock()
+        args.gradient_checkpointing = True
 
         with (
             patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
@@ -745,9 +753,44 @@ class TestRecallEarlyStopCallbackStateachine:
             ),
             patch("experiments.utils.recall_diagnostics.update_first_perfect_log"),
         ):
-            cb.on_epoch_end(None, _make_state(1.0), _make_control())
+            cb.on_epoch_end(args, _make_state(1.0), _make_control())
 
         model.gradient_checkpointing_enable.assert_called_once()
+
+    def test_gradient_checkpointing_NOT_reenabled_when_args_says_off(self, tmp_path):
+        """When args.gradient_checkpointing=False, the probe must NOT re-enable it.
+
+        Catches the regression class flagged in CLAUDE.md
+        (``feedback_apply_claudemd_to_all_generate.md``): silently turning
+        checkpointing back on after the probe breaks the next epoch's
+        ``model.generate`` KV-cache contract.  Production today defaults to
+        True so this branch is latent, but any debug / VRAM-tuning
+        configuration that flips it False must stay flipped.
+        """
+        cb, state_out, model = _make_callback(tmp_path, total=2)
+        perfect = _make_recall_result(2, 2)
+        args = MagicMock()
+        args.gradient_checkpointing = False
+
+        with (
+            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch(
+                "experiments.utils.recall_diagnostics.per_field_split_counts",
+                return_value={
+                    "both": 2,
+                    "q_only": 0,
+                    "a_only": 0,
+                    "neither": 0,
+                    "total": 2,
+                    "q_correct": 2,
+                    "a_correct": 2,
+                },
+            ),
+            patch("experiments.utils.recall_diagnostics.update_first_perfect_log"),
+        ):
+            cb.on_epoch_end(args, _make_state(1.0), _make_control())
+
+        model.gradient_checkpointing_enable.assert_not_called()
 
     def test_gradient_checkpointing_not_called_on_non_probe_epoch(self, tmp_path):
         """gradient_checkpointing_enable() must NOT be called for non-probe epochs."""

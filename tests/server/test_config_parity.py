@@ -134,6 +134,8 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
         "consolidation.graph_enrichment_enabled",  # graph-tier SOTA ON in tests
         "consolidation.graph_enrichment_interim_enabled",
         "consolidation.extraction_role_aware_grounding",  # 'active' in tests
+        # ON in tests + live deployment; example ships OFF (default-OFF rollout posture).
+        "consolidation.recall_early_stopping",
         "debug",  # tests want full diagnostic artefacts
         "sanitization.cloud_mode",  # tests anonymize-and-send; example blocks
         # --- Sandbox-rooted paths: every path the fixture writes to must
