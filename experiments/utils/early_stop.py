@@ -197,6 +197,77 @@ class RecallEarlyStopCallback(TrainerCallback):
         self._signaled_stop: bool = False
         self._cycle_started_at: int = int(time.time())
 
+        # Restore prior pause/resume state from disk if any of the persisted
+        # files exist.  Without this, every tresume after a tpause restarts
+        # the early-stop accumulators (epoch_log, first_perfect_epoch,
+        # stable_perfect_epoch, _consecutive_perfect, _first_perfect_log,
+        # _cycle_started_at) from scratch — silently distorting recorded
+        # first/stable epoch labels for any seed paused after convergence.
+        self._rehydrate_from_disk()
+
+    def _rehydrate_from_disk(self) -> None:
+        """Restore in-memory state from the previous run's persisted artifacts.
+
+        Reads:
+          - ``progress_path`` for ``cycle_started_at`` (anchors wall-time math
+            across resumes).
+          - ``epoch_log_path`` for ``state.epoch_log`` and the derived
+            counters (``_last_epoch``, ``_consecutive_perfect``,
+            ``state.first_perfect_epoch``, ``state.stable_perfect_epoch``).
+          - ``first_perfect_log_path`` for the per-key first-perfect map.
+
+        Failures are swallowed: a missing or malformed file is treated as a
+        cold start.  ``stop_epoch`` is intentionally NOT rehydrated — if the
+        prior run had stopped, we would not be resuming.
+        """
+        if self._progress_path is not None and self._progress_path.exists():
+            try:
+                existing = json.loads(self._progress_path.read_text())
+                saved = existing.get("cycle_started_at")
+                if isinstance(saved, (int, float)):
+                    self._cycle_started_at = int(saved)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        if self._epoch_log_path.exists():
+            try:
+                saved_log = json.loads(self._epoch_log_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                saved_log = None
+            if isinstance(saved_log, list) and saved_log:
+                self._state.epoch_log = list(saved_log)
+                try:
+                    self._last_epoch = int(saved_log[-1].get("epoch", -1))
+                except (TypeError, ValueError):
+                    self._last_epoch = -1
+                consecutive = 0
+                window = self._policy.window
+                for entry in saved_log:
+                    fill = entry.get("fill") or {}
+                    exact = fill.get("exact_count", 0)
+                    total = fill.get("total", 0)
+                    is_perfect = total > 0 and exact == total
+                    consecutive = consecutive + 1 if is_perfect else 0
+                    if is_perfect and self._state.first_perfect_epoch is None:
+                        try:
+                            self._state.first_perfect_epoch = int(entry.get("epoch"))
+                        except (TypeError, ValueError):
+                            pass
+                    if self._state.stable_perfect_epoch is None and consecutive >= window:
+                        try:
+                            self._state.stable_perfect_epoch = int(entry.get("epoch"))
+                        except (TypeError, ValueError):
+                            pass
+                self._consecutive_perfect = consecutive
+
+        if self._first_perfect_log_path.exists():
+            try:
+                saved_fp = json.loads(self._first_perfect_log_path.read_text())
+                if isinstance(saved_fp, dict):
+                    self._first_perfect_log = saved_fp
+            except (OSError, json.JSONDecodeError):
+                pass
+
     def on_epoch_end(self, args, state, control, **kwargs) -> None:  # noqa: ARG002
         """Probe fill (and optionally retention), update logs, check stop.
 

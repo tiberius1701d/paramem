@@ -186,6 +186,19 @@ class RecallProbeCallback(TrainerCallback):
         self._keys_in_phase = keys_in_phase
         self._cycle_started_at = int(time.time())
 
+        # Preserve cycle_started_at across tpause/tresume so wall-time math
+        # in tstatus remains anchored to the original cycle start.  Test 13
+        # resumes at phase boundaries (not within phases), so epoch_log
+        # rehydration isn't applicable here — only the timestamp.
+        if self._progress_path is not None and self._progress_path.exists():
+            try:
+                existing = json.loads(self._progress_path.read_text())
+                saved = existing.get("cycle_started_at")
+                if isinstance(saved, (int, float)):
+                    self._cycle_started_at = int(saved)
+            except (OSError, json.JSONDecodeError):
+                pass
+
     def on_epoch_end(self, args, state, control, **kwargs):
         epoch = int(round(state.epoch))
         if epoch <= self._last_epoch:
