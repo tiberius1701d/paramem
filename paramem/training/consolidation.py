@@ -17,17 +17,10 @@ from typing import Optional
 
 from torch.utils.data import Dataset
 
+from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.extractor import (
-    DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
-    DEFAULT_SYSTEM_PROMPT_FILENAME,
-    DEFAULT_USER_PROMPT_FILENAME,
-    DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME,
-    DOCUMENT_SYSTEM_PROMPT_FILENAME,
-    DOCUMENT_USER_PROMPT_FILENAME,
     PROVIDER_KEY_ENV,
     _graph_enrich_with_sota,
-    extract_graph,
-    extract_procedural_graph,
 )
 from paramem.graph.merger import GraphMerger, _normalize_predicate
 from paramem.graph.qa_generator import (
@@ -63,38 +56,6 @@ from paramem.utils.config import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _require_speaker_id(overrides: dict) -> str:
-    """Return the speaker_id from the overrides dict, raising if absent or empty.
-
-    ``_extraction_kwargs`` calls this so that a forgotten or empty
-    ``speaker_id`` surfaces as a clear ``ValueError`` rather than silently
-    propagating ``""`` into the extraction chain and being accepted by the
-    Pydantic schema.  Every caller of ``_run_extract_graph`` passes
-    ``speaker_id`` explicitly through ``extract_session`` / ``run_cycle`` /
-    server paths, so a missing value is always a programming error.
-
-    Args:
-        overrides: The ``**overrides`` dict forwarded to ``_extraction_kwargs``.
-
-    Returns:
-        The non-empty speaker_id string.
-
-    Raises:
-        ValueError: If ``speaker_id`` is absent from *overrides* or is an
-            empty string.
-    """
-    speaker_id = overrides.get("speaker_id", "")
-    if not speaker_id:
-        raise ValueError(
-            "_extraction_kwargs: speaker_id is required but was absent or empty. "
-            "Every caller must supply a real speaker ID (e.g. the SpeakerStore "
-            "anonymous-group ID for sessions without a named speaker). "
-            "Passing an empty string silently corrupts Relation.speaker_id and "
-            "breaks per-speaker preference scoping."
-        )
-    return speaker_id
 
 
 @dataclass
@@ -220,31 +181,42 @@ class ConsolidationLoop:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.extraction_temperature = extraction_temperature
-        self.extraction_max_tokens = extraction_max_tokens
-        self.extraction_plausibility_max_tokens = extraction_plausibility_max_tokens
-
-        # Extraction pipeline flags — the SOTA enrichment chain (anonymize →
-        # noise-filter → plausibility → de-anonymize → NER). Loop-level defaults
-        # propagate to every extraction; callers may override per call.
-        self.extraction_stt_correction = extraction_stt_correction
-        self.extraction_ha_validation = extraction_ha_validation
-        self.extraction_noise_filter = extraction_noise_filter
-        self.extraction_noise_filter_model = extraction_noise_filter_model
-        self.extraction_noise_filter_endpoint = extraction_noise_filter_endpoint
-        self.extraction_ner_check = extraction_ner_check
-        self.extraction_ner_model = extraction_ner_model
-        self.extraction_plausibility_judge = extraction_plausibility_judge
-        self.extraction_plausibility_stage = extraction_plausibility_stage
-        self.extraction_role_aware_grounding = extraction_role_aware_grounding
-        self.extraction_verify_anonymization = extraction_verify_anonymization
-        # Cloud egress / consolidation-enrichment PII anonymization scope.
-        # Sourced from ``ServerConfig.sanitization.cloud_scope`` at the
-        # bootstrap call site so consolidation honours the same operator
-        # policy as inference-time cloud egress.  ``None`` falls back to
-        # the primitive default in ``extractor.py`` (``{person, place}``)
-        # for back-compat with experiment scripts that don't pass a value.
-        self.extraction_pii_scope = extraction_pii_scope
+        # Extraction pipeline — the single chokepoint for ``extract_graph`` /
+        # ``extract_procedural_graph``.  Owns the 15 SOTA-pipeline tunables
+        # (temperature, max_tokens, anonymizer / noise_filter / plausibility /
+        # NER flags, PII scope, etc.) sourced from the ``extraction_*``
+        # ConsolidationLoop kwargs.  Every consolidation call site reaches the
+        # extractors through ``self.extraction.run`` / ``run_procedural`` —
+        # no direct ``extract_graph(...)`` calls in this module.
+        #
+        # Cloud egress PII anonymization scope (``extraction_pii_scope``) is
+        # sourced at the bootstrap call site from
+        # ``ServerConfig.sanitization.cloud_scope`` so consolidation honours
+        # the same operator policy as inference-time cloud egress.  ``None``
+        # falls back to the primitive default in ``extractor.py``
+        # (``{person, place}``) for back-compat with experiment scripts.
+        self.extraction = ExtractionPipeline(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            config=ExtractionConfig(
+                temperature=extraction_temperature,
+                max_tokens=extraction_max_tokens,
+                plausibility_max_tokens=extraction_plausibility_max_tokens,
+                stt_correction=extraction_stt_correction,
+                ha_validation=extraction_ha_validation,
+                noise_filter=extraction_noise_filter,
+                noise_filter_model=extraction_noise_filter_model,
+                noise_filter_endpoint=extraction_noise_filter_endpoint,
+                ner_check=extraction_ner_check,
+                ner_model=extraction_ner_model,
+                plausibility_judge=extraction_plausibility_judge,
+                plausibility_stage=extraction_plausibility_stage,
+                verify_anonymization=extraction_verify_anonymization,
+                role_aware_grounding=extraction_role_aware_grounding,
+                pii_scope=extraction_pii_scope,
+            ),
+            prompts_dir=prompts_dir,
+        )
 
         # Graph-level SOTA enrichment knobs (Task #10).
         self.graph_enrichment_enabled = graph_enrichment_enabled
@@ -486,98 +458,19 @@ class ConsolidationLoop:
             out.append(rel)
         return out
 
-    def _extraction_kwargs(self, *, source_type: str = "transcript", **overrides) -> dict:
-        """Build the full kwarg set passed to ``extract_graph``.
-
-        Resolves each flag to the per-call override if given (not None), else
-        the source-type-aware default below.  Single source of truth for every
-        extraction path.
-
-        ``source_type`` selects both prompt filenames AND the defaults of two
-        gates whose semantics are tied to dialogue content:
-
-        * ``"transcript"`` (default) — dialogue system prompt
-          (:data:`~paramem.graph.extractor.DEFAULT_SYSTEM_PROMPT_FILENAME`)
-          and user template
-          (:data:`~paramem.graph.extractor.DEFAULT_USER_PROMPT_FILENAME`).
-          ``stt_correction`` and ``ha_validation`` default to the loop-level
-          operator-configured values (typically ``True``).
-        * ``"document"`` — document system prompt
-          (:data:`~paramem.graph.extractor.DOCUMENT_SYSTEM_PROMPT_FILENAME`)
-          and user template
-          (:data:`~paramem.graph.extractor.DOCUMENT_USER_PROMPT_FILENAME`).
-          Narrator binding is handled by the ``{speaker_context}`` slot in
-          ``extraction_document.txt`` — no extra context string is needed.
-          ``stt_correction`` defaults to ``False`` (the input is already
-          written text — there is no STT artifact surface to correct), and
-          ``ha_validation`` defaults to ``False`` (Home Assistant entity
-          grounding is a dialogue-context concern).  Operators may still
-          override either explicitly via the per-call kwargs (e.g. when
-          ingesting an audiobook transcript through the document path).
-
-        ``speaker_id`` is **required** in *overrides* and must be a non-empty
-        string.  Callers that have no named speaker must pass the
-        SpeakerStore anonymous-group ID (e.g. ``"Speaker0"``).  An absent or
-        empty value raises :exc:`ValueError` via :func:`_require_speaker_id`
-        so the omission surfaces at call time rather than silently corrupting
-        every ``Relation.speaker_id`` downstream.
-        """
-
-        def pick(name: str, fallback):
-            val = overrides.get(name, None)
-            return fallback if val is None else val
-
-        if source_type == "document":
-            system_prompt_filename = DOCUMENT_SYSTEM_PROMPT_FILENAME
-            user_prompt_filename = DOCUMENT_USER_PROMPT_FILENAME
-            stt_correction_default = False
-            ha_validation_default = False
-        else:
-            system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
-            user_prompt_filename = DEFAULT_USER_PROMPT_FILENAME
-            stt_correction_default = self.extraction_stt_correction
-            ha_validation_default = self.extraction_ha_validation
-
-        return dict(
-            temperature=self.extraction_temperature,
-            max_tokens=self.extraction_max_tokens,
-            plausibility_max_tokens=self.extraction_plausibility_max_tokens,
-            prompts_dir=self.prompts_dir,
-            ha_context=overrides.get("ha_context"),
-            stt_correction=pick("stt_correction", stt_correction_default),
-            ha_validation=pick("ha_validation", ha_validation_default),
-            noise_filter=pick("noise_filter", self.extraction_noise_filter),
-            noise_filter_model=pick("noise_filter_model", self.extraction_noise_filter_model),
-            noise_filter_endpoint=pick(
-                "noise_filter_endpoint", self.extraction_noise_filter_endpoint
-            ),
-            speaker_name=overrides.get("speaker_name"),
-            ner_check=pick("ner_check", self.extraction_ner_check),
-            ner_model=pick("ner_model", self.extraction_ner_model),
-            plausibility_judge=pick("plausibility_judge", self.extraction_plausibility_judge),
-            plausibility_stage=pick("plausibility_stage", self.extraction_plausibility_stage),
-            verify_anonymization=pick("verify_anonymization", self.extraction_verify_anonymization),
-            role_aware_grounding=pick("role_aware_grounding", self.extraction_role_aware_grounding),
-            pii_scope=pick("pii_scope", self.extraction_pii_scope),
-            speaker_id=_require_speaker_id(overrides),
-            # Prompt-filename overrides flow through ``pick`` so calibration
-            # callers can swap in a calib_-prefixed variant.  The
-            # source-type-derived value is the fallback when no override is
-            # supplied — production paths (no overrides) preserve their
-            # current behaviour exactly.
-            system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
-            user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),
-            stop_phase=overrides.get("stop_phase"),
-        )
-
     def _dump_session_graph(self, graph: SessionGraph, session_id: str, kind: str) -> None:
         """Persist a per-session SessionGraph (with diagnostics) under debug mode.
 
-        Called from both extraction chokepoints (``_run_extract_graph`` and
-        ``_run_extract_procedural_graph``) so every extractor output is
-        captured before downstream merging strips per-session diagnostics
-        (``sota_raw_response``, ``residual_dropped_facts``,
+        Called immediately after every ``self.extraction.run`` /
+        ``self.extraction.run_procedural`` invocation so every extractor
+        output is captured before downstream merging strips per-session
+        diagnostics (``sota_raw_response``, ``residual_dropped_facts``,
         ``sota_updated_transcript``, ``fallback_path``).
+
+        Persistence stays with the consolidation orchestrator because the
+        snapshot path is cycle-scoped (``cycle_<N>/sessions/<id>/``) — the
+        extraction pipeline itself is cycle-agnostic and returns the graph
+        without side-effects.
 
         Same debug-mode gate as the cumulative graph snapshot.  Adapter
         allocation (episodic / semantic / procedural / interim) is downstream
@@ -598,102 +491,6 @@ class ConsolidationLoop:
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(graph.model_dump_json(indent=2))
-
-    def _run_extract_graph(
-        self,
-        session_transcript: str,
-        session_id: str,
-        *,
-        source_type: str = "transcript",
-        **overrides,
-    ):
-        """Single entry-point to ``extract_graph`` with unified flags + adapter guard.
-
-        Every orchestrator (``extract_session``, ``run_cycle``, future callers)
-        goes through this helper so the pipeline cannot diverge by accident.
-
-        ``source_type`` selects both the system prompt and the user template:
-        ``"transcript"`` (default) uses the dialogue prompts;
-        ``"document"`` uses the written-document prompts.  Narrator binding is
-        handled by the ``{speaker_context}`` slot in the user template — no
-        separate context string is required.
-        """
-        from peft import PeftModel as _PeftModel
-
-        self._disable_gradient_checkpointing()
-        kwargs = self._extraction_kwargs(
-            source_type=source_type,
-            **overrides,
-        )
-        if isinstance(self.model, _PeftModel):
-            with self.model.disable_adapter():
-                graph = extract_graph(
-                    self.model, self.tokenizer, session_transcript, session_id, **kwargs
-                )
-        else:
-            graph = extract_graph(
-                self.model, self.tokenizer, session_transcript, session_id, **kwargs
-            )
-        self._dump_session_graph(graph, session_id, "graph")
-        return graph
-
-    def _run_extract_procedural_graph(
-        self,
-        session_transcript: str,
-        session_id: str,
-        speaker_id: str,
-        speaker_name: str | None = None,
-        stt_correction: bool | None = None,
-        source_type: str = "transcript",
-    ):
-        """Single entry-point to ``extract_procedural_graph`` with adapter guard.
-
-        ``source_type`` mirrors the same parameter on ``_run_extract_graph``:
-        ``"document"`` selects the written-document system prompt so the
-        procedural extractor is not primed with dialogue-style few-shots.
-        It also flips the ``stt_correction`` default to ``False`` for the
-        same reason as ``_extraction_kwargs`` — written text has no STT
-        artefact surface.  Explicit ``stt_correction`` overrides still win.
-
-        ``speaker_id`` is stamped onto every ``Relation`` produced by the
-        procedural extractor as provenance. Required — callers must always
-        supply a real speaker ID.
-        """
-        from peft import PeftModel as _PeftModel
-
-        self._disable_gradient_checkpointing()
-        stt_default = False if source_type == "document" else self.extraction_stt_correction
-        stt = stt_default if stt_correction is None else stt_correction
-        system_prompt_filename = (
-            DOCUMENT_SYSTEM_PROMPT_FILENAME
-            if source_type == "document"
-            else DEFAULT_SYSTEM_PROMPT_FILENAME
-        )
-        user_prompt_filename = (
-            DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME
-            if source_type == "document"
-            else DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME
-        )
-        call_kwargs = dict(
-            max_tokens=self.extraction_max_tokens,
-            prompts_dir=self.prompts_dir,
-            stt_correction=stt,
-            speaker_name=speaker_name,
-            speaker_id=speaker_id,
-            system_prompt_filename=system_prompt_filename,
-            user_prompt_filename=user_prompt_filename,
-        )
-        if isinstance(self.model, _PeftModel):
-            with self.model.disable_adapter():
-                graph = extract_procedural_graph(
-                    self.model, self.tokenizer, session_transcript, session_id, **call_kwargs
-                )
-        else:
-            graph = extract_procedural_graph(
-                self.model, self.tokenizer, session_transcript, session_id, **call_kwargs
-            )
-        self._dump_session_graph(graph, session_id, "procedural_graph")
-        return graph
 
     def extract_session(
         self,
@@ -738,7 +535,7 @@ class ConsolidationLoop:
         logger.info("=== Extraction (session=%s) ===", session_id)
 
         # --- EXTRACT ---
-        session_graph = self._run_extract_graph(
+        session_graph = self.extraction.run(
             session_transcript,
             session_id,
             source_type=source_type,
@@ -757,6 +554,7 @@ class ConsolidationLoop:
             verify_anonymization=verify_anonymization,
             role_aware_grounding=role_aware_grounding,
         )
+        self._dump_session_graph(session_graph, session_id, "graph")
 
         logger.info(
             "Extracted %d entities, %d relations",
@@ -789,7 +587,7 @@ class ConsolidationLoop:
 
         # --- PROCEDURAL: separate extraction pass ---
         if self.procedural_config is not None:
-            proc_graph = self._run_extract_procedural_graph(
+            proc_graph = self.extraction.run_procedural(
                 session_transcript,
                 session_id,
                 speaker_name=speaker_name,
@@ -797,6 +595,7 @@ class ConsolidationLoop:
                 source_type=source_type,
                 speaker_id=speaker_id,
             )
+            self._dump_session_graph(proc_graph, session_id, "procedural_graph")
             procedural_rels.extend(
                 {
                     "subject": r.subject,
@@ -1420,15 +1219,17 @@ class ConsolidationLoop:
         )
 
         # --- 1. EXTRACT ---
-        # Unified extraction path: same helper as extract_session(), so every
-        # SOTA pipeline flag configured on the loop is applied identically.
-        session_graph = self._run_extract_graph(
+        # Unified extraction path: every consolidation site reaches the
+        # extractors through ``self.extraction`` so every SOTA pipeline flag
+        # configured on the loop is applied identically.
+        session_graph = self.extraction.run(
             session_transcript,
             session_id,
             source_type=source_type,
             speaker_name=speaker_name,
             speaker_id=speaker_id,
         )
+        self._dump_session_graph(session_graph, session_id, "graph")
 
         result.entities_extracted = len(session_graph.entities)
         result.relations_extracted = len(session_graph.relations)
@@ -1471,13 +1272,14 @@ class ConsolidationLoop:
         # Mirror extract_session(): run the dedicated procedural prompt so
         # experiments exercise the same pipeline as production.
         if self.procedural_config is not None:
-            proc_graph = self._run_extract_procedural_graph(
+            proc_graph = self.extraction.run_procedural(
                 session_transcript,
                 session_id,
                 speaker_name=speaker_name,
                 source_type=source_type,
                 speaker_id=speaker_id,
             )
+            self._dump_session_graph(proc_graph, session_id, "procedural_graph")
             procedural_rels.extend(
                 {
                     "subject": r.subject,
@@ -3050,7 +2852,12 @@ class ConsolidationLoop:
             )
             return {**_empty, "skipped": True, "skip_reason": "floor"}
 
-        provider = self.extraction_noise_filter
+        # Graph-tier SOTA enrichment shares the operator-configured provider
+        # with session-tier extraction (anonymize → noise-filter → plausibility
+        # chain).  Reading from ``self.extraction.config`` keeps both tiers
+        # pointing at the same model + endpoint without an extra knob.
+        ext_cfg = self.extraction.config
+        provider = ext_cfg.noise_filter
         if not provider:
             logger.info("graph_enrichment: no SOTA provider configured — skipping")
             return {**_empty, "skipped": True, "skip_reason": "no_provider"}
@@ -3065,8 +2872,8 @@ class ConsolidationLoop:
             )
             return {**_empty, "skipped": True, "skip_reason": "no_api_key"}
 
-        filter_model = self.extraction_noise_filter_model
-        endpoint = self.extraction_noise_filter_endpoint or None
+        filter_model = ext_cfg.noise_filter_model
+        endpoint = ext_cfg.noise_filter_endpoint or None
         max_entities = max(1, self.graph_enrichment_max_entities_per_pass)
         hops = max(1, self.graph_enrichment_neighborhood_hops)
 

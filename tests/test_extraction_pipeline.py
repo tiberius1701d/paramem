@@ -968,14 +968,21 @@ class TestSOTANoiseFilter:
         assert result.relations[0].subject == "Alex"
         assert result.relations[0].object == "Millfield"
 
-    def test_pipeline_drops_hallucinated_leak(self):
-        """A leaked name NOT in the transcript is classified hallucinated and dropped (D1).
+    def test_deterministic_builder_preempts_hallucinated_leak_for_graph_entities(self):
+        """Under the consolidated deterministic mapping builder, the
+        hallucinated-leak repair path is **not reachable** for entities
+        that exist in ``graph.entities`` — the builder mints a
+        placeholder for every in-scope entity, so the LLM-supplied
+        ``Ghost`` token in ``anon_facts`` is substituted to
+        ``Person_2`` before the verifier runs.  No leak is detected,
+        repair never fires, SOTA is called with fully-scrubbed facts.
 
-        When "Ghost" is in anon_facts but not in the transcript, repair classifies it
-        as hallucinated and drops the referencing triple from anon_facts. After repair,
-        anon_facts is empty → the pipeline returns an empty graph (no triples survive,
-        SOTA is skipped). This is correct: a fact whose object is a hallucinated entity
-        should not reach the adapter.
+        This is the architecturally-correct outcome: the hallucinated-
+        leak repair path used to be a reactive safety net for
+        LLM-omitted mappings; the deterministic builder makes it
+        unnecessary for graph-resident names.  The repair path remains
+        live only for names supplied by NER (``extract_pii_names_with_ner``)
+        that are not in ``graph.entities`` — covered by a separate test.
         """
         from paramem.graph.extractor import _sota_pipeline
 
@@ -1003,15 +1010,24 @@ class TestSOTANoiseFilter:
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
-            result = _sota_pipeline(
-                graph, "Alex mentioned something.", None, None, speaker_id="Speaker0"
-            )
+            _sota_pipeline(graph, "Alex mentioned something.", None, None, speaker_id="Speaker0")
 
-        # The hallucinated triple is dropped during repair.
-        # After repair anon_facts is empty → grounding_gate="no_input", no facts survive.
-        assert filter_calls == [], "SOTA must not be called when anon_facts is empty after repair"
-        assert len(result.relations) == 0
-        assert result.diagnostics.get("grounding_gate") == "no_input"
+        # SOTA WAS called — the deterministic builder substituted
+        # ``Ghost`` to its placeholder before verify ran, so no leak
+        # was detected and the repair path did not fire.
+        assert len(filter_calls) == 1, (
+            "SOTA must be called once after deterministic-builder substitution"
+        )
+        sent_facts = filter_calls[0]
+        assert len(sent_facts) == 1
+        # ``Ghost`` must be substituted out of the object field.
+        assert sent_facts[0]["object"] != "Ghost", (
+            f"Ghost must be substituted before SOTA, got {sent_facts[0]['object']!r}"
+        )
+        obj = sent_facts[0]["object"]
+        assert obj.startswith("Person_"), (
+            f"object must be the deterministic Person_N placeholder, got {obj!r}"
+        )
 
     def test_pipeline_normalizes_mixed_direction_mapping_per_pair(self):
         """Mixed-direction mappings from the anonymizer are normalized per-pair.
@@ -1984,31 +2000,36 @@ class TestPlausibilityDeanon:
 
 
 class TestResidualLeakDropsReferencingTriples:
-    """§7 test 3: D1 — residual leak drops referencing triples, non-referencing survive."""
+    """§7 test 3: D1 — residual-leak fact-level filter.
+
+    The fact-level residual filter exists for the case where
+    ``verify_anonymization_completeness`` flags a leak that the
+    deterministic builder did not pre-empt.  Under the consolidated
+    architecture this can happen only when the leaked name is supplied
+    externally — typically by ``extract_pii_names_with_ner`` over the
+    transcript.  The test below mocks NER to surface ``Ghost`` as a
+    PII name not present in ``graph.entities``; the builder doesn't
+    mint for it, the verifier flags it, repair leaves the residual
+    intact, and the fact-level filter drops only the triples that
+    reference the leaked name.
+    """
 
     def test_residual_leak_filters_fact_level(self):
-        """On residual leak after repair (canonical mapping), only leaked-name triples
-        are dropped. Non-referencing triples survive through the local path (SOTA skipped).
-
-        Setup: _repair_anonymization_leaks is mocked to return anon_facts that still
-        contain a leaked name in the object field, simulating a scenario where repair
-        cannot eliminate the leak. The second verify mock confirms the residual leak,
-        triggering fact-level filtering (_skip_sota=True).
-        """
         from paramem.graph.extractor import _sota_pipeline
 
+        # Ghost is NOT in graph.entities — the deterministic builder
+        # therefore does not mint a placeholder for it.  NER (mocked
+        # below) surfaces it as PII.
         graph = _make_graph(
             [
                 ("Alex", "lives_in", "Millfield"),
-                ("Alex", "friend_of", "Ghost"),  # referenced by the leak
+                ("Alex", "friend_of", "Ghost"),
             ],
             entities=[
                 Entity(name="Alex", entity_type="person"),
                 Entity(name="Millfield", entity_type="place"),
-                Entity(name="Ghost", entity_type="person"),
             ],
         )
-        # anon_facts still has Ghost (not anonymized in object position)
         anon_facts_initial = [
             {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
             {"subject": "Person_1", "predicate": "friend_of", "object": "Ghost"},
@@ -2023,13 +2044,10 @@ class TestResidualLeakDropsReferencingTriples:
             sota_calls.append(list(facts))
             return facts, None, {}, None, {}
 
-        # Mock repair to return anon_facts that STILL contain Ghost (residual leak)
         def fake_repair(
             graph, mapping, anon_facts, anon_transcript, orig_transcript, leaked, **kwargs
         ):
-            # Repair "runs" but Ghost remains in object position — residual leak.
-            # **kwargs absorbs newer optional args like extra_pii_types so this
-            # mock doesn't need to change every time the real signature grows.
+            # Repair runs but Ghost remains — residual leak.
             return (
                 anon_facts,
                 mapping,
@@ -2048,6 +2066,11 @@ class TestResidualLeakDropsReferencingTriples:
                 side_effect=fake_repair,
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+            # NER surfaces Ghost — not in graph.entities — as person PII.
+            patch(
+                "paramem.graph.extractor.extract_pii_names_with_ner",
+                return_value={"Ghost": "person"},
+            ),
         ):
             result = _sota_pipeline(
                 graph,
@@ -2056,6 +2079,7 @@ class TestResidualLeakDropsReferencingTriples:
                 None,
                 speaker_id="Speaker0",
                 plausibility_judge="off",
+                ner_check=True,
             )
 
         # SOTA must NOT be called (_skip_sota=True after residual leak)
@@ -2714,90 +2738,246 @@ class TestConsolidationScheduleConfigPrivacyGuard:
 # ---------------------------------------------------------------------------
 
 
-class TestEnsureSpeakerNameInMapping:
-    """Unit tests for _ensure_speaker_name_in_mapping (Bug A fix).
+class TestBuildAnonymizationMapping:
+    """Unit tests for the consolidated :func:`_build_anonymization_mapping`.
 
-    Verifies that the speaker's display name is added to the anonymizer
-    mapping when it is absent, preventing the forward-path verifier from
-    flagging bare first-name occurrences as residual leaks.
+    The builder is the single source of truth for ``real → placeholder``.
+    It folds the responsibilities of three earlier "Bug X fix" helpers
+    (``_ensure_speaker_name_in_mapping``,
+    ``_extend_mapping_with_pii_attributes``, ambiguous-pair drop) into
+    one deterministic walk over ``graph.entities``.
+
+    Coverage:
+    - Mints placeholders for in-scope entity names.
+    - Adds PII attribute values under the parent entity's placeholder.
+    - Speaker-name seeding when the runtime knows the display name and
+      it isn't covered by entities or LLM hints.
+    - Merges in LLM-only entries (relation participants the graph
+      doesn't know about) without overwriting deterministic ones.
+    - Out-of-scope entities are not minted.
+    - PII attributes on an out-of-scope entity are not minted.
     """
 
-    def test_speaker_already_in_mapping_noop(self):
-        """No change when speaker_name is already a key."""
-        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+    @staticmethod
+    def _build(entities, *, llm_mapping=None, pii_scope=None, speaker_name=None):
+        from paramem.graph.extractor import _build_anonymization_mapping
 
-        mapping = {"Alex": "Person_1"}
-        result = _ensure_speaker_name_in_mapping(mapping, "Alex")
-        assert result == {"Alex": "Person_1"}
-
-    def test_none_speaker_name_noop(self):
-        """Returns mapping unchanged when speaker_name is None."""
-        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
-
-        mapping = {"Alex Smith": "Person_1"}
-        result = _ensure_speaker_name_in_mapping(mapping, None)
-        assert result == {"Alex Smith": "Person_1"}
-
-    def test_empty_speaker_name_noop(self):
-        """Returns mapping unchanged when speaker_name is empty string."""
-        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
-
-        mapping = {"Alex Smith": "Person_1"}
-        result = _ensure_speaker_name_in_mapping(mapping, "")
-        assert result == {"Alex Smith": "Person_1"}
-
-    def test_bare_first_name_reuses_full_name_placeholder(self):
-        """Bare first name is seeded with the SAME placeholder as the full-name key.
-
-        Scenario: anonymizer mapped 'Alex Rivera → Person_1' but left
-        'Alex' (bare first name) out of the mapping.  After
-        _stamp_speaker_entity renames the entity to 'Alex', the verifier
-        flags it.  The fix must reuse Person_1 (not allocate Person_2) so
-        both forms de-anonymize to the same person.
-        """
-        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
-
-        mapping = {"Alex Rivera": "Person_1"}
-        result = _ensure_speaker_name_in_mapping(mapping, "Alex")
-        assert "Alex" in result, "bare first name must be added to mapping"
-        assert result["Alex"] == "Person_1", (
-            "bare first name must reuse the same placeholder as the full-name key"
+        graph = SessionGraph(
+            session_id="s",
+            timestamp="2026-05-06T00:00:00Z",
+            entities=entities,
+            relations=[],
         )
-        # Original key must be preserved.
-        assert result["Alex Rivera"] == "Person_1"
+        return _build_anonymization_mapping(
+            graph,
+            llm_mapping or {},
+            pii_scope=pii_scope,
+            speaker_name=speaker_name,
+        )
 
-    def test_fresh_placeholder_when_no_full_name_key(self):
-        """Fresh Person_N allocated when no full-name key shares the prefix."""
-        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+    def test_mints_placeholders_for_in_scope_entities(self):
+        mapping = self._build(
+            [
+                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Berlin", entity_type="place"),
+                Entity(name="Globex", entity_type="organization"),
+            ],
+            pii_scope={"person", "place"},
+        )
+        assert mapping["Alex"] == "Person_1"
+        assert mapping["Berlin"] == "City_1"
+        # Organization is NOT in pii_scope → not minted by the builder.
+        assert "Globex" not in mapping
 
-        mapping = {"Alice": "Person_1"}
-        result = _ensure_speaker_name_in_mapping(mapping, "Bob")
-        assert "Bob" in result, "speaker name must be added when absent"
-        ph = result["Bob"]
-        assert ph.startswith("Person_"), f"fresh placeholder must use Person_ prefix, got {ph!r}"
-        # Must not collide with existing placeholder.
-        assert ph != "Person_1"
+    def test_pii_attributes_share_parent_placeholder(self):
+        mapping = self._build(
+            [
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    speaker_id="Speaker0",
+                    attributes={
+                        "last_name": "Walker",
+                        "email": "alex.walker@example.com",
+                        "linkedin": "linkedin.com/in/tobias-preusser",
+                        "phone": "+49 178 36 21 668",
+                        "location": "Germany",
+                        # Non-PII attribute MUST NOT enter the mapping.
+                        "job_title": "Senior Engineer",
+                    },
+                )
+            ],
+            pii_scope={"person"},
+        )
+        # Parent placeholder.
+        assert mapping["Alex"] == "Person_1"
+        # PII attributes share the parent placeholder.
+        for v in (
+            "Walker",
+            "alex.walker@example.com",
+            "linkedin.com/in/tobias-preusser",
+            "+49 178 36 21 668",
+            "Germany",
+        ):
+            assert mapping[v] == "Person_1"
+        # Non-PII attribute is not added.
+        assert "Senior Engineer" not in mapping
 
-    def test_does_not_mutate_input(self):
-        """Input mapping is not mutated — a new dict is returned."""
-        from paramem.graph.extractor import _ensure_speaker_name_in_mapping
+    def test_pii_attributes_on_out_of_scope_entity_not_minted(self):
+        mapping = self._build(
+            [
+                Entity(
+                    name="Globex",
+                    entity_type="organization",
+                    attributes={"city": "Springfield"},
+                )
+            ],
+            pii_scope={"person", "place"},
+        )
+        assert "Globex" not in mapping
+        # Springfield is on an out-of-scope entity — also not minted.
+        assert "Springfield" not in mapping
 
-        original = {"Alex Smith": "Person_1"}
-        _ensure_speaker_name_in_mapping(original, "Alex")
-        assert "Alex" not in original, "input mapping must not be mutated"
+    def test_speaker_name_already_in_entities_noop(self):
+        mapping = self._build(
+            [Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+            pii_scope={"person"},
+            speaker_name="Alex",
+        )
+        # Speaker name already covered by the entity walk.
+        assert mapping == {"Alex": "Person_1"}
 
-    def test_speaker_name_in_mapping_after_call_prevents_verifier_flag(self):
-        """After seeding, verify_anonymization_completeness no longer flags the bare first name.
+    def test_speaker_name_reuses_speaker_entity_placeholder(self):
+        """Anonymous→disclosed: graph still has anonymous ``Speaker0``
+        as the entity name but runtime knows the display name as
+        ``Alex``.  Both must share the same placeholder.
+        """
+        mapping = self._build(
+            [Entity(name="Speaker0", entity_type="person", speaker_id="Speaker0")],
+            pii_scope={"person"},
+            speaker_name="Alex",
+        )
+        assert mapping["Speaker0"] == "Person_1"
+        assert mapping["Alex"] == "Person_1", (
+            "speaker_name must reuse the speaker entity's placeholder"
+        )
 
-        This is the end-to-end regression test for Bug A:
-        - Graph entity renamed to 'Alex' (bare first name) by _stamp_speaker_entity.
-        - Anonymizer mapped 'Alex Smith → Person_1' but not 'Alex'.
-        - After _ensure_speaker_name_in_mapping, 'Alex' → 'Person_1' is in the mapping.
-        - Anonymized transcript and facts contain 'Person_1', not 'Alex'.
-        - Verifier returns no leaks.
+    def test_speaker_name_reuses_llm_full_name_placeholder(self):
+        """No speaker entity in scope; LLM seeded a full-name key
+        (``Alex Rivera``); seeding ``Alex`` reuses that placeholder
+        so both forms de-anonymize to the same person.
+        """
+        mapping = self._build(
+            entities=[],
+            llm_mapping={"Alex Rivera": "Person_1"},
+            pii_scope={"person"},
+            speaker_name="Alex",
+        )
+        assert mapping["Alex"] == "Person_1"
+        assert mapping["Alex Rivera"] == "Person_1"
+
+    def test_speaker_name_mints_fresh_when_no_match(self):
+        mapping = self._build(
+            entities=[],
+            llm_mapping={"Alice": "Person_1"},  # unrelated full name
+            pii_scope={"person"},
+            speaker_name="Bob",
+        )
+        assert "Bob" in mapping
+        ph = mapping["Bob"]
+        assert ph.startswith("Person_") and ph != "Person_1"
+
+    def test_llm_only_entries_merged_in(self):
+        """Relation participants the LLM placeholdered but the graph
+        doesn't know about (e.g. ``Honda``) survive into the final
+        mapping via the LLM hint merge.
+        """
+        mapping = self._build(
+            [Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+            llm_mapping={"Honda": "Product_1"},
+            pii_scope={"person"},
+        )
+        assert mapping["Alex"] == "Person_1"
+        assert mapping["Honda"] == "Product_1"
+
+    def test_deterministic_wins_on_conflict(self):
+        """If the LLM mapped ``Alex → Person_2`` but the
+        deterministic build mints ``Alex → Person_1``, the
+        deterministic entry wins (we trust the graph)."""
+        mapping = self._build(
+            [Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+            llm_mapping={"Alex": "Person_2"},
+            pii_scope={"person"},
+        )
+        assert mapping["Alex"] == "Person_1"
+
+    def test_pii_value_already_keyed_by_llm_kept(self):
+        """If an attribute value was already a key in the LLM mapping
+        (LLM saw it in some relation), the LLM's placeholder wins
+        because ``setdefault`` honours the deterministic build's
+        first-write semantics.  Test documents the precise rule:
+        deterministic adds only when the value isn't already mapped.
+        """
+        mapping = self._build(
+            [
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    speaker_id="Speaker0",
+                    attributes={"last_name": "Walker"},
+                )
+            ],
+            # Builder runs FIRST and adds Walker → Person_1 from
+            # attributes; LLM hint Walker → Person_2 is then merged
+            # via setdefault and ignored.
+            llm_mapping={"Walker": "Person_2"},
+            pii_scope={"person"},
+        )
+        assert mapping["Walker"] == "Person_1"
+
+    def test_skips_empty_or_whitespace_attribute_values(self):
+        mapping = self._build(
+            [
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    speaker_id="Speaker0",
+                    attributes={"last_name": "", "email": "   ", "phone": "+49 1"},
+                )
+            ],
+            pii_scope={"person"},
+        )
+        assert mapping["+49 1"] == "Person_1"
+        assert "" not in mapping
+        assert "   " not in mapping
+
+    def test_default_pii_scope_when_none(self):
+        """``pii_scope=None`` falls back to :data:`_DEFAULT_PII_SCOPE`
+        (``{"person", "place"}``), so persons and places are minted
+        but organizations and concepts are not.
+        """
+        mapping = self._build(
+            [
+                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Berlin", entity_type="place"),
+                Entity(name="Globex", entity_type="organization"),
+                Entity(name="Volvo V70", entity_type="concept"),
+            ],
+            pii_scope=None,
+        )
+        assert "Alex" in mapping
+        assert "Berlin" in mapping
+        assert "Globex" not in mapping
+        assert "Volvo V70" not in mapping
+
+    def test_end_to_end_verifier_passes_after_build(self):
+        """After the builder runs, the verifier finds no leaks for an
+        anon_transcript and anon_facts that fully use the placeholders.
+        Locks the contract that the builder produces a complete enough
+        mapping for verify to succeed.
         """
         from paramem.graph.extractor import (
-            _ensure_speaker_name_in_mapping,
+            _build_anonymization_mapping,
             verify_anonymization_completeness,
         )
 
@@ -2808,18 +2988,16 @@ class TestEnsureSpeakerNameInMapping:
                 Entity(name="Google", entity_type="organization"),
             ],
         )
-        mapping = {"Alex Smith": "Person_1", "Google": "Org_1"}
-        mapping = _ensure_speaker_name_in_mapping(mapping, "Alex")
-
-        # After seeding, 'Alex' → 'Person_1' is in the mapping.
-        assert mapping.get("Alex") == "Person_1"
-
+        mapping = _build_anonymization_mapping(
+            graph,
+            {"Google": "Org_1"},  # LLM hint for the org.
+            pii_scope={"person"},
+            speaker_name="Alex",
+        )
         anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Org_1"}]
         anon_transcript = "Person_1 works at Org_1."
         leaked = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
-        assert leaked == [], (
-            f"verifier must not flag leaks after speaker-name seeding, got {leaked!r}"
-        )
+        assert leaked == [], f"verifier must report no leaks; got {leaked!r}"
 
 
 # ---------------------------------------------------------------------------

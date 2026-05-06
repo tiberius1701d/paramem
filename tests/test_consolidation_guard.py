@@ -17,8 +17,12 @@ def _make_loop() -> ConsolidationLoop:
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     # Provide just enough attributes for guard_trial_state and run_cycle guard.
     loop.state_provider = None
-    # Minimal attributes required for run_cycle before _run_extract_graph is called.
+    # Minimal attributes required for run_cycle before extraction is called.
     loop.cycle_count = 0
+    # Stand-in extraction pipeline — tests patch ``loop.extraction.run`` to
+    # assert the guard fires before extraction is reached.  No real model
+    # is required because the patch short-circuits the call.
+    loop.extraction = MagicMock()
     return loop
 
 
@@ -78,21 +82,17 @@ class TestRunCycleGuard:
 
         Verifies the state_provider injection: loop.state_provider returns a
         TRIAL state dict; run_cycle must raise TrialActiveError before any
-        extraction (verified by patching _run_extract_graph to AssertionError).
+        extraction (verified by patching loop.extraction.run to AssertionError).
         """
-        from unittest.mock import patch
-
         trial_state = {"migration": {"state": "TRIAL"}}
         loop = _make_loop()
         loop.state_provider = lambda: trial_state
+        loop.extraction.run.side_effect = AssertionError(
+            "should not be called — guard must raise first"
+        )
 
-        with patch.object(
-            loop.__class__,
-            "_run_extract_graph",
-            side_effect=AssertionError("should not be called — guard must raise first"),
-        ):
-            with pytest.raises(TrialActiveError):
-                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
+        with pytest.raises(TrialActiveError):
+            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
 
     def test_run_cycle_proceeds_when_live(self):
         """run_cycle does NOT block when state_provider returns LIVE state.
@@ -100,38 +100,25 @@ class TestRunCycleGuard:
         This test only verifies that the guard does not raise; it does NOT run
         the full extraction (which requires a real model).
         """
-        from unittest.mock import patch
-
         live_state = {"migration": {"state": "LIVE"}}
         loop = _make_loop()
         loop.state_provider = lambda: live_state
+        loop.extraction.run.side_effect = RuntimeError("extract called — guard did not block")
 
-        # Patch the cycle body so no real GPU work happens.
-        with patch.object(
-            loop.__class__,
-            "_run_extract_graph",
-            side_effect=RuntimeError("extract called — guard did not block"),
-        ):
-            # Guard should pass; RuntimeError from extract (not TrialActiveError).
-            with pytest.raises(RuntimeError, match="extract called"):
-                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
+        # Guard should pass; RuntimeError from extract (not TrialActiveError).
+        with pytest.raises(RuntimeError, match="extract called"):
+            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
 
     def test_run_cycle_proceeds_when_no_state_provider(self):
         """run_cycle is unaffected when state_provider is None (experiment path)."""
-        from unittest.mock import patch
-
         loop = _make_loop()
         # state_provider defaults to None for experiment scripts.
         assert loop.state_provider is None
+        loop.extraction.run.side_effect = RuntimeError("extract called — guard did not block")
 
-        with patch.object(
-            loop.__class__,
-            "_run_extract_graph",
-            side_effect=RuntimeError("extract called — guard did not block"),
-        ):
-            # No TrialActiveError; RuntimeError from extract is expected.
-            with pytest.raises(RuntimeError, match="extract called"):
-                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
+        # No TrialActiveError; RuntimeError from extract is expected.
+        with pytest.raises(RuntimeError, match="extract called"):
+            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
 
 
 class TestEndpointGuards:
@@ -215,22 +202,17 @@ class TestReplayLoopGuard:
         This mirrors the _replay_loop path in app.py:1321 where Fix 4 adds
         state_provider=lambda: _state.
         """
-        from unittest.mock import patch
-
         from paramem.training.consolidation import ConsolidationLoop, TrialActiveError
 
         trial_state = {"migration": {"state": "TRIAL"}}
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.state_provider = lambda: trial_state
         loop.cycle_count = 0
+        loop.extraction = MagicMock()
+        loop.extraction.run.side_effect = AssertionError("should not reach extraction")
 
-        with patch.object(
-            loop.__class__,
-            "_run_extract_graph",
-            side_effect=AssertionError("should not reach extraction"),
-        ):
-            with pytest.raises(TrialActiveError):
-                loop.run_cycle("transcript", "session-x", speaker_id="Speaker0")
+        with pytest.raises(TrialActiveError):
+            loop.run_cycle("transcript", "session-x", speaker_id="Speaker0")
 
         # Verify state_provider is stored and callable.
         assert loop.state_provider is not None, "state_provider must not be None"
@@ -244,8 +226,6 @@ class TestReplayLoopGuard:
         correctly blocks run_cycle once the state transitions to TRIAL.
         This is the regression guard for Fix 4.
         """
-        from unittest.mock import patch
-
         from paramem.training.consolidation import ConsolidationLoop, TrialActiveError
 
         shared_state = {"migration": {"state": "TRIAL"}}
@@ -253,11 +233,10 @@ class TestReplayLoopGuard:
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.state_provider = lambda: shared_state
         loop.cycle_count = 0
+        loop.extraction = MagicMock()
+        loop.extraction.run.side_effect = AssertionError(
+            "should not reach extraction — guard must fire first"
+        )
 
-        with patch.object(
-            loop.__class__,
-            "_run_extract_graph",
-            side_effect=AssertionError("should not reach extraction — guard must fire first"),
-        ):
-            with pytest.raises(TrialActiveError):
-                loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
+        with pytest.raises(TrialActiveError):
+            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")

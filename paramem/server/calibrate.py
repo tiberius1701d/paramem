@@ -15,8 +15,12 @@ endpoint.  No call modifies weights or writes production data on disk.
 Endpoints:
 
 * ``POST /calibrate/extract`` — runs the local extractor through
-  :meth:`ConsolidationLoop._run_extract_graph` (the single-topology
-  chokepoint).  Returns the local-only graph (pre-anonymization).
+  :class:`paramem.graph.extraction_pipeline.ExtractionPipeline` (the
+  single-topology chokepoint).  The pipeline instance is held by the
+  process-wide ``ConsolidationLoop`` (lazy-built on first /consolidate
+  or /calibrate call); calibrate reaches it via ``loop.extraction`` so
+  every flag the production cycle applies is applied here too.  Returns
+  the local-only graph (pre-anonymization).
 * ``POST /calibrate/anonymize`` — runs ``_anonymize_with_local_model`` on
   the caller-supplied SessionGraph + transcript.
 * ``POST /calibrate/plausibility`` — runs ``_local_plausibility_filter``
@@ -294,16 +298,18 @@ def _preflight(state: dict) -> None:
 def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, Any]:
     """Run the local extractor for a single transcript.
 
-    Routes through ``ConsolidationLoop._run_extract_graph`` (the
-    single-topology chokepoint).  Never calls ``extract_graph`` directly.
+    Routes through :meth:`ExtractionPipeline.run` (the single-topology
+    chokepoint).  The pipeline lives on the process-wide
+    ``ConsolidationLoop`` so calibration calls share the exact instance
+    the production /consolidate cycle uses — same model, same config,
+    same flags.  Never calls ``extract_graph`` directly.
     """
     _preflight(state)
     # Lazy-init the loop the same way the production /consolidate handler does.
     # This is not a parallel route — it's the same factory and the same single
     # ConsolidationLoop instance.  The FIRST call (calibrate or consolidate)
-    # creates it; subsequent calls reuse.  No weight modification, no disk
-    # writes — `_run_extract_graph` is read-only, the merger and trainer
-    # come AFTER, in the consolidation orchestrator, and are NOT called here.
+    # creates it; subsequent calls reuse.  Calibration touches only
+    # ``loop.extraction`` (read-only): no merger, no trainer, no disk writes.
     loop = state.get("consolidation_loop")
     if loop is None:
         from paramem.server.consolidation import create_consolidation_loop
@@ -321,15 +327,11 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
     # Resolve prompt files for transparency: even though the actual read
     # happens inside extract_graph via ``_load_prompt``, we surface the
     # operator-supplied path + sha + content in the response so dump
-    # diffs show prompt provenance directly.
-    user_filename = req.extraction_prompt_filename or (
-        "extraction_document.txt" if req.source_type == "document" else "extraction.txt"
-    )
-    sys_filename = req.extraction_system_prompt_filename or (
-        "extraction_system_document.txt"
-        if req.source_type == "document"
-        else "extraction_system.txt"
-    )
+    # diffs show prompt provenance directly.  One prompt-pair is the
+    # single ground truth for every source type — document chunks land
+    # in the same ``{transcript}`` slot.
+    user_filename = req.extraction_prompt_filename or "extraction.txt"
+    sys_filename = req.extraction_system_prompt_filename or "extraction_system.txt"
     user_prompt_path, user_prompt_sha, user_prompt_content = _read_prompt(
         req.prompts_dir, user_filename
     )
@@ -359,7 +361,7 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
     vram_before = _vram_block()
     t0 = time.perf_counter()
     with _cudnn_deterministic():
-        graph = loop._run_extract_graph(
+        graph = loop.extraction.run(
             req.transcript,
             req.session_id,
             source_type=req.source_type,

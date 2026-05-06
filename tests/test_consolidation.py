@@ -217,11 +217,11 @@ class TestExtractionPathParity:
             return procedural_graph
 
         monkeypatch.setattr(
-            "paramem.training.consolidation.extract_graph",
+            "paramem.graph.extraction_pipeline.extract_graph",
             extract_graph_spy if extract_graph_spy is not None else _default_extract,
         )
         monkeypatch.setattr(
-            "paramem.training.consolidation.extract_procedural_graph",
+            "paramem.graph.extraction_pipeline.extract_procedural_graph",
             extract_procedural_spy
             if extract_procedural_spy is not None
             else _default_extract_procedural,
