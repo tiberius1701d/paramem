@@ -1,17 +1,23 @@
 # Test 14a-pre — reproduction & extension
 
-## Status (2026-05-04)
+## Status (2026-05-06)
 
-**Apples-to-apples scheduler config validated by single-seed smoke.**
-The V3/seed42 smoke at `linear + B50 + decay=600` locked at `stable_perfect=20`,
-matching the V3 reference (n=1, B30 stock-linear, stable=20) exactly. 89 min
-wall. Decay window of 600 optimizer steps reproduces the V3 ref LR trajectory
-through epoch 30; the B50 budget gives 20 epochs of LR=0 headroom for slow
-seeds (unused on this seed — early-stop fired at e20).
+**Multi-seed run COMPLETE** at the apples-to-apples config
+(`linear + B50 + decay=600`). V1/V2/V3 × [42, 7, 1337] all converged
+with zero placeholder leakage and final recall 1.0. **The n=1 fill-speed
+ordering V3 < V2 < V1 does not survive multi-seed** — see
+`benchmarking.md` "Multi-seed replication + V5–V8 expansion" for the
+result table.
 
-**Next step:** full V1/V2/V3 × [42, 7, 1337] multi-seed run at the same config.
-Expected ~12 h (8 fresh Phase C runs at ~90 min each; V3/seed42 already done
-at the validated config and will be skipped).
+V5–V8 expansion is **dropped** (decision rule cannot be met against
+V3's noise floor). 14a (scale to N=500) is **deferred on Test 15**
+(`experiments/test15_multiseed.py`, **running since 2026-05-06 17:36**)
+which multi-seeds the scaffold-fill-vs-answer-swap retention question
+— the dimension Test 14 never measured.
+
+This document is preserved for reproducibility of the apples-to-apples
+configuration diagnostic; the "Next step" sections below describe what
+*was* run on 2026-05-05 → 2026-05-06, not what's pending.
 
 ### Smoke result — V3/seed42
 

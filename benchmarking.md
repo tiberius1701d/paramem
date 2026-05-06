@@ -416,14 +416,27 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
    A single Trainer call with callback-based probing reaches 100%. This is a
    training methodology issue, not an adapter capacity issue.
 
-#### Status (2026-04-22)
+#### Status (2026-05-06)
 
 - **Closed:** loss-based early stopping. No threshold is both safe and useful
   given the ~10–15 epoch gap between loss convergence and the recall phase
   transition. Production keeps the fixed 30-epoch budget.
-- **Open:** recall-probing early stopping. Stop when recall on a held-out key
-  probe plateaus at 100% for `patience` consecutive epochs. Unimplemented;
-  the only remaining lever. See `early_stopping.md` for scoping.
+- **Shipped (experiment scripts):** recall-probing early stopping in
+  `experiments/utils/early_stop.py` — `EarlyStopPolicy` + `RecallEarlyStopCallback`
+  fire `control.should_training_stop` after `window` consecutive 100%
+  probes past `signal_from_epoch`. Test 14's multi-seed batch ran on this
+  callback (default policy: `probe_from_epoch=1, signal_from_epoch=10,
+  window=3`); all 9 (V1/V2/V3 × 3 seeds) cells terminated cleanly between
+  e18 and e26 inside the 50-epoch budget. Test 13b uses the same callback's
+  optional retention probe path. Test 15 uses a sibling
+  `RecallProbeCallback` in *observational mode* — records
+  `stable_perfect_epoch` but does not terminate, so cross-seed retention
+  comparison runs on identical optimizer-step counts per phase.
+- **Open (production):** wire `RecallEarlyStopCallback` into
+  `BackgroundTrainer` so production consolidation cycles benefit from
+  the same per-epoch recall gate. Currently the per-cycle `n_epochs`
+  budget is the sole stop condition. Promotion gated on Test 13b
+  validation + 500-key validation (see `feedback_resumable_training.md`).
 
 ---
 
@@ -2314,23 +2327,16 @@ also stays deferred.
 ## Test 14: Content-Free Scaffold + Multi-Round Early-Stop at Scale
 
 **Script:** `experiments/test14.py`
-**Status (2026-04-29 update):** 14a-pre core **COMPLETE** (2026-04-26).
-Extended cells **partially complete at single seed**: V3_extended complete
-(e25, slower than V3); V4 complete (e29 first_perfect, no stable window
-in 30 epochs); V7 (originally launched as "V5" with sha256 placeholders)
-started Phase B e1 then stopped to fold into the multi-seed batch with
-the renamed labels.  **Provisional winner: V3** (stable_perfect e20 at
-n=1).
-
-**Multi-seed batch in flight (2026-04-30):** the new
-V5/V6/V7/V8 uniform-axis variants plus 3-seed replication of V1/V2/V3/V4
-are queued under run_config.json's `phase_c_seeds=[42, 7, 1337]` and
-`phase_c_num_epochs=50` (extended budget so V4/V7 can reach a finite
-`stable_perfect`).  V1 multi-seed complete: 3-seed mean
-stable_perfect=24.7 ±2.1 (vs n=1 = 24, within noise).  V2 paused
-mid-flight at seed=42 e13.  See "Multi-seed replication + V5–V8
-expansion" below for the full plan; 14a (scale to N=500) and 14b
-(multi-round) remain gated on the multi-seed result.
+**Status (2026-05-06):** V1/V2/V3 × 3 seeds (42, 7, 1337) complete at the
+apples-to-apples config (`linear + B50 + decay=600`). Result null on
+fill-speed: V1 first_perfect = 19.0 ± 2.45, V2 = 20.3 ± 2.62, V3 =
+20.7 ± 1.89; pooled std = 2.31 epochs. V3 is the slowest mean. Zero
+leakage, 1.0 final recall across all 9 cells. Aggregate at
+`outputs/test14_pre/mistral/20260426_012907/multiseed_aggregate.json`.
+V5–V8 dropped, 14a deferred on Test 15. V4 closed at single-seed (see
+"V4 status" below). Test 14's "retention" column measured placeholder
+erasure, not real-answer preservation, and is not comparable to Test
+13's retention figure.
 
 ### What it tests
 
@@ -2693,137 +2699,50 @@ spread signature is robust at n=1 but the underlying mechanism (no
 scaffold weight invested) needs corroboration via the next-step
 multi-seed batch.
 
-### Multi-seed replication + V5–V8 expansion (planned, ~12 h V1/V2/V3 + ~58 h V5–V8)
+### Multi-seed result (2026-05-06)
 
-The next experiment block extends the existing 14a-pre run rather than
-starting a new run dir. **Variant numbering reflects the multi-seed
-batch run order**: V1–V4 keep their original meanings; V5–V8 are new
-cells (renamed 2026-04-29 from a working V6a/V6b/V6c label set, and
-the previously-unstarted SHA per-slot variant moved from V5 to V7).
+V1/V2/V3 × seeds [42, 7, 1337], apples-to-apples config (`linear + B50
++ decay=600`, validated 2026-05-04 — see `scripts/dev/test14_reproduce.md`
+for the diagnostic that identified HF's stock linear scheduler scaling
+decay with `num_train_epochs` as the source of an earlier 7-epoch shift).
 
-**LR scheduler — apples-to-apples config validated 2026-05-04.** An
-earlier attempt at this batch (linear scheduler, B50 budget, HF stock
-auto-decay) produced V3/seed42 `stable_perfect=27` vs V3 ref's `20` —
-a 7-epoch shift caused by HF's stock linear scheduler scaling decay
-over `num_train_epochs`, so per-step LR at any given epoch differs by
-total budget. Diagnosed and fixed by introducing `lr_decay_steps` as a
-TrainingConfig override (`paramem/training/trainer.py::_FixedDecayTrainer`)
-and `--phase-c-decay-steps` on the experiment CLI. Validated config:
+| Variant | first_perfect (mean ± std) | stable_perfect (mean ± std) | leakage | final recall |
+|---|---|---|---|---|
+| V1 | 19.00 ± 2.45 | 21.67 ± 2.62 | 0 | 1.0 |
+| V2 | 20.33 ± 2.62 | 23.00 ± 2.16 | 0 | 1.0 |
+| V3 | 20.67 ± 1.89 | 22.67 ± 1.89 | 0 | 1.0 |
 
-> `--lr-scheduler-type linear --phase-c-num-epochs 50 --phase-c-decay-steps 600`
+Pooled std = 2.31. V3 is slower than V1 on mean first_perfect — the
+shared-update-channel hypothesis predicted V3 < V2 < V1; the data does
+not support it. Treat the n=1 V3 win as seed luck.
 
-The 600-step decay window matches V3 ref's stock-linear trajectory at
-B30 (30 epochs × 20 steps/epoch); the B50 budget gives 20 epochs of
-LR=0 headroom for slow seeds. Single-seed validation smoke
-(V3/seed42, registered as `tresume 14s`) locked at `stable_perfect=20`
-in 89 min wall — matching V3 ref exactly. Two configs were ruled out
-during the diagnostic: `constant_with_warmup` (LR=peak forever
-oscillates around the SimHash threshold) and `decay=300` (decay window
-ends at e15, freezes the model at fill≈0.35 before first_perfect can
-land). See `scripts/dev/test14_reproduce.md` for the full diagnostic
-and reproduction commands.
+**V5–V8 dropped.** The decision rule required a candidate's mean
+stable_perfect ≤ V3's mean − pooled std ≈ e20.4. Observed minimum
+across V1/V2/V3 (the unbiased baseline) is e20; no content variant is
+predicted to clear that bar (V7 predicted ≥ e25; V5/V6/V8 within V3's
+neighborhood). ~58 GPU-h saved.
 
-The block addresses two questions in parallel:
+**V4 status: closed at single-seed.** n=1 result was first_perfect=e29
+in a 30-epoch budget, no stable window observable. The original plan
+re-ran V4 with 50-epoch budget at multi-seed; this is dropped under
+the same logic as V5–V8 — V4's signature (per-key spread std 8.2 vs
+V3's 3.5) already disqualifies it as a contender, and the multi-seed
+re-run would only confirm the spread, not change the ranking. The
+single-seed per-key data in "Results — extended cells" is the final
+record for V4.
 
-1. **Is the V3 < V2 < V1 ordering real or n=1 noise?** Replicate Phase C
-   on 3 seeds (42, 7, 1337) for V1/V2/V3, reusing the existing
-   `<variant>/B/adapter` so only Phase C optimizer / shuffler seed
-   varies. Decision criterion: V3 mean stable_perfect < V1 mean by more
-   than the pooled std → ordering is real.
-2. **Can the uniform regime be optimized further?** Three new
-   uniform-axis variants probe around V3's `"pending"` baseline; one
-   per-slot-unique variant pins the upper bound:
+**14a deferred on Test 15.** Test 14 measured fill-speed; Test 13's
+headline is retention. Test 15 (`experiments/test15_multiseed.py`,
+**running since 2026-05-06 17:36** at n=5 seeds) multi-seeds the
+A→B→C1→C2 protocol at apples-to-apples scheduler + WD=0.01 to settle
+whether the C2/B retention ratio (n=1: 6.7×) survives seed variance.
+Decision rule: ratio ≥ 5.0 with lower-CI ≥ 2.5 → claim holds and 14a
+is reactivated; otherwise 14a is cut. ETA ~12-13 h.
 
-| Variant | Q | A | Hypothesis under test |
-|---|---|---|---|
-| **V5** | `"What is the answer to this query?"` | `"The answer is currently unknown."` | Uniform long natural-language template. Most informative test of the shared-transfer-channel hypothesis: if a richer natural-language placeholder accelerates the channel, V5 could beat V3. If it slows it (more weight to overwrite), V3's short uniform stays optimal. |
-| **V6** | `"<PLACEHOLDER>"` | `"<PLACEHOLDER>"` | Same uniformity as V3 with a shorter, less natural-language token. Isolates uniformity from length within the uniform regime. Predicted ≈ V3 under the shared-channel hypothesis. |
-| **V7** | sha256 hex per slot (unique) | sha256 hex per slot (unique) | Per-slot unique OOD tokens — falsifiable upper-bound check on the shared-channel hypothesis. Researcher prediction: V7 stable_perfect ≥ 25. Refuted if V7 ≤ 22. |
-| **V8** | `"a1b2c3d4e5f60718"` (same hex all slots) | same | Uniform long OOD hex — disentangles length from naturalness within the uniform regime. Run only if V5 / V6 results are ambiguous. |
-
-V4 is included in the multi-seed batch with **extended 50-epoch budget**
-(its single-seed result hit budget exhaustion before stable). The goal
-is to obtain a finite `stable_perfect` for V4 to compare against the
-others, not to qualify it as a contender.
-
-**Run order (frontier-first; matches variant numbering):**
-
-Smoke-measured cost: ~5 min per Phase C epoch (probe-dominated) plus
-~10 min for the post-Phase-C final probe.  At 30 epochs that is
-~160 min ≈ 2.7 h per (variant, seed) Phase C run.  The earlier 9 h /
-58 h totals omitted the final-probe cost; revised below.
-
-| Order | Variants × seeds | Phase scope | Wall (~) |
-|---|---|---|---|
-| 1 | V1, V2, V3 × 3 seeds | Phase C only (reuse Phase B) | 24 h |
-| 2 | V5 × 3 seeds | Full Phase B + C (Phase A reused) | 10 h |
-| 3 | V6 × 3 seeds | Full Phase B + C (Phase A reused) | 10 h |
-| 4 | V7 × 3 seeds, 50-epoch budget | Full Phase B + C | 14 h |
-| 5 | V4 × 3 seeds, 50-epoch budget | Phase C only (reuse Phase B) | 14 h |
-| (6) | V8 × 3 seeds (only if V5 / V6 ambiguous) | Full Phase B + C | 10 h |
-
-Total ~72 h GPU (~3 days continuous); resumable per (variant, seed)
-unit via `tresume 14`.  V5/V6 full pipeline includes Phase B (~40 min
-×3 seeds = 2 h) plus Phase C (~2.7 h ×3 seeds = 8 h) = ~10 h per
-variant.  V7/V4 use 50-epoch budgets so Phase C is ~4.5 h × 3 = 13.5 h
-plus Phase B for V7.
-
-**Decision rule (post-batch):** the new winner replaces V3 only if its
-mean `stable_perfect` is below V3's mean by more than the pooled standard
-deviation across seeds (lower-bound 95% CI gap). Marginal improvements
-inside the noise envelope retain V3 for production simplicity. If V5
-wins clearly, it ships as the production scaffold.
-
-**Implementation status:**
-- `experiments/utils/scaffold.py` — V5/V6/V7/V8 builders, tests in
-  `tests/test_scaffold.py`. Done.
-- `experiments/test14.py` — `--phase-c-seeds`, `--phase-c-num-epochs`,
-  `--lr-scheduler-type`, `--phase-c-decay-steps` flags wired through
-  `_training_config`. Auto-migration of stale Phase C results on
-  `lr_scheduler_type` or `lr_decay_steps` mismatch in
-  `_migrate_stale_phase_c`. `reuse_phase_a_from` persisted in
-  `run_config.json` so resume is faithful (no silent scope expansion).
-  Done.
-- `paramem/training/trainer.py` — `_FixedDecayTrainer` subclass
-  decouples LR decay from `num_train_epochs`. Done.
-- `scripts/dev/training-control.sh` — multi-seed resume passthrough
-  (phase_c_seeds, phase_c_num_epochs, lr_scheduler_type,
-  phase_c_decay_steps), per-seed status with mtime-based active
-  attribution, peer-test registry pattern (TEST_EXTRA_FLAGS) used by
-  `tresume 14s` smoke. Done.
-- Tests for multi-seed resume — covered by
-  `tests/test_test14_round_metrics.py` (47 tests pass).
-
-### Edge-device motivation (2026-04-29)
-
-The optimization target is **fastest Phase C convergence** for a fixed
-N=500 scale. Each saved epoch on Phase C is a measurable training-time
-reduction on edge hardware (the Phase C probe dominates wall time, not
-the training step). V3's e20 stable_perfect on N=20 fill is the current
-baseline; V5 is the most credible single-experiment shot at lowering
-that baseline.
-
-### Next: 14a launch (winning variant scaled to N=500)
-
-Gated on the multi-seed batch above. The launch command is unchanged:
-
-```
-python experiments/test14.py --mode=scale --variant=<winner>
-```
-
-`<winner>` is **decided by the multi-seed batch**, not the n=1 result.
-Default is V3. Replaced by V5/V6/V8 only if the post-batch decision
-rule fires (mean `stable_perfect` below V3's mean by more than pooled
-seed std). V3_extended is rejected at n=1 (e25). V7 is included in the
-multi-seed batch as the per-slot-unique upper bound but is not a
-candidate winner. V4 is included for diagnostic comparison only — the
-n=1 result (no `stable_perfect` in 30 epochs) already disqualifies it.
-
-Same A→B→C structure as 14a-pre, single variant. Phase A wall expected
-~17 h, Phase B (scaffold-build) ~17 h, Phase C (fill 100 on 500-key
-scaffold) ~9 h. Total 14a wall ~45 h compute, runnable across two-to-three
-overnights with thermal cooldowns. Output: 500-key filled adapter as the
-input artifact for 14b.
+**Implementation status:** scaffold builders + multi-seed flags +
+`_FixedDecayTrainer` + auto-migration of stale Phase C results all
+shipped (see commits e391b0d / 4691f88 / 1816bf6). Tests for multi-seed
+resume covered by `tests/test_test14_round_metrics.py`.
 
 ### Provenance
 
