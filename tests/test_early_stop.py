@@ -912,3 +912,110 @@ class TestRecallEarlyStopCallbackStateachine:
         cb, state_out, model = _make_callback(tmp_path, total=2)
         log = cb.get_first_perfect_log()
         assert isinstance(log, dict)
+
+
+class TestRecallEarlyStopCallbackResume:
+    """Rehydration of in-memory state from on-disk artifacts at __init__.
+
+    Without this, every tresume after a tpause restarts the early-stop
+    accumulators — silently shifting first_perfect_epoch / stable_perfect_epoch
+    later than reality for any seed paused after convergence.
+    """
+
+    def test_cycle_started_at_preserved_across_resume(self, tmp_path):
+        """progress.json's cycle_started_at survives a re-init."""
+        progress = tmp_path / "progress.json"
+        progress.write_text(json.dumps({"cycle_started_at": 1234567890}))
+        cb, _, _ = _make_callback(tmp_path)
+        assert cb._cycle_started_at == 1234567890
+
+    def test_cycle_started_at_fresh_on_cold_start(self, tmp_path):
+        """No progress.json on disk = stamp time.time() (cold start)."""
+        cb, _, _ = _make_callback(tmp_path)
+        # Stamped at init time, so it must be a recent positive integer.
+        assert cb._cycle_started_at > 0
+
+    def test_epoch_log_rehydrated(self, tmp_path):
+        """epoch_log.json on disk is loaded into state.epoch_log."""
+        epoch_log = tmp_path / "epoch_log.json"
+        prior = [
+            {"epoch": 1, "fill": {"exact_count": 0, "total": 5, "rate": 0.0}},
+            {"epoch": 2, "fill": {"exact_count": 3, "total": 5, "rate": 0.6}},
+        ]
+        epoch_log.write_text(json.dumps(prior))
+        cb, state_out, _ = _make_callback(tmp_path)
+        assert state_out.epoch_log == prior
+        assert cb._last_epoch == 2
+
+    def test_first_perfect_rehydrated_from_log(self, tmp_path):
+        """first_perfect_epoch reconstructed from prior epoch_log entries."""
+        epoch_log = tmp_path / "epoch_log.json"
+        prior = [
+            {"epoch": 1, "fill": {"exact_count": 4, "total": 5, "rate": 0.8}},
+            {"epoch": 2, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+            {"epoch": 3, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+        ]
+        epoch_log.write_text(json.dumps(prior))
+        cb, state_out, _ = _make_callback(tmp_path)
+        assert state_out.first_perfect_epoch == 2
+
+    def test_stable_perfect_rehydrated_from_log(self, tmp_path):
+        """stable_perfect_epoch fires when window of perfect epochs is met."""
+        # window=2 in the default policy_kwargs of _make_callback
+        epoch_log = tmp_path / "epoch_log.json"
+        prior = [
+            {"epoch": 1, "fill": {"exact_count": 4, "total": 5, "rate": 0.8}},
+            {"epoch": 2, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+            {"epoch": 3, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+        ]
+        epoch_log.write_text(json.dumps(prior))
+        cb, state_out, _ = _make_callback(tmp_path)
+        assert state_out.stable_perfect_epoch == 3
+        assert cb._consecutive_perfect == 2
+
+    def test_consecutive_perfect_resets_on_non_perfect(self, tmp_path):
+        """A non-perfect epoch in the log resets the trailing perfect streak."""
+        epoch_log = tmp_path / "epoch_log.json"
+        prior = [
+            {"epoch": 1, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+            {"epoch": 2, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+            {"epoch": 3, "fill": {"exact_count": 4, "total": 5, "rate": 0.8}},
+        ]
+        epoch_log.write_text(json.dumps(prior))
+        cb, state_out, _ = _make_callback(tmp_path)
+        assert state_out.first_perfect_epoch == 1
+        # window=2 means stable triggered at e2 (e1+e2 both perfect).
+        assert state_out.stable_perfect_epoch == 2
+        # Trailing streak after e3 (non-perfect) is 0.
+        assert cb._consecutive_perfect == 0
+
+    def test_first_perfect_log_rehydrated(self, tmp_path):
+        """Per-key first_perfect_log.json rehydrates the in-memory dict."""
+        first_perfect_log = tmp_path / "first_perfect_log.json"
+        prior = {"graph1": {"epoch_first_perfect": 5}}
+        first_perfect_log.write_text(json.dumps(prior))
+        cb, _, _ = _make_callback(tmp_path)
+        assert cb.get_first_perfect_log() == prior
+
+    def test_malformed_json_treated_as_cold_start(self, tmp_path):
+        """A corrupt epoch_log.json doesn't crash __init__."""
+        (tmp_path / "epoch_log.json").write_text("{not json")
+        (tmp_path / "progress.json").write_text("not json either")
+        (tmp_path / "first_perfect_log.json").write_text("[broken")
+        cb, state_out, _ = _make_callback(tmp_path)
+        # Cold-start defaults survive the malformed inputs.
+        assert state_out.epoch_log == []
+        assert state_out.first_perfect_epoch is None
+        assert cb._last_epoch == -1
+        assert cb.get_first_perfect_log() == {}
+
+    def test_stop_epoch_not_rehydrated(self, tmp_path):
+        """state.stop_epoch is not restored from disk — a stopped run isn't resumed."""
+        epoch_log = tmp_path / "epoch_log.json"
+        prior = [
+            {"epoch": 1, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+            {"epoch": 2, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
+        ]
+        epoch_log.write_text(json.dumps(prior))
+        cb, state_out, _ = _make_callback(tmp_path)
+        assert state_out.stop_epoch is None

@@ -239,6 +239,61 @@ class DualRecallProbeCallback(TrainerCallback):
         self._last_epoch = -1
         self._cycle_started_at = int(time.time())
 
+        # Restore prior pause/resume state from disk so a tresume after tpause
+        # continues with the full epoch_log and the correct cycle_started_at.
+        # Without this, every resume restarts the in-memory accumulators and
+        # silently distorts first_perfect_epoch / stable_perfect_epoch.
+        self._rehydrate_from_disk()
+
+    def _rehydrate_from_disk(self) -> None:
+        """Restore in-memory state from the previous run's persisted artifacts.
+
+        Reads ``progress_path`` for ``cycle_started_at`` and ``epoch_log_path``
+        for ``state.epoch_log`` plus the derived counters (``_last_epoch``,
+        ``state.first_perfect_epoch``, ``state.stable_perfect_epoch``).
+        Failures are swallowed and treated as a cold start.
+        """
+        if self._progress_path is not None and self._progress_path.exists():
+            try:
+                existing = json.loads(self._progress_path.read_text())
+                saved = existing.get("cycle_started_at")
+                if isinstance(saved, (int, float)):
+                    self._cycle_started_at = int(saved)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        if self._epoch_log_path.exists():
+            try:
+                saved_log = json.loads(self._epoch_log_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                saved_log = None
+            if isinstance(saved_log, list) and saved_log:
+                self._state.epoch_log = list(saved_log)
+                try:
+                    self._last_epoch = int(saved_log[-1].get("epoch", -1))
+                except (TypeError, ValueError):
+                    self._last_epoch = -1
+                consecutive = 0
+                for entry in saved_log:
+                    fill = entry.get("fill") or {}
+                    exact = fill.get("recall", 0)
+                    total = fill.get("total", 0)
+                    is_perfect = total > 0 and exact == total
+                    consecutive = consecutive + 1 if is_perfect else 0
+                    if is_perfect and self._state.first_perfect_epoch is None:
+                        try:
+                            self._state.first_perfect_epoch = int(entry.get("epoch"))
+                        except (TypeError, ValueError):
+                            pass
+                    if (
+                        self._state.stable_perfect_epoch is None
+                        and consecutive >= STABLE_EPOCH_WINDOW
+                    ):
+                        try:
+                            self._state.stable_perfect_epoch = int(entry.get("epoch"))
+                        except (TypeError, ValueError):
+                            pass
+
     def on_epoch_end(self, args, state, control, **kwargs):
         """Probe fill + unchanged sets, update logs, check pause."""
         epoch = int(round(state.epoch))
