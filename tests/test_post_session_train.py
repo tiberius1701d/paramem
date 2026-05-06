@@ -74,18 +74,27 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.save_cycle_snapshots = False
     loop.persist_graph = False
     loop.enable_entity_promotion = False
-    loop.extraction_temperature = 0.0
-    loop.extraction_max_tokens = 256
-    loop.extraction_stt_correction = False
-    loop.extraction_ha_validation = False
-    loop.extraction_noise_filter = ""
-    loop.extraction_noise_filter_model = ""
-    loop.extraction_noise_filter_endpoint = None
-    loop.extraction_ner_check = False
-    loop.extraction_ner_model = "en_core_web_sm"
-    loop.extraction_plausibility_judge = "off"
-    loop.extraction_plausibility_stage = "deanon"
-    loop.extraction_verify_anonymization = False
+    from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
+
+    loop.extraction = ExtractionPipeline(
+        model=model,
+        tokenizer=tokenizer,
+        config=ExtractionConfig(
+            temperature=0.0,
+            max_tokens=256,
+            stt_correction=False,
+            ha_validation=False,
+            noise_filter="",
+            noise_filter_model="",
+            noise_filter_endpoint=None,
+            ner_check=False,
+            ner_model="en_core_web_sm",
+            plausibility_judge="off",
+            plausibility_stage="deanon",
+            verify_anonymization=False,
+        ),
+        prompts_dir=None,
+    )
     loop.indexed_key_registry = KeyRegistry()
     loop.indexed_key_qa = {}
     loop._indexed_next_index = 1

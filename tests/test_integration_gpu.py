@@ -533,22 +533,22 @@ class TestStagingAdapterGPU:
         assert not (tmp_path / "episodic.old").exists()
 
 
-# --- 7c. _run_extract_graph helper end-to-end on GPU ---
+# --- 7c. ExtractionPipeline.run chokepoint end-to-end on GPU ---
 
 
 class TestRunExtractGraphHelper:
-    """Gap (a): the helper wrapper that every orchestrator goes through must
+    """Gap (a): the chokepoint that every orchestrator goes through must
     actually work end-to-end with a real model.
 
-    Unit tests (tests/test_extraction_pipeline_guard.py) prove the helper
+    Unit tests (tests/test_extraction_pipeline_guard.py) prove the chokepoint
     threads args and guards PeftModel correctly; this test proves the whole
-    chain — `_extraction_kwargs` → `extract_graph` — executes on real hardware
-    without drift. SOTA gates are all disabled so the test depends only on the
-    local model.
+    chain — ``ExtractionPipeline.kwargs`` → ``extract_graph`` — executes on
+    real hardware without drift. SOTA gates are all disabled so the test
+    depends only on the local model.
     """
 
     def test_helper_runs_with_production_config(self, model_and_tokenizer, tmp_path):
-        """Run `_run_extract_graph` with the exact flags from configs/server.yaml.
+        """Run ``loop.extraction.run`` with the exact flags from configs/server.yaml.
 
         Mirrors production: noise_filter, plausibility_judge, verify_anonymization,
         NER — all set to whatever ships in server.yaml today. Skips when
@@ -595,7 +595,7 @@ class TestRunExtractGraphHelper:
             extraction_verify_anonymization=cc.extraction_verify_anonymization,
         )
 
-        graph = loop._run_extract_graph(
+        graph = loop.extraction.run(
             "[user] My name is Alex. I live in Millfield.\n[assistant] Nice to meet you, Alex.",
             "gap_a_session",
             speaker_id="Speaker0",
@@ -930,3 +930,187 @@ class TestVRAMBudget:
         # Success path must NOT have been taken (no "VRAM check passed" log).
         passed_logs = [r for r in caplog.records if "VRAM check passed" in r.getMessage()]
         assert not passed_logs, "Validator logged success but also raised — inconsistent path."
+
+
+# --- 11. Simulate-mode prompt-engineering iteration ---
+
+
+class TestSimulateModePromptIteration:
+    """Run the production extraction pipeline in simulate mode for fast
+    prompt iteration.
+
+    Architecture
+    ------------
+    The full pipeline up to and including `ExtractionPipeline.run` and
+    `ExtractionPipeline.run_procedural` runs unchanged: chunking,
+    `extract_session`, the 8-stage SOTA chain (when configured), QA
+    generation, dedup, key assignment.  The branch in
+    `paramem/server/consolidation.py:423` flips to
+    `loop.simulated_training(...)` instead of `train_adapters` —
+    persistence venue is the simulate JSON store, not LoRA weights.
+    No `model.gradient_checkpointing_enable()` train cycle, no
+    `_save_adapters`, no per-cycle adapter checkpoints.
+
+    Why
+    ---
+    Prompt-engineering iteration on `extraction.txt` /
+    `extraction_system.txt` / `extraction_procedural.txt` /
+    `sota_enrichment.txt` / `sota_plausibility.txt` only exercises
+    upstream phases.  Paying the ~10-minute training cost per iteration
+    is wasteful — the simulate path produces the same per-session graph
+    snapshots and per-phase raw_outputs that the operator inspects to
+    judge a prompt edit, with full extraction quality visible.
+
+    Use
+    ---
+    Run with --gpu; SOTA-chain phases skip silently when
+    `ANTHROPIC_API_KEY` is unset.  Adjust the chunk text to match the
+    domain you're calibrating prompts for.
+
+    Hermetic
+    --------
+    All persistence directories (`paths.adapters`, `paths.simulate`,
+    `paths.debug`, `paths.sessions`, `paths.registry`,
+    `paths.key_metadata`) redirect under `tmp_path`.  No production
+    state is read or written.
+    """
+
+    @pytest.mark.parametrize("source_type", ["transcript", "document"])
+    def test_simulate_run_skips_training_and_records_phases(
+        self, model_and_tokenizer, tmp_path, source_type, monkeypatch
+    ):
+        """End-to-end simulate-mode run on real Mistral.
+
+        * Loads `tests/fixtures/server.yaml` (CI-pinned config surface).
+        * Monkey-patches `consolidation.mode = "simulate"` and redirects
+          every `paths.*` to ``tmp_path``.
+        * Seeds one chunk into a fresh `SessionBuffer` with the
+          parametrized `source_type`.
+        * Runs `run_consolidation` end-to-end.
+
+        Asserts:
+            * Status is ``"simulated"``.
+            * One session was processed.
+            * Per-session ``graph_snapshot.json`` is on disk under
+              ``tmp_path/debug/run_*/cycle_*/sessions/<sid>/``.
+            * Phase trace contains at least ``local_extract``.
+            * No LoRA weight files written (``adapter_model.safetensors``
+              / ``.bin``) anywhere under ``tmp_path``.
+            * Indexed-key registry contains at least one key (assigned
+              by ``_simulate_indexed_key_episodic``).
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        from paramem.server.config import load_server_config
+        from paramem.server.consolidation import run_consolidation
+        from paramem.server.session_buffer import SessionBuffer
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+
+        # Mode override — the only thing we change about the production
+        # pipeline.  Everything else stays at fixture values.
+        monkeypatch.setattr(cfg.consolidation, "mode", "simulate")
+
+        # Hermetic redirection of all persistence paths.  paths.adapters,
+        # paths.registry, paths.key_metadata are derived from paths.data; the
+        # directly-settable fields (sessions, debug, simulate) must be aimed
+        # under the same root.
+        cfg.paths.data = tmp_path / "data"
+        cfg.paths.simulate = tmp_path / "data" / "simulate"
+        cfg.paths.debug = tmp_path / "data" / "debug"
+        cfg.paths.sessions = tmp_path / "data" / "sessions"
+        for path in (
+            cfg.paths.data,
+            cfg.paths.adapters,
+            cfg.paths.simulate,
+            cfg.paths.debug,
+            cfg.paths.sessions,
+            cfg.paths.registry_dir,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+        # debug=True → per-session graph_snapshot.json gets written.
+        # The whole point of this test for prompt iteration is to read
+        # those snapshots; without debug, there is nothing to inspect.
+        monkeypatch.setattr(cfg, "debug", True)
+
+        # SOTA chain: production pipeline hits Anthropic if configured.
+        # Skip its activation when no API key is present so the test
+        # still exercises local_extract + key assignment without depending
+        # on cloud.  Operators iterating on cloud prompts (sota_enrichment,
+        # sota_plausibility) set ANTHROPIC_API_KEY and the chain runs.
+        cc = cfg.consolidation
+        if cc.extraction_noise_filter == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+            monkeypatch.setattr(cc, "extraction_noise_filter", "")
+            monkeypatch.setattr(cc, "extraction_plausibility_judge", "off")
+
+        model, tokenizer = model_and_tokenizer
+
+        buffer = SessionBuffer(session_dir=cfg.paths.sessions, debug=False)
+        buffer.set_speaker("sim-test-001", "Speaker0", "Alex")
+        chunk_text = (
+            "Alex is an Engineering Leader Software at Acme Corp in Germany. "
+            "He led platform architecture for the Polaris XR-7 system."
+        )
+        buffer.append(
+            conversation_id="sim-test-001",
+            role="user",
+            text=chunk_text,
+            metadata={
+                "source_type": source_type,
+                "chunk_index": 0,
+                "doc_title": "tobias_resume_test",
+            },
+        )
+
+        result = run_consolidation(model, tokenizer, cfg, buffer)
+
+        # --- Status assertions ---
+        assert result["status"] == "simulated", (
+            f"Expected status='simulated', got {result['status']!r} (full result: {result})"
+        )
+        assert result["sessions"] == 1
+        assert result.get("simulated") is True
+        assert result["episodic_qa"] >= 1, (
+            f"Expected at least one episodic QA pair from simulate-mode run; "
+            f"got episodic_qa={result['episodic_qa']}"
+        )
+
+        loop = result["loop"]
+        assert loop is not None
+        assert loop.indexed_key_registry is not None
+        assert len(loop.indexed_key_registry.list_active()) >= 1, (
+            "Indexed-key registry empty — _simulate_indexed_key_episodic did not assign keys."
+        )
+
+        # --- Per-session snapshot present and structurally valid ---
+        snapshots = list(
+            (tmp_path / "debug").glob("run_*/cycle_*/sessions/sim-test-001/graph_snapshot.json")
+        )
+        assert len(snapshots) == 1, (
+            f"Expected exactly one per-session graph_snapshot.json under tmp_path/debug; "
+            f"found {len(snapshots)}: {snapshots}"
+        )
+        graph = _json.loads(snapshots[0].read_text())
+        assert graph["session_id"] == "sim-test-001"
+        phase_records = graph.get("diagnostics", {}).get("phases", [])
+        phase_names = [p["name"] for p in phase_records if isinstance(p, dict)]
+        assert "local_extract" in phase_names, (
+            f"local_extract phase did not fire (got {phase_names}). "
+            "ExtractionPipeline.run did not invoke extract_graph."
+        )
+        local_extract = next(p for p in phase_records if p.get("name") == "local_extract")
+        assert local_extract["outcome"] == "ok", (
+            f"local_extract failed: {local_extract.get('reason')}"
+        )
+        assert local_extract.get("raw_output"), (
+            "local_extract raw_output empty — model produced nothing."
+        )
+
+        # --- No LoRA writes happened anywhere under tmp_path ---
+        lora_files = list((_Path(tmp_path)).rglob("adapter_model.safetensors"))
+        lora_files += list((_Path(tmp_path)).rglob("adapter_model.bin"))
+        assert not lora_files, (
+            f"Simulate mode wrote LoRA weight files (should never happen): {lora_files}"
+        )

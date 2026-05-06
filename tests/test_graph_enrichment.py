@@ -909,7 +909,7 @@ class TestInterimEnrichmentHook:
             ],
         )
 
-        with patch.object(loop, "_run_extract_graph", return_value=sg):
+        with patch.object(loop.extraction, "run", return_value=sg):
             loop.extract_session("ignored-transcript", "s1", speaker_id="Speaker0")
 
         assert loop._triples_since_last_enrichment == 2

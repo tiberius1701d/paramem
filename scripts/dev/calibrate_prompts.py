@@ -525,8 +525,11 @@ def _variance_report(stage: str, runs: list[dict]) -> dict:
 
 
 _STAGE_FILENAME = {
-    "extract_user": ("extraction.txt", "extraction_document.txt"),
-    "extract_system": ("extraction_system.txt", "extraction_system_document.txt"),
+    # One prompt-pair for every source type — see
+    # paramem/graph/extraction_pipeline.py.  ``source_type`` survives as
+    # a runtime gate-default flag but no longer selects prompt files.
+    "extract_user": "extraction.txt",
+    "extract_system": "extraction_system.txt",
     "anonymize": "anonymization.txt",
     "enrich": "sota_enrichment.txt",
     "plausibility": "sota_plausibility.txt",
@@ -639,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Decide whether baseline runs alongside candidate.
     base_filenames_per_stage = {
-        "extract": list(_STAGE_FILENAME["extract_user"]) + list(_STAGE_FILENAME["extract_system"]),
+        "extract": [_STAGE_FILENAME["extract_user"], _STAGE_FILENAME["extract_system"]],
         "anonymize": [_STAGE_FILENAME["anonymize"]],
         "enrich": [_STAGE_FILENAME["enrich"]],
         "plausibility": [_STAGE_FILENAME["plausibility"]],
@@ -697,9 +700,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if "extract" in stages:
             extract_runs: list[dict] = []
-            doc_idx = 1 if source_type == "document" else 0
-            user_basename = _STAGE_FILENAME["extract_user"][doc_idx]
-            system_basename = _STAGE_FILENAME["extract_system"][doc_idx]
+            # Single prompt-pair for every source type — same baseline file
+            # regardless of whether the input is a transcript or a document.
+            user_basename = _STAGE_FILENAME["extract_user"]
+            system_basename = _STAGE_FILENAME["extract_system"]
             user_calib = f"{args.prompt_prefix}{user_basename}"
             system_calib = f"{args.prompt_prefix}{system_basename}"
             user_override = user_calib if (prompts_dir / user_calib).exists() else None

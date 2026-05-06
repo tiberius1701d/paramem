@@ -421,13 +421,17 @@ def _strip_ner_possessive(text: str) -> str:
     return text
 
 
-# Prompt filename constants — one definition site; imported by consolidation.py.
+# Prompt filename constants — one definition site for the single
+# extraction-prompt source of truth.  The transcript prompt-pair is
+# used for every source_type; document chunks land in the same
+# ``{transcript}`` slot at the chat-template layer.  Per-source
+# extension goes via overrides or by prepending/appending content to
+# the slot at the caller layer — never via parallel file pairs.  The
+# old DOCUMENT_*_FILENAME constants and their backing files are
+# retired (would silently drift on schema-shape rules).
 DEFAULT_SYSTEM_PROMPT_FILENAME = "extraction_system.txt"
 DEFAULT_USER_PROMPT_FILENAME = "extraction.txt"
-DOCUMENT_SYSTEM_PROMPT_FILENAME = "extraction_system_document.txt"
-DOCUMENT_USER_PROMPT_FILENAME = "extraction_document.txt"
 DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME = "extraction_procedural.txt"
-DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME = "extraction_procedural_document.txt"
 
 
 def build_speaker_context(speaker_name: str | None) -> str:
@@ -464,7 +468,7 @@ def _load_prompt(filename: str, default: str, prompts_dir: Path | None = None) -
     """Load a prompt file, falling back to hardcoded default.
 
     Single chokepoint for ALL prompt loading in the extraction pipeline
-    (extraction.txt, extraction_system.txt, extraction_document.txt,
+    (extraction.txt, extraction_system.txt, extraction_procedural.txt,
     anonymization.txt, sota_enrichment.txt, sota_plausibility.txt, …).
 
     Before editing any file under ``configs/prompts/`` — or adding a new
@@ -504,15 +508,14 @@ def load_extraction_prompts(
                      hardcoded defaults.
         system_filename: Filename of the system prompt.  Defaults to
                          :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
-                         (``"extraction_system.txt"``); pass
-                         :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME`
-                         (``"extraction_system_document.txt"``) for the
-                         written-document extraction variant.
-        user_filename: Filename of the user-turn prompt template.  Defaults to
-                       :data:`DEFAULT_USER_PROMPT_FILENAME`
-                       (``"extraction.txt"``); pass
-                       :data:`DOCUMENT_USER_PROMPT_FILENAME`
-                       (``"extraction_document.txt"``) for the document variant.
+                         (``"extraction_system.txt"``).  Used for every
+                         source type — there is no separate document
+                         variant; document chunks land in the
+                         ``{transcript}`` slot of the same prompt.
+        user_filename: Filename of the user-turn prompt template.
+                       Defaults to :data:`DEFAULT_USER_PROMPT_FILENAME`
+                       (``"extraction.txt"``).  Used for every source
+                       type for the same reason.
 
     Returns:
         ``(system_prompt, extraction_prompt)`` tuple.
@@ -555,19 +558,14 @@ def load_procedural_prompt(
         prompts_dir: Directory containing the prompt files.  Falls back to
                      ``configs/prompts/`` in the project root.
         system_filename: Filename of the system prompt.  Defaults to
-                         :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`; pass
-                         :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME` when
-                         extracting procedural facts from a written document
-                         so the model is not primed with dialogue-style
-                         few-shots.
-        user_filename: Filename of the user-turn prompt template.  Defaults to
+                         :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`.  Used
+                         for every source type — see
+                         :func:`load_extraction_prompts`.
+        user_filename: Filename of the user-turn prompt template.
+                       Defaults to
                        :data:`DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME`
-                       (``"extraction_procedural.txt"``); pass
-                       :data:`DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME`
-                       (``"extraction_procedural_document.txt"``) for written
-                       documents so the model is not primed with
-                       dialogue-shaped few-shots that reference a non-existent
-                       assistant response.
+                       (``"extraction_procedural.txt"``).  Used for
+                       every source type.
     """
     pd = Path(prompts_dir) if prompts_dir else None
     system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd)
@@ -604,23 +602,20 @@ def extract_procedural_graph(
             ``Relation`` extracted in this pass as provenance. Required —
             callers must always supply a real speaker ID.
         stt_correction: Correct entity names from the assistant response turn.
-            This is a no-op when
-            ``user_prompt_filename=DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME``
-            because the document path has no assistant response to
-            cross-reference; passing ``stt_correction=True`` with a document
-            source is harmless but produces no correction.
+            Document chunks have no assistant response, so the
+            ``ExtractionPipeline.run_procedural`` chokepoint defaults
+            this to ``False`` for ``source_type="document"``; passing
+            ``stt_correction=True`` with a document source is harmless
+            but produces no correction.
         system_prompt_filename: Filename of the system prompt within the prompts
-            directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
-            (dialogue variant); pass :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME`
-            when the source is a written document so the model is not
-            instructed to cross-reference a non-existent assistant turn.
+            directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`.
+            One prompt-pair is the single ground truth for procedural
+            extraction; document chunks land in the ``{transcript}`` slot
+            of the same prompt.
         user_prompt_filename: Filename of the user-turn prompt template.
             Defaults to :data:`DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME`
-            (``"extraction_procedural.txt"``); pass
-            :data:`DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME`
-            (``"extraction_procedural_document.txt"``) for written-document
-            sources so the model receives document-shaped few-shots instead of
-            dialogue-shaped ones.
+            (``"extraction_procedural.txt"``).  Same prompt for every
+            source type.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -744,11 +739,11 @@ def extract_graph(
             their own flags (stt_correction, ha_validation).
         ha_context: HA home config for location validation (from get_home_context).
         stt_correction: Correct entity names from assistant responses.
-            This is a no-op when
-            ``user_prompt_filename=DOCUMENT_USER_PROMPT_FILENAME`` because the
-            document path has no assistant response to cross-reference; passing
-            ``stt_correction=True`` with a document source is harmless but
-            produces no correction.
+            Document chunks have no assistant response, so the
+            ``ExtractionPipeline.run`` chokepoint defaults this to
+            ``False`` for ``source_type="document"``; passing
+            ``stt_correction=True`` with a document source is harmless
+            but produces no correction.
         ha_validation: Validate locations against HA home context.
         noise_filter: SOTA provider for noise filtering ("" = disabled).
         ner_check: Enable spaCy NER cross-check for PII detection (default False).
@@ -763,13 +758,12 @@ def extract_graph(
             Required — callers must always supply the session's speaker ID.
         system_prompt_filename: Filename of the system prompt within the prompts
             directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`
-            (``"extraction_system.txt"``); pass
-            :data:`DOCUMENT_SYSTEM_PROMPT_FILENAME`
-            (``"extraction_system_document.txt"``) for written-document sources.
-        user_prompt_filename: Filename of the user-turn prompt template.  Defaults
-            to :data:`DEFAULT_USER_PROMPT_FILENAME` (``"extraction.txt"``); pass
-            :data:`DOCUMENT_USER_PROMPT_FILENAME`
-            (``"extraction_document.txt"``) for written-document sources.
+            (``"extraction_system.txt"``).  Used for every source type;
+            document chunks land in the ``{transcript}`` slot of the
+            same prompt.
+        user_prompt_filename: Filename of the user-turn prompt template.
+            Defaults to :data:`DEFAULT_USER_PROMPT_FILENAME`
+            (``"extraction.txt"``).  Same prompt for every source type.
     """
     # Validate stop_phase against the canonical whitelist before any
     # work happens.  Catches typos early ("anonymise" vs "anonymize")
@@ -1082,9 +1076,9 @@ def _generate_extraction(
 
     The system prompt is passed verbatim — no slot substitution is performed
     on it.  Narrator binding is achieved via the ``{speaker_context}``
-    placeholder in the **user** template (both ``extraction.txt`` and
-    ``extraction_document.txt`` carry this slot), populated by
-    :func:`build_speaker_context`.
+    placeholder in the **user** template (``extraction.txt``), populated by
+    :func:`build_speaker_context`.  One prompt-pair serves every source
+    type — document chunks land in the same ``{transcript}`` slot.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -2099,18 +2093,33 @@ def _sota_pipeline(
     if norm_stats["dropped"]:
         graph.diagnostics["mapping_ambiguous_dropped"] = norm_stats["dropped"]
 
-    # Bug A fix: guarantee the speaker's display name is in the mapping so the
-    # forward-path verifier does not flag bare first-name occurrences as leaks.
-    # The extended mapping is propagated into anon_transcript via the
-    # re-anonymization step below so every form of the name is replaced before
-    # the verifier sees the output.
-    if speaker_name:
-        mapping = _ensure_speaker_name_in_mapping(mapping, speaker_name)
+    # Single source of truth for real → placeholder.  The deterministic
+    # builder walks ``graph.entities`` once and:
+    #   * mints placeholders for every in-scope entity name,
+    #   * adds PII attribute values (last_name, email, phone, …) under
+    #     the parent entity's placeholder,
+    #   * threads ``speaker_name`` so the runtime-known speaker is
+    #     always covered (even when the LLM emitted only the anonymous
+    #     ``Speaker_N`` form).
+    # The LLM-emitted mapping is treated as a HINT rather than truth:
+    # entries it produced for entities or attributes are overwritten by
+    # the deterministic build (we trust the graph).  Entries the LLM
+    # emitted for relation participants the graph doesn't know about
+    # (e.g. an org named in a relation but not in entities[]) are
+    # preserved via :func:`_recover_missing_placeholder_mappings`
+    # below — that recovery is an orthogonal concern (LLM mints a
+    # placeholder for a real name not in our mapping).
+    mapping = _build_anonymization_mapping(
+        graph,
+        mapping,
+        pii_scope=pii_scope,
+        speaker_name=speaker_name,
+    )
 
-    # Bug B fix: recover forward-mapping entries the anonymizer emitted in
-    # anonymized_facts but forgot to include in the returned mapping dict.
-    # Without this, Product_1-style placeholders have no reverse entry and are
-    # dropped by the residual sweep at de-anonymization time.
+    # Recover forward-mapping entries the anonymizer emitted in
+    # anonymized_facts but never added to the mapping (typically
+    # relation-participant placeholders for entities not in
+    # ``graph.entities`` — e.g. ``Honda → Product_1``).
     mapping = _recover_missing_placeholder_mappings(mapping, anon_facts, graph.relations)
 
     # (Re-)build anonymized transcript AND facts from the ORIGINAL transcript
@@ -2695,80 +2704,165 @@ def _next_placeholder_index(mapping: dict, prefix: str) -> int:
     return max_n + 1
 
 
-def _ensure_speaker_name_in_mapping(
-    mapping: dict,
+# PII-bearing attribute keys.  The local extractor projects these onto
+# ``Entity.attributes`` rather than as standalone entities or relations
+# — their values appear verbatim in the source transcript and must be
+# scrubbed before the anonymized transcript is sent to a SOTA cloud
+# provider.  Consumed by :func:`_build_anonymization_mapping`.
+#
+# The list is intentionally conservative: keys with a high prior of
+# carrying personally-identifying or location data.  Operators can
+# extend by adding entries here.
+_PII_ATTRIBUTE_KEYS: frozenset[str] = frozenset(
+    {
+        "last_name",
+        "first_name",
+        "email",
+        "phone",
+        "linkedin",
+        "city",
+        "country",
+        "location",
+    }
+)
+
+
+def _build_anonymization_mapping(
+    graph: SessionGraph,
+    llm_mapping: dict,
+    *,
+    pii_scope: set[str] | frozenset[str] | None,
     speaker_name: str | None,
 ) -> dict:
-    """Guarantee that the speaker's display name is covered by the anonymizer mapping.
+    """Single source of truth for the real → placeholder mapping.
 
-    Bug A fix: the local anonymizer maps the full-name form (e.g.
-    ``Alex Rivera → Person_1``) but leaves the bare first name (``Alex``)
-    out of the mapping.  After :func:`_stamp_speaker_entity` renames the graph
-    entity to the display name (``Alex``), the forward-path privacy verifier
-    finds ``Alex`` in the transcript and flags it as a leak — triggering the
-    residual-leak path, skipping SOTA enrichment, and ultimately dropping two
-    facts that contain ``Product_1`` (which can only be resolved via the full
-    SOTA enrichment path).
+    The anonymizer LLM is good at producing **anon_facts** (canonical
+    predicates, compound-fact splits, dropping unsafe relations) but
+    historically untrustworthy at producing a **complete mapping**:
+    it routinely omits the bare first-name form when it has the full
+    name, never sees ``Entity.attributes`` at all (so PII embedded in
+    attributes leaks), and emits ambiguous pairs that have to be
+    canonicalized after the fact.  Three accreting "Bug X fix" helpers
+    (speaker-name seeding, attribute-extend, ambiguous-pair drop) used
+    to patch the LLM's output incrementally.
 
-    This function is called once per pipeline run, AFTER
-    :func:`_normalize_anonymization_mapping`, BEFORE the first
-    :func:`verify_anonymization_completeness` call.  It extends the mapping
-    in-place-safe fashion (returns a new dict) so the verifier and all
-    downstream steps see a complete mapping that covers every form the speaker's
-    name can take.
+    This builder replaces that pattern with one deterministic walk:
 
-    Resolution strategy (in priority order):
-    1. ``speaker_name`` already a key → no-op (mapping is complete).
-    2. A key in ``mapping`` starts with ``speaker_name + " "`` (full-name
-       variant, e.g. ``"Alex Rivera"``) → reuse its placeholder so both
-       the bare and full forms map to the *same* ``Person_N`` token.
-       De-anonymization then consistently produces the full name at every site.
-    3. No existing key covers ``speaker_name`` → allocate a fresh ``Person_N``
-       placeholder (type-safe: speakers are always persons).
+    1. **Mint placeholders for in-scope entity names.**  The graph
+       knows the canonical entity inventory; we don't need the LLM
+       to enumerate it.  Placeholder counter is per-prefix
+       (``Person_1, Person_2, …, Org_1, …``).
+    2. **Add PII attribute values under the parent entity's
+       placeholder.**  Reusing the placeholder is privacy-correct
+       (SOTA only needs tokens scrubbed, not unique placeholders per
+       attribute) and keeps the mapping canonical (no novel
+       placeholder shapes).
+    3. **Speaker-name seeding** (legacy Bug A).  When the runtime
+       knows the speaker's display name and that name isn't already
+       in the mapping (e.g. anonymous-id session, full-name vs
+       first-name mismatch), reuse the speaker entity's placeholder
+       or — if no speaker entity is in scope — fall back to LLM's
+       full-name match (``"Alex Rivera"`` → reuse ``Person_1``) or
+       mint a fresh ``Person_N``.
+    4. **Preserve LLM hints.**  Entries the LLM emitted that the
+       deterministic build does not cover (typically relation
+       participants the graph doesn't know about — e.g. ``Honda``
+       mentioned in a relation but not a graph entity) are merged
+       in.  When the LLM's entry conflicts with a deterministic one,
+       deterministic wins (we trust the graph).
+
+    The companion :func:`_recover_missing_placeholder_mappings` runs
+    after this builder and handles the orthogonal concern of LLM
+    placeholders that surface in ``anon_facts`` without any mapping
+    entry.
 
     Args:
-        mapping: Canonical ``{real_name: placeholder}`` mapping as returned
-            by :func:`_normalize_anonymization_mapping`.
-        speaker_name: Display name of the speaker (e.g. ``"Alex"`` or
-            ``"Sam"``) as passed to :func:`_sota_pipeline`.  When ``None``
-            or empty, the mapping is returned unchanged.
+        graph: The session graph carrying entities (with names and
+            attributes) and relations.
+        llm_mapping: Canonicalised ``{real_name: placeholder}`` mapping
+            from :func:`_normalize_anonymization_mapping`.  Treated as
+            a hint, not truth.
+        pii_scope: Entity-types in scope for anonymization (e.g.
+            ``{"person", "place"}``).  Out-of-scope entities pass
+            through unscrubbed by design.
+        speaker_name: Runtime-known display name of the session's
+            speaker.  When set, this name is guaranteed to be covered.
 
     Returns:
-        Potentially-extended mapping (new dict; input is not mutated).
+        Complete mapping ready to feed :func:`_anonymize_transcript`
+        and :func:`verify_anonymization_completeness`.
     """
-    if not speaker_name:
-        return mapping
-    if speaker_name in mapping:
-        return mapping
+    scope: frozenset[str] = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
+    type_to_prefix = anonymizer_type_to_prefix()
+    counter: dict[str, int] = {}
+    mapping: dict[str, str] = {}
 
-    new_mapping = dict(mapping)
-    speaker_lower = speaker_name.lower()
+    def _next_placeholder(prefix: str) -> str:
+        counter[prefix] = counter.get(prefix, 0) + 1
+        return f"{prefix}_{counter[prefix]}"
 
-    # Strategy 2: reuse the placeholder of any full-name key that starts with
-    # the speaker's first name (e.g. "Alex Rivera" when speaker is "Alex").
-    for key, placeholder in mapping.items():
-        if not isinstance(key, str):
+    # Step 1 + 2: mint placeholders for in-scope entities and fold in
+    # their PII attribute values under the same placeholder.
+    speaker_entity_placeholder: str | None = None
+    for entity in graph.entities:
+        if entity.entity_type not in scope:
             continue
-        if key.lower().startswith(speaker_lower + " "):
-            new_mapping[speaker_name] = placeholder
-            logger.debug(
-                "Speaker-name seeding: %r reuses placeholder %r from full-name key %r",
-                speaker_name,
-                placeholder,
-                key,
-            )
-            return new_mapping
+        if not entity.name:
+            continue
+        prefix = type_to_prefix.get(entity.entity_type, entity.entity_type.capitalize())
+        if entity.name not in mapping:
+            mapping[entity.name] = _next_placeholder(prefix)
+        placeholder = mapping[entity.name]
+        if entity.speaker_id is not None and speaker_entity_placeholder is None:
+            speaker_entity_placeholder = placeholder
+        attrs = entity.attributes or {}
+        for attr_key, attr_value in attrs.items():
+            if attr_key not in _PII_ATTRIBUTE_KEYS:
+                continue
+            if not isinstance(attr_value, str) or not attr_value.strip():
+                continue
+            mapping.setdefault(attr_value, placeholder)
 
-    # Strategy 3: allocate a fresh Person_N placeholder.
-    person_prefix = anonymizer_type_to_prefix().get("person", "Person")
-    fresh_placeholder = f"{person_prefix}_{_next_placeholder_index(new_mapping, person_prefix)}"
-    new_mapping[speaker_name] = fresh_placeholder
-    logger.debug(
-        "Speaker-name seeding: %r allocated fresh placeholder %r",
-        speaker_name,
-        fresh_placeholder,
-    )
-    return new_mapping
+    # Step 3: speaker-name seeding (legacy Bug A).
+    if speaker_name and speaker_name not in mapping:
+        if speaker_entity_placeholder is not None:
+            # Speaker is in graph.entities but under a different
+            # surface form (e.g. anonymous "Speaker0" → display
+            # "Tobias").  Reuse that placeholder so every form maps
+            # consistently.
+            mapping[speaker_name] = speaker_entity_placeholder
+        else:
+            # No speaker entity in scope — fall back to LLM hints
+            # (full-name match) or mint a fresh Person_N.
+            speaker_lower = speaker_name.lower()
+            reused: str | None = None
+            for key, placeholder in llm_mapping.items():
+                if isinstance(key, str) and key.lower().startswith(speaker_lower + " "):
+                    reused = placeholder
+                    break
+            if reused is not None:
+                mapping[speaker_name] = reused
+            else:
+                person_prefix = type_to_prefix.get("person", "Person")
+                # Allocate Person_N taking BOTH counter and llm_mapping
+                # values into account so we don't collide with an
+                # LLM-emitted Person_K.
+                merged_for_idx = dict(mapping)
+                for k, v in llm_mapping.items():
+                    merged_for_idx.setdefault(k, v)
+                idx = _next_placeholder_index(merged_for_idx, person_prefix)
+                mapping[speaker_name] = f"{person_prefix}_{idx}"
+
+    # Step 4: merge in LLM hints we don't already cover (typically
+    # relation-participant placeholders for entities not in
+    # graph.entities).  Deterministic entries win on conflict; LLM-only
+    # entries are added.
+    for k, v in llm_mapping.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        mapping.setdefault(k, v)
+
+    return mapping
 
 
 def _recover_missing_placeholder_mappings(
@@ -2805,9 +2899,8 @@ def _recover_missing_placeholder_mappings(
     those belong to the SOTA enrichment path and are handled separately.
 
     Args:
-        mapping: Canonical ``{real_name: placeholder}`` mapping as returned
-            by :func:`_normalize_anonymization_mapping` (and extended by
-            :func:`_ensure_speaker_name_in_mapping`).
+        mapping: Complete ``{real_name: placeholder}`` mapping as returned
+            by :func:`_build_anonymization_mapping`.
         anon_facts: Anonymized fact dicts returned by
             :func:`_anonymize_with_local_model`.
         original_relations: The ``graph.relations`` list BEFORE anonymization

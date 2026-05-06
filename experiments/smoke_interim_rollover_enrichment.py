@@ -62,9 +62,21 @@ def _build_loop(graph: nx.MultiDiGraph, *, hops: int, max_entities: int) -> Cons
     loop.graph_enrichment_min_triples_floor = FLOOR
     loop._triples_since_last_enrichment = FLOOR + 5  # above floor
     # SOTA credentials routed through the extraction-pipeline knobs.
-    loop.extraction_noise_filter = PROVIDER
-    loop.extraction_noise_filter_model = MODEL
-    loop.extraction_noise_filter_endpoint = None
+    # Build a stand-in pipeline with just the SOTA config the enrichment
+    # path reads from `loop.extraction.config`.  Model/tokenizer aren't
+    # used because graph-tier enrichment hits the SOTA API directly.
+    from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
+
+    loop.extraction = ExtractionPipeline(
+        model=MagicMock(),
+        tokenizer=MagicMock(),
+        config=ExtractionConfig(
+            noise_filter=PROVIDER,
+            noise_filter_model=MODEL,
+            noise_filter_endpoint=None,
+        ),
+        prompts_dir=None,
+    )
     return loop
 
 

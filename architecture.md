@@ -173,11 +173,9 @@ The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP la
 
 Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
 
-### AD-12: Swappable Extraction Backend (Phase 4)
+### AD-12: Swappable Extraction Backend (Phase 4) — superseded
 
-`extract_graph()` accepts a `backend` parameter to select between local (current 3B prompt-and-parse) and API-based extraction. The local backend has 94.5% success rate — workable but noisy. API backend is opt-in for users who want higher quality and have API access.
-
-This is a strategy pattern, not a rewrite. The extraction prompt, schema, and normalization stay the same regardless of backend.
+Originally posed as a `backend` parameter on `extract_graph()` to switch between a local 3B prompt-and-parse path and an API-based extractor. Superseded by AD-16: instead of swapping backends, extraction became a staged chain where the local model and the SOTA cloud model run *both*, in different roles. The local model owns transcript-touching stages (extract, anonymize); SOTA runs only on anonymized data (enrichment, plausibility). The `backend` parameter was never shipped.
 
 ### AD-13: Indexed Key Memory (Phase 4)
 
@@ -229,6 +227,8 @@ N keeps the predecessor's output and continues.
 7. **Transcript-grounding gate** (`_apply_grounding_gate` → `_drop_ungrounded_facts`): every surviving fact's subject and object must either be a known real-name or have every significant token appear in the original transcript. Drops SOTA world-knowledge inferences. A **role-aware** extension (`extraction_role_aware_grounding: off | diagnostic | active`) additionally requires the *object* of any speaker-subject triple to ground in the speaker's own user turns, not in assistant turns. Closes the assistant-into-graph cascade where the model confabulates a fact and the extractor mis-attributes it to the speaker. `diagnostic` mode (ship default) records would-be drops without changing production behaviour; `active` enforces them.
 
 A **fallback path** (`_fallback_plausibility_on_raw`) runs local plausibility + grounding on the raw extraction when the primary chain empties out. Per-stage diagnostics (`SessionGraph.diagnostics`) record raw outputs, transcript round-trip, and dropped facts for audit.
+
+**Single chokepoint.** Every orchestrator (training consolidation, calibration endpoint, experiments, tests) reaches the 7-stage chain through `ExtractionPipeline` (`paramem/graph/extraction_pipeline.py`) — one class that owns kwarg assembly, prompt-filename resolution, adapter guard, and gradient-checkpointing discipline. Direct calls to `extract_graph(...)` or `extract_procedural_graph(...)` are forbidden by `tests/test_extraction_pipeline_guard.py`. The class exposes `run(transcript, session_id, *, source_type, **overrides)` for transcript-shaped inputs and `run_procedural(...)` for the preference/habits stream; `kwargs(*, source_type, **overrides)` returns the resolved kwarg dict for callers that need to invoke `extract_graph` indirectly (e.g. legacy fixtures in the grandfathered list).
 
 ### AD-17: Background Training with Inference Pause (Phase 5)
 

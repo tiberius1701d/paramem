@@ -1,9 +1,10 @@
 """Structural guard: forbid direct extract_graph / extract_procedural_graph calls.
 
 The extraction pipeline has exactly one callable topology. All orchestrators
-(server, experiments, tests) must reach the extractors through the
-ConsolidationLoop helpers `_run_extract_graph` / `_run_extract_procedural_graph`,
-never via direct calls to `extract_graph(...)` / `extract_procedural_graph(...)`.
+(server, experiments, tests) must reach the extractors through
+:class:`paramem.graph.extraction_pipeline.ExtractionPipeline` (the
+:meth:`run` / :meth:`run_procedural` chokepoints), never via direct calls
+to ``extract_graph(...)`` / ``extract_procedural_graph(...)``.
 
 This test scans the tracked codebase and fails if a new call site appears
 outside the whitelist. Pair with the parity tests in test_consolidation.py.
@@ -15,17 +16,18 @@ import inspect
 import json
 import re
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 # Files allowed to call the extractors directly:
 # - extractor.py: the module defining them.
-# - consolidation.py: the only orchestrator that wraps them.
+# - extraction_pipeline.py: the chokepoint module that wraps them.
 # - tests/: may patch, import, or assert on their names.
 # - archive/: historical, not executed.
 _ALLOWED_SUFFIXES = (
     "paramem/graph/extractor.py",
-    "paramem/training/consolidation.py",
+    "paramem/graph/extraction_pipeline.py",
 )
 
 _ALLOWED_PREFIXES = (
@@ -34,10 +36,10 @@ _ALLOWED_PREFIXES = (
 )
 
 # Grandfathered standalone experiment probes. These pre-date the
-# ConsolidationLoop helpers and run outside the production orchestrator path
-# (one-shot GPU evals, not a live extract→train loop). New experiment code
-# MUST route through ConsolidationLoop._run_extract_graph instead. If one of
-# these is rewritten to use the helpers, remove it from this set.
+# ExtractionPipeline chokepoint and run outside the production orchestrator
+# path (one-shot GPU evals, not a live extract→train loop). New experiment
+# code MUST route through ExtractionPipeline instead. If one of these is
+# rewritten to use the chokepoint, remove it from this set.
 _GRANDFATHERED_FILES = frozenset(
     {
         "experiments/chained_adapter_smoke.py",
@@ -68,7 +70,7 @@ def _find_forbidden_call_sites(py_file: Path) -> list[tuple[int, str]]:
     function definitions, log messages, …).  An ``ast.Call`` whose
     ``func`` is an ``ast.Name`` matching the whitelist is the canonical
     "direct call" we forbid.  Attribute calls like
-    ``self._run_extract_graph(...)`` are different syntax and not caught
+    ``self.extraction.run(...)`` are different syntax and not caught
     here — by design, they are the routed-through pattern we encourage.
     """
     import ast
@@ -108,86 +110,66 @@ def test_no_direct_extract_graph_calls_outside_whitelist():
     assert not offenders, (
         "Direct extract_graph/extract_procedural_graph calls found outside the "
         "allowed orchestrator. Route new callers through "
-        "ConsolidationLoop._run_extract_graph / _run_extract_procedural_graph "
-        "so extraction behavior cannot diverge between production and tests:\n"
+        "ExtractionPipeline.run / ExtractionPipeline.run_procedural so "
+        "extraction behavior cannot diverge between production and tests:\n"
         + "\n".join(f"  {path}:{line} — {src}" for path, line, src in offenders)
     )
 
 
-# Positional params the helpers supply themselves — not user-facing kwargs.
+# Positional params the chokepoint supplies itself — not user-facing kwargs.
 _EXTRACTOR_POSITIONAL = {"model", "tokenizer", "transcript", "session_id"}
 
 
-def _extraction_kwargs_namespace():
-    """Build a minimal namespace with just the attrs _extraction_kwargs reads.
+def _make_pipeline(model=None, tokenizer=None, **config_overrides):
+    """Build a stand-in :class:`ExtractionPipeline` for chokepoint contract tests.
 
-    Avoids constructing a full ConsolidationLoop (which requires a real model
-    for _ensure_adapters). Contract tests don't need the full object graph —
-    only that the method's output keys line up with the extractor signature.
+    Mirrors the attribute shape the contract tests need without a real
+    model load.  The pipeline's :meth:`kwargs` and :meth:`run` /
+    :meth:`run_procedural` methods are exercised against ``MagicMock``
+    stand-ins for the extractor functions via :func:`monkeypatch`.
     """
-    from types import SimpleNamespace
+    from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 
-    return SimpleNamespace(
-        extraction_temperature=0.0,
-        extraction_max_tokens=2048,
-        extraction_plausibility_max_tokens=1024,
+    return ExtractionPipeline(
+        model=model if model is not None else MagicMock(),
+        tokenizer=tokenizer if tokenizer is not None else MagicMock(),
+        config=ExtractionConfig(**config_overrides),
         prompts_dir=None,
-        extraction_stt_correction=True,
-        extraction_ha_validation=True,
-        extraction_noise_filter="",
-        extraction_noise_filter_model="claude-sonnet-4-6",
-        extraction_noise_filter_endpoint=None,
-        extraction_ner_check=False,
-        extraction_ner_model="en_core_web_sm",
-        extraction_plausibility_judge="auto",
-        extraction_plausibility_stage="deanon",
-        extraction_verify_anonymization=True,
-        extraction_role_aware_grounding="off",
-        extraction_pii_scope=None,
-        # Per-session debug-dump gate read by _dump_session_graph (called
-        # from both extraction chokepoints).  Wrappers short-circuit when
-        # either attr is falsy, keeping these tests file-system-free.
-        save_cycle_snapshots=False,
-        snapshot_dir=None,
     )
 
 
 @pytest.mark.parametrize("source_type", ["transcript", "document"])
-def test_extraction_kwargs_match_extract_graph_signature(source_type):
-    """Every kwarg the helper passes must exist on extract_graph.
+def test_extraction_pipeline_kwargs_match_extract_graph_signature(source_type):
+    """Every kwarg the chokepoint passes must exist on extract_graph.
 
-    Catches rename drift: if the helper grows a new flag but the extractor
+    Catches rename drift: if the chokepoint grows a new flag but the extractor
     hasn't caught up (or vice versa), production crashes with TypeError.
     This test fails first.  Parametrized over both source_type values so
     both the transcript and document kwarg sets are validated.
     """
     from paramem.graph.extractor import extract_graph
-    from paramem.training.consolidation import ConsolidationLoop
 
-    ns = _extraction_kwargs_namespace()
-    helper_keys = set(
-        ConsolidationLoop._extraction_kwargs(
-            ns, source_type=source_type, speaker_id="Speaker0"
-        ).keys()
-    )
+    pipeline = _make_pipeline()
+    pipeline_keys = set(pipeline.kwargs(source_type=source_type, speaker_id="Speaker0").keys())
     extractor_params = set(inspect.signature(extract_graph).parameters) - _EXTRACTOR_POSITIONAL
 
-    unknown = helper_keys - extractor_params
+    unknown = pipeline_keys - extractor_params
     assert not unknown, (
-        f"_extraction_kwargs(source_type={source_type!r}) passes kwargs extract_graph does "
-        f"not accept: {sorted(unknown)}. "
-        "Either rename the helper key to match the extractor signature, or add the "
-        "parameter to extract_graph."
+        f"ExtractionPipeline.kwargs(source_type={source_type!r}) passes kwargs "
+        f"extract_graph does not accept: {sorted(unknown)}. "
+        "Either rename the chokepoint key to match the extractor signature, or "
+        "add the parameter to extract_graph."
     )
 
 
 def test_procedural_kwargs_match_extract_procedural_graph_signature():
-    """Same contract for the procedural helper — its inline kwargs dict must
-    line up with the extract_procedural_graph signature."""
+    """Same contract for the procedural chokepoint — the inline kwargs dict
+    inside :meth:`ExtractionPipeline.run_procedural` must line up with the
+    ``extract_procedural_graph`` signature."""
     from paramem.graph.extractor import extract_procedural_graph
 
-    # Mirror the inline kwargs shape inside _run_extract_procedural_graph.
-    # If that helper ever diverges, update this set alongside.
+    # Mirror the inline kwargs shape inside ExtractionPipeline.run_procedural.
+    # If that method ever diverges, update this set alongside.
     # speaker_id is passed as a keyword arg from call_kwargs (even though it is
     # a required positional-or-keyword param in the extractor signature).
     procedural_keys = {
@@ -205,83 +187,71 @@ def test_procedural_kwargs_match_extract_procedural_graph_signature():
 
     unknown = procedural_keys - extractor_params
     assert not unknown, (
-        f"_run_extract_procedural_graph passes kwargs extract_procedural_graph does not "
-        f"accept: {sorted(unknown)}"
+        f"ExtractionPipeline.run_procedural passes kwargs extract_procedural_graph "
+        f"does not accept: {sorted(unknown)}"
     )
 
 
-def _loop_ns_with_model(model, tokenizer=None):
-    """Namespace usable as `self` for bound-call tests of _run_extract_graph."""
-    import types
-    from unittest.mock import MagicMock
+def _peft_model_mock() -> MagicMock:
+    """Return a ``MagicMock(spec=PeftModel)`` with the chokepoint's required
+    methods explicitly attached.
 
-    from paramem.training.consolidation import ConsolidationLoop
+    ``spec=PeftModel`` enables the ``isinstance(model, PeftModel)`` branch
+    inside :meth:`ExtractionPipeline.run` while the explicit assignments
+    expose the attributes the chokepoint actually calls
+    (``disable_adapter`` for the adapter guard,
+    ``gradient_checkpointing_disable`` for the KV-cache fix).  Without
+    these assignments, ``MagicMock(spec=...)`` raises ``AttributeError`` on
+    calls that aren't directly on PeftModel's own surface.
+    """
+    from peft import PeftModel
 
-    ns = _extraction_kwargs_namespace()
-    ns.model = model
-    ns.tokenizer = tokenizer if tokenizer is not None else MagicMock()
-    ns._disable_gradient_checkpointing = lambda: None
-    # _run_extract_graph calls self._extraction_kwargs(...) — bind it.
-    ns._extraction_kwargs = types.MethodType(ConsolidationLoop._extraction_kwargs, ns)
-    # _run_extract_graph also calls self._dump_session_graph(...); bind it
-    # so the wrapper can resolve the attr — short-circuits via the namespace's
-    # save_cycle_snapshots=False / snapshot_dir=None gate.
-    ns._dump_session_graph = types.MethodType(ConsolidationLoop._dump_session_graph, ns)
-    return ns
+    m = MagicMock(spec=PeftModel)
+    m.disable_adapter = MagicMock()
+    m.gradient_checkpointing_disable = MagicMock()
+    return m
 
 
-def test_run_extract_graph_wraps_peft_model_in_disable_adapter(monkeypatch):
-    """Gap B: when the model is a PeftModel, the helper MUST enter the
-    `disable_adapter()` context manager before calling extract_graph.
+def test_run_wraps_peft_model_in_disable_adapter(monkeypatch):
+    """Gap B: when the model is a PeftModel, :meth:`ExtractionPipeline.run`
+    MUST enter the ``disable_adapter()`` context manager before calling
+    extract_graph.
 
     Regression guard: if the guard is ever refactored away, extraction
     silently runs with the training-active adapter, contaminating output.
     """
-    from unittest.mock import MagicMock
-
-    from peft import PeftModel
-
-    from paramem.training.consolidation import ConsolidationLoop
-
-    fake_peft = MagicMock(spec=PeftModel)  # isinstance(fake_peft, PeftModel) is True
-    ns = _loop_ns_with_model(fake_peft)
+    fake_peft = _peft_model_mock()
+    pipeline = _make_pipeline(model=fake_peft)
 
     monkeypatch.setattr(
-        "paramem.training.consolidation.extract_graph",
+        "paramem.graph.extraction_pipeline.extract_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_graph(ns, "transcript", "s001", speaker_id="Speaker0")
+    pipeline.run("transcript", "s001", speaker_id="Speaker0")
 
     fake_peft.disable_adapter.assert_called_once()
 
 
-def test_run_extract_graph_skips_disable_adapter_for_plain_model(monkeypatch):
+def test_run_skips_disable_adapter_for_plain_model(monkeypatch):
     """Gap B (negative): plain (non-PeftModel) models must NOT be wrapped."""
-    from unittest.mock import MagicMock
-
-    from paramem.training.consolidation import ConsolidationLoop
-
     plain_model = MagicMock()  # no spec — fails isinstance(_, PeftModel)
-    ns = _loop_ns_with_model(plain_model)
+    pipeline = _make_pipeline(model=plain_model)
 
     monkeypatch.setattr(
-        "paramem.training.consolidation.extract_graph",
+        "paramem.graph.extraction_pipeline.extract_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_graph(ns, "transcript", "s001", speaker_id="Speaker0")
+    pipeline.run("transcript", "s001", speaker_id="Speaker0")
 
     plain_model.disable_adapter.assert_not_called()
 
 
-def test_run_extract_graph_threads_positional_args(monkeypatch):
-    """Gap C: _run_extract_graph must pass (model, tokenizer, transcript, session_id)
-    to the real extractor unchanged. If the helper ever reshapes the call, this
-    test fails before production notices.
+def test_run_threads_positional_args(monkeypatch):
+    """Gap C: :meth:`ExtractionPipeline.run` must pass
+    ``(model, tokenizer, transcript, session_id)`` to the real extractor
+    unchanged. If the chokepoint ever reshapes the call, this test fails
+    before production notices.
     """
-    from unittest.mock import MagicMock
-
-    from paramem.training.consolidation import ConsolidationLoop
-
     captured = {}
 
     def spy(model, tokenizer, transcript, session_id, **kwargs):
@@ -292,15 +262,18 @@ def test_run_extract_graph_threads_positional_args(monkeypatch):
         captured["kwargs"] = kwargs
         return MagicMock()
 
-    monkeypatch.setattr("paramem.training.consolidation.extract_graph", spy)
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
 
     model_sentinel = MagicMock(name="model_sentinel")
     tokenizer_sentinel = MagicMock(name="tokenizer_sentinel")
-    ns = _loop_ns_with_model(model_sentinel, tokenizer_sentinel)
-    ns.prompts_dir = "/custom/prompts"
-    ns.extraction_noise_filter = "claude"
+    pipeline = _make_pipeline(
+        model=model_sentinel,
+        tokenizer=tokenizer_sentinel,
+        noise_filter="claude",
+    )
+    pipeline.prompts_dir = "/custom/prompts"
 
-    ConsolidationLoop._run_extract_graph(ns, "alex lives here", "s042", speaker_id="Speaker0")
+    pipeline.run("alex lives here", "s042", speaker_id="Speaker0")
 
     assert captured["model"] is model_sentinel
     assert captured["tokenizer"] is tokenizer_sentinel
@@ -476,61 +449,51 @@ def test_server_extract_session_kwargs_map_to_consolidation_config():
     )
 
 
-def test_run_extract_procedural_graph_wraps_peft_model_in_disable_adapter(monkeypatch):
+def test_run_procedural_wraps_peft_model_in_disable_adapter(monkeypatch):
     """Procedural mirror of Gap B: PeftModel must enter `disable_adapter()`
     before the procedural extractor is called.
 
     Without this guard, procedural extraction runs with the training-active
     adapter, contaminating preference capture.
     """
-    from unittest.mock import MagicMock
-
-    from peft import PeftModel
-
-    from paramem.training.consolidation import ConsolidationLoop
-
-    fake_peft = MagicMock(spec=PeftModel)
-    ns = _loop_ns_with_model(fake_peft)
+    fake_peft = _peft_model_mock()
+    pipeline = _make_pipeline(model=fake_peft)
 
     monkeypatch.setattr(
-        "paramem.training.consolidation.extract_procedural_graph",
+        "paramem.graph.extraction_pipeline.extract_procedural_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_procedural_graph(ns, "transcript", "s001", speaker_id="Speaker0")
+    pipeline.run_procedural("transcript", "s001", speaker_id="Speaker0")
 
     fake_peft.disable_adapter.assert_called_once()
 
 
-def test_run_extract_procedural_graph_skips_disable_adapter_for_plain_model(monkeypatch):
+def test_run_procedural_skips_disable_adapter_for_plain_model(monkeypatch):
     """Procedural negative case: plain models must NOT be wrapped."""
-    from unittest.mock import MagicMock
-
-    from paramem.training.consolidation import ConsolidationLoop
-
     plain_model = MagicMock()
-    ns = _loop_ns_with_model(plain_model)
+    pipeline = _make_pipeline(model=plain_model)
 
     monkeypatch.setattr(
-        "paramem.training.consolidation.extract_procedural_graph",
+        "paramem.graph.extraction_pipeline.extract_procedural_graph",
         lambda *a, **kw: MagicMock(),
     )
-    ConsolidationLoop._run_extract_procedural_graph(ns, "transcript", "s001", speaker_id="Speaker0")
+    pipeline.run_procedural("transcript", "s001", speaker_id="Speaker0")
 
     plain_model.disable_adapter.assert_not_called()
 
 
-def test_consolidation_loop_constructor_stores_extraction_flags(tmp_path):
+def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     """Experiment-path mirror of (b): kwargs forwarded to
-    `ConsolidationLoop.__init__` must land on `self.extraction_*` unchanged.
+    ``ConsolidationLoop.__init__`` must land on
+    ``loop.extraction.config.<field>`` unchanged.
 
-    `run_multi_session` (and any other experiment entrypoint) configures the
-    pipeline by passing `extraction_*` kwargs to the loop constructor. If the
-    constructor ever silently drops or renames one of them, experiments run on
-    defaults while tests that check `_extraction_kwargs` output still pass —
-    because those tests seed a namespace by hand. This closes that loop.
+    ``run_multi_session`` (and any other experiment entrypoint) configures
+    the pipeline by passing ``extraction_*`` kwargs to the loop constructor.
+    If the constructor ever silently drops or renames one of them,
+    experiments run on defaults while tests that check
+    ``ExtractionPipeline.kwargs`` output still pass — because those tests
+    seed a config by hand. This closes that loop.
     """
-    from unittest.mock import MagicMock
-
     from peft import PeftModel
 
     from paramem.training.consolidation import ConsolidationLoop
@@ -551,9 +514,10 @@ def test_consolidation_loop_constructor_stores_extraction_flags(tmp_path):
         "extraction_verify_anonymization": False,
     }
 
-    # Skip adapter wiring — we only care about flag storage on self.
-    # __class__ = PeftModel so _ensure_adapters' isinstance check short-circuits
-    # without restricting the mock's attribute surface.
+    # Skip adapter wiring — we only care about flag storage on
+    # loop.extraction.config.  __class__ = PeftModel so _ensure_adapters'
+    # isinstance check short-circuits without restricting the mock's
+    # attribute surface.
     model = MagicMock()
     model.__class__ = PeftModel
     model.peft_config = {
@@ -574,20 +538,20 @@ def test_consolidation_loop_constructor_stores_extraction_flags(tmp_path):
         **flipped,
     )
 
-    for key, expected in flipped.items():
-        actual = getattr(loop, key)
+    cfg = loop.extraction.config
+    for ctor_key, expected in flipped.items():
+        # Constructor key drops the ``extraction_`` prefix on the dataclass field.
+        field = ctor_key.removeprefix("extraction_")
+        actual = getattr(cfg, field)
         assert actual == expected, (
-            f"ConsolidationLoop.__init__ dropped kwarg {key!r}: "
-            f"passed={expected!r}, stored={actual!r}"
+            f"ConsolidationLoop.__init__ dropped kwarg {ctor_key!r}: "
+            f"passed={expected!r}, stored on extraction.config.{field}={actual!r}"
         )
 
 
-def test_run_extract_procedural_graph_threads_positional_args(monkeypatch):
-    """Gap C (procedural): same positional-arg contract for the procedural helper."""
-    from unittest.mock import MagicMock
-
-    from paramem.training.consolidation import ConsolidationLoop
-
+def test_run_threads_positional_args_procedural(monkeypatch):
+    """Gap C (procedural): same positional-arg contract for the procedural
+    chokepoint."""
     captured = {}
 
     def spy(model, tokenizer, transcript, session_id, **kwargs):
@@ -598,14 +562,13 @@ def test_run_extract_procedural_graph_threads_positional_args(monkeypatch):
         captured["kwargs"] = kwargs
         return MagicMock()
 
-    monkeypatch.setattr("paramem.training.consolidation.extract_procedural_graph", spy)
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_procedural_graph", spy)
 
     model_sentinel = MagicMock(name="model_sentinel")
-    ns = _loop_ns_with_model(model_sentinel)
-    ns.prompts_dir = "/custom/prompts"
+    pipeline = _make_pipeline(model=model_sentinel)
+    pipeline.prompts_dir = "/custom/prompts"
 
-    ConsolidationLoop._run_extract_procedural_graph(
-        ns,
+    pipeline.run_procedural(
         "alex prefers coffee",
         "s042",
         speaker_id="Speaker0",
@@ -621,37 +584,23 @@ def test_run_extract_procedural_graph_threads_positional_args(monkeypatch):
     assert captured["kwargs"]["prompts_dir"] == "/custom/prompts"
 
 
-def test_extraction_system_document_prompt_present():
-    """Verify extraction_system_document.txt exists under configs/prompts/.
+def test_run_uses_default_prompts_for_document(monkeypatch):
+    """When called with source_type='document', :meth:`ExtractionPipeline.run`
+    must still use ``DEFAULT_SYSTEM_PROMPT_FILENAME`` and
+    ``DEFAULT_USER_PROMPT_FILENAME``.
 
-    The document extraction path resolves this filename at runtime via
-    load_extraction_prompts; a missing file causes a silent fallback to the
-    hardcoded default system prompt, which has no narrator-binding directives.
+    The two-prompt design (separate document-variant files) was retired
+    after it produced silent drift on schema-shape rules.  One prompt-pair
+    is the single ground truth for every source type; document chunks land
+    in the same ``{transcript}`` slot at the chat-template layer.
+
+    Regression guard: if any future edit re-introduces a source-type-driven
+    prompt-file fork, this test fails before drift can re-emerge.
     """
-    repo_root = Path(__file__).resolve().parent.parent
-    doc_prompt = repo_root / "configs" / "prompts" / "extraction_system_document.txt"
-    assert doc_prompt.exists(), (
-        "configs/prompts/extraction_system_document.txt is missing. "
-        "The document extraction path will silently fall back to the dialogue "
-        "system prompt, losing narrator binding."
-    )
-
-
-def test_run_extract_graph_threads_source_type(monkeypatch):
-    """When called with source_type='document', _run_extract_graph must resolve
-    BOTH system_prompt_filename to DOCUMENT_SYSTEM_PROMPT_FILENAME and
-    user_prompt_filename to DOCUMENT_USER_PROMPT_FILENAME.
-
-    Regression guard: if _extraction_kwargs ever stops routing source_type to
-    the correct filenames, document extraction silently uses the dialogue prompts.
-    """
-    from unittest.mock import MagicMock
-
     from paramem.graph.extractor import (
-        DOCUMENT_SYSTEM_PROMPT_FILENAME,
-        DOCUMENT_USER_PROMPT_FILENAME,
+        DEFAULT_SYSTEM_PROMPT_FILENAME,
+        DEFAULT_USER_PROMPT_FILENAME,
     )
-    from paramem.training.consolidation import ConsolidationLoop
 
     captured = {}
 
@@ -659,52 +608,65 @@ def test_run_extract_graph_threads_source_type(monkeypatch):
         captured["kwargs"] = kwargs
         return MagicMock()
 
-    monkeypatch.setattr("paramem.training.consolidation.extract_graph", spy)
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
 
-    ns = _loop_ns_with_model(MagicMock())
-    ConsolidationLoop._run_extract_graph(
-        ns, "some document text", "doc-001", source_type="document", speaker_id="Speaker0"
-    )
+    pipeline = _make_pipeline()
+    pipeline.run("some document text", "doc-001", source_type="document", speaker_id="Speaker0")
 
     got_system = captured["kwargs"].get("system_prompt_filename")
-    assert got_system == DOCUMENT_SYSTEM_PROMPT_FILENAME, (
-        f"Expected system_prompt_filename={DOCUMENT_SYSTEM_PROMPT_FILENAME!r}, got {got_system!r}"
+    assert got_system == DEFAULT_SYSTEM_PROMPT_FILENAME, (
+        f"Expected system_prompt_filename={DEFAULT_SYSTEM_PROMPT_FILENAME!r}, got {got_system!r}"
     )
     got_user = captured["kwargs"].get("user_prompt_filename")
-    assert got_user == DOCUMENT_USER_PROMPT_FILENAME, (
-        f"Expected user_prompt_filename={DOCUMENT_USER_PROMPT_FILENAME!r}, got {got_user!r}"
+    assert got_user == DEFAULT_USER_PROMPT_FILENAME, (
+        f"Expected user_prompt_filename={DEFAULT_USER_PROMPT_FILENAME!r}, got {got_user!r}"
     )
 
 
-def test_run_extract_graph_honors_prompt_filename_overrides(monkeypatch):
+def test_run_document_flips_gate_defaults(monkeypatch):
+    """``source_type='document'`` survives as a runtime distinction for
+    gate defaults — ``stt_correction`` and ``ha_validation`` default to
+    ``False`` because written text has no STT artefact surface and HA
+    grounding is dialogue-only.  Prompt selection no longer differs.
+    """
+    captured = {}
+
+    def spy(model, tokenizer, transcript, session_id, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
+
+    pipeline = _make_pipeline()
+    pipeline.run("doc text", "doc-001", source_type="document", speaker_id="Speaker0")
+    assert captured["kwargs"]["stt_correction"] is False
+    assert captured["kwargs"]["ha_validation"] is False
+
+
+def test_run_honors_prompt_filename_overrides(monkeypatch):
     """Explicit ``user_prompt_filename`` / ``system_prompt_filename`` overrides
-    passed via ``_run_extract_graph(...)`` MUST win over the source-type
+    passed via :meth:`ExtractionPipeline.run` MUST win over the source-type
     defaults.
 
-    Regression guard for the silent-override-drop bug fixed in
-    paramem/training/consolidation.py::_extraction_kwargs (formerly
-    returned the locally-computed source-type defaults unconditionally,
-    bypassing the ``pick`` helper that handles every other override).
+    Regression guard for the silent-override-drop bug: previously
+    ``_extraction_kwargs`` returned the locally-computed source-type defaults
+    unconditionally, bypassing the ``pick`` helper that handles every other
+    override.
 
     Without this, calibration probes (which inject ``calib_*.txt``
     variants via overrides) silently get the production prompt — making
     every "candidate vs baseline" diff a same-prompt comparison.
     """
-    from unittest.mock import MagicMock
-
-    from paramem.training.consolidation import ConsolidationLoop
-
     captured = {}
 
     def spy(model, tokenizer, transcript, session_id, **kwargs):
         captured["kwargs"] = kwargs
         return MagicMock()
 
-    monkeypatch.setattr("paramem.training.consolidation.extract_graph", spy)
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
 
-    ns = _loop_ns_with_model(MagicMock())
-    ConsolidationLoop._run_extract_graph(
-        ns,
+    pipeline = _make_pipeline()
+    pipeline.run(
         "transcript text",
         "calib-001",
         source_type="transcript",
@@ -716,103 +678,25 @@ def test_run_extract_graph_honors_prompt_filename_overrides(monkeypatch):
 
     assert captured["kwargs"]["user_prompt_filename"] == "calib_extraction.txt", (
         "user_prompt_filename override was dropped — production prompt "
-        "would have been used. See _extraction_kwargs in "
-        "paramem/training/consolidation.py."
+        "would have been used. See ExtractionPipeline.kwargs in "
+        "paramem/graph/extraction_pipeline.py."
     )
     assert captured["kwargs"]["system_prompt_filename"] == "calib_extraction_system.txt"
 
 
-def test_extraction_document_prompt_present():
-    """Verify extraction_document.txt exists under configs/prompts/.
+def test_run_procedural_uses_default_prompts_for_document(monkeypatch):
+    """:meth:`run_procedural` with ``source_type='document'`` must still use
+    ``DEFAULT_SYSTEM_PROMPT_FILENAME`` and
+    ``DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME``.
 
-    The document extraction path resolves this filename at runtime via
-    load_extraction_prompts; a missing file causes a silent fallback to the
-    hardcoded default user template, which has dialogue-shaped few-shots
-    incompatible with document extraction.
+    Symmetric to ``test_run_uses_default_prompts_for_document`` for the
+    procedural rail.  Regression guard against re-introducing the
+    document-variant procedural prompt file.
     """
-    repo_root = Path(__file__).resolve().parent.parent
-    doc_prompt = repo_root / "configs" / "prompts" / "extraction_document.txt"
-    assert doc_prompt.exists(), (
-        "configs/prompts/extraction_document.txt is missing. "
-        "The document extraction path will silently fall back to the dialogue "
-        "user template, producing dialogue-shaped few-shots for document input."
-    )
-
-
-def _loop_ns_for_procedural():
-    """Namespace usable as `self` for bound-call tests of _run_extract_procedural_graph."""
-    import types
-    from unittest.mock import MagicMock
-
-    from paramem.training.consolidation import ConsolidationLoop
-
-    ns = _extraction_kwargs_namespace()
-    ns.model = MagicMock()
-    ns.tokenizer = MagicMock()
-    ns._disable_gradient_checkpointing = lambda: None
-    # Bind _dump_session_graph so the wrapper resolves the attr; short-circuits
-    # on the namespace's save_cycle_snapshots=False / snapshot_dir=None gate.
-    ns._dump_session_graph = types.MethodType(ConsolidationLoop._dump_session_graph, ns)
-    return ns
-
-
-def test_run_extract_procedural_graph_threads_source_type_document(monkeypatch):
-    """When called with source_type='document', _run_extract_procedural_graph must
-    resolve BOTH system_prompt_filename to DOCUMENT_SYSTEM_PROMPT_FILENAME AND
-    user_prompt_filename to DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME.
-
-    Symmetric to test_run_extract_graph_threads_source_type for the episodic rail.
-    Regression guard: if _run_extract_procedural_graph ever stops routing
-    source_type to the correct procedural filenames, document procedural
-    extraction silently receives dialogue-shaped few-shots that reference a
-    non-existent assistant response.
-    """
-    from unittest.mock import MagicMock
-
-    from paramem.graph.extractor import (
-        DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME,
-        DOCUMENT_SYSTEM_PROMPT_FILENAME,
-    )
-    from paramem.training.consolidation import ConsolidationLoop
-
-    captured = {}
-
-    def spy(model, tokenizer, transcript, session_id, **kwargs):
-        captured["kwargs"] = kwargs
-        return MagicMock()
-
-    monkeypatch.setattr("paramem.training.consolidation.extract_procedural_graph", spy)
-
-    ns = _loop_ns_for_procedural()
-    ConsolidationLoop._run_extract_procedural_graph(
-        ns, "some document text", "doc-001", speaker_id="Speaker0", source_type="document"
-    )
-
-    got_system = captured["kwargs"].get("system_prompt_filename")
-    assert got_system == DOCUMENT_SYSTEM_PROMPT_FILENAME, (
-        f"Expected system_prompt_filename={DOCUMENT_SYSTEM_PROMPT_FILENAME!r}, got {got_system!r}"
-    )
-    got_user = captured["kwargs"].get("user_prompt_filename")
-    assert got_user == DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME, (
-        f"Expected user_prompt_filename={DOCUMENT_PROCEDURAL_USER_PROMPT_FILENAME!r}, "
-        f"got {got_user!r}"
-    )
-
-
-def test_run_extract_procedural_graph_threads_source_type_transcript(monkeypatch):
-    """When called with source_type='transcript' (default), _run_extract_procedural_graph
-    must use DEFAULT_SYSTEM_PROMPT_FILENAME and DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME.
-
-    Ensures the transcript path continues to use dialogue prompts after the
-    document-path plumbing was added.
-    """
-    from unittest.mock import MagicMock
-
     from paramem.graph.extractor import (
         DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
         DEFAULT_SYSTEM_PROMPT_FILENAME,
     )
-    from paramem.training.consolidation import ConsolidationLoop
 
     captured = {}
 
@@ -820,11 +704,11 @@ def test_run_extract_procedural_graph_threads_source_type_transcript(monkeypatch
         captured["kwargs"] = kwargs
         return MagicMock()
 
-    monkeypatch.setattr("paramem.training.consolidation.extract_procedural_graph", spy)
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_procedural_graph", spy)
 
-    ns = _loop_ns_for_procedural()
-    ConsolidationLoop._run_extract_procedural_graph(
-        ns, "some transcript text", "s001", speaker_id="Speaker0", source_type="transcript"
+    pipeline = _make_pipeline()
+    pipeline.run_procedural(
+        "some document text", "doc-001", speaker_id="Speaker0", source_type="document"
     )
 
     got_system = captured["kwargs"].get("system_prompt_filename")
@@ -838,62 +722,134 @@ def test_run_extract_procedural_graph_threads_source_type_transcript(monkeypatch
     )
 
 
-def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypatch, tmp_path):
-    """Both extraction chokepoints must persist the per-session SessionGraph
-    (with diagnostics intact) under debug mode, before downstream merging
-    flattens it into the cumulative graph.
+def test_run_procedural_threads_source_type_transcript(monkeypatch):
+    """When called with source_type='transcript' (default),
+    :meth:`run_procedural` must use ``DEFAULT_SYSTEM_PROMPT_FILENAME`` and
+    ``DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME``.
 
-    Verifies the architectural seam: extraction is upstream of adapter
-    allocation, so the dump fires from ``_run_extract_graph`` and
-    ``_run_extract_procedural_graph`` (the single-topology chokepoints),
-    not from any orchestrator.  ``kind`` reflects which extractor produced
-    the graph — never an adapter name (allocation is downstream).
+    Ensures the transcript path continues to use dialogue prompts after the
+    document-path plumbing was added.
+    """
+    from paramem.graph.extractor import (
+        DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
+        DEFAULT_SYSTEM_PROMPT_FILENAME,
+    )
+
+    captured = {}
+
+    def spy(model, tokenizer, transcript, session_id, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_procedural_graph", spy)
+
+    pipeline = _make_pipeline()
+    pipeline.run_procedural(
+        "some transcript text", "s001", speaker_id="Speaker0", source_type="transcript"
+    )
+
+    got_system = captured["kwargs"].get("system_prompt_filename")
+    assert got_system == DEFAULT_SYSTEM_PROMPT_FILENAME, (
+        f"Expected system_prompt_filename={DEFAULT_SYSTEM_PROMPT_FILENAME!r}, got {got_system!r}"
+    )
+    got_user = captured["kwargs"].get("user_prompt_filename")
+    assert got_user == DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME, (
+        f"Expected user_prompt_filename={DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME!r}, "
+        f"got {got_user!r}"
+    )
+
+
+def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
+    """Build a real ConsolidationLoop with snapshot dumping enabled.
+
+    Patches ExtractionPipeline.extract_graph / extract_procedural_graph to
+    return a fixed SessionGraph so the orchestrator's
+    ``_dump_session_graph`` runs against deterministic input.
+    """
+    from peft import PeftModel
+
+    from paramem.training.consolidation import ConsolidationLoop
+    from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+    monkeypatch.setattr(
+        "paramem.graph.extraction_pipeline.extract_graph",
+        lambda *a, **kw: fake_graph,
+    )
+    monkeypatch.setattr(
+        "paramem.graph.extraction_pipeline.extract_procedural_graph",
+        lambda *a, **kw: fake_graph,
+    )
+
+    model = MagicMock()
+    model.__class__ = PeftModel
+    model.peft_config = {
+        "episodic": MagicMock(),
+        "semantic": MagicMock(),
+        "in_training": MagicMock(),
+    }
+
+    loop = ConsolidationLoop(
+        model=model,
+        tokenizer=MagicMock(),
+        consolidation_config=ConsolidationConfig(),
+        training_config=TrainingConfig(),
+        episodic_adapter_config=AdapterConfig(),
+        semantic_adapter_config=AdapterConfig(),
+        output_dir=tmp_path,
+        persist_graph=False,
+        save_cycle_snapshots=True,
+        snapshot_dir=tmp_path,
+    )
+    loop.cycle_count = 7
+    return loop
+
+
+def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp_path):
+    """The consolidation orchestrator must persist the per-session
+    SessionGraph (with diagnostics intact) under debug mode after each
+    extraction chokepoint call, before downstream merging flattens it
+    into the cumulative graph.
+
+    Verifies the architectural seam: extraction returns a SessionGraph;
+    the orchestrator calls ``self._dump_session_graph(graph, session_id, kind)``
+    immediately afterward.  ``kind`` reflects which extractor produced the
+    graph — never an adapter name (allocation is downstream).
 
     Regression guard for the debug-mode persistence gap discovered when
     diagnosing the first end-to-end document-ingest cycle.
     """
-    from unittest.mock import MagicMock
-
     from paramem.graph.schema import Entity, Relation, SessionGraph
-    from paramem.training.consolidation import ConsolidationLoop
 
-    def _fake_session_graph(session_id: str):
-        return SessionGraph(
-            session_id=session_id,
-            timestamp="2026-04-26T22:30:00Z",
-            entities=[Entity(name="Alice", entity_type="person", attributes={})],
-            relations=[
-                Relation(
-                    subject="Alice",
-                    predicate="works_at",
-                    object="Acme",
-                    relation_type="factual",
-                    confidence=1.0,
-                    speaker_id="Speaker0",
-                )
-            ],
-            summary="Alice works at Acme.",
-            diagnostics={
-                "sota_raw_response": "{'malformed': json}",
-                "fallback_path": "all_dropped",
-                "residual_dropped_facts": [{"subject": "Person_1"}],
-            },
-        )
+    fake_graph = SessionGraph(
+        session_id="sess-A",
+        timestamp="2026-04-26T22:30:00Z",
+        entities=[Entity(name="Alice", entity_type="person", attributes={})],
+        relations=[
+            Relation(
+                subject="Alice",
+                predicate="works_at",
+                object="Acme",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            )
+        ],
+        summary="Alice works at Acme.",
+        diagnostics={
+            "sota_raw_response": "{'malformed': json}",
+            "fallback_path": "all_dropped",
+            "residual_dropped_facts": [{"subject": "Person_1"}],
+        },
+    )
+
+    loop = _build_loop_with_session_dump(tmp_path, monkeypatch, fake_graph=fake_graph)
+    snapshot_root = loop.snapshot_dir
 
     # --- Episodic chokepoint ---
-    ns_main = _loop_ns_with_model(MagicMock())
-    ns_main.save_cycle_snapshots = True
-    ns_main.snapshot_dir = tmp_path
-    ns_main.cycle_count = 7
-    monkeypatch.setattr(
-        "paramem.training.consolidation.extract_graph",
-        lambda *a, **kw: _fake_session_graph("sess-A"),
-    )
-    ConsolidationLoop._run_extract_graph(
-        ns_main, "transcript text", "sess-A", speaker_id="Speaker0"
-    )
+    graph = loop.extraction.run("transcript text", "sess-A", speaker_id="Speaker0")
+    loop._dump_session_graph(graph, "sess-A", "graph")
 
-    main_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "graph_snapshot.json"
+    main_path = snapshot_root / "cycle_7" / "sessions" / "sess-A" / "graph_snapshot.json"
     assert main_path.exists(), f"episodic dump missing at {main_path}"
     main_dump = json.loads(main_path.read_text())
     assert main_dump["diagnostics"]["fallback_path"] == "all_dropped"
@@ -901,19 +857,10 @@ def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypa
     assert main_dump["relations"][0]["predicate"] == "works_at"
 
     # --- Procedural chokepoint ---
-    ns_proc = _loop_ns_for_procedural()
-    ns_proc.save_cycle_snapshots = True
-    ns_proc.snapshot_dir = tmp_path
-    ns_proc.cycle_count = 7
-    monkeypatch.setattr(
-        "paramem.training.consolidation.extract_procedural_graph",
-        lambda *a, **kw: _fake_session_graph("sess-A"),
-    )
-    ConsolidationLoop._run_extract_procedural_graph(
-        ns_proc, "transcript text", "sess-A", speaker_id="Speaker0"
-    )
+    proc_graph = loop.extraction.run_procedural("transcript text", "sess-A", speaker_id="Speaker0")
+    loop._dump_session_graph(proc_graph, "sess-A", "procedural_graph")
 
-    proc_path = tmp_path / "cycle_7" / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
+    proc_path = snapshot_root / "cycle_7" / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
     assert proc_path.exists(), f"procedural dump missing at {proc_path}"
     proc_dump = json.loads(proc_path.read_text())
     assert proc_dump["diagnostics"]["fallback_path"] == "all_dropped"
@@ -924,32 +871,28 @@ def test_extraction_chokepoints_dump_per_session_graph_with_diagnostics(monkeypa
     assert main_path.name != proc_path.name
 
 
-def test_dump_session_graph_short_circuits_when_debug_off(monkeypatch, tmp_path):
-    """The dump gate must short-circuit when either save_cycle_snapshots is
-    False or snapshot_dir is None.  Production runs without debug mode must
-    not pay any disk cost from this debug-only diagnostic.
+def test_dump_session_graph_short_circuits_when_debug_off(tmp_path):
+    """:meth:`ConsolidationLoop._dump_session_graph` must short-circuit when
+    either ``save_cycle_snapshots`` is False or ``snapshot_dir`` is None.
+    Production runs without debug mode must not pay any disk cost from this
+    debug-only diagnostic.
     """
-    from unittest.mock import MagicMock
-
     from paramem.training.consolidation import ConsolidationLoop
 
-    monkeypatch.setattr(
-        "paramem.training.consolidation.extract_graph",
-        lambda *a, **kw: MagicMock(model_dump_json=lambda **kw: "{}"),
-    )
+    loop = ConsolidationLoop.__new__(ConsolidationLoop)
+    loop.cycle_count = 0
+    fake_graph = MagicMock(model_dump_json=lambda **kw: "{}")
 
-    # save_cycle_snapshots=False — default in _loop_ns_with_model.
-    ns = _loop_ns_with_model(MagicMock())
-    ns.snapshot_dir = tmp_path  # set, but gate is on save_cycle_snapshots
-    ConsolidationLoop._run_extract_graph(ns, "t", "s001", speaker_id="Speaker0")
+    # save_cycle_snapshots=False → no write.
+    loop.save_cycle_snapshots = False
+    loop.snapshot_dir = tmp_path
+    loop._dump_session_graph(fake_graph, "s001", "graph")
     assert not (tmp_path / "cycle_0").exists(), "dump fired despite save_cycle_snapshots=False"
 
-    # snapshot_dir=None — equally short-circuits.
-    ns2 = _loop_ns_with_model(MagicMock())
-    ns2.save_cycle_snapshots = True
-    ns2.snapshot_dir = None
-    # Would raise AttributeError on `None / "cycle_X"` if the gate didn't fire.
-    ConsolidationLoop._run_extract_graph(ns2, "t", "s002", speaker_id="Speaker0")
+    # snapshot_dir=None → no write (no AttributeError on ``None / "cycle_X"``).
+    loop.save_cycle_snapshots = True
+    loop.snapshot_dir = None
+    loop._dump_session_graph(fake_graph, "s002", "graph")
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +904,7 @@ _SPEAKER_ID_DEFAULT_PATTERN = re.compile(r'speaker_id:\s*str\s*=\s*""')
 
 _SPEAKER_ID_DEFAULT_FILES = (
     "paramem/graph/extractor.py",
+    "paramem/graph/extraction_pipeline.py",
     "paramem/training/consolidation.py",
 )
 
@@ -975,7 +919,8 @@ def test_no_speaker_id_empty_string_defaults():
     the omission — only this test does.
 
     To verify the guard works: temporarily add ``speaker_id: str = ""`` to
-    either file, run this test, and confirm it fails.  Then revert.
+    one of the listed files, run this test, and confirm it fails.  Then
+    revert.
 
     Phase 1 (commit 1b7eba2) left the defaults intentionally as a deferred
     cleanup; Phase 2a removes them (this test is the gating CI assertion).
@@ -1006,35 +951,27 @@ def test_no_speaker_id_empty_string_defaults():
     )
 
 
-def test_extraction_kwargs_raises_on_missing_speaker_id():
-    """``_extraction_kwargs`` must raise ``ValueError`` when ``speaker_id``
-    is absent from the overrides dict.
+def test_kwargs_raises_on_missing_speaker_id():
+    """:meth:`ExtractionPipeline.kwargs` must raise ``ValueError`` when
+    ``speaker_id`` is absent from the overrides dict.
 
     This enforces the contract at the extraction chokepoint: a caller that
     forgets to pass speaker_id gets an immediate, clear error instead of
     silently stamping ``""`` onto every Relation it produces.
     """
-    import pytest
-
-    from paramem.training.consolidation import ConsolidationLoop
-
-    ns = _extraction_kwargs_namespace()
+    pipeline = _make_pipeline()
     with pytest.raises(ValueError, match="speaker_id is required"):
-        ConsolidationLoop._extraction_kwargs(ns)
+        pipeline.kwargs()
 
 
-def test_extraction_kwargs_raises_on_empty_speaker_id():
-    """``_extraction_kwargs`` must raise ``ValueError`` when ``speaker_id``
-    is explicitly passed as an empty string.
+def test_kwargs_raises_on_empty_speaker_id():
+    """:meth:`ExtractionPipeline.kwargs` must raise ``ValueError`` when
+    ``speaker_id`` is explicitly passed as an empty string.
 
     An empty string is semantically indistinguishable from a missing value
     from the schema's perspective (Pydantic accepts both), so the guard must
     treat it the same way as an absent key.
     """
-    import pytest
-
-    from paramem.training.consolidation import ConsolidationLoop
-
-    ns = _extraction_kwargs_namespace()
+    pipeline = _make_pipeline()
     with pytest.raises(ValueError, match="speaker_id is required"):
-        ConsolidationLoop._extraction_kwargs(ns, speaker_id="")
+        pipeline.kwargs(speaker_id="")
