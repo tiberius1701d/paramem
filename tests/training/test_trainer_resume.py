@@ -224,6 +224,160 @@ class TestTrainAdapterResumeParam:
         assert "train_loss" in metrics
 
 
+class TestTrainAdapterEncryptedResume:
+    """Symmetry with EncryptCheckpointCallback: when Security is ON the
+    on-disk ``checkpoint-N/`` is age-encrypted and HF Trainer's
+    ``_load_from_checkpoint`` would crash on the age magic.  ``train_adapter``
+    must materialise the checkpoint into a tempdir (decrypting en route via
+    ``materialize_checkpoint_to_shm``) and hand HF the plaintext path,
+    cleaning up the tempdir in ``finally``.  Mirrors the pattern already in
+    ``BackgroundTrainer._train_adapter``.
+    """
+
+    def setup_method(self):
+        _CapturingTrainer.captured_train_kwargs.clear()
+
+    @pytest.fixture()
+    def train_adapter_mocks(self, tmp_path):
+        with (
+            patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
+            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+        ):
+            mock_args = MagicMock()
+            mock_args_cls.return_value = mock_args
+            yield tmp_path
+
+    def test_security_off_skips_materialization(self, train_adapter_mocks, tmp_path):
+        """When daily_identity_loadable returns False, the on-disk path is
+        forwarded unchanged — no shm tempdir is created."""
+        tmp_path = train_adapter_mocks
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+        ckpt = tmp_path / "adapter" / "checkpoint-40"
+
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch(
+                "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm"
+            ) as mock_materialize,
+        ):
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=_make_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_training_config(),
+                adapter_config=_minimal_adapter_config(),
+                output_dir=tmp_path / "adapter",
+                resume_from_checkpoint=ckpt,
+            )
+
+        mock_materialize.assert_not_called()
+        forwarded = _CapturingTrainer.captured_train_kwargs[0]["resume_from_checkpoint"]
+        assert forwarded == str(ckpt)
+
+    def test_security_on_materializes_to_shm_and_forwards_plaintext_path(
+        self, train_adapter_mocks, tmp_path
+    ):
+        """When daily_identity_loadable returns True, train_adapter calls
+        materialize_checkpoint_to_shm and hands HF Trainer the shm tempdir."""
+        tmp_path = train_adapter_mocks
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+        ckpt = tmp_path / "adapter" / "checkpoint-40"
+        shm_dir = tmp_path / "shm-mock"
+        shm_dir.mkdir()
+
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=True),
+            patch(
+                "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm",
+                return_value=shm_dir,
+            ) as mock_materialize,
+            patch("paramem.training.trainer.shutil.rmtree") as mock_rmtree,
+        ):
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=_make_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_training_config(),
+                adapter_config=_minimal_adapter_config(),
+                output_dir=tmp_path / "adapter",
+                resume_from_checkpoint=ckpt,
+            )
+
+        mock_materialize.assert_called_once_with(Path(str(ckpt)))
+        forwarded = _CapturingTrainer.captured_train_kwargs[0]["resume_from_checkpoint"]
+        assert forwarded == str(shm_dir)
+        mock_rmtree.assert_called_once_with(shm_dir, ignore_errors=True)
+
+    def test_security_on_no_resume_path_skips_materialization(self, train_adapter_mocks, tmp_path):
+        """No resume_from_checkpoint → no shm work even with Security ON."""
+        tmp_path = train_adapter_mocks
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=True),
+            patch(
+                "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm"
+            ) as mock_materialize,
+        ):
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=_make_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_training_config(),
+                adapter_config=_minimal_adapter_config(),
+                output_dir=tmp_path / "adapter",
+                resume_from_checkpoint=None,
+            )
+
+        mock_materialize.assert_not_called()
+        assert _CapturingTrainer.captured_train_kwargs[0]["resume_from_checkpoint"] is None
+
+    def test_shm_dir_cleaned_up_on_exception(self, train_adapter_mocks, tmp_path):
+        """If trainer.train raises, the shm tempdir must still be removed."""
+        tmp_path = train_adapter_mocks
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+        ckpt = tmp_path / "adapter" / "checkpoint-40"
+        shm_dir = tmp_path / "shm-cleanup"
+        shm_dir.mkdir()
+
+        class _BoomTrainer(_CapturingTrainer):
+            def train(self, resume_from_checkpoint=None):
+                _CapturingTrainer.captured_train_kwargs.append(
+                    {"resume_from_checkpoint": resume_from_checkpoint}
+                )
+                raise RuntimeError("boom")
+
+        with (
+            patch("paramem.training.trainer.Trainer", new=_BoomTrainer),
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=True),
+            patch(
+                "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm",
+                return_value=shm_dir,
+            ),
+            patch("paramem.training.trainer.shutil.rmtree") as mock_rmtree,
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=_make_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_training_config(),
+                adapter_config=_minimal_adapter_config(),
+                output_dir=tmp_path / "adapter",
+                resume_from_checkpoint=ckpt,
+            )
+
+        mock_rmtree.assert_called_once_with(shm_dir, ignore_errors=True)
+
+
 class TestTrainAdapterSavePath:
     """Regression: save_pretrained gets output_dir.parent so PEFT's auto-append
     of the adapter name lands the weights at output_dir, not at
