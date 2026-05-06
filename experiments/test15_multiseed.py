@@ -251,6 +251,17 @@ class RecallProbeCallback(TrainerCallback):
             except OSError as exc:
                 logger.warning("progress.json write failed: %s", exc)
 
+        # --- Pause check (after writing progress) ---
+        # Mirrors test13b's DualRecallProbeCallback (line 397) and test14's
+        # RecallEarlyStopCallback so tpause fires at the next epoch
+        # boundary inside a phase, not only at phase boundaries.
+        if PAUSE_FILE.exists():
+            logger.warning(
+                "Pause file detected at epoch %d — signalling stop. Use tresume 15 to continue.",
+                epoch,
+            )
+            control.should_training_stop = True
+
 
 # ---------------------------------------------------------------------------
 # QA pool + phase builders (copied from Test 13).
