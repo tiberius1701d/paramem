@@ -470,7 +470,7 @@ intent:
   fail_closed_intent: personal                    # privacy-preserving default on uncertainty
 
 voice:
-  prompt_file: configs/prompts/ha_voice.txt
+  prompt_file: configs/prompts/pa_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)
 
 speaker:
