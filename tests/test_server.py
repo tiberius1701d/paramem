@@ -130,8 +130,8 @@ class TestSessionBuffer:
         pending = buffer.get_pending()
         assert len(pending) == 1
         assert pending[0]["session_id"] == "conv1"
-        assert "User: Hello" in pending[0]["transcript"]
-        assert "Assistant: Hi there!" in pending[0]["transcript"]
+        assert "[user] Hello" in pending[0]["transcript"]
+        assert "[assistant] Hi there!" in pending[0]["transcript"]
 
     def test_multiple_conversations(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions")
@@ -227,7 +227,10 @@ class TestSessionBuffer:
         buffer.append("conv1", "user", "I live in Amsterdam")
 
         pending = buffer.get_pending()
-        assert "Alex: I live in Amsterdam" in pending[0]["transcript"]
+        # Production format is [user] / [assistant] markers; speaker name
+        # is bound via the {speaker_context} prompt directive, not inlined
+        # in the transcript.  speaker_id continues to flow on the pending dict.
+        assert "[user] I live in Amsterdam" in pending[0]["transcript"]
         assert pending[0]["speaker_id"] == "spk_abc"
 
     def _setup_daily(self, tmp_path, monkeypatch, passphrase="pw"):
@@ -272,7 +275,7 @@ class TestSessionBuffer:
 
         pending = buf2.get_pending()
         assert len(pending) == 1
-        assert "Alex: I live in Amsterdam" in pending[0]["transcript"]
+        assert "[user] I live in Amsterdam" in pending[0]["transcript"]
         assert pending[0]["speaker_id"] == "spk_abc"
         assert buf2.get_speaker("conv1") == "Alex"
 

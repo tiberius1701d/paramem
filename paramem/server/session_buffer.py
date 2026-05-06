@@ -444,23 +444,39 @@ class SessionBuffer:
 
     @staticmethod
     def _format_turns(turns: list[dict]) -> tuple[list[str], str | None]:
-        """Format turns into readable lines and extract dominant speaker_id."""
+        """Format turns into ``[user]`` / ``[assistant]`` marker lines.
+
+        ``[user]`` / ``[assistant]`` is the single transcript marker
+        format the extraction prompt's few-shots use.  Document chunks
+        (which arrive at ``buffer.append`` with ``role="user"`` and no
+        turn structure of their own) come out as a single
+        ``[user] <chunk text>`` line — same surface form as the leading
+        user turn of a transcript.
+
+        Speaker identity is bound via the ``{speaker_context}`` slot in
+        the user template (see ``paramem/graph/extractor.py:437``
+        ``build_speaker_context``), not by inlining the speaker's name
+        here.  ``speaker_id`` continues to track per-turn for downstream
+        provenance.
+        """
         formatted = []
         speaker_ids = []
         for turn in turns:
             role = turn.get("role", "unknown")
             text = turn.get("text", "")
-            speaker = turn.get("speaker")
             sid = turn.get("speaker_id")
 
             if sid:
                 speaker_ids.append(sid)
 
-            if role == "user" and speaker:
-                formatted.append(f"{speaker}: {text}")
-            else:
-                role_label = role.capitalize()
-                formatted.append(f"{role_label}: {text}")
+            marker = (
+                "[user]"
+                if role == "user"
+                else "[assistant]"
+                if role == "assistant"
+                else f"[{role}]"
+            )
+            formatted.append(f"{marker} {text}")
 
         session_speaker_id = None
         if speaker_ids:
