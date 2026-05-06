@@ -10,7 +10,7 @@
 #   source ~/.local/bin/training-control.sh
 #
 #   training_pause       # Signal: stop after current cycle/checkpoint
-#   training_resume [N]  # Launch test N (8, 9, 10, 10b, 11, 13, 13b, 14, 14s).
+#   training_resume [N]  # Launch test N (8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15).
 #   training_status      # Show pause state + GPU + progress for all tests
 #
 # Recommended aliases (add to ~/.bashrc):
@@ -161,6 +161,7 @@ TEST_SCRIPTS[14]="experiments/test14.py"
 # so it can reuse Phase A and Phase B from V3.  Currently configured for
 # the V3/seed42 apples-to-apples validation at linear+B50+decay=600.
 TEST_SCRIPTS["14s"]="experiments/test14.py"
+TEST_SCRIPTS[15]="experiments/test15_multiseed.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
@@ -171,6 +172,7 @@ TEST_OUTPUT_DIRS[13]="outputs/test13_journal_scaffold"
 TEST_OUTPUT_DIRS["13b"]="outputs/test13b_retention_curve"
 TEST_OUTPUT_DIRS[14]="outputs/test14_pre"
 TEST_OUTPUT_DIRS["14s"]="outputs/test14_pre"
+TEST_OUTPUT_DIRS[15]="outputs/test15_multiseed"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
@@ -184,6 +186,7 @@ TEST_PGREP[14]="test14"
 # multi-seed never passes --variant.  Checked before 14 in the iteration
 # order so the more-specific match wins.
 TEST_PGREP["14s"]="test14.*--variant V3"
+TEST_PGREP[15]="test15_multiseed"
 
 # Smoke flags for 14s.  Hardcoded here rather than persisted to
 # run_config.json so the smoke remains an explicit, repeatable probe and
@@ -361,7 +364,7 @@ _find_running_test() {
     # (14s, 13b, 10b) share their script with a broader sibling (14, 13,
     # 10) and must be checked first so a running variant doesn't get
     # mis-attributed to the broader entry.
-    for t in 8 9 10b 10 11 13b 13 14s 14; do
+    for t in 8 9 10b 10 11 13b 13 14s 14 15; do
         [[ -z "${TEST_PGREP[$t]:-}" ]] && continue
         local pids
         pids=$(pgrep -f "${TEST_PGREP[$t]}" 2>/dev/null)
@@ -541,7 +544,7 @@ training_resume() {
 
     # Validate test number
     if [[ -z "${TEST_SCRIPTS[$test_num]}" ]]; then
-        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s."
+        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15."
         return 1
     fi
 
@@ -829,7 +832,7 @@ print(labels.get(r, r or ''))
     fi
 
     # Show status for each test (reuses $running from above)
-    for test_num in 8 9 10 10b 11 13 13b 14; do
+    for test_num in 8 9 10 10b 11 13 13b 14 15; do
         _show_test_status "$test_num" "$running"
     done
 
@@ -905,6 +908,30 @@ _show_test_status() {
         echo -e "  ${BOLD}Test 14${RESET}${is_running}"
         echo "  ────────────────────────────────────────"
         _show_test14_status "$latest_run_dir" "$running_flag"
+        return
+    fi
+
+    # Test 15 uses per-seed *_done.json markers under seedN/{A,B,C1,C2}/.
+    if [[ "$test_num" == "15" ]]; then
+        local latest_run_dir
+        latest_run_dir=$(find "$PROJECT_DIR/$output_dir" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+        if [[ -z "$latest_run_dir" ]]; then
+            if [[ "$running_test" == "$test_num" ]]; then
+                echo ""
+                echo -e "  ${BOLD}Test 15${RESET} ${GREEN}RUNNING${RESET}"
+                echo "  ────────────────────────────────────────"
+                echo -e "  ${DIM}Preparing run directory...${RESET}"
+            fi
+            return
+        fi
+        local is_running=""
+        if [[ "$running_test" == "$test_num" ]]; then
+            is_running=" ${GREEN}RUNNING${RESET}"
+        fi
+        echo ""
+        echo -e "  ${BOLD}Test 15${RESET}${is_running}"
+        echo "  ────────────────────────────────────────"
+        _show_test15_status "$latest_run_dir"
         return
     fi
 
@@ -1324,6 +1351,125 @@ PYEOF
         echo -e "  State:      ${DIM}starting (data prepared, training not yet begun)${RESET}"
     else
         echo -e "  State:      ${DIM}no progress yet${RESET}"
+    fi
+}
+
+_show_test15_status() {
+    # Argument: path to a specific run dir, e.g.
+    #   outputs/test15_multiseed/mistral/20260506_173617
+    #
+    # Test 15 runs A→B→C1→C2 per seed under seedN/.  Status reads each
+    # seed's *_done.json markers + the in-progress phase's progress.json.
+    # multiseed_aggregate.json lands when all seeds complete.
+    local run_dir="$1"
+    local model_name=$(basename "$(dirname "$run_dir")")
+    local run_name=$(basename "$run_dir")
+
+    echo -e "  Model:      ${CYAN}${model_name}${RESET}"
+    echo -e "  Run:        ${DIM}${run_name}${RESET}"
+
+    # Read seeds list from run_config.json (falls back to default seeds).
+    local seeds_csv
+    seeds_csv=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$run_dir/run_config.json'))
+    seeds = cfg.get('seeds', [42, 7, 1337, 1, 11])
+except Exception:
+    seeds = [42, 7, 1337, 1, 11]
+print(' '.join(str(s) for s in seeds))
+" 2>/dev/null)
+    if [[ -z "$seeds_csv" ]]; then
+        seeds_csv="42 7 1337 1 11"
+    fi
+
+    # Per-seed phase summary.  For B and C2 we surface retention because
+    # that's the experiment's primary observable.
+    python3 - "$run_dir" $seeds_csv <<'PYEOF' 2>/dev/null
+import json, sys, os
+run_dir = sys.argv[1]
+seeds = [int(s) for s in sys.argv[2:]]
+GREEN = "\x1b[32m"
+DIM = "\x1b[2m"
+RESET = "\x1b[0m"
+for s in seeds:
+    seed_dir = os.path.join(run_dir, f"seed{s}")
+    parts = []
+    for p in ("A", "B", "C1", "C2"):
+        marker = os.path.join(seed_dir, p, f"{p}_done.json")
+        if not os.path.exists(marker):
+            parts.append(f"{p}={DIM}-{RESET}")
+            continue
+        try:
+            d = json.load(open(marker))
+        except Exception:
+            parts.append(f"{p}={DIM}?{RESET}")
+            continue
+        if p in ("B", "C2"):
+            ret = d.get("retention_unchanged_80", {}).get("rate")
+            ret_s = f"{ret:.2f}" if isinstance(ret, (int, float)) else "-"
+            stable = d.get("stable_perfect_epoch")
+            stable_s = f"e{stable}" if stable is not None else "-"
+            parts.append(f"{GREEN}{p}{RESET}={ret_s}/{stable_s}")
+        else:
+            stable = d.get("stable_perfect_epoch")
+            stable_s = f"e{stable}" if stable is not None else "-"
+            parts.append(f"{GREEN}{p}{RESET}={stable_s}")
+    print(f"  seed{s:>4}:    " + "  ".join(parts))
+print(f"  {DIM}(B / C2 fields show retention/stable_epoch — retention is unchanged-80 rate.){RESET}")
+PYEOF
+
+    # Detect in-progress (seed, phase) — first seed × phase whose marker is
+    # missing.  Iterate seeds in run_config order.
+    local current_seed=""
+    local current_phase=""
+    for s in $seeds_csv; do
+        for p in A B C1 C2; do
+            if [[ ! -f "$run_dir/seed${s}/${p}/${p}_done.json" ]]; then
+                current_seed="$s"
+                current_phase="$p"
+                break 2
+            fi
+        done
+    done
+
+    # Paused marker takes precedence — script writes paused.json at run-dir
+    # level (not per-seed) on clean tpause exit.
+    if [[ -f "$run_dir/paused.json" ]]; then
+        local after
+        after=$(python3 -c "import json; print(json.load(open('$run_dir/paused.json')).get('stopped_after_phase','?'))" 2>/dev/null)
+        echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped after ${after} — tresume 15 to continue)${RESET}"
+    elif [[ -n "$current_phase" ]]; then
+        local phase_dir="$run_dir/seed${current_seed}/${current_phase}"
+        echo -e "  Current:    ${YELLOW}seed${current_seed} Phase ${current_phase}${RESET}"
+        if [[ -f "$phase_dir/progress.json" ]]; then
+            _show_epoch_progress "$phase_dir" "$current_phase"
+        else
+            echo -e "  Training:   ${DIM}starting (no progress yet)${RESET}"
+        fi
+    fi
+
+    # Aggregate verdict, if all seeds × all phases done.
+    if [[ -f "$run_dir/multiseed_aggregate.json" ]]; then
+        python3 - "$run_dir/multiseed_aggregate.json" <<'PYEOF' 2>/dev/null
+import json, sys
+a = json.load(open(sys.argv[1]))
+n = a.get("n_completed", 0)
+mb = a.get("mean_retention_B")
+mc = a.get("mean_retention_C2")
+ratio = a.get("ratio_C2_over_B")
+thr = a.get("decision_threshold_ratio", 5.0)
+GREEN = "\x1b[32m"
+RED = "\x1b[31m"
+RESET = "\x1b[0m"
+verdict_color = GREEN if (ratio is not None and ratio >= thr) else RED
+verdict = "HOLDS" if (ratio is not None and ratio >= thr) else "DOES NOT HOLD"
+mb_s = f"{mb:.3f}" if isinstance(mb, (int, float)) else "?"
+mc_s = f"{mc:.3f}" if isinstance(mc, (int, float)) else "?"
+ratio_s = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "?"
+print(f"  Aggregate:  n={n}  retB={mb_s}  retC2={mc_s}  ratio={ratio_s}  threshold={thr:.1f}× → {verdict_color}{verdict}{RESET}")
+PYEOF
+        echo -e "  Final:      ${GREEN}all seeds complete${RESET}"
     fi
 }
 
