@@ -431,8 +431,10 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
   `probe_from_epoch=1, signal_from_epoch=10, window=3`); all 9
   (V1/V2/V3 × 3 seeds) cells terminated cleanly between e18 and e26
   inside the 50-epoch budget. Test 13b uses the same callback's optional
-  retention probe path. Test 15 uses a sibling `RecallProbeCallback` in
-  *observational mode*.
+  retention probe path. Test 15 (`test15_retention_multiseed`) uses
+  `RecallEarlyStopCallback` with the same `ANALYSIS_POLICY` for
+  production-realistic retention measurement (per-seed step counts may
+  differ; the headline retention is sampled at each seed's stop epoch).
 - **Shipped (production):** `ConsolidationLoop._maybe_make_recall_callback`
   constructs the callback at every production-reachable `train_adapter`
   call site (4 in `paramem/training/consolidation.py`: lines 1529, 1770,
@@ -2742,8 +2744,9 @@ single-seed per-key data in "Results — extended cells" is the final
 record for V4.
 
 **14a deferred on Test 15.** Test 14 measured fill-speed; Test 13's
-headline is retention. Test 15 (see its own section below) multi-seeds
-Test 13's A→B→C1→C2 protocol to settle whether the C2/B retention ratio
+headline is retention. Test 15 (`test15_retention_multiseed`, see its
+own section below) multi-seeds Test 13's A→B→C1→C2 protocol under the
+production recall early-stop to settle whether the C2/B retention ratio
 (n=1: 6.7×) survives seed variance. If the multi-seed lower-CI clears
 the bar, 14a is reactivated; otherwise 14a is cut.
 
@@ -2762,67 +2765,191 @@ the bar, 14a is reactivated; otherwise 14a is cut.
 
 ---
 
-## Test 15: Multi-Seed Retention Probe (Scaffold-Fill vs Answer-Swap)
+## Test 15: Retention Multi-Seed (Scaffold-Fill vs Answer-Swap, Production Early-Stop)
 
-**Script:** `experiments/test15_multiseed.py`
-**Status (2026-05-07):** in preparation. Multi-seed protocol with
-n=5 seeds (42, 7, 1337, 1, 11) at the apples-to-apples scheduler
-(`linear + warmup_steps=10 + decay_steps_for(n,epochs)`) and
-`weight_decay=0.01`.
+**Script:** `experiments/test15_retention_multiseed.py`
+**Status (2026-05-07):** in design. Multi-seed protocol with n=5 seeds
+(42, 7, 1337, 1, 11) at the apples-to-apples scheduler (`linear +
+warmup_steps=10 + decay_steps_for(n,epochs)`) and `weight_decay=0.01`,
+with `RecallEarlyStopCallback` active in `ANALYSIS_POLICY` to match the
+production training configuration (`BackgroundTrainer` behind
+`consolidation.recall_early_stopping`).
 
 ### What it tests
 
 Test 13 (n=1) reported a **6.7× retention advantage** for the
 scaffold-then-fill path over no-scaffold answer-swap: B's no-scaffold
 overwrite preserved 5.6 % of the 80 unchanged keys; C2's scaffold-fill
-preserved 37.5 %. Test 15 multi-seeds the same protocol and reports
-`ratio = mean_retention_C2 / mean_retention_B` with a bootstrap lower CI.
+preserved 37.5 %. Test 15 multi-seeds the same protocol under the
+production recall early-stop and reports `ratio = mean_retention_C2 /
+mean_retention_B` with a bootstrap lower CI. The retention figure
+therefore reflects what deployed users see at the production stop
+epoch; per-seed step counts may differ, and the per-epoch retention
+curve in `epoch_log.json` preserves the full trajectory for cross-seed
+audit.
 
-**Decision rule.** Pass: `ratio ≥ 5.0` AND `lower_CI ≥ 2.5`. Fail: cut
-14a (the N=500 scale follow-up that depends on the retention advantage
-being real beyond seed noise).
+**Decision rule (headline).** Pass: `ratio_raw = mean(C2 RP2) /
+mean(B RP2) ≥ 5.0` AND bootstrap `lower_CI ≥ 2.5` (B=10 000 resamples
+over 5 seeds). Fail: cut 14a (the N=500 scale follow-up that depends
+on the retention advantage being real beyond seed noise). Secondary
+observations (post-repair) reported but not gating: `ratio_repaired`,
+per-seed `alignment_delta`, `corruption_residual`, mean recovery rate
+across the 5 seeds.
 
 ### Phases
 
-Per-seed protocol mirrors Test 13 1:1:
+Per-seed protocol mirrors Test 13 1:1; `RecallEarlyStopCallback` with
+`ANALYSIS_POLICY` (`probe_from_epoch=1, signal_from_epoch=10,
+window=3, probe_every_n_epochs=1`) probes after every epoch and fires
+`should_training_stop` once aggregate fill recall holds 100 % for the
+window past `signal_from_epoch`.
 
 | Phase | What it does | What its recall probe measures |
 |---|---|---|
-| A — fresh | Train `episodic` on 100 real Q+A | Recall on the same 100 keys |
-| B — answer-swap | Continue training `episodic` on 20 swapped-answer keys | Recall on the swapped 20 (warm-start speed) + **retention** on the unchanged 80 (the no-scaffold baseline) |
-| C1 — scaffold | Fresh `journal` adapter trained on 80 real Q+A + 20 `TBD-k` placeholders | Recall on the same 100 entries (scaffold convergence) |
-| C2 — fill | Continue `journal`, replace each `TBD-k` with the real answer | Recall on the 20 filled keys (fill speed) + **retention** on the unchanged 80 (the with-scaffold figure) |
+| A — fresh | Train `episodic` on 100 real Q+A | Fill = 100 keys |
+| B — answer-swap | Continue training `episodic` on 20 swapped-answer keys | Fill = 20 swapped (stop trigger) + **retention** = 80 unchanged (per-epoch curve; RP2 = retention at stop_epoch) — the no-scaffold baseline |
+| C1 — scaffold | Fresh `journal` adapter trained on 80 real Q+A + 20 `TBD-k` placeholders | Fill = 100 entries (scaffold convergence) |
+| C2 — fill | Continue `journal`, replace each `TBD-k` with the real answer | Fill = 20 filled (stop trigger) + **retention** = 80 unchanged (per-epoch curve; RP2 = retention at stop_epoch) — the with-scaffold figure |
 
-`RecallProbeCallback` runs in observational mode — no early stop —
-so optimizer-step counts match across seeds. Required for a clean
-retention comparison.
+The retention probe runs at every probe epoch via the callback's
+`retention_keyed=` parameter, so `epoch_log.json` records the full
+unchanged-80 retention trajectory through training. **RP2** = retention
+rate at each phase's `stop_epoch` (or budget exhaustion); this is the
+write-time figure that feeds `ratio_raw`. **RP3** is recorded after
+the repair loop (next section) and feeds `ratio_repaired`.
 
-### Phase epoch budgets
+### Repair loop (B and C2 only)
 
-Anchored to Test 13's saved trajectories. Test 13b's
-`fill_stable_perfect = e14` applies to *fill* (Phase C2 here), NOT to
-*scaffold* (Phase C1); the two phases have different convergence
-profiles.
+After each retention-recording phase reaches stop_epoch, repair runs
+under the Test 13b recovery primitive (`experiments/test13b_recovery_probe.py`,
+2026-04-23: 97 / 99 failing keys recovered at n=1 in 3.8 min). Test 15
+is the multi-seed validation of that finding.
 
-| Phase | Budget | Reference |
+**Mechanism.** Maximum 5 repair episodes; each episode is 1 epoch at
+LR=1e-5, `weight_decay=0.01`, `save_strategy="no"`, on the failing-key
+subset of the unchanged-80 (failing keys identified from the stop-epoch
+per-key probe). Between episodes, the full unchanged-80 is probed via
+`evaluate_indexed_recall` and the curve recorded. The loop early-exits
+when retention `exact_count == 80` (full recovery).
+
+**Originals preserved.** Repair never writes back to the source
+adapter directory. `<phase>/<adapter>_adapter/`, `<phase>/checkpoint-N/`,
+`<phase>/epoch_log.json`, `<phase>/progress.json`, and
+`<phase>/first_perfect_log.json` are all read-only after stop_epoch —
+the trainer's `save_strategy="no"` discipline prevents incidental
+writes during episodes; the in-memory PeftModel is the working copy.
+The final post-repair state is explicitly saved to
+`<phase>/<adapter>_adapter_repaired/` via `model.save_pretrained` at
+end of loop, so downstream experiments can load either the RP2 stop
+adapter or the RP3 repaired adapter without retraining.
+
+**Resume semantics on repair.** Repair is non-resumable mid-loop. On
+`tresume`, if the phase has `<phase>_train_done.json` but not
+`<phase>_repair_done.json`, the script reloads the source adapter
+(RP2 state on disk, untouched) and restarts the repair loop from
+episode 1. Worst-case wastage: 4 episodes × ~1 min = ~4 min per
+(seed, phase). Phase markers decompose: `<phase>_train_done.json`
+after train_adapter, `<phase>_repair_done.json` after repair loop,
+`<phase>_done.json` only after both. A and C1 have no repair, so for
+those `<phase>_done.json` is written directly after train_adapter.
+
+### Phase epoch budgets (caps under early-stop)
+
+Caps are sized so the recall trigger fires naturally before exhaustion;
+budget exhaustion is a hard fail signalling non-convergence within the
+ANALYSIS_POLICY window.
+
+| Phase | Cap | Reference |
 |---|---|---|
-| A | 30 epochs | Test 13 default; recall reaches 96/100 by e15 and plateaus |
-| B | 15 epochs | Test 13's B reaches stable-perfect at e6–e7 on the 20 swap keys |
-| C1 | 30 epochs | `outputs/test13_journal_scaffold/mistral/20260420_231031/C1/C1_done.json` — 200-key scaffold trajectory: e14=0.18, e16=0.51, e30=0.995. Scaffold has a slow early-epoch profile and converges only in the e25–e30 window |
-| C2 | 14 epochs | Test 13b `fill_stable_perfect = e14` |
+| A | 50 epochs | Test 13 fresh path reaches 96/100 by e15; ANALYSIS_POLICY signal floor e10, so earliest stop e12; cap gives slow seeds margin |
+| B | 30 epochs | Test 13's B reaches stable-perfect at e6–e7 on the 20 swap keys; ANALYSIS_POLICY earliest stop e12 (signal_from_epoch=10 + window=3); cap gives margin |
+| C1 | 50 epochs | `outputs/test13_journal_scaffold/mistral/20260420_231031/C1/C1_done.json` — scaffold has a slow early-epoch profile and converges in e25–e30; cap gives slow seeds margin |
+| C2 | 30 epochs | Test 13b `fill_stable_perfect = e14`; ANALYSIS_POLICY earliest stop e14; cap gives margin |
+
+### Pause / resume contract
+
+`tpause` / `tresume 15` / `tstatus` work via the training-control.sh
+registry (`TEST_SCRIPTS[15]`, `TEST_OUTPUT_DIRS[15]`, `TEST_PGREP[15]`).
+Three pause sites:
+
+1. **Between seeds** — top-level loop calls `_check_pause` before each
+   seed; writes `<run_dir>/paused.json` then `SystemExit`.
+2. **Between phases within a seed** — same primitive at A→B, B→C1,
+   C1→C2 boundaries.
+3. **Mid-phase, mid-epoch** — `RecallEarlyStopCallback` already
+   detects `~/.training_pause` inside `on_epoch_end`
+   (`paramem/training/early_stop.py:463`) and signals
+   `should_training_stop=True`. `_exit_if_paused_mid_phase` (mirror of
+   Test 14's helper) infers the paused-mid-phase state from
+   `stop_epoch is None AND last_epoch < num_epochs` and writes
+   `paused.json` *without* writing `<phase>_done.json`.
+
+On `tresume 15`, the script launches with `--resume`, finds the latest
+run dir, and per (seed, phase) either skips on `<phase>_done.json` or
+finds the latest checkpoint via `_find_latest_checkpoint` and resumes
+the trainer with `resume_from_checkpoint=...`. The callback's
+`_rehydrate_from_disk` (`paramem/training/early_stop.py:218`) restores
+`epoch_log`, `first_perfect_log`, `progress.json`'s `cycle_started_at`,
+and derives `_consecutive_perfect`, so accumulators do not restart on
+resume. `tstatus` renders the active phase's progress.json as a
+progress bar via `_show_epoch_progress` (`scripts/dev/training-control.sh:2043`).
+
+### Output layout
+
+```
+outputs/test15_retention_multiseed/<model>/<ts>/
+  run_config.json                # seeds, n_keys, scheduler, policy, code-version
+  paused.json                    # top-level marker (boundary pauses)
+  multiseed_aggregate.json       # written when all (seed, phase) markers exist
+  seed{42,7,1337,1,11}/
+    A/
+      A_done.json                # written after train_adapter
+      episodic_adapter/          # adapter at stop_epoch (untouched after save)
+      epoch_log.json, progress.json, first_perfect_log.json
+      paused.json                # only if mid-phase pause
+    B/
+      B_train_done.json          # after train_adapter
+      B_repair_done.json         # after repair loop
+      B_done.json                # written only after both
+      episodic_adapter/          # RP2 state (untouched)
+      episodic_adapter_repaired/ # RP3 state (post-repair)
+      repair_log.json            # episode curve, RP2/RP3, alignment_delta, corruption_residual
+      epoch_log.json, progress.json, first_perfect_log.json
+    C1/
+      C1_done.json
+      journal_adapter/           # scaffold adapter at stop_epoch
+      epoch_log.json, progress.json, first_perfect_log.json
+    C2/
+      C2_train_done.json, C2_repair_done.json, C2_done.json
+      journal_adapter/           # RP2 state (untouched)
+      journal_adapter_repaired/  # RP3 state (post-repair)
+      repair_log.json
+      epoch_log.json, progress.json, first_perfect_log.json
+```
 
 ### Provenance
 
 - **Parent pattern:** Test 13 (Phase A/B/C1/C2 structure, `assign_keys`,
   `load_qa_pool` with PerLTQA Q+A string-dedup).
+- **Implementation reference:** Test 14 (`experiments/test14.py`) —
+  pause/resume primitives (`_check_pause`, `paused_requested`,
+  `_exit_if_paused_mid_phase`), `find_latest_run_dir`,
+  `load_or_write_run_config`, `marker_exists`,
+  `_find_latest_checkpoint`, smoke-mode shape, training-control.sh
+  registry pattern.
+- **Early-stop primitive:** `paramem.training.early_stop.RecallEarlyStopCallback`
+  with `ANALYSIS_POLICY`. Same callback that production
+  `BackgroundTrainer` uses behind `consolidation.recall_early_stopping`.
 - **Retention metric:** `retention_unchanged_80.rate` — recall on the 80
-  keys whose answers were not swapped, evaluated at end of B (no-scaffold
-  baseline) and end of C2 (with-scaffold figure).
+  keys whose answers were not swapped, evaluated per epoch via the
+  callback's `retention_keyed=` parameter; headline value sampled at
+  each phase's stop epoch.
 - **Scheduler:** apples-to-apples linear with `warmup_steps=10` and
   `lr_decay_steps = n_keys × num_epochs / 2`, validated by Test 14's
   multi-seed cells (2026-05-04).
-- **Adapter set:** two adapters across the seed loop — `episodic` carries
-  Phase A → B; `journal` is created fresh at C1 and continues into C2.
+- **Adapter set:** two adapters across the seed loop — `episodic`
+  carries Phase A → B; `journal` is created fresh at C1 and continues
+  into C2.
 
 ---
 

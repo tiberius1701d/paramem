@@ -161,7 +161,7 @@ TEST_SCRIPTS[14]="experiments/test14.py"
 # so it can reuse Phase A and Phase B from V3.  Currently configured for
 # the V3/seed42 apples-to-apples validation at linear+B50+decay=600.
 TEST_SCRIPTS["14s"]="experiments/test14.py"
-TEST_SCRIPTS[15]="experiments/test15_multiseed.py"
+TEST_SCRIPTS[15]="experiments/test15_retention_multiseed.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
@@ -172,7 +172,7 @@ TEST_OUTPUT_DIRS[13]="outputs/test13_journal_scaffold"
 TEST_OUTPUT_DIRS["13b"]="outputs/test13b_retention_curve"
 TEST_OUTPUT_DIRS[14]="outputs/test14_pre"
 TEST_OUTPUT_DIRS["14s"]="outputs/test14_pre"
-TEST_OUTPUT_DIRS[15]="outputs/test15_multiseed"
+TEST_OUTPUT_DIRS[15]="outputs/test15_retention_multiseed"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
@@ -186,7 +186,7 @@ TEST_PGREP[14]="test14"
 # multi-seed never passes --variant.  Checked before 14 in the iteration
 # order so the more-specific match wins.
 TEST_PGREP["14s"]="test14.*--variant V3"
-TEST_PGREP[15]="test15_multiseed"
+TEST_PGREP[15]="test15_retention_multiseed"
 
 # Smoke flags for 14s.  Hardcoded here rather than persisted to
 # run_config.json so the smoke remains an explicit, repeatable probe and
@@ -1356,10 +1356,12 @@ PYEOF
 
 _show_test15_status() {
     # Argument: path to a specific run dir, e.g.
-    #   outputs/test15_multiseed/mistral/20260506_173617
+    #   outputs/test15_retention_multiseed/mistral/20260507_HHMMSS
     #
     # Test 15 runs A→B→C1→C2 per seed under seedN/.  Status reads each
-    # seed's *_done.json markers + the in-progress phase's progress.json.
+    # seed's *_done.json markers + the in-progress phase's progress.json
+    # (rendered as a progress bar via _show_epoch_progress; the per-phase
+    # progress.json is written by RecallEarlyStopCallback).
     # multiseed_aggregate.json lands when all seeds complete.
     local run_dir="$1"
     local model_name=$(basename "$(dirname "$run_dir")")
