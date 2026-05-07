@@ -1062,6 +1062,12 @@ class ServerConfig:
             gradient_checkpointing=VALIDATED_TRAINING_CONFIG.gradient_checkpointing,
             max_grad_norm=VALIDATED_TRAINING_CONFIG.max_grad_norm,
             seed=VALIDATED_TRAINING_CONFIG.seed,
+            # logging_steps lives on TrainingConfig (default 1, matches the
+            # historical train_adapter hardcode).  The BG-trainer call site
+            # uses dataclasses.replace to override to 10 when delegating to
+            # train_adapter, preserving its prior log volume; the
+            # consolidation/server path inherits the default.
+            logging_steps=VALIDATED_TRAINING_CONFIG.logging_steps,
             early_stopping_floor=self.consolidation.recall_signal_from_epoch,
             recall_early_stopping=self.consolidation.recall_early_stopping,
             recall_window=self.consolidation.recall_window,

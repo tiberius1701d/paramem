@@ -30,6 +30,14 @@ from paramem.training.encrypted_checkpoint_callback import (
     EncryptCheckpointCallback as _EncryptCheckpointCallback,
 )
 from paramem.training.indexed_memory import format_indexed_training
+
+# Re-exported for ``paramem/server/app.py`` (/status endpoint) which imports
+# ``is_thermal_policy_active`` from this module by qualified name.  The
+# canonical home is now ``paramem.training.thermal_throttle``; the shim keeps
+# the existing import path working.
+from paramem.training.thermal_throttle import (
+    is_thermal_policy_active as is_thermal_policy_active,
+)
 from paramem.utils.config import AdapterConfig, TrainingConfig
 
 logger = logging.getLogger(__name__)
@@ -74,41 +82,6 @@ def _ensure_staging_shape_matches(model, target_config: AdapterConfig):
     )
     model.delete_adapter("in_training")
     return create_adapter(model, target_config, "in_training")
-
-
-def is_thermal_policy_active(
-    mode: str,
-    start: str,
-    end: str,
-    now: datetime | None = None,
-) -> bool:
-    """Pure predicate: is the thermal throttle active under this quiet-hours policy?
-
-    Shared between ``BackgroundTrainer._should_throttle_now`` and the ``/status``
-    endpoint so the latter can report policy state without a live trainer.
-
-    See ``ConsolidationScheduleConfig`` for mode semantics. Invalid windows in
-    ``auto`` mode fall back to ``True`` (prefer-silence default).
-    """
-    if mode == "always_off":
-        return False
-    if mode == "always_on":
-        return True
-    # mode == "auto"
-    try:
-        sh, sm = (int(x) for x in start.split(":"))
-        eh, em = (int(x) for x in end.split(":"))
-    except Exception:
-        return True
-    t = (now or datetime.now()).time()
-    cur = t.hour * 60 + t.minute
-    s = sh * 60 + sm
-    e = eh * 60 + em
-    if s == e:
-        return True
-    if s < e:
-        return s <= cur < e
-    return cur >= s or cur < e
 
 
 def _fingerprint_keyed_pairs(keyed_pairs: list[dict]) -> str:
