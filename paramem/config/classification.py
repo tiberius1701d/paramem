@@ -113,7 +113,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.extraction_plausibility_judge": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_plausibility_stage": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_verify_anonymization": Tier.PIPELINE_ALTERING,
-    "consolidation.extraction_role_aware_grounding": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_ner_check": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_ner_model": Tier.PIPELINE_ALTERING,
     "consolidation.training_temp_limit": Tier.PIPELINE_ALTERING,

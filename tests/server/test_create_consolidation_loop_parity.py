@@ -239,10 +239,6 @@ def test_factory_threads_every_config_knob(
         cfg.consolidation.extraction_verify_anonymization
     )
     assert captured["extraction_max_tokens"] == cfg.consolidation.extraction_max_tokens
-    assert (
-        captured["extraction_role_aware_grounding"]
-        == cfg.consolidation.extraction_role_aware_grounding
-    )
     assert captured["extraction_pii_scope"] == set(cfg.sanitization.cloud_scope)
 
     # --- Misc knobs ---

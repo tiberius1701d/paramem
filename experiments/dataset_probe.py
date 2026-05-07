@@ -318,7 +318,7 @@ def _build_session_diagnostics(
     """
     diag = session_graph.diagnostics if session_graph is not None else {}
 
-    # Normalize drop-counters: extractor stores residual/ungrounded as
+    # Normalize drop-counters: extractor stores residual drops as
     # list[fact-dict] for downstream debugging, but the rest as int. We
     # record counts here so downstream groupby/sum is safe.
     def _as_count(value) -> int:
@@ -339,7 +339,6 @@ def _build_session_diagnostics(
     plaus_raw = _as_count(diag.get("plausibility_dropped"))
     drops = {
         "residual_dropped_facts": _as_count(diag.get("residual_dropped_facts")),
-        "ungrounded_dropped_facts": _as_count(diag.get("ungrounded_dropped_facts")),
         "plausibility_dropped": max(plaus_raw, 0),
         "mapping_ambiguous_dropped": _as_count(diag.get("mapping_ambiguous_dropped")),
         "residual_leaked_triples_dropped": _as_count(diag.get("residual_leaked_triples_dropped")),
@@ -595,17 +594,6 @@ def parse_args() -> argparse.Namespace:
             "capture diagnostics that aren't surfaced via _build_session_diagnostics."
         ),
     )
-    parser.add_argument(
-        "--role-aware-grounding",
-        choices=["off", "diagnostic", "active"],
-        default=None,
-        dest="role_aware_grounding",
-        help=(
-            "Override cfg.consolidation.extraction_role_aware_grounding for this run. "
-            "diagnostic mode populates graph.diagnostics['role_aware_would_drop'] "
-            "without affecting production behaviour — pair with --debug to persist."
-        ),
-    )
     args = parser.parse_args()
     if args.sample_strategy == "stratified" and args.sample_size is None:
         parser.error("--sample-size is required when --sample-strategy=stratified")
@@ -785,8 +773,6 @@ def main() -> None:
 
         if args.debug:
             cfg.debug = True
-        if args.role_aware_grounding is not None:
-            cfg.consolidation.extraction_role_aware_grounding = args.role_aware_grounding
 
         cfg.consolidation.indexed_key_replay = True
 
@@ -867,7 +853,6 @@ def main() -> None:
                         "post_plausibility_count": 0,
                         "drops": {
                             "residual_dropped_facts": 0,
-                            "ungrounded_dropped_facts": 0,
                             "plausibility_dropped": 0,
                             "mapping_ambiguous_dropped": 0,
                             "residual_leaked_triples_dropped": 0,

@@ -45,7 +45,7 @@ EXAMPLE_VERIFY_ALLOWLIST = frozenset(
         # Parity test compares example ↔ fixture key sets.
         "tests/server/test_config_parity.py",
         # Validates that the shipped example loads under all dataclass
-        # validators (role_aware_grounding, sanitization.cloud_mode, etc.).
+        # validators (sanitization.cloud_mode, etc.).
         "tests/server/test_config.py",
     }
 )

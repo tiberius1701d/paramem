@@ -567,8 +567,6 @@ class TestSOTANoiseFilter:
         The old behavior was to return the original graph unchanged.
         The new behavior runs _fallback_plausibility_on_raw so that tautologies,
         role leaks, and other noise are still filtered even without SOTA.
-        The grounding gate inside the fallback may drop facts whose entities are
-        not grounded in the provided transcript — this is correct and expected.
         """
         from paramem.graph.extractor import _sota_pipeline
 
@@ -596,7 +594,7 @@ class TestSOTANoiseFilter:
                 speaker_id="Speaker0",
                 plausibility_judge="off",
             )
-        # With plausibility_judge="off", fallback runs grounding + sweep only.
+        # With plausibility_judge="off", fallback runs the residual-placeholder sweep only.
         # Both entities ARE in the transcript → relation survives.
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
@@ -674,11 +672,7 @@ class TestSOTANoiseFilter:
             assert r.object == "Millfield"
 
     def test_pipeline_deanonymizes_composite_placeholders(self):
-        """Composite strings like 'Person_1's family' get substring-replaced.
-
-        Uses a transcript where all composite entities are grounded so the
-        grounding gate doesn't interfere with testing the deanonymization fix.
-        """
+        """Composite strings like 'Person_1's family' get substring-replaced."""
         from paramem.graph.extractor import _sota_pipeline
 
         transcript = "Alex lives in downtown Millfield with Alex's family"
@@ -1276,420 +1270,6 @@ class TestPlausibilityTupleReturn:
         assert raw is None
 
 
-class TestGroundingGate:
-    def test_known_name_is_grounded_without_transcript_mention(self):
-        from paramem.graph.extractor import _entity_is_grounded
-
-        known = {"Alex"}
-        # "Alex" not in transcript but IS in known real-names.
-        assert _entity_is_grounded("Alex", "the weather is nice", known)
-
-    def test_transcript_grounded_entity_passes(self):
-        from paramem.graph.extractor import _entity_is_grounded
-
-        t = "i drove to munich airport this morning"
-        assert _entity_is_grounded("Munich Airport", t, set())
-        assert _entity_is_grounded("munich_airport", t, set())
-
-    def test_world_knowledge_inference_rejected(self):
-        """SOTA infers CIA from a mention of Langley — CIA has no transcript grounding."""
-        from paramem.graph.extractor import _entity_is_grounded
-
-        t = "i'm heading to langley tomorrow"
-        assert _entity_is_grounded("Langley", t, set())
-        assert not _entity_is_grounded("CIA", t, set())
-        assert not _entity_is_grounded("Central Intelligence Agency", t, set())
-
-    def test_drop_ungrounded_facts_catches_inferences(self):
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        transcript = "Alex is heading to Langley tomorrow."
-        known = {"Alex"}
-        facts = [
-            {"subject": "Alex", "predicate": "travels_to", "object": "Langley"},  # OK
-            {"subject": "Alex", "predicate": "works_at", "object": "CIA"},  # drop
-            {"subject": "CIA", "predicate": "headquartered_in", "object": "Langley"},  # drop
-        ]
-        kept, dropped = _drop_ungrounded_facts(facts, transcript, known)
-        assert len(kept) == 1
-        assert kept[0]["object"] == "Langley"
-        assert len(dropped) == 2
-
-    def test_empty_transcript_with_empty_mapping_drops_all(self):
-        """Degenerate inputs: no transcript, no known names → everything dropped."""
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        facts = [{"subject": "Alex", "predicate": "knows", "object": "Bob"}]
-        kept, dropped = _drop_ungrounded_facts(facts, "", set())
-        assert kept == []
-        assert dropped == facts
-
-    def test_empty_transcript_with_known_mapping_keeps_known(self):
-        """Known real names pass even without a transcript."""
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        facts = [{"subject": "Alex", "predicate": "knows", "object": "Bob"}]
-        kept, dropped = _drop_ungrounded_facts(facts, "", {"Alex", "Bob"})
-        assert kept == facts
-        assert dropped == []
-
-    def test_short_name_not_matched_as_substring(self):
-        """Short names like 'Li' must not match inside longer words (e.g. 'Libya')."""
-        from paramem.graph.extractor import _entity_is_grounded
-
-        # "Libya" contains the substring "li", but whole-word match must reject it.
-        assert not _entity_is_grounded("Li", "i travelled to libya last year", set())
-        # When "Li" is genuinely present as a whole word, it's accepted.
-        assert _entity_is_grounded("Li", "i spoke with li yesterday", set())
-
-
-class TestRoleAwareGroundingGate:
-    """Role-aware extension of ``_drop_ungrounded_facts``.
-
-    With ``speaker_names`` provided, the gate requires speaker-attributed
-    object content to ground in user-only transcript spans, blocking the
-    assistant-into-graph hallucination class deterministically.  Without
-    ``speaker_names`` (or with an empty set), behaviour is exactly as the
-    role-blind gate — backward compatibility for existing call sites.
-    """
-
-    def test_extract_user_spans_handles_bracket_form(self):
-        from paramem.graph.extractor import _extract_user_spans
-
-        t = "[user] hello there\n[assistant] hi back\n[user] how are you"
-        out = _extract_user_spans(t)
-        assert "hello there" in out
-        assert "how are you" in out
-        assert "hi back" not in out
-
-    def test_extract_user_spans_handles_colon_form(self):
-        from paramem.graph.extractor import _extract_user_spans
-
-        t = "user: i live in berlin\nassistant: that is a great city\nuser: i love it"
-        out = _extract_user_spans(t)
-        assert "i live in berlin" in out
-        assert "i love it" in out
-        assert "great city" not in out
-
-    def test_extract_user_spans_inherits_role_until_transition(self):
-        """State-machine semantics: an untagged line after ``[user]`` stays
-        in user role; an untagged line after ``[assistant]`` stays in
-        assistant role.  Pre-marker content (no role established) is
-        dropped."""
-        from paramem.graph.extractor import _extract_user_spans
-
-        t = (
-            "pre-marker noise\n"
-            "[user] tagged line\n"
-            "untagged user continuation\n"
-            "[assistant] also tagged\n"
-            "untagged assistant continuation"
-        )
-        out = _extract_user_spans(t)
-        assert "tagged line" in out
-        assert "untagged user continuation" in out  # inherits [user]
-        assert "pre-marker noise" not in out  # no role established yet
-        assert "also tagged" not in out  # assistant
-        assert "untagged assistant continuation" not in out  # inherits [assistant]
-
-    def test_speaker_subject_object_in_user_kept(self):
-        """Triple grounded in [user] turn passes role-aware gate."""
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        transcript = "[user] i love yoga and reading\n[assistant] that's wonderful"
-        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
-        kept, dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"}, speaker_names={"Alex"})
-        assert kept == facts
-        assert dropped == []
-
-    def test_speaker_subject_object_only_in_assistant_dropped(self):
-        """Triple about the speaker grounded only in [assistant] turn → dropped."""
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        transcript = (
-            "[user] what's a good hobby for me\n"
-            "[assistant] how about combining your love for yoga and travel"
-        )
-        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
-        kept, dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"}, speaker_names={"Alex"})
-        assert kept == []
-        assert dropped == facts
-
-    def test_third_party_subject_uses_full_transcript(self):
-        """Triple where subject is NOT a speaker stays under role-blind grounding.
-
-        Production case: 'Max Schmidt works_at Lorem Industries' extracted from
-        the speaker's mention of a colleague.  Both endpoints appear somewhere
-        in the transcript (possibly only assistant turns confirming names);
-        the role-aware gate must not over-drop these.
-        """
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        transcript = (
-            "[user] my colleague max schmidt joined the office\n"
-            "[assistant] understood; lorem industries"
-        )
-        facts = [
-            {"subject": "Max Schmidt", "predicate": "works_at", "object": "Lorem Industries"},
-        ]
-        kept, dropped = _drop_ungrounded_facts(facts, transcript, set(), speaker_names={"Alex"})
-        assert kept == facts
-        assert dropped == []
-
-    def test_speaker_subject_object_in_known_names_kept(self):
-        """Spelling-fix exemption survives role-aware gating.
-
-        User says 'Frankford', assistant resolves to 'Frankfurt', the
-        anonymization mapping carries 'Frankfurt' as a known real name.
-        The triple uses 'Frankfurt' as the object — under strict role-aware
-        gating it would fail (not in [user] spans verbatim), but the
-        known_names exemption must keep it.
-        """
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        transcript = (
-            "[user] my sister lives in frankford\n[assistant] frankfurt is about 200km from here"
-        )
-        facts = [
-            {"subject": "Alex", "predicate": "sister_lives_in", "object": "Frankfurt"},
-        ]
-        kept, dropped = _drop_ungrounded_facts(
-            facts,
-            transcript,
-            {"Alex", "Frankfurt"},  # 'Frankfurt' came in via mapping
-            speaker_names={"Alex"},
-        )
-        assert kept == facts
-        assert dropped == []
-
-    def test_default_no_speaker_names_is_role_blind(self):
-        """``speaker_names=None`` (default) preserves the old role-blind behaviour."""
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        # Object only in assistant turn — would be dropped under role-aware,
-        # but role-blind accepts it (token appears in transcript).
-        transcript = "[user] suggest a hobby\n[assistant] yoga is great"
-        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
-        kept, _dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"})
-        assert kept == facts  # legacy behaviour preserved
-
-    def test_empty_speaker_names_is_role_blind(self):
-        """An empty set behaves identically to ``None`` (no role-aware path)."""
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        transcript = "[user] suggest a hobby\n[assistant] yoga is great"
-        facts = [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
-        kept, _dropped = _drop_ungrounded_facts(facts, transcript, {"Alex"}, speaker_names=set())
-        assert kept == facts
-
-    def test_subject_grounded_via_assistant_turn_still_passes(self):
-        """Subject-side grounding stays role-blind even in role-aware mode.
-
-        The speaker can be addressed by name in [assistant] turns ("Alex,
-        about your question..."); that mention is sufficient grounding for
-        the subject.  Only the *object's* substantive content needs role-
-        aware grounding.
-        """
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        # Speaker's name appears in [assistant] turn (addressing them).
-        # User's own turn has the object content.
-        transcript = "[user] i practice yoga every morning\n[assistant] alex, that's wonderful"
-        facts = [{"subject": "Alex", "predicate": "practices", "object": "yoga"}]
-        kept, _dropped = _drop_ungrounded_facts(facts, transcript, set(), speaker_names={"Alex"})
-        assert kept == facts
-
-
-class TestApplyGroundingGate:
-    """``_apply_grounding_gate`` orchestrates the role-blind / role-aware
-    gate per the configured mode (off / diagnostic / active).
-    """
-
-    @staticmethod
-    def _hallucination():
-        # Object only in [assistant] turn — role-aware would drop, role-blind keeps.
-        return [{"subject": "Alex", "predicate": "likes", "object": "yoga"}]
-
-    @staticmethod
-    def _transcript():
-        return "[user] suggest a hobby for me\n[assistant] yoga is great for stress"
-
-    def test_off_mode_role_blind(self):
-        from paramem.graph.extractor import _apply_grounding_gate
-
-        kept, dropped, would_drop = _apply_grounding_gate(
-            self._hallucination(),
-            self._transcript(),
-            {"Alex"},
-            speaker_name="Alex",
-            mode="off",
-        )
-        assert kept == self._hallucination()  # role-blind passes it
-        assert dropped == []
-        assert would_drop == []
-
-    def test_diagnostic_mode_passes_facts_but_records_would_drops(self):
-        from paramem.graph.extractor import _apply_grounding_gate
-
-        kept, dropped, would_drop = _apply_grounding_gate(
-            self._hallucination(),
-            self._transcript(),
-            {"Alex"},
-            speaker_name="Alex",
-            mode="diagnostic",
-        )
-        # Production behaviour unchanged: fact still kept.
-        assert kept == self._hallucination()
-        assert dropped == []
-        # But the role-aware gate would have dropped it — recorded.
-        assert would_drop == self._hallucination()
-
-    def test_active_mode_drops_role_aware_failures(self):
-        from paramem.graph.extractor import _apply_grounding_gate
-
-        kept, dropped, would_drop = _apply_grounding_gate(
-            self._hallucination(),
-            self._transcript(),
-            {"Alex"},
-            speaker_name="Alex",
-            mode="active",
-        )
-        assert kept == []
-        assert dropped == self._hallucination()
-        # Active mode does not need to track would_drop — the drop is real.
-        assert would_drop == []
-
-    def test_no_speaker_name_falls_back_to_role_blind(self):
-        from paramem.graph.extractor import _apply_grounding_gate
-
-        # Even in active mode, without a speaker_name there's no [user] anchor.
-        kept, dropped, would_drop = _apply_grounding_gate(
-            self._hallucination(),
-            self._transcript(),
-            {"Alex"},
-            speaker_name=None,
-            mode="active",
-        )
-        assert kept == self._hallucination()  # role-blind kept it
-        assert dropped == []
-        assert would_drop == []
-
-    def test_unknown_mode_warns_and_falls_back_to_off(self):
-        from paramem.graph.extractor import _apply_grounding_gate
-
-        kept, _dropped, would_drop = _apply_grounding_gate(
-            self._hallucination(),
-            self._transcript(),
-            {"Alex"},
-            speaker_name="Alex",
-            mode="hyperactive",  # unknown
-        )
-        # Falls back to off → role-blind result, no would_drop tracking.
-        assert kept == self._hallucination()
-        assert would_drop == []
-
-    def test_diagnostic_mode_with_legitimate_triple_records_nothing(self):
-        """Triples grounded in [user] turns are not flagged in diagnostic mode."""
-        from paramem.graph.extractor import _apply_grounding_gate
-
-        transcript = "[user] i practice yoga every morning"
-        facts = [{"subject": "Alex", "predicate": "practices", "object": "yoga"}]
-        kept, dropped, would_drop = _apply_grounding_gate(
-            facts, transcript, {"Alex"}, speaker_name="Alex", mode="diagnostic"
-        )
-        assert kept == facts
-        assert dropped == []
-        assert would_drop == []
-
-
-class TestProvenanceGateFixture:
-    """Integration test against the curated PerLTQA failure fixture.
-
-    Every candidate in ``tests/fixtures/provenance_gate_failures.json`` is a
-    real assistant-into-graph hallucination from a probe run.  The role-
-    aware gate must drop every one when given the dialogue's speaker as
-    ``speaker_names``.  Conversely, the legacy role-blind path keeps them
-    (object tokens appear in the transcript, just on the wrong side) —
-    asserting both halves proves the gate is what catches them.
-    """
-
-    @staticmethod
-    def _load_fixture():
-        import json
-        from pathlib import Path
-
-        fp = Path(__file__).parent / "fixtures" / "provenance_gate_failures.json"
-        with fp.open() as f:
-            return json.load(f)
-
-    def test_role_aware_drops_every_fixture_candidate(self):
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        fixture = self._load_fixture()
-        misses: list[str] = []
-        for c in fixture["candidates"]:
-            dialogue = fixture["dialogues"][c["dialogue_key"]]
-            transcript = dialogue["transcript"]
-            speaker = dialogue["speaker"]
-            triple = {
-                "subject": c["subject"],
-                "predicate": c["predicate"],
-                "object": c["object"],
-            }
-            kept, _dropped = _drop_ungrounded_facts(
-                [triple], transcript, {speaker}, speaker_names={speaker}
-            )
-            if kept:
-                misses.append(
-                    f"{c['dialogue_key']}: {triple['subject']} | "
-                    f"{triple['predicate']} | {triple['object']!r} "
-                    f"(said by {c['said_by']})"
-                )
-        assert misses == [], (
-            f"Role-aware gate failed to drop {len(misses)} fixture hallucinations:\n"
-            + "\n".join(f"  {m}" for m in misses)
-        )
-
-    def test_role_blind_keeps_fixture_candidates_proves_gate_is_load_bearing(self):
-        """Without ``speaker_names`` the legacy gate keeps every candidate.
-
-        This asserts the gate is doing real work — the fixture's
-        hallucinations *do* ground in the transcript token-wise (the
-        object appears somewhere), they just appear in the wrong role.
-        Role-blind grounding can't tell.  If this test ever fails, it
-        means the role-blind path got tightened separately — re-evaluate
-        the role-aware contract.
-        """
-        from paramem.graph.extractor import _drop_ungrounded_facts
-
-        fixture = self._load_fixture()
-        unexpectedly_dropped = 0
-        for c in fixture["candidates"]:
-            dialogue = fixture["dialogues"][c["dialogue_key"]]
-            transcript = dialogue["transcript"]
-            speaker = dialogue["speaker"]
-            triple = {
-                "subject": c["subject"],
-                "predicate": c["predicate"],
-                "object": c["object"],
-            }
-            kept, _dropped = _drop_ungrounded_facts([triple], transcript, {speaker})
-            if not kept:
-                unexpectedly_dropped += 1
-        # Most fixture candidates should pass role-blind grounding (their
-        # object tokens are present in transcript, just in assistant turns).
-        # A small number may be dropped if the object also fails the basic
-        # grounding (e.g. SOTA invented a name).  Assert >= 80% are kept by
-        # role-blind so the gate's value is demonstrably the role split.
-        total = len(fixture["candidates"])
-        kept_count = total - unexpectedly_dropped
-        assert kept_count / total >= 0.8, (
-            f"Role-blind gate already drops {unexpectedly_dropped}/{total} "
-            f"fixture candidates — fixture may be miscalibrated, or the "
-            f"role-blind gate has tightened.  Re-curate the fixture."
-        )
-
-
 class TestSpeakerContextInjection:
     def test_build_speaker_context_empty_when_unknown(self):
         from paramem.graph.extractor import build_speaker_context
@@ -2138,16 +1718,15 @@ class TestAnonFailureFallback:
 
 
 class TestAllDroppedSafetyNet:
-    """§7 test 5: D7 — all-dropped safety net triggers fallback."""
+    """All-dropped safety net (extractor.py:2528-2543) fires when the
+    pipeline empties out post-deanon. Original drop trigger was the
+    grounding gate (now removed); plausibility is now the final
+    discriminator that can empty the pipeline."""
 
     def test_all_dropped_triggers_fallback(self):
-        """When all relations are dropped by the grounding gate, _fallback_plausibility_on_raw runs.
-
-        The all-dropped safety net (D7) fires AFTER the full pipeline (deanon + grounding gate
-        + plausibility). If kept_relations is empty but original_count > 0, the pipeline
-        calls _fallback_plausibility_on_raw("all_dropped"). This happens when, e.g., the
-        grounding gate drops all SOTA-enriched entities as ungrounded world-knowledge inferences.
-        """
+        """When plausibility drops every surviving fact, the all-dropped
+        safety net invokes _fallback_plausibility_on_raw with reason
+        'all_dropped' so the session does not yield zero facts."""
         from paramem.graph.extractor import _sota_pipeline
 
         graph = _make_graph(
@@ -2159,10 +1738,8 @@ class TestAllDroppedSafetyNet:
         )
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        # SOTA enrichment produces facts with no grounding in transcript ("Saturn", "Jupiter")
-        enriched_ungrounded = [
-            {"subject": "Saturn", "predicate": "orbits", "object": "Jupiter"},
-        ]
+        # SOTA returns the same single fact; plausibility drops it (returns []).
+        sota_enriched = list(anon_facts)
 
         fallback_calls = []
 
@@ -2179,7 +1756,11 @@ class TestAllDroppedSafetyNet:
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
-                return_value=(enriched_ungrounded, None, {}, None, {}),
+                return_value=(sota_enriched, None, {}, None, {}),
+            ),
+            patch(
+                "paramem.graph.extractor._local_plausibility_filter",
+                return_value=([], ""),
             ),
             patch(
                 "paramem.graph.extractor._fallback_plausibility_on_raw",
@@ -2188,15 +1769,14 @@ class TestAllDroppedSafetyNet:
         ):
             result = _sota_pipeline(
                 graph,
-                # Short transcript — "Saturn" and "Jupiter" are not grounded here
                 "Alex lives in Millfield.",
-                None,
-                None,
+                MagicMock(),  # non-None model so deanon-stage plausibility runs
+                MagicMock(),  # non-None tokenizer so deanon-stage plausibility runs
                 speaker_id="Speaker0",
-                plausibility_judge="off",
+                plausibility_judge="auto",
+                plausibility_stage="deanon",
             )
 
-        # Fallback must be called with reason="all_dropped"
         assert "all_dropped" in fallback_calls, f"Expected all_dropped, got: {fallback_calls}"
         assert result.diagnostics.get("fallback_path") == "all_dropped"
 

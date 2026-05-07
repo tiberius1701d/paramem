@@ -615,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
             "phases need inspection). Valid names: local_extract, "
             "stt_correction, ha_validation, anonymize, anonymize_verify, "
             "anonymize_repair, sota_enrich, anon_plausibility, deanon, "
-            "grounding_gate, deanon_plausibility. Default: run full pipeline."
+            "deanon_plausibility. Default: run full pipeline."
         ),
     )
     args = parser.parse_args(argv)

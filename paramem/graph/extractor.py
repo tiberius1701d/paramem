@@ -356,31 +356,6 @@ def _contains_whole_word(text: str, word: str, *, case_insensitive: bool = False
         return True
 
 
-def _extract_alpha_tokens(text: str, *, min_len: int = 1) -> list[str]:
-    """Split text into runs of alphabetic characters.
-
-    Mirrors ``re.findall(r"[a-z]+", text)`` semantics on lowercased input.
-    ASCII-only matches the previous behaviour — Unicode handling is a
-    separate decision the original code didn't take.
-    """
-    tokens: list[str] = []
-    current: list[str] = []
-    for c in text:
-        if "a" <= c <= "z":
-            current.append(c)
-            continue
-        if current:
-            tok = "".join(current)
-            if len(tok) >= min_len:
-                tokens.append(tok)
-            current = []
-    if current:
-        tok = "".join(current)
-        if len(tok) >= min_len:
-            tokens.append(tok)
-    return tokens
-
-
 _NER_APOSTROPHES = ("'", "’")
 
 
@@ -705,7 +680,6 @@ def extract_graph(
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
-    role_aware_grounding: str = "off",
     pii_scope: set[str] | frozenset[str] | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
@@ -858,10 +832,10 @@ def extract_graph(
 
             # Phase 4 — SOTA pipeline.  Each sub-phase (anonymize,
             # anonymize_verify, anonymize_repair, sota_enrich,
-            # anon_plausibility, deanon, grounding_gate,
-            # deanon_plausibility) records its own block via phase_trace
-            # from inside _sota_pipeline.  ``stop_phase`` is forwarded so
-            # _sota_pipeline can short-circuit at any sub-phase boundary.
+            # anon_plausibility, deanon, deanon_plausibility) records its
+            # own block via phase_trace from inside _sota_pipeline.
+            # ``stop_phase`` is forwarded so _sota_pipeline can
+            # short-circuit at any sub-phase boundary.
             if validate and noise_filter and graph.relations:
                 graph = _sota_pipeline(
                     graph,
@@ -878,7 +852,6 @@ def extract_graph(
                     verify_anonymization=verify_anonymization,
                     speaker_name=speaker_name,
                     speaker_id=speaker_id,
-                    role_aware_grounding=role_aware_grounding,
                     pii_scope=pii_scope,
                     max_tokens=max_tokens,
                     plausibility_max_tokens=plausibility_max_tokens,
@@ -1850,11 +1823,10 @@ def _fallback_plausibility_on_raw(
     *,
     speaker_name: str | None = None,
     speaker_id: str,
-    role_aware_grounding: str = "off",
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
 ) -> SessionGraph:
-    """Fallback pipeline path: run local plausibility + grounding on raw (unanonymized) facts.
+    """Fallback pipeline path: run local plausibility on raw (unanonymized) facts.
 
     Used when anonymization fails entirely, when residual leaks after repair
     render the mapping non-canonical (no safe SOTA path), or when the full
@@ -1863,10 +1835,9 @@ def _fallback_plausibility_on_raw(
     Steps (ported from scripts/dev/compare_extraction.py L722-795):
     1. Serialize graph.relations to fact dicts.
     2. Strip any residual placeholder tokens — records drops in diagnostics.
-    3. Drop ungrounded facts (empty known_names — no mapping available).
-    4. If non-empty, run local plausibility filter; keep raw on None return.
-    5. Rebuild Relations, canonicalize symmetric predicates, filter entities.
-    6. Record fallback_path in diagnostics.
+    3. If non-empty, run local plausibility filter; keep raw on None return.
+    4. Rebuild Relations, canonicalize symmetric predicates, filter entities.
+    5. Record fallback_path in diagnostics.
 
     Args:
         speaker_id: Speaker store ID stamped onto every reconstructed
@@ -1897,24 +1868,7 @@ def _fallback_plausibility_on_raw(
             len(res_dropped),
         )
 
-    # Step 3: grounding gate with empty known_names (no mapping available)
-    raw_facts, ungrounded, would_drop = _apply_grounding_gate(
-        raw_facts,
-        transcript,
-        set(),
-        speaker_name=speaker_name,
-        mode=role_aware_grounding,
-    )
-    if ungrounded:
-        graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
-        logger.warning(
-            "_fallback_plausibility_on_raw: dropped %d ungrounded fact(s)",
-            len(ungrounded),
-        )
-    if would_drop:
-        graph.diagnostics["role_aware_would_drop"] = would_drop
-
-    # Step 4: local plausibility filter (uses real names)
+    # Step 3: local plausibility filter (uses real names)
     if raw_facts and model is not None and tokenizer is not None:
         filtered, _raw = _local_plausibility_filter(
             raw_facts,
@@ -1932,7 +1886,7 @@ def _fallback_plausibility_on_raw(
                 graph.diagnostics["plausibility_dropped"] = dropped_count
                 graph.diagnostics["plausibility_judge_actual"] = "local_fallback"
 
-    # Step 5: rebuild Relations
+    # Step 4: rebuild Relations
     kept_relations = []
     for fact in raw_facts:
         try:
@@ -1954,7 +1908,7 @@ def _fallback_plausibility_on_raw(
     graph.entities = [e for e in graph.entities if e.name in kept_names]
     graph.relations = kept_relations
 
-    # Step 6: record fallback path
+    # Step 5: record fallback path
     graph.diagnostics["fallback_path"] = reason
     logger.info(
         "_fallback_plausibility_on_raw: reason=%r, %d relation(s) surviving",
@@ -1979,7 +1933,6 @@ def _sota_pipeline(
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
     speaker_name: str | None = None,
-    role_aware_grounding: str = "off",
     pii_scope: set[str] | frozenset[str] | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
@@ -1996,8 +1949,7 @@ def _sota_pipeline(
     3a. Plausibility on anonymized data (plausibility_stage="anon", SOTA judge)
     3b. De-anonymize + preserve pre-sweep snapshot
     3c. Residual placeholder sweep
-    3d. Grounding gate
-    3e. Plausibility on de-anonymized data (plausibility_stage="deanon", local judge)
+    3d. Plausibility on de-anonymized data (plausibility_stage="deanon", local judge)
     4. Build Relations + entity type rebuild + symmetric canonicalization
     5. All-dropped safety net → fallback to raw plausibility
 
@@ -2071,13 +2023,11 @@ def _sota_pipeline(
             "anon_failed",
             speaker_name=speaker_name,
             speaker_id=speaker_id,
-            role_aware_grounding=role_aware_grounding,
             max_tokens=max_tokens,
             plausibility_max_tokens=plausibility_max_tokens,
         )
     if not anon_facts:
         logger.info("Anonymization produced 0 facts — skipping SOTA pipeline")
-        graph.diagnostics["grounding_gate"] = "no_input"
         graph.diagnostics["anonymize"] = "ok"
         graph.relations = []
         graph.entities = []
@@ -2236,7 +2186,6 @@ def _sota_pipeline(
                     "anon_leaked_noncanonical",
                     speaker_name=speaker_name,
                     speaker_id=speaker_id,
-                    role_aware_grounding=role_aware_grounding,
                     max_tokens=max_tokens,
                     plausibility_max_tokens=plausibility_max_tokens,
                 )
@@ -2309,9 +2258,9 @@ def _sota_pipeline(
                 logger.info("SOTA enrichment removed all relations")
     if stop_phase == "sota_enrich":
         # Calibration short-circuit: SOTA enrichment block recorded,
-        # downstream (anon_plausibility, deanon, grounding_gate,
-        # deanon_plausibility) skipped.  graph.relations stays at the
-        # local-extract output; enrichment result is in phases[sota_enrich].
+        # downstream (anon_plausibility, deanon, deanon_plausibility) skipped.
+        # graph.relations stays at the local-extract output; enrichment result
+        # is in phases[sota_enrich].
         return graph
 
     # Step 3a: Plausibility on anonymized data (SOTA judge, stage="anon").
@@ -2394,7 +2343,6 @@ def _sota_pipeline(
     # anon-stage plausibility (or was already empty), return early.
     if not enriched_anon:
         logger.info("No facts remain after anon-stage plausibility — returning empty graph")
-        graph.diagnostics["grounding_gate"] = "no_input"
         graph.relations = []
         graph.entities = []
         return graph
@@ -2455,57 +2403,15 @@ def _sota_pipeline(
     # Step 3c+: Route scalar-valued objects (URLs, emails, phone numbers,
     # DOIs, version-tagged tool names like "ROS2") off the relation surface
     # and onto Entity.attributes of the subject.  Scalars are verbatim
-    # identifiers, not paraphrasable concept phrases — they fail the
-    # grounding gate's whole-word alpha-token rule because their alpha
-    # portion is concatenated with digits in the transcript
-    # ("username1234", "ROS2").  Routing them to attributes mirrors the
+    # identifiers that flow through to plausibility and downstream filters
+    # without modification.  Routing them to attributes mirrors the
     # email/phone/linkedin path the local extractor already populates and
     # which the QA generator's _flatten_entity_attributes mints into keyed
-    # pairs without grounding.  The projection is applied after the entity
-    # rebuild step below so the subject entity survives pruning.
+    # pairs.  The projection is applied after the entity rebuild step below
+    # so the subject entity survives pruning.
     scalar_facts, deanon_facts = _partition_scalar_facts(deanon_facts)
     if scalar_facts:
         graph.diagnostics["scalar_facts_projected"] = len(scalar_facts)
-
-    # Phase — grounding_gate.  Every surviving fact's subject and object
-    # must be grounded in the original transcript OR be a known real-name
-    # from the mapping.  Catches SOTA world-knowledge inferences (e.g.
-    # inferring "CIA" from a transcript that only mentions "Langley") —
-    # those entities are dropped because they never existed in the user's
-    # actual words.  Pure-Python; raw_output=None.
-    with phase_trace("grounding_gate") as t:
-        pre_gate = len(deanon_facts)
-        known_real_names = set(mapping.keys())
-        deanon_facts, ungrounded, would_drop = _apply_grounding_gate(
-            deanon_facts,
-            transcript,
-            known_real_names,
-            speaker_name=speaker_name,
-            mode=role_aware_grounding,
-        )
-        if ungrounded:
-            graph.diagnostics["ungrounded_dropped_facts"] = ungrounded
-            logger.warning(
-                "Dropped %d fact(s) with entities ungrounded in the transcript "
-                "(likely SOTA world-knowledge inference).",
-                len(ungrounded),
-            )
-        if would_drop:
-            graph.diagnostics["role_aware_would_drop"] = would_drop
-        t.set_parsed(
-            {
-                "input_count": pre_gate,
-                "output_count": len(deanon_facts),
-                "ungrounded_dropped_count": len(ungrounded) if ungrounded else 0,
-                "ungrounded_facts": ungrounded if ungrounded else [],
-                "role_aware_would_drop": would_drop if would_drop else [],
-                "mode": role_aware_grounding,
-            }
-        )
-    if stop_phase == "grounding_gate":
-        # Calibration short-circuit: grounding_gate recorded.  Plausibility
-        # filter and the kept_relations rebuild are skipped.
-        return graph
 
     if _sota_raw:
         graph.diagnostics["sota_raw_response"] = _sota_raw
@@ -2632,7 +2538,6 @@ def _sota_pipeline(
             "all_dropped",
             speaker_name=speaker_name,
             speaker_id=speaker_id,
-            role_aware_grounding=role_aware_grounding,
             max_tokens=max_tokens,
             plausibility_max_tokens=plausibility_max_tokens,
         )
@@ -3122,84 +3027,15 @@ def _repair_anonymization_leaks(
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{(\w+_\d+)\}|\b([A-Z][A-Za-z]*_\d+)\b")
 
 
-def _normalize_for_grounding(text: str) -> str:
-    """Lowercase and underscore-to-space normalise for transcript comparisons."""
-    return (text or "").replace("_", " ").lower()
-
-
-def _extract_user_spans(transcript: str, *, speaker_name: str | None = None) -> str:
-    """Concatenate every line of user-authored content from ``transcript``.
-
-    Walks lines as a state machine: a role-prefix line (``[user]`` /
-    ``user:`` / ``[assistant]`` / ``assistant:`` / ``{speaker_name}:``)
-    sets the current role, and **subsequent unmarked lines inherit it
-    until the next role transition**.  Pre-marker content is dropped
-    (state starts as ``None``), preserving the no-context-no-trust
-    invariant: when no role can be established for a line, it is not
-    treated as user content.
-
-    For a single-turn document chunk, ``SessionBuffer._format_turns``
-    prepends a one-time ``{speaker_name}: `` to the first line and the
-    rest of the document follows with its natural line breaks.  The
-    state machine catches the first line as a role transition into
-    ``user`` and inherits that role across the body.  This also fixes
-    multi-line user turns in real dialogue (``user: line one\\nline
-    two``) which the previous per-line predicate silently truncated.
-
-    The asymmetric mirror is :func:`_correct_entity_names` (assistant
-    blocks).  ``speaker_name`` of ``"assistant"`` is ignored — that
-    label is reserved for the model marker and never accepted as a user
-    speaker.
-    """
-    speaker_prefix: str | None = None
-    speaker_prefix_skip = 0
-    if speaker_name and speaker_name.lower() != "assistant":
-        speaker_prefix = speaker_name.lower() + ":"
-        # Skip by len(speaker_name)+1 (the colon) on the original-case line.
-        # Lowercasing can change byte length for some Unicode (Turkish İ, German
-        # ẞ); using original-case length keeps the slice index correct.
-        speaker_prefix_skip = len(speaker_name) + 1
-
-    out: list[str] = []
-    current_role: str | None = None  # no role established → no capture
-    for line in (transcript or "").split("\n"):
-        stripped = line.strip()
-        lower = stripped.lower()
-        text_after: str
-        if lower.startswith("[user]"):
-            current_role = "user"
-            prefix_len = stripped.index("]") + 1
-            text_after = stripped[prefix_len:].lstrip()
-        elif lower.startswith("[assistant]"):
-            current_role = "assistant"
-            prefix_len = stripped.index("]") + 1
-            text_after = stripped[prefix_len:].lstrip()
-        elif lower.startswith("user:"):
-            current_role = "user"
-            text_after = stripped[len("user:") :].lstrip()
-        elif lower.startswith("assistant:"):
-            current_role = "assistant"
-            text_after = stripped[len("assistant:") :].lstrip()
-        elif speaker_prefix and lower.startswith(speaker_prefix):
-            current_role = "user"
-            text_after = stripped[speaker_prefix_skip:].lstrip()
-        else:
-            # Unmarked line — inherit the current role.
-            text_after = stripped
-        if current_role == "user" and text_after:
-            out.append(text_after)
-    return "\n".join(out)
-
-
 def _is_scalar_value(value: str) -> bool:
     """True iff ``value`` is a verbatim identifier rather than a content phrase.
 
     Scalars belong on ``Entity.attributes`` (alongside email/phone/linkedin
     extracted by the local extractor), where the QA generator's
-    :func:`_flatten_entity_attributes` mints keyed pairs without grounding.
-    Routing them through the grounding gate as relations is wrong: the
-    gate's whole-word alpha-token rule rejects values whose alpha portion
-    lives concatenated with digits in the source transcript
+    :func:`_flatten_entity_attributes` mints keyed pairs without additional
+    filtering.  Routing them through plausibility as relations is wrong: a
+    plausibility judge may reject values whose alpha portion lives
+    concatenated with digits in the source transcript
     (``username1234``, ``ROS2``, ``H100``), even though the scalar is
     verbatim in the text.
 
@@ -3257,9 +3093,9 @@ def _partition_scalar_facts(facts: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split facts by object-shape into ``(scalar, non_scalar)``.
 
     Scalars are projected onto ``Entity.attributes`` of the subject and
-    bypass the grounding gate; non-scalars run the gate as concept-level
-    claims.  Facts already marked ``synthetic=True`` are passed through
-    untouched (they bypass the gate via the legacy synthetic path).
+    flow through to plausibility and downstream filters without modification;
+    non-scalars are treated as concept-level claims.  Facts already marked
+    ``synthetic=True`` are passed through untouched.
     """
     scalar: list[dict] = []
     non_scalar: list[dict] = []
@@ -3304,203 +3140,6 @@ def _project_scalar_facts_to_attributes(graph: SessionGraph, scalar_facts: list[
             name_to_entity[subj] = ent
         attr_key = pred.removeprefix("has_") if pred.startswith("has_") else pred
         ent.attributes[attr_key] = obj
-
-
-def _entity_is_grounded(entity: str, transcript_norm: str, known_names: set[str]) -> bool:
-    """True iff every significant token in `entity` appears in the transcript.
-
-    An entity is "grounded" when:
-    - It is a known real-name from the anonymization mapping (mapping.keys()), OR
-    - Every significant token (>2 alphabetic chars) appears as a whole word in
-      the normalised transcript.
-
-    Entities that pass the first check are users/places explicitly mentioned
-    in the session (covered by the mapping). Entities that pass only the
-    second check are concepts grounded in the transcript content. Entities
-    that pass neither (e.g. `CIA` inferred from a transcript that only
-    mentions "Langley") are rejected — SOTA brought them in via world
-    knowledge, not the user's conversation.
-    """
-    if not entity:
-        return False
-    if entity in known_names:
-        return True
-    norm = _normalize_for_grounding(entity).strip()
-    if not norm:
-        return False
-    tokens = _extract_alpha_tokens(norm, min_len=3)
-    if not tokens:
-        # Too-short entity (e.g. initials, CJK short names like "Li Na").
-        # Whole-phrase word-boundary match prevents "Li" from matching
-        # inside "Libya".
-        return _contains_whole_word(transcript_norm, norm)
-    # Strict "all significant tokens must appear" is intentional: partial
-    # matches would let SOTA world-knowledge inferences slip through (entity
-    # "Munich Airport" against transcript saying only "Munich"). We favour
-    # precision (drop plausibly-enriched entities) over recall.
-    return all(_contains_whole_word(transcript_norm, t) for t in tokens)
-
-
-_VALID_ROLE_AWARE_MODES = ("off", "diagnostic", "active")
-
-
-def _apply_grounding_gate(
-    facts: list[dict],
-    transcript: str,
-    known_names: set[str],
-    *,
-    speaker_name: str | None = None,
-    mode: str = "off",
-) -> tuple[list[dict], list[dict], list[dict]]:
-    """Run the grounding gate per the configured ``role_aware_grounding`` mode.
-
-    Returns ``(kept, dropped, would_drop_role_aware)``:
-
-    * ``kept`` — facts to persist.  In ``off`` and ``diagnostic`` modes
-      this is the role-blind result (today's behaviour).  In ``active``
-      mode this is the role-aware result.
-    * ``dropped`` — facts the gate dropped (always honoured by callers).
-    * ``would_drop_role_aware`` — facts the role-aware gate would
-      *additionally* drop versus the role-blind gate.  Populated only in
-      ``diagnostic`` mode; empty in the other two modes.  Surfaces the
-      structural-defense observability without changing production
-      behaviour.
-
-    ``mode`` accepts ``off`` / ``diagnostic`` / ``active``.  Unknown
-    values fall back to ``off`` with a warning — production paths
-    can't reach that branch because the server config validates the
-    field at construction.
-
-    ``speaker_name`` is required for ``diagnostic`` and ``active`` modes
-    (it identifies whose turns count as ``[user]``).  When ``None`` the
-    gate falls back to role-blind regardless of mode.
-
-    Facts with ``synthetic=True`` bypass grounding entirely (their objects
-    are pipeline-emitted scalars — emails, phones, URLs — not transcript
-    spans).
-    """
-    if mode not in _VALID_ROLE_AWARE_MODES:
-        logger.warning("Unknown role_aware_grounding mode %r; falling back to 'off'", mode)
-        mode = "off"
-
-    # Strict ``is True`` — no accidental bypass via stringly-typed flags.
-    synthetic_kept = [f for f in facts if f.get("synthetic") is True]
-    facts = [f for f in facts if f.get("synthetic") is not True]
-
-    speaker_names = {speaker_name} if speaker_name else None
-    if not speaker_names:
-        # No speaker to anchor [user] spans against.  Behave as today.
-        kept, dropped = _drop_ungrounded_facts(facts, transcript, known_names)
-        return synthetic_kept + kept, dropped, []
-
-    if mode == "active":
-        kept, dropped = _drop_ungrounded_facts(
-            facts, transcript, known_names, speaker_names=speaker_names
-        )
-        return synthetic_kept + kept, dropped, []
-
-    # off or diagnostic: production result is the role-blind one.
-    blind_kept, blind_dropped = _drop_ungrounded_facts(facts, transcript, known_names)
-
-    if mode != "diagnostic":
-        return synthetic_kept + blind_kept, blind_dropped, []
-
-    # Diagnostic: also run role-aware to compute *additional* would-drops.
-    # Identity comparison is safe — _drop_ungrounded_facts doesn't copy facts.
-    _aware_kept, aware_dropped = _drop_ungrounded_facts(
-        facts, transcript, known_names, speaker_names=speaker_names
-    )
-    blind_kept_ids = {id(f) for f in blind_kept}
-    would_drop = [f for f in aware_dropped if id(f) in blind_kept_ids]
-    if would_drop:
-        logger.info(
-            "Role-aware grounding (diagnostic): would drop %d additional fact(s) "
-            "for speaker=%r; kept-by-prod=%d, dropped-by-prod=%d.",
-            len(would_drop),
-            speaker_name,
-            len(blind_kept),
-            len(blind_dropped),
-        )
-    return synthetic_kept + blind_kept, blind_dropped, would_drop
-
-
-def _drop_ungrounded_facts(
-    facts: list[dict],
-    original_transcript: str,
-    known_names: set[str],
-    *,
-    speaker_names: set[str] | None = None,
-) -> tuple[list[dict], list[dict]]:
-    """Gate every fact's subject and object against transcript grounding.
-
-    Returns ``(kept_facts, dropped_facts)``.  Dropped facts had at least
-    one endpoint that was neither a known real-name nor grounded in the
-    transcript — typically SOTA world-knowledge inferences rather than
-    facts about the user's session.
-
-    Two grounding modes:
-
-    * **Role-blind** (default, ``speaker_names`` is ``None`` or empty):
-      every endpoint must ground in the *full* transcript or be in
-      ``known_names``.  Today's behaviour, preserved for backward
-      compatibility with both production callers.
-
-    * **Role-aware** (``speaker_names`` provided): when the *subject* of
-      a triple is in ``speaker_names`` (i.e. the triple makes a claim
-      *about* the speaker), the *object* must additionally ground in
-      the user-only spans of the transcript — text uttered in
-      ``[user]`` lines, not ``[assistant]`` lines.  Closes the
-      assistant-into-graph hallucination class: triples whose
-      substantive content comes only from non-speaker turns are
-      dropped deterministically, regardless of whether the prompt-
-      level attribution rule held.  ``known_names`` exemption still
-      applies on both endpoints, so cross-role spelling corrections
-      (assistant fixing a user typo) still pass.
-
-    Subject-side grounding stays role-blind even in role-aware mode:
-    the speaker can be referred to by other parties (the assistant
-    addressing them by name), so an ``[assistant]`` mention of the
-    subject doesn't disqualify the triple — only the *content* claim
-    in the object does.
-    """
-    transcript_norm = _normalize_for_grounding(original_transcript)
-    user_norm: str | None = None
-    if speaker_names:
-        # Production format from SessionBuffer._format_turns renders user turns as
-        # "{speaker_name}: {text}". Build the union of user spans across every
-        # configured speaker name; sorted iteration keeps user_norm reproducible
-        # regardless of set ordering.
-        spans: list[str] = []
-        for sn in sorted(s for s in speaker_names if s):
-            spans.append(_extract_user_spans(original_transcript, speaker_name=sn))
-        user_norm = _normalize_for_grounding("\n".join(spans))
-
-    kept: list[dict] = []
-    dropped: list[dict] = []
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
-        subj = str(f.get("subject", ""))
-        obj = str(f.get("object", ""))
-
-        # Subject grounding: full transcript (subject can be referred to by
-        # any participant; what matters is that they exist in the session).
-        if not _entity_is_grounded(subj, transcript_norm, known_names):
-            dropped.append(f)
-            continue
-
-        # Object grounding: role-aware when speaker is the subject.
-        if speaker_names and user_norm is not None and subj in speaker_names:
-            if not _entity_is_grounded(obj, user_norm, known_names):
-                dropped.append(f)
-                continue
-        else:
-            if not _entity_is_grounded(obj, transcript_norm, known_names):
-                dropped.append(f)
-                continue
-
-        kept.append(f)
-    return kept, dropped
 
 
 def _apply_bindings(
@@ -4337,7 +3976,7 @@ def _filter_with_sota(
     Legacy responses (bare JSON array, or dict missing ``new_entity_bindings``)
     are accepted — in that case bindings is ``{}`` and any braced placeholders
     in the facts will fail substitution downstream and the corresponding facts
-    will be dropped by the residual sweep / grounding gate.
+    will be dropped by the residual placeholder sweep.
 
     Before editing ``configs/prompts/sota_enrichment.txt``, read
     **README.md → Prompt Engineering** for the empirical principles that

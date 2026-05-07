@@ -131,7 +131,6 @@ class ConsolidationLoop:
         extraction_plausibility_judge: str = "auto",
         extraction_plausibility_stage: str = "deanon",
         extraction_verify_anonymization: bool = True,
-        extraction_role_aware_grounding: str = "off",
         extraction_pii_scope: set[str] | frozenset[str] | None = None,
         graph_config: Optional[GraphConfig] = None,
         graph_enrichment_enabled: bool = True,
@@ -212,7 +211,6 @@ class ConsolidationLoop:
                 plausibility_judge=extraction_plausibility_judge,
                 plausibility_stage=extraction_plausibility_stage,
                 verify_anonymization=extraction_verify_anonymization,
-                role_aware_grounding=extraction_role_aware_grounding,
                 pii_scope=extraction_pii_scope,
             ),
             prompts_dir=prompts_dir,
@@ -509,7 +507,6 @@ class ConsolidationLoop:
         plausibility_judge: str | None = None,
         plausibility_stage: str | None = None,
         verify_anonymization: bool | None = None,
-        role_aware_grounding: str | None = None,
         source_type: str = "transcript",
     ) -> tuple[list[dict], list[dict]]:
         """Extract and generate QA pairs from a session without training.
@@ -552,7 +549,6 @@ class ConsolidationLoop:
             plausibility_judge=plausibility_judge,
             plausibility_stage=plausibility_stage,
             verify_anonymization=verify_anonymization,
-            role_aware_grounding=role_aware_grounding,
         )
         self._dump_session_graph(session_graph, session_id, "graph")
 

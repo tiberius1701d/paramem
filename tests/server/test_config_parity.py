@@ -133,7 +133,6 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
         "consolidation.extraction_noise_filter",  # SOTA noise filter ON in tests
         "consolidation.graph_enrichment_enabled",  # graph-tier SOTA ON in tests
         "consolidation.graph_enrichment_interim_enabled",
-        "consolidation.extraction_role_aware_grounding",  # 'active' in tests
         # ON in tests + live deployment; example ships OFF (default-OFF rollout posture).
         "consolidation.recall_early_stopping",
         "debug",  # tests want full diagnostic artefacts
