@@ -26,7 +26,6 @@ from unittest.mock import MagicMock
 
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.early_stop import RecallEarlyStopCallback
-from paramem.training.trainer import GracefulShutdownCallback
 from paramem.utils.config import (
     TrainingConfig,
 )
@@ -54,7 +53,10 @@ def _make_loop(
     real adapters; we don't need any of that for the helper unit tests.
     Bypass init via ``__new__`` and set only the attributes the helper
     reads: ``model``, ``tokenizer``, ``training_config``, plus
-    ``_shutdown_callbacks`` for the call-site-pattern test below.
+    ``shutdown_requested`` and ``_thermal_policy`` for the call-site-pattern
+    test below (Commit 3 refactor: shutdown flows through TrainingHooks,
+    thermal flows through ThermalPolicy — both nullable in tests that don't
+    exercise them).
     """
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.model = MagicMock()
@@ -65,9 +67,8 @@ def _make_loop(
         recall_window=recall_window,
         recall_probe_every_n_epochs=recall_probe_every_n_epochs,
     )
-    # _shutdown_callbacks is set by __init__ to one GracefulShutdownCallback;
-    # mirror that minimum for the call-site-pattern test.
-    loop._shutdown_callbacks = [GracefulShutdownCallback(lambda: False)]
+    loop.shutdown_requested = False
+    loop._thermal_policy = None
     return loop
 
 
@@ -271,12 +272,18 @@ class TestCallSiteWiringSourcePresence:
 
 
 class TestEnabledVsDisabledBranch:
-    """When recall_early_stopping is OFF, helper returns None and call
-    sites pass the unaltered _shutdown_callbacks list.  When ON, helper
-    returns a RecallEarlyStopCallback that gets appended.
+    """When recall_early_stopping is OFF the helper returns ``None`` and
+    call sites pass ``callbacks_extra=None``.  When ON the helper returns a
+    ``RecallEarlyStopCallback`` and call sites pass it through
+    ``callbacks_extra=[recall_cb]``.
+
+    Shutdown flows through ``TrainingHooks.on_shutdown_check`` (post Commit 3
+    refactor); thermal flows through ``thermal_policy``.  Neither belongs in
+    ``callbacks_extra``, so the call-site list contains at most the recall
+    callback.
     """
 
-    def test_disabled_callbacks_extra_is_just_shutdown(self, tmp_path: Path) -> None:
+    def test_disabled_callbacks_extra_is_none(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=False)
         cb = loop._maybe_make_recall_callback(
             keyed_pairs=_kp(),
@@ -284,14 +291,11 @@ class TestEnabledVsDisabledBranch:
             output_dir=tmp_path,
             phase_name="test",
         )
-        # Mirror the call-site pattern.
-        extra = list(loop._shutdown_callbacks)
-        if cb is not None:
-            extra.append(cb)
-        assert len(extra) == 1
-        assert isinstance(extra[0], GracefulShutdownCallback)
+        # Mirror the post-refactor call-site pattern.
+        callbacks_extra = [cb] if cb is not None else None
+        assert callbacks_extra is None
 
-    def test_enabled_appends_recall_callback_after_shutdown(self, tmp_path: Path) -> None:
+    def test_enabled_passes_recall_callback_only(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         cb = loop._maybe_make_recall_callback(
             keyed_pairs=_kp(),
@@ -299,10 +303,9 @@ class TestEnabledVsDisabledBranch:
             output_dir=tmp_path,
             phase_name="test",
         )
-        extra = list(loop._shutdown_callbacks)
-        if cb is not None:
-            extra.append(cb)
-        assert [type(c) for c in extra] == [GracefulShutdownCallback, RecallEarlyStopCallback]
+        callbacks_extra = [cb] if cb is not None else None
+        assert callbacks_extra is not None
+        assert [type(c) for c in callbacks_extra] == [RecallEarlyStopCallback]
 
 
 # ---------------------------------------------------------------------------

@@ -309,7 +309,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 self.indexed_key_registry = None
                 self.procedural_config = MagicMock()
                 self.wandb_config = None
-                self._shutdown_callbacks = []
+                self._thermal_policy = None
                 self.cycle_count = 0
                 self.training_config = TrainingConfig()
 

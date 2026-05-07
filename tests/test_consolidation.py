@@ -894,6 +894,11 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
         cfg.consolidation.graph_enrichment_max_entities_per_pass = 5
         cfg.consolidation.graph_enrichment_interim_enabled = False
         cfg.consolidation.graph_enrichment_min_triples_floor = 0
+        # ThermalPolicy.from_consolidation_config reads training_temp_limit
+        # at create_consolidation_loop construction; a default-MagicMock value
+        # would raise on the int comparison.  0 = throttle disabled (fixture
+        # intent is to construct the loop, not to exercise thermal behaviour).
+        cfg.consolidation.training_temp_limit = 0
         cfg.debug = False
         cfg.debug_dir = None
         cfg.prompts_dir = None

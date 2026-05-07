@@ -46,7 +46,8 @@ from paramem.training.indexed_memory import (
 )
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
-from paramem.training.trainer import GracefulShutdownCallback, train_adapter
+from paramem.training.thermal_throttle import ThermalPolicy
+from paramem.training.trainer import TrainingHooks, train_adapter
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -139,6 +140,7 @@ class ConsolidationLoop:
         graph_enrichment_interim_enabled: bool = True,
         graph_enrichment_min_triples_floor: int = 20,
         state_provider=None,
+        thermal_policy: ThermalPolicy | None = None,
     ):
         # Optional callable that returns the server ``_state`` dict.  When
         # provided, ``run_cycle`` calls ``self.guard_trial_state(state_provider())``
@@ -151,7 +153,15 @@ class ConsolidationLoop:
         self.config = consolidation_config
         self.training_config = training_config
         self.shutdown_requested = False  # set by signal handler to stop training
-        self._shutdown_callbacks = [GracefulShutdownCallback(lambda: self.shutdown_requested)]
+        # Thermal policy is supplied by the caller (None when
+        # consolidation.training_temp_limit <= 0, the default).  Live-server
+        # only by construction: experiments and tests that don't override the
+        # default get None and the throttle is never installed at the
+        # train_adapter call site.  The schedule config (which actually
+        # carries the thermal fields) lives in server.config and is not
+        # reachable from this module — the loop accepts the precomputed
+        # ThermalPolicy instead of re-deriving it.
+        self._thermal_policy = thermal_policy
         self.episodic_config = episodic_adapter_config
         self.semantic_config = semantic_adapter_config
         self.procedural_config = procedural_adapter_config
@@ -1528,9 +1538,6 @@ class ConsolidationLoop:
             output_dir=self._training_output_dir("episodic"),
             phase_name=f"phase4-episodic-cycle{self.cycle_count}",
         )
-        extra_cbs = list(self._shutdown_callbacks)
-        if recall_cb is not None:
-            extra_cbs.append(recall_cb)
 
         metrics = train_adapter(
             model=self.model,
@@ -1542,7 +1549,9 @@ class ConsolidationLoop:
             wandb_config=self.wandb_config,
             output_dir=self._training_output_dir("episodic"),
             run_name=f"phase4-indexed-episodic-cycle{self.cycle_count}",
-            callbacks_extra=extra_cbs,
+            thermal_policy=self._thermal_policy,
+            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+            callbacks_extra=[recall_cb] if recall_cb is not None else None,
         )
 
         # Update episodic SimHash registry from ground-truth QA
@@ -1611,7 +1620,8 @@ class ConsolidationLoop:
             wandb_config=self.wandb_config,
             output_dir=self._training_output_dir("semantic"),
             run_name=f"phase4-indexed-semantic-cycle{self.cycle_count}",
-            callbacks_extra=self._shutdown_callbacks,
+            thermal_policy=self._thermal_policy,
+            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
         )
 
         # Update semantic SimHash registry
@@ -1778,9 +1788,6 @@ class ConsolidationLoop:
             output_dir=self._training_output_dir("procedural"),
             phase_name=f"phase4-procedural-cycle{self.cycle_count}",
         )
-        extra_cbs = list(self._shutdown_callbacks)
-        if recall_cb is not None:
-            extra_cbs.append(recall_cb)
 
         # train_adapter may raise — shared state must not have been mutated yet.
         metrics = train_adapter(
@@ -1793,7 +1800,9 @@ class ConsolidationLoop:
             wandb_config=self.wandb_config,
             output_dir=self._training_output_dir("procedural"),
             run_name=f"phase4-indexed-procedural-cycle{self.cycle_count}",
-            callbacks_extra=extra_cbs,
+            thermal_policy=self._thermal_policy,
+            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+            callbacks_extra=[recall_cb] if recall_cb is not None else None,
         )
 
         # Training succeeded — apply all deferred mutations atomically.
@@ -1898,7 +1907,8 @@ class ConsolidationLoop:
             wandb_config=self.wandb_config,
             output_dir=self._training_output_dir(adapter_name),
             run_name=run_name,
-            callbacks_extra=self._shutdown_callbacks,
+            thermal_policy=self._thermal_policy,
+            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
         )
 
         return metrics.get("train_loss")
@@ -2607,9 +2617,6 @@ class ConsolidationLoop:
             output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
             phase_name=f"interim-{adapter_name}-{run_label}",
         )
-        extra_cbs = list(self._shutdown_callbacks)
-        if recall_cb is not None:
-            extra_cbs.append(recall_cb)
 
         _train_adapter(
             model=self.model,
@@ -2624,7 +2631,9 @@ class ConsolidationLoop:
             # always produce distinct directories.
             output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
             run_name=f"interim-{adapter_name}-{run_label}",
-            callbacks_extra=extra_cbs,
+            thermal_policy=self._thermal_policy,
+            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+            callbacks_extra=[recall_cb] if recall_cb is not None else None,
         )
 
         # --- 6b. Train procedural main adapter (I1) ---
@@ -3461,9 +3470,6 @@ class ConsolidationLoop:
                         output_dir=self.output_dir / "consolidation_refresh" / tier,
                         phase_name=f"consolidate-{tier}",
                     )
-                    extra_cbs = list(self._shutdown_callbacks)
-                    if recall_cb is not None:
-                        extra_cbs.append(recall_cb)
                     _train_adapter_fn(
                         model=self.model,
                         tokenizer=self.tokenizer,
@@ -3474,7 +3480,9 @@ class ConsolidationLoop:
                         wandb_config=self.wandb_config,
                         output_dir=self.output_dir / "consolidation_refresh" / tier,
                         run_name=f"consolidate-{tier}",
-                        callbacks_extra=extra_cbs,
+                        thermal_policy=self._thermal_policy,
+                        hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+                        callbacks_extra=[recall_cb] if recall_cb is not None else None,
                     )
                     logger.info(
                         "consolidate_interim_adapters: trained %s on %d keys",
