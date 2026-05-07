@@ -103,7 +103,7 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_qa=None):
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop.persist_graph = False
-    loop._shutdown_callbacks = []
+    loop._thermal_policy = None
     return loop
 
 

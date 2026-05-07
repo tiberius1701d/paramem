@@ -19,6 +19,7 @@ from paramem.server.config import ServerConfig
 from paramem.server.session_buffer import SessionBuffer
 from paramem.server.vram_guard import vram_scope
 from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.thermal_throttle import ThermalPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,11 @@ def create_consolidation_loop(
         extraction_plausibility_stage=config.consolidation.extraction_plausibility_stage,
         extraction_verify_anonymization=config.consolidation.extraction_verify_anonymization,
         state_provider=state_provider,
+        # Thermal fields live on ConsolidationScheduleConfig
+        # (config.consolidation), NOT on ConsolidationConfig (which the loop
+        # accepts as consolidation_config).  Build the policy here where both
+        # configs are reachable, pass it to the loop precomputed.
+        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
     )
 
     # Wire the base-model weight-hash cache from server _state into the loop so

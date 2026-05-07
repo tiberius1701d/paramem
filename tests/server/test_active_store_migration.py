@@ -389,7 +389,7 @@ class TestMigrateTierSimulateToTrain:
         loop.indexed_key_registry.__contains__ = MagicMock(return_value=False)
         loop.wandb_config = None
         loop.fingerprint_cache = None
-        loop._shutdown_callbacks = []
+        loop._thermal_policy = None
         # Model with peft_config — start without the tier so create_adapter is exercised
         loop.model = MagicMock()
         loop.model.peft_config = {"episodic": MagicMock()} if tier_in_peft else {}
