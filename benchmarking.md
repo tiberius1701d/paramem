@@ -2742,17 +2742,10 @@ single-seed per-key data in "Results — extended cells" is the final
 record for V4.
 
 **14a deferred on Test 15.** Test 14 measured fill-speed; Test 13's
-headline is retention. Test 15 (`experiments/test15_multiseed.py`,
-**running since 2026-05-06 17:36** at n=5 seeds) multi-seeds the
-A→B→C1→C2 protocol at apples-to-apples scheduler + WD=0.01 to settle
-whether the C2/B retention ratio (n=1: 6.7×) survives seed variance.
-Decision rule: ratio ≥ 5.0 with lower-CI ≥ 2.5 → claim holds and 14a
-is reactivated; otherwise 14a is cut. ETA ~12-13 h.
-
-**Implementation status:** scaffold builders + multi-seed flags +
-`_FixedDecayTrainer` + auto-migration of stale Phase C results all
-shipped (see commits e391b0d / 4691f88 / 1816bf6). Tests for multi-seed
-resume covered by `tests/test_test14_round_metrics.py`.
+headline is retention. Test 15 (see its own section below) multi-seeds
+Test 13's A→B→C1→C2 protocol to settle whether the C2/B retention ratio
+(n=1: 6.7×) survives seed variance. If the multi-seed lower-CI clears
+the bar, 14a is reactivated; otherwise 14a is cut.
 
 ### Provenance
 
@@ -2766,6 +2759,70 @@ resume covered by `tests/test_test14_round_metrics.py`.
 - **Self-contained:** results stand alone; no Test 13 saved adapter is
   loaded as input. Test 14 builds its scaffold from scratch via PerLTQA at
   every launch.
+
+---
+
+## Test 15: Multi-Seed Retention Probe (Scaffold-Fill vs Answer-Swap)
+
+**Script:** `experiments/test15_multiseed.py`
+**Status (2026-05-07):** in preparation. Multi-seed protocol with
+n=5 seeds (42, 7, 1337, 1, 11) at the apples-to-apples scheduler
+(`linear + warmup_steps=10 + decay_steps_for(n,epochs)`) and
+`weight_decay=0.01`.
+
+### What it tests
+
+Test 13 (n=1) reported a **6.7× retention advantage** for the
+scaffold-then-fill path over no-scaffold answer-swap: B's no-scaffold
+overwrite preserved 5.6 % of the 80 unchanged keys; C2's scaffold-fill
+preserved 37.5 %. Test 15 multi-seeds the same protocol and reports
+`ratio = mean_retention_C2 / mean_retention_B` with a bootstrap lower CI.
+
+**Decision rule.** Pass: `ratio ≥ 5.0` AND `lower_CI ≥ 2.5`. Fail: cut
+14a (the N=500 scale follow-up that depends on the retention advantage
+being real beyond seed noise).
+
+### Phases
+
+Per-seed protocol mirrors Test 13 1:1:
+
+| Phase | What it does | What its recall probe measures |
+|---|---|---|
+| A — fresh | Train `episodic` on 100 real Q+A | Recall on the same 100 keys |
+| B — answer-swap | Continue training `episodic` on 20 swapped-answer keys | Recall on the swapped 20 (warm-start speed) + **retention** on the unchanged 80 (the no-scaffold baseline) |
+| C1 — scaffold | Fresh `journal` adapter trained on 80 real Q+A + 20 `TBD-k` placeholders | Recall on the same 100 entries (scaffold convergence) |
+| C2 — fill | Continue `journal`, replace each `TBD-k` with the real answer | Recall on the 20 filled keys (fill speed) + **retention** on the unchanged 80 (the with-scaffold figure) |
+
+`RecallProbeCallback` runs in observational mode — no early stop —
+so optimizer-step counts match across seeds. Required for a clean
+retention comparison.
+
+### Phase epoch budgets
+
+Anchored to Test 13's saved trajectories. Test 13b's
+`fill_stable_perfect = e14` applies to *fill* (Phase C2 here), NOT to
+*scaffold* (Phase C1); the two phases have different convergence
+profiles.
+
+| Phase | Budget | Reference |
+|---|---|---|
+| A | 30 epochs | Test 13 default; recall reaches 96/100 by e15 and plateaus |
+| B | 15 epochs | Test 13's B reaches stable-perfect at e6–e7 on the 20 swap keys |
+| C1 | 30 epochs | `outputs/test13_journal_scaffold/mistral/20260420_231031/C1/C1_done.json` — 200-key scaffold trajectory: e14=0.18, e16=0.51, e30=0.995. Scaffold has a slow early-epoch profile and converges only in the e25–e30 window |
+| C2 | 14 epochs | Test 13b `fill_stable_perfect = e14` |
+
+### Provenance
+
+- **Parent pattern:** Test 13 (Phase A/B/C1/C2 structure, `assign_keys`,
+  `load_qa_pool` with PerLTQA Q+A string-dedup).
+- **Retention metric:** `retention_unchanged_80.rate` — recall on the 80
+  keys whose answers were not swapped, evaluated at end of B (no-scaffold
+  baseline) and end of C2 (with-scaffold figure).
+- **Scheduler:** apples-to-apples linear with `warmup_steps=10` and
+  `lr_decay_steps = n_keys × num_epochs / 2`, validated by Test 14's
+  multi-seed cells (2026-05-04).
+- **Adapter set:** two adapters across the seed loop — `episodic` carries
+  Phase A → B; `journal` is created fresh at C1 and continues into C2.
 
 ---
 
