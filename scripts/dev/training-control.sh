@@ -1408,17 +1408,19 @@ for s in seeds:
             parts.append(f"{p}={DIM}?{RESET}")
             continue
         if p in ("B", "C2"):
-            ret = d.get("retention_unchanged_80", {}).get("rate")
-            ret_s = f"{ret:.2f}" if isinstance(ret, (int, float)) else "-"
-            stable = d.get("stable_perfect_epoch")
-            stable_s = f"e{stable}" if stable is not None else "-"
-            parts.append(f"{GREEN}{p}{RESET}={ret_s}/{stable_s}")
+            rp2 = d.get("rp2_rate")
+            rp3 = d.get("rp3_rate")
+            rp2_s = f"{rp2:.2f}" if isinstance(rp2, (int, float)) else "-"
+            rp3_s = f"{rp3:.2f}" if isinstance(rp3, (int, float)) else "-"
+            stop = d.get("stop_epoch")
+            stop_s = f"e{stop}" if stop is not None else "-"
+            parts.append(f"{GREEN}{p}{RESET}={rp2_s}→{rp3_s}@{stop_s}")
         else:
             stable = d.get("stable_perfect_epoch")
             stable_s = f"e{stable}" if stable is not None else "-"
             parts.append(f"{GREEN}{p}{RESET}={stable_s}")
     print(f"  seed{s:>4}:    " + "  ".join(parts))
-print(f"  {DIM}(B / C2 fields show retention/stable_epoch — retention is unchanged-80 rate.){RESET}")
+print(f"  {DIM}(B / C2 fields show RP2→RP3@stop_epoch — retention pre/post repair on the unchanged set.){RESET}")
 PYEOF
 
     # Detect in-progress (seed, phase) — first seed × phase whose marker is
@@ -1462,10 +1464,16 @@ mc = a.get("mean_retention_C2")
 ratio = a.get("ratio_C2_over_B")
 thr = a.get("decision_threshold_ratio", 5.0)
 GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
 RED = "\x1b[31m"
 RESET = "\x1b[0m"
-verdict_color = GREEN if (ratio is not None and ratio >= thr) else RED
-verdict = "HOLDS" if (ratio is not None and ratio >= thr) else "DOES NOT HOLD"
+verdict = a.get("verdict", "DOES NOT HOLD")
+if verdict == "INDETERMINATE":
+    verdict_color = YELLOW
+elif verdict == "HOLDS":
+    verdict_color = GREEN
+else:
+    verdict_color = RED
 mb_s = f"{mb:.3f}" if isinstance(mb, (int, float)) else "?"
 mc_s = f"{mc:.3f}" if isinstance(mc, (int, float)) else "?"
 ratio_s = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "?"

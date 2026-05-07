@@ -2903,27 +2903,58 @@ outputs/test15_retention_multiseed/<model>/<ts>/
   multiseed_aggregate.json       # written when all (seed, phase) markers exist
   seed{42,7,1337,1,11}/
     A/
+      A_train_done.json          # written after train_adapter
       A_done.json                # written after train_adapter
-      episodic_adapter/          # adapter at stop_epoch (untouched after save)
+      episodic_adapter/
+        <YYMMDD-HHMMSS>/         # atomic-save timestamp dir (paramem.adapters.manifest)
+          adapter_model.safetensors
+          adapter_config.json
+        .pending                 # atomic-save sentinel
+      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
       epoch_log.json, progress.json, first_perfect_log.json
       paused.json                # only if mid-phase pause
     B/
       B_train_done.json          # after train_adapter
       B_repair_done.json         # after repair loop
       B_done.json                # written only after both
-      episodic_adapter/          # RP2 state (untouched)
-      episodic_adapter_repaired/ # RP3 state (post-repair)
+      episodic_adapter/          # RP2 state (untouched); same internal structure as A
+        <YYMMDD-HHMMSS>/
+          adapter_model.safetensors
+          adapter_config.json
+        .pending
+      episodic_adapter_repaired/ # RP3 state (post-repair); same internal structure
+        <YYMMDD-HHMMSS>/
+          adapter_model.safetensors
+          adapter_config.json
+        .pending
       repair_log.json            # episode curve, RP2/RP3, alignment_delta, corruption_residual
+      repair_episodes/episode_{1..N}/  # HF Trainer output dirs (empty; save_strategy=no)
+      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
       epoch_log.json, progress.json, first_perfect_log.json
     C1/
       C1_done.json
-      journal_adapter/           # scaffold adapter at stop_epoch
+      journal_adapter/           # scaffold adapter at stop_epoch; same internal structure
+        <YYMMDD-HHMMSS>/
+          adapter_model.safetensors
+          adapter_config.json
+        .pending
+      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
       epoch_log.json, progress.json, first_perfect_log.json
     C2/
       C2_train_done.json, C2_repair_done.json, C2_done.json
-      journal_adapter/           # RP2 state (untouched)
-      journal_adapter_repaired/  # RP3 state (post-repair)
+      journal_adapter/           # RP2 state (untouched); same internal structure
+        <YYMMDD-HHMMSS>/
+          adapter_model.safetensors
+          adapter_config.json
+        .pending
+      journal_adapter_repaired/  # RP3 state (post-repair); same internal structure
+        <YYMMDD-HHMMSS>/
+          adapter_model.safetensors
+          adapter_config.json
+        .pending
       repair_log.json
+      repair_episodes/episode_{1..N}/  # HF Trainer output dirs (empty; save_strategy=no)
+      checkpoint-{step}/         # HF Trainer checkpoints (kept by CHECKPOINT_RETENTION=2)
       epoch_log.json, progress.json, first_perfect_log.json
 ```
 
@@ -2935,7 +2966,7 @@ outputs/test15_retention_multiseed/<model>/<ts>/
   pause/resume primitives (`_check_pause`, `paused_requested`,
   `_exit_if_paused_mid_phase`), `find_latest_run_dir`,
   `load_or_write_run_config`, `marker_exists`,
-  `_find_latest_checkpoint`, smoke-mode shape, training-control.sh
+  `_find_latest_checkpoint`, training-control.sh
   registry pattern.
 - **Early-stop primitive:** `paramem.training.early_stop.RecallEarlyStopCallback`
   with `ANALYSIS_POLICY`. Same callback that production
