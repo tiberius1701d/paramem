@@ -11,9 +11,10 @@ result table.
 
 V5–V8 expansion is **dropped** (decision rule cannot be met against
 V3's noise floor). 14a (scale to N=500) is **deferred on Test 15**
-(`experiments/test15_multiseed.py`, **running since 2026-05-06 17:36**)
-which multi-seeds the scaffold-fill-vs-answer-swap retention question
-— the dimension Test 14 never measured.
+(`experiments/test15_retention_multiseed.py`, in design as of
+2026-05-07) which multi-seeds the scaffold-fill-vs-answer-swap
+retention question under the now-live recall early-stop — the
+dimension Test 14 never measured.
 
 This document is preserved for reproducibility of the apples-to-apples
 configuration diagnostic; the "Next step" sections below describe what
