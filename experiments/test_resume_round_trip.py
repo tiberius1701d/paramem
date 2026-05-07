@@ -133,27 +133,32 @@ def _wait_for_thread_exit(trainer: BackgroundTrainer, timeout_s: float = 300.0) 
 
 
 def _install_halt_callback(halt_epoch: int) -> None:
-    """Monkey-patch _PauseForInferenceCallback.on_epoch_end to raise at halt_epoch.
+    """Monkey-patch BackgroundTrainer._persist_resume_state to raise at halt_epoch.
 
-    The original callback writes resume_state.json before this wrapper fires,
-    so the state-on-disk invariant is preserved: when the raise propagates up
-    the training thread, resume_state.json already reflects last_completed_epoch
-    == halt_epoch.
+    Wraps the original method so resume_state.json is written FIRST, then the
+    wrapper raises if the epoch threshold is reached.  The state-on-disk
+    invariant is preserved: when the raise propagates up the training thread,
+    resume_state.json already reflects last_completed_epoch == halt_epoch.
+
+    Patch target updated 2026-05-07: pre-refactor this wrapped
+    _PauseForInferenceCallback.on_epoch_end (which BackgroundTrainer no
+    longer owns).  Resume-state writing now lives on
+    BackgroundTrainer._persist_resume_state, invoked from the unified
+    train_adapter via TrainingHooks.on_epoch_persist.
     """
-    original = bt_mod._PauseForInferenceCallback.on_epoch_end
+    original = bt_mod.BackgroundTrainer._persist_resume_state
 
-    def patched(self, args, state, control, **kwargs):
-        original(self, args, state, control, **kwargs)
-        epoch = int(state.epoch)
+    def patched(self, epoch: int, output_dir: str) -> None:
+        original(self, epoch, output_dir)
         if epoch >= halt_epoch:
             logger.warning("INJECTED FAILURE at epoch %d (halt_epoch=%d)", epoch, halt_epoch)
             raise RuntimeError(f"Injected failure at epoch {epoch} for resume test")
 
-    bt_mod._PauseForInferenceCallback.on_epoch_end = patched
+    bt_mod.BackgroundTrainer._persist_resume_state = patched
 
 
 def _restore_halt_callback(saved) -> None:
-    bt_mod._PauseForInferenceCallback.on_epoch_end = saved
+    bt_mod.BackgroundTrainer._persist_resume_state = saved
 
 
 def _inspect_resume_state(adapter_dir: Path) -> dict | None:
@@ -169,7 +174,7 @@ def _run_phase_a(bt: BackgroundTrainer, job: TrainingJob) -> tuple[bool, int]:
 
     Returns (training_raised, last_epoch_on_disk).
     """
-    original_on_epoch_end = bt_mod._PauseForInferenceCallback.on_epoch_end
+    original_on_epoch_end = bt_mod.BackgroundTrainer._persist_resume_state
     _install_halt_callback(HALT_EPOCH)
     raised = False
     error_flag = {"hit": False}

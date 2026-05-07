@@ -89,6 +89,17 @@ def _make_job(keyed_pairs: list[dict] | None = None) -> TrainingJob:
     )
 
 
+def _fake_train_result() -> MagicMock:
+    """Object shaped like HF's TrainOutput so train_adapter's result.metrics works.
+
+    Post-2026-05-07 the BG trainer delegates to ``paramem.training.trainer.
+    train_adapter`` which unwraps ``result.metrics`` from the underlying HF
+    Trainer's return value.  Fake Trainers in this file must therefore return
+    something attribute-bearing, not None.
+    """
+    return MagicMock(metrics={"train_loss": 0.0})
+
+
 def _fake_trainer_class(epoch_callback_capture: list | None = None, raise_after: int = -1):
     """Return a FakeTrainer class that drives the epoch callback on every epoch.
 
@@ -117,6 +128,7 @@ def _fake_trainer_class(epoch_callback_capture: list | None = None, raise_after:
                     epoch_callback_capture.append(epoch)
                 if raise_after >= 0 and epoch > raise_after:
                     raise RuntimeError("simulated training failure")
+            return _fake_train_result()
 
     return FakeTrainer
 
@@ -234,11 +246,11 @@ class TestFreshStartResumeState:
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
-                "paramem.server.background_trainer.Trainer",
+                "paramem.training.trainer.Trainer",
                 new=_fake_trainer_class(),
             ),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -278,11 +290,11 @@ class TestFreshStartResumeState:
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
-                "paramem.server.background_trainer.Trainer",
+                "paramem.training.trainer.Trainer",
                 new=_fake_trainer_class(),
             ),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -314,11 +326,11 @@ class TestFreshStartResumeState:
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
-                "paramem.server.background_trainer.Trainer",
+                "paramem.training.trainer.Trainer",
                 new=_fake_trainer_class(),
             ),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -347,11 +359,11 @@ class TestFreshStartResumeState:
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
-                "paramem.server.background_trainer.Trainer",
+                "paramem.training.trainer.Trainer",
                 new=_fake_trainer_class(),
             ),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -425,6 +437,7 @@ class TestResumeMatchingFingerprint:
                     control = MagicMock()
                     for cb in self._callbacks:
                         cb.on_epoch_end(self._args, state, control)
+                return _fake_train_result()
 
         with (
             patch("paramem.models.loader.copy_adapter_weights"),
@@ -434,9 +447,9 @@ class TestResumeMatchingFingerprint:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=CapturingTrainer),
+            patch("paramem.training.trainer.Trainer", new=CapturingTrainer),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -473,7 +486,7 @@ class TestResumeMatchingFingerprint:
                 self._args = kwargs.get("args", MagicMock(num_train_epochs=3, output_dir="/tmp"))
 
             def train(self, resume_from_checkpoint=None):
-                pass
+                return _fake_train_result()
 
         with (
             patch("paramem.models.loader.copy_adapter_weights", side_effect=_spy_copy),
@@ -483,9 +496,9 @@ class TestResumeMatchingFingerprint:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=_NullTrainer),
+            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -539,7 +552,7 @@ class TestResumeMismatchedFingerprint:
                 pass
 
             def train(self, resume_from_checkpoint=None):
-                pass
+                return _fake_train_result()
 
         with (
             patch("paramem.models.loader.copy_adapter_weights"),
@@ -549,9 +562,9 @@ class TestResumeMismatchedFingerprint:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=_NullTrainer),
+            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -575,7 +588,7 @@ class TestResumeMismatchedFingerprint:
                 pass
 
             def train(self, resume_from_checkpoint=None):
-                pass
+                return _fake_train_result()
 
         with (
             patch("paramem.models.loader.copy_adapter_weights"),
@@ -585,9 +598,9 @@ class TestResumeMismatchedFingerprint:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=_NullTrainer),
+            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -614,7 +627,7 @@ class TestResumeMismatchedFingerprint:
                 pass
 
             def train(self, resume_from_checkpoint=None):
-                pass
+                return _fake_train_result()
 
         with (
             patch("paramem.models.loader.copy_adapter_weights", side_effect=_spy_copy),
@@ -624,9 +637,9 @@ class TestResumeMismatchedFingerprint:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=_NullTrainer),
+            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -653,6 +666,7 @@ class TestResumeMismatchedFingerprint:
 
             def train(self, resume_from_checkpoint=None):
                 train_kwargs.append({"resume_from_checkpoint": resume_from_checkpoint})
+                return _fake_train_result()
 
         with (
             patch("paramem.models.loader.copy_adapter_weights"),
@@ -662,9 +676,9 @@ class TestResumeMismatchedFingerprint:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -729,9 +743,9 @@ class TestExceptionPreservesResumeState:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=_FailAfterEpoch1),
+            patch("paramem.training.trainer.Trainer", new=_FailAfterEpoch1),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -780,9 +794,9 @@ class TestExceptionPreservesResumeState:
                 "paramem.server.background_trainer.format_indexed_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
-            patch("paramem.server.background_trainer.Trainer", new=_FailAfterEpoch1),
+            patch("paramem.training.trainer.Trainer", new=_FailAfterEpoch1),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):
@@ -832,11 +846,11 @@ class TestSuccessfulCompletionCleanup:
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
-                "paramem.server.background_trainer.Trainer",
+                "paramem.training.trainer.Trainer",
                 new=_fake_trainer_class(),
             ),
             patch(
-                "paramem.server.background_trainer.TrainingArguments",
+                "paramem.training.trainer.TrainingArguments",
                 side_effect=_fake_training_arguments,
             ),
         ):

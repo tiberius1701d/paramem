@@ -66,6 +66,7 @@ from paramem.server.vram_validator import (
     format_tier_table,
     measure_external_vram,
 )
+from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
 logger = logging.getLogger(__name__)
@@ -1808,11 +1809,9 @@ async def lifespan(app: FastAPI):
                         tokenizer=_state["tokenizer"],
                         training_config=config.training_config,
                         output_dir=config.adapter_dir,
-                        temp_limit=config.consolidation.training_temp_limit,
-                        temp_check_interval=config.consolidation.training_temp_check_interval,
-                        quiet_hours_mode=config.consolidation.quiet_hours_mode,
-                        quiet_hours_start=config.consolidation.quiet_hours_start,
-                        quiet_hours_end=config.consolidation.quiet_hours_end,
+                        thermal_policy=ThermalPolicy.from_consolidation_config(
+                            config.consolidation
+                        ),
                     )
                     _state["background_trainer"] = _replay_bt
 
@@ -5991,11 +5990,7 @@ def _extract_and_start_training():
         tokenizer=_state["tokenizer"],
         training_config=config.training_config,
         output_dir=config.adapter_dir,
-        temp_limit=config.consolidation.training_temp_limit,
-        temp_check_interval=config.consolidation.training_temp_check_interval,
-        quiet_hours_mode=config.consolidation.quiet_hours_mode,
-        quiet_hours_start=config.consolidation.quiet_hours_start,
-        quiet_hours_end=config.consolidation.quiet_hours_end,
+        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
     )
     _state["background_trainer"] = bt
 
@@ -6128,11 +6123,7 @@ def _run_full_consolidation_sync() -> None:
         tokenizer=_state["tokenizer"],
         training_config=config.training_config,
         output_dir=config.adapter_dir,
-        temp_limit=config.consolidation.training_temp_limit,
-        temp_check_interval=config.consolidation.training_temp_check_interval,
-        quiet_hours_mode=config.consolidation.quiet_hours_mode,
-        quiet_hours_start=config.consolidation.quiet_hours_start,
-        quiet_hours_end=config.consolidation.quiet_hours_end,
+        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
     )
     _state["background_trainer"] = bt
 
@@ -6301,11 +6292,7 @@ def _run_active_store_migration_sync() -> None:
         tokenizer=_state["tokenizer"],
         training_config=config.training_config,
         output_dir=config.adapter_dir,
-        temp_limit=config.consolidation.training_temp_limit,
-        temp_check_interval=config.consolidation.training_temp_check_interval,
-        quiet_hours_mode=config.consolidation.quiet_hours_mode,
-        quiet_hours_start=config.consolidation.quiet_hours_start,
-        quiet_hours_end=config.consolidation.quiet_hours_end,
+        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
     )
     _state["background_trainer"] = bt
 

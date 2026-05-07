@@ -11,24 +11,13 @@ import hashlib
 import json
 import logging
 import queue
-import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from transformers import (
-    Trainer,
-    TrainerCallback,
-    TrainingArguments,
-    default_data_collator,
-)
-
-from paramem.training.encrypted_checkpoint_callback import (
-    EncryptCheckpointCallback as _EncryptCheckpointCallback,
-)
 from paramem.training.indexed_memory import format_indexed_training
 
 # Re-exported for ``paramem/server/app.py`` (/status endpoint) which imports
@@ -36,8 +25,13 @@ from paramem.training.indexed_memory import format_indexed_training
 # canonical home is now ``paramem.training.thermal_throttle``; the shim keeps
 # the existing import path working.
 from paramem.training.thermal_throttle import (
+    ThermalPolicy,
+    _gpu_temp,
+)
+from paramem.training.thermal_throttle import (
     is_thermal_policy_active as is_thermal_policy_active,
 )
+from paramem.training.trainer import TrainingHooks, train_adapter
 from paramem.utils.config import AdapterConfig, TrainingConfig
 
 logger = logging.getLogger(__name__)
@@ -177,22 +171,6 @@ def _read_resume_state(state_path: Path) -> dict | None:
         return None
 
 
-def _gpu_temp() -> int | None:
-    """Read current GPU temperature via nvidia-smi. Returns None on failure."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
-    except Exception:
-        pass
-    return None
-
-
 @dataclass
 class TrainingJob:
     """A single adapter training job.
@@ -220,57 +198,6 @@ class TrainingJob:
     inference_fallback_adapter: str = "episodic"
 
 
-class _PauseForInferenceCallback(TrainerCallback):
-    """Yields to inference between training steps.
-
-    Releases the GPU lock while paused so STT/TTS/inference can proceed,
-    then re-acquires before resuming training. Uses a bounded wait to
-    prevent permanent stalls if the inference caller crashes.
-    """
-
-    _INFERENCE_TIMEOUT = 120.0  # max seconds to wait for inference to finish
-
-    def __init__(self, trainer_ref: "BackgroundTrainer"):
-        self._trainer = trainer_ref
-
-    def on_step_end(self, args, state, control, **kwargs):
-        # Yield to inference if requested
-        if self._trainer._inference_requested.is_set():
-            from paramem.models.loader import switch_adapter
-            from paramem.server.gpu_lock import acquire_gpu, release_gpu
-
-            logger.debug("Training paused for inference at step %d", state.global_step)
-            release_gpu()
-            self._trainer._training_paused.set()
-            signalled = self._trainer._inference_done.wait(timeout=self._INFERENCE_TIMEOUT)
-            if not signalled:
-                logger.warning(
-                    "Inference did not signal done within %.0fs — resuming training",
-                    self._INFERENCE_TIMEOUT,
-                )
-            self._trainer._inference_done.clear()
-            acquire_gpu()
-            # Restore staging adapter as active — inference may have switched
-            # to a production adapter. Training must resume on in_training.
-            switch_adapter(self._trainer.model, "in_training")
-            self._trainer._training_paused.clear()
-            logger.debug("Training resumed at step %d (adapter=in_training)", state.global_step)
-
-        # Thermal throttle — check every N steps
-        self._trainer._thermal_throttle(state.global_step)
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        epoch = int(state.epoch)
-        self._trainer._last_completed_epoch = epoch
-        # Persist resume state so a crash during a later epoch can restart here.
-        self._trainer._write_resume_state(epoch, args.output_dir)
-        # Also check thermal throttle at epoch boundaries
-        self._trainer._thermal_throttle(state.global_step)
-        if self._trainer._shutdown_requested:
-            logger.info("Shutdown requested — stopping after epoch %d", epoch)
-            control.should_training_stop = True
-
-
 class BackgroundTrainer:
     """Manages background training that yields to inference.
 
@@ -289,27 +216,30 @@ class BackgroundTrainer:
         bt.stop()        # graceful stop at next epoch boundary
     """
 
+    # Max seconds the training thread waits for an inference caller to signal
+    # done before resuming.  Bound prevents a permanent stall when the caller
+    # crashes between ``pause()`` and ``resume()``.
+    _INFERENCE_TIMEOUT = 120.0
+
     def __init__(
         self,
         model,
         tokenizer,
         training_config: TrainingConfig,
         output_dir: str | Path = "data/ha/adapters",
-        temp_limit: int = 0,
-        temp_check_interval: int = 5,
-        quiet_hours_mode: str = "always_on",
-        quiet_hours_start: str = "22:00",
-        quiet_hours_end: str = "07:00",
+        thermal_policy: ThermalPolicy | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.training_config = training_config
         self.output_dir = Path(output_dir)
-        self._temp_limit = temp_limit  # 0 = disabled
-        self._temp_check_interval = temp_check_interval
-        self._quiet_hours_mode = quiet_hours_mode
-        self._quiet_hours_start = quiet_hours_start
-        self._quiet_hours_end = quiet_hours_end
+        # ``thermal_policy`` is the single source of truth for the thermal
+        # throttle.  ``None`` (the default for callers without a positive
+        # ``training_temp_limit``) means no throttle install at the
+        # ``train_adapter`` call site below — experiments and tests that
+        # don't override the default get fast unthrottled runs by
+        # construction.  Live-server only when a non-zero limit is set.
+        self._thermal_policy = thermal_policy
 
         self._inference_requested = threading.Event()
         self._inference_done = threading.Event()
@@ -622,8 +552,8 @@ class BackgroundTrainer:
         Used by ``consolidate_interim_adapters`` to mark non-training phases
         (between per-tier ``_train_adapter`` calls; the entire finalize block)
         so ``pause()`` short-circuits and inference waits on the GPU lock alone
-        instead of timing out on the never-firing
-        ``_PauseForInferenceCallback``.
+        instead of timing out on the never-firing inference-yield hook
+        installed by ``train_adapter`` via ``TrainingHooks``.
 
         No locking is needed: the writer (this method, called from inside the
         callable that holds the GPU lock) and the reader (``pause()``'s
@@ -723,71 +653,50 @@ class BackgroundTrainer:
         except Exception:
             logger.exception("Failed to remove resume state file")
 
-    def _should_throttle_now(self, now: datetime | None = None) -> bool:
-        """Whether the thermal throttle is active right now under the quiet-hours policy.
+    def _yield_to_inference(self, global_step: int) -> None:
+        """Pause training while an inference request is being served.
 
-        Thin wrapper around ``is_thermal_policy_active`` that reads the fields
-        the trainer was constructed with. See that helper for mode semantics.
+        Wired into ``train_adapter`` via ``TrainingHooks.on_step_yield`` —
+        invoked at every step boundary, BEFORE the thermal throttle runs at
+        the same step (callback ordering locked in
+        ``paramem/training/trainer.py``).  When an inference request arrives,
+        releases the GPU lock so STT/TTS/inference can proceed, waits a
+        bounded period for the caller to signal done, re-acquires the lock,
+        and restores the ``in_training`` adapter (inference may have
+        switched away).
         """
-        return is_thermal_policy_active(
-            self._quiet_hours_mode,
-            self._quiet_hours_start,
-            self._quiet_hours_end,
-            now,
-        )
-
-    def _thermal_throttle(self, global_step: int):
-        """Pause training if GPU temperature exceeds the configured limit.
-
-        Keeps the machine quiet during background training — fans stay off
-        when GPU temp stays below the ramp-up threshold. Training pauses
-        until the GPU cools back down, then resumes automatically.
-
-        Controlled by ``training_temp_limit`` (0 = disabled) and gated by
-        the quiet-hours policy: outside quiet hours the throttle is a no-op
-        even at hot temperatures, letting training run unthrottled when
-        nobody is listening to fan noise.
-        """
-        if self._temp_limit <= 0:
-            return
-        if global_step % self._temp_check_interval != 0:
-            return
-        if not self._should_throttle_now():
+        if not self._inference_requested.is_set():
             return
 
-        temp = _gpu_temp()
-        if temp is None or temp <= self._temp_limit:
-            return
-
+        from paramem.models.loader import switch_adapter
         from paramem.server.gpu_lock import acquire_gpu, release_gpu
 
-        logger.info(
-            "Thermal throttle: GPU at %d°C (limit %d°C) — releasing GPU at step %d",
-            temp,
-            self._temp_limit,
-            global_step,
-        )
+        logger.debug("Training paused for inference at step %d", global_step)
         release_gpu()
-
-        while temp is not None and temp > self._temp_limit:
-            if self._shutdown_requested:
-                acquire_gpu()
-                return
-            # Quiet-hours window may end mid-wait (e.g. 07:00 arrives) — in
-            # that case we no longer care about fan noise and resume even if
-            # still hot.
-            if not self._should_throttle_now():
-                logger.info(
-                    "Thermal throttle: quiet-hours window ended at %d°C — resuming",
-                    temp,
-                )
-                acquire_gpu()
-                return
-            time.sleep(5)
-            temp = _gpu_temp()
-
+        self._training_paused.set()
+        signalled = self._inference_done.wait(timeout=self._INFERENCE_TIMEOUT)
+        if not signalled:
+            logger.warning(
+                "Inference did not signal done within %.0fs — resuming training",
+                self._INFERENCE_TIMEOUT,
+            )
+        self._inference_done.clear()
         acquire_gpu()
-        logger.info("Thermal throttle: GPU cooled to %d°C — resuming training", temp)
+        # Restore staging adapter as active — inference may have switched
+        # to a production adapter. Training must resume on in_training.
+        switch_adapter(self.model, "in_training")
+        self._training_paused.clear()
+        logger.debug("Training resumed at step %d (adapter=in_training)", global_step)
+
+    def _persist_resume_state(self, epoch: int, output_dir: str) -> None:
+        """Write the resume_state.json marker for crash-safe recovery.
+
+        Wired into ``train_adapter`` via ``TrainingHooks.on_epoch_persist``.
+        Updates the in-memory ``_last_completed_epoch`` book-keeping the
+        ``/status`` endpoint exposes, then writes the on-disk marker.
+        """
+        self._last_completed_epoch = epoch
+        self._write_resume_state(epoch, output_dir)
 
     def _run_jobs(
         self,
@@ -835,7 +744,7 @@ class BackgroundTrainer:
 
     def _cooldown_between_jobs(self):
         """Wait for GPU to cool between training jobs."""
-        threshold = self._temp_limit if self._temp_limit > 0 else 52
+        threshold = self._thermal_policy.temp_limit if self._thermal_policy is not None else 52
         temp = _gpu_temp()
         if temp is None:
             logger.warning("Could not check GPU temperature — skipping cooldown")
@@ -962,44 +871,22 @@ class BackgroundTrainer:
         # Staging checkpoints go under in_training/ to avoid polluting production
         checkpoint_dir = self.output_dir / "in_training" / "bg_checkpoint"
 
-        training_args = TrainingArguments(
-            output_dir=str(checkpoint_dir),
-            num_train_epochs=self.training_config.num_epochs,
-            per_device_train_batch_size=self.training_config.batch_size,
-            gradient_accumulation_steps=self.training_config.gradient_accumulation_steps,
-            learning_rate=job.adapter_config.learning_rate,
-            warmup_steps=self.training_config.warmup_steps
-            if self.training_config.warmup_steps > 0
-            else 0,
-            warmup_ratio=self.training_config.warmup_ratio
-            if self.training_config.warmup_steps == 0
-            else 0.0,
-            lr_scheduler_type=self.training_config.lr_scheduler_type,
-            weight_decay=self.training_config.weight_decay,
-            max_grad_norm=self.training_config.max_grad_norm,
-            gradient_checkpointing=self.training_config.gradient_checkpointing,
-            logging_steps=10,
-            save_strategy="epoch",
-            save_total_limit=2,
-            report_to="none",
-            run_name=f"bg-{job.adapter_name}",
-            seed=self.training_config.seed,
-            bf16=True,
-            remove_unused_columns=False,
-            dataloader_pin_memory=False,
-        )
-
-        if self.training_config.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-
-        trainer = Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=dataset,
-            data_collator=default_data_collator,
-            callbacks=[_PauseForInferenceCallback(self), _EncryptCheckpointCallback()],
+        # Delegate the inner training step to the unified ``train_adapter``.
+        # BG-specific concerns (inference yielding, resume-state persistence,
+        # graceful shutdown) flow through ``TrainingHooks``.  Thermal throttle
+        # installs only when ``self._thermal_policy is not None`` (= live
+        # server with positive ``training_temp_limit``).  /dev/shm
+        # encrypted-checkpoint materialization happens inside ``train_adapter``;
+        # no duplicate /dev/shm handling here.
+        #
+        # ``logging_steps=10`` preserves the BG-side log volume that predates
+        # the unification — the canonical default on ``TrainingConfig`` is 1
+        # (matches the historical ``train_adapter`` hardcode).
+        bg_training_config = replace(self.training_config, logging_steps=10)
+        hooks = TrainingHooks(
+            on_step_yield=self._yield_to_inference,
+            on_epoch_persist=self._persist_resume_state,
+            on_shutdown_check=lambda: self._shutdown_requested,
         )
 
         logger.info(
@@ -1010,30 +897,27 @@ class BackgroundTrainer:
             f" (resume from epoch {self._last_completed_epoch})" if resume_checkpoint else "",
         )
 
-        # Materialize an encrypted on-disk checkpoint to a /dev/shm tempdir
-        # so HF's resume loader sees plaintext files. No-op when the
-        # checkpoint is already plaintext (Security OFF or never-encrypted).
-        shm_resume_dir: Path | None = None
-        effective_resume = resume_checkpoint
-        if resume_checkpoint is not None:
-            from paramem.backup import key_store as _ks
-            from paramem.backup.checkpoint_shard import materialize_checkpoint_to_shm
-
-            if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-                shm_resume_dir = materialize_checkpoint_to_shm(Path(resume_checkpoint))
-                effective_resume = str(shm_resume_dir)
-                logger.info(
-                    "Materialized encrypted checkpoint %s → %s for HF Trainer load",
-                    resume_checkpoint,
-                    shm_resume_dir,
-                )
-
         try:
-            trainer.train(resume_from_checkpoint=effective_resume)
+            train_adapter(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                train_dataset=dataset,
+                adapter_name="in_training",
+                training_config=bg_training_config,
+                adapter_config=job.adapter_config,
+                wandb_config=None,
+                output_dir=checkpoint_dir,
+                run_name=f"bg-{job.adapter_name}",
+                resume_from_checkpoint=resume_checkpoint,
+                thermal_policy=self._thermal_policy,
+                hooks=hooks,
+            )
         except Exception:
             # On training failure: leave resume state and checkpoint intact
             # so the next restart picks up from the last completed epoch.
-            # Restore sane model state so inference isn't broken.
+            # Restore sane model state so inference isn't broken — this is
+            # BG-specific (production adapter must be re-activated; staging
+            # leaves the model in ``in_training``).
             logger.exception("Training failed for adapter %s — restoring state", job.adapter_name)
             try:
                 switch_adapter(self.model, job.adapter_name)
@@ -1043,9 +927,6 @@ class BackgroundTrainer:
             except Exception:
                 logger.exception("Failed to restore model state after training error")
             raise
-        finally:
-            if shm_resume_dir is not None:
-                shutil.rmtree(shm_resume_dir, ignore_errors=True)
 
         # Commit to production first, then clean up resume artefacts.
         self._commit_staging_to_production(job.adapter_name)

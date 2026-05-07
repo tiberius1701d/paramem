@@ -155,96 +155,13 @@ class TestDevicePlacement:
         _verify_device_placement(model, config)
 
 
-class TestThermalThrottle:
-    def test_throttle_disabled_when_zero(self):
-        """No throttle calls when temp_limit is 0."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=0,
-        )
-        # Should return immediately without calling _gpu_temp
-        with patch("paramem.server.background_trainer._gpu_temp") as mock_temp:
-            bt._thermal_throttle(10)
-            mock_temp.assert_not_called()
-
-    def test_throttle_skips_non_interval_steps(self):
-        """Only checks temp at interval boundaries."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=55,
-            temp_check_interval=5,
-        )
-        with patch("paramem.server.background_trainer._gpu_temp", return_value=40) as mock_temp:
-            bt._thermal_throttle(3)  # not a multiple of 5
-            mock_temp.assert_not_called()
-
-            bt._thermal_throttle(5)  # multiple of 5
-            mock_temp.assert_called_once()
-
-    def test_throttle_no_pause_below_limit(self):
-        """No pause when temp is below limit."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=55,
-            temp_check_interval=5,
-        )
-        with patch("paramem.server.background_trainer._gpu_temp", return_value=50):
-            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
-                bt._thermal_throttle(5)
-                mock_release.assert_not_called()
-
-    def test_throttle_pauses_above_limit(self):
-        """Releases GPU lock and waits when temp exceeds limit."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=55,
-            temp_check_interval=5,
-        )
-        # First call: 60°C (above limit), second call: 50°C (below limit)
-        temps = iter([60, 50])
-        with patch("paramem.server.background_trainer._gpu_temp", side_effect=temps):
-            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
-                with patch("paramem.server.gpu_lock.acquire_gpu") as mock_acquire:
-                    with patch("time.sleep"):
-                        bt._thermal_throttle(5)
-                        mock_release.assert_called_once()
-                        mock_acquire.assert_called_once()
-
-    def test_throttle_respects_shutdown(self):
-        """Exits throttle loop on shutdown request."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=55,
-            temp_check_interval=5,
-        )
-        bt._shutdown_requested = True
-        # Temp stays above limit but shutdown should break the loop
-        with patch("paramem.server.background_trainer._gpu_temp", return_value=70):
-            with patch("paramem.server.gpu_lock.release_gpu"):
-                with patch("paramem.server.gpu_lock.acquire_gpu") as mock_acquire:
-                    bt._thermal_throttle(5)
-                    # Should still re-acquire before returning
-                    mock_acquire.assert_called_once()
+# TestThermalThrottle (BackgroundTrainer._thermal_throttle method) was removed
+# 2026-05-07.  After the BG trainer was refactored to delegate to
+# paramem.training.trainer.train_adapter, the throttle body lives in
+# ThermalThrottleCallback (paramem/training/thermal_throttle.py) and is
+# exercised by tests/training/test_thermal_throttle.py.
+# Quiet-hours predicate tests below remain — is_thermal_policy_active is still
+# importable from background_trainer via a re-export shim.
 
 
 class TestQuietHoursPolicy:
@@ -315,77 +232,12 @@ class TestQuietHoursPolicy:
         assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(12, 0)) is True
         assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(3, 0)) is True
 
-    # --- Integration with the throttle ---
-
-    def test_throttle_skipped_when_policy_inactive(self):
-        """always_off makes _thermal_throttle a no-op even at scalding temps."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=55,
-            temp_check_interval=5,
-            quiet_hours_mode="always_off",
-        )
-        with patch("paramem.server.background_trainer._gpu_temp", return_value=80) as mock_temp:
-            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
-                bt._thermal_throttle(5)
-                # Gate short-circuits before the temperature probe runs.
-                mock_temp.assert_not_called()
-                mock_release.assert_not_called()
-
-    def test_throttle_runs_in_auto_mode_inside_window(self):
-        """auto mode with a current-time in window behaves like always_on."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=55,
-            temp_check_interval=5,
-            quiet_hours_mode="auto",
-            quiet_hours_start="00:00",
-            quiet_hours_end="23:59",  # effectively always in window
-        )
-        temps = iter([70, 40])
-        with patch("paramem.server.background_trainer._gpu_temp", side_effect=temps):
-            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
-                with patch("paramem.server.gpu_lock.acquire_gpu") as mock_acquire:
-                    with patch("time.sleep"):
-                        bt._thermal_throttle(5)
-                        mock_release.assert_called_once()
-                        mock_acquire.assert_called_once()
-
-    def test_sleep_loop_exits_early_when_window_ends(self):
-        """If quiet-hours ends while we're waiting for cooldown, resume even if still hot."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-            temp_limit=55,
-            temp_check_interval=5,
-            quiet_hours_mode="auto",
-            quiet_hours_start="00:00",
-            quiet_hours_end="23:59",
-        )
-        # First _should_throttle_now call (gate at entry) → True, triggers throttle.
-        # Second call (entry of sleep loop) → False, breaks out.
-        gate_answers = iter([True, False])
-        with patch("paramem.server.background_trainer._gpu_temp", return_value=70):
-            with patch("paramem.server.gpu_lock.release_gpu") as mock_release:
-                with patch("paramem.server.gpu_lock.acquire_gpu") as mock_acquire:
-                    with patch.object(
-                        bt, "_should_throttle_now", side_effect=lambda: next(gate_answers)
-                    ):
-                        bt._thermal_throttle(5)
-                        mock_release.assert_called_once()
-                        # Re-acquires even though temp never dropped below limit.
-                        mock_acquire.assert_called_once()
+    # --- Throttle-with-policy integration tests removed 2026-05-07 ---
+    # The throttle body lives in ThermalThrottleCallback after the BG trainer
+    # refactor; equivalent tests are in
+    # tests/training/test_thermal_throttle.py::TestThermalThrottleCallbackBehaviour
+    # (skips_when_window_inactive, releases_and_reacquires_when_hot,
+    # shutdown_fn_breaks_wait_loop, etc.).
 
     # --- Config validator ---
 
