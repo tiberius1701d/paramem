@@ -64,6 +64,11 @@ class TrainingConfig:
     seed: int = 42
     save_strategy: str = "epoch"
     save_total_limit: int = 2
+    # HF Trainer logging cadence. Default 1 matches train_adapter's prior
+    # hardcode. The BG-trainer call site overrides via dataclasses.replace
+    # to keep its historical log volume (10 steps) when delegating to
+    # train_adapter; other callers inherit the verbose default.
+    logging_steps: int = 1
     early_stopping: bool = False
     early_stopping_threshold: float = 0.01
     early_stopping_floor: int = 10

@@ -2,8 +2,9 @@
 
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from peft import PeftModel
 from transformers import (
@@ -14,9 +15,63 @@ from transformers import (
     default_data_collator,
 )
 
+from paramem.training.thermal_throttle import ThermalPolicy, ThermalThrottleCallback
 from paramem.utils.config import AdapterConfig, TrainingConfig, WandbConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TrainingHooks:
+    """Caller-supplied behaviour that ``train_adapter`` cannot derive from config.
+
+    The callable fields are converted internally into a single HF
+    ``TrainerCallback`` (``_HooksAdapterCallback``) that runs BEFORE the
+    thermal throttle in the registered callback list, so inference yielding
+    pre-empts throttle waits within the same step.
+
+    All three fields default to ``None`` — callers pass only the intents
+    they need:
+
+    - ``on_step_yield(global_step)``: invoked at every step boundary, used by
+      ``BackgroundTrainer`` to yield to inference requests.
+    - ``on_epoch_persist(epoch, output_dir)``: invoked at every epoch end,
+      used by ``BackgroundTrainer`` to write ``resume_state.json``.
+    - ``on_shutdown_check()``: invoked at every epoch end; returning ``True``
+      sets ``control.should_training_stop``. Replaces ad-hoc
+      ``GracefulShutdownCallback`` instantiation at the call site.
+    """
+
+    on_step_yield: Optional[Callable[[int], None]] = None
+    on_epoch_persist: Optional[Callable[[int, str], None]] = None
+    on_shutdown_check: Optional[Callable[[], bool]] = None
+
+
+class _HooksAdapterCallback(TrainerCallback):
+    """Routes ``TrainingHooks`` intents to HF callback events.
+
+    Registered before ``ThermalThrottleCallback`` so that inference yielding
+    (``on_step_yield``) runs before any potential throttle wait at the same
+    step. Resume-state persistence (``on_epoch_persist``) and shutdown checks
+    (``on_shutdown_check``) fire at epoch boundaries.
+    """
+
+    def __init__(self, hooks: TrainingHooks):
+        self._hooks = hooks
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._hooks.on_step_yield is not None:
+            self._hooks.on_step_yield(state.global_step)
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if self._hooks.on_epoch_persist is not None:
+            self._hooks.on_epoch_persist(int(state.epoch), args.output_dir)
+        if self._hooks.on_shutdown_check is not None and self._hooks.on_shutdown_check():
+            logger.info(
+                "Graceful shutdown requested via TrainingHooks — stopping after epoch %d",
+                int(state.epoch),
+            )
+            control.should_training_stop = True
 
 
 class LossEarlyStoppingCallback(TrainerCallback):
@@ -138,6 +193,8 @@ def train_adapter(
     callbacks_extra: Optional[list] = None,
     active_adapters: Optional[list[str]] = None,
     resume_from_checkpoint: Optional[str | Path] = None,
+    thermal_policy: Optional[ThermalPolicy] = None,
+    hooks: Optional[TrainingHooks] = None,
 ) -> dict:
     """Train a LoRA adapter on the given dataset.
 
@@ -154,6 +211,16 @@ def train_adapter(
             Mirrors the semantics of
             ``paramem.server.background_trainer.BackgroundTrainer._train_adapter``
             which already uses ``trainer.train(resume_from_checkpoint=...)``.
+        thermal_policy: When set, installs a ``ThermalThrottleCallback`` that
+            pauses training when GPU temperature exceeds the policy limit
+            during the configured quiet-hours window. Default ``None`` skips
+            the install — experiments and tests get fast unthrottled runs by
+            construction; only callers wired to ``ConsolidationConfig`` with
+            a positive ``training_temp_limit`` opt in.
+        hooks: When set, wraps caller intents (inference yielding,
+            resume-state persistence, shutdown predicate) into a single HF
+            callback that runs before the thermal throttle so yielding
+            pre-empts throttle waits.
 
     Returns:
         Training metrics dict (same as before; ``resume_from_checkpoint`` does
@@ -201,7 +268,7 @@ def train_adapter(
         weight_decay=training_config.weight_decay,
         max_grad_norm=training_config.max_grad_norm,
         gradient_checkpointing=training_config.gradient_checkpointing,
-        logging_steps=1,
+        logging_steps=training_config.logging_steps,
         save_strategy=training_config.save_strategy,
         save_total_limit=training_config.save_total_limit,
         report_to=report_to,
@@ -226,6 +293,11 @@ def train_adapter(
     # rest) fires and refuses startup.  No-op when Security is OFF.  Same
     # callback :class:`BackgroundTrainer` already uses for its own HF
     # Trainer; sharing it keeps both code paths posture-consistent.
+    # Callback assembly order is load-bearing (HF iterates registrations in
+    # order at every event). _HooksAdapterCallback must run BEFORE
+    # ThermalThrottleCallback so on_step_yield (inference yielding) pre-empts
+    # throttle waits within the same step. callbacks_extra (call-bound, e.g.
+    # recall probe) trail.
     callbacks: list = [EncryptCheckpointCallback()]
     if training_config.early_stopping:
         callbacks.append(
@@ -235,6 +307,18 @@ def train_adapter(
                 patience=training_config.early_stopping_patience,
             )
         )
+    if hooks is not None:
+        callbacks.append(_HooksAdapterCallback(hooks))
+    if thermal_policy is not None:
+        # When hooks expose a shutdown predicate, route it into the throttle
+        # so a mid-wait shutdown breaks the loop cleanly. Otherwise the
+        # throttle's default constant-False shutdown_fn applies.
+        shutdown_fn = (
+            hooks.on_shutdown_check
+            if hooks is not None and hooks.on_shutdown_check is not None
+            else (lambda: False)
+        )
+        callbacks.append(ThermalThrottleCallback(thermal_policy, shutdown_fn=shutdown_fn))
     if callbacks_extra:
         callbacks.extend(callbacks_extra)
 
