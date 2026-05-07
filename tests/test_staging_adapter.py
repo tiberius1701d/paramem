@@ -744,19 +744,18 @@ class TestMultiJobSequencing:
             lambda *a, **k: [{"input_ids": [0], "labels": [0]}],
         )
 
-        # Replace Trainer and TrainingArguments — TrainingArguments validates bf16/GPU
-        # at construction time, which fails on CPU-only CI runners.
-        class FakeTrainer:
-            def __init__(self, **kwargs):
-                pass
+        # BG trainer's _train_adapter now delegates to paramem.training.trainer.
+        # train_adapter (Commit 2 refactor, 2026-05-07).  Mock the delegate at
+        # BG's import site so the train call is recorded without constructing
+        # an HF Trainer or TrainingArguments — the latter validates bf16/GPU at
+        # init and fails on CPU-only CI runners.
+        def _fake_train_adapter(**kwargs):
+            calls.append(("train",))
+            return {"train_loss": 0.0}
 
-            def train(self, resume_from_checkpoint=None):
-                calls.append(("train",))
-
-        monkeypatch.setattr("paramem.server.background_trainer.Trainer", FakeTrainer)
         monkeypatch.setattr(
-            "paramem.server.background_trainer.TrainingArguments",
-            lambda **kwargs: MagicMock(),
+            "paramem.server.background_trainer.train_adapter",
+            _fake_train_adapter,
         )
 
         # in_training config carries concrete shape so _ensure_staging_shape_matches
@@ -766,17 +765,23 @@ class TestMultiJobSequencing:
         in_training_cfg = MagicMock(target_modules=list(attn_only), r=8)
         model.peft_config = {"episodic": MagicMock(), "in_training": in_training_cfg}
 
-        training_config = MagicMock()
-        training_config.gradient_checkpointing = False
-        training_config.num_epochs = 1
-        training_config.batch_size = 1
-        training_config.gradient_accumulation_steps = 1
-        training_config.warmup_steps = 0
-        training_config.warmup_ratio = 0.1
-        training_config.lr_scheduler_type = "linear"
-        training_config.weight_decay = 0.01
-        training_config.max_grad_norm = 1.0
-        training_config.seed = 42
+        # Real TrainingConfig instance — BG path calls dataclasses.replace
+        # on it (Commit 2 refactor) to override logging_steps before delegating
+        # to train_adapter, which requires a genuine dataclass.
+        from paramem.utils.config import TrainingConfig
+
+        training_config = TrainingConfig(
+            gradient_checkpointing=False,
+            num_epochs=1,
+            batch_size=1,
+            gradient_accumulation_steps=1,
+            warmup_steps=0,
+            warmup_ratio=0.1,
+            lr_scheduler_type="linear",
+            weight_decay=0.01,
+            max_grad_norm=1.0,
+            seed=42,
+        )
 
         bt = BackgroundTrainer(
             model=model,

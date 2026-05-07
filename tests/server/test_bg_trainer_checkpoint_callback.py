@@ -1,4 +1,5 @@
-"""Unit tests for ``_EncryptCheckpointCallback`` in ``background_trainer``.
+"""Unit tests for ``EncryptCheckpointCallback`` (used by both the BG trainer
+path and the unified ``train_adapter`` path).
 
 The callback is driven by HF Trainer hooks — we don't instantiate a real
 Trainer here. Instead we stub the small arg / state surface the callback
@@ -6,6 +7,13 @@ actually reads.
 
 Security ON is triggered by a loadable daily age identity
 (``PARAMEM_DAILY_PASSPHRASE`` set + daily key file on disk).
+
+Pre-2026-05-07 the callback was re-exported from
+``paramem.server.background_trainer`` under the ``EncryptCheckpointCallback``
+alias.  After the BG-trainer-delegates-to-train_adapter refactor the callback
+lives at its canonical home in
+``paramem.training.encrypted_checkpoint_callback`` and is installed by
+``train_adapter`` directly.
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ from paramem.backup.key_store import (
     wrap_daily_identity,
     write_daily_key_file,
 )
-from paramem.server.background_trainer import _EncryptCheckpointCallback
+from paramem.training.encrypted_checkpoint_callback import EncryptCheckpointCallback
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +84,7 @@ class TestEncryptCheckpointCallbackOnSave:
         """on_save walks checkpoint-* subdirs and encrypts every plaintext file."""
         ckpt1, ckpt2 = _seed_two_checkpoints(tmp_path)
         args = SimpleNamespace(output_dir=str(tmp_path), load_best_model_at_end=False)
-        cb = _EncryptCheckpointCallback()
+        cb = EncryptCheckpointCallback()
 
         _setup_daily_identity(tmp_path, monkeypatch)
         cb.on_save(args, state=None, control=None)
@@ -97,7 +105,7 @@ class TestEncryptCheckpointCallbackOnSave:
             tmp_path / "absent_daily_key.age",
         )
 
-        _EncryptCheckpointCallback().on_save(args, state=None, control=None)
+        EncryptCheckpointCallback().on_save(args, state=None, control=None)
 
         assert (ckpt1 / "adapter_model.safetensors").read_bytes() == b"weights-1"
         assert not is_age_envelope(ckpt1 / "adapter_model.safetensors")
@@ -122,7 +130,7 @@ class TestEncryptCheckpointCallbackOnSave:
             "paramem.backup.checkpoint_shard.encrypt_checkpoint_dir",
             side_effect=OSError("disk full"),
         ):
-            _EncryptCheckpointCallback().on_save(args, state=None, control=None)
+            EncryptCheckpointCallback().on_save(args, state=None, control=None)
 
         log_text = capfd.readouterr().err + "\n".join(r.getMessage() for r in caplog.records)
         assert "Failed to encrypt checkpoint files" in log_text
@@ -139,7 +147,7 @@ class TestEncryptCheckpointCallbackOnSave:
 
         args = SimpleNamespace(output_dir=str(tmp_path), load_best_model_at_end=False)
         _setup_daily_identity(tmp_path, monkeypatch)
-        _EncryptCheckpointCallback().on_save(args, state=None, control=None)
+        EncryptCheckpointCallback().on_save(args, state=None, control=None)
 
         assert not is_age_envelope(sibling / "events.out")
         assert (sibling / "events.out").read_bytes() == b"tb-events"
@@ -154,7 +162,7 @@ class TestEncryptCheckpointCallbackOnTrainBegin:
 
         _setup_daily_identity(tmp_path, monkeypatch)
         with pytest.raises(RuntimeError, match="load_best_model_at_end"):
-            _EncryptCheckpointCallback().on_train_begin(args, state=None, control=None)
+            EncryptCheckpointCallback().on_train_begin(args, state=None, control=None)
 
     def test_allows_load_best_model_at_end_when_security_off(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -165,7 +173,7 @@ class TestEncryptCheckpointCallbackOnTrainBegin:
             "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT",
             tmp_path / "absent_daily_key.age",
         )
-        _EncryptCheckpointCallback().on_train_begin(args, state=None, control=None)
+        EncryptCheckpointCallback().on_train_begin(args, state=None, control=None)
 
     def test_allows_default_without_daily_identity(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -173,4 +181,4 @@ class TestEncryptCheckpointCallbackOnTrainBegin:
         """Default args (load_best_model_at_end=False) never raise, even with daily loaded."""
         args = SimpleNamespace(output_dir=str(tmp_path), load_best_model_at_end=False)
         _setup_daily_identity(tmp_path, monkeypatch)
-        _EncryptCheckpointCallback().on_train_begin(args, state=None, control=None)
+        EncryptCheckpointCallback().on_train_begin(args, state=None, control=None)

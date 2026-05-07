@@ -3121,8 +3121,9 @@ class ConsolidationLoop:
         - The finalize block (registry rewrite → interim purge → router reload)
           runs as plain sequential statements — no training calls, no HF Trainer-
           driven routines.  Do not smuggle a training call into the finalize
-          section; the _PauseForInferenceCallback only fires at epoch/step
-          boundaries and would not protect non-training code paths.
+          section; the inference-yield hook installed by ``train_adapter`` only
+          fires at epoch/step boundaries and would not protect non-training
+          code paths.
 
         Steps:
         1. Verify the GPU lock is held (entry guard — leak-safe pattern).

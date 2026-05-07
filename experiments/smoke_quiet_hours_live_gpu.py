@@ -6,9 +6,9 @@ on real hardware. Uses GPU power.draw (via nvidia-smi) as the observable
 
 Design:
   Two back-to-back phases of sustained matmul load, each ~20s. Between
-  matmul steps the smoke inlines `BackgroundTrainer._thermal_throttle(step)`
-  at every step boundary (mirroring what the HF Trainer callback does
-  during real training). The workload runs on the same thread that
+  matmul steps the smoke inlines `ThermalThrottleCallback._maybe_throttle(step)`
+  at every step boundary (the same body the HF Trainer callback runs
+  during real training).  The workload runs on the same thread that
   invokes the throttle, so when the throttle sleeps the matmul pauses
   too — and GPU power falls to idle. Between phases we cool down so
   phase B doesn't inherit phase A's thermal state.
@@ -45,7 +45,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -56,8 +55,11 @@ import torch  # noqa: E402
 
 from experiments.utils.gpu_guard import acquire_gpu as reserve_gpu  # noqa: E402
 from experiments.utils.test_harness import setup_logging  # noqa: E402
-from paramem.server.background_trainer import BackgroundTrainer  # noqa: E402
 from paramem.server.gpu_lock import acquire_gpu, release_gpu  # noqa: E402
+from paramem.training.thermal_throttle import (  # noqa: E402
+    ThermalPolicy,
+    ThermalThrottleCallback,
+)
 
 setup_logging()
 logger = logging.getLogger("smoke_quiet_hours_live_gpu")
@@ -129,14 +131,15 @@ def _run_phase(label: str, mode: str) -> list[float]:
 
     Returns the list of power.draw samples captured during this phase.
     """
-    bt = BackgroundTrainer(
-        model=MagicMock(),
-        tokenizer=MagicMock(),
-        training_config=MagicMock(),
+    policy = ThermalPolicy(
         temp_limit=TEMP_LIMIT,
-        temp_check_interval=THROTTLE_CHECK_EVERY,
+        check_interval=THROTTLE_CHECK_EVERY,
         quiet_hours_mode=mode,
+        # Window irrelevant under always_on / always_off; placeholders.
+        quiet_hours_start="22:00",
+        quiet_hours_end="07:00",
     )
+    throttle = ThermalThrottleCallback(policy)
 
     poller = _PowerPoller()
     poller.start()
@@ -162,7 +165,7 @@ def _run_phase(label: str, mode: str) -> list[float]:
             torch.cuda.synchronize()
             step += 1
             # Inline throttle — under always_on it will pause us when hot.
-            bt._thermal_throttle(step)
+            throttle._maybe_throttle(step)
     finally:
         release_gpu()
         poller.stop()
