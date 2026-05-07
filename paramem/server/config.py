@@ -704,20 +704,6 @@ class ConsolidationScheduleConfig:
     extraction_verify_anonymization: bool = True  # forward-path privacy guard
     extraction_ner_check: bool = False  # optional spaCy PII cross-check
     extraction_ner_model: str = "en_core_web_sm"  # spaCy model when ner_check=True
-    # Role-aware grounding gate for the extractor.  Closes the
-    # assistant-into-graph hallucination class: triples where the speaker
-    # is the subject must have their object's substantive tokens ground in
-    # the speaker's own [user] turns, not in [assistant] turns.
-    #   "off"        — role-blind grounding (today's behaviour, default).
-    #   "diagnostic" — production behaves as "off" but logs every triple
-    #                  the role-aware gate WOULD drop, in
-    #                  graph.diagnostics["role_aware_would_drop"].  Use
-    #                  to measure false-positive rate before activation.
-    #   "active"     — the role-aware gate drops triples that fail role
-    #                  checking.  Closes the cascade observed pre-2026-04-21
-    #                  ("How old am I?" → confabulated date → extracted →
-    #                  trained into adapter weights).
-    extraction_role_aware_grounding: str = "off"
     # Maximum number of concurrent interim adapters. Caps the rolling
     # episodic_interim_YYYYMMDDTHHMM adapters resident in VRAM at any one time.
     # Must be proven to fit by the startup VRAM validator before the server starts.
@@ -770,14 +756,6 @@ class ConsolidationScheduleConfig:
                 f"extraction_plausibility_stage='deanon' would send REAL NAMES to a "
                 f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
                 f"local judging."
-            )
-
-        # Role-aware grounding gate (provenance gate).
-        valid_modes = ("off", "diagnostic", "active")
-        if self.extraction_role_aware_grounding not in valid_modes:
-            raise ValueError(
-                f"extraction_role_aware_grounding={self.extraction_role_aware_grounding!r} "
-                f"must be one of {valid_modes}."
             )
 
         # Quiet-hours: reject unknown modes and malformed windows early.

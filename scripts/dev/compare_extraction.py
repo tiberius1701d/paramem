@@ -711,7 +711,6 @@ def _enrich_uniformly(
         "repair": "skipped",
         "enrich": "skipped",
         "plausibility": "skipped",
-        "grounding_gate": "skipped",
         "plausibility_judge": plausibility_judge,
         "plausibility_stage": plausibility_stage,
         "plausibility_judge_actual": None,
@@ -731,9 +730,6 @@ def _enrich_uniformly(
         result, even if SOTA enrichment was unsafe or failed.
         """
         from paramem.graph.extractor import (
-            _drop_ungrounded_facts as _gate,
-        )
-        from paramem.graph.extractor import (
             _strip_residual_placeholders as _sweep,
         )
 
@@ -745,21 +741,6 @@ def _enrich_uniformly(
         if sweep_dropped:
             status["residual_placeholders_dropped"] = len(sweep_dropped)
             status["residual_dropped_facts"] = sweep_dropped
-        # Privacy gate also applies in fallback: local extractors can
-        # hallucinate world-knowledge entities too (not exclusive to SOTA).
-        # `known_names=set()` is deliberate: the main path trusts
-        # `mapping.keys()` because the anonymizer is guaranteed to have only
-        # mapped names present in the transcript. In fallback there's no
-        # mapping to trust, and `extracted.entities` can itself contain
-        # hallucinations (e.g. Qwen's generic "Speaker"). Every entity must
-        # therefore be proven by transcript grounding alone.
-        raw_facts, fallback_ungrounded = _gate(raw_facts, transcript, set())
-        if fallback_ungrounded:
-            status["ungrounded_dropped_facts"] = fallback_ungrounded
-            status["grounding_gate"] = f"dropped_{len(fallback_ungrounded)}"
-            logger.warning("Fallback: dropped %d ungrounded fact(s).", len(fallback_ungrounded))
-        else:
-            status["grounding_gate"] = "ok"
         status["facts_pre_plausibility"] = list(raw_facts)
         if not raw_facts or plausibility_judge == "off":
             status["plausibility"] = "off" if plausibility_judge == "off" else "skipped"
@@ -810,7 +791,6 @@ def _enrich_uniformly(
     if not anon_facts:
         logger.info("Anonymization produced 0 facts — skipping pipeline")
         status["anonymize"] = "ok"
-        status["grounding_gate"] = "no_input"
         return (
             extracted.model_copy(update={"relations": [], "entities": []}),
             status,
@@ -883,7 +863,7 @@ def _enrich_uniformly(
                 status["anonymize"] = "leaked_repaired"
                 # Signal downstream to skip SOTA enrichment and plausibility
                 # on anon (both would expose the leaked real-name). Local
-                # plausibility + grounding gate still apply.
+                # plausibility still applies.
                 _skip_sota = True
         else:
             logger.warning(
@@ -900,7 +880,7 @@ def _enrich_uniformly(
     # Stage 2: SOTA enrichment. Returns (facts, updated_transcript, raw_response).
     # Skipped when the transcript carries a residual real-name leak we can't
     # scrub — sending it would violate privacy. Fall through to local
-    # plausibility + grounding gate on the leak-filtered anon_facts.
+    # plausibility on the leak-filtered anon_facts.
     if _skip_sota:
         enriched_anon, updated_anon_transcript, sota_raw = anon_facts, None, None
         status["enrich"] = "skipped_dirty_transcript"
@@ -1023,8 +1003,7 @@ def _enrich_uniformly(
         # Distinguish three empty states: (a) nothing to extract from the
         # start, (b) all SOTA-added facts were filtered pre-de-anon, (c)
         # residual-leak filter scrubbed everything. Each preserves its own
-        # upstream status; the gate didn't actually run in any case.
-        status["grounding_gate"] = "no_input"
+        # upstream status.
         return (
             extracted.model_copy(update={"relations": [], "entities": []}),
             status,
@@ -1045,26 +1024,6 @@ def _enrich_uniformly(
             "Dropped %d fact(s) with residual placeholder strings post-de-anon.",
             len(dropped_facts),
         )
-
-    # Final privacy gate: drop SOTA world-knowledge inferences by requiring
-    # every surviving fact endpoint to appear in the original transcript
-    # (or be a known real-name placeholder from the mapping).
-    from paramem.graph.extractor import _drop_ungrounded_facts
-
-    known_real_names = set(mapping.keys())
-    deanon_facts, ungrounded_facts = _drop_ungrounded_facts(
-        deanon_facts, transcript, known_real_names
-    )
-    if ungrounded_facts:
-        status["ungrounded_dropped_facts"] = ungrounded_facts
-        status["grounding_gate"] = f"dropped_{len(ungrounded_facts)}"
-        logger.warning(
-            "Dropped %d fact(s) ungrounded in the transcript (likely SOTA "
-            "world-knowledge inference).",
-            len(ungrounded_facts),
-        )
-    else:
-        status["grounding_gate"] = "ok"
 
     # If no plausibility runs (any reason — off, stage mismatch, empty), the
     # snapshot keys reflect the de-anonymized post-enrichment state.
@@ -1286,7 +1245,6 @@ def run_pass(
                 "anonymize": "skipped",
                 "enrich": "skipped",
                 "plausibility": "skipped",
-                "grounding_gate": "skipped",
                 "plausibility_judge": plausibility_judge,
                 "plausibility_stage": plausibility_stage,
                 "anonymization_verified": verify_anonymization,

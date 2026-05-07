@@ -92,7 +92,6 @@ class ExtractionConfig:
     plausibility_judge: str = "auto"
     plausibility_stage: str = "deanon"
     verify_anonymization: bool = True
-    role_aware_grounding: str = "off"
     pii_scope: set[str] | frozenset[str] | None = None
 
 
@@ -235,7 +234,6 @@ class ExtractionPipeline:
             plausibility_judge=pick("plausibility_judge", cfg.plausibility_judge),
             plausibility_stage=pick("plausibility_stage", cfg.plausibility_stage),
             verify_anonymization=pick("verify_anonymization", cfg.verify_anonymization),
-            role_aware_grounding=pick("role_aware_grounding", cfg.role_aware_grounding),
             pii_scope=pick("pii_scope", cfg.pii_scope),
             speaker_id=_require_speaker_id(overrides),
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),

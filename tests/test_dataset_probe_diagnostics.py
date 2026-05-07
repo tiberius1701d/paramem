@@ -1,8 +1,8 @@
 """Tests for _build_session_diagnostics in experiments/dataset_probe.py.
 
 Specifically targets the _as_count inner helper, which normalises drop-counter
-values that may be lists (residual_dropped_facts, ungrounded_dropped_facts) or
-ints (plausibility_dropped, etc.) or None.
+values that may be lists (residual_dropped_facts) or ints
+(plausibility_dropped, etc.) or None.
 
 Before _as_count was introduced, computing raw_fact_count via
 ``post_plausibility_count + sum(drops.values())`` raised:
@@ -121,14 +121,6 @@ class TestAsCountCoercesListToLength:
         diag = _call_diag(_make_session(), graph)
         assert diag["extraction"]["drops"]["residual_dropped_facts"] == 2
 
-    def test_ungrounded_dropped_facts_list_becomes_count(self):
-        """A list with three fact dicts in ungrounded_dropped_facts yields 3."""
-        graph = _make_graph(
-            {"ungrounded_dropped_facts": [{"text": "a"}, {"text": "b"}, {"text": "c"}]}
-        )
-        diag = _call_diag(_make_session(), graph)
-        assert diag["extraction"]["drops"]["ungrounded_dropped_facts"] == 3
-
     def test_int_valued_drop_passes_through_unchanged(self):
         """An integer drop counter (plausibility_dropped=3) stays 3."""
         graph = _make_graph({"plausibility_dropped": 3})
@@ -146,7 +138,6 @@ class TestAsCountCoercesListToLength:
         graph = _make_graph({})
         diag = _call_diag(_make_session(), graph)
         assert diag["extraction"]["drops"]["residual_dropped_facts"] == 0
-        assert diag["extraction"]["drops"]["ungrounded_dropped_facts"] == 0
         assert diag["extraction"]["drops"]["plausibility_dropped"] == 0
 
 
@@ -163,7 +154,6 @@ class TestRawFactCountRegression:
         graph = _make_graph(
             {
                 "residual_dropped_facts": [{"text": "x"}],  # list
-                "ungrounded_dropped_facts": [{"text": "y"}, {"text": "z"}],  # list
                 "plausibility_dropped": 3,  # int
             }
         )
@@ -177,7 +167,6 @@ class TestRawFactCountRegression:
         graph = _make_graph(
             {
                 "residual_dropped_facts": [{"text": "x"}, {"text": "y"}],  # 2
-                "ungrounded_dropped_facts": [],  # 0
                 "plausibility_dropped": 5,  # 5
                 "mapping_ambiguous_dropped": 1,  # 1
                 "residual_leaked_triples_dropped": 0,  # 0
@@ -186,7 +175,7 @@ class TestRawFactCountRegression:
         # 3 surviving QA pairs (post_plausibility_count = 3)
         episodic_qa = [{"q": f"Q{i}", "a": f"A{i}"} for i in range(3)]
         diag = _call_diag(_make_session(), graph, episodic_qa=episodic_qa)
-        # Expected: 3 + 2 + 0 + 5 + 1 + 0 = 11
+        # Expected: 3 + 2 + 5 + 1 + 0 = 11
         assert diag["extraction"]["raw_fact_count"] == 11
 
     def test_raw_fact_count_all_zeros_no_qa(self):

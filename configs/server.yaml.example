@@ -239,22 +239,6 @@ consolidation:
   extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
   extraction_ner_check: false                   # optional spaCy PII cross-check
   extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
-  # Role-aware grounding gate (assistant-into-graph defense). When the
-  # speaker is the subject of a triple, require the object's substantive
-  # tokens to ground in the speaker's own [user] turns, not in [assistant]
-  # turns. Closes the cascade: confabulated answer → extracted as fact →
-  # trained into adapter weights.
-  #   "off"        — role-blind grounding, no observability
-  #   "diagnostic" — production behaves identically to "off" (no drops),
-  #                  but every triple the gate WOULD drop is recorded under
-  #                  graph.diagnostics["role_aware_would_drop"]. With
-  #                  debug: true, snapshots persist. Zero production-
-  #                  behaviour cost. Ship default — collects per-corpus
-  #                  evidence so an operator can decide on "active" with
-  #                  data, not guesses.
-  #   "active"     — gate drops triples that fail role checking. Validate
-  #                  on a representative corpus in "diagnostic" first.
-  extraction_role_aware_grounding: "diagnostic"   # quoted: bare off/on parse as YAML 1.1 booleans
   # Max concurrent interim adapters in VRAM. Together with refresh_cadence
   # this determines the derived full-consolidation period:
   #     full_cycle = refresh_cadence × max_interim_count

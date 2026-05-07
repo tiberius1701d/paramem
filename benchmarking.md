@@ -2837,8 +2837,13 @@ Ministral 8B, Llama 3.1 8B, Qwen 2.5 7B, Gemma 4 E4B. Validator (SOTA
 enricher + plausibility judge): Claude.
 **Full privacy-aware pipeline active:** extract → anonymize → leak guard +
 repair → SOTA enrichment with brace-binding protocol → de-anonymize +
-residual sweep → plausibility filter → transcript-grounding gate → fallback
-on all-dropped.
+residual sweep → plausibility filter → fallback on all-dropped.
+
+> Historical note: this sweep was recorded under a pipeline that included a
+> transcript-grounding gate as the final stage. The gate has since been
+> removed (it dropped legitimate SOTA enrichments at high recall cost
+> without catching genuine world-knowledge fabrications); plausibility is
+> now the residual filter. Numbers below are preserved as recorded.
 
 ### Final totals
 
@@ -2848,17 +2853,16 @@ on all-dropped.
 | Mistral 7B | 21 | **45** | 0 | Best total. Multi-subject enrichment from "we/our" pronouns legitimately expanded single-subject raw facts. |
 | Ministral 8B | 6 | **7** | 0 | Sparse extractor; clean output. |
 | Llama 3.1 8B | 17 | **9** | anon=3 | Can't emit valid anonymization JSON on 3/5 sessions; fallback path runs local plausibility on raw extraction. |
-| Qwen 2.5 7B | 25 | **20** | 0 | Grounding gate correctly dropped 7 `Speaker` placeholder triples (local-extractor hallucination of first-person speaker). |
+| Qwen 2.5 7B | 25 | **20** | 0 | The (since-removed) grounding gate dropped 7 `Speaker` placeholder triples (local-extractor hallucination of first-person speaker). |
 | Gemma 4 E4B | 13 | **22** | plaus=1 | Residual-leak path dropped zero referencing triples after repair → new fact-level filter kept the session alive (previously whole-session drop). One plausibility call hit a transient Anthropic `APIConnectionError` — pipeline fell through cleanly. |
 | **Totals** | **96** | **145** | — | — |
 
 ### Pipeline-stage observations
 
-- **Grounding gate activity:** 14 triples dropped across models as
+- **Grounding gate activity** (gate since removed): 14 triples dropped across models as
   ungrounded inferences (Qwen Speaker ×7, Mistral attribute-label
   summarizations ×5, Ministral ×1, Llama ×1). No world-knowledge leaks
-  surfaced from these PerLTQA sessions (no CIA-from-Langley-style triggers),
-  but the gate is live and catches the class.
+  surfaced from these PerLTQA sessions (no CIA-from-Langley-style triggers).
 - **SOTA bindings captured** across the sweep: 14+ via transcript-diff
   protocol (`{Event_1}`/`{Topic_1}` style reifications grounded back to real
   spans like "community fitness event" / "benefits of regular exercise").
@@ -3209,9 +3213,9 @@ and multi-adapter compartmentalization.
 
 Outlines never worked in production — 0% success across all Tests 1-8 due to a `max_tokens` bug, then inconsistent failures with quantized Mistral 7B even after the fix. Every successful extraction came from the unconstrained prompt-parse fallback. Outlines was removed entirely in favor of generate-once-parse-once.
 
-### v2: 7-stage privacy-aware pipeline (current)
+### Current privacy-aware pipeline
 
-Extract → anonymize → leak-guard + repair → SOTA enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter → transcript-grounding gate. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by SOTA-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
+Extract → anonymize → leak-guard + repair → SOTA enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by SOTA-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after (post-hoc token-attestation against the original transcript was structurally incompatible with SOTA's licensed enrichment surface; CV probe data showed it dropped reasonable enrichments at high recall cost without catching genuine fabrications). See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
 
 ## Extraction Probe Sweep (2026-04-17)
 
@@ -3245,7 +3249,7 @@ Same 100 stratified sessions (seed=42), paired comparison:
 | Ungrounded drops | 13 | 27 | +14 (expected) |
 | Zero-extraction sessions | 6 | 11 | +5 |
 
-**Interpretation:** Total QA yield is flat (+2), but extraction *quality* improved structurally. More correct entity types (person, place), more diverse relation types (preference +59%, social +20%). The remaining 38 residual drops are SOTA-invented placeholders never in the mapping — the deanon path is fixed. Ungrounded drops increased because facts previously lost to the residual sweep now survive deanonymization but fail the grounding gate — the pipeline filters more precisely. The 5 additional zero-extraction sessions reflect non-deterministic extraction variance from altered transcript text (speaker names), not a regression.
+**Interpretation:** Total QA yield is flat (+2), but extraction *quality* improved structurally. More correct entity types (person, place), more diverse relation types (preference +59%, social +20%). The remaining 38 residual drops are SOTA-invented placeholders never in the mapping — the deanon path is fixed. Ungrounded drops increased because facts previously lost to the residual sweep now survived deanonymization but failed the (since-removed) grounding gate — the pipeline filtered more precisely under the prior architecture. The 5 additional zero-extraction sessions reflect non-deterministic extraction variance from altered transcript text (speaker names), not a regression.
 
 Per-session paired analysis: 17 sessions had residual drops eliminated, with individual recoveries of up to +10 QA pairs. 42 sessions gained QA, 33 lost, 25 unchanged.
 
@@ -3268,7 +3272,7 @@ Same 89 sessions across 3 characters (Deng Yu 31, Liang Xin 30, Xia Yu 28), pair
 
 **Interpretation:** The composite-placeholder deanon fix barely moves PerLTQA (-1.2% residual drops) compared to LME (-46%). PerLTQA's first-person dialogue rarely triggers the SOTA enrichment patterns (`Person_1's cousin`, `downtown City_1`) that the bug affected — those constructions appear primarily in LME's assistant-style content. The fix is real and validated on LME; on PerLTQA it shows no regression.
 
-The +7 net ungrounded drops are spread across 12 sessions (deltas ±1-2 each). Raw fact counts shift in both directions between runs — extraction is mildly non-deterministic at temperature=0, and the grounding gate correctly drops the new ungrounded subset each run. Entity and relation type distributions are essentially unchanged: pipeline already stable on this dataset. One session (`Xia Yu_119_10_4#13`) shows `leaked_repaired` in both runs with identical content (11 raw, 1 residual drop, 1 ungrounded) — a deterministic single-token leak that the repair path handles correctly.
+The +7 net ungrounded drops are spread across 12 sessions (deltas ±1-2 each). Raw fact counts shift in both directions between runs — extraction is mildly non-deterministic at temperature=0, and the (since-removed) grounding gate dropped the new ungrounded subset each run. Entity and relation type distributions are essentially unchanged: pipeline already stable on this dataset. One session (`Xia Yu_119_10_4#13`) shows `leaked_repaired` in both runs with identical content (11 raw, 1 residual drop, 1 ungrounded) — a deterministic single-token leak that the repair path handles correctly.
 
 ### Results: Cross-dataset comparison
 

@@ -203,7 +203,7 @@ TEST_EXTRA_FLAGS["14s"]="--mode=pre --variant V3 --phase-c-seeds 42 --phase-c-nu
 # last_completed_epoch). tstatus/tresume helpers branch on epoch fields
 # and would need a probe-aware code path: tresume must replay the
 # original CLI args (dataset, split, sample_strategy, sample_size, seed,
-# model, no_train, debug, role_aware_grounding) from the run's state
+# model, no_train, debug) from the run's state
 # args_snapshot, not derive from registry. tstatus must report
 # "N/30 sessions done" instead of "epoch X/Y". Until that lands, run the
 # probe directly (`python experiments/dataset_probe.py …`) and rely on
