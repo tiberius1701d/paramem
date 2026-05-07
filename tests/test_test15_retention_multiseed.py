@@ -935,15 +935,43 @@ class TestPhaseAResume:
     """
 
     def test_find_latest_checkpoint_returns_highest(self, tmp_path):
-        """_find_latest_checkpoint returns the checkpoint with the highest step number."""
+        """_find_latest_checkpoint returns the checkpoint with the highest step number.
+
+        Each fixture dir mirrors a real HF Trainer checkpoint by including
+        ``trainer_state.json`` — the marker the function uses to distinguish
+        committed checkpoints from partial-save dirs left behind by a
+        SIGKILL / system bugcheck mid-save.  See ``test_find_latest_checkpoint_skips_partial``
+        for the negative case.
+        """
         phase_dir = tmp_path / "A"
         phase_dir.mkdir()
-        (phase_dir / "checkpoint-10").mkdir()
-        (phase_dir / "checkpoint-15").mkdir()
-        (phase_dir / "checkpoint-5").mkdir()
+        for step in (10, 15, 5):
+            ckpt = phase_dir / f"checkpoint-{step}"
+            ckpt.mkdir()
+            (ckpt / "trainer_state.json").write_text("{}")
         result = _find_latest_checkpoint(phase_dir)
         assert result is not None
         assert result.name == "checkpoint-15"
+
+    def test_find_latest_checkpoint_skips_partial(self, tmp_path):
+        """_find_latest_checkpoint walks down past partial dirs missing trainer_state.json.
+
+        Locks the partial-save guard documented at
+        ``experiments/test15_retention_multiseed.py:289-293``: a SIGKILL / bugcheck
+        mid-save can leave a half-written ``checkpoint-N`` directory on disk;
+        resuming from it would feed HF Trainer a torn checkpoint and crash.
+        The function must skip past it to the highest VALID checkpoint.
+        """
+        phase_dir = tmp_path / "A"
+        phase_dir.mkdir()
+        # checkpoint-15 is partial (no trainer_state.json); checkpoint-10 is complete.
+        (phase_dir / "checkpoint-15").mkdir()
+        ckpt_10 = phase_dir / "checkpoint-10"
+        ckpt_10.mkdir()
+        (ckpt_10 / "trainer_state.json").write_text("{}")
+        result = _find_latest_checkpoint(phase_dir)
+        assert result is not None
+        assert result.name == "checkpoint-10"
 
     def test_find_latest_checkpoint_none_when_empty(self, tmp_path):
         """_find_latest_checkpoint returns None when no checkpoint dirs exist."""
