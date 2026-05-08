@@ -39,7 +39,10 @@ def _capture_callbacks(**train_adapter_kwargs):
         instance.train.return_value = MagicMock(metrics={"train_loss": 0.0})
         return instance
 
+    # TrainingArguments validates bf16 against device support at __init__.
+    # CI runs CPU-only — patch it out; the callbacks list is what's under test.
     with (
+        patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
         patch("paramem.training.trainer.Trainer", side_effect=_capture_init),
         patch(
             "paramem.training.trainer._FixedDecayTrainer",

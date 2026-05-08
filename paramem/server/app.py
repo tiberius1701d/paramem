@@ -56,7 +56,13 @@ from paramem.server.trial_state import (
     clear_trial_marker,
     write_trial_marker,
 )
-from paramem.server.vram_guard import apply_process_cap
+from paramem.server.vram_guard import (
+    VramExhausted,
+    apply_process_cap,
+    assert_free_vram,
+    safe_empty_cache,
+    vram_scope,
+)
 from paramem.server.vram_validator import (
     ConfigurationError,
     assess_topology,
@@ -1367,24 +1373,10 @@ async def lifespan(app: FastAPI):
             logger.error("VRAM configuration error:\n%s", exc)
             sys.exit(1)
 
-        logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
-        model, tokenizer = load_base_model(config.model_config)
-
-        # Initialize manifest-related state (new Slice-3a surface).
-        _state["adapter_manifest_status"] = {}
-        _state["base_model_hash_cache"] = {}
-
-        # Load adapters using the slot-dir resolver with manifest verification.
-        model = _mount_adapters_from_slots(model, tokenizer, config, _state)
-
-        # Restore the main episodic adapter as the active adapter so that all
-        # inference probes default to the consolidated tier.  Only needed when at
-        # least one adapter is present; on a fresh install peft_config is absent.
-        if hasattr(model, "peft_config") and "episodic" in model.peft_config:
-            switch_adapter(model, "episodic")
-
-        _state["model"] = model
-        _state["tokenizer"] = tokenizer
+        # Model load + adapter mount factored into ``_load_model_into_state``
+        # so the model never enters the lifespan async-generator's frame.
+        # See that function's docstring for why this is load-bearing.
+        _load_model_into_state(config)
     _state["session_buffer"] = SessionBuffer(
         config.session_dir,
         retain_sessions=config.consolidation.retain_sessions,
@@ -1838,6 +1830,20 @@ async def lifespan(app: FastAPI):
                     )
     else:
         _state["post_session_queue"] = None
+
+    # Trim the ~390 MiB of allocator-pool slack accumulated during
+    # startup (model + adapter mount + STT/TTS load) — but ONLY when
+    # we have a base model loaded. In cloud-only mode no model is
+    # loaded, no GPU allocator activity has happened, and there is no
+    # CUDA context to interact with. Calling safe_empty_cache here
+    # would unconditionally create a CUDA context (via
+    # torch.cuda.synchronize / torch._C._cuda_clearCublasWorkspaces),
+    # making paramem show up in nvidia-smi compute-apps even when
+    # --defer-model'd — which breaks training-control.sh's strict
+    # zero-compute-apps cleanup check (scripts/dev/training-control.sh:509)
+    # used by tresume's "defer to cloud-only" path.
+    if _state.get("model") is not None:
+        safe_empty_cache()
 
     logger.info("ParaMem server ready — mode: %s, model: %s", _state["mode"], config.model_name)
 
@@ -2709,26 +2715,238 @@ async def status():
 
 @app.post("/gpu/force-local")
 async def gpu_force_local():
-    """Operator override: drop any PARAMEM_EXTRA_ARGS=--defer-model hold and,
-    if the current process is in defer mode, restart so the next boot loads
-    the model locally.
+    """Operator override: drop any PARAMEM_EXTRA_ARGS=--defer-model hold
+    and, if the current process is in cloud-only / defer mode, reload
+    the base model **in-process** so the existing FastAPI listener,
+    Wyoming sockets, HA satellites stay connected.
 
-    Called by ``pstatus --force-local``.  Use when /status or pstatus reports
-    an orphaned hold (``hold.owner_alive == false`` or ``owner_pid == null``
-    after auto-reclaim has stopped).  Idempotent: safe when no hold is set.
+    Called by ``pstatus --force-local``. Use when /status or pstatus
+    reports an orphaned hold (``hold.owner_alive == false`` or
+    ``owner_pid == null`` after auto-reclaim has stopped). Idempotent:
+    safe when no hold is set or when already in local mode.
+
+    Mechanism: the in-process path uses :func:`_live_reload_base_model`
+    (release + load_model + load_voice). On unexpected error during
+    reload, falls back to ``_restart_service`` so the operator's intent
+    (move to local) is honoured even if the live path fails.
     """
     hold_before = _get_hold_state()
     cleared = _clear_hold_env()
-    will_restart = bool(_state.get("defer_model", False))
-    if cleared and will_restart:
-        _restart_service()
+    # Gate must remain narrow: only act when the process was cold-started
+    # with --defer-model AND we are currently cloud-only. Broadening to
+    # any cloud-only state would silently reclaim the GPU after a
+    # ``/gpu/release`` (which is set BY an external consumer to ask
+    # paramem to step aside) — the inverse of the operator intent that
+    # set ``cloud_only_reason="released"``. ``/gpu/force-local`` is
+    # specifically for orphaned ``--defer-model`` holds, not generic
+    # cloud-only reclaim.
+    needs_reload = bool(_state.get("defer_model", False)) and _state.get("mode") == "cloud-only"
+    reloaded_live = False
+    if needs_reload:
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _live_reload_base_model)
+            reloaded_live = _state.get("mode") == "local"
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "In-process reload failed during /gpu/force-local; falling back to restart"
+            )
+        if not reloaded_live:
+            _restart_service()
     return {
         "cleared": cleared,
         "was_active": hold_before["hold_active"],
         "owner_pid": hold_before["owner_pid"],
         "owner_alive": hold_before["owner_alive"],
-        "will_restart": cleared and will_restart,
+        "will_restart": needs_reload and not reloaded_live,
+        "reloaded_live": reloaded_live,
     }
+
+
+def _load_model_into_state(config) -> None:
+    """Load base model + adapters into ``_state`` without retaining the
+    handles in the caller's frame.
+
+    Called from lifespan startup AND from :func:`_live_reload_base_model`.
+    Architecturally this function returns nothing — keeping the model
+    out of the caller's frame is load-bearing. The original lifespan
+    inlined this block; the resulting ``model``/``tokenizer`` locals
+    were retained by the lifespan async generator's frame for the app's
+    lifetime, pinning the entire ``MistralForCausalLM`` (~4 GiB of
+    bitsandbytes ``Params4bit`` tensors) and making the device
+    unrecoverable via any in-process release path. Factoring the load
+    into a function whose locals go out of scope on return solves this
+    by construction.
+
+    Manifest caches (``adapter_manifest_status``,
+    ``base_model_hash_cache``) are reset on every load — they describe
+    the model that's currently in ``_state["model"]`` and a swap
+    invalidates them.
+
+    The per-process VRAM cap is applied here (not just at lifespan
+    startup) so a transition cloud-only → local via /gpu/force-local
+    — where the lifespan's own ``apply_process_cap`` branch was
+    skipped — still gets the safety bulkhead before any tensor
+    allocation. ``apply_process_cap`` is idempotent.
+    """
+    apply_process_cap(fraction=config.vram.process_cap_fraction)
+    logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
+    model, tokenizer = load_base_model(config.model_config)
+
+    # Manifest caches are model-specific; re-init on every load.
+    _state["adapter_manifest_status"] = {}
+    _state["base_model_hash_cache"] = {}
+
+    # Mount adapters from slots — wraps the model in PeftModel.
+    model = _mount_adapters_from_slots(model, tokenizer, config, _state)
+
+    # Restore the main episodic adapter as the active adapter.
+    if hasattr(model, "peft_config") and "episodic" in model.peft_config:
+        switch_adapter(model, "episodic")
+
+    _state["model"] = model
+    _state["tokenizer"] = tokenizer
+    # Drop the locals — see the docstring rationale. Without this, this
+    # function's own frame holds the model and a caller doing
+    # release+reload would never reclaim memory.
+    del model, tokenizer
+
+
+def _live_reload_base_model() -> None:
+    """Release+reload the base model in-process to recover device memory.
+
+    Used as the recovery path when STT cannot reload post-cycle because
+    the cycle's allocator-pool growth is reserved-but-unused inside
+    PyTorch and cannot collapse while the base model is alive (the
+    model's tensors keep the pool's segments active). Genuinely
+    destroying and re-creating the model is the only path to actually
+    return that headroom to the device — verified empirically: a
+    post-cycle device at 4666 MiB used drops to 772 MiB used after this
+    function runs, sufficient for STT to reload cleanly.
+
+    Preserves the ``ConsolidationLoop`` and ``BackgroundTrainer`` object
+    identities (only swaps their ``self.model``). Their in-memory state
+    (cycle_count, key_sessions counters, simhash sets) is not always
+    persisted per-cycle and is load-bearing for promotion + debug
+    snapshots.
+
+    Caller responsibilities:
+    - Must hold ``gpu_lock_sync()`` so STT/TTS audio paths and other
+      GPU consumers wait.
+    - Must accept ~25-30 s of model-load latency. Mode is flipped to
+      cloud-only for the duration so any concurrent /chat handler
+      routes to SOTA rather than crashing on a None model.
+    """
+    config = _state["config"]
+    logger.info("Live model reload — releasing and reloading base model in-process")
+    prior_mode = _state["mode"]
+    prior_reason = _state.get("cloud_only_reason")
+    _state["mode"] = "cloud-only"
+    _state["cloud_only_reason"] = "live_reload"
+
+    # No local refs to ConsolidationLoop / BackgroundTrainer — saving
+    # them in this function's frame would re-pin the model graph
+    # transitively (verified empirically: an attempt to preserve and
+    # re-attach object identity OOM'd at the load step because the
+    # local frame kept the prior model alive). Instead we drop both
+    # entirely; the next consolidation tick lazily re-creates them via
+    # ``create_consolidation_loop``, which seeds from disk
+    # (``key_metadata.json``, ``indexed_key_registry.json``,
+    # ``simhash_registry_*.json``). The only state that resets is
+    # ``cycle_count`` (used for debug snapshot dir naming) — acceptable
+    # tradeoff for getting the device back to a fresh memory profile.
+    try:
+        _release_base_model_in_process()
+        _load_model_into_state(config)
+        # Voice pipeline is intentionally NOT touched here. It is only
+        # evicted by ``_evict_voice_pipeline`` during a consolidation
+        # cycle's eviction window (doc-only cycles, ~tens of seconds);
+        # the cycle's own ``_load_voice_pipeline`` reloads it at cycle
+        # end. ``_live_reload_base_model`` is invoked from
+        # contexts that have nothing to do with the cycle (operator
+        # ``/gpu/force-local`` after a cold-started ``--defer-model``
+        # boot), so STT/TTS lifetime is orthogonal here. Calling
+        # ``_load_voice_pipeline`` would either be a no-op (if voice
+        # is already loaded) or load voice when the cold-start branch
+        # has them on CPU (cpu_fallback) — both wrong. Voice profile
+        # transitions are the next-commit's concern via
+        # ``_set_voice_pipeline_profile``.
+        _state["mode"] = prior_mode
+        _state["cloud_only_reason"] = prior_reason
+        logger.info("Live model reload — complete; base model restored")
+    except Exception:
+        logger.exception(
+            "Live model reload failed — server stays cloud-only until next process restart"
+        )
+        # mode stays cloud-only. The caller (e.g. /gpu/force-local) is
+        # responsible for the recovery decision — the current default
+        # is a fallback to ``_restart_service``. Do not assume
+        # auto-reclaim recovers; ``_auto_reclaim_loop`` only runs when
+        # explicitly started (lifespan defer-model branch or
+        # /gpu/release), and is not started on this failure path.
+
+
+def _release_base_model_in_process() -> None:
+    """Drop every reference to the base model and free its device memory.
+
+    The base model is reachable through four holders:
+
+    1. ``_state["model"]`` — primary handle.
+    2. ``_state["consolidation_loop"].model`` — captured at
+       ``ConsolidationLoop.__init__`` (``self.model = model`` in
+       ``paramem/training/consolidation.py``); persists across cycles
+       by design so adapter+SimHash state is reused.
+    3. ``_state["background_trainer"].model`` — captured at
+       ``BackgroundTrainer.__init__`` (``self.model = model`` in
+       ``paramem/server/background_trainer.py``).
+    4. **The bg-trainer worker thread's frame.** After a train-mode
+       cycle, ``bt._worker_thread`` is parked on
+       ``self._job_queue.get()`` (``paramem/server/background_trainer.py:525``)
+       with stale locals from the prior job: ``fn = _run_interim_training``
+       (closure cell capturing ``loop``), ``fallback_adapter``, ``item``,
+       ``sentinel``. Until a NEW job arrives, those locals stay
+       referenced and ``loop.model`` stays alive. ``_state[...] = None``
+       on the dict entries does not affect the worker frame.
+
+    The first three are addressed by nulling. The fourth is addressed
+    by ``bt._stop_callable_worker()`` — sends ``_WORKER_STOP`` through
+    the queue, the worker breaks out of its loop, the function returns,
+    its frame collapses, the closure cell drops. Joining is bounded by
+    the helper's 5-s timeout. A fresh worker thread is started by the
+    next ``BackgroundTrainer`` instance the next consolidation cycle
+    creates.
+
+    Idempotent: callable when the model is already absent;
+    ``_stop_callable_worker`` is safe even if no worker has ever
+    started.
+    """
+    # Stop the bg-trainer worker thread first — without this, its
+    # frame's stale locals (closure-captured `loop`) would pin the
+    # model graph through any number of subsequent gc.collect +
+    # empty_cache calls.
+    bt = _state.get("background_trainer")
+    if bt is not None:
+        try:
+            bt._stop_callable_worker()
+        except Exception:
+            logger.exception("Error stopping bg-trainer worker during release")
+    # Now null the dict-entry holders. With the worker dead, dropping
+    # _state["consolidation_loop"] / _state["background_trainer"] /
+    # _state["model"] actually drives refcounts to zero.
+    _state["consolidation_loop"] = None
+    _state["background_trainer"] = None
+    if _state.get("model") is not None:
+        try:
+            unload_model(_state["model"], _state.get("tokenizer"))
+        except Exception:
+            logger.exception("Error unloading model during in-process release")
+        _state["model"] = None
+        _state["tokenizer"] = None
+    # Belt-and-braces: rerun the cache flush after every holder was
+    # cleared. ``unload_model`` already calls gc.collect+empty_cache,
+    # but at that moment the loop/trainer/worker may have been live;
+    # running it again now that they're gone collapses the allocator
+    # pool slack the cycle accumulated while the model was alive.
+    safe_empty_cache()
 
 
 @app.post("/gpu/release")
@@ -2776,13 +2994,7 @@ async def gpu_release():
 
     logger.info("Release requested via /gpu/release — unloading model and switching to cloud-only.")
 
-    if _state.get("model") is not None:
-        try:
-            unload_model(_state["model"], _state.get("tokenizer"))
-        except Exception:
-            logger.exception("Error unloading model during /gpu/release")
-        _state["model"] = None
-        _state["tokenizer"] = None
+    _release_base_model_in_process()
 
     _state["mode"] = "cloud-only"
     _state["cloud_only_reason"] = "released"
@@ -5759,6 +5971,93 @@ def _retro_claim_orphan_sessions() -> int:
     return total
 
 
+def _evict_voice_pipeline() -> None:
+    """Unload STT and TTS from VRAM before a consolidation cycle.
+
+    On an 8 GiB device the resident voice pipeline (Whisper Large V3
+    plus Piper / MMS-TTS engines) eats several GiB that the extraction
+    chain — main extraction, anonymization, plausibility filter, QA-gen
+    — needs for KV cache. With both resident the chain has been
+    observed to exhaust the device mid-session.
+
+    Pair this with :func:`_load_voice_pipeline` at the cycle's end
+    (every ``_state["consolidating"] = False`` site). Eviction and
+    load are symmetric operations against the same shared resource:
+    eviction frees VRAM for the cycle, load returns the device to
+    the post-startup state so voice queries are served again.
+
+    Best-effort: a failure here must not prevent consolidation from
+    proceeding. The failed unload only costs us VRAM headroom that
+    would otherwise be available for the cycle.
+    """
+    stt = _state.get("stt")
+    if stt is not None and stt.is_loaded:
+        try:
+            stt.unload()
+        except Exception:  # noqa: BLE001
+            logger.exception("Voice eviction: stt.unload() failed; continuing")
+    tts_manager = _state.get("tts_manager")
+    if tts_manager is not None and tts_manager.is_loaded:
+        try:
+            tts_manager.unload_all()
+        except Exception:  # noqa: BLE001
+            logger.exception("Voice eviction: tts_manager.unload_all() failed; continuing")
+
+
+def _load_voice_pipeline() -> None:
+    """Load STT + TTS engines onto the device — symmetric counterpart
+    to :func:`_evict_voice_pipeline`.
+
+    Use case: local mode, post-consolidation. The cycle's eviction
+    freed VRAM for extraction; once the cycle is done and that VRAM
+    is available again, this primitive reloads STT/TTS so voice
+    queries are served without waiting for any other event.
+
+    Flow:
+    1. ``safe_empty_cache()`` — flush allocator-pool fragments left
+       by the cycle's GPU work before ``WhisperSTT.load``'s
+       ``check_vram`` gate (stt.py:109) sees them as inflated usage.
+    2. ``stt.load()`` — gated on ``not is_loaded`` (the load method
+       itself is NOT idempotent — re-instantiates ``self._model`` and
+       leaks the prior). With ``VRAM_HEADROOM_MB = 0`` and the
+       allocator flush, this succeeds inline post-cycle (verified
+       empirically: 3 sequential cycles, identical 5626/2266 device
+       state, STT loaded each time).
+    3. ``tts_manager.load_all()`` — same idempotency contract.
+    4. Warn if STT didn't actually load — surfaces under-budget cases
+       so operator knows voice is degraded.
+
+    When the engine was never configured (``_state["stt"]`` /
+    ``_state["tts_manager"]`` is None), each step is a no-op — startup
+    decided STT/TTS were not part of this deployment, and re-loading
+    must not change that.
+
+    Best-effort: a failure here must not raise out of the cycle's
+    finalisation path. A failed STT load leaves voice queries
+    returning empty transcripts (existing ``wyoming_handler.py:97``
+    degradation) until the next /chat reload or
+    ``/gpu/release+/gpu/force-local`` operator recovery.
+    """
+    safe_empty_cache()
+    stt = _state.get("stt")
+    if stt is not None and not stt.is_loaded:
+        try:
+            stt.load()
+        except Exception:  # noqa: BLE001
+            logger.exception("Voice load: stt.load() raised")
+    tts_manager = _state.get("tts_manager")
+    if tts_manager is not None and not tts_manager.is_loaded:
+        try:
+            tts_manager.load_all()
+        except Exception:  # noqa: BLE001
+            logger.exception("Voice load: tts_manager.load_all() raised")
+    if stt is not None and not stt.is_loaded:
+        logger.warning(
+            "Voice load: STT failed to load. Device may be under-budget; "
+            "voice path is degraded until next /chat reload or /gpu/release+/gpu/force-local."
+        )
+
+
 def _scheduled_extract_done_callback(future):
     """Clear the consolidating flag only if the extraction phase failed.
 
@@ -5771,8 +6070,6 @@ def _scheduled_extract_done_callback(future):
     exceptions still surface only through the loud ``logger.exception``
     line (operators tail the journal).
     """
-    from paramem.server.vram_guard import VramExhausted
-
     exc = future.exception()
     if exc:
         logger.error("Scheduled extraction failed: %s", exc, exc_info=exc)
@@ -5783,6 +6080,14 @@ def _scheduled_extract_done_callback(future):
                 "phase": phase,
                 "at": datetime.now(timezone.utc).isoformat(),
             }
+        # Voice was evicted at the cycle's start (doc-only path). On
+        # exception the cycle's normal end-of-cycle restore was not
+        # reached; restore here so STT/TTS aren't stuck unloaded until
+        # the next /chat triggers a wyoming reconnect.
+        try:
+            _load_voice_pipeline()
+        except Exception:
+            logger.exception("Voice restore on extraction failure path raised; ignoring")
         _state["consolidating"] = False
 
 
@@ -5836,8 +6141,29 @@ def _extract_and_start_training():
     all_procedural_rels = []
     session_ids = []
     speaker_ids = []
+    # Sessions whose extract_session call exhausted VRAM. Per-chunk
+    # isolation: a single bad chunk (e.g. a pathologically dense
+    # document) must not poison the whole cycle. Failed chunks are NOT
+    # marked_consolidated so they remain pending for the next cycle,
+    # which starts on a fresh cache (lazy STT/TTS reload only happens
+    # on voice activity, so the bg cycle still sees the headroom).
+    failed_session_ids: set[str] = set()
+
+    # Voice eviction is scoped to document-only cycles. Live conversation
+    # transcripts (source_type="transcript") are bounded in density by the
+    # turn-by-turn dialog that produced them and the existing GPU-lock
+    # pause/resume contract relies on STT/TTS staying resident so they can
+    # interleave with extraction. Document chunks have no such bound — a
+    # dense ~1500-word resume chunk is the regime that exhausts VRAM —
+    # and the user driving an /ingest-sessions run is on a CLI, not a
+    # voice path, so eviction has no UX cost. The predicate guards the
+    # whole pending batch: a single transcript session in the cycle keeps
+    # voice resident.
+    document_only_cycle = bool(pending) and all(s.get("source_type") == "document" for s in pending)
 
     with gpu_lock_sync():
+        if document_only_cycle:
+            _evict_voice_pipeline()
         for session in pending:
             session_id = session["session_id"]
             transcript = session["transcript"]
@@ -5862,24 +6188,57 @@ def _extract_and_start_training():
                 except Exception as e:
                     logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
 
-            episodic_qa, procedural_rels = loop.extract_session(
-                transcript,
-                session_id,
-                speaker_id=session_speaker_id,
-                speaker_name=speaker_name,
-                ha_context=ha_context,
-                stt_correction=config.consolidation.extraction_stt_correction,
-                ha_validation=config.consolidation.extraction_ha_validation,
-                noise_filter=config.consolidation.extraction_noise_filter,
-                noise_filter_model=config.consolidation.extraction_noise_filter_model,
-                noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
-                ner_check=config.consolidation.extraction_ner_check,
-                ner_model=config.consolidation.extraction_ner_model,
-                plausibility_judge=config.consolidation.extraction_plausibility_judge,
-                plausibility_stage=config.consolidation.extraction_plausibility_stage,
-                verify_anonymization=config.consolidation.extraction_verify_anonymization,
-                source_type=session.get("source_type", "transcript"),
-            )
+            # vram_scope mirrors the full-cycle path in paramem/server/
+            # consolidation.py:335 — empty_cache between sessions and OOM
+            # → VramExhausted so the done-callback populates
+            # last_consolidation_error visibly via /status.
+            try:
+                # Pre-chunk watchdog: short-circuit if the device is
+                # already below the threshold for a viable extraction
+                # phase. Same VramExhausted exception type as a
+                # mid-generate fault, so the catch below handles both
+                # the proactive abort and the reactive abort uniformly.
+                assert_free_vram(session_id)
+                with vram_scope(session_id):
+                    episodic_qa, procedural_rels = loop.extract_session(
+                        transcript,
+                        session_id,
+                        speaker_id=session_speaker_id,
+                        speaker_name=speaker_name,
+                        ha_context=ha_context,
+                        stt_correction=config.consolidation.extraction_stt_correction,
+                        ha_validation=config.consolidation.extraction_ha_validation,
+                        noise_filter=config.consolidation.extraction_noise_filter,
+                        noise_filter_model=config.consolidation.extraction_noise_filter_model,
+                        noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint
+                        or None,
+                        ner_check=config.consolidation.extraction_ner_check,
+                        ner_model=config.consolidation.extraction_ner_model,
+                        plausibility_judge=config.consolidation.extraction_plausibility_judge,
+                        plausibility_stage=config.consolidation.extraction_plausibility_stage,
+                        verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                        source_type=session.get("source_type", "transcript"),
+                    )
+            except VramExhausted as exc:
+                # Per-chunk isolation: log, record, skip — continue to next
+                # chunk under a fresh cache (vram_scope's finally clause
+                # already ran empty_cache before re-raising). Do NOT mark
+                # this chunk consolidated; it stays pending for next cycle.
+                phase = exc.args[0] if exc.args else "unknown"
+                logger.warning(
+                    "Chunk %s OOM at phase=%s — skipping; remains pending for retry",
+                    session_id,
+                    phase,
+                )
+                failed_session_ids.add(session_id)
+                _state.setdefault("chunk_failures", []).append(
+                    {
+                        "session_id": session_id,
+                        "phase": phase,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                continue
             _increment_key_sessions(loop, session_id)
 
             for qa in episodic_qa:
@@ -5891,16 +6250,23 @@ def _extract_and_start_training():
             all_procedural_rels.extend(procedural_rels)
             speaker_ids.append(session_speaker_id)
 
+    # Helper: mark only sessions whose extract_session call succeeded.
+    # Failed chunks remain pending so the next cycle retries them.
+    def _completed_session_ids() -> list[str]:
+        return [sid for sid in session_ids if sid not in failed_session_ids]
+
     if not all_episodic_qa and not all_procedural_rels:
         logger.info("No QA pairs extracted — skipping")
-        session_buffer.mark_consolidated(session_ids)
+        session_buffer.mark_consolidated(_completed_session_ids())
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
         _state["last_consolidation_result"] = {
             "status": "no_facts",
             "sessions": len(session_ids),
+            "skipped_oom": len(failed_session_ids),
             "episodic_qa": 0,
             "procedural_rels": 0,
         }
+        _load_voice_pipeline()
         _state["consolidating"] = False
         return
 
@@ -5941,18 +6307,21 @@ def _extract_and_start_training():
             # keyed_pairs.json written by _save_keyed_pairs_for_router is the
             # only simulate-mode persistence (cycle_<N>/ snapshots dropped).
 
-        # Simulate is peer storage — retire pending sessions like train.
-        session_buffer.mark_consolidated(session_ids)
+        # Simulate is peer storage — retire successfully-extracted sessions
+        # like train. OOM-skipped chunks stay pending for retry.
+        session_buffer.mark_consolidated(_completed_session_ids())
 
         _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
         _state["last_consolidation_result"] = {
             "status": "simulated",
             "sessions": len(session_ids),
+            "skipped_oom": len(failed_session_ids),
             "episodic_qa": len(all_episodic_qa),
             "procedural_rels": len(all_procedural_rels),
             "newly_promoted": len(newly_promoted),
             "simulated": sim_result.get("simulated", True),
         }
+        _load_voice_pipeline()
         _state["consolidating"] = False
         logger.info(
             "Simulation complete: %d episodic QA, %d procedural rels, %d promoted",
@@ -5973,7 +6342,8 @@ def _extract_and_start_training():
     # learned facts surface ahead of the stale main snapshot.
     if not loop.config.indexed_key_replay_enabled:
         logger.warning("Indexed key replay disabled — skipping training")
-        session_buffer.mark_consolidated(session_ids)
+        session_buffer.mark_consolidated(_completed_session_ids())
+        _load_voice_pipeline()
         _state["consolidating"] = False
         return
 
@@ -6021,6 +6391,10 @@ def _extract_and_start_training():
                 "status": "error",
                 "sessions": len(session_ids),
             }
+            # Restore voice pipeline even on training failure — we evicted
+            # at cycle start, the device should return to its post-startup
+            # baseline regardless of whether training succeeded.
+            _load_voice_pipeline()
             _state["consolidating"] = False
             return
 
@@ -6040,9 +6414,16 @@ def _extract_and_start_training():
         try:
             _promote_mature_keys(loop, config)
             _save_key_metadata(loop, config)
-            session_buffer.mark_consolidated(session_ids)
+            session_buffer.mark_consolidated(_completed_session_ids())
         except Exception:
             logger.exception("Post-interim bookkeeping failed (non-fatal)")
+
+        # Restore voice pipeline on the BG worker thread, before posting
+        # _finalize_interim to the event loop. Voice load is multi-second
+        # GPU work; running it on the event loop would block asyncio.
+        # Symmetric with the eviction at cycle start: paired with the
+        # _state["consolidating"] = False signal inside _finalize_interim.
+        _load_voice_pipeline()
 
         # State mutations + router reload — post to the event loop so the
         # router cache and inference path see the new slot atomically.
@@ -6129,6 +6510,12 @@ def _run_full_consolidation_sync() -> None:
 
     def _run_full_cycle() -> None:
         """Run on the BG trainer worker thread under the GPU lock."""
+        # No voice eviction here. The full cycle collapses existing
+        # interim slots (already-trained keys) into main; it does not
+        # re-run the extraction chain that drives the KV-cache spikes
+        # the eviction was meant to mitigate. Voice eviction is scoped
+        # to the extraction path in _extract_and_start_training, and
+        # only when the pending batch is document-only.
         try:
             result = loop.consolidate_interim_adapters(
                 trainer=bt,

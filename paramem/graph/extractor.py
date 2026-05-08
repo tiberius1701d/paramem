@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from paramem.evaluation.recall import generate_answer
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.schema import Entity, SessionGraph
 from paramem.graph.schema_config import (
@@ -21,6 +22,8 @@ from paramem.graph.schema_config import (
     format_replacement_rules,
     relation_types,
 )
+from paramem.models.loader import adapt_messages
+from paramem.server.vram_guard import vram_scope
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,17 @@ _DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Outpu
 # chunker's max). Empirical worst-case observed output for a dense resume
 # chunk was ~2200 tokens; 8192 gives ~3.7× headroom. If the chunker contract
 # changes, revisit jointly with that change.
+#
+# Plausibility output couples to chunk density. The filter's contract
+# (configs/prompts/sota_plausibility.txt) is "Return ONLY a JSON array of
+# surviving facts, schema unchanged" — so its output volume scales with
+# the surviving-fact count, which scales with chunk density. Lowering the
+# cap independently for plausibility was attempted and reverted: a 2048
+# cap truncated the JSON array on dense chunks, the parse failed, and the
+# caller fell back to passing the unfiltered set forward. KV-cache
+# pressure must be mitigated upstream (STT/TTS eviction, gc.collect
+# before empty_cache, per-phase vram_scope wraps), not by truncating
+# correctness-bearing output.
 _DEFAULT_FILTER_MAX_TOKENS = 8192
 # Validator temperature: deterministic by default. Threaded all the way to the
 # provider call so Anthropic and OpenAI-compatible filters match exactly.
@@ -592,9 +606,6 @@ def extract_procedural_graph(
             (``"extraction_procedural.txt"``).  Same prompt for every
             source type.
     """
-    from paramem.evaluation.recall import generate_answer
-    from paramem.models.loader import adapt_messages
-
     system, prompt = load_procedural_prompt(
         prompts_dir,
         system_filename=system_prompt_filename,
@@ -619,9 +630,14 @@ def extract_procedural_graph(
         add_generation_prompt=True,
     )
 
-    raw_output = generate_answer(
-        model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
-    )
+    # vram_scope: procedural extraction is a separate generate per session
+    # that follows the main extraction + anonymization + plausibility chain.
+    # Empty cache before it runs so its prefill does not pile onto residual
+    # KV cache from the prior phases. Symmetric with the other wraps.
+    with vram_scope("procedural"):
+        raw_output = generate_answer(
+            model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
+        )
     logger.debug("Procedural extraction raw: %s", raw_output[:500])
 
     try:
@@ -1053,9 +1069,6 @@ def _generate_extraction(
     :func:`build_speaker_context`.  One prompt-pair serves every source
     type — document chunks land in the same ``{transcript}`` slot.
     """
-    from paramem.evaluation.recall import generate_answer
-    from paramem.models.loader import adapt_messages
-
     system, prompt = load_extraction_prompts(
         prompts_dir,
         system_filename=system_prompt_filename,
@@ -1080,13 +1093,20 @@ def _generate_extraction(
         adapt_messages(messages, tokenizer), tokenize=False, add_generation_prompt=True
     )
 
-    return generate_answer(
-        model,
-        tokenizer,
-        formatted,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-    )
+    # vram_scope: main extraction generate is the longest prefill of the
+    # extraction chain. Without an empty_cache between this phase and the
+    # downstream anonymization / plausibility / qa-gen prefills, the
+    # ``past_key_values`` from this generate stay pinned and compound into
+    # the next phase's allocation. Symmetric with the plausibility and
+    # qa-gen wraps elsewhere in the chain.
+    with vram_scope("extract_main"):
+        return generate_answer(
+            model,
+            tokenizer,
+            formatted,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+        )
 
 
 def _parse_extraction(
@@ -3615,9 +3635,6 @@ def _anonymize_with_local_model(
     trace can record it without re-running the call.  An empty string is
     returned only when the model did not produce a response at all.
     """
-    from paramem.evaluation.recall import generate_answer
-    from paramem.models.loader import adapt_messages
-
     facts = [
         {
             "subject": r.subject,
@@ -3645,9 +3662,15 @@ def _anonymize_with_local_model(
         add_generation_prompt=True,
     )
 
-    raw = generate_answer(
-        model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
-    )
+    # vram_scope: anonymization is the second-largest local generate after
+    # main extraction and immediately precedes the plausibility filter.
+    # Empty cache between this and the next phase so the filter's prefill
+    # does not stack on top of anonymization's KV cache. Symmetric with
+    # the other wraps.
+    with vram_scope("anonymize"):
+        raw = generate_answer(
+            model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
+        )
     logger.debug("Anonymization raw: %s", raw[:500])
 
     try:
@@ -4238,9 +4261,6 @@ def _local_plausibility_filter(
     **README.md → Prompt Engineering** for the empirical principles that
     govern these files.
     """
-    from paramem.evaluation.recall import generate_answer
-    from paramem.models.loader import adapt_messages
-
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
     prompt = plaus_prompt.format(
@@ -4268,14 +4288,22 @@ def _local_plausibility_filter(
         max_tokens,
     )
     _vram_snapshot("plaus_filter_pre_generate")
+    # vram_scope: the plausibility prompt drives a long generate (≥6 K
+    # token prompt + up to 8 K new tokens of KV cache). Without this wrap,
+    # the cached pool stays held when the next phase (QA generation in
+    # consolidation.extract_session) starts its own prefill, and on an
+    # 8 GiB device with STT/TTS resident the device exhausts. The scope's
+    # finally clause runs torch.cuda.empty_cache() so the cached pool is
+    # returned before control passes back to the caller.
     try:
-        raw = generate_answer(
-            model,
-            tokenizer,
-            formatted,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-        )
+        with vram_scope("plaus_filter"):
+            raw = generate_answer(
+                model,
+                tokenizer,
+                formatted,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(
             "plaus_filter generate_answer raised %s: %s",
