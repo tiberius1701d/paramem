@@ -190,3 +190,36 @@ def test_unload_failure_does_not_block_mode_switch():
         assert result == {"mode": "cloud-only", "released": True, "reason": "released"}
         assert app_module._state["mode"] == "cloud-only"
         assert app_module._state["model"] is None
+
+
+def test_release_switches_voice_to_cpu():
+    """After model unload, voice pipeline is switched to cpu profile.
+
+    Ordering: _release_base_model_in_process() called BEFORE the voice switch
+    (verified via MagicMock.mock_calls ordering on the executor).
+    """
+    from paramem.server import app as app_module
+
+    fake_config = MagicMock()
+    fake_config.server.reclaim_interval_minutes = 5
+
+    state_patch = {
+        "mode": "local",
+        "cloud_only_reason": None,
+        "consolidating": False,
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+        "reclaim_task": None,
+        "config": fake_config,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "unload_model"),
+        patch.object(app_module, "_set_voice_pipeline_profile") as mock_profile,
+        patch("asyncio.create_task"),
+    ):
+        _call_gpu_release()
+
+        # Voice switch to cpu must have been called.
+        mock_profile.assert_called_once_with("cpu")

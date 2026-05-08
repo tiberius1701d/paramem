@@ -86,7 +86,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "server.host": Tier.OPERATIONAL,
     "server.port": Tier.OPERATIONAL,
     "server.reclaim_interval_minutes": Tier.OPERATIONAL,
-    "server.vram_safety_margin_mb": Tier.OPERATIONAL,
     # --- adapters (wildcard for any adapter name) ---
     "adapters.*.enabled": Tier.DESTRUCTIVE,
     "adapters.*.rank": Tier.DESTRUCTIVE,

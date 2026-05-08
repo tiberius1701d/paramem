@@ -45,8 +45,13 @@ logger = logging.getLogger(__name__)
 _SAFETY_MARGIN_BYTES: int = 256 * 1024 * 1024  # 256 MiB
 
 # KV-cache / activation headroom default (1 GiB).
-# Rationale: context windows up to 4096 tokens with bfloat16 KV cache for
-# 32 attention layers in Mistral 7B consume ~1 GiB at max sequence length.
+# Sized for the per-phase peak — vram_scope wraps each extraction phase
+# with empty_cache between phases (paramem/graph/extractor.py and
+# paramem/training/consolidation.py), so the static reservation covers what
+# the largest single phase holds at once, not the cumulative peak across
+# phases. The plausibility-filter's ~1.9 GiB allocator pool is released
+# before QA-gen begins. Tunable via vram.vram_cache_headroom_gib for
+# workloads with longer single-phase context windows.
 _DEFAULT_HEADROOM_GIB: float = 1.0
 
 # Hardware tiers (GiB) for the topology-fit assessment table. Covers the
@@ -141,7 +146,7 @@ _TTS_UNKNOWN_ENGINE_BYTES_PER_VOICE: int = 300 * 1024 * 1024  # 300 MiB conserva
 def estimate_stt_bytes(
     stt_config,
     *,
-    cloud_only: bool = False,
+    permanent_cloud_only: bool = False,
 ) -> int:
     """Estimate GPU VRAM bytes for Whisper STT under the given config.
 
@@ -154,8 +159,11 @@ def estimate_stt_bytes(
         stt_config: :class:`paramem.server.config.STTConfig`-like object with
             ``enabled``, ``device``, ``model``, ``compute_type``, and
             ``cpu_fallback_model`` attributes.
-        cloud_only: When True, the server forces STT to CPU regardless of
-            ``stt_config.device``. Mirrors :func:`app.lifespan` behavior.
+        permanent_cloud_only: When True, the GPU STT pair will never be loaded
+            for this process lifetime (``cloud_only_reason in {"explicit",
+            "gpu_conflict"}``). Returns 0 so the budget does not reserve GPU
+            bytes that will never be allocated. ``--defer-model`` (reason
+            ``"training"``) passes False — auto-reclaim will load the GPU pair.
 
     Returns:
         Estimated STT footprint in bytes. 0 for any CPU/disabled case.
@@ -164,8 +172,8 @@ def estimate_stt_bytes(
         return 0
 
     device = getattr(stt_config, "device", "cpu")
-    if cloud_only and device != "cpu":
-        return 0  # Cloud-only mode forces Whisper to CPU
+    if permanent_cloud_only and device != "cpu":
+        return 0  # GPU pair will never be loaded this process lifetime
     if device not in ("cuda", "auto"):
         return 0
 
@@ -195,7 +203,7 @@ def estimate_stt_bytes(
 def estimate_tts_bytes(
     tts_config,
     *,
-    cloud_only: bool = False,
+    permanent_cloud_only: bool = False,
 ) -> int:
     """Estimate GPU VRAM bytes for all configured TTS voices.
 
@@ -209,8 +217,11 @@ def estimate_tts_bytes(
         tts_config: :class:`paramem.server.config.TTSConfig`-like object with
             ``enabled``, ``device``, and ``voices`` attributes. Each voice has
             ``engine`` and an optional ``device`` override.
-        cloud_only: When True, the server forces TTS to CPU. Mirrors
-            :func:`app.lifespan` behavior.
+        permanent_cloud_only: When True, the GPU TTS pair will never be loaded
+            for this process lifetime (``cloud_only_reason in {"explicit",
+            "gpu_conflict"}``). Returns 0 so the budget does not reserve GPU
+            bytes that will never be allocated. ``--defer-model`` (reason
+            ``"training"``) passes False — auto-reclaim will load the GPU pair.
 
     Returns:
         Estimated TTS footprint in bytes. 0 for any CPU/disabled case.
@@ -219,7 +230,7 @@ def estimate_tts_bytes(
         return 0
 
     default_device = getattr(tts_config, "device", "cpu")
-    if cloud_only and default_device != "cpu":
+    if permanent_cloud_only and default_device != "cpu":
         return 0
 
     voices = getattr(tts_config, "voices", {}) or {}

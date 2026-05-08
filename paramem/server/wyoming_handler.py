@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from wyoming.asr import Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
@@ -215,34 +215,40 @@ class SpeakerSTTHandler(AsyncEventHandler):
 async def start_wyoming_server(
     host: str,
     port: int,
-    stt,
+    stt=None,
     speaker_store=None,
     chat_callback=None,
     embedding_callback=None,
     language_callback=None,
     min_embedding_duration_seconds: float = 1.0,
+    stt_provider: Callable[[], object] | None = None,
 ) -> AsyncServer:
     """Start the Wyoming STT server (non-blocking).
 
     Args:
         host: TCP host to bind.
         port: TCP port to listen on.
-        stt: Loaded STT model instance.
+        stt: Loaded STT model instance. Used when ``stt_provider`` is None.
         speaker_store: Optional SpeakerStore for embedding enrichment.
         chat_callback: Async callable forwarding (text, embedding) to /chat.
         embedding_callback: Callable storing the latest embedding in server state.
         language_callback: Callable storing the detected language in server state.
         min_embedding_duration_seconds: Minimum audio duration to compute an
             embedding; passed through to compute_speaker_embedding().
+        stt_provider: Optional callable returning the active STT instance. When
+            provided, the handler factory calls this on every connection so
+            profile hot-swaps (gpu/cpu) take effect without restarting the
+            socket listener. Supersedes ``stt`` when not None.
 
     Returns the server instance. Call server.stop() on shutdown.
     """
 
     def handler_factory(reader, writer):
+        active_stt = stt_provider() if stt_provider is not None else stt
         return SpeakerSTTHandler(
             reader,
             writer,
-            stt,
+            active_stt,
             speaker_store,
             chat_callback,
             embedding_callback,
@@ -392,20 +398,27 @@ class TTSHandler(AsyncEventHandler):
 async def start_wyoming_tts_server(
     host: str,
     port: int,
-    tts_manager: TTSManager,
+    tts_manager: TTSManager | None = None,
     language_resolver=None,
     audio_chunk_bytes: int = 4096,
+    tts_manager_provider: Callable[[], TTSManager] | None = None,
 ) -> AsyncServer:
     """Start the Wyoming TTS server (non-blocking).
 
     Args:
-        tts_manager: Loaded TTSManager with voice engines.
+        tts_manager: Loaded TTSManager with voice engines. Used when
+            ``tts_manager_provider`` is None.
         language_resolver: Callable returning the detected language code.
         audio_chunk_bytes: Bytes per Wyoming audio chunk sent to satellite.
+        tts_manager_provider: Optional callable returning the active TTSManager.
+            When provided, the handler factory calls this on every connection so
+            profile hot-swaps (gpu/cpu) take effect without restarting the
+            socket listener. Supersedes ``tts_manager`` when not None.
     """
 
     def handler_factory(reader, writer):
-        return TTSHandler(reader, writer, tts_manager, language_resolver, audio_chunk_bytes)
+        active_tts = tts_manager_provider() if tts_manager_provider is not None else tts_manager
+        return TTSHandler(reader, writer, active_tts, language_resolver, audio_chunk_bytes)
 
     server = AsyncServer.from_uri(f"tcp://{host}:{port}")
 

@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -39,7 +39,7 @@ from paramem.backup.types import ArtifactKind
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server import calibrate as calibrate_module
 from paramem.server.cloud import get_cloud_agent
-from paramem.server.config import TTSConfig, load_server_config
+from paramem.server.config import TTSConfig, TTSVoiceConfig, load_server_config
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.inference import (
     ChatResult,
@@ -137,8 +137,15 @@ _state = {
     "event_loop": None,  # asyncio event loop reference for cross-thread scheduling
     "speaker_store": None,
     "stt": None,
-    "wyoming_server": None,
+    "stt_gpu": None,
+    "stt_cpu": None,
     "tts_manager": None,
+    "tts_gpu": None,
+    "tts_cpu": None,
+    "voice_box": None,  # {"stt": <active>, "tts_manager": <active>} or None
+    "voice_profile": None,  # "gpu" | "cpu" | None (pre-init)
+    "last_reclaim_error": None,  # {"at", "error", "attempt_count"} or None
+    "wyoming_server": None,
     "wyoming_tts_server": None,
     "latest_embedding": None,
     "latest_language_detection": None,  # {language: str, probability: float}
@@ -313,7 +320,7 @@ class StatusResponse(BaseModel):
     # env).  Set by gpu_guard / tresume when an ML workload wants the GPU; the
     # server stays cloud-only until the holder clears it.  Surfaces the owner
     # PID + liveness so an operator can spot orphaned holds (SIGKILLed test
-    # processes) and clear with ``pstatus --force-local``.  Schema:
+    # processes) and clear with ``pstatus --acquire``.  Schema:
     #   {hold_active, owner_pid, owner_alive, age_seconds}
     hold: dict = {}
     # Operator-attention block. Always present; ``items`` is empty when no
@@ -348,6 +355,11 @@ class StatusResponse(BaseModel):
     # session_buffer.get_summary()["per_source_type"].
     pending_documents: int = 0
     pending_transcripts: int = 0
+    # Auto-reclaim error tracking (D3). Populated when the in-process reclaim
+    # loop fails a tick; cleared on next successful reclaim. None means the last
+    # reclaim completed cleanly (or none has run yet).
+    # Shape: {"at": <iso8601>, "error": <str>, "attempt_count": <int>}
+    last_reclaim_error: dict | None = None
 
 
 class ConsolidateResponse(BaseModel):
@@ -1316,32 +1328,28 @@ async def lifespan(app: FastAPI):
         cloud_only = True
         _state["cloud_only_reason"] = "gpu_conflict"
 
-    if cloud_only:
-        logger.info("Starting in cloud-only mode — skipping model load")
-        _state["model"] = None
-        _state["tokenizer"] = None
-    else:
-        # Startup VRAM validation runs BEFORE loading the base model.
-        # On (re)start ParaMem's own footprint is wiped — the CUDA context
-        # begins empty for this process. ``torch.cuda.memory_allocated`` at
-        # this point therefore reports bytes held by OTHER GPU consumers
-        # (Windows desktop, another model server, etc.). That external
-        # occupancy is subtracted from the hardware cap to yield the live
-        # budget the configured topology must fit into. The topology math
-        # itself is hardware-agnostic — logged at INFO with a per-tier fit
-        # table so operators see what a bigger card would buy.
-        main_adapter_count = sum(
-            1
-            for adapter_cfg in (
-                config.adapters.episodic,
-                config.adapters.semantic,
-                config.adapters.procedural,
-            )
-            if adapter_cfg.enabled
-        )
-        stt_pre_bytes = estimate_stt_bytes(config.stt, cloud_only=cloud_only)
-        tts_pre_bytes = estimate_tts_bytes(config.tts, cloud_only=cloud_only)
+    # Permanent cloud-only: the GPU pair will NEVER be loaded this process
+    # lifetime. explicit/gpu_conflict → no auto-reclaim. training (--defer-model)
+    # → auto-reclaim will load the GPU pair; reserve the bytes ahead of time.
+    permanent_cloud_only = _state.get("cloud_only_reason") in ("explicit", "gpu_conflict")
 
+    # Startup VRAM validation. Hoisted out of the ``if not cloud_only:`` branch
+    # so --defer-model startups (cloud_only=True but GPU pair loaded later by
+    # auto-reclaim) still reserve the correct budget. The CUDA-availability check
+    # and model load below stay inside the branch (eager load is skipped).
+    main_adapter_count = sum(
+        1
+        for adapter_cfg in (
+            config.adapters.episodic,
+            config.adapters.semantic,
+            config.adapters.procedural,
+        )
+        if adapter_cfg.enabled
+    )
+    stt_pre_bytes = estimate_stt_bytes(config.stt, permanent_cloud_only=permanent_cloud_only)
+    tts_pre_bytes = estimate_tts_bytes(config.tts, permanent_cloud_only=permanent_cloud_only)
+
+    if not permanent_cloud_only:
         if not torch.cuda.is_available():
             logger.error(
                 "Local model mode requires a CUDA-capable GPU but none was detected. "
@@ -1349,17 +1357,13 @@ async def lifespan(app: FastAPI):
             )
             sys.exit(1)
 
-        # Apply the per-process VRAM cap before any allocation so that an
-        # over-allocation surfaces as a Python OOM exception rather than a
-        # host driver fault.
-        apply_process_cap(fraction=config.vram.process_cap_fraction)
-
         assessment = assess_topology(
             config.episodic_adapter_config,
             max_interim_count=config.consolidation.max_interim_count,
             model_name=config.model_name,
             model_id=config.model_config.model_id,
             main_adapter_count=main_adapter_count,
+            headroom_gib=config.vram.vram_cache_headroom_gib,
             stt_bytes=stt_pre_bytes,
             tts_bytes=tts_pre_bytes,
         )
@@ -1372,6 +1376,16 @@ async def lifespan(app: FastAPI):
         except ConfigurationError as exc:
             logger.error("VRAM configuration error:\n%s", exc)
             sys.exit(1)
+
+    if cloud_only:
+        logger.info("Starting in cloud-only mode — skipping model load")
+        _state["model"] = None
+        _state["tokenizer"] = None
+    else:
+        # Apply per-process VRAM cap before any tensor allocation so that
+        # over-allocation surfaces as a Python OOM exception rather than a
+        # host driver fault.
+        apply_process_cap(fraction=config.vram.process_cap_fraction)
 
         # Model load + adapter mount factored into ``_load_model_into_state``
         # so the model never enters the lifespan async-generator's frame.
@@ -1413,70 +1427,53 @@ async def lifespan(app: FastAPI):
         _state["speaker_store"] = None
         logger.info("Speaker identification disabled")
 
-    # Initialize local STT (Faster Whisper) if configured
-    # In cloud-only mode, force CPU to avoid GPU contention with training
+    # Initialize local STT + TTS with dual-instance voice pairs.
+    # The CPU pair is always resident (consolidation and cloud-only both use it).
+    # The GPU pair is eagerly loaded at startup in local mode; lazily by
+    # auto-reclaim under --defer-model; never under permanent cloud-only.
+    # voice_box indirects Wyoming handlers to the active pair (W3).
     _state["stt"] = None
     _state["wyoming_server"] = None
     if config.stt.enabled:
         from paramem.server.stt import WhisperSTT
 
-        if cloud_only and config.stt.device != "cpu":
-            stt_device = "cpu"
-            stt_model = config.stt.cpu_fallback_model
-            stt_compute = "int8"
-            logger.info(
-                "Cloud-only mode — Whisper on CPU (%s instead of %s)",
-                stt_model,
-                config.stt.model,
-            )
-        else:
-            stt_device = config.stt.device
-            stt_model = config.stt.model
-            stt_compute = config.stt.compute_type
-
-        stt = WhisperSTT(
-            model_name=stt_model,
-            device=stt_device,
-            compute_type=stt_compute,
+        # CPU pair — always loaded, permanently resident (G2: device hard-coded).
+        stt_cpu = WhisperSTT(
+            model_name=config.stt.cpu_fallback_model,
+            device="cpu",
+            compute_type="int8",
             language=config.stt.language,
             beam_size=config.stt.beam_size,
             vad_filter=config.stt.vad_filter,
         )
-        if stt.load():
-            _state["stt"] = stt
-            logger.info("Local STT: Whisper %s on %s", stt_model, stt_device)
-
-            # Start Wyoming STT server
-            from paramem.server.wyoming_handler import start_wyoming_server
-
-            def _on_stt_embedding(embedding):
-                """Store latest speaker embedding from Wyoming STT."""
-                if embedding:
-                    _state["latest_embedding"] = embedding
-
-            def _on_stt_language(language: str, probability: float):
-                """Store latest detected language from Wyoming STT.
-
-                Written as single dict to avoid race between language and probability.
-                Read by both /chat endpoint and TTS language resolver.
-                """
-                _state["latest_language_detection"] = {
-                    "language": language,
-                    "probability": probability,
-                }
-
-            _state["wyoming_server"] = await start_wyoming_server(
-                host=config.server.host,
-                port=config.stt.port,
-                stt=stt,
-                speaker_store=_state.get("speaker_store"),
-                embedding_callback=_on_stt_embedding,
-                language_callback=_on_stt_language,
-                min_embedding_duration_seconds=config.speaker.min_embedding_duration_seconds,
+        aio_loop = asyncio.get_running_loop()
+        stt_cpu_ok = await aio_loop.run_in_executor(None, stt_cpu.load)
+        if stt_cpu_ok:
+            _state["stt_cpu"] = stt_cpu
+            logger.info(
+                "Local STT CPU: %s on cpu",
+                config.stt.cpu_fallback_model,
             )
-            logger.info("Wyoming STT server listening on port %d", config.stt.port)
         else:
-            logger.warning("Local STT disabled — model failed to load")
+            logger.warning(
+                "Local STT CPU pair failed to load — voice path unavailable in cloud-only mode"
+            )
+
+        # GPU pair — only in non-cloud-only mode (G2: config device passes through).
+        if not cloud_only:
+            stt_gpu = WhisperSTT(
+                model_name=config.stt.model,
+                device=config.stt.device,
+                compute_type=config.stt.compute_type,
+                language=config.stt.language,
+                beam_size=config.stt.beam_size,
+                vad_filter=config.stt.vad_filter,
+            )
+            if stt_gpu.load():
+                _state["stt_gpu"] = stt_gpu
+                logger.info("Local STT GPU: Whisper %s on %s", config.stt.model, config.stt.device)
+            else:
+                logger.warning("Local STT GPU pair failed to load")
     else:
         logger.info("Local STT: disabled")
 
@@ -1484,34 +1481,73 @@ async def lifespan(app: FastAPI):
     if config.tts.enabled:
         from paramem.server.tts import TTSManager
 
-        tts_config = config.tts
-        if cloud_only and tts_config.device != "cpu":
-            logger.info("Cloud-only mode — forcing TTS to CPU")
-            # Override device to CPU so engines don't attempt GPU loading
-            tts_config = TTSConfig(
-                enabled=tts_config.enabled,
-                port=tts_config.port,
-                device="cpu",
-                default_language=tts_config.default_language,
-                language_confidence_threshold=tts_config.language_confidence_threshold,
-                model_dir=tts_config.model_dir,
-                audio_chunk_bytes=tts_config.audio_chunk_bytes,
-                voices=tts_config.voices,
+        # CPU pair — always loaded.
+        # _build_cpu_tts_config neutralises per-voice cuda overrides (G1).
+        tts_cpu = TTSManager(_build_cpu_tts_config(config.tts))
+        aio_loop = asyncio.get_running_loop()
+        await aio_loop.run_in_executor(None, tts_cpu.load_all)
+        if tts_cpu.is_loaded:
+            _state["tts_cpu"] = tts_cpu
+            logger.info("Local TTS CPU: %s", ", ".join(tts_cpu.available_languages))
+        else:
+            logger.warning(
+                "Local TTS CPU pair failed to load — voice path unavailable in cloud-only mode"
             )
 
-        tts_manager = TTSManager(
-            tts_config,
-            vram_safety_margin_mb=config.server.vram_safety_margin_mb,
-        )
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, tts_manager.load_all)
+        # GPU pair — only in non-cloud-only mode (G1: config.tts unchanged,
+        # per-voice overrides respected).
+        if not cloud_only:
+            tts_gpu = TTSManager(config.tts)
+            await aio_loop.run_in_executor(None, tts_gpu.load_all)
+            if tts_gpu.is_loaded:
+                _state["tts_gpu"] = tts_gpu
+                logger.info("Local TTS GPU: %s", ", ".join(tts_gpu.available_languages))
+            else:
+                logger.warning("Local TTS GPU pair failed to load")
+    else:
+        logger.info("Local TTS: disabled")
 
-        if tts_manager.is_loaded:
-            _state["tts_manager"] = tts_manager
-            logger.info("Local TTS: %s", ", ".join(tts_manager.available_languages))
+    # Seed voice_box and voice_profile based on initial startup mode (W3).
+    _active_stt = _state.get("stt_gpu") if not cloud_only else _state.get("stt_cpu")
+    _active_tts = _state.get("tts_gpu") if not cloud_only else _state.get("tts_cpu")
+    if _active_stt is not None or _active_tts is not None:
+        _state["voice_box"] = {"stt": _active_stt, "tts_manager": _active_tts}
+        _state["stt"] = _active_stt
+        _state["tts_manager"] = _active_tts
 
-            from paramem.server.wyoming_handler import start_wyoming_tts_server
+        # Register Wyoming servers with provider lambdas so profile swaps
+        # take effect without restarting the socket listeners.
+        from paramem.server.wyoming_handler import start_wyoming_server, start_wyoming_tts_server
 
+        def _on_stt_embedding(embedding):
+            """Store latest speaker embedding from Wyoming STT."""
+            if embedding:
+                _state["latest_embedding"] = embedding
+
+        def _on_stt_language(language: str, probability: float):
+            """Store latest detected language from Wyoming STT.
+
+            Written as single dict to avoid race between language and probability.
+            Read by both /chat endpoint and TTS language resolver.
+            """
+            _state["latest_language_detection"] = {
+                "language": language,
+                "probability": probability,
+            }
+
+        if config.stt.enabled:
+            _state["wyoming_server"] = await start_wyoming_server(
+                host=config.server.host,
+                port=config.stt.port,
+                speaker_store=_state.get("speaker_store"),
+                embedding_callback=_on_stt_embedding,
+                language_callback=_on_stt_language,
+                min_embedding_duration_seconds=config.speaker.min_embedding_duration_seconds,
+                stt_provider=lambda: _state["voice_box"]["stt"],
+            )
+            logger.info("Wyoming STT server listening on port %d", config.stt.port)
+
+        if config.tts.enabled:
             lang_conf_threshold = config.tts.language_confidence_threshold
 
             def _resolve_language():
@@ -1530,15 +1566,14 @@ async def lifespan(app: FastAPI):
             _state["wyoming_tts_server"] = await start_wyoming_tts_server(
                 host=config.server.host,
                 port=config.tts.port,
-                tts_manager=tts_manager,
                 language_resolver=_resolve_language,
                 audio_chunk_bytes=config.tts.audio_chunk_bytes,
+                tts_manager_provider=lambda: _state["voice_box"]["tts_manager"],
             )
             logger.info("Wyoming TTS server listening on port %d", config.tts.port)
-        else:
-            logger.warning("Local TTS disabled — no voices loaded")
-    else:
-        logger.info("Local TTS: disabled")
+
+    _state["voice_profile"] = "cpu" if cloud_only else "gpu"
+    logger.info("Voice pipeline profile: %r", _state["voice_profile"])
 
     # Post-load sanity: compare actual ParaMem allocation against the prediction.
     # Not a gate — the pre-load check already enforced the budget against
@@ -2710,37 +2745,40 @@ async def status():
         pending_transcripts=pending_transcripts,
         pending_rehydration=bool(_state.get("pending_rehydration", False)),
         effective_mode=_state.get("effective_mode"),
+        last_reclaim_error=_state.get("last_reclaim_error"),
     )
 
 
-@app.post("/gpu/force-local")
-async def gpu_force_local():
-    """Operator override: drop any PARAMEM_EXTRA_ARGS=--defer-model hold
-    and, if the current process is in cloud-only / defer mode, reload
-    the base model **in-process** so the existing FastAPI listener,
-    Wyoming sockets, HA satellites stay connected.
+@app.post("/gpu/acquire")
+async def gpu_acquire():
+    """Reclaim the GPU in-process and switch to local mode.
 
-    Called by ``pstatus --force-local``. Use when /status or pstatus
-    reports an orphaned hold (``hold.owner_alive == false`` or
-    ``owner_pid == null`` after auto-reclaim has stopped). Idempotent:
-    safe when no hold is set or when already in local mode.
+    Standard reclaim primitive — symmetric counterpart of ``/gpu/release``.
+    Triggers an in-process base-model reload + voice profile switch to gpu
+    so existing FastAPI listener, Wyoming sockets, and HA satellites stay
+    connected. Also clears any stale ``PARAMEM_EXTRA_ARGS=--defer-model``
+    hold from systemd user env.
 
-    Mechanism: the in-process path uses :func:`_live_reload_base_model`
-    (release + load_model + load_voice). On unexpected error during
-    reload, falls back to ``_restart_service`` so the operator's intent
-    (move to local) is honoured even if the live path fails.
+    Acts whenever mode is cloud-only EXCEPT when ``cloud_only_reason=="explicit"``
+    (yaml ``cloud_only: true``) — that flag represents persistent operator
+    intent and requires a config edit + restart to leave. Idempotent in
+    local mode (returns 200 with ``reloaded_live: false``).
+
+    On reload failure, falls back to ``_restart_service`` so the operator's
+    intent is honoured even when the live path fails.
     """
     hold_before = _get_hold_state()
     cleared = _clear_hold_env()
-    # Gate must remain narrow: only act when the process was cold-started
-    # with --defer-model AND we are currently cloud-only. Broadening to
-    # any cloud-only state would silently reclaim the GPU after a
-    # ``/gpu/release`` (which is set BY an external consumer to ask
-    # paramem to step aside) — the inverse of the operator intent that
-    # set ``cloud_only_reason="released"``. ``/gpu/force-local`` is
-    # specifically for orphaned ``--defer-model`` holds, not generic
-    # cloud-only reclaim.
-    needs_reload = bool(_state.get("defer_model", False)) and _state.get("mode") == "cloud-only"
+    # Reload whenever ParaMem is in cloud-only mode UNLESS the operator
+    # opted in via the yaml ``cloud_only: true`` setting (reason="explicit").
+    # The action is operator-driven and explicit; covers the post-/gpu/release
+    # reclaim, the --defer-model orphan recovery, and the gpu-conflict autoswitch.
+    # ``cloud_only: true`` in yaml represents persistent operator intent and is
+    # respected — operators must edit yaml and restart to leave that mode.
+    needs_reload = (
+        _state.get("mode") == "cloud-only"
+        and _state.get("cloud_only_reason") != "explicit"
+    )
     reloaded_live = False
     if needs_reload:
         try:
@@ -2748,9 +2786,13 @@ async def gpu_force_local():
             reloaded_live = _state.get("mode") == "local"
         except Exception:  # noqa: BLE001
             logger.exception(
-                "In-process reload failed during /gpu/force-local; falling back to restart"
+                "In-process reload failed during /gpu/acquire; falling back to restart"
             )
-        if not reloaded_live:
+        if reloaded_live:
+            await asyncio.get_running_loop().run_in_executor(
+                None, _set_voice_pipeline_profile, "gpu"
+            )
+        else:
             _restart_service()
     return {
         "cleared": cleared,
@@ -2783,7 +2825,7 @@ def _load_model_into_state(config) -> None:
     invalidates them.
 
     The per-process VRAM cap is applied here (not just at lifespan
-    startup) so a transition cloud-only → local via /gpu/force-local
+    startup) so a transition cloud-only → local via /gpu/acquire
     — where the lifespan's own ``apply_process_cap`` branch was
     skipped — still gets the safety bulkhead before any tensor
     allocation. ``apply_process_cap`` is idempotent.
@@ -2838,8 +2880,6 @@ def _live_reload_base_model() -> None:
     """
     config = _state["config"]
     logger.info("Live model reload — releasing and reloading base model in-process")
-    prior_mode = _state["mode"]
-    prior_reason = _state.get("cloud_only_reason")
     _state["mode"] = "cloud-only"
     _state["cloud_only_reason"] = "live_reload"
 
@@ -2857,27 +2897,17 @@ def _live_reload_base_model() -> None:
     try:
         _release_base_model_in_process()
         _load_model_into_state(config)
-        # Voice pipeline is intentionally NOT touched here. It is only
-        # evicted by ``_evict_voice_pipeline`` during a consolidation
-        # cycle's eviction window (doc-only cycles, ~tens of seconds);
-        # the cycle's own ``_load_voice_pipeline`` reloads it at cycle
-        # end. ``_live_reload_base_model`` is invoked from
-        # contexts that have nothing to do with the cycle (operator
-        # ``/gpu/force-local`` after a cold-started ``--defer-model``
-        # boot), so STT/TTS lifetime is orthogonal here. Calling
-        # ``_load_voice_pipeline`` would either be a no-op (if voice
-        # is already loaded) or load voice when the cold-start branch
-        # has them on CPU (cpu_fallback) — both wrong. Voice profile
-        # transitions are the next-commit's concern via
+        # Voice pipeline is intentionally NOT touched here.
+        # Voice profile transitions are handled by the caller via
         # ``_set_voice_pipeline_profile``.
-        _state["mode"] = prior_mode
-        _state["cloud_only_reason"] = prior_reason
-        logger.info("Live model reload — complete; base model restored")
+        _state["mode"] = "local"
+        _state["cloud_only_reason"] = None
+        logger.info("Live model reload — complete; mode=local")
     except Exception:
         logger.exception(
             "Live model reload failed — server stays cloud-only until next process restart"
         )
-        # mode stays cloud-only. The caller (e.g. /gpu/force-local) is
+        # mode stays cloud-only. The caller (e.g. /gpu/acquire) is
         # responsible for the recovery decision — the current default
         # is a fallback to ``_restart_service``. Do not assume
         # auto-reclaim recovers; ``_auto_reclaim_loop`` only runs when
@@ -2995,6 +3025,7 @@ async def gpu_release():
     logger.info("Release requested via /gpu/release — unloading model and switching to cloud-only.")
 
     _release_base_model_in_process()
+    await asyncio.get_running_loop().run_in_executor(None, _set_voice_pipeline_profile, "cpu")
 
     _state["mode"] = "cloud-only"
     _state["cloud_only_reason"] = "released"
@@ -3946,7 +3977,7 @@ async def _run_trial_consolidation() -> None:
     Acquires the GPU lock, reloads config from the newly-active server.yaml,
     builds a trial ConsolidationLoop with overrides (mode=train, paths →
     state/trial_adapter/, persist_graph=True on state/trial_graph/), and
-    calls ``run_consolidation`` with ``mark_consolidated_callback=lambda _: None``.
+    calls ``_run_extraction_phase`` with ``mark_callback=lambda _: None``.
 
     The ``mark_consolidated_callback`` no-op ensures that
     ``session_buffer.mark_consolidated`` is **never** called from the trial
@@ -4034,22 +4065,47 @@ async def _run_trial_consolidation() -> None:
                 speaker_store = _state.get("speaker_store")
 
                 def _run():
-                    with gpu_lock_sync():
-                        from paramem.server.consolidation import run_consolidation as _run_consol
+                    # Temporarily override _state for the trial context so that
+                    # _run_extraction_phase reads the trial config and the live
+                    # session_buffer, then restore _state after the call.
+                    # Trial keeps its own loop (separate adapter/graph dirs).
+                    prior_config = _state.get("config")
+                    prior_ha_client = _state.get("ha_client")
+                    prior_speaker_store = _state.get("speaker_store")
+                    _state["config"] = trial_config
+                    # ha_context and speaker_store are passed implicitly through _state
+                    # ha_client.get_home_context() is called inside _run_extraction_phase;
+                    # inject the pre-fetched context via a shim that returns it directly.
+                    if ha_context is not None:
 
-                        return _run_consol(
-                            model,
-                            tokenizer,
-                            trial_config,
-                            session_buffer,
-                            loop=loop,
-                            ha_context=ha_context,
-                            speaker_store=speaker_store,
-                            # Trial path: do NOT call mark_consolidated — pending sessions
-                            # stay in the buffer so /migration/rollback (3b.3) can restore
-                            # the full queue (spec L364).
-                            mark_consolidated_callback=lambda _: None,
-                        )
+                        class _HAContextShim:
+                            """Stub used by trial-migration when no live HA client is available.
+
+                            Mirrors only the surface that ``_run_extraction_phase`` reads via
+                            ``ha_client.get_home_context()``.  The pre-fetched ``ha_context``
+                            is returned directly so no real HA API call is issued during the
+                            trial run.
+                            """
+
+                            def get_home_context(self):
+                                return ha_context
+
+                        _state["ha_client"] = _HAContextShim()
+                    else:
+                        _state["ha_client"] = None
+                    _state["speaker_store"] = speaker_store
+                    try:
+                        with gpu_lock_sync():
+                            # Trial path: mark_callback=lambda _: None so sessions stay
+                            # pending (spec L364) and /migration/rollback can restore queue.
+                            return _run_extraction_phase(
+                                loop,
+                                mark_callback=lambda _: None,
+                            )
+                    finally:
+                        _state["config"] = prior_config
+                        _state["ha_client"] = prior_ha_client
+                        _state["speaker_store"] = prior_speaker_store
 
                 try:
                     summary = await asyncio.get_running_loop().run_in_executor(None, _run)
@@ -5971,91 +6027,413 @@ def _retro_claim_orphan_sessions() -> int:
     return total
 
 
-def _evict_voice_pipeline() -> None:
-    """Unload STT and TTS from VRAM before a consolidation cycle.
+# _evict_voice_pipeline and _load_voice_pipeline were deleted here.
+# All call sites have been migrated to _set_voice_pipeline_profile.
 
-    On an 8 GiB device the resident voice pipeline (Whisper Large V3
-    plus Piper / MMS-TTS engines) eats several GiB that the extraction
-    chain — main extraction, anonymization, plausibility filter, QA-gen
-    — needs for KV cache. With both resident the chain has been
-    observed to exhaust the device mid-session.
 
-    Pair this with :func:`_load_voice_pipeline` at the cycle's end
-    (every ``_state["consolidating"] = False`` site). Eviction and
-    load are symmetric operations against the same shared resource:
-    eviction frees VRAM for the cycle, load returns the device to
-    the post-startup state so voice queries are served again.
+# ---------------------------------------------------------------------------
+# Voice-pipeline profile helpers
+# ---------------------------------------------------------------------------
 
-    Best-effort: a failure here must not prevent consolidation from
-    proceeding. The failed unload only costs us VRAM headroom that
-    would otherwise be available for the cycle.
+
+def _build_cpu_tts_config(tts_config: TTSConfig) -> TTSConfig:
+    """Return a CPU-only TTSConfig derived from ``tts_config``.
+
+    Sets top-level ``device="cpu"`` and resets every voice's ``device`` to
+    ``""`` (inherit) so per-voice cuda overrides do not survive the cpu
+    profile (G1).  All other fields are preserved verbatim.
     """
-    stt = _state.get("stt")
-    if stt is not None and stt.is_loaded:
-        try:
-            stt.unload()
-        except Exception:  # noqa: BLE001
-            logger.exception("Voice eviction: stt.unload() failed; continuing")
-    tts_manager = _state.get("tts_manager")
-    if tts_manager is not None and tts_manager.is_loaded:
-        try:
-            tts_manager.unload_all()
-        except Exception:  # noqa: BLE001
-            logger.exception("Voice eviction: tts_manager.unload_all() failed; continuing")
-
-
-def _load_voice_pipeline() -> None:
-    """Load STT + TTS engines onto the device — symmetric counterpart
-    to :func:`_evict_voice_pipeline`.
-
-    Use case: local mode, post-consolidation. The cycle's eviction
-    freed VRAM for extraction; once the cycle is done and that VRAM
-    is available again, this primitive reloads STT/TTS so voice
-    queries are served without waiting for any other event.
-
-    Flow:
-    1. ``safe_empty_cache()`` — flush allocator-pool fragments left
-       by the cycle's GPU work before ``WhisperSTT.load``'s
-       ``check_vram`` gate (stt.py:109) sees them as inflated usage.
-    2. ``stt.load()`` — gated on ``not is_loaded`` (the load method
-       itself is NOT idempotent — re-instantiates ``self._model`` and
-       leaks the prior). With ``VRAM_HEADROOM_MB = 0`` and the
-       allocator flush, this succeeds inline post-cycle (verified
-       empirically: 3 sequential cycles, identical 5626/2266 device
-       state, STT loaded each time).
-    3. ``tts_manager.load_all()`` — same idempotency contract.
-    4. Warn if STT didn't actually load — surfaces under-budget cases
-       so operator knows voice is degraded.
-
-    When the engine was never configured (``_state["stt"]`` /
-    ``_state["tts_manager"]`` is None), each step is a no-op — startup
-    decided STT/TTS were not part of this deployment, and re-loading
-    must not change that.
-
-    Best-effort: a failure here must not raise out of the cycle's
-    finalisation path. A failed STT load leaves voice queries
-    returning empty transcripts (existing ``wyoming_handler.py:97``
-    degradation) until the next /chat reload or
-    ``/gpu/release+/gpu/force-local`` operator recovery.
-    """
-    safe_empty_cache()
-    stt = _state.get("stt")
-    if stt is not None and not stt.is_loaded:
-        try:
-            stt.load()
-        except Exception:  # noqa: BLE001
-            logger.exception("Voice load: stt.load() raised")
-    tts_manager = _state.get("tts_manager")
-    if tts_manager is not None and not tts_manager.is_loaded:
-        try:
-            tts_manager.load_all()
-        except Exception:  # noqa: BLE001
-            logger.exception("Voice load: tts_manager.load_all() raised")
-    if stt is not None and not stt.is_loaded:
-        logger.warning(
-            "Voice load: STT failed to load. Device may be under-budget; "
-            "voice path is degraded until next /chat reload or /gpu/release+/gpu/force-local."
+    cpu_voices = {
+        lang: TTSVoiceConfig(
+            engine=voice_cfg.engine,
+            model=voice_cfg.model,
+            language_name=voice_cfg.language_name,
+            device="",  # reset: inherit top-level "cpu"
         )
+        for lang, voice_cfg in (tts_config.voices or {}).items()
+    }
+    return TTSConfig(
+        enabled=tts_config.enabled,
+        port=tts_config.port,
+        device="cpu",
+        default_language=tts_config.default_language,
+        language_confidence_threshold=tts_config.language_confidence_threshold,
+        model_dir=tts_config.model_dir,
+        audio_chunk_bytes=tts_config.audio_chunk_bytes,
+        voices=cpu_voices,
+    )
+
+
+def _target_profile() -> Literal["gpu", "cpu"]:
+    """Return the profile the voice pipeline should restore to after a cycle.
+
+    Cloud-only mode permanently targets cpu; local mode targets gpu.
+    """
+    return "cpu" if _state.get("mode") == "cloud-only" else "gpu"
+
+
+def _set_voice_pipeline_profile(
+    profile: Literal["gpu", "cpu"],
+    *,
+    lock_held: bool = False,
+) -> None:
+    """Atomically swap the active STT+TTS pair under the GPU lock.
+
+    Idempotent: returns immediately (DEBUG) when the current profile already
+    matches ``profile``.
+
+    Atomic ordering (B2): construct/ensure NEW pair loaded → update
+    ``_state["voice_box"]`` and ``_state["stt"]``/``_state["tts_manager"]``
+    mirrors → unload OLD GPU pair (only on gpu→cpu; CPU pair is never torn
+    down).
+
+    Lock contract: if ``lock_held=True``, the caller already holds
+    ``gpu_lock_sync()`` and no acquisition is attempted. Default
+    (``False``) acquires the lock before entering the critical section.
+
+    Best-effort: on STT/TTS load failure ``_state["voice_profile"]`` is
+    updated to the target anyway, a WARN is emitted, and the GPU instance
+    is left present-but-unloaded (existing degradation contract,
+    wyoming_handler.py).
+    """
+    if profile == _state.get("voice_profile"):
+        logger.debug("_set_voice_pipeline_profile: already %r — no-op", profile)
+        return
+
+    from paramem.server.gpu_lock import gpu_lock_sync
+    from paramem.server.stt import WhisperSTT
+    from paramem.server.tts import TTSManager
+
+    config = _state["config"]
+
+    ctx = gpu_lock_sync() if not lock_held else nullcontext()
+    with ctx:
+        if profile == "gpu":
+            # Flush allocator-pool slack from prior cycle work BEFORE the
+            # WhisperSTT.load() gate inspects free VRAM (stt.py:90 reads
+            # mem_get_info; uncollapsed pool inflates "used", refusing
+            # loads that physically fit). Mirrors the historical
+            # _load_voice_pipeline pattern.
+            safe_empty_cache()
+            # Lazy-construct GPU pair when absent or after a prior gpu→cpu flip.
+            if config.stt.enabled and _state["stt_gpu"] is None:
+                _state["stt_gpu"] = WhisperSTT(
+                    model_name=config.stt.model,
+                    device=config.stt.device,  # "auto" passes through (G2)
+                    compute_type=config.stt.compute_type,
+                    language=config.stt.language,
+                    beam_size=config.stt.beam_size,
+                    vad_filter=config.stt.vad_filter,
+                )
+            if config.tts.enabled and _state["tts_gpu"] is None:
+                _state["tts_gpu"] = TTSManager(config.tts)  # per-voice overrides respected (G1)
+
+            # Ensure loaded.
+            stt_gpu = _state.get("stt_gpu")
+            if config.stt.enabled and stt_gpu is not None and not stt_gpu.is_loaded:
+                try:
+                    loaded = stt_gpu.load()
+                except Exception:  # noqa: BLE001
+                    loaded = False
+                if not loaded:
+                    logger.warning(
+                        "_set_voice_pipeline_profile('gpu'): STT load failed; voice path degraded"
+                    )
+            tts_gpu = _state.get("tts_gpu")
+            if config.tts.enabled and tts_gpu is not None and not tts_gpu.is_loaded:
+                try:
+                    tts_gpu.load_all()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "_set_voice_pipeline_profile('gpu'): TTS load failed; voice path degraded"
+                    )
+
+            # Atomic flip: update box and mirrors.
+            _state["voice_box"] = {
+                "stt": _state.get("stt_gpu"),
+                "tts_manager": _state.get("tts_gpu"),
+            }
+            _state["stt"] = _state["voice_box"]["stt"]
+            _state["tts_manager"] = _state["voice_box"]["tts_manager"]
+            # Transition from cpu: nothing to unload (CPU pair stays resident).
+
+        else:  # profile == "cpu"
+            # CPU pair is always resident (loaded at startup); no construction.
+            old_stt_gpu = _state.get("stt_gpu")
+            old_tts_gpu = _state.get("tts_gpu")
+
+            # Atomic flip: box and mirrors point at CPU pair BEFORE unloading GPU pair (B2).
+            _state["voice_box"] = {
+                "stt": _state.get("stt_cpu"),
+                "tts_manager": _state.get("tts_cpu"),
+            }
+            _state["stt"] = _state["voice_box"]["stt"]
+            _state["tts_manager"] = _state["voice_box"]["tts_manager"]
+
+            # Unload old GPU pair and reclaim VRAM.
+            if old_stt_gpu is not None:
+                try:
+                    old_stt_gpu.unload()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "_set_voice_pipeline_profile('cpu'): stt_gpu.unload() failed; continuing"
+                    )
+                _state["stt_gpu"] = None
+
+            if old_tts_gpu is not None:
+                try:
+                    old_tts_gpu.unload_all()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "_set_voice_pipeline_profile('cpu'): tts_gpu.unload_all() failed; "
+                        "continuing"
+                    )
+                _state["tts_gpu"] = None
+
+            safe_empty_cache()
+
+    _state["voice_profile"] = profile
+    logger.info("Voice pipeline profile: %r", profile)
+
+
+def _run_extraction_phase(
+    loop,
+    mark_callback=None,
+) -> dict:
+    """Extract all pending sessions and train once (full-cycle path).
+
+    Direct port of the deleted ``paramem.server.consolidation.run_consolidation``.
+    Reads ``session_buffer`` and ``config`` from ``_state``; isolated from
+    ``_state`` mutations so the trial path can run it with a separate loop
+    without touching live state.
+
+    Parameters
+    ----------
+    loop:
+        :class:`~paramem.server.consolidation.ConsolidationLoop` instance.
+        Must be pre-constructed by the caller (trial or production).
+    mark_callback:
+        Optional callable accepting a list of session IDs.  When ``None``,
+        ``session_buffer.mark_consolidated`` is called (production behaviour).
+        Pass ``lambda _: None`` for the trial path so pending sessions remain
+        in the buffer (spec L364 — "transcript sweeper blocks archive+delete").
+
+    Returns a result dict including the loop instance for reuse.
+
+    D2 classification: all class-1 mock sites (prevent real execution only;
+    ``_run_extraction_phase`` may close over ``_state`` directly).
+    """
+    import time
+
+    from paramem.server.consolidation import (
+        _dedup_episodic,
+        _dedup_procedural,
+        _do_mark_consolidated,
+        _increment_key_sessions,
+        _promote_mature_keys,
+        _save_debug_artifacts,
+        _save_key_metadata,
+        _save_keyed_pairs_for_router,
+    )
+
+    config = _state["config"]
+    session_buffer = _state["session_buffer"]
+
+    if not config.adapters.episodic.enabled:
+        logger.info("Episodic adapter is disabled in config, skipping consolidation")
+        return {"status": "disabled", "sessions": 0, "loop": loop}
+
+    start_time = time.time()
+
+    pending = session_buffer.get_pending()
+    if not pending:
+        logger.info("No pending sessions to consolidate")
+        return {"status": "no_pending", "sessions": 0, "loop": loop}
+
+    logger.info("Consolidating %d pending sessions", len(pending))
+
+    # --- Phase 1: Extract all sessions ---
+    all_episodic_qa = []
+    all_procedural_rels = []
+    session_ids = []
+    speaker_ids = []
+    total_relations = 0
+
+    ha_context = None
+    ha_client = _state.get("ha_client")
+    if ha_client is not None:
+        ha_context = ha_client.get_home_context()
+    speaker_store = _state.get("speaker_store")
+
+    for session in pending:
+        session_id = session["session_id"]
+        transcript = session["transcript"]
+        session_speaker_id = session.get("speaker_id")
+
+        session_ids.append(session_id)
+
+        if not session_speaker_id:
+            logger.debug(
+                "Session %s has no speaker_id — skipping (text-only, no voice attribution)",
+                session_id,
+            )
+            continue
+
+        speaker_name = None
+        if speaker_store is not None:
+            try:
+                speaker_name = speaker_store.get_name(session_speaker_id)
+            except Exception as e:
+                logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
+        with vram_scope(session_id):
+            episodic_qa, procedural_rels = loop.extract_session(
+                transcript,
+                session_id,
+                speaker_id=session_speaker_id,
+                speaker_name=speaker_name,
+                ha_context=ha_context,
+                stt_correction=config.consolidation.extraction_stt_correction,
+                ha_validation=config.consolidation.extraction_ha_validation,
+                noise_filter=config.consolidation.extraction_noise_filter,
+                noise_filter_model=config.consolidation.extraction_noise_filter_model,
+                noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
+                ner_check=config.consolidation.extraction_ner_check,
+                ner_model=config.consolidation.extraction_ner_model,
+                plausibility_judge=config.consolidation.extraction_plausibility_judge,
+                plausibility_stage=config.consolidation.extraction_plausibility_stage,
+                verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                source_type=session.get("source_type", "transcript"),
+            )
+
+        _increment_key_sessions(loop, session_id)
+
+        for qa in episodic_qa:
+            qa["speaker_id"] = session_speaker_id
+        for rel in procedural_rels:
+            rel["speaker_id"] = session_speaker_id
+
+        all_episodic_qa.extend(episodic_qa)
+        all_procedural_rels.extend(procedural_rels)
+        total_relations += len(episodic_qa) + len(procedural_rels)
+        speaker_ids.append(session_speaker_id)
+
+        logger.info(
+            "Extracted session %s: %d episodic, %d procedural relations",
+            session_id,
+            len(episodic_qa),
+            len(procedural_rels),
+        )
+
+        if loop.shutdown_requested:
+            logger.info("Shutdown requested — stopping extraction after %s", session_id)
+            break
+
+    if not all_episodic_qa and not all_procedural_rels:
+        logger.info("No QA pairs extracted — skipping training")
+        _do_mark_consolidated(session_buffer, session_ids, mark_callback)
+        return {
+            "status": "no_facts",
+            "sessions": len(session_ids),
+            "loop": loop,
+        }
+
+    # --- Cross-session dedup on (subject, predicate, object) identity ---
+    pre_ep, pre_pr = len(all_episodic_qa), len(all_procedural_rels)
+    all_episodic_qa = _dedup_episodic(all_episodic_qa)
+    all_procedural_rels = _dedup_procedural(all_procedural_rels)
+    if pre_ep != len(all_episodic_qa) or pre_pr != len(all_procedural_rels):
+        logger.info(
+            "Dedup: episodic %d→%d, procedural %d→%d",
+            pre_ep,
+            len(all_episodic_qa),
+            pre_pr,
+            len(all_procedural_rels),
+        )
+
+    if config.debug:
+        try:
+            _save_debug_artifacts(loop, config, all_episodic_qa, all_procedural_rels)
+        except Exception:
+            logger.exception("debug-artifact write failed; continuing consolidation")
+
+    simulate = config.consolidation.mode == "simulate"
+    if simulate:
+        primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
+        try:
+            sim_result = loop.simulated_training(
+                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker_sim
+            )
+            newly_promoted = _promote_mature_keys(loop, config)
+            _save_keyed_pairs_for_router(loop, config)
+            _save_key_metadata(loop, config)
+        except Exception:
+            logger.exception(
+                "Simulated consolidation failed — leaving %d sessions pending",
+                len(session_ids),
+            )
+            raise
+
+        _do_mark_consolidated(session_buffer, session_ids, mark_callback)
+        elapsed = time.time() - start_time
+        summary = {
+            "status": "simulated",
+            "sessions": len(session_ids),
+            "total_relations": total_relations,
+            "newly_promoted": len(newly_promoted),
+            "episodic_qa": len(all_episodic_qa),
+            "procedural_rels": len(all_procedural_rels),
+            "episodic_keys": len(loop.episodic_simhash),
+            "semantic_keys": len(loop.semantic_simhash),
+            "procedural_keys": len(loop.procedural_simhash),
+            "elapsed_seconds": round(elapsed, 1),
+            "simulated": sim_result.get("simulated", True),
+            "loop": loop,
+        }
+        logger.info("Simulation complete: %s", {k: v for k, v in summary.items() if k != "loop"})
+        return summary
+
+    # --- Phase 2: Train once ---
+    logger.info(
+        "Training on %d episodic + %d procedural QA pairs",
+        len(all_episodic_qa),
+        len(all_procedural_rels),
+    )
+    primary_speaker = speaker_ids[-1] if speaker_ids else ""
+    try:
+        with vram_scope("training"):
+            train_result = loop.train_adapters_no_save(
+                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
+            )
+        newly_promoted = _promote_mature_keys(loop, config)
+        loop._save_adapters()
+        _save_key_metadata(loop, config)
+    except Exception:
+        logger.exception(
+            "Consolidation failed during train/save — leaving %d sessions pending",
+            len(session_ids),
+        )
+        raise
+
+    _do_mark_consolidated(session_buffer, session_ids, mark_callback)
+
+    elapsed = time.time() - start_time
+    summary = {
+        "status": "complete",
+        "sessions": len(session_ids),
+        "total_relations": total_relations,
+        "newly_promoted": len(newly_promoted),
+        "episodic_keys": len(loop.episodic_simhash),
+        "semantic_keys": len(loop.semantic_simhash),
+        "procedural_keys": len(loop.procedural_simhash),
+        "train_loss": train_result.get("episodic_train_loss"),
+        "elapsed_seconds": round(elapsed, 1),
+        "loop": loop,
+    }
+    logger.info(
+        "Consolidation complete: %s",
+        {k: v for k, v in summary.items() if k != "loop"},
+    )
+    return summary
 
 
 def _scheduled_extract_done_callback(future):
@@ -6069,6 +6447,14 @@ def _scheduled_extract_done_callback(future):
     the failure is visible via ``/status`` without scraping logs. Other
     exceptions still surface only through the loud ``logger.exception``
     line (operators tail the journal).
+
+    Self-healing voice restore: this callback is attached to three executor
+    entry points — ``_extract_and_start_training``, ``_run_full_consolidation_sync``,
+    and ``_run_active_store_migration_sync``.  On any failure path it calls
+    ``_set_voice_pipeline_profile`` unconditionally; idempotency inside that
+    function makes this safe on paths that did not evict voice.  Lock state at
+    this site is ``lock_held=False``: the callback runs on the event-loop thread
+    after the executor future has already returned.
     """
     exc = future.exception()
     if exc:
@@ -6085,7 +6471,7 @@ def _scheduled_extract_done_callback(future):
         # reached; restore here so STT/TTS aren't stuck unloaded until
         # the next /chat triggers a wyoming reconnect.
         try:
-            _load_voice_pipeline()
+            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
         except Exception:
             logger.exception("Voice restore on extraction failure path raised; ignoring")
         _state["consolidating"] = False
@@ -6163,7 +6549,7 @@ def _extract_and_start_training():
 
     with gpu_lock_sync():
         if document_only_cycle:
-            _evict_voice_pipeline()
+            _set_voice_pipeline_profile("cpu", lock_held=True)
         for session in pending:
             session_id = session["session_id"]
             transcript = session["transcript"]
@@ -6266,7 +6652,8 @@ def _extract_and_start_training():
             "episodic_qa": 0,
             "procedural_rels": 0,
         }
-        _load_voice_pipeline()
+        if document_only_cycle:
+            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
         _state["consolidating"] = False
         return
 
@@ -6321,7 +6708,8 @@ def _extract_and_start_training():
             "newly_promoted": len(newly_promoted),
             "simulated": sim_result.get("simulated", True),
         }
-        _load_voice_pipeline()
+        if document_only_cycle:
+            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
         _state["consolidating"] = False
         logger.info(
             "Simulation complete: %d episodic QA, %d procedural rels, %d promoted",
@@ -6343,7 +6731,8 @@ def _extract_and_start_training():
     if not loop.config.indexed_key_replay_enabled:
         logger.warning("Indexed key replay disabled — skipping training")
         session_buffer.mark_consolidated(_completed_session_ids())
-        _load_voice_pipeline()
+        if document_only_cycle:
+            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
         _state["consolidating"] = False
         return
 
@@ -6394,7 +6783,8 @@ def _extract_and_start_training():
             # Restore voice pipeline even on training failure — we evicted
             # at cycle start, the device should return to its post-startup
             # baseline regardless of whether training succeeded.
-            _load_voice_pipeline()
+            if document_only_cycle:
+                _set_voice_pipeline_profile(_target_profile(), lock_held=True)
             _state["consolidating"] = False
             return
 
@@ -6423,7 +6813,8 @@ def _extract_and_start_training():
         # GPU work; running it on the event loop would block asyncio.
         # Symmetric with the eviction at cycle start: paired with the
         # _state["consolidating"] = False signal inside _finalize_interim.
-        _load_voice_pipeline()
+        if document_only_cycle:
+            _set_voice_pipeline_profile(_target_profile(), lock_held=True)
 
         # State mutations + router reload — post to the event loop so the
         # router cache and inference path see the new slot atomically.
@@ -7071,17 +7462,24 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
 
     1. If any non-server GPU compute process is running → wait.
     2. Else inspect the hold state (PARAMEM_EXTRA_ARGS in systemd --user env):
-       - Hold cleared → reclaim: restart for a clean model load.
+       - Hold cleared → reclaim: reload model in-process (no restart).
+         On transient failure: log WARN, record ``last_reclaim_error``,
+         continue loop; retry on next tick.
        - Hold set, holder PID alive → legitimate mid-training window
-         (cooldown, model swap) → keep polling, do not restart.
+         (cooldown, model swap) → keep polling, do not reclaim.
        - Hold set, holder PID dead or unregistered → orphan suspected →
          emit one WARN and exit the loop.  Operator clears via
-         ``pstatus --force-local`` (POST /gpu/force-local).
+         ``pstatus --acquire`` (POST /gpu/acquire).
 
-    Exiting on orphan stops the infinite systemctl-restart loop that was
-    happening when a SIGKILLed test left PARAMEM_EXTRA_ARGS=--defer-model
-    behind: visibility over silent auto-heal, per design.
+    Exiting on orphan stops the infinite restart loop that was happening
+    when a SIGKILLed test left PARAMEM_EXTRA_ARGS=--defer-model behind:
+    visibility over silent auto-heal, per design.
+
+    On transient reclaim failures the loop retries every ``interval_minutes``
+    minutes without restarting; ``last_reclaim_error`` on ``/status``
+    tracks attempt count and last error message.
     """
+    loop = asyncio.get_event_loop()
     interval_seconds = interval_minutes * 60
     while True:
         await asyncio.sleep(interval_seconds)
@@ -7090,9 +7488,31 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
             continue
         hold = _get_hold_state()
         if not hold["hold_active"]:
-            logger.info("Auto-reclaim: GPU free — restarting for clean model load")
-            _restart_service()
-            return
+            # Hold cleared — reload in-process; no service restart.
+            try:
+                from paramem.server.gpu_lock import gpu_lock
+
+                async with gpu_lock():
+                    await loop.run_in_executor(None, _live_reload_base_model)
+                await loop.run_in_executor(None, _set_voice_pipeline_profile, "gpu")
+                _state["last_reclaim_error"] = None
+                logger.info("Auto-reclaim: GPU reclaimed in-process")
+                return
+            except Exception as exc:  # noqa: BLE001
+                attempt_count = (_state.get("last_reclaim_error") or {}).get("attempt_count", 0) + 1
+                _state["last_reclaim_error"] = {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "error": str(exc),
+                    "attempt_count": attempt_count,
+                }
+                logger.warning(
+                    "Auto-reclaim: in-process reclaim failed (attempt %d): %s"
+                    " — will retry on next tick",
+                    attempt_count,
+                    exc,
+                    exc_info=True,
+                )
+                continue
         owner_pid = hold["owner_pid"]
         owner_alive = hold["owner_alive"]
         if owner_alive is True:
@@ -7106,14 +7526,14 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
             logger.warning(
                 "Auto-reclaim: PARAMEM_EXTRA_ARGS=--defer-model still set but "
                 "holder PID %s is dead — orphaned hold. Clear and reclaim with "
-                "`pstatus --force-local` (POST /gpu/force-local).",
+                "`pstatus --acquire` (POST /gpu/acquire).",
                 owner_pid,
             )
         else:
             logger.warning(
                 "Auto-reclaim: PARAMEM_EXTRA_ARGS=--defer-model still set but no "
                 "holder PID registered — suspected orphan. Clear and reclaim with "
-                "`pstatus --force-local` (POST /gpu/force-local)."
+                "`pstatus --acquire` (POST /gpu/acquire)."
             )
         return
 
@@ -7121,9 +7541,12 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
 def _restart_service():
     """Restart the systemd service for a clean process.
 
-    Used by auto-reclaim: model loading requires CUDA initialization on the
-    main thread at process startup. In-process reclaim from a thread pool
-    creates meta-device tensors that aren't resident in VRAM.
+    No longer called from auto-reclaim (D3: auto-reclaim now uses in-process
+    reload via ``_live_reload_base_model`` + ``_set_voice_pipeline_profile``).
+    Still used by :func:`gpu_acquire` as a fallback when in-process reload
+    fails, and is kept defined for future emergency use. Process-level death
+    is handled orthogonally by ``Restart=on-failure`` + ``RestartSec=30`` in
+    the systemd unit.
     """
     logger.info("Restarting paramem-server service...")
     try:

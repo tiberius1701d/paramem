@@ -619,29 +619,6 @@ stt:
     assert config.stt.language == "de"
 
 
-# --- Config: vram_safety_margin_mb ---
-
-
-def test_vram_safety_margin_default():
-    from paramem.server.config import ServerNetConfig
-
-    config = ServerNetConfig()
-    assert config.vram_safety_margin_mb == 200
-
-
-def test_vram_safety_margin_from_yaml(tmp_path):
-    yaml_content = """
-server:
-  vram_safety_margin_mb: 300
-model: mistral
-"""
-    yaml_path = tmp_path / "server.yaml"
-    yaml_path.write_text(yaml_content)
-    config = load_server_config(yaml_path)
-
-    assert config.server.vram_safety_margin_mb == 300
-
-
 # --- Config: audio_chunk_bytes ---
 
 

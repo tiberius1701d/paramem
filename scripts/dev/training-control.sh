@@ -27,8 +27,8 @@
 #
 # Orphan recovery (SIGKILLed test, env vars left behind):
 #   Auto-reclaim detects the orphan (hold set + holder PID dead) and
-#   stops looping after one WARN. Run `pstatus --force-local` (or POST
-#   /gpu/force-local) to clear the stamps and restart into local mode.
+#   stops looping after one WARN. Run `pstatus --acquire` (or POST
+#   /gpu/acquire) to clear the stamps and reload into local mode in-process.
 #
 # ============================================================================
 

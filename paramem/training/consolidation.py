@@ -3695,7 +3695,7 @@ class ConsolidationLoop:
         Raises:
             RuntimeError: When ``recall < threshold``, signalling that the
                 on-disk artifact is corrupt or degraded.  The caller's
-                try/except in ``run_consolidation`` will then skip
+                try/except in ``_run_extraction_phase`` (app.py) will then skip
                 ``mark_consolidated``, leaving sessions pending for the next
                 cycle to retry.
         """

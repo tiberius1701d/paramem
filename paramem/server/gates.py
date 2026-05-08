@@ -8,7 +8,7 @@ transformers.
 Gates run inside the server process, reusing the already-loaded base model
 (8 GB VRAM constraint — no second model load).  They are called from
 ``_run_trial_consolidation`` in ``app.py`` after the trial
-``run_consolidation`` call returns.
+``_run_extraction_phase`` call returns (D2: ``_run_extraction_phase`` deleted).
 
 Public entry point: :func:`evaluate_gates`.
 """
@@ -134,7 +134,7 @@ def _is_training_marker(exc: BaseException) -> bool:
     Parameters
     ----------
     exc:
-        Exception captured from ``run_consolidation``.
+        Exception captured from ``_run_extraction_phase``.
 
     Returns
     -------
@@ -527,10 +527,10 @@ def _gate_1_extraction(
     session_buffer_empty:
         True when the pending session queue was empty before the trial run.
     summary:
-        Return value from ``run_consolidation``, or ``None`` when the call
+        Return value from ``_run_extraction_phase``, or ``None`` when the call
         was skipped.
     exc:
-        Exception captured from ``run_consolidation``, or ``None``.
+        Exception captured from ``_run_extraction_phase``, or ``None``.
 
     Returns
     -------
@@ -592,9 +592,9 @@ def _gate_2_training(
     session_buffer_empty:
         True when the pending session queue was empty before the trial run.
     summary:
-        Return value from ``run_consolidation``, or ``None``.
+        Return value from ``_run_extraction_phase``, or ``None``.
     exc:
-        Exception captured from ``run_consolidation``, or ``None``.
+        Exception captured from ``_run_extraction_phase``, or ``None``.
     trial_adapter_dir:
         Directory where the trial adapter should have been written.
 
@@ -757,7 +757,7 @@ def _gate_3_reload_smoke(
     session_buffer_empty:
         True when the pending session queue was empty before the trial run.
     summary:
-        Return value from ``run_consolidation``, or ``None``.
+        Return value from ``_run_extraction_phase``, or ``None``.
     model:
         PeftModel already loaded in memory.
     tokenizer:
@@ -1117,10 +1117,10 @@ def evaluate_gates(
     session_buffer_empty:
         True when the pending session queue was empty before the trial run.
     consolidation_summary:
-        Return value from ``run_consolidation``, or ``None`` when the call
+        Return value from ``_run_extraction_phase``, or ``None`` when the call
         was skipped (buffer empty) or raised.
     consolidation_exception:
-        Exception captured from ``run_consolidation``, or ``None``.
+        Exception captured from ``_run_extraction_phase``, or ``None``.
 
     Returns
     -------

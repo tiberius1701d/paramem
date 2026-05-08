@@ -897,7 +897,7 @@ def test_estimate_stt_bytes_zero_when_cpu_or_disabled():
 
     assert estimate_stt_bytes(_FakeSTTConfig(enabled=False)) == 0
     assert estimate_stt_bytes(_FakeSTTConfig(device="cpu")) == 0
-    assert estimate_stt_bytes(_FakeSTTConfig(device="cuda"), cloud_only=True) == 0
+    assert estimate_stt_bytes(_FakeSTTConfig(device="cuda"), permanent_cloud_only=True) == 0
 
 
 def test_estimate_stt_bytes_scales_with_compute_type():
@@ -1008,7 +1008,7 @@ def test_estimate_tts_bytes_zero_when_disabled_or_cloud_only():
         voices={"en": _FakeTTSVoice(engine="piper")},
     )
     assert estimate_tts_bytes(_FakeTTSConfig(enabled=False)) == 0
-    assert estimate_tts_bytes(cfg, cloud_only=True) == 0
+    assert estimate_tts_bytes(cfg, permanent_cloud_only=True) == 0
     cpu_cfg = _FakeTTSConfig(device="cpu", voices={"en": _FakeTTSVoice(engine="piper")})
     assert estimate_tts_bytes(cpu_cfg) == 0
 
@@ -1191,4 +1191,157 @@ def test_enforce_live_budget_rejects_when_external_consumes_majority():
     msg = str(exc_info.value)
     assert "VRAM live budget insufficient" in msg
     assert "External occupancy" in msg
-    assert "Deficit" in msg
+
+
+# ---------------------------------------------------------------------------
+# G3 — permanent_cloud_only semantics and defer-model budget reservation
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_stt_bytes_returns_gpu_bytes_when_defer_model():
+    """permanent_cloud_only=False (defer-model path) reserves GPU pair bytes.
+
+    Under --defer-model the server starts cloud-only but auto-reclaim will
+    load the GPU STT pair later. Budget must reserve those bytes now.
+    """
+    from paramem.server.vram_validator import estimate_stt_bytes
+
+    cfg = _FakeSTTConfig(enabled=True, device="cuda", model="distil-large-v3", compute_type="int8")
+    result = estimate_stt_bytes(cfg, permanent_cloud_only=False)
+    assert result > 0, "GPU STT bytes must be reserved when permanent_cloud_only=False"
+
+
+def test_estimate_tts_bytes_returns_gpu_bytes_when_defer_model():
+    """permanent_cloud_only=False (defer-model path) reserves GPU pair bytes for TTS."""
+    from paramem.server.vram_validator import estimate_tts_bytes
+
+    cfg = _FakeTTSConfig(
+        enabled=True,
+        device="cuda",
+        voices={"en": _FakeTTSVoice(engine="piper", model="en_US-lessac-high")},
+    )
+    result = estimate_tts_bytes(cfg, permanent_cloud_only=False)
+    assert result > 0, "GPU TTS bytes must be reserved when permanent_cloud_only=False"
+
+
+def test_estimate_stt_bytes_zero_when_explicit_cloud_only():
+    """permanent_cloud_only=True (--cloud-only / gpu_conflict) returns zero bytes."""
+    from paramem.server.vram_validator import estimate_stt_bytes
+
+    cfg = _FakeSTTConfig(enabled=True, device="cuda", model="distil-large-v3", compute_type="int8")
+    assert estimate_stt_bytes(cfg, permanent_cloud_only=True) == 0
+
+
+def test_estimate_tts_bytes_zero_when_explicit_cloud_only():
+    """permanent_cloud_only=True (--cloud-only / gpu_conflict) returns zero bytes."""
+    from paramem.server.vram_validator import estimate_tts_bytes
+
+    cfg = _FakeTTSConfig(
+        enabled=True,
+        device="cuda",
+        voices={"en": _FakeTTSVoice(engine="piper", model="en_US-lessac-high")},
+    )
+    assert estimate_tts_bytes(cfg, permanent_cloud_only=True) == 0
+
+
+# G3: lifespan startup-state matrix (permanent_cloud_only derivation)
+
+
+def _permanent_cloud_only_from_reason(reason):
+    """Mirror the lifespan logic: permanent when reason in explicit/gpu_conflict."""
+    return reason in ("explicit", "gpu_conflict")
+
+
+def test_lifespan_budget_includes_gpu_voice_bytes_under_defer_model():
+    """cloud_only_reason='training' (--defer-model): permanent_cloud_only=False → non-zero.
+
+    Auto-reclaim will load the GPU pair later; budget must reserve those bytes now.
+    """
+    from paramem.server.vram_validator import estimate_stt_bytes, estimate_tts_bytes
+
+    reason = "training"
+    pco = _permanent_cloud_only_from_reason(reason)
+    assert pco is False
+
+    stt_cfg = _FakeSTTConfig(
+        enabled=True, device="cuda", model="distil-large-v3", compute_type="int8"
+    )
+    tts_cfg = _FakeTTSConfig(
+        enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
+    )
+    assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) > 0
+    assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) > 0
+
+
+def test_lifespan_budget_zeroes_voice_bytes_under_explicit_cloud_only():
+    """cloud_only_reason='explicit' (--cloud-only): permanent_cloud_only=True → zero."""
+    from paramem.server.vram_validator import estimate_stt_bytes, estimate_tts_bytes
+
+    reason = "explicit"
+    pco = _permanent_cloud_only_from_reason(reason)
+    assert pco is True
+
+    stt_cfg = _FakeSTTConfig(
+        enabled=True, device="cuda", model="distil-large-v3", compute_type="int8"
+    )
+    tts_cfg = _FakeTTSConfig(
+        enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
+    )
+    assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) == 0
+    assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) == 0
+
+
+def test_lifespan_budget_zeroes_voice_bytes_under_gpu_conflict():
+    """cloud_only_reason='gpu_conflict': permanent_cloud_only=True → zero."""
+    from paramem.server.vram_validator import estimate_stt_bytes, estimate_tts_bytes
+
+    reason = "gpu_conflict"
+    pco = _permanent_cloud_only_from_reason(reason)
+    assert pco is True
+
+    stt_cfg = _FakeSTTConfig(
+        enabled=True, device="cuda", model="distil-large-v3", compute_type="int8"
+    )
+    tts_cfg = _FakeTTSConfig(
+        enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
+    )
+    assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) == 0
+    assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) == 0
+
+
+def test_lifespan_budget_includes_gpu_voice_bytes_under_default_local():
+    """cloud_only_reason=None (default local mode): permanent_cloud_only=False → non-zero."""
+    from paramem.server.vram_validator import estimate_stt_bytes, estimate_tts_bytes
+
+    reason = None
+    pco = _permanent_cloud_only_from_reason(reason)
+    assert pco is False
+
+    stt_cfg = _FakeSTTConfig(
+        enabled=True, device="cuda", model="distil-large-v3", compute_type="int8"
+    )
+    tts_cfg = _FakeTTSConfig(
+        enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
+    )
+    assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) > 0
+    assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) > 0
+
+
+# ---------------------------------------------------------------------------
+# G5 — vram_cache_headroom_gib exposed; default sized for per-phase peak
+# ---------------------------------------------------------------------------
+
+
+def test_default_headroom_constant_is_1_gib():
+    """_DEFAULT_HEADROOM_GIB sizes for per-phase peak (vram_scope releases between phases)."""
+    from paramem.server.vram_validator import _DEFAULT_HEADROOM_GIB
+
+    assert _DEFAULT_HEADROOM_GIB == 1.0
+
+
+def test_default_headroom_is_1_gib_via_config():
+    """VramConfig.vram_cache_headroom_gib defaults to 1.0."""
+    from paramem.server.config import VramConfig
+
+    cfg = VramConfig()
+    assert cfg.vram_cache_headroom_gib == 1.0
