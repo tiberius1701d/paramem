@@ -540,13 +540,17 @@ class TestCurriculumDecayProtection:
 class TestAnonymousSpeakerNotSkipped:
     """Speaker{N} sessions must flow through extraction, not be silently discarded.
 
-    Verifies that run_consolidation (paramem.server.consolidation) calls
+    Verifies that _run_extraction_phase (paramem.server.app) calls
     loop.extract_session for sessions whose speaker_id is 'Speaker3' —
     i.e. the old hard-skip on falsy speaker_id is gone.
+
+    D2: these tests previously called run_consolidation from consolidation.py;
+    that function has been deleted. They now call _run_extraction_phase directly,
+    which reads config and session_buffer from _state.
     """
 
     def _make_mock_loop(self):
-        """Minimal mock ConsolidationLoop with the attributes run_consolidation touches."""
+        """Minimal mock ConsolidationLoop with the attributes _run_extraction_phase touches."""
 
         loop = MagicMock()
         loop.shutdown_requested = False
@@ -595,21 +599,33 @@ class TestAnonymousSpeakerNotSkipped:
         buffer.append(conv_id, "assistant", "Hi!")
         return buffer
 
+    def _call_run_extraction_phase(self, loop, config, buffer):
+        """Inject config + session_buffer into _state and call _run_extraction_phase."""
+        import paramem.server.app as _app
+
+        prior_config = _app._state.get("config")
+        prior_buffer = _app._state.get("session_buffer")
+        prior_ha = _app._state.get("ha_client")
+        prior_speaker = _app._state.get("speaker_store")
+        _app._state["config"] = config
+        _app._state["session_buffer"] = buffer
+        _app._state["ha_client"] = None
+        _app._state["speaker_store"] = None
+        try:
+            return _app._run_extraction_phase(loop)
+        finally:
+            _app._state["config"] = prior_config
+            _app._state["session_buffer"] = prior_buffer
+            _app._state["ha_client"] = prior_ha
+            _app._state["speaker_store"] = prior_speaker
+
     def test_anonymous_speaker_id_not_skipped(self, tmp_path):
         """Sessions with speaker_id='Speaker3' reach extract_session."""
-        from paramem.server.consolidation import run_consolidation
-
         loop = self._make_mock_loop()
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, speaker_id="Speaker3")
 
-        run_consolidation(
-            model=None,
-            tokenizer=None,
-            config=config,
-            session_buffer=buffer,
-            loop=loop,
-        )
+        self._call_run_extraction_phase(loop, config, buffer)
 
         loop.extract_session.assert_called_once()
         call_kwargs = loop.extract_session.call_args
@@ -618,19 +634,11 @@ class TestAnonymousSpeakerNotSkipped:
 
     def test_named_speaker_not_skipped(self, tmp_path):
         """Named (enrolled) speaker IDs continue to reach extract_session."""
-        from paramem.server.consolidation import run_consolidation
-
         loop = self._make_mock_loop()
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, speaker_id="abc12345")
 
-        run_consolidation(
-            model=None,
-            tokenizer=None,
-            config=config,
-            session_buffer=buffer,
-            loop=loop,
-        )
+        self._call_run_extraction_phase(loop, config, buffer)
 
         loop.extract_session.assert_called_once()
         assert loop.extract_session.call_args.kwargs.get("speaker_id") == "abc12345"
@@ -642,19 +650,11 @@ class TestAnonymousSpeakerNotSkipped:
         None speaker_id would key procedural_sp_index on (None, subject, predicate),
         causing unrelated text-only sessions to cross-retire each other's procedural keys.
         """
-        from paramem.server.consolidation import run_consolidation
-
         loop = self._make_mock_loop()
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, speaker_id=None)
 
-        run_consolidation(
-            model=None,
-            tokenizer=None,
-            config=config,
-            session_buffer=buffer,
-            loop=loop,
-        )
+        self._call_run_extraction_phase(loop, config, buffer)
 
         # Text-only sessions without a speaker_id must NOT reach extract_session.
         loop.extract_session.assert_not_called()

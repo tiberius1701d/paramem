@@ -168,9 +168,8 @@ class MMSTTSEngine(TTSEngine):
     (~1-3s per sentence), but ~50-200ms on GPU.
     """
 
-    def __init__(self, model_id: str, vram_safety_margin_mb: int = 200):
+    def __init__(self, model_id: str):
         self._model_id = model_id
-        self._vram_safety_margin_mb = vram_safety_margin_mb
         self._model = None
         self._tokenizer = None
         self._device = "cpu"
@@ -190,24 +189,10 @@ class MMSTTSEngine(TTSEngine):
             self._tokenizer = VitsTokenizer.from_pretrained(self._model_id)
 
             if device == "cuda" and torch.cuda.is_available():
-                free_bytes, _ = torch.cuda.mem_get_info()
-                free_mb = free_bytes / (1024 * 1024)
-                if free_mb > self._vram_safety_margin_mb:
-                    self._model = VitsModel.from_pretrained(self._model_id, device_map="cuda")
-                    self._device = "cuda"
-                    self._actual_device = "cuda"
-                    logger.info(
-                        "MMS-TTS loaded on GPU: %s (%.0f MB free)",
-                        self._model_id,
-                        free_mb,
-                    )
-                else:
-                    logger.warning(
-                        "Insufficient VRAM for MMS-TTS (%.0f MB free), using CPU",
-                        free_mb,
-                    )
-                    self._model = VitsModel.from_pretrained(self._model_id)
-                    self._device = "cpu"
+                self._model = VitsModel.from_pretrained(self._model_id, device_map="cuda")
+                self._device = "cuda"
+                self._actual_device = "cuda"
+                logger.info("MMS-TTS loaded on GPU: %s", self._model_id)
             else:
                 self._model = VitsModel.from_pretrained(self._model_id)
                 self._device = "cpu"
@@ -252,24 +237,20 @@ class MMSTTSEngine(TTSEngine):
         return self._model is not None
 
 
-def _piper_factory(
-    voice_config: TTSVoiceConfig, tts_config: TTSConfig, vram_safety_margin_mb: int
-) -> TTSEngine:
+def _piper_factory(voice_config: TTSVoiceConfig, tts_config: TTSConfig) -> TTSEngine:
     model_dir = Path(tts_config.model_dir) if tts_config.model_dir else None
     piper_dir = (model_dir / "piper") if model_dir else None
     return PiperTTSEngine(model_name=voice_config.model, model_dir=piper_dir)
 
 
-def _mms_factory(
-    voice_config: TTSVoiceConfig, tts_config: TTSConfig, vram_safety_margin_mb: int
-) -> TTSEngine:
-    return MMSTTSEngine(model_id=voice_config.model, vram_safety_margin_mb=vram_safety_margin_mb)
+def _mms_factory(voice_config: TTSVoiceConfig, tts_config: TTSConfig) -> TTSEngine:
+    return MMSTTSEngine(model_id=voice_config.model)
 
 
 # Registry of engine factory functions.
-# Each callable: (voice_config, tts_config, vram_margin) -> TTSEngine.
+# Each callable: (voice_config, tts_config) -> TTSEngine.
 # Adding a new provider: write a factory function and add one entry here.
-EngineFactory = Callable[[TTSVoiceConfig, TTSConfig, int], TTSEngine]
+EngineFactory = Callable[[TTSVoiceConfig, TTSConfig], TTSEngine]
 ENGINE_REGISTRY: dict[str, EngineFactory] = {
     "piper": _piper_factory,
     "mms": _mms_factory,
@@ -279,14 +260,13 @@ ENGINE_REGISTRY: dict[str, EngineFactory] = {
 def _create_engine(
     voice_config: TTSVoiceConfig,
     tts_config: TTSConfig,
-    vram_safety_margin_mb: int = 200,
 ) -> TTSEngine:
     """Create a TTS engine from config using the engine registry."""
     factory = ENGINE_REGISTRY.get(voice_config.engine)
     if factory is None:
         available = ", ".join(sorted(ENGINE_REGISTRY.keys()))
         raise ValueError(f"Unknown TTS engine: '{voice_config.engine}'. Available: {available}")
-    return factory(voice_config, tts_config, vram_safety_margin_mb)
+    return factory(voice_config, tts_config)
 
 
 class TTSManager:
@@ -296,9 +276,8 @@ class TTSManager:
     if the requested language has no voice configured.
     """
 
-    def __init__(self, config: TTSConfig, vram_safety_margin_mb: int = 200):
+    def __init__(self, config: TTSConfig):
         self._config = config
-        self._vram_safety_margin_mb = vram_safety_margin_mb
         self._engines: dict[str, TTSEngine] = {}
         self._engine_devices: dict[str, str] = {}  # lang → actual device after load
         self._default_language = config.default_language
@@ -316,7 +295,7 @@ class TTSManager:
             if lang_code in self._engines:
                 continue
             device = voice_config.device or self._config.device
-            engine = _create_engine(voice_config, self._config, self._vram_safety_margin_mb)
+            engine = _create_engine(voice_config, self._config)
 
             if engine.load(device=device):
                 self._engines[lang_code] = engine

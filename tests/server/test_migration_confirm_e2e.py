@@ -6,7 +6,7 @@ This single test exercises the full confirm flow as one assertion sequence:
   Step 9     — Assert gates.status == "no_new_sessions".
   Steps 10–11 — Restart simulation via recover_migration_state → RESUME_TRIAL.
 
-No GPU is used.  The trainer is mocked at the run_consolidation boundary.
+No GPU is used.  The trainer is mocked at the _run_extraction_phase boundary.
 The trial consolidation task is captured and driven synchronously by the test
 rather than relying on TestClient's event loop to flush it.
 """
@@ -112,7 +112,7 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
     Steps 10–11: Rebuild _state from scratch and run lifespan recovery →
                  assert RESUME_TRIAL with matching trial fields.
 
-    No GPU — run_consolidation is mocked at its call-site boundary inside
+    No GPU — _run_extraction_phase is mocked at its call-site boundary inside
     _run_trial_consolidation.
     """
     # ------------------------------------------------------------------
@@ -235,7 +235,7 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
                     mock_gpu.return_value.__exit__ = MagicMock(return_value=False)
 
                     with patch(
-                        "paramem.server.consolidation.run_consolidation",
+                        "paramem.server.app._run_extraction_phase",
                         return_value=mock_summary,
                     ):
                         with patch(

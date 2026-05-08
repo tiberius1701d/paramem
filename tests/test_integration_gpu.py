@@ -782,10 +782,7 @@ class TestVRAMBudget:
             if server_cfg.tts.enabled:
                 from paramem.server.tts import TTSManager
 
-                tts_manager = TTSManager(
-                    server_cfg.tts,
-                    vram_safety_margin_mb=server_cfg.server.vram_safety_margin_mb,
-                )
+                tts_manager = TTSManager(server_cfg.tts)
                 tts_manager.load_all()
 
             # ── Adapters: 3 main + max_interim interims + 1 staging slot.
@@ -986,7 +983,7 @@ class TestSimulateModePromptIteration:
           every `paths.*` to ``tmp_path``.
         * Seeds one chunk into a fresh `SessionBuffer` with the
           parametrized `source_type`.
-        * Runs `run_consolidation` end-to-end.
+        * Runs `_run_extraction_phase` end-to-end.
 
         Asserts:
             * Status is ``"simulated"``.
@@ -1002,8 +999,9 @@ class TestSimulateModePromptIteration:
         import json as _json
         from pathlib import Path as _Path
 
+        import paramem.server.app as _app
         from paramem.server.config import load_server_config
-        from paramem.server.consolidation import run_consolidation
+        from paramem.server.consolidation import create_consolidation_loop
         from paramem.server.session_buffer import SessionBuffer
 
         cfg = load_server_config("tests/fixtures/server.yaml")
@@ -1064,7 +1062,23 @@ class TestSimulateModePromptIteration:
             },
         )
 
-        result = run_consolidation(model, tokenizer, cfg, buffer)
+        # D2: run_consolidation deleted; use _run_extraction_phase via _state.
+        loop = create_consolidation_loop(model, tokenizer, cfg)
+        prior_config = _app._state.get("config")
+        prior_buffer = _app._state.get("session_buffer")
+        prior_ha = _app._state.get("ha_client")
+        prior_speaker = _app._state.get("speaker_store")
+        _app._state["config"] = cfg
+        _app._state["session_buffer"] = buffer
+        _app._state["ha_client"] = None
+        _app._state["speaker_store"] = None
+        try:
+            result = _app._run_extraction_phase(loop)
+        finally:
+            _app._state["config"] = prior_config
+            _app._state["session_buffer"] = prior_buffer
+            _app._state["ha_client"] = prior_ha
+            _app._state["speaker_store"] = prior_speaker
 
         # --- Status assertions ---
         assert result["status"] == "simulated", (

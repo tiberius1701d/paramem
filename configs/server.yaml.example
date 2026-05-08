@@ -71,7 +71,6 @@ server:
   host: "0.0.0.0"
   port: 8420
   reclaim_interval_minutes: 10  # how often to check if GPU is free for auto-reclaim
-  vram_safety_margin_mb: 200   # free VRAM to keep after loading all GPU components
 
 model: mistral  # mistral | gemma | qwen3b | gemma4
 
@@ -558,6 +557,7 @@ process:
 # device; raise cautiously, only after measuring.
 vram:
   process_cap_fraction: 0.85   # in (0, 1]; rejected at startup otherwise
+  vram_cache_headroom_gib: 1.0   # Per-phase peak; vram_scope releases the KV pool between extraction phases. Raise for workloads with longer single-phase context windows.
 
 # ============================================================================
 # SECURITY

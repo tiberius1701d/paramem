@@ -502,16 +502,16 @@ behind by a `SIGKILL`ed test.
 | State | PID-row annotation | Meaning |
 |-------|--------------------|---------|
 | Alive holder | `(held by [python / experiments.test8_large_scale] (age 4m))` | Legitimate mid-training hold — auto-reclaim respects it. |
-| Orphaned (holder PID dead) | `(orphaned hold by [...] (age 15m) — pstatus --force-local)` (yellow) | `SIGKILL`ed test.  Auto-reclaim has emitted a single WARN and stopped looping. |
-| Orphaned (no holder registered) | `(orphaned hold, no holder registered — pstatus --force-local)` (yellow) | `PARAMEM_EXTRA_ARGS` set by legacy caller / manual tinkering. |
+| Orphaned (holder PID dead) | `(orphaned hold by [...] (age 15m) — pstatus --acquire)` (yellow) | `SIGKILL`ed test.  Auto-reclaim has emitted a single WARN and stopped looping. |
+| Orphaned (no holder registered) | `(orphaned hold, no holder registered — pstatus --acquire)` (yellow) | `PARAMEM_EXTRA_ARGS` set by legacy caller / manual tinkering. |
 
 Operator recovery is a single command:
 
 ```bash
-pstatus --force-local
-# → POST /gpu/force-local: clears PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_*
-#   and, if the running server is in --defer-model, restarts so the
-#   next boot loads the model locally.
+pstatus --acquire
+# → POST /gpu/acquire: clears PARAMEM_EXTRA_ARGS / PARAMEM_HOLD_*
+#   and, if the running server is in --defer-model, reloads the base
+#   model in-process (no service restart needed).
 ```
 
 Auto-reclaim **never auto-clears orphans** — by design, visibility over
@@ -533,7 +533,7 @@ state until the migration finishes.
 | `/status` | GET | Full operational snapshot — server mode, model id + device, per-adapter specs (`rank`/`alpha`/`lr`/`target_kind`), interim adapter inventory + capacity, speaker embedding backend/model/device, STT/TTS engines, enrolled speakers, pending sessions + orphans + oldest age, consolidating flag + BG trainer state, last consolidation result, schedule + next-run ETA, deferred-mode `hold` block (owner PID + liveness + age + cmd hint) |
 | `/consolidate` | POST | Trigger consolidation manually (blocking) |
 | `/refresh-ha` | POST | Rebuild the HA entity graph from `/api/states` + `/api/services` |
-| `/gpu/force-local` | POST | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, restart into local mode.  Called by `pstatus --force-local`.  Idempotent. |
+| `/gpu/acquire` | POST | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, reload the base model in-process.  Called by `pstatus --acquire`.  Idempotent. |
 
 **Chat request:**
 

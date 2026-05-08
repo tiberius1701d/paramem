@@ -283,11 +283,21 @@ class VramConfig:
     """
 
     process_cap_fraction: float = 0.85
+    # KV-cache + activation headroom passed to assess_topology and the lifespan
+    # VRAM gate. 1.0 GiB sizes for the per-phase peak — vram_scope's
+    # inter-phase empty_cache releases the allocator pool between phases, so
+    # the static reservation only needs to cover one phase's max KV growth.
+    # Raise on workloads with longer single-phase context windows.
+    vram_cache_headroom_gib: float = 1.0
 
     def __post_init__(self) -> None:
         if not (0.0 < self.process_cap_fraction <= 1.0):
             raise ValueError(
                 f"vram.process_cap_fraction must be in (0, 1]; got {self.process_cap_fraction!r}"
+            )
+        if self.vram_cache_headroom_gib <= 0:
+            raise ValueError(
+                f"vram.vram_cache_headroom_gib must be > 0; got {self.vram_cache_headroom_gib!r}"
             )
 
 
@@ -296,7 +306,6 @@ class ServerNetConfig:
     host: str = "0.0.0.0"
     port: int = 8420
     reclaim_interval_minutes: int = 10  # auto-reclaim GPU check interval
-    vram_safety_margin_mb: int = 200  # free VRAM to keep after loading all GPU components
 
 
 @dataclass

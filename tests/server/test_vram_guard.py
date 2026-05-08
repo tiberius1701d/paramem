@@ -140,7 +140,7 @@ class TestVramScope:
 
 
 class TestConsolidationIntegration:
-    """`run_consolidation` wraps every `extract_session` in `session_guard`.
+    """`_run_extraction_phase` wraps every `extract_session` in `session_guard`.
 
     A torch OOM during extraction must abort the cycle (raise
     :class:`VramExhausted` outward, do NOT continue to the next session).
@@ -194,9 +194,31 @@ class TestConsolidationIntegration:
         buffer.append(conv_id, "assistant", "Hi!")
         return buffer
 
-    def test_oom_during_extract_aborts_cycle(self, tmp_path):
-        from paramem.server.consolidation import run_consolidation
+    @staticmethod
+    def _call_run_extraction_phase(loop, config, buffer):
+        """Inject config + session_buffer into _state and call _run_extraction_phase.
 
+        D2: run_consolidation deleted. Tests now call _run_extraction_phase directly.
+        """
+        import paramem.server.app as _app
+
+        prior_config = _app._state.get("config")
+        prior_buffer = _app._state.get("session_buffer")
+        prior_ha = _app._state.get("ha_client")
+        prior_speaker = _app._state.get("speaker_store")
+        _app._state["config"] = config
+        _app._state["session_buffer"] = buffer
+        _app._state["ha_client"] = None
+        _app._state["speaker_store"] = None
+        try:
+            return _app._run_extraction_phase(loop)
+        finally:
+            _app._state["config"] = prior_config
+            _app._state["session_buffer"] = prior_buffer
+            _app._state["ha_client"] = prior_ha
+            _app._state["speaker_store"] = prior_speaker
+
+    def test_oom_during_extract_aborts_cycle(self, tmp_path):
         loop = self._make_mock_loop()
         loop.extract_session = lambda *_a, **_kw: (_ for _ in ()).throw(
             torch.cuda.OutOfMemoryError("simulated")
@@ -208,18 +230,10 @@ class TestConsolidationIntegration:
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted):
-                    run_consolidation(
-                        model=None,
-                        tokenizer=None,
-                        config=config,
-                        session_buffer=buffer,
-                        loop=loop,
-                    )
+                    self._call_run_extraction_phase(loop, config, buffer)
 
     def test_oom_in_first_session_skips_remaining(self, tmp_path):
         from unittest.mock import MagicMock
-
-        from paramem.server.consolidation import run_consolidation
 
         loop = self._make_mock_loop()
         # First call raises OOM; if the loop ever called extract a second time,
@@ -236,13 +250,7 @@ class TestConsolidationIntegration:
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted):
-                    run_consolidation(
-                        model=None,
-                        tokenizer=None,
-                        config=config,
-                        session_buffer=buffer,
-                        loop=loop,
-                    )
+                    self._call_run_extraction_phase(loop, config, buffer)
 
         assert loop.extract_session.call_count == 1
 
@@ -253,8 +261,6 @@ class TestConsolidationIntegration:
         with phase label "training" so operators can distinguish a
         training crash from an extract crash.
         """
-        from paramem.server.consolidation import run_consolidation
-
         loop = self._make_mock_loop()
         # Extract returns one QA pair so the cycle reaches the training step.
         loop.extract_session = lambda *_a, **_kw: ([{"key": "k1", "speaker_id": "Speaker7"}], [])
@@ -268,13 +274,7 @@ class TestConsolidationIntegration:
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
                 with pytest.raises(VramExhausted) as info:
-                    run_consolidation(
-                        model=None,
-                        tokenizer=None,
-                        config=config,
-                        session_buffer=buffer,
-                        loop=loop,
-                    )
+                    self._call_run_extraction_phase(loop, config, buffer)
         assert info.value.args == ("training",)
 
 
@@ -491,16 +491,15 @@ class TestPerChunkOOMSkip:
             app_module._state["ha_client"] = None
             app_module._state["speaker_store"] = None
 
-            # GPU lock + voice helpers + vram_scope + assert_free_vram are
-            # no-ops for this test — we only care about the OOM-skip flow.
+            # GPU lock + voice profile helper + vram_scope + assert_free_vram
+            # are no-ops for this test — we only care about the OOM-skip flow.
             no_lock = MagicMock()
             no_lock.__enter__ = MagicMock(return_value=None)
             no_lock.__exit__ = MagicMock(return_value=False)
 
             with (
                 patch("paramem.server.gpu_lock.gpu_lock_sync", return_value=no_lock),
-                patch("paramem.server.app._evict_voice_pipeline"),
-                patch("paramem.server.app._load_voice_pipeline"),
+                patch("paramem.server.app._set_voice_pipeline_profile"),
                 patch("paramem.server.app.assert_free_vram"),
                 patch("paramem.server.app.vram_scope", return_value=no_lock),
                 # `_increment_key_sessions` and `create_consolidation_loop`

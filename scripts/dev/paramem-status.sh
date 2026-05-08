@@ -3,8 +3,8 @@
 #
 # Usage:
 #   pstatus                # show server status
-#   pstatus --force-local  # clear any PARAMEM_EXTRA_ARGS=--defer-model hold
-#                            and restart the server so it boots in local mode
+#   pstatus --acquire      # clear any PARAMEM_EXTRA_ARGS=--defer-model hold
+#                            and reload the base model in-process (local mode)
 #
 # Alias (add to ~/.bashrc):
 #   alias pstatus='bash ~/.local/bin/paramem-status.sh'
@@ -74,13 +74,13 @@ print(yaml.safe_dump(_to_plain(cfg), default_flow_style=False, sort_keys=False))
 PYEOF
 fi
 
-# --force-local: clear the deferred-mode hold and restart into local mode.
+# --acquire: clear the deferred-mode hold and reload the base model in-process.
 # Intended for operator use when auto-reclaim has flagged an orphaned hold
 # (holder PID dead or no PID registered) and stopped looping.  Hits
-# POST /gpu/force-local on the running server.
-if [[ "${1:-}" == "--force-local" ]]; then
+# POST /gpu/acquire on the running server.
+if [[ "${1:-}" == "--acquire" ]]; then
     resp=$(curl -s --max-time 10 -X POST \
-        "http://localhost:${PARAMEM_SERVER_PORT}/gpu/force-local" 2>/dev/null || true)
+        "http://localhost:${PARAMEM_SERVER_PORT}/gpu/acquire" 2>/dev/null || true)
     if [[ -z "$resp" ]]; then
         echo "Server unreachable — clearing environment directly."
         systemctl --user unset-environment \
@@ -625,10 +625,10 @@ if [[ "$hold_active" == "True" ]]; then
             pid_line+=" ${DIM}(held by${cmd_tag}${age_tag})${RESET}"
             ;;
         no)
-            pid_line+=" ${YELLOW}(orphaned hold by${cmd_tag}${age_tag} — pstatus --force-local)${RESET}"
+            pid_line+=" ${YELLOW}(orphaned hold by${cmd_tag}${age_tag} — pstatus --acquire)${RESET}"
             ;;
         *)
-            pid_line+=" ${YELLOW}(orphaned hold, no holder registered — pstatus --force-local)${RESET}"
+            pid_line+=" ${YELLOW}(orphaned hold, no holder registered — pstatus --acquire)${RESET}"
             ;;
     esac
 fi

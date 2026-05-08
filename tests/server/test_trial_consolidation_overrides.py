@@ -223,13 +223,13 @@ class TestTrialDoesNotMarkConsolidated:
     """Fix 1 regression: trial cycle must never call session_buffer.mark_consolidated."""
 
     def test_trial_cycle_does_not_mark_consolidated(self, tmp_path, monkeypatch):
-        """run_consolidation called from trial path must not invoke mark_consolidated.
+        """_run_extraction_phase called from trial path must not invoke mark_consolidated.
 
         Verifies the ``mark_consolidated_callback=lambda _: None`` plumbing:
         the real session_buffer.mark_consolidated must not be called so that
         pending sessions stay in the buffer after the trial cycle (spec L364).
 
-        Slice 4: session_buffer.pending_count is set to 2 so run_consolidation
+        Slice 4: session_buffer.pending_count is set to 2 so _run_extraction_phase
         is called (buffer-empty path skips it).  evaluate_gates is patched to
         avoid GPU interactions.
         """
@@ -241,7 +241,7 @@ class TestTrialDoesNotMarkConsolidated:
         monkeypatch.setattr(app_module, "_state", state)
 
         mock_session_buffer = MagicMock()
-        mock_session_buffer.pending_count = 2  # non-zero → run_consolidation called
+        mock_session_buffer.pending_count = 2  # non-zero → _run_extraction_phase called
         mock_session_buffer.get_pending.return_value = []  # empty queue → no_pending
         state["session_buffer"] = mock_session_buffer
 
@@ -268,7 +268,7 @@ class TestTrialDoesNotMarkConsolidated:
                         mock_gpu.return_value.__exit__ = MagicMock(return_value=False)
 
                         with patch(
-                            "paramem.server.consolidation.run_consolidation",
+                            "paramem.server.app._run_extraction_phase",
                             return_value=mock_summary,
                         ) as mock_run:
                             with patch(
@@ -276,12 +276,10 @@ class TestTrialDoesNotMarkConsolidated:
                                 return_value=skipped_gates,
                             ):
                                 await app_module._run_trial_consolidation()
-                            # Verify mark_consolidated_callback=lambda _: None was passed.
+                            # Verify mark_callback=lambda _: None was passed (D2 interface).
                             call_kwargs = mock_run.call_args.kwargs
-                            callback = call_kwargs.get("mark_consolidated_callback")
-                            assert callback is not None, (
-                                "trial path must pass mark_consolidated_callback"
-                            )
+                            callback = call_kwargs.get("mark_callback")
+                            assert callback is not None, "trial path must pass mark_callback"
                             # Calling the callback must be a no-op, not delegate to buffer.
                             callback(["session-1", "session-2"])
                             assert not mock_session_buffer.mark_consolidated.called, (
@@ -296,7 +294,7 @@ class TestTrialDoesNotMarkConsolidated:
         The trial cycle must leave the session buffer untouched so
         /migration/rollback (3b.3) finds the original pending queue intact.
 
-        Slice 4: session_buffer.pending_count is set to 2 so run_consolidation
+        Slice 4: session_buffer.pending_count is set to 2 so _run_extraction_phase
         is called.  evaluate_gates is patched to avoid GPU interactions.
         """
         from unittest.mock import MagicMock, patch
@@ -308,7 +306,7 @@ class TestTrialDoesNotMarkConsolidated:
 
         pending_before = [{"session_id": "s1"}, {"session_id": "s2"}]
         mock_session_buffer = MagicMock()
-        mock_session_buffer.pending_count = 2  # non-zero → run_consolidation called
+        mock_session_buffer.pending_count = 2  # non-zero → _run_extraction_phase called
         mock_session_buffer.get_pending.return_value = pending_before
         state["session_buffer"] = mock_session_buffer
 
@@ -335,7 +333,7 @@ class TestTrialDoesNotMarkConsolidated:
                         mock_gpu.return_value.__exit__ = MagicMock(return_value=False)
 
                         with patch(
-                            "paramem.server.consolidation.run_consolidation",
+                            "paramem.server.app._run_extraction_phase",
                             return_value=mock_summary,
                         ):
                             with patch(
@@ -354,7 +352,7 @@ class TestTrialDoesNotMarkConsolidated:
 
         Spec Resolved Decision 27, L239: trial mode is always train.
         Slice 4: session_buffer is provided with pending_count > 0 so that
-        run_consolidation is actually called (buffer-empty path skips it).
+        _run_extraction_phase is actually called (buffer-empty path skips it).
         evaluate_gates is patched to avoid GPU interactions.
         """
         from unittest.mock import MagicMock, patch
@@ -364,7 +362,7 @@ class TestTrialDoesNotMarkConsolidated:
         state = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", state)
 
-        # Give the state a non-empty session buffer so run_consolidation is called.
+        # Give the state a non-empty session buffer so _run_extraction_phase is called.
         mock_session_buffer = MagicMock()
         mock_session_buffer.pending_count = 2
         state["session_buffer"] = mock_session_buffer
@@ -397,12 +395,16 @@ class TestTrialDoesNotMarkConsolidated:
                         mock_gpu.return_value.__enter__ = MagicMock(return_value=None)
                         mock_gpu.return_value.__exit__ = MagicMock(return_value=False)
 
-                        def capture_run(model, tokenizer, cfg, buf, **kw):
-                            captured_cfg["mode"] = cfg.consolidation.mode
+                        def capture_run(loop, mark_callback=None):
+                            # _run_extraction_phase reads config from _state;
+                            # capture the mode that was injected by _run_trial_consolidation.
+                            import paramem.server.app as _app
+
+                            captured_cfg["mode"] = _app._state["config"].consolidation.mode
                             return mock_summary
 
                         with patch(
-                            "paramem.server.consolidation.run_consolidation",
+                            "paramem.server.app._run_extraction_phase",
                             side_effect=capture_run,
                         ):
                             with patch(
@@ -616,7 +618,7 @@ class TestSlice4GateExtensions:
                         mock_gpu.return_value.__exit__ = MagicMock(return_value=False)
 
                         with patch(
-                            "paramem.server.consolidation.run_consolidation",
+                            "paramem.server.app._run_extraction_phase",
                             return_value=mock_summary,
                         ):
                             with patch(
@@ -688,7 +690,7 @@ class TestSlice4GateExtensions:
                         mock_gpu.return_value.__exit__ = MagicMock(return_value=False)
 
                         with patch(
-                            "paramem.server.consolidation.run_consolidation",
+                            "paramem.server.app._run_extraction_phase",
                             return_value=mock_summary,
                         ):
                             with patch(

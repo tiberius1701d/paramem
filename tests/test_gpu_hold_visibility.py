@@ -7,7 +7,7 @@ Covers:
 - ``_clear_hold_env`` invokes ``systemctl --user unset-environment`` with all
   three hold variables.
 
-The auto-reclaim loop and the /gpu/force-local endpoint depend on these
+The auto-reclaim loop and the /gpu/acquire endpoint depend on these
 helpers; they are the operator-visibility surface surfaced to /status and
 ``pstatus``.
 """

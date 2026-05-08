@@ -299,6 +299,25 @@ def _collect_extract_session_kwargs(py_file: Path) -> list[set[str]]:
     return out
 
 
+def _collect_extract_session_callsites(
+    py_file: Path,
+) -> list[tuple[int, set[str]]]:
+    """Return ``(lineno, kwarg_name_set)`` for every ``*.extract_session(...)``
+    call in ``py_file``."""
+    import ast
+
+    tree = ast.parse(py_file.read_text())
+    out: list[tuple[int, set[str]]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "extract_session"
+        ):
+            out.append((node.lineno, {kw.arg for kw in node.keywords if kw.arg is not None}))
+    return out
+
+
 def test_server_extract_session_callsites_pass_identical_kwargs():
     """Gap D: every `*.extract_session(...)` call site under `paramem/server/`
     must pass the same kwarg names as every other server caller.
@@ -307,42 +326,45 @@ def test_server_extract_session_callsites_pass_identical_kwargs():
     landed) means the same consolidation operation runs with different SOTA
     pipeline behavior depending on which code path triggered it.
 
-    Scans the whole `paramem/server/` tree, so a new orchestrator that starts
-    calling `extract_session` is audited automatically — no test edit needed.
+    Scans the whole `paramem/server/` tree at call-site granularity.  After
+    D2 merged the second orchestrator into ``app.py``, both call sites live in
+    the same file — per-file deduplication would hide a divergence between
+    them.  This version tracks each site independently so parity is enforced
+    regardless of how many files the sites are spread across.
     """
     repo_root = Path(__file__).resolve().parent.parent
     server_dir = repo_root / "paramem" / "server"
 
-    per_file: dict[str, set[str]] = {}
+    # key: "<rel_path>:<lineno>", value: kwarg name set
+    all_sites: dict[str, set[str]] = {}
     for py_file in server_dir.rglob("*.py"):
-        call_kwargs = _collect_extract_session_kwargs(py_file)
-        if not call_kwargs:
-            continue
-        per_file[py_file.relative_to(repo_root).as_posix()] = set().union(*call_kwargs)
+        for lineno, kwset in _collect_extract_session_callsites(py_file):
+            label = f"{py_file.relative_to(repo_root).as_posix()}:{lineno}"
+            all_sites[label] = kwset
 
-    assert len(per_file) >= 2, (
+    assert len(all_sites) >= 2, (
         "expected at least two server-layer extract_session call sites; found: "
-        f"{sorted(per_file)}. If extract_session was refactored out of the server, "
-        "update or remove this test. If a new caller replaced an old one, the "
-        "single remaining site still needs a peer for parity to be meaningful."
+        f"{sorted(all_sites)}. If extract_session was refactored out of the server, "
+        "update or remove this test.  Both orchestration paths in app.py "
+        "(_extract_and_start_training and _run_extraction_phase) must be present."
     )
 
-    reference_path, reference_kwargs = sorted(per_file.items())[0]
+    reference_label, reference_kwargs = sorted(all_sites.items())[0]
     divergent: dict[str, tuple[set[str], set[str]]] = {}
-    for path, kwargs in per_file.items():
-        if path == reference_path:
+    for label, kwargs in all_sites.items():
+        if label == reference_label:
             continue
         missing_here = reference_kwargs - kwargs
         extra_here = kwargs - reference_kwargs
         if missing_here or extra_here:
-            divergent[path] = (missing_here, extra_here)
+            divergent[label] = (missing_here, extra_here)
 
     assert not divergent, (
         "extract_session kwargs diverge across server-layer call sites — same "
-        f"operation, different flags. Reference: {reference_path}\n"
+        f"operation, different flags. Reference: {reference_label}\n"
         + "\n".join(
-            f"  {path}: missing={sorted(miss)} extra={sorted(extra)}"
-            for path, (miss, extra) in sorted(divergent.items())
+            f"  {label}: missing={sorted(miss)} extra={sorted(extra)}"
+            for label, (miss, extra) in sorted(divergent.items())
         )
     )
 
