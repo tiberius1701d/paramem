@@ -49,7 +49,12 @@ COMPUTE_TYPE_MULTIPLIER = {
     "float32": 4.0,
 }
 
-VRAM_HEADROOM_MB = 200  # GPU inference lock prevents concurrent usage
+VRAM_HEADROOM_MB = 0  # GPU inference lock prevents concurrent usage; the
+# per-model estimate is itself the required reserve. Whisper distil-large-v3
+# has a 2500 MiB estimate that already exceeds its measured runtime
+# footprint (~500 MiB on this device); an additional headroom on top
+# created false-failures post-cycle when allocator-pool growth left only
+# ~2497 MiB free — the gate would refuse a load that physically fits.
 
 
 class WhisperSTT:

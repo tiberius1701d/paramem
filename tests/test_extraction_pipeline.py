@@ -552,8 +552,13 @@ class TestSOTANoiseFilter:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value="not json"),
-            patch("paramem.models.loader.adapt_messages", return_value=[]),
+            # ``generate_answer`` and ``adapt_messages`` are imported at
+            # module top in ``paramem.graph.extractor`` (no longer lazy).
+            # Patches must target the bound name in that module, not the
+            # source module — the rebound name is what ``extractor``
+            # actually calls.
+            patch("paramem.graph.extractor.generate_answer", return_value="not json"),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
             result, mapping, anon_transcript, _raw = _anonymize_with_local_model(
                 graph, model, tokenizer
@@ -727,8 +732,10 @@ class TestSOTANoiseFilter:
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=kept_response),
-            patch("paramem.models.loader.adapt_messages", return_value=[]),
+            # See companion comment above: extractor binds these names
+            # at module top, so patches must target the bound name.
+            patch("paramem.graph.extractor.generate_answer", return_value=kept_response),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
             result, raw = _local_plausibility_filter(facts, "transcript", MagicMock(), tokenizer)
         assert result is not None

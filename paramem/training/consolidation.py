@@ -34,6 +34,7 @@ from paramem.graph.scoring import (
     get_relations_for_nodes,
 )
 from paramem.models.loader import atomic_save_adapter, save_adapter, switch_adapter
+from paramem.server.vram_guard import vram_scope
 from paramem.training.curriculum import CurriculumSampler
 from paramem.training.indexed_memory import (
     assign_keys,
@@ -584,12 +585,17 @@ class ConsolidationLoop:
         # session_graph.relations and entity.attributes, projects attributes
         # into the relation-dict shape, partitions by relation_type, and mints
         # QA pairs for the episodic side.
-        episodic_qa, procedural_rels = generate_qa_from_graph(
-            session_graph,
-            procedural_enabled=self.procedural_config is not None,
-            model=self.model,
-            tokenizer=self.tokenizer,
-        )
+        # vram_scope: QA-gen runs one model.generate per relation. The
+        # immediately-preceding plausibility filter (deanon stage) reserves
+        # a multi-GiB KV-cache pool; without an empty_cache between phases
+        # the QA-gen prefill exhausts the device on small-VRAM hosts.
+        with vram_scope(f"qa_gen:{session_id}"):
+            episodic_qa, procedural_rels = generate_qa_from_graph(
+                session_graph,
+                procedural_enabled=self.procedural_config is not None,
+                model=self.model,
+                tokenizer=self.tokenizer,
+            )
 
         # --- PROCEDURAL: separate extraction pass ---
         if self.procedural_config is not None:

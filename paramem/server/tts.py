@@ -304,8 +304,17 @@ class TTSManager:
         self._default_language = config.default_language
 
     def load_all(self) -> None:
-        """Load all configured voice engines."""
+        """Load all configured voice engines.
+
+        Idempotent at the per-language level: an engine already in
+        ``self._engines`` is skipped. This matters when ``load_all`` is
+        re-invoked after a previous call where some engines loaded and
+        others failed — the failed ones get a retry without leaking
+        duplicate engine instances for the successful ones.
+        """
         for lang_code, voice_config in self._config.voices.items():
+            if lang_code in self._engines:
+                continue
             device = voice_config.device or self._config.device
             engine = _create_engine(voice_config, self._config, self._vram_safety_margin_mb)
 

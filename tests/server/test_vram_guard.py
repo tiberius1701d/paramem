@@ -86,15 +86,47 @@ class TestVramScope:
         assert empty.call_count >= 1
 
     def test_non_oom_exception_propagates_unchanged(self):
-        class _Sentinel(RuntimeError):
-            pass
-
+        # Use a plain RuntimeError whose message does NOT match any
+        # CUDA-driver-fault marker — the widened catch must let it pass.
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache") as empty:
-                with pytest.raises(_Sentinel):
+                with pytest.raises(RuntimeError, match="not an OOM"):
                     with vram_scope("s003"):
-                        raise _Sentinel("not an OOM")
+                        raise RuntimeError("not an OOM")
         empty.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "marker_message",
+        [
+            "CUDA driver error: device not ready",
+            "CUDA error: device not ready",
+            "device not ready",
+        ],
+    )
+    def test_cuda_driver_fault_runtimeerror_converted_to_vram_exhausted(self, marker_message):
+        """WSL2 dxgkrnl reports unsatisfiable allocations as bare
+        ``RuntimeError("...device not ready...")``, not ``OutOfMemoryError``.
+
+        The vram_scope must treat these as the same VRAM-overalloc class
+        so ``last_consolidation_error`` populates and the cycle aborts
+        cleanly.
+        """
+        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+                with pytest.raises(VramExhausted) as info:
+                    with vram_scope("plaus_filter"):
+                        raise RuntimeError(marker_message)
+        assert info.value.args == ("plaus_filter",)
+        assert isinstance(info.value.__cause__, RuntimeError)
+
+    def test_empty_cache_called_on_cuda_driver_fault(self):
+        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.server.vram_guard.torch.cuda.empty_cache") as empty:
+                with pytest.raises(VramExhausted):
+                    with vram_scope("plaus_filter"):
+                        raise RuntimeError("CUDA driver error: device not ready")
+        # Once on the fault path before re-raise, once in the finally — both fine.
+        assert empty.call_count >= 1
 
     def test_empty_cache_failure_is_swallowed(self):
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
@@ -347,3 +379,163 @@ class TestDoneCallbackErrorSurfacing:
             assert _state["consolidating"] is False
         finally:
             _state["last_consolidation_error"] = prior
+
+
+class TestPerChunkOOMSkip:
+    """`_extract_and_start_training` per-chunk VramExhausted skip mechanism.
+
+    A ``VramExhausted`` raised inside the per-chunk wrapping must:
+    - be caught locally (not propagate out of the cycle)
+    - record the chunk's session_id in the local ``failed_session_ids`` set
+    - append a ``{session_id, phase, at}`` entry to ``_state["chunk_failures"]``
+    - exclude the failed chunk from the ``mark_consolidated`` call so it
+      stays pending for retry on the next cycle
+    - allow subsequent chunks in the same cycle to proceed normally
+
+    Mirrors the empirical behaviour the user verified across 3 sequential
+    live cycles (post-cycle state was identical 5626/2266 with no
+    accumulating leak; the skip path didn't fire because all chunks
+    succeeded). Without a unit test, regressions in
+    ``_completed_session_ids`` / ``mark_consolidated`` filtering can ship
+    silently.
+    """
+
+    @staticmethod
+    def _make_state(tmp_path):
+        """Build a minimal `_state` mock that lets `_extract_and_start_training`
+        run end-to-end without touching real GPU work or HF/wyoming.
+
+        Returns (config, buffer, loop) for the caller's assertions.
+        """
+        from unittest.mock import MagicMock
+
+        from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.session_buffer import SessionBuffer
+
+        # Two doc-source pending sessions so we can verify subsequent
+        # chunks proceed after the first one's OOM.
+        config = ServerConfig()
+        ha = tmp_path / "ha"
+        config.paths = PathsConfig(
+            data=ha,
+            sessions=ha / "sessions",
+            debug=ha / "debug",
+            simulate=ha / "simulate",
+        )
+        # Disable indexed_key_replay so the no-facts/early-exit path
+        # is the simplest and most testable shape (we're only verifying
+        # the per-chunk skip + mark_consolidated filter, not training).
+        config.consolidation.indexed_key_replay = False
+
+        (ha / "adapters").mkdir(parents=True, exist_ok=True)
+
+        buffer = SessionBuffer(ha / "sessions", debug=False)
+        # Two pending document sessions, both with speaker_id set.
+        for sid in ("doc-aaa", "doc-bbb"):
+            buffer.set_speaker(sid, "Speaker1", "Speaker1")
+            buffer.append(
+                sid,
+                "user",
+                f"Synthetic chunk for {sid}",
+                metadata={"source_type": "document", "doc_title": sid, "chunk_index": 0},
+            )
+
+        # Mock loop with extract_session: VramExhausted for doc-aaa,
+        # success ([], []) for doc-bbb. Track call count to assert the
+        # second chunk really did run.
+        loop = MagicMock()
+        loop.shutdown_requested = False
+        loop.config = MagicMock()
+        loop.config.indexed_key_replay_enabled = False
+
+        from paramem.server.vram_guard import VramExhausted as _Exh
+
+        def _extract(transcript, sid, **kwargs):
+            if sid == "doc-aaa":
+                raise _Exh("doc-aaa")
+            return ([], [])
+
+        loop.extract_session = MagicMock(side_effect=_extract)
+        loop.model = None  # cloud-only model handle (irrelevant to this path)
+
+        return config, buffer, loop
+
+    def test_first_chunk_oom_lets_second_chunk_run_and_filter_mark_consolidated(self, tmp_path):
+        """Single VramExhausted on chunk #1 must NOT poison chunk #2.
+
+        Asserts both `extract_session` calls happen (chunk #2 reaches
+        the loop), `_state["chunk_failures"]` records the first chunk,
+        and `mark_consolidated` is called with only the survivor.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server import app as app_module
+
+        config, buffer, loop = self._make_state(tmp_path)
+
+        # Patch the SessionBuffer.mark_consolidated so we can inspect args
+        # without it having to manage real archive state.
+        marked: list[list[str]] = []
+        original_mark = buffer.mark_consolidated
+        buffer.mark_consolidated = lambda ids: marked.append(list(ids)) or original_mark([])
+
+        prior_state = {k: app_module._state.get(k) for k in app_module._state}
+        try:
+            app_module._state["config"] = config
+            app_module._state["session_buffer"] = buffer
+            app_module._state["consolidation_loop"] = loop
+            app_module._state["model"] = None
+            app_module._state["tokenizer"] = None
+            app_module._state["chunk_failures"] = []
+            # No HA, no speaker_store, no background trainer for this test
+            app_module._state["ha_client"] = None
+            app_module._state["speaker_store"] = None
+
+            # GPU lock + voice helpers + vram_scope + assert_free_vram are
+            # no-ops for this test — we only care about the OOM-skip flow.
+            no_lock = MagicMock()
+            no_lock.__enter__ = MagicMock(return_value=None)
+            no_lock.__exit__ = MagicMock(return_value=False)
+
+            with (
+                patch("paramem.server.gpu_lock.gpu_lock_sync", return_value=no_lock),
+                patch("paramem.server.app._evict_voice_pipeline"),
+                patch("paramem.server.app._load_voice_pipeline"),
+                patch("paramem.server.app.assert_free_vram"),
+                patch("paramem.server.app.vram_scope", return_value=no_lock),
+                # `_increment_key_sessions` and `create_consolidation_loop`
+                # are lazily imported inside _extract_and_start_training
+                # from paramem.server.consolidation; patch them there.
+                patch("paramem.server.consolidation._increment_key_sessions"),
+                patch(
+                    "paramem.server.consolidation.create_consolidation_loop",
+                    return_value=loop,
+                ),
+            ):
+                app_module._extract_and_start_training()
+
+            # Both chunks attempted — chunk #2 reached the loop after #1's OOM.
+            assert loop.extract_session.call_count == 2
+
+            # Failure tracked in _state["chunk_failures"].
+            failures = app_module._state.get("chunk_failures", [])
+            failure_ids = {f["session_id"] for f in failures}
+            assert "doc-aaa" in failure_ids, f"doc-aaa should be in chunk_failures, got {failures}"
+            for f in failures:
+                if f["session_id"] == "doc-aaa":
+                    assert f["phase"] == "doc-aaa"
+                    assert "at" in f
+
+            # mark_consolidated was called, but ONLY with chunks that
+            # didn't fail. doc-aaa must be excluded; doc-bbb included.
+            assert marked, "mark_consolidated was never called"
+            all_marked = [sid for batch in marked for sid in batch]
+            assert "doc-aaa" not in all_marked, (
+                f"doc-aaa was incorrectly marked consolidated: {all_marked}"
+            )
+            assert "doc-bbb" in all_marked, (
+                f"doc-bbb should have been marked consolidated, got {all_marked}"
+            )
+        finally:
+            for k, v in prior_state.items():
+                app_module._state[k] = v
