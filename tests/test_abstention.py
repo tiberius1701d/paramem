@@ -129,6 +129,30 @@ class TestAbstentionShortCircuit:
         router._speaker_key_index = {speaker_id: {"graph0001"}}
         return router
 
+    def _make_router_with_steps(self, speaker_id: str, intent=None):
+        """Router that yields a non-empty plan.steps so the chat handler
+        dispatches into ``_probe_and_reason`` rather than the no-steps
+        abstention branch in ``handle_chat``.
+        """
+        from paramem.server.router import Intent, RoutingPlan, RoutingStep
+
+        if intent is None:
+            intent = Intent.PERSONAL
+
+        router = MagicMock()
+        router.route = lambda text, speaker=None, speaker_id=None: RoutingPlan(
+            strategy="direct",
+            intent=intent,
+            steps=[
+                RoutingStep(adapter_name="episodic", keys_to_probe=["graph0001"]),
+            ],
+        )
+        router._speaker_key_index = {speaker_id: {"graph0001"}}
+        # _all_entities is read by handle_chat for the sanitizer's known-entities
+        # set; an empty list is a valid stub that doesn't perturb sanitization.
+        router._all_entities = []
+        return router
+
     def test_fires_when_sanitizer_blocks_and_no_match(self):
         """Self-referential query + speaker has facts but query missed →
         canned ``response``, never invokes ``_base_model_answer``."""
@@ -369,3 +393,149 @@ class TestAbstentionShortCircuit:
 
         mock_base_model.assert_called_once()
         assert result.text == "base fallback"
+
+    def test_fires_in_probe_and_reason_when_probes_fail_and_sanitizer_blocks(self):
+        """Speaker has keys (router builds plan.steps), the query routes
+        through ``_probe_and_reason``, every probe misses, sanitizer blocks
+        cloud egress.  The previous fallthrough went to ``_base_model_answer``
+        (confabulation risk on personal interrogatives — AbstentionBench
+        showed prompt-only abstention is unreliable at 7B).  The new
+        short-circuit returns the canned ``response`` instead.
+
+        This branch is structurally distinct from the no-steps abstention
+        gate at ``handle_chat``: a speaker with ANY keys in the index will
+        always route through this path for every PERSONAL query, so the
+        more facts a speaker has, the more reliably this gap fires.
+        """
+        from paramem.server.inference import handle_chat
+
+        config = ServerConfig()
+        assert config.abstention.enabled is True
+
+        # Make every probe miss so ``layers`` stays empty in _probe_and_reason.
+        # Sanitizer blocks (returns None) which prevents HA / SOTA escalation
+        # and previously dropped through to _base_model_answer.
+        with (
+            patch(
+                "paramem.server.inference.sanitize_for_cloud",
+                return_value=(None, ["first_person_personal"]),
+            ),
+            patch(
+                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                return_value={"graph0001": None},
+            ),
+            patch(
+                "paramem.training.indexed_memory.probe_keys_from_disk",
+                return_value={"graph0001": None},
+            ),
+            patch("paramem.server.inference._base_model_answer") as mock_base_model,
+        ):
+            result = handle_chat(
+                text="Where do I live?",
+                conversation_id="test",
+                speaker="Alex",
+                history=None,
+                model=self._minimal_mock_model(),
+                tokenizer=MagicMock(),
+                config=config,
+                router=self._make_router_with_steps("spk-abc123"),
+                speaker_id="spk-abc123",
+            )
+
+        assert result.text == config.abstention.load_response()
+        mock_base_model.assert_not_called()
+
+    def test_ha_tool_answer_preferred_over_abstention_in_probe_and_reason(self):
+        """Inside ``_probe_and_reason``, when probes fail but HA returns a
+        tool answer (calendar, sensors, etc.), use the HA answer rather
+        than abstain.  HA tool answers are factual, not hallucinated, so
+        the no-hallucinate guarantee is preserved while still serving
+        personal queries that route through HA tools (e.g. "What's my next
+        meeting?").
+        """
+        from paramem.server.inference import ChatResult, handle_chat
+
+        config = ServerConfig()
+
+        with (
+            # Sanitizer ALLOWS the query (returns sanitized text, not None).
+            # This represents a personal-flavored query that doesn't trip
+            # the self-referential blocker — HA can be attempted.
+            patch(
+                "paramem.server.inference.sanitize_for_cloud",
+                return_value=("What's my next meeting?", []),
+            ),
+            patch(
+                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                return_value={"graph0001": None},
+            ),
+            patch(
+                "paramem.training.indexed_memory.probe_keys_from_disk",
+                return_value={"graph0001": None},
+            ),
+            patch(
+                "paramem.server.inference._escalate_to_ha_agent",
+                return_value=ChatResult(text="Your 3pm with Pat.", escalated=True),
+            ) as mock_ha,
+            patch("paramem.server.inference._base_model_answer") as mock_base_model,
+        ):
+            result = handle_chat(
+                text="What's my next meeting?",
+                conversation_id="test",
+                speaker="Alex",
+                history=None,
+                model=self._minimal_mock_model(),
+                tokenizer=MagicMock(),
+                config=config,
+                router=self._make_router_with_steps("spk-abc123"),
+                speaker_id="spk-abc123",
+            )
+
+        mock_ha.assert_called_once()
+        assert result.text == "Your 3pm with Pat."
+        # Neither abstention nor base model were used — HA answered.
+        assert result.text != config.abstention.load_response()
+        mock_base_model.assert_not_called()
+
+    def test_probe_and_reason_disabled_falls_through_to_base_model(self):
+        """With abstention.enabled=False, ``_probe_and_reason`` retains the
+        old behavior: sanitizer-blocked + no probes + no HA → base model.
+        Locks the toggle as a real opt-out for both abstention sites
+        (handle_chat AND _probe_and_reason)."""
+        from paramem.server.inference import ChatResult, handle_chat
+
+        config = ServerConfig()
+        config.abstention.enabled = False
+
+        with (
+            patch(
+                "paramem.server.inference.sanitize_for_cloud",
+                return_value=(None, ["first_person_personal"]),
+            ),
+            patch(
+                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                return_value={"graph0001": None},
+            ),
+            patch(
+                "paramem.training.indexed_memory.probe_keys_from_disk",
+                return_value={"graph0001": None},
+            ),
+            patch(
+                "paramem.server.inference._base_model_answer",
+                return_value=ChatResult(text="base model answer"),
+            ) as mock_base_model,
+        ):
+            result = handle_chat(
+                text="Where do I live?",
+                conversation_id="test",
+                speaker="Alex",
+                history=None,
+                model=self._minimal_mock_model(),
+                tokenizer=MagicMock(),
+                config=config,
+                router=self._make_router_with_steps("spk-abc123"),
+                speaker_id="spk-abc123",
+            )
+
+        mock_base_model.assert_called_once()
+        assert result.text == "base model answer"

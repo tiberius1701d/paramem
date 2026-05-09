@@ -177,6 +177,56 @@ class ChatResult:
     probed_keys: list[str] = field(default_factory=list)
 
 
+def _abstain_if_applicable(
+    text: str,
+    config: ServerConfig,
+    *,
+    is_personal: bool,
+    speaker_id: str | None = None,
+    router=None,
+) -> tuple[ChatResult, str] | None:
+    """Decide whether to short-circuit with the canned abstention response.
+
+    Gate: ``config.abstention.enabled`` AND ``is_personal`` AND the query
+    is interrogative (per :func:`paramem.server.router._is_interrogative`).
+    When the gate fires, returns ``(canned_chat_result, exit_via_label)``;
+    otherwise returns ``None`` and the caller continues the escalation
+    chain.
+
+    The cold-start variant fires when ``speaker_id`` is set but the
+    router has no keys for them yet (between enrollment and the first
+    consolidation cycle).  The standard ``response`` covers the
+    coverage-gap case (speaker has facts but this query missed them).
+    Callers that don't know the cold-start state — e.g. a callee deep
+    in the dispatch tree where probes already succeeded — can omit
+    ``router`` / ``speaker_id`` and the helper defaults to the canned
+    response.
+
+    The label distinguishes ``"abstention_cold_start"`` from
+    ``"abstention_canned"`` for routing-diagnostics; callers update
+    their own diag dicts from the returned label as needed.
+
+    AbstentionBench (NeurIPS 2025) showed prompt-only abstention is
+    unreliable at 7B-9B; this deterministic short-circuit is the only
+    fix with zero hallucination risk on personal interrogatives that
+    parametric memory cannot answer.
+    """
+    from paramem.server.router import _is_interrogative
+
+    if not (config.abstention.enabled and is_personal and _is_interrogative(text)):
+        return None
+    is_cold_start = bool(speaker_id) and (
+        router is None or not router._speaker_key_index.get(speaker_id)
+    )
+    response_text = (
+        config.abstention.load_cold_start_response()
+        if is_cold_start
+        else config.abstention.load_response()
+    )
+    label = "abstention_cold_start" if is_cold_start else "abstention_canned"
+    return ChatResult(text=response_text), label
+
+
 def handle_chat(
     text: str,
     conversation_id: str,
@@ -313,50 +363,33 @@ def handle_chat(
         # Declarative personal turns (introductions, fact-sharing) are not a
         # confabulation risk — the user is the source of the facts in the same
         # turn — so they fall through to the base model for conversational
-        # acknowledgement.  The interrogative gate distinguishes the two.
+        # acknowledgement.  The interrogative gate (inside the helper)
+        # distinguishes the two.
         #
-        # Gate uses the router's intent decision rather than a sanitizer
-        # finding: the intent classifier draws on PA state and the encoder
-        # residual, which generalizes beyond first-person pronouns
-        # (e.g. "Where does Alex live?" classified as PERSONAL via PA
-        # match would also benefit from abstention if PA probe couldn't
-        # satisfy it; though in practice PERSONAL with steps is terminal-
-        # returned from _probe_and_reason and never reaches this branch).
-        #
-        # Two response variants distinguish the two states:
-        #
-        # * Cold start — speaker is identified but the router has no keys for
-        #   them yet (typical between enrollment and the next consolidation).
-        #   The canned "I don't have that information stored yet" reads as
-        #   confused in that state because the system *can't* have facts about
-        #   a freshly enrolled speaker. Use ``cold_start_response`` instead.
-        # * Coverage gap — speaker has parametric facts but this query missed.
-        #   The standard ``response`` is appropriate.
-        from paramem.server.router import _is_interrogative
-
-        if (
-            sanitized_text is None
-            and config.abstention.enabled
-            and is_personal
-            and _is_interrogative(text)
-        ):
-            is_cold_start = bool(speaker_id) and (
-                router is None or not router._speaker_key_index.get(speaker_id)
+        # Scoped to the sanitizer-blocked path here: when the sanitizer
+        # allowed the query, escalation has already been attempted above
+        # (HA → SOTA fallback) and either succeeded or failed for non-
+        # privacy reasons; only the sanitizer-blocked path falls through
+        # without trying anything.  The companion call site inside
+        # ``_probe_and_reason`` covers the parallel case where probes
+        # ran but recalled nothing.
+        if sanitized_text is None:
+            abstention = _abstain_if_applicable(
+                text,
+                config,
+                is_personal=is_personal,
+                speaker_id=speaker_id,
+                router=router,
             )
-            response_text = (
-                config.abstention.load_cold_start_response()
-                if is_cold_start
-                else config.abstention.load_response()
-            )
-            routing_diags["paths_attempted"].append("abstention")
-            routing_diags["exit_via"] = (
-                "abstention_cold_start" if is_cold_start else "abstention_canned"
-            )
-            logger.info(
-                "Abstention: self-referential query + no local match (cold_start=%s)",
-                is_cold_start,
-            )
-            return ChatResult(text=response_text)
+            if abstention is not None:
+                result, label = abstention
+                routing_diags["paths_attempted"].append("abstention")
+                routing_diags["exit_via"] = label
+                logger.info(
+                    "Abstention: self-referential query + no local match (%s)",
+                    label,
+                )
+                return result
 
         # All cloud services failed — local base model as last resort
         routing_diags["paths_attempted"].append("base")
@@ -720,6 +753,27 @@ def _probe_and_reason(
             )
             if sota_result is not None:
                 return sota_result
+        # Abstention: ``_probe_and_reason`` is reached only for PERSONAL with
+        # non-empty plan.steps (handle_chat dispatch).  Probes failed and HA
+        # had no tool answer either; the base model has no context here
+        # (``not layers`` means no facts were recalled), so generating an
+        # answer would be unconditional confabulation.
+        #
+        # ``router`` and ``speaker_id`` are not threaded into this function —
+        # default of ``None`` makes :func:`_abstain_if_applicable` return the
+        # canned response (cold-start can't apply: reaching here means the
+        # router built probes from the speaker's existing keys, so the
+        # speaker has facts and the coverage-gap response fits).
+        abstention = _abstain_if_applicable(text, config, is_personal=is_personal)
+        if abstention is not None:
+            result, _label = abstention
+            logger.info(
+                "Abstention: PA-empty personal interrogative in _probe_and_reason "
+                "(probes=%d failed, HA returned None)",
+                sum(len(s.keys_to_probe) for s in plan.steps),
+            )
+            return result
+
         return _base_model_answer(
             text,
             history,

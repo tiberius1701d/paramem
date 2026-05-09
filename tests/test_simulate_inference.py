@@ -304,8 +304,8 @@ class TestSimulateInferenceEndToEnd:
     # T2
     # ------------------------------------------------------------------
 
-    def test_pa_match_kp_missing_falls_through_to_ha_then_base(self, tmp_path):
-        """No keyed_pairs.json → fallback chain HA → base-model.
+    def test_pa_match_kp_missing_falls_through_to_ha_then_abstains(self, tmp_path):
+        """No keyed_pairs.json → fallback chain HA → abstention.
 
         Under the intent-keyed dispatch, ``intent=PERSONAL`` (set by the
         ``_pa_router_stub``) blocks SOTA at every internal escalation site.
@@ -315,22 +315,28 @@ class TestSimulateInferenceEndToEnd:
             ↓ (returns None)
             SOTA blocked by privacy invariant (would have run pre-Phase-2)
             ↓
-            base-model fallthrough
+            abstention canned response (NOT base-model — base model would
+            confabulate personal facts; AbstentionBench-grounded short-
+            circuit prevents that)
 
         Setup:
         - ``paths.simulate`` exists but is empty (no keyed_pairs).
         - HA returns ``None``.
         - SOTA mock present but must NOT be invoked.
-        - ``_base_model_answer`` patched to return the terminal answer.
+        - ``_base_model_answer`` patched but must NOT be invoked either —
+          abstention short-circuits before reaching it.
 
         Assertions:
         - HA was tried once (tool fallback allowed for PERSONAL).
         - SOTA was NOT called (privacy invariant for PERSONAL).
-        - ``_base_model_answer`` was reached as the terminal step.
+        - ``_base_model_answer`` was NOT called (abstention pre-empts it).
+        - The returned text is the configured abstention response.
 
         Why this catches a regression: any future change that re-enables
         the SOTA fallback for PERSONAL queries on disk-recall failure
-        breaks this test.
+        breaks this test.  Equally, any change that puts ``_base_model_answer``
+        back on the personal-no-recall path (re-introducing confabulation
+        risk) breaks the abstention assertion below.
         """
         config = _simulate_config(tmp_path)
         # The privacy invariant tested here ("PERSONAL never reaches
@@ -347,8 +353,6 @@ class TestSimulateInferenceEndToEnd:
         model = _stub_model()
         tokenizer = MagicMock()
 
-        base_result = ChatResult(text="<base>")
-
         with (
             patch(
                 "paramem.server.inference.sanitize_for_cloud",
@@ -364,7 +368,7 @@ class TestSimulateInferenceEndToEnd:
             ) as mock_sota,
             patch(
                 "paramem.server.inference._base_model_answer",
-                return_value=base_result,
+                return_value=ChatResult(text="<base>"),
             ) as mock_base,
         ):
             result = handle_chat(
@@ -381,23 +385,24 @@ class TestSimulateInferenceEndToEnd:
                 speaker_id="spk-test",
             )
 
-        assert result.text == "<base>"
+        assert result.text == config.abstention.load_response()
         mock_ha.assert_called_once()
         mock_sota.assert_not_called()
-        mock_base.assert_called_once()
+        mock_base.assert_not_called()
         model.generate.assert_not_called()
 
     # ------------------------------------------------------------------
     # T2b
     # ------------------------------------------------------------------
 
-    def test_pa_match_kp_missing_all_cloud_failed_falls_to_base(self, tmp_path):
-        """No keyed_pairs + HA fails + SOTA unavailable → base-model helper reached.
+    def test_pa_match_kp_missing_all_cloud_failed_abstains(self, tmp_path):
+        """No keyed_pairs + HA fails + SOTA unavailable → abstention.
 
         Setup:
         - ``paths.simulate`` exists but empty.
         - ``sota_agent=None`` and HA returns ``None``.
-        - ``_base_model_answer`` patched to return ``ChatResult(text="<base>")``.
+        - ``_base_model_answer`` patched but must NOT fire — abstention
+          pre-empts it.
 
         Code path: inside ``_probe_and_reason``, when ``layers`` is empty and
         ``sanitize_for_cloud`` allows escalation:
@@ -405,14 +410,21 @@ class TestSimulateInferenceEndToEnd:
             result = _escalate_to_ha_agent(...)  # → None
             if result is not None: return result  # skipped
             if sota_agent is not None: ...        # skipped (sota_agent is None)
-            return _base_model_answer(...)        # reached
+            # Personal interrogative + abstention enabled (default) →
+            # canned response.  The bare base model would otherwise
+            # confabulate personal facts here.
+            return ChatResult(text=config.abstention.load_response())
 
         Assertion:
-        - ``_base_model_answer`` was called once.
+        - The returned text is the abstention canned response.
+        - ``_base_model_answer`` was NOT called.
 
-        Why this catches a regression: when all cloud paths are exhausted
-        the caller must fall through to ``_base_model_answer``.  This
-        verifies the fallback is not short-circuited.
+        Why this catches a regression: when probes fail for a PERSONAL
+        interrogative and no tool/cloud answer exists, the bare base
+        model must NEVER be reached.  AbstentionBench (NeurIPS 2025)
+        confirms 7B-class models cannot be relied on for prompt-only
+        abstention — the deterministic short-circuit is the only fix
+        with zero hallucination risk.
         """
         config = _simulate_config(tmp_path)
         config.simulate_dir.mkdir(parents=True, exist_ok=True)
@@ -420,8 +432,6 @@ class TestSimulateInferenceEndToEnd:
         router = _pa_router_stub("episodic", ["graph1"])
         model = _stub_model()
         tokenizer = MagicMock()
-
-        base_result = ChatResult(text="<base>")
 
         with (
             patch(
@@ -434,7 +444,7 @@ class TestSimulateInferenceEndToEnd:
             ),
             patch(
                 "paramem.server.inference._base_model_answer",
-                return_value=base_result,
+                return_value=ChatResult(text="<base>"),
             ) as mock_base,
         ):
             result = handle_chat(
@@ -446,13 +456,13 @@ class TestSimulateInferenceEndToEnd:
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
-                sota_agent=None,  # None so SOTA branch is skipped; falls to _base_model_answer
+                sota_agent=None,  # None so SOTA branch is skipped
                 ha_client=MagicMock(),
                 speaker_id="spk-test",
             )
 
-        mock_base.assert_called_once()
-        assert result.text == "<base>"
+        assert result.text == config.abstention.load_response()
+        mock_base.assert_not_called()
 
     # ------------------------------------------------------------------
     # T3
