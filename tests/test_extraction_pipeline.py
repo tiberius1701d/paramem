@@ -219,14 +219,23 @@ class TestExtractJsonBlock:
         result = json.loads(_extract_json_block(text))
         assert result[0]["subject"] == "Alex"
 
-    def test_array_before_object(self):
-        # First candidate `[1, 2]` is a list of scalars (no ``subject`` key
-        # in a dict element) — rejected as not-an-envelope.  Walk continues
-        # to the dict envelope.  Documents that bare-scalar lists are not
+    def test_string_list_before_object(self):
+        # First candidate `["a", "b"]` has neither dict-shaped nor int-typed
+        # elements — rejected as not-an-envelope.  Walk continues to the
+        # dict envelope.  Documents that string-list scalars are not
         # accepted as envelopes (they would be truncation-survivors).
-        text = '[1, 2] {"entities": []}'
+        text = '["a", "b"] {"entities": []}'
         result = json.loads(_extract_json_block(text))
         assert result == {"entities": []}
+
+    def test_bare_int_list_is_envelope(self):
+        # Plausibility-shape: drop-set bare integer array (`[0, 2, 5]`).
+        # Accepted as a valid envelope so the shared finder serves the
+        # drop-set parser without bespoke unwrap.  Distinct from extraction
+        # / enrichment outputs (those have dict-shaped first elements).
+        text = "[0, 2, 5]"
+        result = json.loads(_extract_json_block(text))
+        assert result == [0, 2, 5]
 
     def test_markdown_code_block(self):
         text = '```json\n{"facts": []}\n```'
@@ -677,6 +686,261 @@ class TestRenderIndexedFacts:
         )
         assert "Müller" in rendered
         assert "Köln" in rendered
+
+
+class TestEnrichmentDelta:
+    """``_parse_enrichment_delta`` and ``_apply_enrichment_delta`` are the
+    SOTA enrichment counterpart of the plausibility drop-set helpers.
+    The judge emits a small ``{"add": [...], "modify": [...], "drop":
+    [...], "bindings": {...}}`` envelope; every key is optional.  The
+    parser is permissive about wrapping (markdown fences / inline-code /
+    prose preamble) via the shared envelope finder.  The applier
+    composes modify → drop → add and reconstructs ``updated_transcript``
+    locally from ``bindings`` + ``anon_transcript`` (no transcript echo
+    on the wire).
+    """
+
+    @staticmethod
+    def _facts(n: int) -> list[dict]:
+        return [{"subject": f"S{i}", "predicate": "p", "object": f"O{i}"} for i in range(n)]
+
+    def test_empty_envelope_is_noop(self):
+        """``{}`` — model emitted nothing to do.  Surviving facts equal
+        input; transcript unchanged; bindings empty."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(3)
+        out, transcript, bindings, _ = _apply_enrichment_delta(facts, "{}", "hello")
+        assert out == facts
+        assert transcript == "hello"
+        assert bindings == {}
+
+    def test_drop_only(self):
+        """Pure subtractive delta — same shape as a plausibility output;
+        applier still works (drop is shared between protocols)."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(4)
+        out, _, _, _ = _apply_enrichment_delta(facts, '{"drop": [1, 3]}', None)
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S2"]
+
+    def test_add_only(self):
+        """Append-only — coreference resolution case."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(2)
+        raw = (
+            '{"add": [{"subject": "Person_1", "predicate": "married_to",'
+            ' "object": "Person_2", "relation_type": "social", "confidence": 0.9}]}'
+        )
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert len(out) == 3
+        assert out[2]["predicate"] == "married_to"
+
+    def test_modify_partial_field_update(self):
+        """Synonym dedup — replace ``employed_by`` with ``worked_for``
+        on a single indexed fact."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = [
+            {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
+            {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"},
+        ]
+        raw = '{"modify": [{"index": 0, "fields": {"predicate": "worked_for"}}]}'
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert out[0]["predicate"] == "worked_for"
+        # Other fields untouched (shallow merge).
+        assert out[0]["subject"] == "Alex"
+        assert out[0]["object"] == "Acme"
+        # Other facts untouched.
+        assert out[1] == facts[1]
+
+    def test_compound_split_via_drop_plus_add(self):
+        """``likes(P, "hiking and cooking")`` → drop the compound, add
+        two atomic facts.  Documents the canonical compound-split shape
+        in the new protocol."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = [
+            {"subject": "P", "predicate": "likes", "object": "hiking and cooking"},
+            {"subject": "P", "predicate": "lives_in", "object": "Berlin"},
+        ]
+        raw = (
+            '{"drop": [0],'
+            ' "add": [{"subject":"P","predicate":"likes","object":"hiking"},'
+            ' {"subject":"P","predicate":"likes","object":"cooking"}]}'
+        )
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        objs = [f["object"] for f in out]
+        assert "hiking and cooking" not in objs
+        assert "hiking" in objs
+        assert "cooking" in objs
+        assert "Berlin" in objs
+
+    def test_combined_modify_drop_add(self):
+        """All three actions together — exercises the full pipeline.
+        Indices in ``modify`` and ``drop`` reference the *original*
+        input list, regardless of application order."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(4)
+        raw = (
+            '{"modify": [{"index": 0, "fields": {"object": "O0_modified"}}],'
+            ' "drop": [2],'
+            ' "add": [{"subject":"S_new","predicate":"p","object":"O_new"}]}'
+        )
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        # S0 modified, S2 dropped, S_new appended → [S0, S1, S3, S_new]
+        subjects = [f["subject"] for f in out]
+        assert subjects == ["S0", "S1", "S3", "S_new"]
+        assert out[0]["object"] == "O0_modified"
+
+    def test_bindings_reconstruct_transcript_longest_first(self):
+        """Reconstruction must replace longest spans first so a longer
+        span wins over a shorter one that would otherwise consume part
+        of it."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts: list[dict] = []
+        anon = "Person_1 was a Senior Software Engineer at Org_1."
+        # Both bindings share the substring "Software Engineer".  Without
+        # longest-first ordering, "Software Engineer" would replace first
+        # and corrupt the longer span.
+        raw = '{"bindings": {"Role_1": "Senior Software Engineer", "Role_2": "Software Engineer"}}'
+        _, transcript, bindings, _ = _apply_enrichment_delta(facts, raw, anon)
+        assert "{Role_1}" in transcript
+        # "Software Engineer" should not survive because it was inside
+        # the longer span that got replaced first.
+        assert "Software Engineer" not in transcript
+        # Role_2's span no longer appears, so its placeholder isn't
+        # written into the transcript — that's expected, the binding
+        # just sits unused.
+        assert bindings == {
+            "Role_1": "Senior Software Engineer",
+            "Role_2": "Software Engineer",
+        }
+
+    def test_bindings_replace_all_occurrences(self):
+        """Entities mentioned more than once in the transcript get one
+        placeholder consistently — every occurrence replaced."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        anon = "Person_1 led Event. Later, Person_2 joined Event."
+        raw = '{"bindings": {"Event_1": "Event"}}'
+        _, transcript, _, _ = _apply_enrichment_delta([], raw, anon)
+        assert transcript.count("{Event_1}") == 2
+        assert "Event " not in transcript or transcript.count("Event ") == 0
+
+    def test_code_fenced_envelope_unwrapped(self):
+        """Markdown fences handled by the shared envelope finder."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(2)
+        raw = '```json\n{"drop": [0]}\n```'
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S1"]
+
+    def test_legacy_new_entity_bindings_alias(self):
+        """``new_entity_bindings`` is accepted as a synonym of
+        ``bindings`` so older response shapes don't lose the binding
+        payload silently during the transition."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        anon = "Person_1 led the agile transformation initiative."
+        raw = '{"new_entity_bindings": {"Event_1": "the agile transformation initiative"}}'
+        _, transcript, bindings, _ = _apply_enrichment_delta([], raw, anon)
+        assert bindings == {"Event_1": "the agile transformation initiative"}
+        assert "{Event_1}" in transcript
+
+    def test_out_of_range_modify_skipped(self):
+        """Modify index outside ``[0, n_facts)`` is dropped with a
+        warning, not failed — single bad index shouldn't void the
+        whole delta."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(2)
+        raw = '{"modify": [{"index": 99, "fields": {"object": "X"}}]}'
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert out == facts  # nothing applied
+
+    def test_out_of_range_drop_skipped(self):
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(2)
+        raw = '{"drop": [99]}'
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert out == facts
+
+    def test_modify_with_non_dict_fields_skipped(self):
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(2)
+        raw = '{"modify": [{"index": 0, "fields": "not a dict"}]}'
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert out == facts
+
+    def test_add_entries_must_be_dicts(self):
+        """Non-dict entries in ``add`` are skipped, not failed."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(1)
+        raw = '{"add": ["not a fact", null, {"subject":"X","predicate":"p","object":"Y"}]}'
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert len(out) == 2  # 1 input + 1 valid add
+        assert out[1]["subject"] == "X"
+
+    def test_malformed_envelope_returns_none(self):
+        """Caller fail-opens — applier returns ``None`` for new_facts so
+        ``_sota_pipeline`` keeps the pre-enrichment facts."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(2)
+        out, _, _, _ = _apply_enrichment_delta(facts, "I cannot process this.", None)
+        assert out is None
+
+    def test_none_raw_returns_none(self):
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        out, _, _, _ = _apply_enrichment_delta(self._facts(1), None, "transcript")
+        assert out is None
+
+    def test_null_keys_treated_as_empty(self):
+        """Model emits ``"add": null`` instead of ``[]`` — must not crash."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = self._facts(2)
+        raw = '{"add": null, "modify": null, "drop": null, "bindings": null}'
+        out, transcript, bindings, _ = _apply_enrichment_delta(facts, raw, "anon")
+        assert out == facts
+        assert transcript == "anon"
+        assert bindings == {}
+
+    def test_bindings_with_missing_span_in_transcript_skipped(self):
+        """Hallucinated binding (span not in transcript) leaves the
+        transcript untouched.  No crash, no replacement."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        anon = "Person_1 said hello."
+        raw = '{"bindings": {"Event_1": "this span is not here"}}'
+        _, transcript, bindings, _ = _apply_enrichment_delta([], raw, anon)
+        assert transcript == anon
+        assert bindings == {"Event_1": "this span is not here"}
+
+    def test_none_transcript_returns_none_transcript(self):
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        _, transcript, _, _ = _apply_enrichment_delta([], '{"add": []}', None)
+        assert transcript is None
 
 
 class TestPipelineMaxTokensThreading:

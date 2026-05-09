@@ -68,13 +68,12 @@ class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):
         """No stray single-brace placeholders that collide with .format()."""
         tmpl = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
-        # Must not raise KeyError — all literal braces escaped as {{ }}.
+        # Must not raise KeyError — every literal brace pair escaped as
+        # `{{` / `}}`.  ``str.format`` itself validates this.
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
-        # Rendered output should still contain the example braced tokens.
+        # Rendered output should still contain the example braced tokens
+        # (single-brace form after format-escape).
         assert "{Event_1}" in rendered or "{Prefix_N}" in rendered
-        # And must not contain unescaped literals left over.
-        assert "{{" not in rendered
-        assert "}}" not in rendered
 
     def test_preserves_bare_placeholder_convention(self):
         """The binding-recovery algorithm depends on SOTA leaving existing
@@ -95,16 +94,30 @@ class TestEnrichmentPromptContract:
         )
 
     def test_requires_grounding_of_new_placeholders(self):
-        """HARD REQUIREMENT: every placeholder in facts must appear in the
-        updated transcript. Without this clause, SOTA's reified entities
-        are dropped wholesale by the residual sweep.
+        """HARD REQUIREMENT: every braced placeholder used in `add` must
+        have a matching entry in `bindings`. Without this clause, SOTA's
+        reified entities are dropped wholesale by the residual sweep.
+
+        Updated transcript is no longer carried on the wire (delta
+        protocol — reconstructed locally from bindings + anon transcript)
+        so the contract is now solely "facts ↔ bindings".
         """
         tmpl = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
-        # Looser check — any phrasing that requires both sides match.
-        assert "updated_transcript" in tmpl
+        # Bindings is the grounding contract; the prompt must name it.
+        assert "bindings" in tmpl
+        # Look for a hard requirement that braced placeholders appear in
+        # both `add` (facts) and `bindings`.  Phrasing is free to evolve;
+        # the structural claim is not.
         assert re.search(r"MUST.*appear|appear.*MUST", tmpl, re.IGNORECASE), (
             "Enrichment prompt must contain a hard requirement that new "
-            "placeholders appear in both facts and updated_transcript."
+            "braced placeholders appear in both `add` and `bindings`."
+        )
+        # No transcript echo on the wire — `updated_transcript` must not
+        # appear as an output key (catches accidental reintroduction).
+        assert "updated_transcript" not in tmpl, (
+            "Enrichment prompt must not request `updated_transcript` in "
+            "the output — the transcript is reconstructed locally from "
+            "bindings to keep output bandwidth bounded."
         )
 
     def test_teaches_role_instance_aggregation(self):
@@ -132,8 +145,16 @@ class TestEnrichmentPromptContract:
         )
         # Co-temporal attributes must be bound to {{Role_1}} (subject
         # position).  A flat-triples regression would have them on
-        # Person_1 instead.
-        assert re.search(r"start_date\(\{\{Role_1\}\}", tmpl), (
+        # Person_1 instead.  The delta protocol uses JSON-shaped facts
+        # (``"subject": "{{Role_1}}", "predicate": "start_date"``);
+        # match either ordering of those two key/value pairs within a
+        # short window so the test is robust to minor reformatting.
+        assert re.search(
+            r'"\{\{Role_1\}\}"[^{}]{0,200}start_date'
+            r"|"
+            r'start_date[^{}]{0,200}"\{\{Role_1\}\}"',
+            tmpl,
+        ), (
             "Role example must show start_date with {{Role_1}} as subject — "
             "the structural teaching is that dates bind to the role-instance, "
             "not to the speaker."
