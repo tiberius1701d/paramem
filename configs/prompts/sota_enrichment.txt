@@ -16,10 +16,16 @@ POSITIVE — transcript: `"...Person_1 led the agile transformation initiative a
 → updated_transcript: `"...Person_1 led {{Event_1}} at Org_1..."`
 → new_entity_bindings: `{{"Event_1": "the agile transformation initiative"}}`
 
+POSITIVE (role-instance — bind co-temporal attributes to ONE entity, not flat triples on the speaker) — transcript: `"...Person_1 was Senior Engineer at Org_1 in City_1 from Jan 2014 to Sep 2017..."`
+→ facts: `held_role(Person_1, {{Role_1}})`, `at_company({{Role_1}}, Org_1)`, `in_location({{Role_1}}, City_1)`, `start_date({{Role_1}}, "Jan 2014")`, `end_date({{Role_1}}, "Sep 2017")`
+→ updated_transcript: `"...Person_1 was {{Role_1}} at Org_1 in City_1 from Jan 2014 to Sep 2017..."`
+→ new_entity_bindings: `{{"Role_1": "Senior Engineer"}}`
+
 NEGATIVE — same transcript:
 - WRONG: `led(Person_1, Project_1)` — bare `Project_1` looks like an anonymizer placeholder but isn't in the mapping → fact dropped at residual sweep.
 - WRONG: `led(Person_1, {{Event_1}})` with `Event_1` missing from `new_entity_bindings` → no binding to substitute → fact dropped.
 - WRONG: `new_entity_bindings: {{"{{Event_1}}": "..."}}` — key includes braces → lookup misses → fact dropped.
+- WRONG (role flattened onto speaker): `held_role(Person_1, "Senior Engineer")`, `worked_at(Person_1, Org_1)`, `lived_in(Person_1, City_1)`, `start_date(Person_1, "Jan 2014")`, `end_date(Person_1, "Sep 2017")` — co-temporal attributes orphan from the role. With multiple roles in one transcript the dates cannot be paired back to a title; downstream reasoning over "what title did Person_1 hold in 2015?" fails.
 
 
 ## Coreference resolution
