@@ -107,6 +107,45 @@ class TestEnrichmentPromptContract:
             "placeholders appear in both facts and updated_transcript."
         )
 
+    def test_teaches_role_instance_aggregation(self):
+        """The brace-binding section must show a role-instance POSITIVE
+        example that aggregates multiple co-temporal attributes (title,
+        company, location, dates) onto a single bound entity rather
+        than flattening them as independent triples on the speaker.
+
+        Without this teaching, SOTA emits the bound title once but
+        leaves dates / company / location as orphan triples on the
+        speaker.  Downstream reasoning over multi-role chronology
+        ("what title did the speaker hold in 2015?") then fails because
+        co-temporal facts cannot be paired back to a role.
+
+        Empirical evidence pre-fix: zero ``Role_*`` entities across 24+
+        production graph snapshots (data/ha/debug/run_*/), even though
+        the brace-binding contract itself is honoured for ``Event_*``.
+        """
+        tmpl = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
+        # Structural assertion: a Role_N braced placeholder must appear
+        # in a positive-example block alongside multiple bound facts —
+        # at minimum a date attribute and a company/location attribute.
+        assert "{{Role_1}}" in tmpl, (
+            "Enrichment prompt must include a Role_1 example to teach role-instance aggregation."
+        )
+        # Co-temporal attributes must be bound to {{Role_1}} (subject
+        # position).  A flat-triples regression would have them on
+        # Person_1 instead.
+        assert re.search(r"start_date\(\{\{Role_1\}\}", tmpl), (
+            "Role example must show start_date with {{Role_1}} as subject — "
+            "the structural teaching is that dates bind to the role-instance, "
+            "not to the speaker."
+        )
+        # The NEGATIVE block must spell out the speaker-flattening anti-
+        # pattern so a future prompt edit cannot keep the POSITIVE
+        # example while quietly removing the warning.
+        assert re.search(r"WRONG.*speaker|flat.*speaker|speaker.*flat", tmpl, re.IGNORECASE), (
+            "Enrichment prompt must call out the flat-triples-on-speaker "
+            "anti-pattern in a NEGATIVE block."
+        )
+
 
 class TestPlausibilityPromptContract:
     def test_renders_without_format_errors(self):
