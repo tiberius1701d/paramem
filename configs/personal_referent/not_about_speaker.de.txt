@@ -1,0 +1,24 @@
+# Personal referent: NOT_ABOUT_SPEAKER — siehe not_about_speaker.en.txt für Details.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+
+Was ist die Hauptstadt von Frankreich?
+Wie hoch ist der Eiffelturm?
+Wann ist Weihnachten dieses Jahr?
+Wer hat Romeo und Julia geschrieben?
+Wie hoch ist die Lichtgeschwindigkeit?
+Erzähl mir etwas über Quantencomputer.
+Wie wird das Wetter morgen?
+Wie spät ist es in Tokio?
+Mache das Licht in der Küche an.
+Stelle die Heizung auf zwanzig Grad.
+Spiele Musik im Wohnzimmer.
+Schließe die Haustür ab.
+Öffne das Garagentor.
+Pausiere die Musik.
+Wie viele Einwohner hat Berlin?
+Wie funktioniert Photosynthese?
+Wo gibt es ein gutes Restaurant in der Nähe?
+Was läuft heute Abend im Fernsehen?
+Wer ist der Präsident von Frankreich?
+Wie setze ich einen Router zurück?

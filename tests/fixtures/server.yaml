@@ -476,6 +476,14 @@ sentence_type:
   exemplars_dir: configs/sentence_types
   confidence_margin: 0.05
 
+# Personal-referent classifier: ABOUT_SPEAKER / NOT_ABOUT_SPEAKER.
+# Reuses the multilingual encoder loaded by `intent` above.  Used by
+# the cloud-egress sanitizer's first-person check.
+personal_referent:
+  enabled: true
+  exemplars_dir: configs/personal_referent
+  confidence_margin: 0.05
+
 voice:
   prompt_file: configs/prompts/pa_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)

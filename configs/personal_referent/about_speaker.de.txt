@@ -1,0 +1,24 @@
+# Personal referent: ABOUT_SPEAKER — siehe about_speaker.en.txt für Details.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+
+Wie heiße ich?
+Wo wohne ich?
+Wann habe ich Geburtstag?
+Warum bin ich nach Berlin gezogen?
+Wer ist mein Bruder?
+Wie alt bin ich?
+Sag mir meine Adresse.
+Sag mir, wo ich wohne.
+Wie ist meine Telefonnummer?
+Mein Name ist Anna.
+Ich wohne in Berlin.
+Ich arbeite als Ingenieur.
+Ich bin gerade von einer Reise zurückgekommen.
+Wir waren letztes Wochenende wandern.
+Mein Geburtstag ist im März.
+Was steht heute auf meinem Plan?
+Wie sieht mein Kalender morgen aus?
+Habe ich heute Nachmittag Termine?
+Wo habe ich meinen Schlüssel hingelegt?
+Wo ist mein Handy?

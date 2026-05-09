@@ -1,0 +1,30 @@
+# Personal referent: NOT_ABOUT_SPEAKER — query is about the world,
+# devices, third parties, or general knowledge — NOT about the speaker
+# themselves.  Used by the encoder-based first-person check in the
+# cloud-egress sanitizer.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+#
+# Coverage: general-knowledge questions, device commands, third-party
+# questions, weather / time / news.
+
+What is the capital of France?
+How tall is the Eiffel Tower?
+When is Christmas this year?
+Who wrote Romeo and Juliet?
+What is the speed of light?
+Tell me about quantum computing.
+What's the weather forecast?
+What time is it in Tokyo?
+Turn on the kitchen light.
+Set the thermostat to twenty degrees.
+Play music in the living room.
+Lock the front door.
+Open the garage door.
+Pause the music.
+What is the population of Berlin?
+How does photosynthesis work?
+What's a good restaurant near the office?
+What's on TV tonight?
+Who is the president of France?
+How do I reset a router?

@@ -112,6 +112,75 @@ class TestFirstPersonResolution:
         )
         assert findings == []
 
+    def test_encoder_path_overrides_token_set_for_german(self):
+        """Encoder-based classification fires when ``personal_referent_config``
+        is provided; classifies German first-person queries that the
+        legacy English token-set would miss.
+
+        Closes the multilingual sanitizer gap demonstrated by the
+        live probe: ``"Wo wohne ich?"`` was passing through unsanitized
+        because ``_contains_first_person`` is English-only.
+        """
+        from unittest.mock import patch
+
+        from paramem.server.config import PersonalReferentConfig
+        from paramem.server.personal_referent import PersonalReferent
+
+        cfg = PersonalReferentConfig()
+        with patch(
+            "paramem.server.personal_referent.classify_personal_referent",
+            return_value=PersonalReferent.ABOUT_SPEAKER,
+        ):
+            findings = check_personal_content(
+                "Wo wohne ich?",
+                speaker_id="Speaker0",
+                personal_referent_config=cfg,
+            )
+        assert "first_person_personal" in findings
+
+    def test_encoder_returning_not_about_speaker_clears_finding(self):
+        """Encoder verdict NOT_ABOUT_SPEAKER suppresses the finding even
+        when the English token-set heuristic would fire.  (The encoder
+        recognises that the surface "I" doesn't refer to the speaker.)
+        """
+        from unittest.mock import patch
+
+        from paramem.server.config import PersonalReferentConfig
+        from paramem.server.personal_referent import PersonalReferent
+
+        cfg = PersonalReferentConfig()
+        with patch(
+            "paramem.server.personal_referent.classify_personal_referent",
+            return_value=PersonalReferent.NOT_ABOUT_SPEAKER,
+        ):
+            findings = check_personal_content(
+                "I read that the Eiffel Tower was built in 1889.",
+                speaker_id="Speaker0",
+                personal_referent_config=cfg,
+            )
+        assert "first_person_personal" not in findings
+
+    def test_encoder_uncertain_falls_back_to_token_set(self):
+        """Encoder returning ``None`` (margin not met / not loaded) falls
+        through to the English token-set check.  Confirms the
+        encoderless fallback path works as designed.
+        """
+        from unittest.mock import patch
+
+        from paramem.server.config import PersonalReferentConfig
+
+        cfg = PersonalReferentConfig()
+        with patch(
+            "paramem.server.personal_referent.classify_personal_referent",
+            return_value=None,
+        ):
+            findings = check_personal_content(
+                "Where do I live?",
+                speaker_id="Speaker0",
+                personal_referent_config=cfg,
+            )
+        assert "first_person_personal" in findings
+
     def test_first_person_anywhere_in_text_matches(self):
         # "my" appears mid-sentence, not first word.
         findings = check_personal_content(
