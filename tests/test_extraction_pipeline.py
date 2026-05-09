@@ -845,12 +845,19 @@ class TestSOTANoiseFilter:
             ],
         )
         mapping = {"Alex": "Person_1"}
+        reverse = {"Person_1": "Alex"}
         anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Google"}]
         anon_transcript = "Person_1 works at Google."
         # "Google" is in the transcript → missed, not hallucinated.
         leaked = ["Google"]
-        facts, new_mapping, _, status = _repair_anonymization_leaks(
-            graph, mapping, anon_facts, anon_transcript, "Alex works at Google.", leaked
+        facts, new_mapping, new_reverse, _, status = _repair_anonymization_leaks(
+            graph,
+            mapping,
+            reverse,
+            anon_facts,
+            anon_transcript,
+            "Alex works at Google.",
+            leaked,
         )
         assert status["missed_fixed"] == 1, (
             "organization entity present in transcript must be classified as missed and fixed"
@@ -860,6 +867,8 @@ class TestSOTANoiseFilter:
         assert org_placeholder.startswith("Org_"), (
             f"organization entity must get an Org_N placeholder, got {org_placeholder!r}"
         )
+        # Reverse companion is mirrored.
+        assert new_reverse[org_placeholder] == "Google"
         # The fact's object must be rewritten to the placeholder.
         assert facts[0]["object"] == org_placeholder, (
             f"anon_facts object must be rewritten to placeholder, got {facts[0]['object']!r}"
@@ -1063,7 +1072,7 @@ class TestApplyBindings:
 
     def test_substitutes_anonymizer_placeholders(self):
         """Bare anonymizer placeholders (Person_1, Org_1) substitute via
-        the reversed mapping."""
+        the reverse mapping."""
         from paramem.graph.extractor import _apply_bindings
 
         facts = [
@@ -1075,8 +1084,8 @@ class TestApplyBindings:
                 "confidence": 1.0,
             },
         ]
-        mapping = {"Alice": "Person_1", "Acme": "Org_1"}
-        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        reverse = {"Person_1": "Alice", "Org_1": "Acme"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
         assert dropped == []
         assert kept[0]["subject"] == "Alice"
         assert kept[0]["object"] == "Acme"
@@ -1095,9 +1104,9 @@ class TestApplyBindings:
                 "confidence": 1.0,
             },
         ]
-        mapping = {"Alice": "Person_1"}
+        reverse = {"Person_1": "Alice"}
         bindings = {"Event_1": "the agile transformation workshop"}
-        kept, dropped = _apply_bindings(facts, mapping, bindings)
+        kept, dropped = _apply_bindings(facts, reverse, bindings)
         assert dropped == []
         assert kept[0]["subject"] == "Alice"
         assert kept[0]["object"] == "the agile transformation workshop"
@@ -1117,8 +1126,8 @@ class TestApplyBindings:
                 "confidence": 1.0,
             },
         ]
-        mapping = {"Alice": "Person_1", "Acme": "Org_1"}
-        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        reverse = {"Person_1": "Alice", "Org_1": "Acme"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
         assert dropped == []
         assert kept[0]["object"] == "Acme Hungary"
 
@@ -1145,9 +1154,9 @@ class TestApplyBindings:
                 "confidence": 1.0,
             },
         ]
-        mapping = {"Alice": "Person_1"}
+        reverse = {"Person_1": "Alice"}
         # No binding for Event_1; no mapping for Person_99.
-        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
         assert kept == []
         assert len(dropped) == 2
 
@@ -1165,8 +1174,8 @@ class TestApplyBindings:
                 "confidence": 1.0,
             },
         ]
-        mapping = {"Alice": "Person_1", "Bob": "Person_2"}
-        kept, dropped = _apply_bindings(facts, mapping, sota_bindings={})
+        reverse = {"Person_1": "Alice", "Person_2": "Bob"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
         assert dropped == []
         assert kept[0]["object"] == "Bob's cousin"
 
@@ -1184,9 +1193,9 @@ class TestApplyBindings:
                 "confidence": 1.0,
             },
         ]
-        mapping = {"Alice": "Person_1", "Acme": "Org_1"}
+        reverse = {"Person_1": "Alice", "Org_1": "Acme"}
         bindings = {"Event_1": "the workshop"}
-        kept, dropped = _apply_bindings(facts, mapping, bindings)
+        kept, dropped = _apply_bindings(facts, reverse, bindings)
         assert dropped == []
         assert kept[0]["subject"] == "Alice"
         assert kept[0]["object"] == "the workshop at Acme"
@@ -1212,11 +1221,50 @@ class TestApplyBindings:
                 "synthetic": False,
             },
         ]
-        mapping = {"Alice": "Person_1", "Bob": "Person_2"}
-        kept, _ = _apply_bindings(facts, mapping, sota_bindings={})
+        reverse = {"Person_1": "Alice", "Person_2": "Bob"}
+        kept, _ = _apply_bindings(facts, reverse, sota_bindings={})
         assert kept[0]["relation_type"] == "social"
         assert kept[0]["confidence"] == 0.7
         assert kept[0]["synthetic"] is False
+
+    def test_pii_fold_does_not_corrupt_speaker_name(self):
+        """Regression for the deanon corruption regression: when
+        :func:`_build_anonymization_mapping` folds PII attribute values
+        (phone, email, …) onto the speaker entity's placeholder in the
+        forward map, the reverse map must still restore the entity
+        *name* — not the last attribute value folded."""
+        from paramem.graph.extractor import _apply_bindings, _build_anonymization_mapping
+        from paramem.graph.schema import Entity, SessionGraph
+
+        graph = SessionGraph(
+            session_id="s1",
+            speaker_id="Speaker0",
+            timestamp="2026-05-09T13:00:00Z",
+        )
+        graph.entities.append(
+            Entity(
+                name="Alex",
+                entity_type="person",
+                speaker_id="Speaker0",
+                attributes={
+                    "last_name": "Walker",
+                    "email": "alex.walker@example.com",
+                    "phone": "+49 178 99 99 999",
+                },
+            )
+        )
+        forward, reverse = _build_anonymization_mapping(
+            graph, llm_mapping={}, pii_scope={"person"}, speaker_name="Alex"
+        )
+        # Forward fold is preserved (privacy contract).
+        assert forward["Alex"] == "Person_1"
+        assert forward["+49 178 99 99 999"] == "Person_1"
+        # Reverse must restore the entity name, never an attribute value.
+        assert reverse["Person_1"] == "Alex"
+
+        facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Germany"}]
+        kept, _ = _apply_bindings(facts, reverse, sota_bindings={})
+        assert kept[0]["subject"] == "Alex"
 
 
 class TestResidualSweepCatchesEmbeddedPlaceholders:
@@ -1632,12 +1680,20 @@ class TestResidualLeakDropsReferencingTriples:
             return facts, None, {}, None, {}
 
         def fake_repair(
-            graph, mapping, anon_facts, anon_transcript, orig_transcript, leaked, **kwargs
+            graph,
+            mapping,
+            reverse,
+            anon_facts,
+            anon_transcript,
+            orig_transcript,
+            leaked,
+            **kwargs,
         ):
             # Repair runs but Ghost remains — residual leak.
             return (
                 anon_facts,
                 mapping,
+                reverse,
                 anon_transcript,
                 {"missed_fixed": 0, "hallucinated_dropped": 0, "residual_dropped": 0},
             )
@@ -2347,6 +2403,16 @@ class TestBuildAnonymizationMapping:
 
     @staticmethod
     def _build(entities, *, llm_mapping=None, pii_scope=None, speaker_name=None):
+        forward, _reverse = TestBuildAnonymizationMapping._build_pair(
+            entities,
+            llm_mapping=llm_mapping,
+            pii_scope=pii_scope,
+            speaker_name=speaker_name,
+        )
+        return forward
+
+    @staticmethod
+    def _build_pair(entities, *, llm_mapping=None, pii_scope=None, speaker_name=None):
         from paramem.graph.extractor import _build_anonymization_mapping
 
         graph = SessionGraph(
@@ -2377,7 +2443,7 @@ class TestBuildAnonymizationMapping:
         assert "Globex" not in mapping
 
     def test_pii_attributes_share_parent_placeholder(self):
-        mapping = self._build(
+        forward, reverse = self._build_pair(
             [
                 Entity(
                     name="Alex",
@@ -2397,18 +2463,27 @@ class TestBuildAnonymizationMapping:
             pii_scope={"person"},
         )
         # Parent placeholder.
-        assert mapping["Alex"] == "Person_1"
-        # PII attributes share the parent placeholder.
-        for v in (
+        assert forward["Alex"] == "Person_1"
+        # PII attributes share the parent placeholder in the FORWARD map
+        # (so the cloud-egress anonymizer scrubs every PII surface form
+        # to the same token).
+        attr_values = (
             "Walker",
             "alex.walker@example.com",
             "linkedin.com/in/tobias-preusser",
             "+49 178 36 21 668",
             "Germany",
-        ):
-            assert mapping[v] == "Person_1"
+        )
+        for v in attr_values:
+            assert forward[v] == "Person_1"
         # Non-PII attribute is not added.
-        assert "Senior Engineer" not in mapping
+        assert "Senior Engineer" not in forward
+        # Reverse map: only the entity name resolves Person_1 — attribute
+        # values are deliberately absent so SOTA-returned text never
+        # restores `Person_1` to a phone/email/etc.
+        assert reverse["Person_1"] == "Alex"
+        for v in attr_values:
+            assert v not in reverse.values() or v == "Alex"
 
     def test_pii_attributes_on_out_of_scope_entity_not_minted(self):
         mapping = self._build(
@@ -2575,7 +2650,7 @@ class TestBuildAnonymizationMapping:
                 Entity(name="Google", entity_type="organization"),
             ],
         )
-        mapping = _build_anonymization_mapping(
+        mapping, _reverse = _build_anonymization_mapping(
             graph,
             {"Google": "Org_1"},  # LLM hint for the org.
             pii_scope={"person"},
@@ -2628,11 +2703,16 @@ class TestRecoverMissingPlaceholderMappings:
             }
         ]
         mapping = {}  # anonymizer forgot to include Honda → Product_1
-        result = _recover_missing_placeholder_mappings(mapping, anon_facts, original_relations)
+        reverse: dict[str, str] = {}
+        result, result_reverse = _recover_missing_placeholder_mappings(
+            mapping, reverse, anon_facts, original_relations
+        )
         assert "Honda" in result, "gap recovery must add the original real name as a key"
         assert result["Honda"] == "Product_1", (
             f"recovered value must be the placeholder, got {result['Honda']!r}"
         )
+        # Reverse companion is mirrored in lockstep.
+        assert result_reverse["Product_1"] == "Honda"
 
     def test_already_covered_placeholder_not_duplicated(self):
         """Placeholder already in mapping.values() is not added again."""
@@ -2650,8 +2730,12 @@ class TestRecoverMissingPlaceholderMappings:
         ]
         anon_facts = [{"subject": "Person_1", "predicate": "knows", "object": "Person_2"}]
         mapping = {"Alice": "Person_1", "Bob": "Person_2"}  # both already covered
-        result = _recover_missing_placeholder_mappings(mapping, anon_facts, original_relations)
+        reverse = {"Person_1": "Alice", "Person_2": "Bob"}
+        result, result_reverse = _recover_missing_placeholder_mappings(
+            mapping, reverse, anon_facts, original_relations
+        )
         assert result == mapping, "no new entries must be added when mapping is already complete"
+        assert result_reverse == reverse
 
     def test_object_field_placeholder_recovered(self):
         """Placeholder in the object field is recovered, not just the subject."""
@@ -2669,17 +2753,30 @@ class TestRecoverMissingPlaceholderMappings:
         ]
         anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Org_1"}]
         mapping = {"Alice": "Person_1"}  # Acme Corp → Org_1 missing
-        result = _recover_missing_placeholder_mappings(mapping, anon_facts, original_relations)
+        reverse = {"Person_1": "Alice"}
+        result, result_reverse = _recover_missing_placeholder_mappings(
+            mapping, reverse, anon_facts, original_relations
+        )
         assert "Acme Corp" in result, "object-field gap must be recovered"
         assert result["Acme Corp"] == "Org_1"
+        assert result_reverse["Org_1"] == "Acme Corp"
 
     def test_empty_inputs_return_unchanged_mapping(self):
         """Empty anon_facts or empty original_relations returns mapping unchanged."""
         from paramem.graph.extractor import _recover_missing_placeholder_mappings
 
         mapping = {"Alice": "Person_1"}
-        assert _recover_missing_placeholder_mappings(mapping, [], []) == mapping
-        assert _recover_missing_placeholder_mappings(mapping, [], [None]) == mapping  # type: ignore[list-item]
+        reverse = {"Person_1": "Alice"}
+        assert _recover_missing_placeholder_mappings(mapping, reverse, [], []) == (
+            mapping,
+            reverse,
+        )
+        assert _recover_missing_placeholder_mappings(
+            mapping,
+            reverse,
+            [],
+            [None],  # type: ignore[list-item]
+        ) == (mapping, reverse)
 
     def test_does_not_mutate_input(self):
         """Input mapping is not mutated — a new dict is returned."""
@@ -2696,9 +2793,13 @@ class TestRecoverMissingPlaceholderMappings:
             )
         ]
         anon_facts = [{"subject": "Product_1", "predicate": "manufactures", "object": "Legend"}]
-        original_mapping = {}
-        _recover_missing_placeholder_mappings(original_mapping, anon_facts, original_relations)
+        original_mapping: dict[str, str] = {}
+        original_reverse: dict[str, str] = {}
+        _recover_missing_placeholder_mappings(
+            original_mapping, original_reverse, anon_facts, original_relations
+        )
         assert original_mapping == {}, "input mapping must not be mutated"
+        assert original_reverse == {}, "input reverse must not be mutated"
 
     def test_apply_bindings_resolves_recovered_placeholder(self):
         """End-to-end: Product_1 in object field de-anonymizes correctly after gap recovery.
@@ -2706,8 +2807,8 @@ class TestRecoverMissingPlaceholderMappings:
         This is the regression test for Bug B:
         - anon_facts has object "software development for Product_1's Legend SAE Level 3 system"
         - mapping initially missing Honda → Product_1
-        - after gap recovery, mapping has Honda → Product_1
-        - _apply_bindings reverses the mapping: Product_1 → Honda
+        - after gap recovery, mapping has Honda → Product_1 and reverse has Product_1 → Honda
+        - _apply_bindings substitutes via the reverse map
         - the object field becomes "software development for Honda's Legend SAE Level 3 system"
         """
         from paramem.graph.extractor import _apply_bindings, _recover_missing_placeholder_mappings
@@ -2734,15 +2835,17 @@ class TestRecoverMissingPlaceholderMappings:
             }
         ]
         mapping = {"Alex Rivera": "Person_1"}  # Honda → Product_1 missing
+        reverse = {"Person_1": "Alex Rivera"}
 
-        recovered_mapping = _recover_missing_placeholder_mappings(
-            mapping, anon_facts, original_relations
+        recovered_mapping, recovered_reverse = _recover_missing_placeholder_mappings(
+            mapping, reverse, anon_facts, original_relations
         )
         assert "Honda" in recovered_mapping, (
             "gap recovery must add Honda → Product_1 to the mapping"
         )
+        assert recovered_reverse["Product_1"] == "Honda"
 
-        kept, dropped = _apply_bindings(anon_facts, recovered_mapping, sota_bindings={})
+        kept, dropped = _apply_bindings(anon_facts, recovered_reverse, sota_bindings={})
         assert dropped == [], f"no facts must be dropped after gap recovery, got {dropped!r}"
         assert len(kept) == 1
         assert "Honda" in kept[0]["object"], (

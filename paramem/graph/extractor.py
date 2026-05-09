@@ -890,7 +890,7 @@ def extract_and_anonymize_for_cloud(
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
     pii_scope: set[str] | frozenset[str] | None = None,
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict[str, str], dict[str, str]]:
     """Local extract + local anonymize for cloud egress.
 
     Composition over existing primitives — same anonymization sequence
@@ -914,33 +914,37 @@ def extract_and_anonymize_for_cloud(
     (``{"person"}``) — narrower than the primitive default because the
     cloud-utility tradeoff (Berlin restaurants, organisation-aware
     advice) bites here.  An empty scope short-circuits before any LLM
-    call: the helper returns ``(transcript, {})`` and the caller sends
-    the original text to the cloud verbatim — no anonymization, no
-    deanonymization needed.
+    call: the helper returns ``(transcript, {}, {})`` and the caller
+    sends the original text to the cloud verbatim — no anonymization,
+    no deanonymization needed.
 
     Return shapes:
 
-    * ``(anon_transcript, mapping)`` — anonymization ran, mapping is
-      non-empty.  Caller deanonymizes the cloud's response with
-      :func:`deanonymize_text`.
-    * ``(transcript, {})`` — operator opted out (``pii_scope=[]``) or
-      the input had no in-scope content; caller forwards verbatim.
-    * ``("", {})`` — block.  Extraction error, anonymizer parse
+    * ``(anon_transcript, forward, reverse)`` — anonymization ran;
+      ``forward`` is the ``{real → placeholder}`` map produced by the
+      anonymizer LLM (one-to-one by contract — the prompt operates on
+      relation participants, not on attribute values, so no
+      placeholder fold), ``reverse`` is its inverse.  Caller
+      deanonymizes the cloud's response with :func:`deanonymize_text`
+      using ``reverse``.
+    * ``(transcript, {}, {})`` — operator opted out (``pii_scope=[]``)
+      or the input had no in-scope content; caller forwards verbatim.
+    * ``("", {}, {})`` — block.  Extraction error, anonymizer parse
       failure, residual leak after repair, or non-canonical mapping.
       Caller skips the cloud call.
 
     The companion :func:`deanonymize_text` is a no-op on an empty
-    mapping, so callers can apply it unconditionally.
+    reverse map, so callers can apply it unconditionally.
     """
     if not transcript or not transcript.strip():
-        return "", {}
+        return "", {}, {}
 
     scope = _CLOUD_EGRESS_DEFAULT_SCOPE if pii_scope is None else frozenset(pii_scope)
     # Empty scope = operator opt-out.  Skip the entire LLM-driven
     # anonymization path and let the caller forward the transcript
-    # verbatim.  Distinguished from ``("", {})`` block by non-empty text.
+    # verbatim.  Distinguished from ``("", {}, {})`` block by non-empty text.
     if not scope:
-        return transcript, {}
+        return transcript, {}, {}
 
     try:
         graph = extract_graph(
@@ -957,10 +961,10 @@ def extract_and_anonymize_for_cloud(
         )
     except Exception:
         logger.exception("Cloud egress: local extraction failed; treating as block")
-        return "", {}
+        return "", {}, {}
 
     if not graph.relations:
-        return "", {}
+        return "", {}, {}
 
     try:
         anon_facts, mapping, anon_transcript, _raw = _anonymize_with_local_model(
@@ -968,10 +972,10 @@ def extract_and_anonymize_for_cloud(
         )
     except Exception:
         logger.exception("Cloud egress: anonymization raised; treating as block")
-        return "", {}
+        return "", {}, {}
 
     if anon_facts is None or not mapping:
-        return "", {}
+        return "", {}, {}
 
     mapping, _norm_stats = _normalize_anonymization_mapping(mapping)
     if not anon_transcript:
@@ -979,6 +983,15 @@ def extract_and_anonymize_for_cloud(
         # transcript mechanically from the mapping (same fallback
         # `_sota_pipeline` uses).
         anon_transcript = _anonymize_transcript(transcript, mapping)
+
+    # Build the reverse map alongside the forward.  ``_anonymize_with_local_model``
+    # produces a one-to-one ``{real → placeholder}`` mapping (the anonymizer
+    # prompt operates on relation participants only, no attribute fold), so a
+    # straight dict inversion is information-preserving here.  Repairs below
+    # extend both maps in lockstep via :func:`_repair_anonymization_leaks`.
+    reverse: dict[str, str] = {
+        v: k for k, v in mapping.items() if isinstance(k, str) and isinstance(v, str) and k and v
+    }
 
     # Defense-in-depth: NER cross-check catches PII that extraction missed
     # (e.g. Mistral 7B emits relations referencing place names without
@@ -1002,10 +1015,11 @@ def extract_and_anonymize_for_cloud(
                 "Cloud egress: residual leaks with non-canonical mapping (%s); blocking",
                 leaked[:3],
             )
-            return "", {}
-        anon_facts, mapping, anon_transcript, _status = _repair_anonymization_leaks(
+            return "", {}, {}
+        anon_facts, mapping, reverse, anon_transcript, _status = _repair_anonymization_leaks(
             graph,
             mapping,
+            reverse,
             anon_facts,
             anon_transcript,
             transcript,
@@ -1022,25 +1036,32 @@ def extract_and_anonymize_for_cloud(
         )
         if leaked:
             logger.warning("Cloud egress: residual leaks after repair (%s); blocking", leaked[:3])
-            return "", {}
+            return "", {}, {}
 
     if not anon_transcript or not mapping:
-        return "", {}
+        return "", {}, {}
 
-    return anon_transcript, mapping
+    return anon_transcript, mapping, reverse
 
 
-def deanonymize_text(text: str, mapping: dict[str, str]) -> str:
+def deanonymize_text(text: str, reverse: dict[str, str]) -> str:
     """Restore real names in cloud-returned text via the reverse mapping.
 
-    ``mapping`` is the forward direction (``real -> placeholder``);
-    this function inverts it internally.  Word-boundary anchored, so
-    a placeholder embedded in unrelated text doesn't match.
-    Idempotent on text without placeholders or with empty mapping.
+    ``reverse`` is the ``{placeholder: real_name}`` map produced
+    alongside the forward map by
+    :func:`_build_anonymization_mapping` (or by the dict-inversion in
+    :func:`extract_and_anonymize_for_cloud` for LLM-emitted mappings,
+    which are one-to-one by contract).  This function never inverts
+    a forward map itself — that inversion was lossy when the forward
+    map folded PII attribute values onto the entity placeholder, and
+    the asymmetry now lives in the producer.
+
+    Word-boundary anchored, so a placeholder embedded in unrelated
+    text doesn't match.  Idempotent on text without placeholders or
+    with an empty reverse map.
     """
-    if not text or not mapping:
+    if not text or not reverse:
         return text
-    reverse = {v: k for k, v in mapping.items() if isinstance(k, str) and isinstance(v, str)}
     return _substitute_whole_words(text, reverse)
 
 
@@ -2079,7 +2100,7 @@ def _sota_pipeline(
     # preserved via :func:`_recover_missing_placeholder_mappings`
     # below — that recovery is an orthogonal concern (LLM mints a
     # placeholder for a real name not in our mapping).
-    mapping = _build_anonymization_mapping(
+    mapping, reverse_mapping = _build_anonymization_mapping(
         graph,
         mapping,
         pii_scope=pii_scope,
@@ -2090,7 +2111,9 @@ def _sota_pipeline(
     # anonymized_facts but never added to the mapping (typically
     # relation-participant placeholders for entities not in
     # ``graph.entities`` — e.g. ``Honda → Product_1``).
-    mapping = _recover_missing_placeholder_mappings(mapping, anon_facts, graph.relations)
+    mapping, reverse_mapping = _recover_missing_placeholder_mappings(
+        mapping, reverse_mapping, anon_facts, graph.relations
+    )
 
     # (Re-)build anonymized transcript AND facts from the ORIGINAL transcript
     # and relations using the now-complete mapping.  This covers three cases:
@@ -2144,9 +2167,16 @@ def _sota_pipeline(
         if leaked:
             if _mapping_is_canonical(mapping):
                 logger.info("Repairing %d leaked name(s): %s", len(leaked), leaked[:5])
-                anon_facts, mapping, anon_transcript, repair_status = _repair_anonymization_leaks(
+                (
+                    anon_facts,
+                    mapping,
+                    reverse_mapping,
+                    anon_transcript,
+                    repair_status,
+                ) = _repair_anonymization_leaks(
                     graph,
                     mapping,
+                    reverse_mapping,
                     anon_facts,
                     anon_transcript,
                     transcript,
@@ -2377,12 +2407,11 @@ def _sota_pipeline(
     # + ``_strip_placeholder_braces`` + reverse-mapping substitution).
     from paramem.graph.schema import Entity, Relation
 
-    # Reverse anonymizer mapping (placeholder -> real_name). Used by the
-    # entity-rebuild loop later to derive entity_type from the placeholder
-    # prefix.
-    reverse_mapping = {
-        v: k for k, v in mapping.items() if isinstance(k, str) and isinstance(v, str) and k
-    }
+    # ``reverse_mapping`` (placeholder -> entity name) is produced by
+    # :func:`_build_anonymization_mapping` and threaded through
+    # :func:`_recover_missing_placeholder_mappings` /
+    # :func:`_repair_anonymization_leaks` above; it is consumed by the
+    # deanon dict-substitution and by the entity-rebuild loop below.
 
     # Phase — deanon.  Pure dict substitution restoring real names from
     # placeholders.  No LLM call; raw_output stays None.  Dropped facts
@@ -2390,7 +2419,7 @@ def _sota_pipeline(
     # calibration inspection.
     with phase_trace("deanon") as t:
         deanon_input_count = len(enriched_anon)
-        deanon_facts, dropped_facts = _apply_bindings(enriched_anon, mapping, sota_bindings)
+        deanon_facts, dropped_facts = _apply_bindings(enriched_anon, reverse_mapping, sota_bindings)
         if dropped_facts:
             graph.diagnostics["residual_dropped_facts"] = dropped_facts
             logger.warning(
@@ -2658,7 +2687,7 @@ def _build_anonymization_mapping(
     *,
     pii_scope: set[str] | frozenset[str] | None,
     speaker_name: str | None,
-) -> dict:
+) -> tuple[dict[str, str], dict[str, str]]:
     """Single source of truth for the real → placeholder mapping.
 
     The anonymizer LLM is good at producing **anon_facts** (canonical
@@ -2681,7 +2710,11 @@ def _build_anonymization_mapping(
        placeholder.**  Reusing the placeholder is privacy-correct
        (SOTA only needs tokens scrubbed, not unique placeholders per
        attribute) and keeps the mapping canonical (no novel
-       placeholder shapes).
+       placeholder shapes).  These attribute values land in the
+       *forward* map only — the reverse map records only the entity
+       name for each placeholder, so deanonymization can never
+       restore an attribute value (phone, email, …) where the entity
+       name belongs.
     3. **Speaker-name seeding** (legacy Bug A).  When the runtime
        knows the speaker's display name and that name isn't already
        in the mapping (e.g. anonymous-id session, full-name vs
@@ -2714,13 +2747,20 @@ def _build_anonymization_mapping(
             speaker.  When set, this name is guaranteed to be covered.
 
     Returns:
-        Complete mapping ready to feed :func:`_anonymize_transcript`
-        and :func:`verify_anonymization_completeness`.
+        ``(forward, reverse)`` — ``forward`` is the many-to-one
+        ``{real_name | attr_value: placeholder}`` mapping that feeds
+        :func:`_anonymize_transcript` and
+        :func:`verify_anonymization_completeness`.  ``reverse`` is the
+        one-to-one ``{placeholder: entity_name}`` map consumed by the
+        deanon path (:func:`deanonymize_text`, :func:`_apply_bindings`)
+        — attribute values are deliberately absent so a folded
+        placeholder always restores to the entity name.
     """
     scope: frozenset[str] = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
     type_to_prefix = anonymizer_type_to_prefix()
     counter: dict[str, int] = {}
     mapping: dict[str, str] = {}
+    reverse: dict[str, str] = {}
 
     def _next_placeholder(prefix: str) -> str:
         counter[prefix] = counter.get(prefix, 0) + 1
@@ -2738,6 +2778,10 @@ def _build_anonymization_mapping(
         if entity.name not in mapping:
             mapping[entity.name] = _next_placeholder(prefix)
         placeholder = mapping[entity.name]
+        # Only entity names enter the reverse map.  ``setdefault`` so the
+        # first-seen entity wins if two distinct entities collide on the
+        # same placeholder via an LLM hint downstream.
+        reverse.setdefault(placeholder, entity.name)
         if entity.speaker_id is not None and speaker_entity_placeholder is None:
             speaker_entity_placeholder = placeholder
         attrs = entity.attributes or {}
@@ -2747,6 +2791,11 @@ def _build_anonymization_mapping(
             if not isinstance(attr_value, str) or not attr_value.strip():
                 continue
             mapping.setdefault(attr_value, placeholder)
+            # NOTE: deliberately not adding to ``reverse``.  Folding
+            # attribute values into the forward map is privacy-correct
+            # (one placeholder scrubs every PII surface form) but the
+            # reverse direction must restore the entity name, not an
+            # attribute value.
 
     # Step 3: speaker-name seeding (legacy Bug A).
     if speaker_name and speaker_name not in mapping:
@@ -2754,7 +2803,10 @@ def _build_anonymization_mapping(
             # Speaker is in graph.entities but under a different
             # surface form (e.g. anonymous "Speaker0" → display
             # "Alex").  Reuse that placeholder so every form maps
-            # consistently.
+            # consistently.  ``reverse`` already points the placeholder
+            # at the canonical entity name from step 1; do not
+            # overwrite — the entity name is the preferred display
+            # form for the deanon target.
             mapping[speaker_name] = speaker_entity_placeholder
         else:
             # No speaker entity in scope — fall back to LLM hints
@@ -2767,6 +2819,7 @@ def _build_anonymization_mapping(
                     break
             if reused is not None:
                 mapping[speaker_name] = reused
+                reverse.setdefault(reused, speaker_name)
             else:
                 person_prefix = type_to_prefix.get("person", "Person")
                 # Allocate Person_N taking BOTH counter and llm_mapping
@@ -2776,25 +2829,31 @@ def _build_anonymization_mapping(
                 for k, v in llm_mapping.items():
                     merged_for_idx.setdefault(k, v)
                 idx = _next_placeholder_index(merged_for_idx, person_prefix)
-                mapping[speaker_name] = f"{person_prefix}_{idx}"
+                fresh = f"{person_prefix}_{idx}"
+                mapping[speaker_name] = fresh
+                reverse.setdefault(fresh, speaker_name)
 
     # Step 4: merge in LLM hints we don't already cover (typically
     # relation-participant placeholders for entities not in
     # graph.entities).  Deterministic entries win on conflict; LLM-only
-    # entries are added.
+    # entries are added.  LLM-emitted keys are entity-name-shaped (the
+    # anonymizer prompt operates on relation participants, not
+    # attributes), so they are safe to enter the reverse map.
     for k, v in llm_mapping.items():
         if not isinstance(k, str) or not isinstance(v, str):
             continue
-        mapping.setdefault(k, v)
+        if mapping.setdefault(k, v) == v:
+            reverse.setdefault(v, k)
 
-    return mapping
+    return mapping, reverse
 
 
 def _recover_missing_placeholder_mappings(
     mapping: dict,
+    reverse: dict,
     anon_facts: list[dict],
     original_relations: list,
-) -> dict:
+) -> tuple[dict, dict]:
     """Recover anonymizer mapping entries that the model emitted in facts but omitted from mapping.
 
     Bug B fix: the local anonymizer may produce placeholder tokens in
@@ -2823,19 +2882,27 @@ def _recover_missing_placeholder_mappings(
     Braced SOTA-style tokens (``{Prefix_N}``) are intentionally skipped —
     those belong to the SOTA enrichment path and are handled separately.
 
+    Recovered entries are entity-name shaped (relation participants), so
+    they are mirrored into ``reverse`` at the same time.  Both dicts are
+    returned as new dicts — inputs are not mutated.
+
     Args:
-        mapping: Complete ``{real_name: placeholder}`` mapping as returned
-            by :func:`_build_anonymization_mapping`.
+        mapping: Complete ``{real_name: placeholder}`` forward mapping as
+            returned by :func:`_build_anonymization_mapping`.
+        reverse: ``{placeholder: entity_name}`` companion map from
+            :func:`_build_anonymization_mapping` (extended in lockstep
+            with ``mapping`` here).
         anon_facts: Anonymized fact dicts returned by
             :func:`_anonymize_with_local_model`.
         original_relations: The ``graph.relations`` list BEFORE anonymization
             (list of :class:`~paramem.graph.schema.Relation` objects).
 
     Returns:
-        Potentially-extended mapping (new dict; input is not mutated).
+        ``(forward, reverse)`` — both potentially extended; new dicts,
+        inputs are not mutated.
     """
     if not anon_facts or not original_relations:
-        return mapping
+        return mapping, reverse
 
     # Set of placeholder token strings already covered — no need to recover.
     covered_placeholders: set[str] = {
@@ -2918,7 +2985,7 @@ def _recover_missing_placeholder_mappings(
                         break
 
     if not recovered:
-        return mapping
+        return mapping, reverse
 
     logger.info(
         "Mapping gap recovery: added %d missing entr%s: %s",
@@ -2928,18 +2995,22 @@ def _recover_missing_placeholder_mappings(
     )
     new_mapping = dict(mapping)
     new_mapping.update(recovered)
-    return new_mapping
+    new_reverse = dict(reverse)
+    for real, ph in recovered.items():
+        new_reverse.setdefault(ph, real)
+    return new_mapping, new_reverse
 
 
 def _repair_anonymization_leaks(
     graph: SessionGraph,
     mapping: dict,
+    reverse: dict,
     anon_facts: list[dict],
     anon_transcript: str,
     original_transcript: str,
     leaked: list[str],
     extra_pii_types: dict[str, str] | None = None,
-) -> tuple[list[dict], dict, str, dict]:
+) -> tuple[list[dict], dict, dict, str, dict]:
     """Deterministic repair of anonymization leaks — no LLM call.
 
     For each leaked name:
@@ -2964,13 +3035,20 @@ def _repair_anonymization_leaks(
     Precondition: mapping must be in canonical {real: placeholder} direction.
     Caller checks `_mapping_is_canonical(mapping)` and skips repair otherwise.
 
-    Returns: (repaired_facts, extended_mapping, repaired_transcript, repair_status)
-    where repair_status = {"missed_fixed", "hallucinated_dropped", "residual_dropped"}.
+    The reverse map is extended in lockstep with the forward map: every
+    newly-allocated ``name → placeholder`` entry is mirrored as
+    ``placeholder → name`` so the deanon path can restore the leaked name
+    after SOTA round-trips.
+
+    Returns: ``(repaired_facts, extended_mapping, extended_reverse,
+    repaired_transcript, repair_status)`` where ``repair_status =
+    {"missed_fixed", "hallucinated_dropped", "residual_dropped"}``.
     """
     type_by_name = {e.name: e.entity_type for e in graph.entities}
     status = {"missed_fixed": 0, "hallucinated_dropped": 0, "residual_dropped": 0}
 
     new_mapping = dict(mapping)
+    new_reverse = dict(reverse)
     facts = [dict(f) for f in anon_facts if isinstance(f, dict)]
 
     # Compute next-index allocator per prefix from current mapping values.
@@ -3009,6 +3087,7 @@ def _repair_anonymization_leaks(
             continue
         placeholder = f"{prefix}_{_next_index(prefix)}"
         new_mapping[name] = placeholder
+        new_reverse.setdefault(placeholder, name)
         status["missed_fixed"] += 1
 
     # Drop hallucinated-referencing triples from anon_facts.
@@ -3041,7 +3120,7 @@ def _repair_anonymization_leaks(
                 f["object"] = _substitute_whole_words(o, missed_mapping)
         anon_transcript = _anonymize_transcript(original_transcript, new_mapping)
 
-    return facts, new_mapping, anon_transcript, status
+    return facts, new_mapping, new_reverse, anon_transcript, status
 
 
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{(\w+_\d+)\}|\b([A-Z][A-Za-z]*_\d+)\b")
@@ -3164,17 +3243,22 @@ def _project_scalar_facts_to_attributes(graph: SessionGraph, scalar_facts: list[
 
 def _apply_bindings(
     facts: list[dict],
-    mapping: dict[str, str],
+    reverse: dict[str, str],
     sota_bindings: dict[str, str],
 ) -> tuple[list[dict], list[dict]]:
     """De-anonymize facts via state-machine substitution.
 
     Combines two substitution sources into one pass:
 
-    * **Anonymizer mapping** (``mapping`` arg) — ``real_name -> placeholder``
-      from the local anonymizer pass. Reversed here; substituted via word-
-      boundary token walk so apostrophes / punctuation around bare tokens
-      don't break (``Person_2's cousin`` -> ``Alex's cousin``).
+    * **Anonymizer reverse map** (``reverse`` arg) —
+      ``placeholder -> entity_name`` produced by
+      :func:`_build_anonymization_mapping`.  Substituted via
+      word-boundary token walk so apostrophes / punctuation around
+      bare tokens don't break (``Person_2's cousin`` ->
+      ``Alex's cousin``).  Earlier revisions inverted the forward
+      mapping here, which was lossy when PII attributes folded onto
+      the entity placeholder; the explicit reverse is now produced
+      alongside the forward map.
     * **SOTA bindings** (``sota_bindings`` arg) — ``placeholder_name -> real_text``
       that SOTA emitted alongside its enriched facts. The braced literal
       ``{Event_1}`` is matched and replaced directly (string substitution);
@@ -3202,10 +3286,10 @@ def _apply_bindings(
         for k, v in sota_bindings.items()
         if isinstance(k, str) and isinstance(v, str) and k and v
     }
-    # Map bare placeholder -> real_name (reversed anonymizer mapping).
+    # Bare placeholder -> entity_name comes from the producer; no inversion here.
     bare_map: dict[str, str] = {
         ph: real
-        for real, ph in mapping.items()
+        for ph, real in reverse.items()
         if isinstance(ph, str) and isinstance(real, str) and ph and real
     }
 

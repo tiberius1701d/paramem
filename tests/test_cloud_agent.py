@@ -763,7 +763,7 @@ class TestCloudModePolicy:
         with (
             patch(
                 "paramem.graph.extractor.extract_and_anonymize_for_cloud",
-                return_value=("Person_1 query", {"Alex": "Person_1"}),
+                return_value=("Person_1 query", {"Alex": "Person_1"}, {"Person_1": "Alex"}),
             ) as mock_anon,
             patch(
                 "paramem.graph.extractor.deanonymize_text",
@@ -789,7 +789,7 @@ class TestCloudModePolicy:
         cloud_agent = self._make_cloud_agent()
         with patch(
             "paramem.graph.extractor.extract_and_anonymize_for_cloud",
-            return_value=("", {}),  # leak guard tripped
+            return_value=("", {}, {}),  # leak guard tripped
         ):
             self._run(
                 router=self._personal_router(),
@@ -816,7 +816,7 @@ class TestCloudModePolicy:
         with (
             patch(
                 "paramem.graph.extractor.extract_and_anonymize_for_cloud",
-                return_value=("anon q", {"Berlin": "City_1"}),
+                return_value=("anon q", {"Berlin": "City_1"}, {"City_1": "Berlin"}),
             ),
             patch(
                 "paramem.graph.extractor.deanonymize_text",

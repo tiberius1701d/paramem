@@ -135,7 +135,7 @@ def _run_one(
         extract_and_anonymize_for_cloud,
     )
 
-    anon_text, mapping = extract_and_anonymize_for_cloud(
+    anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
         transcript,
         model,
         tokenizer,
@@ -144,7 +144,7 @@ def _run_one(
     )
     if not mapping or not anon_text:
         return anon_text or "", mapping or {}, ""
-    round_trip = deanonymize_text(anon_text, mapping)
+    round_trip = deanonymize_text(anon_text, reverse)
     return anon_text, mapping, round_trip
 
 

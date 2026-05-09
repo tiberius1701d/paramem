@@ -510,7 +510,7 @@ def _escalate_via_cloud_policy(
         # single anonymized transcript here is redundant (cloud sees the
         # history twice) and forces multi-turn text reproduction on the
         # local 7B model, which it doesn't do reliably.
-        anon_text, mapping = extract_and_anonymize_for_cloud(
+        anon_text, _mapping, reverse = extract_and_anonymize_for_cloud(
             text,
             model,
             tokenizer,
@@ -521,7 +521,7 @@ def _escalate_via_cloud_policy(
             # Per-query block: extraction error, anonymizer parse failure,
             # leak guard tripped, residual leak after repair, or empty
             # mapping under non-empty scope.  Privacy-safe — cloud call
-            # is suppressed.  Distinct from the (verbatim, {}) shape
+            # is suppressed.  Distinct from the ``(verbatim, {}, {})`` shape
             # returned when cloud_scope is empty (operator opt-out).
             return None
         result = _escalate_to_sota(
@@ -532,9 +532,9 @@ def _escalate_via_cloud_policy(
             history=history,
             language=language,
         )
-        # deanonymize_text is a no-op on empty mapping, so the empty-scope
-        # opt-out path (mapping=={}) flows through unchanged.
-        result.text = deanonymize_text(result.text, mapping)
+        # deanonymize_text is a no-op on an empty reverse map, so the
+        # empty-scope opt-out path flows through unchanged.
+        result.text = deanonymize_text(result.text, reverse)
         return result
 
     # cloud_mode=block + non-PERSONAL: send verbatim (today's behaviour).

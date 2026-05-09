@@ -266,16 +266,16 @@ def test_verify_anonymization_completeness_default_scope_is_person_place():
 def test_cloud_egress_empty_scope_returns_verbatim_passthrough():
     """``pii_scope=set()`` short-circuits before any LLM call.
 
-    Distinguishes the operator opt-out path ``(transcript, {})`` from
-    the block path ``("", {})``.  The caller (inference handler)
+    Distinguishes the operator opt-out path ``(transcript, {}, {})`` from
+    the block path ``("", {}, {})``.  The caller (inference handler)
     forwards the verbatim transcript to the cloud unchanged when scope
-    is empty; deanonymize_text is a no-op on an empty mapping.
+    is empty; deanonymize_text is a no-op on an empty reverse map.
     """
     transcript = "[user] Alice told me about the Berlin trip.\n[assistant] Got it."
     # Model/tokenizer should NOT be invoked under the empty-scope path,
     # so passing ``None`` is safe — if the helper short-circuits as
     # designed, it never touches them.
-    anon_text, mapping = extract_and_anonymize_for_cloud(
+    anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
         transcript,
         model=None,  # type: ignore[arg-type]
         tokenizer=None,  # type: ignore[arg-type]
@@ -283,11 +283,12 @@ def test_cloud_egress_empty_scope_returns_verbatim_passthrough():
     )
     assert anon_text == transcript  # verbatim passthrough
     assert mapping == {}  # no anonymization happened
+    assert reverse == {}
 
 
 def test_cloud_egress_empty_string_returns_block():
-    """Empty input is the block sentinel ``("", {})`` regardless of scope."""
-    anon_text, mapping = extract_and_anonymize_for_cloud(
+    """Empty input is the block sentinel ``("", {}, {})`` regardless of scope."""
+    anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
         "",
         model=None,  # type: ignore[arg-type]
         tokenizer=None,  # type: ignore[arg-type]
@@ -295,6 +296,7 @@ def test_cloud_egress_empty_string_returns_block():
     )
     assert anon_text == ""
     assert mapping == {}
+    assert reverse == {}
 
 
 # ---------------------------------------------------------------------------
