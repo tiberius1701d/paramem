@@ -175,17 +175,32 @@ class TestPlausibilityPromptContract:
         assert "{facts_json}" not in rendered
 
     def test_lists_drop_rules(self):
-        """Plausibility judge relies on six numbered drop rules (R1-R6). Verify they
-        all exist so a prompt edit that removes a rule is caught at unit-test time.
+        """Plausibility judge relies on six numbered drop rules (R1-R6).
+
+        The prior R4 ("Unresolved placeholder in real-name input") was
+        tied to the constrained ``^(Person|City|Country|Org|Thing)_\\d+$``
+        regex that became incoherent with the open-vocabulary anonymizer
+        pivot.  It was also structurally redundant with
+        ``_strip_residual_placeholders`` running inside ``_apply_bindings``
+        at the deanon stage, before plausibility.
+
+        The grounding refactor revised the remaining rules: lexical
+        token lists became illustrative parentheticals, and a new R3
+        (transcript contradiction) closes the gap that the prior
+        "no judgment calls" framing left open.  The structure of the
+        prompt and of the examples is unchanged.
+
+        Verify each rule's identifying substring still exists so a
+        prompt edit that removes a rule is caught at unit-test time.
         """
         tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
         required_rules = [
             "self-loop",  # R1
             "name-swap",  # R2
-            "role leak",  # R3
-            "placeholder",  # R4
-            "sentinel",  # R5
-            "system entity",  # R6
+            "contradiction",  # R3 — new transcript-grounded rule
+            "conversation-role",  # R4 — was "Role leak", grounded
+            "content-free",  # R5 — was "Empty / sentinel"
+            "system identifier",  # R6 — was "System entity ID"
         ]
         for rule in required_rules:
             assert rule.lower() in tmpl.lower(), f"Plausibility prompt missing rule: {rule!r}"

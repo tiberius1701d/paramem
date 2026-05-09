@@ -1,17 +1,15 @@
-You are filtering enriched personal facts from a voice assistant conversation. Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.
-
-You decide DROP or KEEP per fact. Output ONLY the indices of facts that match a DROP rule. Never echo, modify, or add facts.
+You are filtering enriched personal facts from a voice assistant conversation. Decide KEEP or DROP per fact, grounding each against the transcript. Output ONLY the indices of facts that match a DROP rule. Never echo, modify, or add facts.
 
 ## KEEP — leave the fact in the output
 
-Default action. Apply whenever none of the DROP rules below match the fact's lexical pattern. Do not drop on semantic judgment. When uncertain, KEEP.
+Default action. Keep the fact when its subject, object, and predicate are supported by the transcript (literally or by clear implication). When uncertain, KEEP.
 
 Example: `[0] {{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP (do not include 0 in the output)
 Example: `[1] {{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP (do not include 1 in the output)
 
 ## DROP — emit this fact's index
 
-Apply when any of the lexical patterns below match. No judgment calls.
+Apply when any of the rules below matches.
 
 **R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), regardless of predicate.
 Example: `[2] {{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1) — include 2 in the output.
@@ -19,16 +17,16 @@ Example: `[2] {{"subject": "Person_1", "predicate": "has_name", "object": "Perso
 **R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are in the input (also `named`, `is`, `equals`). Drop both indices.
 Example: `[3] {{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND `[4] {{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2) — include 3 and 4.
 
-**R3. Role leak.** Subject or object is exactly one of: "Assistant", "User", "Speaker", "the bot", "the model". Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, NOT role leaks.
-Example: `[5] {{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3) — include 5.
+**R3. Transcript contradiction.** The transcript states a different value for the same subject and predicate.
+Example: `[5] {{"subject": "Alex", "predicate": "lives_in", "object": "Tokyo"}}` (when the transcript says Alex lives in Portland) → DROP (R3) — include 5.
 
-**R4. Unresolved placeholder in real-name input.** When the input is real-named (no `Person_N` / `City_N` / `Country_N` / `Org_N` / `Thing_N` placeholders expected in the transcript), drop any fact whose subject or object still matches `^(Person|City|Country|Org|Thing)_\d+$`.
-Example: `[6] {{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input) — include 6.
+**R4. Conversation-role reference.** Subject or object refers to a conversation-role label (e.g. "Assistant", "User", "Speaker", "the bot", "the model") rather than a real-world entity introduced by the transcript.
+Example: `[6] {{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R4) — include 6.
 
-**R5. Empty / sentinel object.** Object is exactly one of: "", "Unknown", "None", "Various", "Something", "N/A".
+**R5. Content-free object.** Object provides no transcript-grounded claim — empty, whitespace-only, or a content-free placeholder (e.g. "Unknown", "None", "Various", "Something", "N/A").
 Example: `[7] {{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5) — include 7.
 
-**R6. System entity ID.** Subject or object contains a dot-separated HA-style identifier (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`).
+**R6. Namespaced system identifier.** Subject or object is a system / automation identifier — a dot-separated or URI-shaped namespaced token (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`, `climate.kitchen_thermostat`) referring to a device, sensor, or service rather than a personal entity.
 Example: `[8] {{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6) — include 8.
 
 ## Input
