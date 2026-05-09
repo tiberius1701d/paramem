@@ -1330,6 +1330,19 @@ _JSON_ENVELOPE_KEYS = frozenset(
         # Anonymizer envelope — `{"anonymized": [...], "mapping": {...}}`
         "anonymized",
         "mapping",
+        # Plausibility drop-set envelope — `{"drop": [<idx>...]}` plus
+        # tolerated aliases the parser accepts.
+        "drop",
+        "drop_indices",
+        "indices",
+        # SOTA enrichment delta envelope — `{"add": [...], "modify": [...],
+        # "drop": [...], "bindings": {...}}`. ``drop`` is shared with
+        # plausibility above. ``bindings`` overlaps `new_entity_bindings`
+        # in role only — kept distinct because the new contract uses the
+        # shorter name.
+        "add",
+        "modify",
+        "bindings",
     )
 )
 
@@ -1417,15 +1430,29 @@ def _extract_json_block(text: str) -> str:
         #     that survives a truncated outer envelope — its elements
         #     have ``name`` / ``entity_type``, not ``subject``.
         if isinstance(value, dict):
-            is_envelope = bool(set(value.keys()) & _JSON_ENVELOPE_KEYS)
+            # Empty dict is unambiguously "no items" (drop-set-style
+            # no-op delta), symmetric to the empty-list envelope below.
+            # A truncated outer envelope cannot produce `{}` because the
+            # model always emits at least one key before EOF or never
+            # closes the outer brace at all.
+            is_envelope = not value or bool(set(value.keys()) & _JSON_ENVELOPE_KEYS)
         elif isinstance(value, list):
             if not value:
                 is_envelope = True
             else:
                 first = value[0]
-                is_envelope = isinstance(first, dict) and (
-                    "subject" in first or "predicate" in first or "object" in first
-                )
+                if isinstance(first, dict):
+                    is_envelope = "subject" in first or "predicate" in first or "object" in first
+                elif isinstance(first, int) and not isinstance(first, bool):
+                    # Bare integer array — plausibility's tolerated drop-set
+                    # form (`[0, 2, 5]`).  Accepting any int-first list as
+                    # an envelope is safe: extractor / enrichment / anon
+                    # outputs that survive a truncated outer envelope have
+                    # dict-shaped first elements (entity / relation / fact),
+                    # not bare ints.
+                    is_envelope = True
+                else:
+                    is_envelope = False
         else:
             is_envelope = False
         if is_envelope:
@@ -1748,27 +1775,35 @@ the local de-anonymization step reverses this to recover real names.
 # and self-referential schema artifacts.
 
 _DEFAULT_ENRICHMENT_PROMPT = """\
-Review these extracted personal facts (anonymized — placeholders like Person_1).
+Review these extracted personal facts (anonymized — placeholders like Person_1). \
+Emit a small JSON delta naming only what to change. KEEP is the default; \
+unnamed input facts pass through untouched. Each input fact below carries its \
+zero-based index in square brackets — reference it via `modify` or `drop`.
 
-1. Resolve coreference ("my wife" → married_to relation).
-2. Split compound facts into individual relations.
-3. Canonicalize symmetric predicates: emit only ONE direction. For predicates \
-   like friend_of, married_to, sibling_of, colleague_of, neighbor_of, knows, \
-   workout_partner_of, met_with — if both (A, p, B) and (B, p, A) are present, \
-   drop the one where subject > object lexicographically. Asymmetric predicates \
-   (parent_of/child_of, manages/reports_to) keep both directions if both stated.
+Tasks:
+1. Resolve coreference (e.g. "my wife" → `add` a `married_to` relation).
+2. Split compound facts: `drop` the compound index and `add` atomic facts.
+3. Canonicalize symmetric predicates: when both (A, p, B) and (B, p, A) appear \
+   for friend_of / married_to / sibling_of / colleague_of / neighbor_of / knows / \
+   met_with, `drop` the one where subject > object lexicographically. Asymmetric \
+   predicates (parent_of/child_of, manages/reports_to) keep both directions.
+4. Predicate dedup: per (subject, object) pair, emit at most one predicate via \
+   `drop` of the synonyms.
 
-You may ADD new facts that follow directly from the resolved coreference.
-Do NOT drop facts for other reasons — a separate plausibility filter handles removal.
+You may mint new entities for things the extractor missed — use `{{Prefix_N}}` \
+braced placeholders and supply the matching span in `bindings`. Existing bare \
+placeholders (Person_1, City_1, Org_1, ...) stay bare; do NOT re-brace them.
 
 Conversation transcript (anonymized):
 {transcript}
 
-Extracted facts (anonymized):
+Extracted facts (anonymized, numbered):
 {facts_json}
 
-Return ONLY a JSON array of facts. Each fact: subject, predicate, object, \
-relation_type, confidence. If none, return [].
+Return ONLY a JSON object with optional keys: `add` (array of new fact dicts), \
+`modify` (array of `{{"index": <int>, "fields": {{...}}}}`), `drop` (array of \
+integer indices), `bindings` (dict mapping new `Prefix_N` to exact transcript \
+spans). Empty `{{}}` if you have nothing to change.
 """
 
 # NOTE: keep this template byte-equivalent to ``configs/prompts/sota_plausibility.txt``.
@@ -4141,36 +4176,34 @@ def _filter_with_sota(
 ) -> tuple[list[dict] | None, str | None, dict[str, str], str | None, dict]:
     """SOTA enrichment pass — coreference + compound splitting + safe reification.
 
-    Returns ``(facts, updated_transcript, new_entity_bindings, raw_response, info)``.
+    Returns ``(facts, updated_transcript, bindings, raw_response, info)``.
 
-    ``new_entity_bindings`` maps each new braced placeholder SOTA introduced
-    (without braces, e.g. ``"Event_1"``) to the exact transcript span it stands
-    for. Empty dict when SOTA introduced no new entities or used the legacy
-    response shape that lacked the field. SOTA already knows the binding at
-    the moment it mints each placeholder, so emitting it explicitly removes
-    the entire transcript-diff reconstruction problem the previous pipeline
-    used to do post-hoc.
+    The SOTA emits a delta envelope ``{"add": [...], "modify": [...],
+    "drop": [...], "bindings": {...}}`` describing what to change against
+    the indexed input facts. KEEP is the default; unnamed input facts pass
+    through unchanged. The transcript is rendered locally from
+    ``anon_transcript`` plus ``bindings`` — never carried back on the
+    wire — so output bandwidth is bounded by the size of the change set,
+    not by the size of the input.
+
+    ``bindings`` maps each new braced placeholder SOTA introduced (key
+    without braces, e.g. ``"Event_1"``) to the exact transcript span it
+    stands for. SOTA already knows the binding the moment it mints each
+    placeholder, so emitting it explicitly removes the transcript-diff
+    reconstruction step the previous "echo every fact" protocol relied on.
 
     ``info`` is a dict with diagnostic flags the caller persists into
     ``graph.diagnostics``:
 
-    - ``parse_path``: ``"preferred"`` (strict JSON, dict with ``facts`` + ``updated_transcript``)
-      or ``"legacy_fallback"`` (response failed strict parse; bare-array salvage).
-    - ``response_truncated``: ``True`` when strict parse failed (typically max_tokens
-      hit; JSON ends mid-string). Salvaged facts may be a strict subset of what
-      the model intended to emit — a silent kill site historically.
-    - ``response_chars``: length of the raw response in characters, for sizing
-      decisions and budget tracking.
-    - ``preferred_fact_count`` / ``legacy_fact_count``: count after each parse path,
-      whichever ran. Lets us measure salvage rate when truncation hits.
-    - ``new_entity_bindings_count``: number of SOTA-introduced placeholders for
-      which the response carried an explicit binding. Useful to spot when the
-      model omits the field (legacy-shape responses surface as 0).
-
-    Legacy responses (bare JSON array, or dict missing ``new_entity_bindings``)
-    are accepted — in that case bindings is ``{}`` and any braced placeholders
-    in the facts will fail substitution downstream and the corresponding facts
-    will be dropped by the residual placeholder sweep.
+    * ``parse_path``: ``"delta"`` (envelope parsed, delta applied),
+      ``"failed"`` (parse failure — caller fail-opens), or
+      ``"no_response"`` (provider returned nothing).
+    * ``response_chars``: length of the raw response in characters.
+    * ``add_count`` / ``modify_count`` / ``drop_count``: validated
+      action counts; entries that fail per-entry validation (out-of-range
+      indices, non-dict fields) are not counted.
+    * ``bindings_count``: number of SOTA-introduced placeholders for
+      which the response carried an explicit binding.
 
     Before editing ``configs/prompts/sota_enrichment.txt``, read
     **README.md → Prompt Engineering** for the empirical principles that
@@ -4178,7 +4211,7 @@ def _filter_with_sota(
     """
     enrichment_prompt = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
     prompt = enrichment_prompt.format(
-        facts_json=json.dumps(anon_facts, indent=2),
+        facts_json=_render_indexed_facts(anon_facts),
         transcript=anon_transcript or "(not available)",
     )
     raw = _sota_call(
@@ -4194,42 +4227,20 @@ def _filter_with_sota(
     )
     if raw is None:
         return None, None, {}, None, {"parse_path": "no_response"}
-    info: dict = {"response_chars": len(raw)}
-    # Preferred schema:
-    # {"facts": [...], "updated_transcript": "...", "new_entity_bindings": {...}}
-    try:
-        parsed = json.loads(_extract_json_block(raw))
-        if isinstance(parsed, dict) and isinstance(parsed.get("facts"), list):
-            bindings_raw = parsed.get("new_entity_bindings") or {}
-            bindings: dict[str, str] = {}
-            if isinstance(bindings_raw, dict):
-                bindings = {
-                    str(k): str(v)
-                    for k, v in bindings_raw.items()
-                    if isinstance(k, str) and isinstance(v, str) and k and v
-                }
-            info["parse_path"] = "preferred"
-            info["response_truncated"] = False
-            info["preferred_fact_count"] = len(parsed["facts"])
-            info["new_entity_bindings_count"] = len(bindings)
-            return parsed["facts"], parsed.get("updated_transcript"), bindings, raw, info
-    except (json.JSONDecodeError, ValueError):
-        pass
-    # Legacy / salvage: strict parse failed. Most common cause is max_tokens
-    # truncation cutting JSON mid-string. Best-effort fact recovery only.
-    salvaged = _parse_facts_response(raw)
-    info["parse_path"] = "legacy_fallback"
-    info["response_truncated"] = True
-    info["legacy_fact_count"] = len(salvaged) if salvaged else 0
-    info["new_entity_bindings_count"] = 0
-    logger.warning(
-        "SOTA strict-parse failed; salvaged %d fact(s) via legacy fallback "
-        "(response_chars=%d, max_tokens=%d) — likely truncation",
-        info["legacy_fact_count"],
-        info["response_chars"],
-        max_tokens,
+    surviving, updated_transcript, bindings, counts = _apply_enrichment_delta(
+        anon_facts, raw, anon_transcript
     )
-    return salvaged, None, {}, raw, info
+    info: dict = {"response_chars": len(raw), **counts}
+    if surviving is None:
+        info["parse_path"] = "failed"
+        logger.warning(
+            "SOTA enrichment delta parse failed (response_chars=%d) — "
+            "caller will fail-open and keep pre-enrichment facts",
+            info["response_chars"],
+        )
+    else:
+        info["parse_path"] = "delta"
+    return surviving, updated_transcript, bindings, raw, info
 
 
 # ---------------------------------------------------------------------------
@@ -4397,36 +4408,18 @@ def _parse_drop_set(raw: str | None, n_facts: int) -> set[int] | None:
     """
     if raw is None or not raw.strip():
         return None
-    # Strip markdown wrappers before parsing — models routinely emit
-    # ```json\n{...}\n``` (triple-backtick fence) or `{...}` (single
-    # inline-code) even when asked for bare JSON.  ``_extract_json_block``
-    # would reject the drop-set object because ``drop`` isn't in its
-    # envelope-key set (that helper is calibrated for fact-list envelopes),
-    # so do the unwrap ourselves.
-    src = raw.strip()
-    for marker in ("```json", "```"):
-        if marker in src:
-            start = src.index(marker) + len(marker)
-            closing = src.find("```", start)
-            if closing != -1:
-                src = src[start:closing].strip()
-                break
-    # Strip a single-backtick wrapper if the entire payload is one
-    # inline-code span: `{...}`.  Don't touch interior backticks — they
-    # might be inside a JSON string literal.
-    if src.startswith("`") and src.endswith("`") and src.count("`") == 2:
-        src = src[1:-1].strip()
+    # Routes through the shared envelope finder (`_extract_json_block`).
+    # That helper handles markdown fences, prose preamble before the
+    # JSON, and the inline-backtick `{...}` wrapper implicitly (raw_decode
+    # stops at the JSON's natural close; a trailing backtick is ignored).
+    # Drop / drop_indices / indices are in `_JSON_ENVELOPE_KEYS`, and
+    # bare integer arrays are accepted as envelopes for the same reason.
     try:
-        parsed = json.loads(src)
-    except (json.JSONDecodeError, ValueError):
-        # Fall back to envelope detection — handles preamble like
-        # "I'll drop the following: {...}" by walking ``{``/``[`` positions.
-        try:
-            json_str = _extract_json_block(src)
-            parsed = json.loads(json_str)
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning("plaus drop-set parse failed: %s", e)
-            return None
+        json_str = _extract_json_block(raw)
+        parsed = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning("plaus drop-set parse failed: %s", e)
+        return None
     candidates: list[object]
     if isinstance(parsed, dict):
         for key in ("drop", "drop_indices", "indices"):
@@ -4483,6 +4476,235 @@ def _apply_drop_set(facts: list[dict], raw: str | None) -> list[dict] | None:
     if not drop:
         return list(facts)
     return [f for i, f in enumerate(facts) if i not in drop]
+
+
+def _parse_enrichment_delta(
+    raw: str | None, n_facts: int
+) -> tuple[list[dict], list[tuple[int, dict]], set[int], dict[str, str]] | None:
+    """Parse the SOTA enrichment judge's delta-envelope output.
+
+    Returns ``(add, modify, drop, bindings)`` on success; ``None`` on
+    parse failure (caller fail-opens — keep input facts unchanged, no
+    enrichment applied).
+
+    * ``add``      — list of new fact dicts to append.
+    * ``modify``   — list of ``(index, fields_dict)`` tuples; each entry
+      is a partial update for the indexed input fact.
+    * ``drop``     — set of zero-based indices to drop from the input.
+    * ``bindings`` — dict mapping new ``"Prefix_N"`` placeholders to the
+      exact anonymized-transcript spans they stand for.
+
+    Tolerated shapes (mirroring ``_parse_drop_set``'s permissiveness):
+
+    * ``{"add": [...], "modify": [...], "drop": [...], "bindings": {...}}``
+      — preferred shape; all four keys optional (missing == no-op).
+    * Markdown fences / prose preamble / inline-backtick wraps —
+      unwrapped via the shared envelope finder.
+    * ``null`` values for any key — coerced to empty.
+    * ``new_entity_bindings`` accepted as a synonym of ``bindings`` so
+      legacy-shape responses don't lose the binding payload silently.
+
+    Indices outside ``[0, n_facts)`` in ``drop`` / ``modify`` are
+    skipped with a warning rather than failing the whole parse — a
+    single bad index shouldn't void an otherwise-valid delta.
+    """
+    if raw is None or not raw.strip():
+        return None
+    try:
+        json_str = _extract_json_block(raw)
+        parsed = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning("enrichment delta parse failed: %s", e)
+        return None
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "enrichment delta unexpected shape: %s",
+            type(parsed).__name__,
+        )
+        return None
+
+    # add[] — every entry must be a dict; skip the rest.
+    add: list[dict] = []
+    raw_add = parsed.get("add")
+    if isinstance(raw_add, list):
+        for entry in raw_add:
+            if isinstance(entry, dict):
+                add.append(entry)
+    elif raw_add is not None:
+        logger.warning(
+            "enrichment delta: 'add' has non-list shape %s — ignored",
+            type(raw_add).__name__,
+        )
+
+    # modify[] — each entry is {"index": <int>, "fields": {<partial>}};
+    # tolerate either out-of-range indices or non-dict fields by skipping.
+    modify: list[tuple[int, dict]] = []
+    out_of_range_mod = 0
+    raw_modify = parsed.get("modify")
+    if isinstance(raw_modify, list):
+        for entry in raw_modify:
+            if not isinstance(entry, dict):
+                continue
+            idx = entry.get("index")
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                continue
+            fields = entry.get("fields")
+            if not isinstance(fields, dict):
+                continue
+            if 0 <= idx < n_facts:
+                modify.append((idx, fields))
+            else:
+                out_of_range_mod += 1
+    elif raw_modify is not None:
+        logger.warning(
+            "enrichment delta: 'modify' has non-list shape %s — ignored",
+            type(raw_modify).__name__,
+        )
+    if out_of_range_mod:
+        logger.warning(
+            "enrichment delta: %d modify index(es) out of range [0, %d) — skipped",
+            out_of_range_mod,
+            n_facts,
+        )
+
+    # drop[] — tolerates the same per-entry shapes as `_parse_drop_set`
+    # (bare ints, `{"index": N, "rule": "Rk"}` annotated form).
+    drop: set[int] = set()
+    out_of_range_drop = 0
+    raw_drop = parsed.get("drop")
+    if isinstance(raw_drop, list):
+        for c in raw_drop:
+            if isinstance(c, dict):
+                idx = c.get("index")
+                if isinstance(idx, bool) or not isinstance(idx, int):
+                    continue
+            elif isinstance(c, bool) or not isinstance(c, int):
+                continue
+            else:
+                idx = c
+            if 0 <= idx < n_facts:
+                drop.add(idx)
+            else:
+                out_of_range_drop += 1
+    elif raw_drop is not None:
+        logger.warning(
+            "enrichment delta: 'drop' has non-list shape %s — ignored",
+            type(raw_drop).__name__,
+        )
+    if out_of_range_drop:
+        logger.warning(
+            "enrichment delta: %d drop index(es) out of range [0, %d) — skipped",
+            out_of_range_drop,
+            n_facts,
+        )
+
+    # bindings{} — primary key is `bindings`; `new_entity_bindings` is a
+    # legacy-shape synonym kept so older responses don't silently lose
+    # the payload.  Each entry must be a non-empty string→string pair.
+    bindings: dict[str, str] = {}
+    raw_bindings = parsed.get("bindings")
+    if raw_bindings is None:
+        raw_bindings = parsed.get("new_entity_bindings")
+    if isinstance(raw_bindings, dict):
+        for k, v in raw_bindings.items():
+            if isinstance(k, str) and isinstance(v, str) and k and v:
+                bindings[k] = v
+    elif raw_bindings is not None:
+        logger.warning(
+            "enrichment delta: 'bindings' has non-dict shape %s — ignored",
+            type(raw_bindings).__name__,
+        )
+
+    return add, modify, drop, bindings
+
+
+def _reconstruct_updated_transcript(
+    anon_transcript: str | None,
+    bindings: dict[str, str],
+) -> str | None:
+    """Substitute SOTA-introduced bindings into the anonymized transcript.
+
+    Replaces each binding's span with ``{{<placeholder>}}``. Spans are
+    processed longest-first so a longer span (``"Senior Software
+    Engineer"``) wins over a shorter one (``"Software Engineer"``) that
+    might otherwise consume part of it. All occurrences of each span are
+    replaced — entities mentioned more than once in the transcript get
+    one placeholder consistently.
+
+    Returns the substituted transcript, the input unchanged when there
+    are no bindings, or ``None`` when ``anon_transcript`` is ``None``.
+    """
+    if anon_transcript is None:
+        return None
+    if not bindings:
+        return anon_transcript
+    out = anon_transcript
+    # Single-brace `{Prefix_N}` matches the convention SOTA used to echo
+    # in the previous protocol's `updated_transcript` (saved snapshots
+    # under `data/ha/debug/`) and the literal that `_apply_bindings`
+    # already substitutes in fact subject / object.
+    for placeholder, span in sorted(bindings.items(), key=lambda kv: -len(kv[1])):
+        if span and span in out:
+            out = out.replace(span, "{" + placeholder + "}")
+    return out
+
+
+def _apply_enrichment_delta(
+    facts: list[dict],
+    raw: str | None,
+    anon_transcript: str | None,
+) -> tuple[list[dict] | None, str | None, dict[str, str], dict]:
+    """Apply the enrichment delta to input facts and reconstruct transcript.
+
+    Returns ``(new_facts, updated_transcript, bindings, counts)``.  On
+    parse failure ``new_facts`` is ``None`` so the caller can fail-open
+    (matches the prior ``_filter_with_sota`` contract: when SOTA's
+    response is unparseable, ``_sota_pipeline`` keeps the pre-enrichment
+    facts and logs a warning).  ``counts`` is a small diagnostic dict
+    (``add_count`` / ``modify_count`` / ``drop_count`` / ``bindings_count``)
+    that callers persist into ``graph.diagnostics``; on parse failure
+    every count is zero.
+
+    Application order:
+      1. ``modify`` — shallow-merge ``fields`` into a copy of each
+         indexed input fact.
+      2. ``drop`` — remove dropped indices.
+      3. ``add`` — append new facts.
+      4. Reconstruct ``updated_transcript`` from ``anon_transcript`` +
+         ``bindings`` (longest-span-first single pass).
+
+    The transcript-on-the-wire is gone: SOTA emits only the bindings,
+    and the substitution is deterministic.  Downstream diagnostics that
+    used ``sota_updated_transcript`` continue to work because the
+    reconstruction lives at the same call site.
+    """
+    parsed = _parse_enrichment_delta(raw, len(facts))
+    if parsed is None:
+        zero_counts = {
+            "add_count": 0,
+            "modify_count": 0,
+            "drop_count": 0,
+            "bindings_count": 0,
+        }
+        return None, None, {}, zero_counts
+    add, modify, drop, bindings = parsed
+    working = [dict(f) for f in facts]
+    for idx, fields in modify:
+        working[idx].update(fields)
+    surviving = [f for i, f in enumerate(working) if i not in drop]
+    surviving.extend(add)
+    counts = {
+        "add_count": len(add),
+        "modify_count": len(modify),
+        "drop_count": len(drop),
+        "bindings_count": len(bindings),
+    }
+    return (
+        surviving,
+        _reconstruct_updated_transcript(anon_transcript, bindings),
+        bindings,
+        counts,
+    )
 
 
 def _plausibility_filter_with_sota(

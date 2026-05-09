@@ -1,4 +1,6 @@
-Review extracted personal facts from a voice assistant conversation. The facts and transcript are anonymized — entities appear as bare placeholders (Person_1, City_1, Thing_1). KEEP, MODIFY (resolve coreference / split compound / canonicalize symmetric / dedupe synonyms), or ADD facts directly stated by the transcript. Do NOT drop facts — a separate plausibility filter handles removal.
+Review extracted personal facts from a voice assistant conversation. The facts and transcript are anonymized — entities appear as bare placeholders (Person_1, City_1, Thing_1). You emit a small JSON delta describing what to ADD, MODIFY, or DROP — never echo facts, never echo the transcript. KEEP is the default: any input fact you don't name in the delta passes through unchanged.
+
+Each input fact below is preceded by its zero-based index in square brackets. Use that index to refer to the fact in your `modify` or `drop` output.
 
 
 ## Brace-binding contract — REQUIRED for every NEW entity you mint
@@ -6,71 +8,71 @@ Review extracted personal facts from a voice assistant conversation. The facts a
 You may introduce new placeholders for entities the extractor missed (an event, topic, location, project, etc. named in the transcript). Pre-existing anonymizer placeholders stay BARE (`Person_1`, `City_1`); placeholders YOU mint must use BRACED form (`{{Event_1}}`).
 
 Every new braced placeholder MUST appear in BOTH:
-- `updated_transcript` — the placeholder substituted at the exact position of the real-text span it replaces.
-- `new_entity_bindings` — a dict entry `"Prefix_N": "<exact transcript span>"` (key WITHOUT braces).
+- a fact in `add` (or in a `modify` `fields` block), under subject or object.
+- `bindings` — a dict entry `"Prefix_N": "<exact transcript span>"` (key WITHOUT braces).
 
-Type-appropriate prefixes: Person, City, Country, Org, Event, Topic, Location, Thing. Allocate the smallest free index above all observed values for that prefix (count BOTH bare and braced occurrences).
+Type-appropriate prefixes: Person, City, Country, Org, Event, Topic, Location, Thing, Role. Allocate the smallest free index above all observed values for that prefix (count BOTH bare and braced occurrences in the input facts).
 
 POSITIVE — transcript: `"...Person_1 led the agile transformation initiative at Org_1..."`
-→ facts: `led(Person_1, {{Event_1}})`, `works_at(Person_1, Org_1)`
-→ updated_transcript: `"...Person_1 led {{Event_1}} at Org_1..."`
-→ new_entity_bindings: `{{"Event_1": "the agile transformation initiative"}}`
+→ add: `[{{"subject": "Person_1", "predicate": "led", "object": "{{Event_1}}", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "Person_1", "predicate": "works_at", "object": "Org_1", "relation_type": "factual", "confidence": 0.9}}]`
+→ bindings: `{{"Event_1": "the agile transformation initiative"}}`
 
 POSITIVE (role-instance — bind co-temporal attributes to ONE entity, not flat triples on the speaker) — transcript: `"...Person_1 was Senior Engineer at Org_1 in City_1 from Jan 2014 to Sep 2017..."`
-→ facts: `held_role(Person_1, {{Role_1}})`, `at_company({{Role_1}}, Org_1)`, `in_location({{Role_1}}, City_1)`, `start_date({{Role_1}}, "Jan 2014")`, `end_date({{Role_1}}, "Sep 2017")`
-→ updated_transcript: `"...Person_1 was {{Role_1}} at Org_1 in City_1 from Jan 2014 to Sep 2017..."`
-→ new_entity_bindings: `{{"Role_1": "Senior Engineer"}}`
+→ add: `[{{"subject": "Person_1", "predicate": "held_role", "object": "{{Role_1}}", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "at_company", "object": "Org_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "in_location", "object": "City_1", "relation_type": "factual", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "start_date", "object": "Jan 2014", "relation_type": "temporal", "confidence": 0.9}}, {{"subject": "{{Role_1}}", "predicate": "end_date", "object": "Sep 2017", "relation_type": "temporal", "confidence": 0.9}}]`
+→ bindings: `{{"Role_1": "Senior Engineer"}}`
 
 NEGATIVE — same transcript:
-- WRONG: `led(Person_1, Project_1)` — bare `Project_1` looks like an anonymizer placeholder but isn't in the mapping → fact dropped at residual sweep.
-- WRONG: `led(Person_1, {{Event_1}})` with `Event_1` missing from `new_entity_bindings` → no binding to substitute → fact dropped.
-- WRONG: `new_entity_bindings: {{"{{Event_1}}": "..."}}` — key includes braces → lookup misses → fact dropped.
-- WRONG (role flattened onto speaker): `held_role(Person_1, "Senior Engineer")`, `worked_at(Person_1, Org_1)`, `lived_in(Person_1, City_1)`, `start_date(Person_1, "Jan 2014")`, `end_date(Person_1, "Sep 2017")` — co-temporal attributes orphan from the role. With multiple roles in one transcript the dates cannot be paired back to a title; downstream reasoning over "what title did Person_1 hold in 2015?" fails.
+- WRONG: `add: [{{"subject":"Person_1","predicate":"led","object":"Project_1",...}}]` — bare `Project_1` looks like an anonymizer placeholder but isn't in the input mapping → fact dropped at residual sweep.
+- WRONG: `add: [{{"subject":"Person_1","predicate":"led","object":"{{Event_1}}",...}}]` with `Event_1` missing from `bindings` → no binding to substitute → fact dropped.
+- WRONG: `bindings: {{"{{Event_1}}": "..."}}` — key includes braces → lookup misses → fact dropped.
+- WRONG (role flattened onto speaker): `add: [{{"subject":"Person_1","predicate":"held_role","object":"Senior Engineer",...}}, {{"subject":"Person_1","predicate":"worked_at","object":"Org_1",...}}, {{"subject":"Person_1","predicate":"start_date","object":"Jan 2014",...}}, {{"subject":"Person_1","predicate":"end_date","object":"Sep 2017",...}}]` — co-temporal attributes orphan from the role. With multiple roles in one transcript the dates cannot be paired back to a title; downstream reasoning over "what title did Person_1 hold in 2015?" fails.
+
+Existing bare anonymizer placeholders (`Person_1`, `City_1`, `Org_1`, etc.) stay bare. Do NOT re-brace them. Leave them exactly as the extractor emitted them.
 
 
 ## Coreference resolution
 
 Few-shot — "my wife is also a teacher"
-→ ADD `married_to(Person_1, Person_2)`, `profession(Person_2, "teacher")`.
+→ add: `[{{"subject":"Person_1","predicate":"married_to","object":"Person_2","relation_type":"social","confidence":0.9}}, {{"subject":"Person_2","predicate":"profession","object":"teacher","relation_type":"factual","confidence":0.9}}]`.
 
 Few-shot — "we went there last summer" (context: Person_1 + Person_2 + Location_1)
-→ ADD `visited(Person_1, Location_1, "last summer")`, `visited(Person_2, Location_1, "last summer")`.
+→ add: `[{{"subject":"Person_1","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9}}, {{"subject":"Person_2","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9}}]`.
 
 Few-shot — "I" / "me" / "my" → Person_1 (the speaker, unless context indicates otherwise).
 
 Few-shot — "my sister's husband"
-→ chain: `sister_of(Person_1, Person_2)`, `married_to(Person_2, Person_3)`.
+→ add: `[{{"subject":"Person_1","predicate":"sister_of","object":"Person_2",...}}, {{"subject":"Person_2","predicate":"married_to","object":"Person_3",...}}]`.
 
 
 ## Compound fact splitting
 
-Few-shot — "grew up in City_1 and studied in City_2"
-→ `grew_up_in(Person_1, City_1)`, `studied_in(Person_1, City_2)`.
+Few-shot — input: `[3] {{"subject":"Person_1","predicate":"likes","object":"hiking and cooking"}}`
+→ drop: `[3]`, add: `[{{"subject":"Person_1","predicate":"likes","object":"hiking",...}}, {{"subject":"Person_1","predicate":"likes","object":"cooking",...}}]`.
 
-Few-shot — "likes hiking and cooking"
-→ `likes(Person_1, hiking)`, `likes(Person_1, cooking)`.
+Few-shot — input: `[5] {{"subject":"Person_1","predicate":"grew_up_in","object":"City_1 and studied in City_2"}}`
+→ drop: `[5]`, add: `[{{"subject":"Person_1","predicate":"grew_up_in","object":"City_1",...}}, {{"subject":"Person_1","predicate":"studied_in","object":"City_2",...}}]`.
 
 
 ## Symmetric predicate canonicalization
 
 Symmetric predicates (one triple represents both directions; lexicographic-min subject wins): friend_of, friends_with, married_to, spouse_of, sibling_of, brother_of, sister_of, cousin_of (when reciprocal), colleague_of, coworker_of, neighbor_of, partner_of, related_to, met_with, knows (only if reciprocal), agrees_with, disagrees_with, attended_with, shares_interest_with.
 
-Few-shot — input has `friend_of(A, B)` AND `friend_of(B, A)`
-→ EMIT `friend_of(A, B)` only.
+Few-shot — input: `[2] friend_of(A, B)` AND `[3] friend_of(B, A)`
+→ drop: `[3]`. Keep `[2]` (lexicographic-min subject).
 
-Few-shot — input has `parent_of(A, B)` AND `child_of(B, A)`
-→ EMIT BOTH. Asymmetric pair (also: manages/reports_to, taught/studied_under, likes/liked_by) — distinct semantics, keep both directions.
+Few-shot — input: `[4] parent_of(A, B)` AND `[5] child_of(B, A)`
+→ no delta — asymmetric pair (also: manages/reports_to, taught/studied_under, likes/liked_by) — distinct semantics, keep both directions.
 
 
 ## Predicate de-duplication
 
 Per `(subject, object)` pair, emit AT MOST ONE predicate.
 
-Few-shot — input: `worked_for(P, Org_1)` AND `employed_by(P, Org_1)`
-→ EMIT `worked_for(P, Org_1)`. Synonyms; pick the predicate already most frequent in the rest of your output.
+Few-shot — input: `[6] worked_for(P, Org_1)` AND `[7] employed_by(P, Org_1)`
+→ drop: `[7]` (synonym of `[6]`; pick the predicate already most frequent in the rest of your output).
 
-Few-shot — input: `parent_of(P, Q)` AND `birth_parent_of(P, Q)`
-→ EMIT `birth_parent_of(P, Q)`. Same relation, more specific surface; pick the more specific.
+Few-shot — input: `[8] parent_of(P, Q)` AND `[9] birth_parent_of(P, Q)`
+→ drop: `[8]` (more specific predicate `[9]` wins; same relation, keep the specific surface).
 
 
 ## ADD discipline
@@ -78,26 +80,37 @@ Few-shot — input: `parent_of(P, Q)` AND `birth_parent_of(P, Q)`
 Only emit a new fact when the transcript directly states it.
 
 Few-shot — transcript: "scaled team from 15 to 100+ engineers across 4 countries"
-→ ADD `scaled_team_from(P, 15 engineers)`, `scaled_team_to(P, 100+ engineers)`, `managed_teams_across(P, 4 countries)`.
-→ DO NOT ADD `interviewed/hired/mentored(P, 15 engineers)` — actions not stated.
+→ add `scaled_team_from(P, "15 engineers")`, `scaled_team_to(P, "100+ engineers")`, `managed_teams_across(P, "4 countries")`.
+→ DO NOT add `interviewed/hired/mentored(P, "15 engineers")` — actions not stated.
 → DO NOT broadcast `operates_in(P, Country_X)` for each of the 4 countries — the transcript names a count, not a list.
 
 Few-shot — same artefact named twice ("Indexed Key Retrieval paper", "the parametric memory system")
-→ MERGE into one canonical entity; rewrite every relation to that entity. Do not keep two entities with overlapping attributes.
+→ either pick one canonical entity name and use `modify` to rewrite synonym occurrences in the indexed input, or use `drop`+`add` if the rewrite is too tangled. Do not keep two entities with overlapping attributes.
 
 
-## Output format
+## Conversation transcript (anonymized)
 
-Return ONLY a JSON object with exactly three keys:
-- `"facts"`: array of `{{subject, predicate, object, relation_type, confidence}}`. New entities appear as `{{Prefix_N}}`.
-- `"updated_transcript"`: the anonymized transcript with all new braced placeholders substituted in at their span positions; all other text verbatim.
-- `"new_entity_bindings"`: dict mapping each NEW braced placeholder (key WITHOUT braces) to its exact transcript span. Empty `{{}}` if you minted no new entities.
-
-Confidence: 0.9 for coreference-resolved facts, 0.8 for inferred facts, original confidence for unchanged facts.
-
-
-Conversation transcript (anonymized):
 {transcript}
 
-Extracted facts (anonymized):
+
+## Extracted facts (anonymized, numbered)
+
 {facts_json}
+
+
+## Output
+
+Return ONLY a single JSON object with these four optional keys:
+
+- `add` — array of new facts to append. Each fact: `{{"subject", "predicate", "object", "relation_type", "confidence"}}`. New entities appear as `{{Prefix_N}}`.
+- `modify` — array of partial updates against the indexed input facts. Each entry: `{{"index": <int>, "fields": {{<partial fact dict — only the keys you want to change>}}}}`.
+- `drop` — array of zero-based integer indices to drop from the input facts.
+- `bindings` — dict mapping each NEW braced placeholder you used in `add` (key WITHOUT braces) to its exact transcript span. Empty `{{}}` if you minted no new entities.
+
+Confidence: 0.9 for coreference-resolved facts, 0.8 for inferred facts. Do not echo the input facts back. Do not echo the transcript back.
+
+Example clean input where you have nothing to do: `{{}}`
+Example with one synonym dedup: `{{"drop": [7]}}`
+Example with coreference resolution and a new entity: `{{"add": [{{"subject":"Person_1","predicate":"married_to","object":"Person_2","relation_type":"social","confidence":0.9}}, {{"subject":"Person_1","predicate":"led","object":"{{Event_1}}","relation_type":"factual","confidence":0.9}}], "bindings": {{"Event_1": "the agile transformation initiative"}}}}
+
+Do NOT wrap the output in backticks, code fences, or any other prose.
