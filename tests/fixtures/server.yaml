@@ -543,7 +543,7 @@ process:
 # device; raise cautiously, only after measuring.
 vram:
   process_cap_fraction: 0.85   # in (0, 1]; rejected at startup otherwise
-  vram_cache_headroom_gib: 1.0   # Per-phase peak; vram_scope releases the KV pool between extraction phases. Raise for workloads with longer single-phase context windows.
+  vram_cache_headroom_gib: 2.0   # Per-phase peak; vram_scope releases the KV pool between extraction phases. Raise for workloads with longer single-phase context windows.
 
 # ============================================================================
 # SECURITY

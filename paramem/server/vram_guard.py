@@ -25,7 +25,7 @@ from __future__ import annotations
 import gc
 import logging
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Iterator, MutableMapping
 
 import torch
 
@@ -228,3 +228,64 @@ def safe_empty_cache() -> None:
         torch.cuda.empty_cache()
     except Exception as exc:  # noqa: BLE001
         logger.warning("VRAM guard: empty_cache failed: %s", exc)
+
+
+@contextmanager
+def vram_measure(label: str) -> Iterator[MutableMapping[str, int]]:
+    """Capture free-VRAM delta around a load operation.
+
+    Yields a mutable dict; populated on exit with:
+        free_before  — bytes free per mem_get_info() before the loader ran
+        free_after   — bytes free after the loader ran (+ a sync)
+        delta        — free_before - free_after (component VRAM cost)
+        total        — device total bytes
+
+    Logs delta at INFO with the label.
+
+    On torch.cuda.OutOfMemoryError or CUDA driver fault (matching the
+    existing _CUDA_DRIVER_FAULT_MARKERS), calls safe_empty_cache and
+    re-raises as VramExhausted(label). On success, does NOT call
+    safe_empty_cache (the caller may want the loaded tensors live).
+
+    No-op when CUDA is unavailable: yields {free_before: 0, free_after: 0,
+    delta: 0, total: 0}.
+    """
+    result: dict[str, int] = {"free_before": 0, "free_after": 0, "delta": 0, "total": 0}
+    if not torch.cuda.is_available():
+        yield result
+        return
+    try:
+        free_before, total = torch.cuda.mem_get_info()
+        result["free_before"] = free_before
+        result["total"] = total
+        yield result
+    except torch.cuda.OutOfMemoryError as exc:
+        logger.error("vram_measure: %s exhausted device memory: %s", label, exc)
+        safe_empty_cache()
+        raise VramExhausted(label) from exc
+    except RuntimeError as exc:
+        if _is_cuda_driver_fault(exc):
+            logger.error(
+                "vram_measure: %s hit CUDA driver fault (treating as VRAM exhausted): %s",
+                label,
+                exc,
+            )
+            safe_empty_cache()
+            raise VramExhausted(label) from exc
+        raise
+    else:
+        try:
+            torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+        free_after, _ = torch.cuda.mem_get_info()
+        result["free_after"] = free_after
+        delta = free_before - free_after
+        result["delta"] = delta
+        logger.info(
+            "vram_measure[%s]: used %.0f MiB (free %d → %d MiB)",
+            label,
+            delta / (1024 * 1024),
+            free_before >> 20,
+            free_after >> 20,
+        )

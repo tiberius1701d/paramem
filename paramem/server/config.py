@@ -284,10 +284,11 @@ class VramConfig:
 
     process_cap_fraction: float = 0.85
     # KV-cache + activation headroom passed to assess_topology and the lifespan
-    # VRAM gate. 1.0 GiB sizes for the per-phase peak — vram_scope's
+    # VRAM gate. Code default 1.0 GiB is the conservative minimum for callers
+    # that don't load a yaml; production yaml ships 2.0 GiB (configs/server.yaml
+    # and tests/fixtures/server.yaml) for the per-phase peak. vram_scope's
     # inter-phase empty_cache releases the allocator pool between phases, so
-    # the static reservation only needs to cover one phase's max KV growth.
-    # Raise on workloads with longer single-phase context windows.
+    # the reservation only needs to cover one phase's max KV growth.
     vram_cache_headroom_gib: float = 1.0
 
     def __post_init__(self) -> None:

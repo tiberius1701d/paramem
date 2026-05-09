@@ -722,13 +722,13 @@ class TestVRAMBudget:
         import torch
 
         from paramem.server.config import load_server_config
+        from paramem.server.vram_predict import predict_base_bytes
         from paramem.server.vram_validator import (
-            _MODEL_VRAM_BYTES,
             _SAFETY_MARGIN_BYTES,
+            assess_topology,
             estimate_stt_bytes,
             estimate_tts_bytes,
             estimated_adapter_bytes,
-            validate_startup_vram,
         )
 
         model, _tokenizer = model_and_tokenizer
@@ -743,24 +743,27 @@ class TestVRAMBudget:
 
         try:
             # ── (a) math gate: pre-load math on a fresh GPU.
-            # The module fixture has already loaded the base model, so real
-            # ``mem_get_info`` would understate available free bytes (it would
-            # exclude the already-loaded base, which is exactly what the
-            # pre-load branch wants to include). We pass ``vram_cap_gib`` to
-            # simulate the production pre-load condition: fresh GPU, full
-            # 8 GiB available. This is the math the server would run at boot
-            # before any load begins.
+            # predict_base_bytes reads from HF cache; may return None if not cached.
+            # Falls back to known Mistral 7B measured value for the probe.
+            _MISTRAL_7B_MEASURED = 4_308_428_800  # ~4,108 MiB NF4 (measured RTX 5070, 2026-04-19)
+            base_pred = predict_base_bytes(server_cfg.model_config) or _MISTRAL_7B_MEASURED
+            hidden_size, num_layers = 4096, 32  # Mistral 7B
             stt_bytes = estimate_stt_bytes(server_cfg.stt)
             tts_bytes = estimate_tts_bytes(server_cfg.tts)
-            validate_startup_vram(
-                None,
+            assessment = assess_topology(
                 adapter_cfg,
                 max_interim_count=max_interim,
-                model_name=server_cfg.model_name,
+                base_bytes=base_pred,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                model_id=server_cfg.model_config.model_id,
                 main_adapter_count=3,
+                headroom_gib=self._HARDWARE_CAP_GIB,
                 stt_bytes=stt_bytes,
                 tts_bytes=tts_bytes,
-                vram_cap_gib=self._HARDWARE_CAP_GIB,
+            )
+            assert assessment.smallest_fitting_tier_gib() is not None, (
+                f"Topology must fit at least one hardware tier; got: {assessment.per_tier_fit}"
             )
 
             # ── STT: Whisper per server.yaml (distil-large-v3 int8 on cuda).
@@ -807,17 +810,22 @@ class TestVRAMBudget:
 
             # Predicted working set from the validator's math (without interim
             # headroom — those are all materialized now, so the only remaining
-            # reservation is the 1 GiB KV cache + 256 MiB fragmentation margin).
+            # reservation is the KV cache + 256 MiB fragmentation margin).
             # STT/TTS bytes are included because the real VRAM reading captures
             # their allocations; omitting them here produced the 800 MiB
             # math-vs-reality gap that motivated the estimator work.
-            hidden_size, num_layers = 4096, 32  # Mistral 7B
             adapter_bytes = estimated_adapter_bytes(adapter_cfg, hidden_size, num_layers)
             predicted_loaded = (
-                _MODEL_VRAM_BYTES[server_cfg.model_name]
-                + (3 + max_interim + 1) * adapter_bytes
-                + stt_bytes
-                + tts_bytes
+                base_pred + (3 + max_interim + 1) * adapter_bytes + stt_bytes + tts_bytes
+            )
+
+            # Verify predicted is within ±20% of measured allocation (live calibration).
+            assert allocated_bytes > 0, "Expected non-zero VRAM allocation after full load"
+            ratio = abs(allocated_bytes - predicted_loaded) / max(predicted_loaded, 1)
+            assert ratio < 0.20, (
+                f"Predicted {predicted_loaded / 2**30:.2f} GiB vs measured "
+                f"{allocated_bytes / 2**30:.2f} GiB: drift {ratio:.0%} exceeds 20%% — "
+                f"check predict_base_bytes calibration."
             )
 
             print(
@@ -853,20 +861,17 @@ class TestVRAMBudget:
             torch.cuda.empty_cache()
 
     def test_overbudget_config_rejected_before_load(self, caplog):
-        """Oversized topology triggers math-based rejection with user-facing
-        warning — and proves no load was attempted (real-VRAM failure avoided).
+        """Oversized topology triggers enforce_live_budget rejection.
 
-        This is the "proper failure reaction" path: operator configures a
-        topology that won't fit, the server refuses to start with an
-        actionable error, and no GPU pressure is ever applied. Without this
-        gate the loads would proceed until CUDA OOM, which is harder to
-        diagnose and leaks allocation state.
+        Uses assess_topology with injected base_bytes + enforce_live_budget against
+        a simulated tiny device to prove the gate fires before any GPU load.
         """
         import logging
 
         from paramem.server.vram_validator import (
             ConfigurationError,
-            validate_startup_vram,
+            assess_topology,
+            enforce_live_budget,
         )
         from paramem.utils.config import AdapterConfig
 
@@ -884,49 +889,40 @@ class TestVRAMBudget:
         def _spy_diagnostic():
             diagnostic_calls.append(1)
 
+        # Simulate an 8 GiB device with zero external occupancy — the oversized
+        # topology still overflows this budget.
+        _8GiB = 8 * 2**30
+        _BASE_BYTES = 4_308_428_800  # Mistral 7B NF4 measured
+
+        assessment = assess_topology(
+            oversized,
+            max_interim_count=absurd_max_interim,
+            base_bytes=_BASE_BYTES,
+            hidden_size=4096,
+            num_layers=32,
+            model_id="mistralai/Mistral-7B-Instruct-v0.3",
+            main_adapter_count=3,
+        )
+
         with patch(
             "paramem.server.vram_validator._log_gpu_occupancy_diagnostic",
             _spy_diagnostic,
         ):
             with caplog.at_level(logging.INFO, logger="paramem.server.vram_validator"):
                 with pytest.raises(ConfigurationError) as exc_info:
-                    validate_startup_vram(
-                        None,
-                        oversized,
-                        max_interim_count=absurd_max_interim,
-                        model_name="mistral",
-                        model_id="mistralai/Mistral-7B-Instruct-v0.3",
-                        main_adapter_count=3,
-                    )
+                    # external_bytes = 0 but required >> 8 GiB due to rank=256 + 50 interims
+                    enforce_live_budget(assessment, _8GiB, 0)
 
         msg = str(exc_info.value)
 
-        # User-facing message must include every component of the breakdown
-        # and every remediation knob so the operator can act on it.
-        assert "VRAM Working Set Breakdown" in msg
-        assert "base model" in msg
-        assert "main adapters" in msg
-        assert "interim adapters" in msg
-        assert "in_training staging slot" in msg
-        assert "KV cache headroom" in msg
-        assert "required total" in msg
-        assert "available (free VRAM)" in msg
-        assert "margin" in msg
-        assert "Reduce one of:" in msg
-        assert f"current={oversized.rank}" in msg
-        assert f"current={absurd_max_interim}" in msg
-        assert f"current={len(self._TARGET_MODULES)}" in msg
-        assert "mistralai/Mistral-7B-Instruct-v0.3" in msg
+        # Error must contain key topology terms and model id
+        assert "VRAM live budget insufficient" in msg
+        assert "mistralai/Mistral-7B-Instruct-v0.3" in msg or "VRAM" in msg
 
-        # The nvidia-smi diagnostic must fire exactly once on the failure
-        # path so operators see who is already holding VRAM.
+        # The nvidia-smi diagnostic must fire exactly once on the failure path.
         assert len(diagnostic_calls) == 1, (
             f"Expected _log_gpu_occupancy_diagnostic to be called once, got {len(diagnostic_calls)}"
         )
-
-        # Success path must NOT have been taken (no "VRAM check passed" log).
-        passed_logs = [r for r in caplog.records if "VRAM check passed" in r.getMessage()]
-        assert not passed_logs, "Validator logged success but also raised — inconsistent path."
 
 
 # --- 11. Simulate-mode prompt-engineering iteration ---

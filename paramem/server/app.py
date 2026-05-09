@@ -61,12 +61,15 @@ from paramem.server.vram_guard import (
     apply_process_cap,
     assert_free_vram,
     safe_empty_cache,
+    vram_measure,
     vram_scope,
 )
+from paramem.server.vram_predict import predict_base_bytes
 from paramem.server.vram_validator import (
     ConfigurationError,
     assess_topology,
     enforce_live_budget,
+    enforce_post_load_budget,
     estimate_stt_bytes,
     estimate_tts_bytes,
     format_tier_table,
@@ -1349,6 +1352,10 @@ async def lifespan(app: FastAPI):
     stt_pre_bytes = estimate_stt_bytes(config.stt, permanent_cloud_only=permanent_cloud_only)
     tts_pre_bytes = estimate_tts_bytes(config.tts, permanent_cloud_only=permanent_cloud_only)
 
+    # Pre-load topology check driven by cache-derived prediction.
+    # base_pred is None on a cache miss — skip topology check, rely on live gate.
+    base_pred = predict_base_bytes(config.model_config)
+
     if not permanent_cloud_only:
         if not torch.cuda.is_available():
             logger.error(
@@ -1357,25 +1364,71 @@ async def lifespan(app: FastAPI):
             )
             sys.exit(1)
 
-        assessment = assess_topology(
-            config.episodic_adapter_config,
-            max_interim_count=config.consolidation.max_interim_count,
-            model_name=config.model_name,
-            model_id=config.model_config.model_id,
-            main_adapter_count=main_adapter_count,
-            headroom_gib=config.vram.vram_cache_headroom_gib,
-            stt_bytes=stt_pre_bytes,
-            tts_bytes=tts_pre_bytes,
-        )
-        logger.info("VRAM topology assessment:\n%s", assessment.breakdown)
-        logger.info("%s", format_tier_table(assessment))
+        assessment = None
+        if base_pred is None:
+            logger.warning(
+                "Base model %s not cached; pre-load topology check skipped — "
+                "live load gate is authoritative.",
+                config.model_config.model_id,
+            )
+        else:
+            # local_files_only=True: predict_base_bytes returning non-None
+            # means the cache is populated, so the AutoConfig read must hit
+            # cache. Refusing the network here matches the offline-first
+            # posture and avoids a silent boot stall when the network is
+            # unhealthy.
+            try:
+                import transformers
 
-        total_memory_bytes, external_bytes = measure_external_vram()
-        try:
-            enforce_live_budget(assessment, total_memory_bytes, external_bytes)
-        except ConfigurationError as exc:
-            logger.error("VRAM configuration error:\n%s", exc)
-            sys.exit(1)
+                model_hf_config = transformers.AutoConfig.from_pretrained(
+                    config.model_config.model_id,
+                    trust_remote_code=config.model_config.trust_remote_code,
+                    local_files_only=True,
+                )
+                hidden_size = getattr(model_hf_config, "hidden_size", None)
+                num_layers = getattr(
+                    model_hf_config,
+                    "num_hidden_layers",
+                    getattr(model_hf_config, "n_layers", None),
+                )
+            except Exception as _cfg_exc:  # noqa: BLE001
+                logger.warning(
+                    "AutoConfig read failed for %s (%s); skipping pre-load topology check, "
+                    "live load gate is authoritative.",
+                    config.model_config.model_id,
+                    _cfg_exc,
+                )
+                hidden_size = num_layers = None
+
+            if hidden_size is None or num_layers is None:
+                logger.warning(
+                    "AutoConfig for %s did not expose hidden_size/num_hidden_layers; "
+                    "skipping pre-load topology check, live load gate is authoritative.",
+                    config.model_config.model_id,
+                )
+            else:
+                assessment = assess_topology(
+                    config.episodic_adapter_config,
+                    max_interim_count=config.consolidation.max_interim_count,
+                    base_bytes=base_pred,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    model_id=config.model_config.model_id,
+                    quant_label=config.model_config.quantization,
+                    main_adapter_count=main_adapter_count,
+                    headroom_gib=config.vram.vram_cache_headroom_gib,
+                    stt_bytes=stt_pre_bytes,
+                    tts_bytes=tts_pre_bytes,
+                )
+                logger.info("VRAM topology assessment:\n%s", assessment.breakdown)
+                logger.info("%s", format_tier_table(assessment))
+
+                total_memory_bytes, external_bytes = measure_external_vram()
+                try:
+                    enforce_live_budget(assessment, total_memory_bytes, external_bytes)
+                except ConfigurationError as exc:
+                    logger.error("VRAM configuration error:\n%s", exc)
+                    sys.exit(1)
 
     if cloud_only:
         logger.info("Starting in cloud-only mode — skipping model load")
@@ -1575,25 +1628,24 @@ async def lifespan(app: FastAPI):
     _state["voice_profile"] = "cpu" if cloud_only else "gpu"
     logger.info("Voice pipeline profile: %r", _state["voice_profile"])
 
-    # Post-load sanity: compare actual ParaMem allocation against the prediction.
-    # Not a gate — the pre-load check already enforced the budget against
-    # (total_memory − external_bytes). This surfaces any drift between the
-    # static VRAM tables (base model, STT, TTS) and reality, so calibration
-    # errors show up in logs rather than silently over-committing.
+    # Post-load authoritative gate: measured allocation must leave headroom for
+    # KV cache + activations.  Prediction drift is logged at INFO for calibration.
     if _state.get("model") is not None and torch.cuda.is_available():
         actual_bytes = torch.cuda.memory_allocated(0)
-        predicted_bytes = assessment.required_bytes
-        delta_mib = (actual_bytes - predicted_bytes) / (1024 * 1024)
-        logger.info(
-            "VRAM post-load sanity: predicted %.2f GiB, measured %.2f GiB (delta %+.0f MiB)",
-            predicted_bytes / 2**30,
-            actual_bytes / 2**30,
-            delta_mib,
-        )
-        if actual_bytes > predicted_bytes * 1.10:
-            logger.warning(
-                "Actual VRAM usage exceeds prediction by >10%% — "
-                "re-calibrate _MODEL_VRAM_BYTES / STT / TTS tables."
+        headroom_bytes = int(config.vram.vram_cache_headroom_gib * 2**30)
+        total_bytes = torch.cuda.get_device_properties(0).total_memory
+        try:
+            enforce_post_load_budget(actual_bytes, total_bytes, headroom_bytes)
+        except ConfigurationError as exc:
+            logger.error("VRAM post-load gate failed:\n%s", exc)
+            sys.exit(1)
+        if base_pred is not None:
+            delta_mib = (actual_bytes - base_pred) / (1024 * 1024)
+            logger.info(
+                "VRAM calibration drift: predicted %.2f GiB, measured %.2f GiB (delta %+.0f MiB)",
+                base_pred / 2**30,
+                actual_bytes / 2**30,
+                delta_mib,
             )
 
     # Initialize SOTA agent if configured
@@ -1910,6 +1962,12 @@ async def lifespan(app: FastAPI):
     if _state["model"]:
         unload_model(_state["model"], _state["tokenizer"])
         logger.info("Model unloaded")
+
+    # Final mop-up — covers cuBLAS workspaces / allocator slack the per-component
+    # unloads couldn't reach while their frame-locals were still live. Without
+    # this, the next paramem boot's _gpu_has_compute_processes() sees a [Not Found]
+    # ghost PID and routes into permanent gpu_conflict (no auto-reclaim).
+    safe_empty_cache()
 
 
 app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
@@ -2776,8 +2834,7 @@ async def gpu_acquire():
     # ``cloud_only: true`` in yaml represents persistent operator intent and is
     # respected — operators must edit yaml and restart to leave that mode.
     needs_reload = (
-        _state.get("mode") == "cloud-only"
-        and _state.get("cloud_only_reason") != "explicit"
+        _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") != "explicit"
     )
     reloaded_live = False
     if needs_reload:
@@ -6109,11 +6166,9 @@ def _set_voice_pipeline_profile(
     ctx = gpu_lock_sync() if not lock_held else nullcontext()
     with ctx:
         if profile == "gpu":
-            # Flush allocator-pool slack from prior cycle work BEFORE the
-            # WhisperSTT.load() gate inspects free VRAM (stt.py:90 reads
-            # mem_get_info; uncollapsed pool inflates "used", refusing
-            # loads that physically fit). Mirrors the historical
-            # _load_voice_pipeline pattern.
+            # Flush allocator-pool slack from prior cycle work before
+            # WhisperSTT.load() — vram_measure reads mem_get_info before the
+            # load, and uncollapsed pool inflates "used", skewing the delta.
             safe_empty_cache()
             # Lazy-construct GPU pair when absent or after a prior gpu→cpu flip.
             if config.stt.enabled and _state["stt_gpu"] is None:
@@ -6132,7 +6187,8 @@ def _set_voice_pipeline_profile(
             stt_gpu = _state.get("stt_gpu")
             if config.stt.enabled and stt_gpu is not None and not stt_gpu.is_loaded:
                 try:
-                    loaded = stt_gpu.load()
+                    with vram_measure("stt-gpu-profile"):
+                        loaded = stt_gpu.load()
                 except Exception:  # noqa: BLE001
                     loaded = False
                 if not loaded:

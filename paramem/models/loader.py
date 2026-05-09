@@ -243,14 +243,20 @@ def load_base_model(
 
 
 def unload_model(model, tokenizer=None) -> None:
-    """Free a model from GPU/CPU memory."""
-    import gc
+    """Free a model from GPU/CPU memory.
+
+    Routes through ``safe_empty_cache`` (lazy-imported to avoid a
+    module-level models→server dependency) so cuBLAS workspaces and
+    allocator-pool slack are released too — otherwise process teardown
+    leaves a ~280 MiB ghost CUDA context that ``_gpu_has_compute_processes``
+    sees on the next boot and forces gpu_conflict mode.
+    """
+    from paramem.server.vram_guard import safe_empty_cache
 
     del model
     if tokenizer is not None:
         del tokenizer
-    gc.collect()
-    torch.cuda.empty_cache()
+    safe_empty_cache()
     logger.info("Model unloaded, CUDA cache cleared")
 
 
