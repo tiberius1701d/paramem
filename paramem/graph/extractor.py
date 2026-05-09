@@ -1810,22 +1810,21 @@ spans). Empty `{{}}` if you have nothing to change.
 # fmt: off
 _DEFAULT_PLAUSIBILITY_PROMPT = (
     "You are filtering enriched personal facts from a voice assistant conversation. "  # noqa: E501
-    "Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.\n"  # noqa: E501
-    "\n"
-    "You decide DROP or KEEP per fact. Output ONLY the indices of facts that match a DROP rule. "  # noqa: E501
+    "Decide KEEP or DROP per fact, grounding each against the transcript. "
+    "Output ONLY the indices of facts that match a DROP rule. "
     "Never echo, modify, or add facts.\n"
     "\n"
     "## KEEP — leave the fact in the output\n"
     "\n"
-    "Default action. Apply whenever none of the DROP rules below match the fact's lexical pattern. "  # noqa: E501
-    "Do not drop on semantic judgment. When uncertain, KEEP.\n"
+    "Default action. Keep the fact when its subject, object, and predicate are supported by the transcript "  # noqa: E501
+    "(literally or by clear implication). When uncertain, KEEP.\n"
     "\n"
     'Example: `[0] {{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP (do not include 0 in the output)\n'  # noqa: E501
     'Example: `[1] {{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP (do not include 1 in the output)\n'  # noqa: E501
     "\n"
     "## DROP — emit this fact's index\n"
     "\n"
-    "Apply when any of the lexical patterns below match. No judgment calls.\n"
+    "Apply when any of the rules below matches.\n"
     "\n"
     "**R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), regardless of predicate.\n"  # noqa: E501
     'Example: `[2] {{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1) — include 2 in the output.\n'  # noqa: E501
@@ -1835,24 +1834,23 @@ _DEFAULT_PLAUSIBILITY_PROMPT = (
     'Example: `[3] {{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND '
     '`[4] {{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2) — include 3 and 4.\n'  # noqa: E501
     "\n"
-    "**R3. Role leak.** Subject or object is exactly one of: "
-    '"Assistant", "User", "Speaker", "the bot", "the model". '
-    'Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, NOT role leaks.\n'  # noqa: E501
-    'Example: `[5] {{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3) — include 5.\n'  # noqa: E501
+    "**R3. Transcript contradiction.** The transcript states a different value for the same subject and predicate.\n"  # noqa: E501
+    'Example: `[5] {{"subject": "Alex", "predicate": "lives_in", "object": "Tokyo"}}` '
+    "(when the transcript says Alex lives in Portland) → DROP (R3) — include 5.\n"
     "\n"
-    "**R4. Unresolved placeholder in real-name input.** When the input is real-named "  # noqa: E501
-    "(no `Person_N` / `City_N` / `Country_N` / `Org_N` / `Thing_N` placeholders expected in the transcript), "  # noqa: E501
-    "drop any fact whose subject or object still matches "
-    r"`^(Person|City|Country|Org|Thing)_\d+$`."  # noqa: E501
+    "**R4. Conversation-role reference.** Subject or object refers to a conversation-role label "  # noqa: E501
+    '(e.g. "Assistant", "User", "Speaker", "the bot", "the model") '
+    "rather than a real-world entity introduced by the transcript.\n"
+    'Example: `[6] {{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R4) — include 6.\n'  # noqa: E501
     "\n"
-    'Example: `[6] {{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input) — include 6.\n'  # noqa: E501
-    "\n"
-    "**R5. Empty / sentinel object.** Object is exactly one of: "
-    '"", "Unknown", "None", "Various", "Something", "N/A".\n'
+    "**R5. Content-free object.** Object provides no transcript-grounded claim — empty, "  # noqa: E501
+    'whitespace-only, or a content-free placeholder (e.g. "Unknown", "None", "Various", "Something", "N/A").\n'  # noqa: E501
     'Example: `[7] {{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5) — include 7.\n'  # noqa: E501
     "\n"
-    "**R6. System entity ID.** Subject or object contains a dot-separated HA-style identifier "  # noqa: E501
-    "(e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`).\n"
+    "**R6. Namespaced system identifier.** Subject or object is a system / automation identifier — "  # noqa: E501
+    "a dot-separated or URI-shaped namespaced token "
+    "(e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`, `climate.kitchen_thermostat`) "  # noqa: E501
+    "referring to a device, sensor, or service rather than a personal entity.\n"
     'Example: `[8] {{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6) — include 8.\n'  # noqa: E501
     "\n"
     "## Input\n"
