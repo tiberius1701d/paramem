@@ -452,6 +452,20 @@ intent:
   confidence_margin: 0.05                         # min top1-top2 margin; below → fail_closed_intent
   fail_closed_intent: personal                    # privacy-preserving default on uncertainty
 
+# Sentence-type classifier: INTERROGATIVE / NON_INTERROGATIVE.  Reuses the
+# multilingual encoder loaded by `intent` above (no separate model
+# download); only the exemplar bank + threshold are configured here.
+# Used by the abstention helper to gate canned-response short-circuits
+# multilingually.  When the encoder is unavailable or the margin gate
+# isn't met, the routing path falls back to a deterministic
+# punctuation + English first-word lexicon heuristic — that's more
+# informative than fail-closing here, where the caller has a useful
+# default at hand.
+sentence_type:
+  enabled: true
+  exemplars_dir: configs/sentence_types
+  confidence_margin: 0.05                         # min top1-top2 margin; below → caller's heuristic
+
 voice:
   prompt_file: configs/prompts/pa_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)

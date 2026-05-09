@@ -3,7 +3,7 @@
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -129,6 +129,108 @@ class TestIsInterrogative:
 
     def test_single_word_imperative(self):
         assert _is_interrogative("Turn") is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # German — the configs/intents/personal.de.txt cohort that the
+            # legacy English-only first-word lookup missed entirely.
+            "Wo wohne ich?",
+            "Was ist meine Adresse?",
+            "Wann habe ich Geburtstag?",
+            # Spanish — opening punctuation present, closing handles it.
+            "¿Dónde vivo?",
+            # Mandarin — fullwidth question mark.
+            "我住在哪里？",
+            # Arabic — RTL question mark glyph.
+            "أين أعيش؟",
+            # English declarative shaped as a question by punctuation.
+            "Berlin is in Germany?",
+            # Whitespace tolerance — trailing space before the mark.
+            "Where do I live? ",
+            # Whitespace tolerance — newline between question and mark.
+            "Where do I live\n?",
+        ],
+    )
+    def test_terminal_question_mark_is_interrogative(self, text: str):
+        """Layer 1 — punctuation-based detection works language-agnostically.
+
+        Locks the contract that any text ending in ``?`` / ``？`` / ``؟``
+        classifies as interrogative, regardless of leading word.  Without
+        this layer the German abstention path silently misfires (a
+        privacy-relevant gap on personal queries).
+        """
+        assert _is_interrogative(text) is True
+
+    def test_greek_semicolon_is_not_interrogative(self):
+        """Greek uses ``;`` (U+003B) as a question mark, but the glyph is
+        identical to the ASCII semicolon.  Treating it as interrogative
+        would mis-classify any declarative sentence ending in ``;`` —
+        not worth the trade-off for the rare Greek-language case.
+        """
+        assert _is_interrogative("Turn off the light;") is False
+
+    def test_declarative_with_trailing_period_is_not_interrogative(self):
+        """Layer 1 fires only on question marks; periods / exclamation
+        marks fall through to the leading-word check (and miss it for
+        non-English imperatives)."""
+        assert _is_interrogative("Mache das Licht aus.") is False
+        assert _is_interrogative("Schalte die Lampe an!") is False
+
+    def test_encoder_tier_overrides_punctuation_when_decisive(self):
+        """Tier 1 (encoder classifier) takes precedence over the
+        deterministic tiers when ``config`` is provided AND the encoder
+        produced a confident verdict.  Verifies the production path:
+        ``classify_sentence_type`` returning ``INTERROGATIVE`` short-
+        circuits and returns True regardless of leading word.
+        """
+        from paramem.server.config import SentenceTypeConfig
+        from paramem.server.sentence_type import SentenceType
+
+        cfg = SentenceTypeConfig()
+        with patch(
+            "paramem.server.sentence_type.classify_sentence_type",
+            return_value=SentenceType.INTERROGATIVE,
+        ) as mock_classify:
+            # No leading wh-word, no terminal ?, but encoder says interrogative.
+            assert _is_interrogative("the door locked", config=cfg) is True
+        mock_classify.assert_called_once()
+
+    def test_encoder_tier_returns_false_when_classifier_says_non(self):
+        """Encoder verdict NON_INTERROGATIVE wins over the punctuation/
+        lexicon tiers — even if the deterministic heuristic would
+        flag the query."""
+        from paramem.server.config import SentenceTypeConfig
+        from paramem.server.sentence_type import SentenceType
+
+        cfg = SentenceTypeConfig()
+        with patch(
+            "paramem.server.sentence_type.classify_sentence_type",
+            return_value=SentenceType.NON_INTERROGATIVE,
+        ):
+            # Has terminal ? — would normally classify as interrogative.
+            assert _is_interrogative("Berlin is in Germany?", config=cfg) is False
+
+    def test_encoder_tier_falls_through_when_classifier_returns_none(self):
+        """Encoder unavailable / margin not met → ``classify_sentence_type``
+        returns ``None``; the deterministic tiers (punctuation +
+        lexicon) take over.  Locks the fallback contract that the
+        encoder's "I don't know" doesn't accidentally suppress
+        question detection.
+        """
+        from paramem.server.config import SentenceTypeConfig
+
+        cfg = SentenceTypeConfig()
+        with patch(
+            "paramem.server.sentence_type.classify_sentence_type",
+            return_value=None,
+        ):
+            # No encoder verdict → punctuation tier catches the German question.
+            assert _is_interrogative("Wo wohne ich?", config=cfg) is True
+            # No encoder verdict, no terminal ?, English wh-word → lexicon catches it.
+            assert _is_interrogative("What is my name", config=cfg) is True
+            # No encoder verdict, no terminal ?, non-English imperative → False.
+            assert _is_interrogative("Mache das Licht an", config=cfg) is False
 
 
 # ---------------------------------------------------------------------------

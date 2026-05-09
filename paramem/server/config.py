@@ -577,6 +577,35 @@ class IntentConfig:
 
 
 @dataclass
+class SentenceTypeConfig:
+    """Encoder-based sentence-type classifier — INTERROGATIVE / NON_INTERROGATIVE.
+
+    Reuses the multilingual sentence encoder loaded by
+    :class:`IntentConfig` (singleton at
+    :func:`paramem.server.intent.get_encoder`); only the exemplar bank
+    and the threshold are independent here.  Used by the abstention
+    helper to gate canned-response short-circuits multilingually
+    without per-language lexicons.
+
+    * Exemplar files live under ``configs/sentence_types/`` as
+      ``<class>.<lang>.txt`` (e.g. ``interrogative.de.txt``).  ``<class>``
+      must be a valid :class:`paramem.server.sentence_type.SentenceType`
+      value (``interrogative`` / ``non_interrogative``).  Adding a new
+      language is just a new file pair; no code change.
+    * ``confidence_margin`` is the gap between top-1 and top-2 cosine
+      similarity scores.  Below the margin the classifier returns
+      ``None`` and the caller falls back to its deterministic heuristic
+      (punctuation + English first-word lexicon) — that's *more*
+      informative than fail-closing to a fixed default at the gate
+      level, where the heuristic is meaningful.
+    """
+
+    enabled: bool = True
+    exemplars_dir: str = "configs/sentence_types"
+    confidence_margin: float = 0.05
+
+
+@dataclass
 class VoiceConfig:
     prompt_file: str = "configs/prompts/pa_voice.txt"
     system_prompt: str = ""
@@ -979,6 +1008,7 @@ class ServerConfig:
     sanitization: SanitizationConfig = field(default_factory=SanitizationConfig)
     abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
     intent: IntentConfig = field(default_factory=IntentConfig)
+    sentence_type: SentenceTypeConfig = field(default_factory=SentenceTypeConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)

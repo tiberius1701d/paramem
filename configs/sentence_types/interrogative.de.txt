@@ -1,0 +1,24 @@
+# Sentence type: INTERROGATIVE — siehe interrogative.en.txt für Details.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+
+Wie heiße ich?
+Wo wohne ich?
+Wann habe ich Geburtstag?
+Warum bin ich nach Berlin gezogen?
+Wer ist mein Bruder?
+Wie alt bin ich?
+Bei welcher Firma arbeite ich?
+Ist die Tür abgeschlossen?
+Sind die Lichter noch an?
+Habe ich morgen Termine?
+Hat mein Kalender heute eine freie Stunde?
+Kannst du mir meine Adresse sagen?
+Könntest du mich daran erinnern, wann ich angefangen habe?
+Sag mir, wo ich wohne.
+Sag mir meine Telefonnummer.
+Berlin liegt in Deutschland?
+Das stimmt?
+Wie ist das Wetter?
+Wo ist mein Handy?
+Wie setze ich mein Passwort zurück?

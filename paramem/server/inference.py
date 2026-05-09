@@ -213,7 +213,11 @@ def _abstain_if_applicable(
     """
     from paramem.server.router import _is_interrogative
 
-    if not (config.abstention.enabled and is_personal and _is_interrogative(text)):
+    if not (
+        config.abstention.enabled
+        and is_personal
+        and _is_interrogative(text, config=config.sentence_type)
+    ):
         return None
     is_cold_start = bool(speaker_id) and (
         router is None or not router._speaker_key_index.get(speaker_id)
