@@ -26,7 +26,7 @@ a mapping):
   (forward-path leak guard).
 * Every entry in ``expected_names`` appears in ``mapping.keys()``
   (coverage).
-* ``deanonymize_text(anon_text, mapping)`` whitespace-equals the
+* ``deanonymize_text(anon_text, reverse)`` whitespace-equals the
   original transcript (round-trip integrity).
 
 Aggregate contract: at least ``_MATCH_THRESHOLD`` of fixture transcripts
@@ -200,7 +200,7 @@ def test_cloud_anonymizer_contract(loaded_model):
         if expected_names:
             expected_personal += 1
 
-        anon_text, mapping = extract_and_anonymize_for_cloud(
+        anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
             transcript,
             model,
             tokenizer,
@@ -238,7 +238,7 @@ def test_cloud_anonymizer_contract(loaded_model):
 
         # Round-trip contract: deanonymize_text restores the original
         # transcript (modulo whitespace, which the anonymizer LLM may reflow).
-        round_trip = deanonymize_text(anon_text, mapping)
+        round_trip = deanonymize_text(anon_text, reverse)
         if _normalise(round_trip) != _normalise(transcript):
             failures.append(
                 f"[{entry['id']}] Round-trip mismatch:\n"
@@ -290,7 +290,7 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     entry = next(e for e in _FIXTURE if e["id"] == "person_and_place")
     transcript = entry["transcript"]
 
-    anon_text, mapping = extract_and_anonymize_for_cloud(
+    anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
         transcript,
         model,
         tokenizer,
@@ -317,7 +317,7 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     # whitespace, which the anonymizer LLM may reflow).  Catches a
     # mapping/transcript inconsistency that would silently leave the
     # cloud's response with placeholders the user sees.
-    round_trip = deanonymize_text(anon_text, mapping)
+    round_trip = deanonymize_text(anon_text, reverse)
     assert _normalise(round_trip) == _normalise(transcript), (
         f"[{entry['id']}, scope=person+place] Round-trip mismatch:\n"
         f"  original:   {transcript!r}\n"
