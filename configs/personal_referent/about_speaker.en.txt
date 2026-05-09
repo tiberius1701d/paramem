@@ -1,0 +1,35 @@
+# Personal referent: ABOUT_SPEAKER — query asks about / refers to the
+# speaker themselves (their facts, family, schedule, possessions,
+# history, preferences).  Used by the encoder-based first-person check
+# in the cloud-egress sanitizer to gate sanitization decisions
+# multilingually — replaces the English-only ``_contains_first_person``
+# token lookup.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+#
+# Coverage: first-person interrogatives, first-person declaratives,
+# self-introductions, possessive references, indirect first-person.
+#
+# Keep balanced with not_about_speaker.en.txt — count parity helps
+# the margin gate calibrate.
+
+What is my name?
+Where do I live?
+When is my birthday?
+Why did I move to Berlin?
+Who is my brother?
+How old am I?
+Tell me my address.
+Tell me where I live.
+What's my phone number?
+My name is Alex.
+I live in Berlin.
+I work as an engineer.
+I just got back from a trip.
+We went hiking last weekend.
+My birthday is in March.
+What do I have on my schedule today?
+What does my calendar look like tomorrow?
+Do I have any meetings this afternoon?
+Where did I leave my keys?
+Where is my phone?

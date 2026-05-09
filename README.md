@@ -415,7 +415,10 @@ options. A short map of the top-level sections:
 | `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Also gates the extraction pipeline stages (noise filter, plausibility, anonymization, NER check) and the thermal-throttle quiet-hours policy (`quiet_hours_mode` = `always_on`/`always_off`/`auto` with `start`/`end`). |
 | `agents` | SOTA cloud fallback (`sota` + `sota_providers`), HA conversation agent id. |
 | `tools.ha` | HA URL, token, language filter, entity allowlist, tool timeout. |
-| `sanitization` | PII gate for cloud egress (`off`/`warn`/`block`). |
+| `sanitization` | PII gate for cloud egress (`off`/`warn`/`block`). The first-person check is encoder-based and multilingual when the intent encoder is loaded; falls back to an English token-set. See `personal_referent` below. |
+| `intent` | Multilingual sentence encoder (`intfloat/multilingual-e5-small` by default) used by the routing-path classifiers. Loaded once at server start; reused by all axes below. |
+| `sentence_type` | Encoder-based interrogative-vs-non-interrogative classifier with exemplars under `configs/sentence_types/<class>.<lang>.txt`. Adding a language is one new file pair, no code change. Falls back to terminal-punctuation + English first-word lexicon when the encoder isn't available. |
+| `personal_referent` | Encoder-based about-speaker-vs-not-about-speaker classifier with exemplars under `configs/personal_referent/<class>.<lang>.txt`. Closes the multilingual hole in the sanitizer: German / Mandarin / Spanish / etc. self-referential queries are blocked at the cloud-egress gate even though the legacy English token-set wouldn't match. Falls back to that token-set when the encoder isn't available. |
 | `voice` | Voice prompt file, per-speaker greeting cadence. |
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |

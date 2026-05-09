@@ -1726,6 +1726,18 @@ async def lifespan(app: FastAPI):
 
         load_sentence_type_exemplars(config.sentence_type)
 
+        # Personal-referent classifier — same encoder, replaces the
+        # English-only token-set lookup in
+        # ``sanitizer._contains_first_person`` with a multilingual
+        # cosine match.  Without this layer, German / Mandarin / etc.
+        # self-referential queries silently bypass the cloud-egress
+        # sanitization gate.
+        from paramem.server.personal_referent import (
+            load_exemplars as load_personal_referent_exemplars,
+        )
+
+        load_personal_referent_exemplars(config.personal_referent)
+
     # Global observed-language tracker — records STT-detected languages with
     # high confidence, publishes to HA as input_text.voice_observed_languages
     # so the conversation agent can use it as context when interpreting

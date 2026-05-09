@@ -466,6 +466,18 @@ sentence_type:
   exemplars_dir: configs/sentence_types
   confidence_margin: 0.05                         # min top1-top2 margin; below → caller's heuristic
 
+# Personal-referent classifier: ABOUT_SPEAKER / NOT_ABOUT_SPEAKER.
+# Reuses the multilingual encoder loaded by `intent` above.  Used by
+# the cloud-egress sanitizer's first-person check — replaces the
+# English-only token-set lookup that silently let German / Mandarin /
+# etc. self-referential queries past the sanitization gate.  Below
+# the margin or with encoder unavailable the sanitizer falls back to
+# the legacy English token-set check.
+personal_referent:
+  enabled: true
+  exemplars_dir: configs/personal_referent
+  confidence_margin: 0.05
+
 voice:
   prompt_file: configs/prompts/pa_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)

@@ -307,6 +307,7 @@ def handle_chat(
             mode=config.sanitization.mode,
             speaker_id=speaker_id,
             known_entities=known_entities,
+            personal_referent_config=config.personal_referent,
         )
 
         # PERSONAL → local PA probe + reason.  No SOTA anywhere on this

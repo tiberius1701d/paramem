@@ -577,6 +577,36 @@ class IntentConfig:
 
 
 @dataclass
+class PersonalReferentConfig:
+    """Encoder-based personal-referent classifier — ABOUT_SPEAKER /
+    NOT_ABOUT_SPEAKER.
+
+    Reuses the multilingual sentence encoder loaded by
+    :class:`IntentConfig` (singleton at
+    :func:`paramem.server.intent.get_encoder`); only the exemplar bank
+    and the threshold are independent here.  Used by the cloud-egress
+    sanitizer to gate first-person detection multilingually — replaces
+    the English-only token-set lookup in
+    :func:`paramem.server.sanitizer._contains_first_person`.
+
+    * Exemplar files live under ``configs/personal_referent/`` as
+      ``<class>.<lang>.txt`` (e.g. ``about_speaker.de.txt``).
+      ``<class>`` must be a valid
+      :class:`paramem.server.personal_referent.PersonalReferent` value
+      (``about_speaker`` / ``not_about_speaker``).  Adding a new
+      language is just a new file pair; no code change.
+    * ``confidence_margin`` is the gap between top-1 and top-2 cosine
+      similarity scores.  Below the margin the classifier returns
+      ``None`` and the caller falls back to the English token-set
+      heuristic.
+    """
+
+    enabled: bool = True
+    exemplars_dir: str = "configs/personal_referent"
+    confidence_margin: float = 0.05
+
+
+@dataclass
 class SentenceTypeConfig:
     """Encoder-based sentence-type classifier — INTERROGATIVE / NON_INTERROGATIVE.
 
@@ -1009,6 +1039,7 @@ class ServerConfig:
     abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
     intent: IntentConfig = field(default_factory=IntentConfig)
     sentence_type: SentenceTypeConfig = field(default_factory=SentenceTypeConfig)
+    personal_referent: PersonalReferentConfig = field(default_factory=PersonalReferentConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
