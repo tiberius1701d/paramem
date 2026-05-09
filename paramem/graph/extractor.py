@@ -19,7 +19,6 @@ from paramem.graph.schema_config import (
     format_entity_types,
     format_predicate_examples,
     format_relation_types,
-    format_replacement_rules,
     relation_types,
 )
 from paramem.models.loader import adapt_messages
@@ -1740,32 +1739,30 @@ def _validate_with_ha_context(graph: SessionGraph, ha_context: dict) -> SessionG
 
 
 _DEFAULT_ANONYMIZATION_PROMPT = """\
-Anonymize the following extracted personal facts AND the conversation transcript \
-by replacing all identifying information with category-prefixed placeholders.
+Identify identifying names in the extracted personal facts and replace them \
+with type-prefixed placeholders. Each placeholder is `<Prefix>_<N>` where \
+`Prefix` is a PascalCase noun naming the entity's type (Person, City, Org, \
+Thing, University, Product, Project, Language, ... — pick the type-appropriate \
+one) and `N` is a positive integer. Each real name must map to a UNIQUE \
+placeholder; reuse the same placeholder for every occurrence of the same name.
 
-Replace:
-{replacement_rules}
-
-Use the SAME placeholder for the SAME entity across facts and transcript. \
-The mapping you return MUST contain every real name that appears in either input \
-so the reverse mapping is total. If an entity appears in the transcript but not \
-in any fact, still include it in the mapping (e.g. "my wife" mentioned but no \
-fact yet — emit Person_2 in the mapping).
-
-Keep predicates, relation_type, and confidence unchanged.
+Rules:
+- Anonymize identifying names; leave common nouns and descriptive phrases \
+verbatim. When in doubt, leave verbatim.
+- Mapping totality: every placeholder in any anonymized fact MUST appear as \
+a value in `mapping`. Orphan placeholders cause the fact to be silently dropped.
+- Mapping direction: `real_name → placeholder`. Real name is the JSON KEY, \
+placeholder is the JSON VALUE.
+- Keep `predicate`, `relation_type`, and `confidence` of every fact unchanged.
 
 Facts to anonymize:
 {facts_json}
 
-Transcript to anonymize:
+Transcript (context only — do NOT echo or rewrite):
 {transcript}
 
-Return JSON in this exact format:
-{{"anonymized_facts": [...], "anonymized_transcript": "...", \
-"mapping": {{"original_name": "Person_1", ...}}}}
-
-The mapping MUST use real names as keys and placeholders as values — \
-the local de-anonymization step reverses this to recover real names.
+Return JSON only with exactly the keys `anonymized` and `mapping`. No prose, \
+no markdown, no extra keys.
 """
 
 # Two-stage SOTA pipeline: enrichment first, then plausibility filtering.
@@ -2141,12 +2138,7 @@ def _sota_pipeline(
     #     ``Speaker_N`` form).
     # The LLM-emitted mapping is treated as a HINT rather than truth:
     # entries it produced for entities or attributes are overwritten by
-    # the deterministic build (we trust the graph).  Entries the LLM
-    # emitted for relation participants the graph doesn't know about
-    # (e.g. an org named in a relation but not in entities[]) are
-    # preserved via :func:`_recover_missing_placeholder_mappings`
-    # below — that recovery is an orthogonal concern (LLM mints a
-    # placeholder for a real name not in our mapping).
+    # the deterministic build (we trust the graph).
     mapping, reverse_mapping = _build_anonymization_mapping(
         graph,
         mapping,
@@ -2154,13 +2146,15 @@ def _sota_pipeline(
         speaker_name=speaker_name,
     )
 
-    # Recover forward-mapping entries the anonymizer emitted in
-    # anonymized_facts but never added to the mapping (typically
-    # relation-participant placeholders for entities not in
-    # ``graph.entities`` — e.g. ``Honda → Product_1``).
-    mapping, reverse_mapping = _recover_missing_placeholder_mappings(
-        mapping, reverse_mapping, anon_facts, graph.relations
-    )
+    # Mapping-totality diagnostic.  The anonymization prompt requires
+    # every placeholder in any anonymized fact to appear as a value in
+    # ``mapping``.  When the LLM violates that contract (rare under the
+    # tightened shape-contract prompt), the orphan placeholder cannot be
+    # substituted at deanon time and the affected fact is dropped at
+    # ``_strip_residual_placeholders``.  Surface the violation here so
+    # prompt regressions are visible in ``journalctl`` and
+    # ``graph.diagnostics`` rather than silently shedding facts.
+    _check_mapping_totality(graph, anon_facts, mapping)
 
     # (Re-)build anonymized transcript AND facts from the ORIGINAL transcript
     # and relations using the now-complete mapping.  This covers three cases:
@@ -2455,10 +2449,10 @@ def _sota_pipeline(
     from paramem.graph.schema import Entity, Relation
 
     # ``reverse_mapping`` (placeholder -> entity name) is produced by
-    # :func:`_build_anonymization_mapping` and threaded through
-    # :func:`_recover_missing_placeholder_mappings` /
-    # :func:`_repair_anonymization_leaks` above; it is consumed by the
-    # deanon dict-substitution and by the entity-rebuild loop below.
+    # :func:`_build_anonymization_mapping` and extended by
+    # :func:`_repair_anonymization_leaks` (when NER-detected leaks
+    # require fresh placeholders); it is consumed by the deanon
+    # dict-substitution and by the entity-rebuild loop below.
 
     # Phase — deanon.  Pure dict substitution restoring real names from
     # placeholders.  No LLM call; raw_output stays None.  Dropped facts
@@ -2776,10 +2770,11 @@ def _build_anonymization_mapping(
        in.  When the LLM's entry conflicts with a deterministic one,
        deterministic wins (we trust the graph).
 
-    The companion :func:`_recover_missing_placeholder_mappings` runs
-    after this builder and handles the orthogonal concern of LLM
+    The companion :func:`_check_mapping_totality` runs after this
+    builder as a diagnostic for the orthogonal concern of LLM
     placeholders that surface in ``anon_facts`` without any mapping
-    entry.
+    entry — those facts are dropped by the residual placeholder sweep
+    post-deanon, with the violation logged for monitoring.
 
     Args:
         graph: The session graph carrying entities (with names and
@@ -2895,157 +2890,103 @@ def _build_anonymization_mapping(
     return mapping, reverse
 
 
-def _recover_missing_placeholder_mappings(
-    mapping: dict,
-    reverse: dict,
+def _check_mapping_totality(
+    graph: SessionGraph,
     anon_facts: list[dict],
-    original_relations: list,
-) -> tuple[dict, dict]:
-    """Recover anonymizer mapping entries that the model emitted in facts but omitted from mapping.
+    mapping: dict,
+) -> None:
+    """Diagnostic check: every placeholder in any anonymized fact must
+    appear as a value in ``mapping`` (the prompt's mapping-totality
+    contract).  Surfaces violations to ``logger`` and
+    ``graph.diagnostics["totality_orphans"]`` so prompt regressions are
+    visible rather than silently shedding facts.
 
-    Bug B fix: the local anonymizer may produce placeholder tokens in
-    ``anonymized_facts`` (e.g. ``Product_1``) without including the corresponding
-    forward mapping entry (e.g. ``Honda → Product_1``).  When this happens the
-    reverse mapping used at de-anonymization time has no entry for ``Product_1``,
-    so the placeholder survives the residual sweep and the fact is dropped.
-
-    This function is called once per pipeline run, after
-    :func:`_anonymize_with_local_model` and after
-    :func:`_normalize_anonymization_mapping`.  It scans each ``anon_fact``
-    field (subject, object) for placeholder-shaped tokens that are absent from
-    ``mapping.values()`` and tries to recover the original value by comparing
-    against the corresponding ``original_relations`` entry.
-
-    Matching strategy:
-    - Primary: positional (anon_facts[i] ↔ original_relations[i]).  The
-      anonymizer is expected to preserve fact order.
-    - The comparison is field-by-field: when anon_fact's ``subject`` is a
-      bare placeholder not in ``mapping.values()`` and original_relation's
-      ``subject`` is not a placeholder, add ``original → placeholder`` to the
-      recovered mapping.
-
-    Only bare placeholder tokens (matching :data:`_PLACEHOLDER_TOKEN_RE`)
-    that are NOT already covered by ``mapping.values()`` are recovered.
-    Braced SOTA-style tokens (``{Prefix_N}``) are intentionally skipped —
-    those belong to the SOTA enrichment path and are handled separately.
-
-    Recovered entries are entity-name shaped (relation participants), so
-    they are mirrored into ``reverse`` at the same time.  Both dicts are
-    returned as new dicts — inputs are not mutated.
-
-    Args:
-        mapping: Complete ``{real_name: placeholder}`` forward mapping as
-            returned by :func:`_build_anonymization_mapping`.
-        reverse: ``{placeholder: entity_name}`` companion map from
-            :func:`_build_anonymization_mapping` (extended in lockstep
-            with ``mapping`` here).
-        anon_facts: Anonymized fact dicts returned by
-            :func:`_anonymize_with_local_model`.
-        original_relations: The ``graph.relations`` list BEFORE anonymization
-            (list of :class:`~paramem.graph.schema.Relation` objects).
-
-    Returns:
-        ``(forward, reverse)`` — both potentially extended; new dicts,
-        inputs are not mutated.
+    Does not mutate inputs and does not change the data flow.  When the
+    contract is violated the orphan placeholder cannot be substituted
+    at deanon time and the affected fact will be dropped at
+    :func:`_strip_residual_placeholders` — the correct fail-closed
+    semantic.  The position-based ``_recover_missing_placeholder_mappings``
+    helper that previously patched these gaps was retired alongside the
+    open-vocabulary prompt rewrite: per-session prefix divergence is
+    harmless because cross-cycle entity merge happens on real names in
+    :class:`paramem.graph.merger.GraphMerger`, not on placeholder
+    vocabulary.
     """
-    if not anon_facts or not original_relations:
-        return mapping, reverse
-
-    # Set of placeholder token strings already covered — no need to recover.
-    covered_placeholders: set[str] = {
-        str(v).lower() for v in mapping.values() if isinstance(v, str) and v
-    }
-
-    # Bare placeholder pattern (no braces, no anchoring) — finds embedded
-    # tokens like "Product_1" inside "software for Product_1's Legend system".
-    _bare_ph_re = re.compile(r"\b([A-Z][A-Za-z]*_\d+)\b")
-
-    recovered: dict[str, str] = {}
-    for i, anon_fact in enumerate(anon_facts):
-        if not isinstance(anon_fact, dict):
+    if not anon_facts:
+        return
+    mapping_values = set(mapping.values()) if mapping else set()
+    orphans: set[str] = set()
+    for f in anon_facts:
+        if not isinstance(f, dict):
             continue
-        if i >= len(original_relations):
-            break
-        orig = original_relations[i]
-        orig_subj = getattr(orig, "subject", "") or ""
-        orig_obj = getattr(orig, "object", "") or ""
-        anon_subj = str(anon_fact.get("subject", ""))
-        anon_obj = str(anon_fact.get("object", ""))
+        for field in ("subject", "object"):
+            for token in _BARE_PLACEHOLDER_RE.findall(str(f.get(field, ""))):
+                if token not in mapping_values:
+                    orphans.add(token)
+    if orphans:
+        ordered = sorted(orphans)
+        logger.warning(
+            "Anonymization mapping-totality violation: %d orphan placeholder(s) "
+            "in anon_facts not in mapping.values(): %s. Affected fact(s) will be "
+            "dropped at the residual placeholder sweep post-deanon.",
+            len(ordered),
+            ordered[:5],
+        )
+        graph.diagnostics["totality_orphans"] = ordered
 
-        for anon_val, orig_val in ((anon_subj, orig_subj), (anon_obj, orig_obj)):
-            if not anon_val or not orig_val:
-                continue
-            # Find all bare placeholders in the anon field.
-            ph_tokens = _bare_ph_re.findall(anon_val)
-            if not ph_tokens:
-                continue
-            for ph_token in ph_tokens:
-                if ph_token.lower() in covered_placeholders:
-                    continue
-                # The original field must not already contain this placeholder.
-                if ph_token in orig_val:
-                    continue
-                # Two recovery strategies:
-                #
-                # Case A — whole-field placeholder: the entire anon_val IS the
-                # placeholder (e.g. anon_val="Org_1", orig_val="Acme Corp").
-                # The original field is recovered directly.
-                if anon_val.strip() == ph_token and orig_val not in mapping:
-                    recovered[orig_val] = ph_token
-                    covered_placeholders.add(ph_token.lower())
-                    logger.debug(
-                        "Gap recovery (whole-field): %r → %r (position %d)",
-                        orig_val,
-                        ph_token,
-                        i,
-                    )
-                    break
-                #
-                # Case B — embedded placeholder: ph_token appears inside a
-                # compound anon_val (e.g. "software for Product_1's Legend").
-                # Recover the original word by finding the word in orig_val that
-                # is absent from anon_val, is not itself a placeholder, and when
-                # substituted into anon_val in place of ph_token reconstructs
-                # orig_val exactly.
-                orig_words = re.findall(r"\b[\w]+\b", orig_val)
-                anon_words = set(re.findall(r"\b[\w]+\b", anon_val))
-                candidates = [
-                    w
-                    for w in orig_words
-                    if w not in anon_words
-                    and not re.match(r"^[A-Z][A-Za-z]*_\d+$", w)
-                    and w not in mapping
-                ]
-                for candidate in candidates:
-                    # Verify: replacing ph_token with candidate in anon_val
-                    # produces the original field (whole-word replacement).
-                    reconstructed = _substitute_whole_words(anon_val, {ph_token: candidate})
-                    if reconstructed == orig_val:
-                        recovered[candidate] = ph_token
-                        covered_placeholders.add(ph_token.lower())
-                        logger.debug(
-                            "Gap recovery (embedded): %r → %r (position %d, verified)",
-                            candidate,
-                            ph_token,
-                            i,
-                        )
-                        break
 
-    if not recovered:
-        return mapping, reverse
+_BARE_PLACEHOLDER_RE = re.compile(r"\b([A-Z][A-Za-z]*_\d+)\b")
 
-    logger.info(
-        "Mapping gap recovery: added %d missing entr%s: %s",
-        len(recovered),
-        "y" if len(recovered) == 1 else "ies",
-        list(recovered.items())[:5],
-    )
-    new_mapping = dict(mapping)
-    new_mapping.update(recovered)
-    new_reverse = dict(reverse)
-    for real, ph in recovered.items():
-        new_reverse.setdefault(ph, real)
-    return new_mapping, new_reverse
+
+_TYPE_PREFIX_OVERRIDES = {
+    # Historical shorthands the anonymizer LLM has been trained on.  Repair
+    # allocates with the same shorthand so existing data and repaired data
+    # use a consistent prefix per type.  "place" → "City" predates
+    # `Country` / `Location` distinctions and is kept for backward
+    # compatibility (the open vocabulary still allows the LLM to mint
+    # `Country_N` / `Location_N` for the corresponding NER labels).
+    "person": "Person",
+    "place": "City",
+    "organization": "Org",
+    "concept": "Thing",
+}
+
+
+def _type_to_pascal_prefix(etype: str) -> str:
+    """Convert an entity-type label to a PascalCase placeholder prefix.
+
+    Used by :func:`_repair_anonymization_leaks` when allocating a fresh
+    placeholder for an NER-detected leaked name.  The shape contract
+    (:func:`anonymizer_placeholder_pattern`) is open: any
+    PascalCase prefix is well-formed, so the prefix is derived directly
+    from the upstream type label rather than looked up in a fixed
+    vocabulary.
+
+    Behaviour:
+
+    * The four historically-common types (``person``, ``place``,
+      ``organization``, ``concept``) map to ``Person`` / ``City`` /
+      ``Org`` / ``Thing`` via :data:`_TYPE_PREFIX_OVERRIDES`, matching
+      the conventions the anonymizer LLM and existing data both use.
+    * Any other label (``product``, ``language``, ``event``,
+      ``work_of_art``, ``self-driving``, ...) is split on whitespace /
+      hyphen / underscore and PascalCase-joined.  ``"work_of_art"`` →
+      ``"WorkOfArt"``, ``"language"`` → ``"Language"``.
+    * Empty / whitespace-only input falls back to ``"Entity"`` so every
+      leaked name gets a recoverable placeholder regardless of upstream
+      type-signal availability.
+    """
+    if not etype:
+        return "Entity"
+    e = etype.strip().lower()
+    if not e:
+        return "Entity"
+    override = _TYPE_PREFIX_OVERRIDES.get(e)
+    if override is not None:
+        return override
+    parts = re.split(r"[\s_\-]+", e)
+    pascal = "".join(p.capitalize() for p in parts if p)
+    return pascal or "Entity"
 
 
 def _repair_anonymization_leaks(
@@ -3118,20 +3059,20 @@ def _repair_anonymization_leaks(
         if not in_transcript:
             hallucinated.add(name)
             continue
-        # Missed — allocate placeholder based on declared type.  Extractor
-        # type wins; fall back to NER (extra_pii_types) when extractor has
-        # no opinion; final default to "person" preserves prior behaviour.
+        # Missed — allocate a fresh placeholder.  Prefix comes from the
+        # extractor's declared type (preferred — semantically richer) or
+        # the NER label as fallback.  Final default ``"entity"`` ensures
+        # every leaked name in the transcript gets recovered, regardless
+        # of whether NER had an opinion.  This is the post-pivot
+        # contract: the prefix vocabulary is open (cf.
+        # ``anonymizer_placeholder_pattern``), so we no longer drop a
+        # leaked name just because its type lacks a configured primary
+        # prefix.  Cross-cycle entity merge resolves any per-session
+        # prefix divergence on the deanonymized real-name graph in
+        # :class:`paramem.graph.merger.GraphMerger`.
         ner_type = (extra_pii_types or {}).get(name)
-        etype = (type_by_name.get(name) or ner_type or "person").lower()
-        prefix = anonymizer_type_to_prefix().get(etype)
-        if prefix is None:
-            # Missed — allocate placeholder based on declared type. Types with a
-            # primary_for_type prefix in configs/schema.yaml (person→Person, place→
-            # City, organization→Org, concept→Thing) get a fresh placeholder of
-            # that type. Types without a primary prefix (event, preference) are
-            # treated as hallucinated — there is no PII-scope anchor to bind to.
-            hallucinated.add(name)
-            continue
+        etype = (type_by_name.get(name) or ner_type or "entity").strip().lower()
+        prefix = _type_to_pascal_prefix(etype)
         placeholder = f"{prefix}_{_next_index(prefix)}"
         new_mapping[name] = placeholder
         new_reverse.setdefault(placeholder, name)
@@ -3412,13 +3353,6 @@ def _normalize_anonymization_mapping(mapping: dict) -> tuple[dict, dict]:
     if not mapping:
         return mapping, {"inverted": 0, "dropped": 0}
     _pat = anonymizer_placeholder_pattern()
-    if _pat is None:
-        logger.warning(
-            "Anonymization mapping: no anonymizer prefixes configured; "
-            "dropping %d pairs — nothing can be canonicalized.",
-            len(mapping),
-        )
-        return {}, {"inverted": 0, "dropped": len(mapping)}
     out: dict = {}
     inverted = 0
     dropped = 0
@@ -3456,22 +3390,36 @@ def _normalize_anonymization_mapping(mapping: dict) -> tuple[dict, dict]:
 
 
 def _mapping_is_canonical(mapping: dict) -> bool:
-    """True iff mapping is {real_name: placeholder} with all values matching.
+    """Validate the structural contract: shape, uniqueness, direction.
 
-    When no anonymizer prefixes are configured (``anonymizer_placeholder_pattern``
-    returns ``None``), an empty mapping is considered canonical (no entries to
-    validate), and any non-empty mapping is non-canonical (no placeholder
-    vocabulary means no real-name→placeholder mapping can be valid).
+    Returns ``True`` iff the mapping satisfies all three:
+
+    * **Shape** — every value matches ``^[A-Z][A-Za-z]*_\\d+$``
+      (PascalCase prefix + ``_<positive integer>``).  The prefix
+      vocabulary is open: ``Person`` / ``City`` / ``Org`` / ``Thing``
+      are common but not exhaustive.  ``University_1`` / ``Project_1``
+      / ``Language_1`` and any other type-appropriate PascalCase
+      prefix are equally valid.
+    * **Uniqueness** — no two real names map to the same placeholder.
+      A duplicate value would collide two distinct entities into one
+      identifier, breaking the deanonymization round-trip.
+    * **Direction** — keys are real names, not placeholder shapes.
+      Self-mapped entries (``"Project_1": "Project_1"``) are caught
+      here and flagged non-canonical.
+
+    Empty mapping is canonical (no entries to validate).
     """
     if not mapping:
         return True
-    _pat = anonymizer_placeholder_pattern()
-    if _pat is None:
-        # No placeholder vocabulary — non-empty mapping cannot be canonical.
-        return not mapping
-    return all(_pat.match(str(v)) for v in mapping.values()) and not any(
-        _pat.match(str(k)) for k in mapping.keys()
-    )
+    shape_re = anonymizer_placeholder_pattern()
+    # Shape: every value must match the universal placeholder shape.
+    if not all(shape_re.match(str(v)) for v in mapping.values()):
+        return False
+    # Direction: no key may match the placeholder shape (would be self-mapped).
+    if any(shape_re.match(str(k)) for k in mapping.keys()):
+        return False
+    # Uniqueness: no two real names share a placeholder.
+    return len(set(mapping.values())) == len(mapping)
 
 
 # spaCy entity label → internal type name.
@@ -3781,7 +3729,6 @@ def _anonymize_with_local_model(
     prompt = anon_prompt.format(
         facts_json=json.dumps(facts, indent=2),
         transcript=transcript or "(no transcript provided)",
-        replacement_rules=format_replacement_rules(),
     )
     messages = [
         {"role": "system", "content": "You anonymize data. Output valid JSON only."},

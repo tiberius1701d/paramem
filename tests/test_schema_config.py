@@ -399,18 +399,42 @@ class TestAnonymizerConfig:
     # anonymizer_placeholder_pattern                                      #
     # ------------------------------------------------------------------ #
 
-    def test_pattern_matches_valid_placeholders(self):
-        """Standard placeholder tokens must match."""
+    def test_pattern_matches_common_placeholders(self):
+        """The common-prefix placeholders all match the universal shape regex."""
         pat = anonymizer_placeholder_pattern()
         for token in ("Person_1", "City_42", "Country_3", "Org_10", "Thing_999"):
             assert pat.match(token), f"Pattern should match {token!r}"
 
-    def test_pattern_is_case_insensitive(self):
-        """Pattern must be case-insensitive per _PLACEHOLDER_RE convention."""
+    def test_pattern_matches_invented_prefixes(self):
+        """The prefix vocabulary is open — type-appropriate PascalCase prefixes
+        outside the common set must match.  Closes the regression that caused
+        the position-based `_recover_missing_placeholder_mappings` helper to
+        carry weight: when the LLM mints `University_1` / `Project_1` /
+        `Language_1`, the canonical check accepts it as well-formed instead
+        of forcing a constrained vocabulary."""
         pat = anonymizer_placeholder_pattern()
-        assert pat.match("person_1"), "Pattern should match lowercase 'person_1'"
-        assert pat.match("city_42"), "Pattern should match lowercase 'city_42'"
-        assert pat.match("THING_5"), "Pattern should match uppercase 'THING_5'"
+        for token in (
+            "University_1",
+            "Project_3",
+            "Paper_1",
+            "Language_2",
+            "Currency_1",
+            "Event_5",
+            "Role_1",
+            "Tool_99",
+        ):
+            assert pat.match(token), f"Pattern should match invented prefix {token!r}"
+
+    def test_pattern_requires_uppercase_first_letter(self):
+        """Pattern requires the prefix to start with an uppercase letter.
+        Lowercase-start is the most common LLM error mode and signals the
+        model ignored the shape contract — the canonical check should reject.
+        Mid-prefix uppercase (e.g. all-caps acronym-style ``URL_1``) is
+        accepted by the shape regex; the contract teaches PascalCase but
+        does not police every internal capitalisation pattern."""
+        pat = anonymizer_placeholder_pattern()
+        assert not pat.match("person_1"), "lowercase-start prefix must NOT match"
+        assert not pat.match("city_42"), "lowercase-start prefix must NOT match"
 
     def test_pattern_does_not_match_real_names(self):
         """Real names must not match the placeholder pattern."""
@@ -419,20 +443,19 @@ class TestAnonymizerConfig:
             assert not pat.match(token), f"Pattern should NOT match {token!r}"
 
     def test_pattern_does_not_match_prefix_without_suffix(self):
-        """'Person' without '_N' suffix must not match."""
+        """'Person' without '_<N>' suffix must not match."""
         pat = anonymizer_placeholder_pattern()
         assert not pat.match("Person"), "Pattern should NOT match bare 'Person'"
         assert not pat.match("Person_"), "Pattern should NOT match 'Person_' (no digits)"
+        assert not pat.match("Person_abc"), "Pattern should NOT match 'Person_abc' (non-digit)"
 
-    def test_pattern_does_not_match_unconfigured_prefix(self):
-        """'Location_1' is not a configured prefix — must not match."""
-        pat = anonymizer_placeholder_pattern()
-        assert not pat.match("Location_1"), (
-            "Pattern should NOT match 'Location_1' — 'location' is not a configured prefix."
-        )
-
-    def test_pattern_returns_none_when_prefixes_empty(self, tmp_path):
-        """Empty prefixes list must return None, not a degenerate regex."""
+    def test_pattern_independent_of_schema_yaml(self, tmp_path):
+        """The shape regex is universal — empty `anonymizer.prefixes` in
+        the schema YAML does NOT change the returned pattern.  This pins
+        the post-rewrite invariant: the `anonymizer.prefixes` block is
+        illustrative-only, not a gate.  Cross-cycle entity merge happens
+        on real names in :class:`paramem.graph.merger.GraphMerger`, not
+        on placeholder vocabulary."""
         tmp = tmp_path / "empty_prefixes.yaml"
         tmp.write_text(
             "entity_types:\n  person: {anchor: 'schema:Person'}\n"
@@ -446,14 +469,16 @@ class TestAnonymizerConfig:
         )
         reset_cache()
         result = anonymizer_placeholder_pattern(path=str(tmp))
-        assert result is None, (
-            "anonymizer_placeholder_pattern must return None when prefix list is empty, "
-            f"got {result!r}"
-        )
+        # Pattern is still the universal shape regex regardless of YAML content.
+        import re
+
+        assert isinstance(result, re.Pattern)
+        assert result.match("Person_1")
+        assert result.match("AnyType_1")  # invented prefix still accepted
         reset_cache()
 
     def test_pattern_is_pattern_when_prefixes_nonempty(self):
-        """Default config has prefixes configured — must return a compiled Pattern."""
+        """Default config — must return a compiled Pattern (not None)."""
         import re
 
         reset_cache()

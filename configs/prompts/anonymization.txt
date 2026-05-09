@@ -1,60 +1,86 @@
-Identify all identifying names in the extracted personal facts and replace them with category-prefixed placeholders. Return the anonymized facts and a `real_name → placeholder` mapping.
+Identify all identifying names in the extracted personal facts and replace them with type-prefixed placeholders. Return the anonymized facts and a `real_name → placeholder` mapping.
 
-Replace:
-{replacement_rules}
+## Placeholder shape contract
 
-Rules:
+Each placeholder is `<Prefix>_<N>` where:
+- `Prefix` is a PascalCase noun naming the entity's type. Common prefixes are `Person`, `City`, `Country`, `Org`, `Thing`, but you may use any type-appropriate PascalCase prefix (`University`, `Product`, `Project`, `Paper`, `Language`, `Tool`, `Currency`, `Year`, `Event`, `Role`, ...) when one of the common ones doesn't fit.
+- `N` is a positive integer. Allocate the smallest free index per prefix in order of first appearance (`Person_1` before `Person_2`).
+- Each real name must map to a UNIQUE placeholder. No two real names share the same placeholder.
+
+## Rules
+
+- **Anonymize-or-not is decided by the rules below** (identifying names → anonymize; common nouns and descriptive phrases → leave verbatim). When in doubt, leave verbatim. Once you HAVE decided to replace a name with a placeholder, you MUST add the `real_name → placeholder` entry to `mapping` in the same response. A placeholder appearing in a fact without a corresponding mapping entry causes the fact to be silently dropped at downstream verification.
 - Mapping direction is `real_name → placeholder`: real name is the JSON KEY, placeholder is the JSON VALUE.
 - Use the SAME placeholder for every occurrence of a name across the facts.
-- Allocate placeholder indices in order of first appearance (Person_1 before Person_2, City_1 before City_2, etc.).
 - Keep `predicate`, `relation_type`, and `confidence` of every fact unchanged.
 - The transcript at the bottom is CONTEXT — it helps you tell identifying names from common nouns. Do NOT echo, paraphrase, or rewrite the transcript in your output. Only the facts and the mapping appear in your output.
 - Common nouns are NEVER added to the mapping, even if the extractor capitalised them. "Dog", "Partner", "Friend", "Assistant", "User" are common nouns. "Rex", "Alice", "Berlin", "Acme Corp" are identifying names.
+- Numeric values, dates, and currencies that name no specific entity stay verbatim. Only proper nouns / named entities get placeholders.
 
-POSITIVE example — facts: [{{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", "relation_type": "factual", "confidence": 1.0}}]
+## Examples
+
+POSITIVE — facts: [{{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] My friend Alice lives in Berlin. [assistant] Got it."
 Output:
 {{"anonymized": [{{"subject": "Person_1", "predicate": "lives_in", "object": "City_1", "relation_type": "factual", "confidence": 1.0}}],
   "mapping": {{"Alice": "Person_1", "Berlin": "City_1"}}}}
 
-POSITIVE example — facts: [{{"subject": "Pat", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}]
-Transcript: "[user] My partner Pat noticed our dog was sick last week."
-Output:
-{{"anonymized": [{{"subject": "Person_1", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}],
-  "mapping": {{"Pat": "Person_1"}}}}
-
-Note: "Dog" appears in the input facts, but the transcript context ("our dog") makes clear it is a common noun, not a name. Pat is anonymized; "Dog" stays verbatim.
-
-POSITIVE example — facts: [{{"subject": "Charlie", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}]
+POSITIVE — facts: [{{"subject": "Charlie", "predicate": "works_at", "object": "Siemens", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] I work at Siemens in the R&D group."
 Output:
 {{"anonymized": [{{"subject": "Person_1", "predicate": "works_at", "object": "Org_1", "relation_type": "factual", "confidence": 1.0}}],
   "mapping": {{"Charlie": "Person_1", "Siemens": "Org_1"}}}}
 
-POSITIVE example — compound product/system name maps to Thing_N:
+POSITIVE — type-appropriate prefix outside the common set:
+facts: [{{"subject": "Mira", "predicate": "studied_at", "object": "Northcrest University", "relation_type": "factual", "confidence": 1.0}},
+        {{"subject": "Mira", "predicate": "led", "object": "Atlas Initiative", "relation_type": "factual", "confidence": 1.0}}]
+Transcript: "[user] I studied at Northcrest University and led the Atlas Initiative."
+Output:
+{{"anonymized": [{{"subject": "Person_1", "predicate": "studied_at", "object": "University_1", "relation_type": "factual", "confidence": 1.0}},
+                 {{"subject": "Person_1", "predicate": "led", "object": "Project_1", "relation_type": "factual", "confidence": 1.0}}],
+  "mapping": {{"Mira": "Person_1", "Northcrest University": "University_1", "Atlas Initiative": "Project_1"}}}}
+Note: `University_1` and `Project_1` are not in the common-prefix set but they are type-appropriate, well-formed (PascalCase + `_<N>`), unique, and present in the mapping. That is the contract.
+
+POSITIVE — common noun stays verbatim:
+facts: [{{"subject": "Pat", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}]
+Transcript: "[user] My partner Pat noticed our dog was sick last week."
+Output:
+{{"anonymized": [{{"subject": "Person_1", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}],
+  "mapping": {{"Pat": "Person_1"}}}}
+Note: "Dog" appears in the fact, but the transcript context ("our dog") makes clear it is a common noun. Pat is anonymized; "Dog" stays verbatim and does NOT appear in the mapping.
+
+POSITIVE — compound product name with type-appropriate prefix:
 facts: [{{"subject": "Sam", "predicate": "uses", "object": "iPhone 15 Pro", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] I switched to the iPhone 15 Pro last month."
 Output:
-{{"anonymized": [{{"subject": "Person_1", "predicate": "uses", "object": "Thing_1", "relation_type": "factual", "confidence": 1.0}}],
-  "mapping": {{"Sam": "Person_1", "iPhone 15 Pro": "Thing_1"}}}}
+{{"anonymized": [{{"subject": "Person_1", "predicate": "uses", "object": "Product_1", "relation_type": "factual", "confidence": 1.0}}],
+  "mapping": {{"Sam": "Person_1", "iPhone 15 Pro": "Product_1"}}}}
 
-NEGATIVE example — mapping direction reversed:
+NEGATIVE — mapping direction reversed:
 WRONG: {{"mapping": {{"Person_1": "Alice", "City_1": "Berlin"}}}}
 RIGHT: {{"mapping": {{"Alice": "Person_1", "Berlin": "City_1"}}}}
 The real name is the KEY; the placeholder is the VALUE.
 
-NEGATIVE example — common noun anonymized:
+NEGATIVE — orphan placeholder in fact (totality violation):
+facts: [{{"subject": "Honda", "predicate": "made", "object": "Civic", "relation_type": "factual", "confidence": 1.0}}]
+WRONG: {{"anonymized": [{{"subject": "Org_1", "predicate": "made", "object": "Product_1", "relation_type": "factual", "confidence": 1.0}}],
+        "mapping": {{"Honda": "Org_1"}}}}
+The fact uses `Product_1` in object but `Product_1` is missing from `mapping` — the fact will be silently dropped at downstream verification. Either emit a mapping entry for the placeholder OR leave the original surface form in the fact.
+RIGHT: {{"anonymized": [{{"subject": "Org_1", "predicate": "made", "object": "Product_1", "relation_type": "factual", "confidence": 1.0}}],
+        "mapping": {{"Honda": "Org_1", "Civic": "Product_1"}}}}
+
+NEGATIVE — duplicate placeholder for two distinct names (uniqueness violation):
+WRONG: {{"mapping": {{"Alice": "Person_1", "Pat": "Person_1"}}}}
+Each real name must map to a unique placeholder. Allocate `Pat → Person_2`, not a duplicate of `Person_1`.
+
+NEGATIVE — common noun anonymized:
 Given facts where a fact object is "Dog" but the transcript clearly says "my dog":
 WRONG: {{"mapping": {{"Dog": "Thing_1"}}}}
 "dog" is a common noun, not an identifying name. Do NOT add it to the mapping. The fact subject/object stays as "Dog" verbatim.
 
-NEGATIVE example — self-mapped placeholder:
+NEGATIVE — self-mapped placeholder (key is a placeholder shape):
 WRONG: {{"mapping": {{"Project_1": "Project_1", "Program_1": "Program_1"}}}}
-Every mapping KEY must be a real name copied verbatim from the input facts (or a name you derived from the transcript context). Never use a placeholder shape (Person_N / City_N / Country_N / Org_N / Thing_N) as the KEY. Self-mapped entries are dropped at canonicalisation, taking their facts with them. If the input fact object is a descriptive phrase rather than an identifying name (e.g. "delivery from quarterly cycles to continuous deployment"), leave it VERBATIM in the anonymized fact and DO NOT add an entry to mapping.
-
-NEGATIVE example — non-schema prefix:
-WRONG: {{"mapping": {{"Acme Whisper": "Project_1"}}}}
-Only Person, City, Country, Org, and Thing prefixes are configured. A product/system name that isn't a Person/City/Country/Org maps to Thing_N. The example would be RIGHT as: {{"mapping": {{"Acme Whisper": "Thing_1"}}}}.
+Every mapping KEY must be a real name copied verbatim from the input facts (or derived from the transcript context). Never use a placeholder shape (`<Prefix>_<N>`) as a KEY. Self-mapped entries are dropped at canonicalisation, taking their facts with them. If the input fact object is a descriptive phrase rather than an identifying name (e.g. "delivery from quarterly cycles to continuous deployment"), leave it VERBATIM in the anonymized fact and DO NOT add an entry to mapping.
 
 Facts to anonymize:
 {facts_json}
