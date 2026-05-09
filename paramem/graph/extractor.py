@@ -1780,58 +1780,70 @@ _DEFAULT_PLAUSIBILITY_PROMPT = (
     "You are filtering enriched personal facts from a voice assistant conversation. "  # noqa: E501
     "Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.\n"  # noqa: E501
     "\n"
-    "Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, or confidence of any fact.\n"  # noqa: E501
+    "You decide DROP or KEEP per fact. Output ONLY the indices of facts that match a DROP rule. "  # noqa: E501
+    "Never echo, modify, or add facts.\n"
     "\n"
-    "## KEEP — return the fact unchanged\n"
+    "## KEEP — leave the fact in the output\n"
     "\n"
     "Default action. Apply whenever none of the DROP rules below match the fact's lexical pattern. "  # noqa: E501
     "Do not drop on semantic judgment. When uncertain, KEEP.\n"
     "\n"
-    'Example: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP\n'  # noqa: E501
-    'Example: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP\n'  # noqa: E501
+    'Example: `[0] {{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP (do not include 0 in the output)\n'  # noqa: E501
+    'Example: `[1] {{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP (do not include 1 in the output)\n'  # noqa: E501
     "\n"
-    "## DROP — remove the fact from the output\n"
+    "## DROP — emit this fact's index\n"
     "\n"
     "Apply when any of the lexical patterns below match. No judgment calls.\n"
     "\n"
     "**R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), regardless of predicate.\n"  # noqa: E501
-    'Example: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)\n'  # noqa: E501
+    'Example: `[2] {{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1) — include 2 in the output.\n'  # noqa: E501
     "\n"
     "**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are in the input "  # noqa: E501
-    "(also `named`, `is`, `equals`). Drop both.\n"
-    'Example: `{{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND '
-    '`{{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2)\n'  # noqa: E501
+    "(also `named`, `is`, `equals`). Drop both indices.\n"
+    'Example: `[3] {{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND '
+    '`[4] {{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2) — include 3 and 4.\n'  # noqa: E501
     "\n"
     "**R3. Role leak.** Subject or object is exactly one of: "
     '"Assistant", "User", "Speaker", "the bot", "the model". '
     'Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, NOT role leaks.\n'  # noqa: E501
-    'Example: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)\n'  # noqa: E501
+    'Example: `[5] {{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3) — include 5.\n'  # noqa: E501
     "\n"
     "**R4. Unresolved placeholder in real-name input.** When the input is real-named "  # noqa: E501
     "(no `Person_N` / `City_N` / `Country_N` / `Org_N` / `Thing_N` placeholders expected in the transcript), "  # noqa: E501
     "drop any fact whose subject or object still matches "
     r"`^(Person|City|Country|Org|Thing)_\d+$`."  # noqa: E501
     "\n"
-    'Example: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)\n'  # noqa: E501
+    'Example: `[6] {{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input) — include 6.\n'  # noqa: E501
     "\n"
     "**R5. Empty / sentinel object.** Object is exactly one of: "
     '"", "Unknown", "None", "Various", "Something", "N/A".\n'
-    'Example: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)\n'  # noqa: E501
+    'Example: `[7] {{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5) — include 7.\n'  # noqa: E501
     "\n"
     "**R6. System entity ID.** Subject or object contains a dot-separated HA-style identifier "  # noqa: E501
     "(e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`).\n"
-    'Example: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)\n'  # noqa: E501
+    'Example: `[8] {{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6) — include 8.\n'  # noqa: E501
     "\n"
     "## Input\n"
+    "\n"
+    "Each fact below is preceded by its zero-based index in square brackets. "  # noqa: E501
+    "Use that index to refer to the fact in your output.\n"
     "\n"
     "Conversation transcript:\n"
     "{transcript}\n"
     "\n"
-    "Enriched facts:\n"
+    "Enriched facts (numbered):\n"
     "{facts_json}\n"
     "\n"
-    "Return ONLY a JSON array of surviving facts, schema unchanged. "
-    "If all facts survive, return them all. If no facts survive, return [].\n"
+    "## Output\n"
+    "\n"
+    'Return ONLY a single JSON object with the key "drop", whose value is an array of zero-based integer indices.\n'  # noqa: E501
+    "\n"
+    'Example with two drops: {{"drop": [3, 5]}}\n'
+    'Example for a clean input where nothing matches a DROP rule: {{"drop": []}}\n'  # noqa: E501
+    "\n"
+    "Do NOT wrap the output in backticks, code fences, or any other prose.\n"
+    "Do NOT include the facts themselves. Do NOT modify any field of any fact. "  # noqa: E501
+    "Do NOT emit the surviving (KEPT) indices — only the indices to DROP.\n"
 )
 # fmt: on
 
@@ -4021,6 +4033,14 @@ def _parse_facts_response(raw: str | None, strict_array: bool = False) -> list[d
     `strict_array=True` rejects dict-wrapped responses — used by the
     plausibility filter, whose contract requires a bare JSON array. The
     enrichment stage is more permissive (tries common dict keys before failing).
+
+    When the strict envelope parse fails (typically because Mistral 7B emits
+    EOS mid-array on long KEEP-by-default plausibility passes — the closing
+    ``]`` never arrives), a stream-parse salvage walks ``{…}`` objects from
+    the response and returns those that look fact-shaped.  Each salvaged
+    object must carry at least one of ``subject`` / ``predicate`` / ``object``
+    so unrelated JSON inside the response (preamble, commentary literals)
+    isn't pulled into the result.
     """
     if raw is None:
         return None
@@ -4037,8 +4057,75 @@ def _parse_facts_response(raw: str | None, strict_array: bool = False) -> list[d
         logger.warning("SOTA response unexpected format: %s", type(validated).__name__)
         return None
     except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+        logger.debug("SOTA response strict parse failed: %s — attempting salvage", e)
+        salvaged = _salvage_fact_objects(raw)
+        if salvaged:
+            logger.warning(
+                "SOTA response strict parse failed (%s); salvaged %d fact dict(s) "
+                "via stream-parse — likely a truncated array",
+                e,
+                len(salvaged),
+            )
+            return salvaged
         logger.warning("SOTA response parse failed: %s", e)
         return None
+
+
+def _salvage_fact_objects(raw: str) -> list[dict]:
+    """Stream-parse ``{…}`` fact objects from a malformed JSON envelope.
+
+    Walks the response and yields each balanced ``{…}`` block.  Each block
+    is parsed with ``json.loads``; successful parses that look fact-shaped
+    (carry ``subject``, ``predicate``, or ``object``) are kept.  Used as a
+    fallback when the envelope is truncated mid-array (no closing ``]``)
+    so the strict parse can't recover anything.
+
+    Conservative on inclusion: an object with none of the fact keys is
+    dropped to avoid pulling commentary literals (``{"note": "..."}``) or
+    the SOTA-style ``new_entity_bindings`` sub-dict into a fact list.
+    Returns an empty list when no fact-shaped objects can be recovered.
+    """
+    if not raw:
+        return []
+    salvaged: list[dict] = []
+    depth = 0
+    in_string = False
+    escape = False
+    start: int | None = None
+    for i, ch in enumerate(raw):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth == 0:
+                # Stray closer — ignore.
+                continue
+            depth -= 1
+            if depth == 0 and start is not None:
+                block = raw[start : i + 1]
+                start = None
+                try:
+                    obj = json.loads(block)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if any(k in obj for k in ("subject", "predicate", "object")):
+                    salvaged.append(obj)
+    return salvaged
 
 
 def _filter_with_sota(
@@ -4279,6 +4366,125 @@ def _graph_enrich_with_sota(
     return new_relations, same_as_pairs, raw
 
 
+def _render_indexed_facts(facts: list[dict]) -> str:
+    """Format facts for the plausibility prompt as ``[N] <json>`` lines.
+
+    The plausibility judge's output contract is a small ``{"drop": [...]}``
+    object listing zero-based indices of facts that match a DROP rule.
+    Rendering each input with its index in square brackets is what makes
+    that contract referenceable — the judge can quote ``[3]`` rather than
+    echoing the entire fact verbatim, which is what used to truncate
+    Mistral 7B mid-array on long KEEP-by-default outputs.
+    """
+    return "\n".join(f"[{i}] {json.dumps(f, ensure_ascii=False)}" for i, f in enumerate(facts))
+
+
+def _parse_drop_set(raw: str | None, n_facts: int) -> set[int] | None:
+    """Parse the plausibility judge's drop-set output.
+
+    Accepts these shapes (most permissive — all are observed in practice):
+
+    * ``{"drop": [0, 2, 5]}`` — the prompt's preferred shape.
+    * ``[0, 2, 5]`` — bare integer array; some models drop the wrapper.
+    * ``{"drop": [{"index": 0, "rule": "R1"}, ...]}`` — the model
+      annotated each drop with its rule reason.  Indices are extracted;
+      rules are ignored at parse time.
+
+    Returns the drop set on success; ``None`` on parse failure (caller
+    fail-opens — keep all facts).  Indices outside ``[0, n_facts)`` are
+    skipped with a warning rather than failing the parse — a single bad
+    index shouldn't void an otherwise-valid drop set.
+    """
+    if raw is None or not raw.strip():
+        return None
+    # Strip markdown wrappers before parsing — models routinely emit
+    # ```json\n{...}\n``` (triple-backtick fence) or `{...}` (single
+    # inline-code) even when asked for bare JSON.  ``_extract_json_block``
+    # would reject the drop-set object because ``drop`` isn't in its
+    # envelope-key set (that helper is calibrated for fact-list envelopes),
+    # so do the unwrap ourselves.
+    src = raw.strip()
+    for marker in ("```json", "```"):
+        if marker in src:
+            start = src.index(marker) + len(marker)
+            closing = src.find("```", start)
+            if closing != -1:
+                src = src[start:closing].strip()
+                break
+    # Strip a single-backtick wrapper if the entire payload is one
+    # inline-code span: `{...}`.  Don't touch interior backticks — they
+    # might be inside a JSON string literal.
+    if src.startswith("`") and src.endswith("`") and src.count("`") == 2:
+        src = src[1:-1].strip()
+    try:
+        parsed = json.loads(src)
+    except (json.JSONDecodeError, ValueError):
+        # Fall back to envelope detection — handles preamble like
+        # "I'll drop the following: {...}" by walking ``{``/``[`` positions.
+        try:
+            json_str = _extract_json_block(src)
+            parsed = json.loads(json_str)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("plaus drop-set parse failed: %s", e)
+            return None
+    candidates: list[object]
+    if isinstance(parsed, dict):
+        for key in ("drop", "drop_indices", "indices"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+        else:
+            logger.warning(
+                "plaus drop-set object missing 'drop' key (got keys: %s)",
+                list(parsed.keys())[:5],
+            )
+            return None
+    elif isinstance(parsed, list):
+        candidates = parsed
+    else:
+        logger.warning("plaus drop-set unexpected shape: %s", type(parsed).__name__)
+        return None
+    drop: set[int] = set()
+    out_of_range = 0
+    for c in candidates:
+        if isinstance(c, dict):
+            idx = c.get("index")
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                continue
+        elif isinstance(c, bool) or not isinstance(c, int):
+            continue
+        else:
+            idx = c
+        if 0 <= idx < n_facts:
+            drop.add(idx)
+        else:
+            out_of_range += 1
+    if out_of_range:
+        logger.warning(
+            "plaus drop-set: %d index(es) out of range [0, %d) — skipped",
+            out_of_range,
+            n_facts,
+        )
+    return drop
+
+
+def _apply_drop_set(facts: list[dict], raw: str | None) -> list[dict] | None:
+    """Apply the judge's drop-set output to the input facts.
+
+    Returns ``None`` on parse failure so the caller can fail-open
+    (matches the prior contract: ``filtered_list is None`` →
+    ``_sota_pipeline`` keeps all input facts unchanged and logs a
+    warning).  Empty drop set → input list returned unchanged.
+    """
+    drop = _parse_drop_set(raw, len(facts))
+    if drop is None:
+        return None
+    if not drop:
+        return list(facts)
+    return [f for i, f in enumerate(facts) if i not in drop]
+
+
 def _plausibility_filter_with_sota(
     enriched_anon_facts: list[dict],
     api_key: str,
@@ -4295,6 +4501,12 @@ def _plausibility_filter_with_sota(
     No additions, no modifications. See sota_plausibility.txt for the
     drop criteria (self-loops, tautologies, role leaks, etc.).
 
+    The judge emits a small ``{"drop": [<index>, ...]}`` object; this
+    helper applies the drop-set to the input facts and returns the
+    survivors.  Output is bounded and tiny by construction, so the
+    truncation failure mode that hit the previous "echo every fact"
+    protocol cannot recur on long inputs.
+
     Returns `(facts, raw_response)`. Raw response is preserved so callers
     can inspect the judge's verdict when questioning drop decisions.
 
@@ -4304,7 +4516,7 @@ def _plausibility_filter_with_sota(
     """
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
     prompt = plaus_prompt.format(
-        facts_json=json.dumps(enriched_anon_facts, indent=2),
+        facts_json=_render_indexed_facts(enriched_anon_facts),
         transcript=anon_transcript or "(not available)",
     )
     raw = _sota_call(
@@ -4318,7 +4530,7 @@ def _plausibility_filter_with_sota(
         system_prompt=_SOTA_PLAUSIBILITY_SYSTEM_PROMPT,
         timeout_seconds=timeout_seconds,
     )
-    return _parse_facts_response(raw, strict_array=True), raw
+    return _apply_drop_set(enriched_anon_facts, raw), raw
 
 
 def _local_plausibility_filter(
@@ -4348,7 +4560,7 @@ def _local_plausibility_filter(
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
     prompt = plaus_prompt.format(
-        facts_json=json.dumps(facts, indent=2),
+        facts_json=_render_indexed_facts(facts),
         transcript=transcript or "(not available)",
     )
     messages = [
@@ -4397,4 +4609,4 @@ def _local_plausibility_filter(
         _vram_snapshot("plaus_filter_post_generate_error")
         raise
     _vram_snapshot("plaus_filter_post_generate")
-    return _parse_facts_response(raw, strict_array=True), raw
+    return _apply_drop_set(facts, raw), raw
