@@ -5,7 +5,6 @@ MMS-TTS (HuggingFace) for languages Piper doesn't cover (e.g. Tagalog).
 Both support CPU and GPU execution.
 """
 
-import gc
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -15,6 +14,7 @@ import numpy as np
 import torch
 
 from paramem.server.config import TTSConfig, TTSVoiceConfig
+from paramem.server.vram_guard import safe_empty_cache
 
 logger = logging.getLogger(__name__)
 
@@ -227,9 +227,9 @@ class MMSTTSEngine(TTSEngine):
             del self._tokenizer
             self._model = None
             self._tokenizer = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # safe_empty_cache (not bare empty_cache) — clears cuBLAS workspaces
+            # that survive empty_cache and otherwise persist as a ghost context.
+            safe_empty_cache()
             logger.info("MMS-TTS unloaded: %s", self._model_id)
 
     @property

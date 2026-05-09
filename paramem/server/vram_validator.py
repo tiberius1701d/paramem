@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import torch
 
+from paramem.server.vram_predict import predict_stt_bytes, predict_tts_bytes
 from paramem.utils.config import AdapterConfig
 
 logger = logging.getLogger(__name__)
@@ -44,14 +45,14 @@ logger = logging.getLogger(__name__)
 # Fixed overhead for CUDA memory fragmentation and runtime bookkeeping.
 _SAFETY_MARGIN_BYTES: int = 256 * 1024 * 1024  # 256 MiB
 
-# KV-cache / activation headroom default (1 GiB).
-# Sized for the per-phase peak — vram_scope wraps each extraction phase
-# with empty_cache between phases (paramem/graph/extractor.py and
-# paramem/training/consolidation.py), so the static reservation covers what
-# the largest single phase holds at once, not the cumulative peak across
-# phases. The plausibility-filter's ~1.9 GiB allocator pool is released
-# before QA-gen begins. Tunable via vram.vram_cache_headroom_gib for
-# workloads with longer single-phase context windows.
+# KV-cache / activation headroom default (1 GiB) — conservative code-side
+# minimum. Production yaml (configs/server.yaml and tests/fixtures/server.yaml)
+# ships 2.0 GiB for the observed per-phase peak. vram_scope wraps each
+# extraction phase with empty_cache between phases (paramem/graph/extractor.py
+# and paramem/training/consolidation.py), so the reservation covers what the
+# largest single phase holds at once, not the cumulative peak across phases.
+# The plausibility-filter's ~1.9 GiB allocator pool is released before QA-gen
+# begins. Tunable via vram.vram_cache_headroom_gib.
 _DEFAULT_HEADROOM_GIB: float = 1.0
 
 # Hardware tiers (GiB) for the topology-fit assessment table. Covers the
@@ -75,73 +76,6 @@ _LORA_DTYPE_BYTES: int = 2
 # wrappers, adapter-config metadata tensors, and CUDA allocator alignment padding.
 _PEFT_OVERHEAD_PER_ADAPTER_BYTES: int = 10 * 1024 * 1024  # 10 MiB
 
-# Known model hidden dimensions and layer counts.
-# Format: model_key → (hidden_size, num_hidden_layers)
-# Used to compute adapter bytes without loading the model.
-# Source: official model configs on HuggingFace.
-_MODEL_DIMS: dict[str, tuple[int, int]] = {
-    "mistral": (4096, 32),  # Mistral-7B-Instruct-v0.3
-    "ministral": (4096, 36),  # Ministral-8B-Instruct-2410
-    "llama": (4096, 32),  # Llama-3.1-8B-Instruct
-    "gemma": (3584, 42),  # Gemma-2-9B-IT
-    "qwen3b": (2048, 36),  # Qwen2.5-3B-Instruct
-    "qwen": (3584, 28),  # Qwen2.5-7B-Instruct
-    "gemma4": (2560, 34),  # Gemma-4-E4B (approximate; subject to revision)
-}
-
-# NF4 base model footprint estimates (bytes) — used when CUDA is unavailable.
-# Derived from: param_count × 0.5 bytes (NF4) + small metadata overhead.
-# Source: measured empirically (torch.cuda.memory_allocated after load),
-# rounded up to nearest 128 MiB. Mistral 7B NF4 lands at ~4,108 MiB on load.
-_MODEL_VRAM_BYTES: dict[str, int] = {
-    "mistral": 4_308_428_800,  # ~4,108 MiB NF4 (measured RTX 5070, 2026-04-19)
-    "ministral": 4_718_592_000,  # ~4.4 GiB NF4
-    "llama": 4_718_592_000,  # ~4.4 GiB NF4
-    "gemma": 5_242_880_000,  # ~5.0 GiB NF4 (partial GPU; gpu alloc only)
-    "qwen3b": 2_147_483_648,  # ~2.0 GiB NF4
-    "qwen": 4_194_304_000,  # ~4.0 GiB NF4
-    "gemma4": 2_684_354_560,  # ~2.5 GiB NF4 (approximate)
-}
-
-# Sentinel for the static fallback when torch.cuda.memory_allocated returns 0
-# for an unregistered model name.
-_FALLBACK_BASE_BYTES: int = 4_500_000_000
-
-
-# ── STT / TTS VRAM tables ───────────────────────────────────────────────────
-# Calibrated against empirical measurements on RTX 5070 Laptop (2026-04-19)
-# with ``mem_get_info`` before/after each load. Values in the ``stt.py`` table
-# are 2-3× higher because they target its own pre-load ``check_vram`` gate
-# (defense-in-depth, worst-case activations). The validator needs values close
-# to reality so it doesn't block configs that actually fit. We apply a
-# down-scale factor to ``stt.py``'s table rather than duplicating per-model
-# entries — keeps the single source of truth for model naming, decouples the
-# safety margin from the runtime reality.
-
-# Empirical ratio: real_used / stt_py_table ≈ 0.4 for distil-large-v3 int8
-# (960 MiB measured vs 2500 MiB tabled). Applied uniformly; holds within ~20%
-# across sizes because PyTorch/CT2 per-parameter overhead is roughly constant.
-_STT_CALIBRATION_FACTOR: float = 0.4
-
-# Safety headroom on top of the calibrated base — covers first-transcribe
-# workspace growth that the idle-load probe doesn't see.
-_STT_CALIBRATION_HEADROOM_MB: int = 250
-
-# Fallback for unknown Whisper model names. 1.5 GiB covers the largest sane
-# workload (large-v3 int8 scaled ≈ 2.4 GiB, distil variants much less); a typo
-# surfaces quickly as a clear WARNING.
-_STT_FALLBACK_BYTES: int = 1_500 * 1024 * 1024  # 1.5 GiB
-
-# Per-engine TTS GPU footprint — calibrated from the same probe: 4 Piper + 1
-# MMS voices combined = 724 MiB. Piper uses ONNX Runtime; each voice's ONNX
-# session holds a small model (~60-80 MB) and the CUDA execution provider
-# allocates a context (~300 MB) shared across sessions in the same process.
-# MMS-TTS is a HuggingFace VITS model that sits on GPU per voice.
-_TTS_PIPER_BYTES_PER_VOICE: int = 80 * 1024 * 1024  # 80 MiB (was 120)
-_TTS_PIPER_ORT_CONTEXT_BYTES: int = 300 * 1024 * 1024  # 300 MiB, counted once
-_TTS_MMS_BYTES_PER_VOICE: int = 200 * 1024 * 1024  # 200 MiB (was 250)
-_TTS_UNKNOWN_ENGINE_BYTES_PER_VOICE: int = 300 * 1024 * 1024  # 300 MiB conservative
-
 
 def estimate_stt_bytes(
     stt_config,
@@ -150,54 +84,35 @@ def estimate_stt_bytes(
 ) -> int:
     """Estimate GPU VRAM bytes for Whisper STT under the given config.
 
-    Reads the authoritative size table from :mod:`paramem.server.stt` so the
-    validator and the STT loader agree on what "fits". Returns 0 when STT is
-    disabled, when the resolved device is not CUDA, or when CUDA is globally
-    unavailable.
+    Thin wrapper over :func:`paramem.server.vram_predict.predict_stt_bytes`.
+    Returns 0 when STT is disabled, when the resolved device is not CUDA,
+    when CUDA is globally unavailable, or when the predictor returns None
+    (cache miss — live gate is authoritative).
 
     Args:
         stt_config: :class:`paramem.server.config.STTConfig`-like object with
-            ``enabled``, ``device``, ``model``, ``compute_type``, and
-            ``cpu_fallback_model`` attributes.
+            ``enabled``, ``device``, ``model``, and ``compute_type`` attributes.
         permanent_cloud_only: When True, the GPU STT pair will never be loaded
-            for this process lifetime (``cloud_only_reason in {"explicit",
-            "gpu_conflict"}``). Returns 0 so the budget does not reserve GPU
-            bytes that will never be allocated. ``--defer-model`` (reason
-            ``"training"``) passes False — auto-reclaim will load the GPU pair.
+            for this process lifetime. Returns 0 so the budget does not reserve
+            GPU bytes that will never be allocated.
 
     Returns:
-        Estimated STT footprint in bytes. 0 for any CPU/disabled case.
+        Estimated STT footprint in bytes. 0 for any CPU/disabled/cache-miss case.
     """
     if not getattr(stt_config, "enabled", False):
         return 0
 
     device = getattr(stt_config, "device", "cpu")
     if permanent_cloud_only and device != "cpu":
-        return 0  # GPU pair will never be loaded this process lifetime
+        return 0
     if device not in ("cuda", "auto"):
         return 0
 
-    from paramem.server.stt import (
-        COMPUTE_TYPE_MULTIPLIER,
-        VRAM_ESTIMATES_INT8_MB,
-    )
-
-    model_name = getattr(stt_config, "model", "")
-    compute_type = getattr(stt_config, "compute_type", "int8")
-    base_mb = VRAM_ESTIMATES_INT8_MB.get(model_name)
-    if base_mb is None:
-        logger.warning(
-            "STT model %r not in VRAM_ESTIMATES_INT8_MB; using fallback %d MiB. "
-            "Register the model for accurate pre-load VRAM budgeting.",
-            model_name,
-            _STT_FALLBACK_BYTES // (1024 * 1024),
-        )
-        return _STT_FALLBACK_BYTES
-    multiplier = COMPUTE_TYPE_MULTIPLIER.get(compute_type, 1.0)
-    # Calibrated to empirical measurements (see _STT_CALIBRATION_FACTOR doc).
-    calibrated_mb = int(base_mb * multiplier * _STT_CALIBRATION_FACTOR)
-    total_mb = calibrated_mb + _STT_CALIBRATION_HEADROOM_MB
-    return total_mb * 1024 * 1024
+    result = predict_stt_bytes(stt_config, permanent_cloud_only=permanent_cloud_only)
+    if result is None:
+        logger.info("STT not cached; live gate is authoritative")
+        return 0
+    return result
 
 
 def estimate_tts_bytes(
@@ -207,24 +122,19 @@ def estimate_tts_bytes(
 ) -> int:
     """Estimate GPU VRAM bytes for all configured TTS voices.
 
-    Iterates over ``tts_config.voices`` and sums the conservative per-engine
-    footprint for every voice that resolves to GPU. Piper voices share a
-    single ONNX Runtime CUDA context, so that fixed cost is added once per
-    process regardless of how many Piper voices are configured. MMS-TTS
-    voices each hold their own model on GPU, so their cost is per-voice.
+    Thin wrapper over :func:`paramem.server.vram_predict.predict_tts_bytes`.
+    Returns 0 when TTS is disabled, when all voices are CPU-bound, or when
+    the predictor returns None (cache miss — live gate is authoritative).
 
     Args:
         tts_config: :class:`paramem.server.config.TTSConfig`-like object with
-            ``enabled``, ``device``, and ``voices`` attributes. Each voice has
-            ``engine`` and an optional ``device`` override.
+            ``enabled``, ``device``, and ``voices`` attributes.
         permanent_cloud_only: When True, the GPU TTS pair will never be loaded
-            for this process lifetime (``cloud_only_reason in {"explicit",
-            "gpu_conflict"}``). Returns 0 so the budget does not reserve GPU
-            bytes that will never be allocated. ``--defer-model`` (reason
-            ``"training"``) passes False — auto-reclaim will load the GPU pair.
+            for this process lifetime. Returns 0 so the budget does not reserve
+            GPU bytes that will never be allocated.
 
     Returns:
-        Estimated TTS footprint in bytes. 0 for any CPU/disabled case.
+        Estimated TTS footprint in bytes. 0 for any CPU/disabled/cache-miss case.
     """
     if not getattr(tts_config, "enabled", False):
         return 0
@@ -233,33 +143,11 @@ def estimate_tts_bytes(
     if permanent_cloud_only and default_device != "cpu":
         return 0
 
-    voices = getattr(tts_config, "voices", {}) or {}
-    total_bytes = 0
-    piper_voices_on_gpu = 0
-
-    for _lang, voice_config in voices.items():
-        voice_device = getattr(voice_config, "device", None) or default_device
-        if voice_device != "cuda":
-            continue
-        engine = getattr(voice_config, "engine", "").lower()
-        if engine == "piper":
-            piper_voices_on_gpu += 1
-            total_bytes += _TTS_PIPER_BYTES_PER_VOICE
-        elif engine == "mms":
-            total_bytes += _TTS_MMS_BYTES_PER_VOICE
-        else:
-            logger.warning(
-                "TTS engine %r not in validator table; using conservative "
-                "fallback %d MiB per voice.",
-                engine,
-                _TTS_UNKNOWN_ENGINE_BYTES_PER_VOICE // (1024 * 1024),
-            )
-            total_bytes += _TTS_UNKNOWN_ENGINE_BYTES_PER_VOICE
-
-    if piper_voices_on_gpu > 0:
-        total_bytes += _TTS_PIPER_ORT_CONTEXT_BYTES
-
-    return total_bytes
+    result = predict_tts_bytes(tts_config, permanent_cloud_only=permanent_cloud_only)
+    if result is None:
+        logger.info("TTS not cached; live gate is authoritative")
+        return 0
+    return result
 
 
 class ConfigurationError(RuntimeError):
@@ -414,7 +302,9 @@ def assess_topology(
     adapter_config: AdapterConfig,
     *,
     max_interim_count: int,
-    model_name: str = "",
+    base_bytes: int,
+    hidden_size: int,
+    num_layers: int,
     model_id: str = "",
     quant_label: str = "nf4",
     main_adapter_count: int = 3,
@@ -432,13 +322,13 @@ def assess_topology(
     Args:
         adapter_config: LoRA config for interim/episodic adapters.
         max_interim_count: Rolling interim cap (``consolidation.max_interim_count``).
-        model_name: Registry key (``"mistral"``, ``"gemma"``, ...). Drives the
-            static base-bytes lookup in ``_MODEL_VRAM_BYTES`` and the dims
-            lookup in ``_MODEL_DIMS``. Unknown names trigger fallbacks.
-        model_id: HF model id for the breakdown label. Defaults to ``model_name``.
+        base_bytes: Base-model GPU bytes (from predict_base_bytes or live measurement).
+        hidden_size: Hidden dimension of the base model (from AutoConfig or known value).
+        num_layers: Number of transformer layers (from AutoConfig or known value).
+        model_id: HF model id for the breakdown label.
         quant_label: Quantization scheme label for display only.
         main_adapter_count: Always-resident main adapters (default 3).
-        headroom_gib: KV cache + activation headroom (default 1 GiB).
+        headroom_gib: KV cache + activation headroom (default 2 GiB).
         stt_bytes: Whisper STT footprint (0 if CPU/disabled).
         tts_bytes: TTS footprint (0 if CPU/disabled).
 
@@ -446,29 +336,8 @@ def assess_topology(
         :class:`TopologyAssessment` — pure data, no side effects.
     """
     _GiB = 2**30
-    _MiB = 1024 * 1024
 
     headroom_bytes = int(headroom_gib * _GiB)
-
-    base_bytes = _MODEL_VRAM_BYTES.get(model_name)
-    if base_bytes is None:
-        logger.warning(
-            "Model %r not in _MODEL_VRAM_BYTES; using fallback %d MiB. "
-            "Register the model for accurate pre-load VRAM budgeting.",
-            model_name,
-            _FALLBACK_BASE_BYTES // _MiB,
-        )
-        base_bytes = _FALLBACK_BASE_BYTES
-
-    dims = _MODEL_DIMS.get(model_name)
-    if dims is None:
-        logger.warning(
-            "Model %r not in _MODEL_DIMS lookup; using Mistral 7B dims (4096, 32) "
-            "as fallback for VRAM estimation. Actual adapter size may differ.",
-            model_name,
-        )
-        dims = (4096, 32)
-    hidden_size, num_layers = dims
 
     adapter_bytes = estimated_adapter_bytes(adapter_config, hidden_size, num_layers)
 
@@ -489,9 +358,8 @@ def assess_topology(
         margin = tier_bytes - total_with_margin
         per_tier_fit[tier_gib] = (margin >= 0, margin)
 
-    display_model_id = model_id if model_id else model_name
     breakdown = _format_breakdown(
-        model_id=display_model_id,
+        model_id=model_id,
         quant_label=quant_label,
         base_bytes=base_bytes,
         main_adapter_count=main_adapter_count,
@@ -696,6 +564,40 @@ def enforce_live_budget(
     )
 
 
+def enforce_post_load_budget(
+    measured_alloc_bytes: int,
+    total_memory_bytes: int,
+    headroom_bytes: int,
+) -> None:
+    """Authoritative post-load gate.
+
+    Raises ConfigurationError if measured_alloc_bytes > total_memory_bytes
+    - headroom_bytes. The headroom is the operator-tunable
+    vram.vram_cache_headroom_gib reservation for KV cache + activations.
+
+    Args:
+        measured_alloc_bytes: torch.cuda.memory_allocated(0) after model load.
+        total_memory_bytes: Device hardware cap.
+        headroom_bytes: Reserved bytes for KV cache and activations.
+
+    Raises:
+        ConfigurationError: If the measured allocation leaves less than
+            headroom_bytes free on the device.
+    """
+    budget = total_memory_bytes - headroom_bytes
+    if measured_alloc_bytes <= budget:
+        return
+    deficit = measured_alloc_bytes - budget
+    raise ConfigurationError(
+        f"Post-load VRAM gate failed: measured {measured_alloc_bytes / 2**30:.2f} GiB "
+        f"exceeds budget {budget / 2**30:.2f} GiB "
+        f"(total {total_memory_bytes / 2**30:.2f} GiB "
+        f"− headroom {headroom_bytes / 2**30:.2f} GiB). "
+        f"Deficit {deficit / 2**30:.2f} GiB. "
+        f"Reduce rank, max_interim_count, or increase vram.vram_cache_headroom_gib."
+    )
+
+
 def _format_breakdown(
     *,
     model_id: str,
@@ -723,8 +625,7 @@ def _format_breakdown(
     are formatted in MiB so operators can compare directly with ``nvidia-smi``.
 
     Args:
-        model_id: Full HuggingFace model ID string (e.g.
-            ``"mistralai/Mistral-7B-Instruct-v0.3"``).
+        model_id: Full HuggingFace model ID string.
         quant_label: Quantization scheme label (e.g. ``"nf4"``).
         base_bytes: GPU footprint of the quantized base model in bytes.
         main_adapter_count: Number of always-resident main adapters.
@@ -748,7 +649,7 @@ def _format_breakdown(
     margin = available_bytes - total_with_margin_bytes
     margin_sign = "+" if margin >= 0 else ""
 
-    sep = "\u2500" * 65
+    sep = "─" * 65
 
     col_w = 53  # label column width (chars)
 
@@ -815,218 +716,3 @@ def _log_gpu_occupancy_diagnostic() -> None:
             logger.error("Current GPU occupancy (nvidia-smi): no compute processes")
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.debug("nvidia-smi diagnostic unavailable: %s", exc)
-
-
-def validate_startup_vram(
-    model,
-    adapter_config: AdapterConfig,
-    *,
-    max_interim_count: int,
-    model_name: str = "",
-    model_id: str = "",
-    quant_label: str = "nf4",
-    main_adapter_count: int = 3,
-    headroom_gib: float = _DEFAULT_HEADROOM_GIB,
-    vram_cap_gib: float | None = None,
-    stt_bytes: int = 0,
-    tts_bytes: int = 0,
-) -> None:
-    """Validate that the configured adapter topology fits in available VRAM.
-
-    Designed to be called *before* the base model is loaded: free VRAM then
-    reflects total GPU capacity minus external consumers, which maps directly
-    onto the required working set (base + adapters + headroom). When called
-    post-load (``model`` is provided and the CUDA allocator reports a non-zero
-    footprint), the already-loaded base model footprint is added back to the
-    available budget so the comparison remains self-consistent.
-
-    Two-stage gate:
-
-    * **Pre-load (math-only)** — ``model`` is ``None``. The base footprint is
-      taken from ``_MODEL_VRAM_BYTES``. When the math predicts the worst-case
-      working set won't fit, this path emits a **logger.warning** with the
-      structured breakdown and returns. The server then proceeds to load and
-      a later post-load call either confirms the load fit (with a pessimistic
-      estimate) or raises the configuration error below.
-    * **Post-load (real VRAM)** — ``model`` is a live (possibly multi-adapter)
-      model. The base footprint is read from ``torch.cuda.memory_allocated``.
-      If the measured working set exceeds available VRAM, this path raises
-      :class:`ConfigurationError` with the breakdown and an actionable
-      remediation block. This is the authoritative rejection.
-
-    On the success path, the same breakdown is logged at INFO level so
-    operators always know the budget after startup.
-
-    Raises immediately with a clear message if no CUDA GPU is detected, rather
-    than crashing later with an opaque ``AttributeError``.
-
-    Args:
-        model: The loaded base model (may already have main adapters attached),
-            or ``None`` when called pre-load. When ``None`` (or when the CUDA
-            allocator reports 0 bytes), the base model footprint is taken from
-            ``_MODEL_VRAM_BYTES`` lookup.
-        adapter_config: LoRA adapter config for interim adapters (rank, target_modules).
-            Episodic and interim adapters share the same config in the current design.
-        max_interim_count: Maximum number of concurrent interim adapters.
-            From ``consolidation.max_interim_count`` in server config.
-        model_name: Model registry key (e.g. ``"mistral"``). Used to look up
-            hidden dimensions. If unknown, falls back to a conservative estimate.
-        model_id: Full HuggingFace model ID string for display in the breakdown
-            (e.g. ``"mistralai/Mistral-7B-Instruct-v0.3"``). Defaults to
-            ``model_name`` when not provided.
-        quant_label: Quantization scheme label shown in the breakdown
-            (e.g. ``"nf4"``). Defaults to ``"nf4"``.
-        main_adapter_count: Number of always-resident main adapters.
-            Default 3 (episodic + semantic + procedural).
-        headroom_gib: GiB to reserve for KV cache, activations, and CUDA overhead.
-            Default 1.0 GiB.
-        vram_cap_gib: Override VRAM cap in GiB. If ``None`` (default), reads
-            available free bytes from ``torch.cuda.mem_get_info(0)``.
-        stt_bytes: Estimated Whisper STT VRAM footprint. 0 when STT is disabled
-            or CPU-bound. Obtain via :func:`estimate_stt_bytes`.
-        tts_bytes: Estimated TTS VRAM footprint summed across GPU voices. 0
-            when TTS is disabled or fully CPU-bound. Obtain via
-            :func:`estimate_tts_bytes`.
-
-    Raises:
-        ConfigurationError: If no CUDA GPU is available, or (post-load only)
-            if the measured working set exceeds the VRAM cap. Pre-load mismatch
-            is logged at WARNING and does not raise.
-    """
-    # Fix 3 — Fail fast when local mode has no GPU (MINOR-4)
-    if not torch.cuda.is_available():
-        raise ConfigurationError(
-            "Local model mode requires a CUDA-capable GPU but none was detected. "
-            "Either provide a GPU, or start in cloud-only mode "
-            "(pass --cloud-only to the server, or use --defer-model for auto-reclaim)."
-        )
-
-    _GiB = 2**30
-    _MiB = 1024 * 1024
-
-    headroom_bytes = int(headroom_gib * _GiB)
-
-    # Base model footprint: prefer CUDA allocator snapshot when the model is
-    # loaded, otherwise use the static lookup (pre-load path).
-    base_bytes = estimated_base_model_bytes(model) if model is not None else 0
-    model_already_loaded = base_bytes > 0
-
-    if not model_already_loaded:
-        fallback = _MODEL_VRAM_BYTES.get(model_name)
-        if fallback is None:
-            logger.warning(
-                "Model %r not in _MODEL_VRAM_BYTES; using fallback %d MiB. "
-                "Register the model for accurate pre-load VRAM budgeting.",
-                model_name,
-                _FALLBACK_BASE_BYTES // _MiB,
-            )
-            fallback = _FALLBACK_BASE_BYTES
-        base_bytes = fallback
-
-    # Determine available VRAM. The budget question this validator answers is
-    # "does the configured topology fit the configured GPU?" — that is a
-    # question about hardware capacity, not about what the allocator happens
-    # to hold at this instant. We therefore default to the device's total
-    # memory (``torch.cuda.get_device_properties(0).total_memory``) rather
-    # than ``mem_get_info()[0]`` (free bytes), which is polluted by the CUDA
-    # context and any unrelated process. ``vram_cap_gib`` remains an explicit
-    # override for tests or sub-budget caps.
-    if vram_cap_gib is not None:
-        available_bytes = int(vram_cap_gib * _GiB)
-    else:
-        available_bytes = torch.cuda.get_device_properties(0).total_memory
-
-    # Adapter bytes per unit
-    dims = _MODEL_DIMS.get(model_name)
-    if dims is None:
-        # Unknown model — use Mistral 7B dims as a conservative fallback
-        logger.warning(
-            "Model %r not in _MODEL_DIMS lookup; using Mistral 7B dims (4096, 32) "
-            "as fallback for VRAM estimation. Actual adapter size may differ.",
-            model_name,
-        )
-        dims = (4096, 32)
-    hidden_size, num_layers = dims
-
-    adapter_bytes = estimated_adapter_bytes(adapter_config, hidden_size, num_layers)
-
-    total_required = required_working_set_bytes(
-        base_model_bytes=base_bytes,
-        adapter_bytes=adapter_bytes,
-        main_adapter_count=main_adapter_count,
-        max_interim_count=max_interim_count,
-        headroom_bytes=headroom_bytes,
-        stt_bytes=stt_bytes,
-        tts_bytes=tts_bytes,
-    )
-
-    total_with_margin = total_required + _SAFETY_MARGIN_BYTES
-
-    # Resolve display model_id: use explicit arg, fall back to model_name
-    display_model_id = model_id if model_id else model_name
-
-    num_modules = len(adapter_config.target_modules)
-
-    # Fix 1 — Per-component VRAM breakdown (MINOR-2): shared table for both paths
-    breakdown = _format_breakdown(
-        model_id=display_model_id,
-        quant_label=quant_label,
-        base_bytes=base_bytes,
-        main_adapter_count=main_adapter_count,
-        adapter_bytes=adapter_bytes,
-        max_interim_count=max_interim_count,
-        num_modules=num_modules,
-        rank=adapter_config.rank,
-        headroom_bytes=headroom_bytes,
-        total_required_bytes=total_required,
-        total_with_margin_bytes=total_with_margin,
-        available_bytes=available_bytes,
-        stt_bytes=stt_bytes,
-        tts_bytes=tts_bytes,
-    )
-
-    if total_with_margin <= available_bytes:
-        # Success path — always log the breakdown so operators know the budget.
-        logger.info("VRAM check passed.\n%s", breakdown)
-        return
-
-    # Failure path — structured breakdown + actionable remediation block.
-    target_modules_str = ", ".join(adapter_config.target_modules)
-    remediation_lines = [
-        "Configured topology does not fit. Reduce one of:",
-        f"  rank                  current={adapter_config.rank}"
-        "         (smaller rank halves all adapter costs)",
-        f"  max_interim_count     current={max_interim_count}         (fewer interim adapters)",
-        f"  target_modules        current={num_modules} ({target_modules_str})"
-        "  (drop k_proj/o_proj for q/v only)",
-        f"  base model            current={display_model_id} (smaller model = less base VRAM)",
-    ]
-    if stt_bytes > 0:
-        remediation_lines.append(
-            "  stt.device            current=cuda"
-            "      (set to 'cpu', or pick a smaller Whisper model / int8 compute)"
-        )
-    if tts_bytes > 0:
-        remediation_lines.append(
-            "  tts.device            current=cuda"
-            "      (set to 'cpu', or move GPU voices to Piper CPU / smaller MMS)"
-        )
-    remediation = "\n".join(remediation_lines)
-
-    # Pre-load (math-only) path: emit a warning and return so the loader can
-    # try the actual allocation. The post-load call is authoritative and will
-    # raise if reality matches the prediction.
-    if not model_already_loaded:
-        logger.warning(
-            "VRAM pre-load math predicts the configured topology will not fit.\n"
-            "%s\n\n%s\n"
-            "Server will still attempt to load; post-load check is authoritative.",
-            breakdown,
-            remediation,
-        )
-        return
-
-    # Post-load (real VRAM) path: measurement has confirmed the topology does
-    # not fit. Log who holds VRAM and raise — this is the authoritative gate.
-    _log_gpu_occupancy_diagnostic()
-    raise ConfigurationError(f"\n{breakdown}\n\n{remediation}")

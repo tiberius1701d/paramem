@@ -1,7 +1,8 @@
 """Local speech-to-text via Faster Whisper.
 
-Loads a Whisper model on GPU (or CPU) alongside the LLM.
-VRAM check at startup ensures both models fit.
+Loads a Whisper model on GPU (or CPU) alongside the LLM. The live load
+itself is the VRAM gate — vram_measure captures the delta and raises
+VramExhausted when the device is exhausted.
 """
 
 import logging
@@ -9,6 +10,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+
+from paramem.server.vram_guard import VramExhausted, safe_empty_cache, vram_measure
 
 logger = logging.getLogger(__name__)
 
@@ -22,43 +25,8 @@ class TranscriptionResult:
     language_probability: float  # 0.0–1.0 confidence
 
 
-# Approximate VRAM usage in MB per model size (INT8 quantization).
-# float16 uses roughly 2x these values.
-VRAM_ESTIMATES_INT8_MB = {
-    "tiny": 400,
-    "tiny.en": 400,
-    "base": 500,
-    "base.en": 500,
-    "small": 1000,
-    "small.en": 1000,
-    "medium": 2000,
-    "medium.en": 2000,
-    "large-v1": 6000,
-    "large-v2": 6000,
-    "large-v3": 6000,
-    "distil-large-v3": 2500,
-    "distil-small.en": 800,
-    "distil-medium.en": 1500,
-}
-
-# Multiplier for compute types relative to INT8
-COMPUTE_TYPE_MULTIPLIER = {
-    "int8": 1.0,
-    "int16": 1.5,
-    "float16": 2.0,
-    "float32": 4.0,
-}
-
-VRAM_HEADROOM_MB = 0  # GPU inference lock prevents concurrent usage; the
-# per-model estimate is itself the required reserve. Whisper distil-large-v3
-# has a 2500 MiB estimate that already exceeds its measured runtime
-# footprint (~500 MiB on this device); an additional headroom on top
-# created false-failures post-cycle when allocator-pool growth left only
-# ~2497 MiB free — the gate would refuse a load that physically fits.
-
-
 class WhisperSTT:
-    """Local Whisper STT with VRAM-aware loading."""
+    """Local Whisper STT with live-load VRAM measurement."""
 
     def __init__(
         self,
@@ -77,88 +45,97 @@ class WhisperSTT:
         self.vad_filter = vad_filter
         self._model = None
 
-    def check_vram(self) -> bool:
-        """Check if GPU has enough free VRAM for this model.
-
-        Returns True if sufficient, False otherwise.
-        Only relevant for device=cuda.
-        """
-        if self.device == "cpu":
-            return True
-
-        base_mb = VRAM_ESTIMATES_INT8_MB.get(self.model_name, 2000)
-        multiplier = COMPUTE_TYPE_MULTIPLIER.get(self.compute_type, 1.0)
-        estimated_mb = int(base_mb * multiplier)
-        required_mb = estimated_mb + VRAM_HEADROOM_MB
-
-        if not torch.cuda.is_available():
-            logger.warning("CUDA not available — cannot load Whisper on GPU")
-            return False
-
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        free_mb = free_bytes / (1024 * 1024)
-
-        logger.info(
-            "VRAM check: Whisper %s needs ~%d MB, %d MB free (of %d MB total)",
-            self.model_name,
-            required_mb,
-            int(free_mb),
-            int(total_bytes / (1024 * 1024)),
-        )
-
-        if free_mb < required_mb:
-            logger.warning(
-                "Insufficient VRAM for Whisper %s: need %d MB, have %d MB free. STT disabled.",
-                self.model_name,
-                required_mb,
-                int(free_mb),
-            )
-            return False
-        return True
-
     def load(self) -> bool:
-        """Load the Whisper model. Returns True on success."""
+        """Load the Whisper model. Returns True on success.
+
+        Wraps WhisperModel construction in vram_measure so the actual load
+        is the VRAM gate. On torch.cuda.OutOfMemoryError or VramExhausted
+        the GPU cache is flushed and False is returned; the caller decides
+        whether to fall back to CPU.
+
+        device="auto" tries CUDA first, falls back to CPU on failure.
+        device="cuda" returns False if load fails.
+        device="cpu" loads unconditionally.
+        """
         try:
             from faster_whisper import WhisperModel
         except ImportError:
             logger.error("faster-whisper not installed. Install with: pip install paramem[stt]")
             return False
 
-        # Resolve device
         device = self.device
+
         if device == "auto":
-            if torch.cuda.is_available() and self.check_vram():
-                device = "cuda"
-            else:
+            if torch.cuda.is_available():
+                loaded = self._try_load_on_device("cuda", WhisperModel)
+                if loaded:
+                    return True
                 logger.warning(
-                    "VRAM insufficient for Whisper %s with device=auto. STT disabled.",
+                    "Whisper %s failed to load on CUDA with device=auto; falling back to CPU",
                     self.model_name,
                 )
-                return False
-        elif device == "cuda" and not self.check_vram():
-            return False
+                device = "cpu"
+            else:
+                device = "cpu"
+            return self._try_load_on_device(device, WhisperModel)
 
+        return self._try_load_on_device(device, WhisperModel)
+
+    def _try_load_on_device(self, device: str, WhisperModel) -> bool:
+        """Attempt to load the Whisper model on a specific device.
+
+        Uses vram_measure for CUDA devices to capture the actual footprint.
+        Returns True on success, False on failure.
+        """
         logger.info(
             "Loading Whisper %s on %s (%s)...",
             self.model_name,
             device,
             self.compute_type,
         )
-
         try:
-            self._model = WhisperModel(
+            if device == "cuda":
+                with vram_measure("stt") as m:
+                    self._model = WhisperModel(
+                        self.model_name,
+                        device=device,
+                        compute_type=self.compute_type,
+                    )
+                delta_mib = m["delta"] / (1024 * 1024)
+                logger.info(
+                    "Whisper %s loaded on %s, used %.0f MiB",
+                    self.model_name,
+                    device,
+                    delta_mib,
+                )
+            else:
+                self._model = WhisperModel(
+                    self.model_name,
+                    device=device,
+                    compute_type=self.compute_type,
+                )
+                logger.info("Whisper %s loaded on %s", self.model_name, device)
+        except VramExhausted:
+            safe_empty_cache()
+            logger.warning(
+                "Insufficient VRAM for Whisper %s on %s — load failed",
                 self.model_name,
-                device=device,
-                compute_type=self.compute_type,
+                device,
             )
+            return False
+        except torch.cuda.OutOfMemoryError:
+            safe_empty_cache()
+            logger.warning(
+                "OOM loading Whisper %s on %s",
+                self.model_name,
+                device,
+            )
+            return False
         except Exception:
-            logger.exception("Failed to load Whisper model")
+            logger.exception("Failed to load Whisper model %s on %s", self.model_name, device)
             return False
 
-        # Update self.device to the resolved value so pstatus and other
-        # readers see "cuda"/"cpu" rather than the pre-load "auto" literal.
         self.device = device
-        logger.info("Whisper %s loaded on %s", self.model_name, device)
         return True
 
     def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> TranscriptionResult:
@@ -203,11 +180,10 @@ class WhisperSTT:
         if self._model is not None:
             del self._model
             self._model = None
-            import gc
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # safe_empty_cache (not bare empty_cache) — clears cuBLAS workspaces
+            # that empty_cache cannot touch; otherwise teardown leaves a ghost
+            # CUDA context that pollutes the next boot's _gpu_occupied check.
+            safe_empty_cache()
             logger.info("Whisper model unloaded")
 
     @property
