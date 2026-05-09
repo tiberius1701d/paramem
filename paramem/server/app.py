@@ -1715,6 +1715,17 @@ async def lifespan(app: FastAPI):
         if encoder_handle is not None:
             load_exemplars(config.intent, encoder_handle)
 
+        # Sentence-type classifier reuses the same encoder (no second
+        # download / load).  Loading the exemplar bank only succeeds
+        # when the intent encoder loaded above; otherwise the
+        # _is_interrogative tier falls through to the deterministic
+        # punctuation + English lexicon path.
+        from paramem.server.sentence_type import (
+            load_exemplars as load_sentence_type_exemplars,
+        )
+
+        load_sentence_type_exemplars(config.sentence_type)
+
     # Global observed-language tracker — records STT-detected languages with
     # high confidence, publishes to HA as input_text.voice_observed_languages
     # so the conversation agent can use it as context when interpreting

@@ -1,0 +1,24 @@
+# Sentence type: NON_INTERROGATIVE — siehe non_interrogative.en.txt für Details.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+
+Mache das Licht in der Küche an.
+Stelle die Heizung auf zwanzig Grad.
+Spiele Musik im Wohnzimmer.
+Schließe die Haustür ab.
+Erinnere mich morgen um acht.
+Öffne das Garagentor.
+Pausiere die Musik.
+Mein Name ist Anna.
+Ich wohne in Berlin.
+Ich bin gerade von einer Reise zurückgekommen.
+Heute war ein wirklich guter Tag.
+Das Paket ist heute Morgen angekommen.
+Wir waren letztes Wochenende wandern.
+Mein Geburtstag ist im März.
+Ich arbeite als Ingenieur.
+Ich habe zwei Geschwister.
+Die Hochzeit ist am Samstag.
+Erstelle eine Einkaufsliste.
+Plane für morgen einen Termin ein.
+Schicke meinem Partner eine Nachricht.

@@ -1,0 +1,34 @@
+# Sentence type: INTERROGATIVE — queries that ask a question.  Used by the
+# encoder-based ``_is_interrogative`` classifier on the routing path:
+# the abstention helper invokes this gate to decide whether to short-
+# circuit personal queries with the canned response.
+#
+# Lines starting with # and blank lines are ignored.  One query per line.
+#
+# Coverage: wh-questions, yes/no questions, indirect questions, and
+# declarative-shaped queries that end with ``?`` (the punctuation cue
+# that real human askers and STT engines reliably emit).
+#
+# Keep balanced with non_interrogative.en.txt — count parity helps the
+# margin-gate calibrate.
+
+What is my name?
+Where do I live?
+When is my birthday?
+Why did I move to Berlin?
+Who is my brother?
+How old am I?
+Which company do I work for?
+Is the door locked?
+Are the lights still on?
+Do I have any meetings tomorrow?
+Does my schedule have a free slot?
+Can you tell me my address?
+Could you remind me when I started?
+Tell me where I live.
+Tell me my phone number.
+Berlin is in Germany?
+This is correct?
+What's the weather like?
+Where is my phone?
+How do I reset my password?

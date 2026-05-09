@@ -134,10 +134,80 @@ _INTERROGATIVE_PREFIXES = frozenset(
     }
 )
 
+# Terminal punctuation that marks a query as interrogative regardless of
+# leading word.  Covers the question-mark glyphs ParaMem-supported scripts
+# actually use:
+#   ``?``   — ASCII / Latin / most European scripts (U+003F).
+#   ``？``  — fullwidth, used in CJK rendering (U+FF1F).
+#   ``؟``  — Arabic / Persian / Urdu (U+061F).
+# Greek question mark (U+003B, ``;``) is intentionally excluded because it
+# is glyphically identical to the ASCII semicolon and would mis-classify
+# declarative sentences ending in ``;``.
+_INTERROGATIVE_PUNCT = frozenset({"?", "？", "؟"})
 
-def _is_interrogative(text: str) -> bool:
-    """Check if the query is a question (not an imperative command)."""
-    first_word = text.strip().split()[0].lower() if text.strip() else ""
+
+def _is_interrogative(text: str, config=None) -> bool:
+    """Check if the query is a question (not an imperative command).
+
+    Three-tier detection, in order — each tier produces a definitive
+    answer when it can, otherwise falls through to the next:
+
+    1. **Encoder-based classifier** (when ``config`` is a
+       :class:`paramem.server.config.SentenceTypeConfig` and the
+       encoder + exemplar bank are loaded — the production path).
+       Cosine vs multilingual exemplars + margin gate.  Returns the
+       encoder's verdict directly when confidence is sufficient.
+       Below the margin or on any classifier failure: ``None`` is
+       returned by the classifier and we fall through to tier 2.
+    2. **Terminal punctuation** — a query ending in any of the
+       :data:`_INTERROGATIVE_PUNCT` glyphs is treated as a question
+       regardless of leading word.  Language-agnostic and catches
+       written queries like ``"Wo wohne ich?"`` / ``"¿Dónde vivo?"``
+       / ``"我住在哪里？"``.  Used as the deterministic fallback
+       when the encoder isn't available (encoderless boot, tests).
+    3. **English first-word lexicon** — for queries that arrive
+       without terminal punctuation (some STT engines, conversational
+       fragments), match the leading word against
+       :data:`_INTERROGATIVE_PREFIXES`.  Possessive contractions
+       (``"who's"`` → ``"who"``, ``"what's"`` → ``"what"``) are
+       collapsed before lookup.  Only applies when neither tier 1
+       nor tier 2 fired.
+
+    The cost asymmetry inside the abstention check (the only consumer)
+    favours over-classifying as interrogative: a false positive triggers
+    abstention when the user wanted a base-model answer (mildly annoying,
+    privacy-safe), a false negative falls through to base-model
+    confabulation on personal queries.  Both the encoder fallback path
+    and the punctuation tier lean into that bias.
+
+    ``config`` is optional for backward compat with call sites that
+    don't have a :class:`ServerConfig` to hand (tests).  ``None``
+    skips the encoder tier and uses tiers 2 + 3 only.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    # Tier 1: encoder-based classifier (production path).
+    if config is not None:
+        from paramem.server.sentence_type import (
+            SentenceType,
+            classify_sentence_type,
+        )
+
+        verdict = classify_sentence_type(stripped, config=config)
+        if verdict is SentenceType.INTERROGATIVE:
+            return True
+        if verdict is SentenceType.NON_INTERROGATIVE:
+            return False
+        # verdict is None — encoder unavailable / margin not met.
+        # Fall through to deterministic tiers below.
+
+    # Tier 2: terminal punctuation (language-agnostic).
+    if stripped[-1] in _INTERROGATIVE_PUNCT:
+        return True
+    # Tier 3: English first-word lexicon.
+    first_word = stripped.split()[0].lower()
     # Handle possessives: "who's" → "who", "what's" → "what"
     if first_word.endswith("'s"):
         first_word = first_word[:-2]
