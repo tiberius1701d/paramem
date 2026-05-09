@@ -1417,28 +1417,57 @@ class TestSOTANoiseFilter:
         assert normalized == {}
         assert stats == {"inverted": 0, "dropped": 0}
 
-    def test_normalize_mapping_empty_vocab_drops_all(self, monkeypatch):
-        """With no anonymizer prefixes configured, all mapping pairs are dropped."""
-        from paramem.graph.extractor import _normalize_anonymization_mapping
-
-        monkeypatch.setattr("paramem.graph.extractor.anonymizer_placeholder_pattern", lambda: None)
-        result, stats = _normalize_anonymization_mapping({"Alex": "Person_1"})
-        assert result == {}
-        assert stats == {"inverted": 0, "dropped": 1}
-
-    def test_mapping_is_canonical_empty_vocab_empty_mapping(self, monkeypatch):
-        """Empty vocab + empty mapping → canonical (nothing to be wrong)."""
+    def test_mapping_is_canonical_invented_prefix_accepted(self):
+        """Open prefix vocabulary — `University_1`, `Project_1`, `Language_1`
+        are valid placeholders alongside the common `{Person, City, Org, ...}`
+        set.  Cross-cycle entity merge happens on real names in
+        :class:`paramem.graph.merger.GraphMerger`, not on placeholder
+        vocabulary, so per-session prefix divergence is harmless and
+        enforcing a fixed lexicon would just push the work into a
+        position-based recovery helper (the pattern this rewrite is
+        retiring)."""
         from paramem.graph.extractor import _mapping_is_canonical
 
-        monkeypatch.setattr("paramem.graph.extractor.anonymizer_placeholder_pattern", lambda: None)
-        assert _mapping_is_canonical({}) is True
+        assert _mapping_is_canonical({"Northcrest University": "University_1"}) is True
+        assert _mapping_is_canonical({"Atlas Initiative": "Project_1"}) is True
+        assert _mapping_is_canonical({"German": "Language_1"}) is True
+        # Mixed common + invented prefixes also valid.
+        assert (
+            _mapping_is_canonical(
+                {
+                    "Mira": "Person_1",
+                    "Northcrest University": "University_1",
+                    "Atlas Initiative": "Project_1",
+                }
+            )
+            is True
+        )
 
-    def test_mapping_is_canonical_empty_vocab_nonempty_mapping(self, monkeypatch):
-        """Empty vocab + non-empty mapping → not canonical (no prefix vocabulary)."""
+    def test_mapping_is_canonical_uniqueness_violation(self):
+        """Two real names sharing a placeholder → not canonical.  The
+        anonymizer prompt's uniqueness rule is structural; the canonical
+        check enforces it post-LLM so a duplicate-value mapping cannot
+        slip through and silently collide two distinct entities into one
+        identifier in the deanon round-trip."""
         from paramem.graph.extractor import _mapping_is_canonical
 
-        monkeypatch.setattr("paramem.graph.extractor.anonymizer_placeholder_pattern", lambda: None)
-        assert _mapping_is_canonical({"Alex": "Person_1"}) is False
+        # Two persons mapped to the same placeholder.
+        assert _mapping_is_canonical({"Alice": "Person_1", "Pat": "Person_1"}) is False
+        # Same shape but with one entry valid → still false.
+        assert (
+            _mapping_is_canonical({"Alice": "Person_1", "Pat": "Person_1", "Berlin": "City_1"})
+            is False
+        )
+
+    def test_mapping_is_canonical_malformed_shape_rejected(self):
+        """Values that don't match the universal `<Prefix>_<N>` shape
+        (lowercase prefix, missing index, etc.) are non-canonical."""
+        from paramem.graph.extractor import _mapping_is_canonical
+
+        assert _mapping_is_canonical({"Alice": "person_1"}) is False  # lowercase
+        assert _mapping_is_canonical({"Alice": "Person"}) is False  # missing _<N>
+        assert _mapping_is_canonical({"Alice": "Person_"}) is False  # empty index
+        assert _mapping_is_canonical({"Alice": "Person_abc"}) is False  # non-digit
 
     def test_repair_anonymization_leaks_organization_type(self):
         """_repair_anonymization_leaks allocates Org_N placeholder for organization entities.
@@ -1485,6 +1514,104 @@ class TestSOTANoiseFilter:
         assert facts[0]["object"] == org_placeholder, (
             f"anon_facts object must be rewritten to placeholder, got {facts[0]['object']!r}"
         )
+
+    def test_repair_anonymization_leaks_open_type_falls_through(self):
+        """Repair allocates a fresh placeholder for any extractor type, not
+        only those with a configured ``primary_for_type`` flag.  Previously
+        types like ``"event"`` / ``"preference"`` had no configured prefix
+        and the leaked name was silently dropped (treated as hallucinated).
+        Under the open vocabulary the prefix is derived directly from the
+        type label (``event`` → ``Event``), and the leak gets repaired.
+        """
+        from paramem.graph.extractor import _repair_anonymization_leaks
+
+        graph = _make_graph(
+            [("Alex", "attended", "DefCon")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="DefCon", entity_type="event"),
+            ],
+        )
+        mapping = {"Alex": "Person_1"}
+        reverse = {"Person_1": "Alex"}
+        anon_facts = [{"subject": "Person_1", "predicate": "attended", "object": "DefCon"}]
+        anon_transcript = "Person_1 attended DefCon."
+        leaked = ["DefCon"]
+        facts, new_mapping, new_reverse, _, status = _repair_anonymization_leaks(
+            graph,
+            mapping,
+            reverse,
+            anon_facts,
+            anon_transcript,
+            "Alex attended DefCon.",
+            leaked,
+        )
+        assert status["missed_fixed"] == 1, (
+            "event entity present in transcript must be repaired, not dropped as hallucinated"
+        )
+        event_placeholder = new_mapping["DefCon"]
+        assert event_placeholder.startswith("Event_"), (
+            f"open-type repair must derive PascalCase prefix from the type label; "
+            f"got {event_placeholder!r}"
+        )
+        assert facts[0]["object"] == event_placeholder
+
+    def test_repair_anonymization_leaks_unknown_type_falls_back_to_entity(self):
+        """When neither extractor nor NER provides a type, repair falls back
+        to a generic ``Entity_N`` prefix rather than dropping the leak.
+        Closes the residual case where the previous person-default could
+        misclassify a city as a person."""
+        from paramem.graph.extractor import _repair_anonymization_leaks
+
+        graph = _make_graph(
+            [("Alex", "mentioned", "Foundry-X")],
+            # Note: the leaked name "Foundry-X" is NOT in graph.entities
+            # and no NER hint is provided, exercising the final fallback.
+            entities=[Entity(name="Alex", entity_type="person")],
+        )
+        mapping = {"Alex": "Person_1"}
+        reverse = {"Person_1": "Alex"}
+        anon_facts = [{"subject": "Person_1", "predicate": "mentioned", "object": "Foundry-X"}]
+        anon_transcript = "Person_1 mentioned Foundry-X."
+        leaked = ["Foundry-X"]
+        facts, new_mapping, _, _, status = _repair_anonymization_leaks(
+            graph,
+            mapping,
+            reverse,
+            anon_facts,
+            anon_transcript,
+            "Alex mentioned Foundry-X.",
+            leaked,
+        )
+        assert status["missed_fixed"] == 1
+        # Default fallback: when no type signal is available the prefix is
+        # "Entity" — generic but well-formed and recoverable.
+        assert new_mapping["Foundry-X"].startswith("Entity_"), (
+            f"unknown-type repair must fall back to Entity_N, got {new_mapping['Foundry-X']!r}"
+        )
+
+    def test_type_to_pascal_prefix_overrides_and_derivations(self):
+        """Pin the contract for ``_type_to_pascal_prefix``: historical
+        common types map via the override table; everything else is
+        PascalCase-joined; empty input falls back to ``Entity``."""
+        from paramem.graph.extractor import _type_to_pascal_prefix
+
+        # Historical overrides — match anonymizer LLM conventions.
+        assert _type_to_pascal_prefix("person") == "Person"
+        assert _type_to_pascal_prefix("place") == "City"
+        assert _type_to_pascal_prefix("organization") == "Org"
+        assert _type_to_pascal_prefix("concept") == "Thing"
+        # Open types — derived directly.
+        assert _type_to_pascal_prefix("product") == "Product"
+        assert _type_to_pascal_prefix("language") == "Language"
+        assert _type_to_pascal_prefix("event") == "Event"
+        # Multi-word labels collapse to PascalCase.
+        assert _type_to_pascal_prefix("work_of_art") == "WorkOfArt"
+        assert _type_to_pascal_prefix("self-driving") == "SelfDriving"
+        assert _type_to_pascal_prefix("law enforcement") == "LawEnforcement"
+        # Empty / whitespace fall back to a generic recoverable shape.
+        assert _type_to_pascal_prefix("") == "Entity"
+        assert _type_to_pascal_prefix("   ") == "Entity"
 
     def test_clean_ner_span_strips_dialogue_tail(self):
         """NER span cleanup removes 'Name: Response' dialogue artifacts."""
@@ -3270,194 +3397,101 @@ class TestBuildAnonymizationMapping:
 
 
 # ---------------------------------------------------------------------------
-# Bug B — mapping gap recovery for model-omitted entries
+# Mapping totality — diagnostic check post-anonymization
 # ---------------------------------------------------------------------------
 
 
-class TestRecoverMissingPlaceholderMappings:
-    """Unit tests for _recover_missing_placeholder_mappings (Bug B fix).
+class TestCheckMappingTotality:
+    """Unit tests for ``_check_mapping_totality``.
 
-    Verifies that placeholder tokens present in anonymized facts but absent
-    from the returned mapping are recovered by matching against the original
-    relations so de-anonymization can restore the real name.
+    The diagnostic replaces the retired
+    ``_recover_missing_placeholder_mappings`` helper.  Under the open-
+    vocabulary anonymizer prompt the LLM is expected to produce a total
+    mapping by construction (see live probe at the prompt-pivot commit);
+    this helper surfaces violations to ``logger`` and
+    ``graph.diagnostics`` so prompt regressions are visible rather than
+    silently shedding facts.  Orphan-placeholder facts get dropped
+    downstream by :func:`_strip_residual_placeholders` — fail-closed.
     """
 
-    def test_recovers_missing_product_placeholder(self):
-        """Product_1 in anon_facts but absent from mapping → recovered from original.
-
-        Scenario: anonymizer produced 'Product_1' in anonymized_facts for the
-        original 'Honda', but forgot to include 'Honda → Product_1' in the
-        mapping.  Gap recovery must add it.
-        """
-        from paramem.graph.extractor import _recover_missing_placeholder_mappings
-
-        # Original relation has Honda as subject.
-        original_relations = [
-            Relation(
-                subject="Honda",
-                predicate="manufactures",
-                object="Legend SAE Level 3 System",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="Speaker0",
-            )
-        ]
-        anon_facts = [
-            {
-                "subject": "Product_1",
-                "predicate": "manufactures",
-                "object": "Legend SAE Level 3 System",
-            }
-        ]
-        mapping = {}  # anonymizer forgot to include Honda → Product_1
-        reverse: dict[str, str] = {}
-        result, result_reverse = _recover_missing_placeholder_mappings(
-            mapping, reverse, anon_facts, original_relations
-        )
-        assert "Honda" in result, "gap recovery must add the original real name as a key"
-        assert result["Honda"] == "Product_1", (
-            f"recovered value must be the placeholder, got {result['Honda']!r}"
-        )
-        # Reverse companion is mirrored in lockstep.
-        assert result_reverse["Product_1"] == "Honda"
-
-    def test_already_covered_placeholder_not_duplicated(self):
-        """Placeholder already in mapping.values() is not added again."""
-        from paramem.graph.extractor import _recover_missing_placeholder_mappings
-
-        original_relations = [
-            Relation(
-                subject="Alice",
-                predicate="knows",
-                object="Bob",
-                relation_type="social",
-                confidence=1.0,
-                speaker_id="Speaker0",
-            )
-        ]
-        anon_facts = [{"subject": "Person_1", "predicate": "knows", "object": "Person_2"}]
-        mapping = {"Alice": "Person_1", "Bob": "Person_2"}  # both already covered
-        reverse = {"Person_1": "Alice", "Person_2": "Bob"}
-        result, result_reverse = _recover_missing_placeholder_mappings(
-            mapping, reverse, anon_facts, original_relations
-        )
-        assert result == mapping, "no new entries must be added when mapping is already complete"
-        assert result_reverse == reverse
-
-    def test_object_field_placeholder_recovered(self):
-        """Placeholder in the object field is recovered, not just the subject."""
-        from paramem.graph.extractor import _recover_missing_placeholder_mappings
-
-        original_relations = [
-            Relation(
-                subject="Alice",
-                predicate="works_at",
-                object="Acme Corp",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="Speaker0",
-            )
-        ]
-        anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Org_1"}]
-        mapping = {"Alice": "Person_1"}  # Acme Corp → Org_1 missing
-        reverse = {"Person_1": "Alice"}
-        result, result_reverse = _recover_missing_placeholder_mappings(
-            mapping, reverse, anon_facts, original_relations
-        )
-        assert "Acme Corp" in result, "object-field gap must be recovered"
-        assert result["Acme Corp"] == "Org_1"
-        assert result_reverse["Org_1"] == "Acme Corp"
-
-    def test_empty_inputs_return_unchanged_mapping(self):
-        """Empty anon_facts or empty original_relations returns mapping unchanged."""
-        from paramem.graph.extractor import _recover_missing_placeholder_mappings
-
-        mapping = {"Alice": "Person_1"}
-        reverse = {"Person_1": "Alice"}
-        assert _recover_missing_placeholder_mappings(mapping, reverse, [], []) == (
-            mapping,
-            reverse,
-        )
-        assert _recover_missing_placeholder_mappings(
-            mapping,
-            reverse,
+    @staticmethod
+    def _graph() -> "SessionGraph":
+        return _make_graph(
             [],
-            [None],  # type: ignore[list-item]
-        ) == (mapping, reverse)
-
-    def test_does_not_mutate_input(self):
-        """Input mapping is not mutated — a new dict is returned."""
-        from paramem.graph.extractor import _recover_missing_placeholder_mappings
-
-        original_relations = [
-            Relation(
-                subject="Honda",
-                predicate="manufactures",
-                object="Legend",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="Speaker0",
-            )
-        ]
-        anon_facts = [{"subject": "Product_1", "predicate": "manufactures", "object": "Legend"}]
-        original_mapping: dict[str, str] = {}
-        original_reverse: dict[str, str] = {}
-        _recover_missing_placeholder_mappings(
-            original_mapping, original_reverse, anon_facts, original_relations
+            entities=[Entity(name="Alex", entity_type="person")],
         )
-        assert original_mapping == {}, "input mapping must not be mutated"
-        assert original_reverse == {}, "input reverse must not be mutated"
 
-    def test_apply_bindings_resolves_recovered_placeholder(self):
-        """End-to-end: Product_1 in object field de-anonymizes correctly after gap recovery.
+    def test_total_mapping_records_no_orphans(self):
+        """Every fact placeholder maps → no diagnostic emitted."""
+        from paramem.graph.extractor import _check_mapping_totality
 
-        This is the regression test for Bug B:
-        - anon_facts has object "software development for Product_1's Legend SAE Level 3 system"
-        - mapping initially missing Honda → Product_1
-        - after gap recovery, mapping has Honda → Product_1 and reverse has Product_1 → Honda
-        - _apply_bindings substitutes via the reverse map
-        - the object field becomes "software development for Honda's Legend SAE Level 3 system"
-        """
-        from paramem.graph.extractor import _apply_bindings, _recover_missing_placeholder_mappings
-
-        original_relations = [
-            Relation(
-                subject="Alex Rivera",
-                predicate="led",
-                object="software development for Honda's Legend SAE Level 3 system",
-                relation_type="factual",
-                confidence=1.0,
-                speaker_id="Speaker0",
-            )
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
         ]
-        # After anonymization the subject is Person_1 and object has Product_1.
-        # BUT the mapping is missing Honda → Product_1 (anonymizer bug).
+        mapping = {"Alex": "Person_1", "Berlin": "City_1"}
+        _check_mapping_totality(graph, anon_facts, mapping)
+        assert "totality_orphans" not in graph.diagnostics
+
+    def test_orphan_placeholder_recorded(self):
+        """A fact placeholder absent from mapping.values() is recorded as
+        an orphan in ``graph.diagnostics`` for monitoring.  No mutation
+        of inputs."""
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
+        ]
+        # University_1 is missing from mapping — a totality violation.
+        mapping = {"Alex": "Person_1"}
+        _check_mapping_totality(graph, anon_facts, mapping)
+        assert graph.diagnostics.get("totality_orphans") == ["University_1"]
+        # Inputs must not be mutated.
+        assert mapping == {"Alex": "Person_1"}
+
+    def test_multiple_orphans_sorted(self):
+        """Multiple orphans are deduplicated and sorted for stable
+        diagnostic output."""
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Org_1", "predicate": "made", "object": "Product_1"},
+            {"subject": "Person_1", "predicate": "speaks", "object": "Language_1"},
+            {"subject": "Person_1", "predicate": "uses", "object": "Product_1"},
+        ]
+        # Person_1 is in mapping but Org_1, Product_1, Language_1 are not.
+        mapping = {"Alex": "Person_1"}
+        _check_mapping_totality(graph, anon_facts, mapping)
+        assert graph.diagnostics.get("totality_orphans") == [
+            "Language_1",
+            "Org_1",
+            "Product_1",
+        ]
+
+    def test_embedded_placeholder_caught(self):
+        """Placeholder embedded in a compound string still surfaces as
+        an orphan when missing from mapping."""
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
         anon_facts = [
             {
                 "subject": "Person_1",
                 "predicate": "led",
-                "object": "software development for Product_1's Legend SAE Level 3 system",
-                "relation_type": "factual",
-                "confidence": 1.0,
-            }
+                "object": "software for Product_1's Legend",
+            },
         ]
-        mapping = {"Alex Rivera": "Person_1"}  # Honda → Product_1 missing
-        reverse = {"Person_1": "Alex Rivera"}
+        mapping = {"Alex": "Person_1"}
+        _check_mapping_totality(graph, anon_facts, mapping)
+        assert graph.diagnostics.get("totality_orphans") == ["Product_1"]
 
-        recovered_mapping, recovered_reverse = _recover_missing_placeholder_mappings(
-            mapping, reverse, anon_facts, original_relations
-        )
-        assert "Honda" in recovered_mapping, (
-            "gap recovery must add Honda → Product_1 to the mapping"
-        )
-        assert recovered_reverse["Product_1"] == "Honda"
+    def test_empty_facts_short_circuits(self):
+        """No facts → no diagnostic, regardless of mapping shape."""
+        from paramem.graph.extractor import _check_mapping_totality
 
-        kept, dropped = _apply_bindings(anon_facts, recovered_reverse, sota_bindings={})
-        assert dropped == [], f"no facts must be dropped after gap recovery, got {dropped!r}"
-        assert len(kept) == 1
-        assert "Honda" in kept[0]["object"], (
-            f"de-anonymization must restore 'Honda' in object, got {kept[0]['object']!r}"
-        )
-        assert "Product_1" not in kept[0]["object"], (
-            "placeholder must be fully replaced in object field"
-        )
+        graph = self._graph()
+        _check_mapping_totality(graph, [], {})
+        _check_mapping_totality(graph, [], {"Alex": "Person_1"})
+        assert "totality_orphans" not in graph.diagnostics

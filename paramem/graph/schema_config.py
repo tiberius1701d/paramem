@@ -334,30 +334,35 @@ def format_replacement_rules(path: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def anonymizer_placeholder_pattern(path: str | None = None) -> "re.Pattern[str] | None":
-    """Return the compiled placeholder regex, or None when no prefixes are configured.
+_UNIVERSAL_PLACEHOLDER_RE = re.compile(r"^[A-Z][A-Za-z]*_\d+$")
 
-    Built from the configured prefixes — e.g.
-    ``r"^(Person|City|Country|Org|Thing)_\\d+$"``.  Case-insensitive.
 
-    Callers treat ``None`` as "no vocabulary is configured" and branch to the
-    appropriate no-vocab behavior — they do not fall through to regex calls.
+def anonymizer_placeholder_pattern(path: str | None = None) -> "re.Pattern[str]":
+    """Return the universal placeholder shape regex.
 
-    When prefixes are present the regex object is returned from Python's
-    internal ``re`` compile cache on repeated calls, so there is no
-    significant overhead from calling this function multiple times.
+    The shape contract is ``<Prefix>_<N>`` where:
 
-    Args:
-        path: Optional override path for the schema YAML.
+    * ``Prefix`` is a PascalCase noun naming the entity's type.  The
+      prefix vocabulary is **open**: ``Person`` / ``City`` / ``Org`` /
+      ``Thing`` are common and ship as illustrative examples in
+      ``configs/schema.yaml``, but the model is free to mint
+      type-appropriate prefixes (``University``, ``Project``, ``Paper``,
+      ``Language``, ``Currency``, ...) when none of the common ones fit.
+      Cross-cycle entity merge happens on real names in
+      :class:`paramem.graph.merger.GraphMerger`, not on placeholder
+      vocabulary, so per-session prefix divergence is harmless.
+    * ``N`` is a positive integer; uniqueness is enforced by callers
+      (the anonymizer prompt requires unique placeholders per real name,
+      and ``_mapping_is_canonical`` validates).
+
+    The ``path`` argument is accepted for backward compatibility but
+    ignored — the shape is universal and does not depend on the
+    schema YAML.  The historical "configured-prefix-only" behavior was
+    retired when the entity_type schema went open (commit ``779c820``)
+    and the anonymizer prompt switched to a structural contract.
 
     Returns:
-        A compiled ``re.Pattern`` matching ``<Prefix>_<digits>``
-        (case-insensitive) for all configured prefixes, or ``None`` when
-        the prefix list is empty.
+        A compiled ``re.Pattern`` matching the universal placeholder
+        shape ``^[A-Z][A-Za-z]*_\\d+$``.
     """
-    prefixes = [
-        p["prefix"] for p in load_schema_config(path).get("anonymizer", {}).get("prefixes", [])
-    ]
-    if not prefixes:
-        return None
-    return re.compile(rf"^({'|'.join(prefixes)})_\d+$", re.IGNORECASE)
+    return _UNIVERSAL_PLACEHOLDER_RE

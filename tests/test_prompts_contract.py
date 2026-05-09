@@ -27,7 +27,6 @@ from paramem.graph.schema_config import (
     format_entity_types,
     format_predicate_examples,
     format_relation_types,
-    format_replacement_rules,
 )
 
 
@@ -308,7 +307,14 @@ class TestProceduralPrompt:
 
 
 class TestAnonymizationPrompt:
-    """Contract tests for the anonymization prompt — both default and file-based."""
+    """Contract tests for the anonymization prompt — both default and file-based.
+
+    The prompt teaches a shape contract (PascalCase prefix + ``_<N>``,
+    uniqueness, totality, direction), not a constrained vocabulary.  The
+    earlier ``replacement_rules`` interpolation that listed the configured
+    prefixes is gone — prefixes are illustrative-only inside the prompt
+    body, and the model picks any type-appropriate PascalCase prefix.
+    """
 
     def _render(self, tmpl: str) -> str:
         """Render the anonymization prompt with all expected kwargs."""
@@ -316,7 +322,6 @@ class TestAnonymizationPrompt:
             facts_json='[{"subject": "Person_1", "predicate": "lives_in", '
             '"object": "City_1", "relation_type": "factual", "confidence": 0.9}]',
             transcript="Person_1 lives in City_1.",
-            replacement_rules=format_replacement_rules(),
         )
 
     def test_default_renders_without_format_errors(self):
@@ -324,30 +329,50 @@ class TestAnonymizationPrompt:
         rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
-        assert "{replacement_rules}" not in rendered
 
     def test_file_based_renders_without_format_errors(self):
         """File-based anonymization.txt must render with all expected kwargs without KeyError."""
         tmpl = load_anonymization_prompt()
         rendered = self._render(tmpl)
-        assert "{replacement_rules}" not in rendered
+        assert "{facts_json}" not in rendered
+        assert "{transcript}" not in rendered
 
-    def test_replacement_rules_present_in_default(self):
-        """All five configured prefixes must appear in the rendered default prompt."""
+    def test_shape_contract_present_in_default(self):
+        """The default prompt must teach the four parts of the shape contract:
+        well-formed shape, uniqueness, totality, direction."""
         rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
-        for prefix in ("Person", "City", "Country", "Org", "Thing"):
-            assert prefix in rendered, (
-                f"Prefix {prefix!r} missing from rendered _DEFAULT_ANONYMIZATION_PROMPT."
-            )
+        # Shape clause — `<Prefix>_<N>` or equivalent shape language.
+        assert "PascalCase" in rendered or "Prefix" in rendered, (
+            "Default prompt must teach the placeholder shape (PascalCase + _<N>)."
+        )
+        # Uniqueness clause.
+        assert "UNIQUE" in rendered or "unique" in rendered
+        # Totality clause.
+        assert "totality" in rendered.lower() or "every placeholder" in rendered.lower()
+        # Direction clause.
+        assert "real_name" in rendered or "real name" in rendered.lower()
 
-    def test_replacement_rules_present_in_file_based(self):
-        """All five configured prefixes must appear in the rendered file-based prompt."""
+    def test_shape_contract_present_in_file_based(self):
+        """The file-based prompt must teach the same four-part shape contract.
+
+        Verifies the file isn't accidentally pinned to a constrained vocabulary
+        (the regression that prompted this rewrite — the model invented prefixes
+        like ``University_1`` / ``Project_1`` and the recovery helper had to
+        patch the gap).
+        """
         tmpl = load_anonymization_prompt()
         rendered = self._render(tmpl)
-        for prefix in ("Person", "City", "Country", "Org", "Thing"):
-            assert prefix in rendered, (
-                f"Prefix {prefix!r} missing from rendered file-based anonymization.txt."
-            )
+        assert "PascalCase" in rendered or "Prefix" in rendered
+        assert "UNIQUE" in rendered or "unique" in rendered
+        assert "totality" in rendered.lower() or "every placeholder" in rendered.lower()
+        assert "real_name" in rendered or "real name" in rendered.lower()
+        # Diverse-prefix examples present — illustrative breadth signals
+        # the model that prefixes outside the common set are valid.
+        assert "University" in rendered or "Project" in rendered or "Product" in rendered, (
+            "File-based prompt must show at least one type-appropriate prefix "
+            "outside the common {Person, City, Country, Org, Thing} set so the "
+            "model knows the prefix vocabulary is open."
+        )
 
     def test_no_stray_unescaped_placeholders_in_default(self):
         """After rendering, no stray {word} tokens should remain (only JSON literal braces)."""
