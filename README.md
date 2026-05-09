@@ -406,7 +406,8 @@ options. A short map of the top-level sections:
 |---------|---------|
 | `cloud_only` | Opt-out of local PM — route every query to the SOTA cloud agent. Security-critical. |
 | `headless_boot` | Auto-start the server before any interactive login. Reconciles systemd linger + (WSL) a Windows startup task on every start via `scripts/setup/headless-boot.sh`. |
-| `server` | Host, port, VRAM safety margin, auto-reclaim polling. |
+| `server` | Host, port, auto-reclaim polling, restart policy. |
+| `vram` | Per-process cap fraction (`process_cap_fraction`); KV cache + activation headroom (`vram_cache_headroom_gib`, code default 1.0 GiB, shipped yaml 2.0 GiB). |
 | `model` | Base model (`mistral`, `gemma`, `qwen3b`, `gemma4`). |
 | `debug` | Privacy mode — disables retention of transcripts on disk; session snapshots still write (envelope-encrypted under Security-ON, plaintext under Security-OFF) so mid-turn state survives graceful restarts. |
 | `paths` | Data, sessions, debug, prompts directories. |
@@ -453,7 +454,7 @@ ParaMem owns memory (speaker identification, entity routing, adapter recall, con
 - **Epoch-level resume:** `BackgroundTrainer` writes `resume_state.json` + keeps the two most recent HF Trainer checkpoints in `bg_checkpoint/` at each epoch boundary. A crash mid-cycle resumes at the last completed epoch after SHA-256 fingerprint validation of `keyed_pairs` + training config. Stale state is discarded.
 - **Persistent post-session queue:** when `post_session_train_enabled: true`, each assistant turn enqueues the session via atomic temp-file + `os.replace` before the training hook fires. Startup drains leftover entries so a crash between session end and training start replays automatically.
 - **Systemd user timer:** `paramem-consolidate.timer` drives scheduling with `Persistent=true`, so a trigger missed while the laptop is suspended fires on resume.
-- **VRAM pre-load validator:** `paramem/server/vram_validator.py` proves base model + main adapters + `max_interim_count` + staging slot + STT + TTS + KV cache fits the configured budget before the server loads any weights. The server refuses to start rather than OOM mid-load.
+- **VRAM topology check + live gate:** `paramem/server/vram_validator.py` reads cache-derived predictions from `paramem/server/vram_predict.py` (HF cache size × quant factor) to assess whether base model + main adapters + `max_interim_count` + staging slot + STT + TTS + KV cache headroom fits the device pre-load. On cache miss the assessment is skipped; the live gate (`vram_guard.vram_measure` records `mem_get_info` deltas around each load + `enforce_post_load_budget` post-load) is authoritative and `sys.exit(1)`s on overrun rather than OOM mid-request.
 
 ### GPU Lifecycle
 

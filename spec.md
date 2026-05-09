@@ -245,10 +245,16 @@ refresh window, not only after the next full consolidation.
   tiers via replay on `keyed_pairs ∪ all_interim_keys`, the rebuilt mains
   probed for recall sanity, interim adapters and directories purged, and the
   cycle rolls back on sanity-check failure. See `paramem/training/consolidation.py::consolidate_interim_adapters`.
-- **F5.8d:** VRAM validator (`paramem/server/vram_validator.py`): proves the
-  full topology fits before loading the base model — accounts for base +
-  main adapters + max_interim_count + staging slot + STT + TTS + KV cache.
-  Server refuses to start when the envelope exceeds the configured budget.
+- **F5.8d:** VRAM topology check + live gate
+  (`paramem/server/vram_validator.py` + `paramem/server/vram_predict.py` +
+  `paramem/server/vram_guard.py::vram_measure`): pre-load assessment reads
+  cache-derived predictions (HF cache size × quant factor for the base
+  model; CT2 disk × compute_type for STT; ONNX size + ORT context for
+  Piper TTS) and validates the working-set envelope against device
+  capacity. On cache miss the assessment is skipped; the live gate
+  (`vram_measure` deltas around each load + `enforce_post_load_budget`
+  post-load) is authoritative and exits with `sys.exit(1)` if measured
+  allocation exceeds `total_memory − vram.vram_cache_headroom_gib`.
 
 #### F5.9 Background Trainer Resume & Post-Session Queue
 
