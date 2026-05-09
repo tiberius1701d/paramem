@@ -339,6 +339,346 @@ class TestParseExtractionShapes:
         assert len(g.entities) == 0
 
 
+class TestParseFactsResponseSalvage:
+    """``_parse_facts_response`` recovers fact dicts when the model emits a
+    structured response but the outer JSON envelope is truncated (Mistral 7B
+    on long KEEP-by-default plausibility passes hits EOS mid-array; the
+    closing ``]`` never arrives).
+
+    Without the salvage path the plausibility filter's strict array parse
+    fails and ``_local_plausibility_filter`` returns ``None`` — the gate
+    fail-opens and 0 facts get filtered.  Salvage extracts the well-formed
+    inner ``{…}`` blocks via depth-walk and returns those.
+    """
+
+    def test_clean_array_returned_as_is(self):
+        from paramem.graph.extractor import _parse_facts_response
+
+        raw = (
+            "[\n"
+            '  {"subject": "Alice", "predicate": "lives_in", "object": "Berlin"},\n'
+            '  {"subject": "Bob",   "predicate": "knows",    "object": "Alice"}\n'
+            "]"
+        )
+        out = _parse_facts_response(raw, strict_array=True)
+        assert isinstance(out, list)
+        assert len(out) == 2
+        assert out[0]["subject"] == "Alice"
+        assert out[1]["object"] == "Alice"
+
+    def test_truncated_bare_array_is_salvaged(self):
+        """The Mistral-EOS-mid-array case: array opens, two records emit
+        cleanly, third record is partial / missing — salvage keeps the two
+        complete dicts.
+        """
+        from paramem.graph.extractor import _parse_facts_response
+
+        raw = (
+            "[\n"
+            '  {"subject": "Alice", "predicate": "lives_in", "object": "Berlin"},\n'
+            '  {"subject": "Bob",   "predicate": "knows",    "object": "Alice"},\n'
+            '  {"subject": "Carol", "predicate": "wo'  # truncated mid-string
+        )
+        out = _parse_facts_response(raw, strict_array=True)
+        assert isinstance(out, list), f"salvage must return a list, got {type(out)}"
+        assert len(out) == 2, f"expected 2 salvaged dicts, got {out!r}"
+        assert {f["subject"] for f in out} == {"Alice", "Bob"}
+
+    def test_truncated_after_last_record_is_salvaged(self):
+        """Real-world shape from the live probe: array's last well-formed
+        record closes with ``}`` and the model emits EOS without the
+        comma-or-``]`` continuation.  All records are valid; salvage should
+        keep all of them.
+        """
+        from paramem.graph.extractor import _parse_facts_response
+
+        raw = (
+            "[\n"
+            '  {"subject": "Alice", "predicate": "lives_in", "object": "Berlin"},\n'
+            '  {"subject": "Bob", "predicate": "knows", "object": "Alice"}'
+            # No trailing comma, no closing ]
+        )
+        out = _parse_facts_response(raw, strict_array=True)
+        assert isinstance(out, list)
+        assert len(out) == 2
+
+    def test_salvage_filters_non_fact_dicts(self):
+        """Stream-walk picks up every balanced ``{…}`` block — it must
+        drop dicts that aren't fact-shaped (no ``subject`` / ``predicate``
+        / ``object``) so commentary literals, bindings sub-dicts etc.
+        don't pollute the result.
+        """
+        from paramem.graph.extractor import _parse_facts_response
+
+        raw = (
+            "[\n"
+            '  {"note": "preamble commentary"},\n'
+            '  {"subject": "Alice", "predicate": "knows", "object": "Bob"},\n'
+            '  {"meta": "trailing"'  # truncated; would-be 3rd dict not closed
+        )
+        out = _parse_facts_response(raw, strict_array=True)
+        assert isinstance(out, list)
+        assert len(out) == 1
+        assert out[0]["subject"] == "Alice"
+
+    def test_dict_wrapped_clean_response(self):
+        """Non-strict mode: the SOTA enrichment legacy path accepts a
+        dict-wrapped response with a ``facts``/``relations`` key.
+        """
+        from paramem.graph.extractor import _parse_facts_response
+
+        raw = '{"facts": [{"subject": "Alice", "predicate": "knows", "object": "Bob"}]}'
+        out = _parse_facts_response(raw, strict_array=False)
+        assert isinstance(out, list)
+        assert len(out) == 1
+
+    def test_none_input_returns_none(self):
+        from paramem.graph.extractor import _parse_facts_response
+
+        assert _parse_facts_response(None, strict_array=True) is None
+        assert _parse_facts_response(None, strict_array=False) is None
+
+    def test_empty_string_returns_none(self):
+        from paramem.graph.extractor import _parse_facts_response
+
+        assert _parse_facts_response("", strict_array=True) is None
+
+    def test_garbage_no_braces_returns_none(self):
+        """Salvage needs at least one balanced ``{…}`` block to recover
+        anything; pure prose with no JSON yields ``None``.
+        """
+        from paramem.graph.extractor import _parse_facts_response
+
+        out = _parse_facts_response("I cannot help with that request.", strict_array=True)
+        assert out is None
+
+    def test_salvage_handles_strings_with_braces(self):
+        """A ``}`` inside a string literal must not close the depth
+        counter.  Without proper string-state tracking the salvage walk
+        would split on the inner brace and emit a malformed half-block.
+        """
+        from paramem.graph.extractor import _parse_facts_response
+
+        raw = (
+            "[\n"
+            '  {"subject": "Alice", "predicate": "said", "object": "hello } world"},\n'
+            '  {"subject": "Bob", "predicate": "knows", "obj'  # truncated
+        )
+        out = _parse_facts_response(raw, strict_array=True)
+        assert isinstance(out, list)
+        assert len(out) == 1
+        assert out[0]["object"] == "hello } world"
+
+
+class TestPlausibilityDropSet:
+    """The plausibility judge emits ``{"drop": [<index>, ...]}`` — a small
+    JSON object listing which input facts to drop by zero-based index.
+    ``_apply_drop_set`` parses that output and returns the surviving facts.
+
+    This class covers the parser tolerance and the drop application:
+    happy path, alternative output shapes the model might produce, edge
+    cases (out-of-range, duplicates, malformed), and the fail-open
+    contract on parse failure.
+    """
+
+    def _facts(self, n: int) -> list[dict]:
+        return [{"subject": f"S{i}", "predicate": "p", "object": f"O{i}"} for i in range(n)]
+
+    def test_empty_drop_set_keeps_all_facts(self):
+        """``{"drop": []}`` is the prompt-defined "clean input" output — the
+        judge found no DROP-rule matches; every fact survives."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(5)
+        out = _apply_drop_set(facts, '{"drop": []}')
+        assert out == facts
+
+    def test_single_index_dropped(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(5)
+        out = _apply_drop_set(facts, '{"drop": [2]}')
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S1", "S3", "S4"]
+
+    def test_multiple_indices_dropped_unordered(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(6)
+        out = _apply_drop_set(facts, '{"drop": [4, 0, 2]}')
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S1", "S3", "S5"]
+
+    def test_duplicate_indices_dedupped(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(5)
+        out = _apply_drop_set(facts, '{"drop": [1, 1, 1]}')
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S2", "S3", "S4"]
+
+    def test_out_of_range_indices_skipped(self):
+        """A bad index shouldn't void an otherwise-valid drop set —
+        skip with a warning rather than fail-open the entire gate."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop": [0, 99, -1, 2]}')
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S1"]
+
+    def test_bare_array_shape_accepted(self):
+        """Some models drop the ``{"drop": ...}`` wrapper and emit a bare
+        integer array.  Accepted because the intent is unambiguous."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(4)
+        out = _apply_drop_set(facts, "[1, 3]")
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S2"]
+
+    def test_object_index_with_rule_annotation(self):
+        """Some models annotate each drop with the rule that fired:
+        ``{"drop": [{"index": 2, "rule": "R1"}, ...]}``.  Index extracted;
+        rule ignored at parse time (could land in diagnostics later)."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(5)
+        raw = '{"drop": [{"index": 1, "rule": "R3"}, {"index": 4, "rule": "R5"}]}'
+        out = _apply_drop_set(facts, raw)
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S2", "S3"]
+
+    def test_alternate_key_drop_indices(self):
+        """``"drop_indices"`` is a common synonym a model might pick.
+        Accept it transparently."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        out = _apply_drop_set(facts, '{"drop_indices": [0]}')
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S1", "S2"]
+
+    def test_code_fenced_output_is_unwrapped(self):
+        """Models often wrap structured output in ```json``` fences.
+        The shared envelope-finder strips them."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(4)
+        raw = '```json\n{"drop": [2]}\n```'
+        out = _apply_drop_set(facts, raw)
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S1", "S3"]
+
+    def test_single_backtick_inline_code_is_unwrapped(self):
+        """Live-probe regression: when the prompt itself uses inline-code
+        formatting around the output spec example, the model copies the
+        single-backtick wrapper into its answer (``​`{"drop": [2]}`​``).
+        Parser must strip the inline-code wrapper too — not just the
+        triple-backtick code-fence form.
+        """
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(4)
+        raw = '`{"drop": [2]}`'
+        out = _apply_drop_set(facts, raw)
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S1", "S3"]
+
+    def test_malformed_output_returns_none(self):
+        """Parse failure must return ``None`` — caller fail-opens by
+        keeping all input facts.  This matches the prior contract:
+        ``filtered_list is None`` → ``_sota_pipeline`` logs a warning
+        and continues with the unfiltered input."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(3)
+        assert _apply_drop_set(facts, "I cannot process this request.") is None
+        assert _apply_drop_set(facts, "{not_valid_json") is None
+
+    def test_none_input_returns_none(self):
+        from paramem.graph.extractor import _apply_drop_set
+
+        assert _apply_drop_set([], None) is None
+        assert _apply_drop_set([{"subject": "S"}], None) is None
+
+    def test_empty_input_with_empty_drop(self):
+        """``_apply_drop_set([], '{"drop": []}')`` is the most common
+        plausibility outcome on an extraction that produced no facts —
+        must succeed and return an empty list."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        out = _apply_drop_set([], '{"drop": []}')
+        assert out == []
+
+    def test_drop_set_with_non_int_entries_skipped(self):
+        """Stray strings / null / booleans inside the array don't void the
+        whole set — they're skipped while integer entries are honoured."""
+        from paramem.graph.extractor import _apply_drop_set
+
+        facts = self._facts(4)
+        out = _apply_drop_set(facts, '{"drop": [1, "junk", null, 3, true]}')
+        assert out is not None
+        assert [f["subject"] for f in out] == ["S0", "S2"]
+
+
+class TestRenderIndexedFacts:
+    """``_render_indexed_facts`` produces ``[N] <json>`` lines that the
+    plausibility prompt teaches the judge to reference.  Without a stable
+    indexing scheme the drop-set protocol can't address specific facts."""
+
+    def test_indices_are_zero_based_and_contiguous(self):
+        from paramem.graph.extractor import _render_indexed_facts
+
+        rendered = _render_indexed_facts(
+            [
+                {"subject": "A", "predicate": "p", "object": "B"},
+                {"subject": "C", "predicate": "p", "object": "D"},
+                {"subject": "E", "predicate": "p", "object": "F"},
+            ]
+        )
+        lines = rendered.splitlines()
+        assert len(lines) == 3
+        assert lines[0].startswith("[0] ")
+        assert lines[1].startswith("[1] ")
+        assert lines[2].startswith("[2] ")
+
+    def test_each_line_is_valid_json_after_prefix(self):
+        from paramem.graph.extractor import _render_indexed_facts
+
+        facts = [
+            {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"},
+            {"subject": "Alex", "predicate": "likes", "object": "jazz"},
+        ]
+        rendered = _render_indexed_facts(facts)
+        for i, line in enumerate(rendered.splitlines()):
+            prefix = f"[{i}] "
+            assert line.startswith(prefix)
+            # The remainder must round-trip through json.loads to the
+            # original dict — this is what makes the index-based protocol
+            # safe (the judge sees both the index and the fact).
+            parsed = json.loads(line[len(prefix) :])
+            assert parsed == facts[i]
+
+    def test_empty_input_produces_empty_string(self):
+        from paramem.graph.extractor import _render_indexed_facts
+
+        assert _render_indexed_facts([]) == ""
+
+    def test_unicode_facts_preserved_verbatim(self):
+        """Real PII attributes contain non-ASCII (German names, location
+        diacritics).  The renderer must not escape them — round-trip
+        through ``json.loads`` would still work but the judge sees a
+        less natural string."""
+        from paramem.graph.extractor import _render_indexed_facts
+
+        rendered = _render_indexed_facts(
+            [{"subject": "Müller", "predicate": "lives_in", "object": "Köln"}]
+        )
+        assert "Müller" in rendered
+        assert "Köln" in rendered
+
+
 class TestPipelineMaxTokensThreading:
     """Verify the single ``extraction_max_tokens`` config flows through the
     entire LLM pipeline (local extract → anonymize → SOTA enrich → deanon →
@@ -720,28 +1060,36 @@ class TestSOTANoiseFilter:
             assert "City_1" not in r.object
 
     def test_local_plausibility_filter_round_trip(self):
-        """Local plausibility filter parses the standard array response."""
+        """Local plausibility filter applies the drop-set to the input facts.
+
+        Output contract is ``{"drop": [<index>, ...]}``; the helper indexes
+        by position and returns the surviving facts unchanged.  This used
+        to be an echo-protocol where the model returned the kept facts
+        verbatim — that protocol triggered Mistral 7B truncation on long
+        inputs (see ``TestPlausibilityDropSet`` for the structural tests
+        and the new prompt contract).
+        """
         from paramem.graph.extractor import _local_plausibility_filter
 
         facts = [
             {"subject": "Alex", "predicate": "lives_in", "object": "Millfield"},
             {"subject": "Alex", "predicate": "has_name", "object": "Alex"},  # self-loop
         ]
-        # Model output: drops the self-loop, keeps the valid fact
-        kept_response = '[{"subject": "Alex", "predicate": "lives_in", "object": "Millfield"}]'
+        # Drop the self-loop at index 1; keep index 0.
+        drop_response = '{"drop": [1]}'
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         with (
             # See companion comment above: extractor binds these names
             # at module top, so patches must target the bound name.
-            patch("paramem.graph.extractor.generate_answer", return_value=kept_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=drop_response),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
             result, raw = _local_plausibility_filter(facts, "transcript", MagicMock(), tokenizer)
         assert result is not None
         assert len(result) == 1
-        assert result[0]["predicate"] == "lives_in"
-        assert raw == kept_response
+        assert result[0] == facts[0]  # input fact returned unchanged
+        assert raw == drop_response
 
     def test_verify_anonymization_catches_leak(self):
         """Forward-path guard detects a real name leaking past anonymization."""
@@ -1286,29 +1634,24 @@ class TestResidualSweepCatchesEmbeddedPlaceholders:
 
 class TestPlausibilityTupleReturn:
     def test_plausibility_with_sota_returns_facts_and_raw(self):
-        """_plausibility_filter_with_sota returns (facts, raw_response)."""
+        """_plausibility_filter_with_sota returns (facts, raw_response).
+
+        Plausibility is now a drop-set protocol — the judge emits a small
+        ``{"drop": [<index>, ...]}`` object instead of echoing kept facts.
+        Empty drop set keeps every input fact unchanged.
+        """
         from paramem.graph.extractor import _plausibility_filter_with_sota
 
-        fake_raw = (
-            '[{"subject":"A","predicate":"knows","object":"B",'
-            '"relation_type":"social","confidence":1.0}]'
-        )
+        fake_raw = '{"drop": []}'
+        input_fact = {"subject": "A", "predicate": "knows", "object": "B"}
         with patch("paramem.graph.extractor._sota_call", return_value=fake_raw):
             facts, raw = _plausibility_filter_with_sota(
-                [{"subject": "A", "predicate": "knows", "object": "B"}],
+                [input_fact],
                 api_key="k",
                 provider="anthropic",
                 anon_transcript="A knows B.",
             )
-        assert facts == [
-            {
-                "subject": "A",
-                "predicate": "knows",
-                "object": "B",
-                "relation_type": "social",
-                "confidence": 1.0,
-            }
-        ]
+        assert facts == [input_fact]
         assert raw == fake_raw
 
     def test_plausibility_with_sota_none_on_api_failure(self):

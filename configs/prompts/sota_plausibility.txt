@@ -1,42 +1,52 @@
 You are filtering enriched personal facts from a voice assistant conversation. Inputs may be anonymized (placeholders like Person_1) or real-named — apply the same rules either way.
 
-Do NOT add new facts. Do NOT modify subject, predicate, object, relation_type, or confidence of any fact.
+You decide DROP or KEEP per fact. Output ONLY the indices of facts that match a DROP rule. Never echo, modify, or add facts.
 
-## KEEP — return the fact unchanged
+## KEEP — leave the fact in the output
 
 Default action. Apply whenever none of the DROP rules below match the fact's lexical pattern. Do not drop on semantic judgment. When uncertain, KEEP.
 
-Example: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP
-Example: `{{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP
+Example: `[0] {{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP (do not include 0 in the output)
+Example: `[1] {{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP (do not include 1 in the output)
 
-## DROP — remove the fact from the output
+## DROP — emit this fact's index
 
 Apply when any of the lexical patterns below match. No judgment calls.
 
 **R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), regardless of predicate.
-Example: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1)
+Example: `[2] {{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1) — include 2 in the output.
 
-**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are in the input (also `named`, `is`, `equals`). Drop both.
-Example: `{{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND `{{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2)
+**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are in the input (also `named`, `is`, `equals`). Drop both indices.
+Example: `[3] {{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND `[4] {{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2) — include 3 and 4.
 
 **R3. Role leak.** Subject or object is exactly one of: "Assistant", "User", "Speaker", "the bot", "the model". Note: "Person_1" / "City_1" / "Org_1" / "Thing_1" are valid entity placeholders, NOT role leaks.
-Example: `{{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3)
+Example: `[5] {{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R3) — include 5.
 
 **R4. Unresolved placeholder in real-name input.** When the input is real-named (no `Person_N` / `City_N` / `Country_N` / `Org_N` / `Thing_N` placeholders expected in the transcript), drop any fact whose subject or object still matches `^(Person|City|Country|Org|Thing)_\d+$`.
-Example: `{{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input)
+Example: `[6] {{"subject": "Alex", "predicate": "owns", "object": "Person_4"}}` → DROP (R4, real-name input) — include 6.
 
 **R5. Empty / sentinel object.** Object is exactly one of: "", "Unknown", "None", "Various", "Something", "N/A".
-Example: `{{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5)
+Example: `[7] {{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5) — include 7.
 
 **R6. System entity ID.** Subject or object contains a dot-separated HA-style identifier (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`).
-Example: `{{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6)
+Example: `[8] {{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6) — include 8.
 
 ## Input
+
+Each fact below is preceded by its zero-based index in square brackets. Use that index to refer to the fact in your output.
 
 Conversation transcript:
 {transcript}
 
-Enriched facts:
+Enriched facts (numbered):
 {facts_json}
 
-Return ONLY a JSON array of surviving facts, schema unchanged. If all facts survive, return them all. If no facts survive, return [].
+## Output
+
+Return ONLY a single JSON object with the key "drop", whose value is an array of zero-based integer indices.
+
+Example with two drops: {{"drop": [3, 5]}}
+Example for a clean input where nothing matches a DROP rule: {{"drop": []}}
+
+Do NOT wrap the output in backticks, code fences, or any other prose.
+Do NOT include the facts themselves. Do NOT modify any field of any fact. Do NOT emit the surviving (KEPT) indices — only the indices to DROP.

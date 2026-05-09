@@ -197,6 +197,44 @@ class TestPlausibilityPromptContract:
             "causing silent data loss."
         )
 
+    def test_output_contract_is_drop_index_set(self):
+        """The plausibility judge's output protocol is a small JSON object
+        ``{"drop": [<index>, ...]}`` listing which input facts to drop —
+        NOT an echo of every kept fact.
+
+        Why this is structural, not stylistic: the previous "echo every
+        kept fact" contract had Mistral 7B emit EOS mid-array on long
+        inputs (the closing ``]`` never arrived; ``_parse_facts_response``
+        couldn't recover the envelope; the gate fail-opened with 0 facts
+        filtered).  The drop-set output is bounded by the count of
+        actual rule matches — typically 0–5 indices for clean inputs —
+        so truncation cannot kill the gate.
+
+        Regressing to "echo every fact" silently re-introduces the
+        truncation failure mode, so this assertion locks the contract.
+        """
+        tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+        # Must specify the drop-index-set object shape.
+        assert '"drop"' in tmpl, (
+            'Plausibility prompt must specify the drop-set output shape ({"drop": [<index>, ...]}).'
+        )
+        # Must describe the index-based reference convention.
+        assert "zero-based" in tmpl.lower() and "index" in tmpl.lower(), (
+            "Plausibility prompt must teach zero-based index references — the "
+            "judge needs to know how facts are numbered to refer to them."
+        )
+        # Must forbid echoing kept facts (the regression vector).
+        forbids_echo = re.search(
+            r"do not (echo|include the facts|return surviving|emit the surviving)",
+            tmpl,
+            re.IGNORECASE,
+        )
+        assert forbids_echo, (
+            "Plausibility prompt must explicitly forbid echoing the kept facts — "
+            "without this the model defaults to verbose echo and triggers the "
+            "Mistral-7B EOS-mid-array truncation."
+        )
+
     def test_inline_default_matches_file(self):
         """The inline ``_DEFAULT_PLAUSIBILITY_PROMPT`` is only used when the
         file is missing. If it drifts from the file, production behaviour
