@@ -216,15 +216,28 @@ def safe_empty_cache() -> None:
     Best-effort hygiene — a failure here must not mask a more important
     upstream exception or block clean shutdown.
     """
-    try:
-        if torch.cuda.is_available():
+    # Each release step in its own guard: a failure on one (e.g. a
+    # broken-driver synchronize) must not skip the others. The Python-
+    # side gc.collect runs even when CUDA is wedged, and the allocator
+    # release calls are best-effort hygiene either way.
+    if torch.cuda.is_available():
+        try:
             # Force pending kernels to complete so the allocator sees the
             # post-kernel state. Without sync, mem_get_info can report
             # stale numbers when called immediately after a generate.
             torch.cuda.synchronize()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("VRAM guard: synchronize failed: %s", exc)
+    try:
         gc.collect()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("VRAM guard: gc.collect failed: %s", exc)
+    try:
         if hasattr(torch._C, "_cuda_clearCublasWorkspaces"):
             torch._C._cuda_clearCublasWorkspaces()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("VRAM guard: clearCublasWorkspaces failed: %s", exc)
+    try:
         torch.cuda.empty_cache()
     except Exception as exc:  # noqa: BLE001
         logger.warning("VRAM guard: empty_cache failed: %s", exc)
