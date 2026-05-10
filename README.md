@@ -537,8 +537,12 @@ state until the migration finishes.
 | `/chat` | POST | Send a message, get a response |
 | `/status` | GET | Full operational snapshot — server mode, model id + device, per-adapter specs (`rank`/`alpha`/`lr`/`target_kind`), interim adapter inventory + capacity, speaker embedding backend/model/device, STT/TTS engines, enrolled speakers, pending sessions + orphans + oldest age, consolidating flag + BG trainer state, last consolidation result, schedule + next-run ETA, deferred-mode `hold` block (owner PID + liveness + age + cmd hint) |
 | `/consolidate` | POST | Trigger consolidation manually (blocking) |
+| `/ingest-sessions` | POST | Enqueue pre-chunked document segments for the next consolidation cycle (operator CLI: `scripts/ingest_docs.py`) |
 | `/refresh-ha` | POST | Rebuild the HA entity graph from `/api/states` + `/api/services` |
 | `/gpu/acquire` | POST | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, reload the base model in-process.  Called by `pstatus --acquire`.  Idempotent. |
+| `/admin/assign-orphans` | POST | Operator-only corrective action: permanently attribute orphan sessions to a single speaker.  Rewrites session jsonls on disk when present; the bound speaker_id flows through the next consolidation cycle into permanent storage regardless of debug mode.  Gated by `PARAMEM_API_TOKEN` (refuses to operate when bearer-token auth is disabled). |
+| `/debug/probe` | POST | Operator-only ephemeral probe of the chat handler with explicit `speaker_id` injection.  Bypasses `_resolve_speaker`; **no buffer mutation, no jsonl rewrite, no consolidation impact** — pure single-call probe in RAM only.  Body: `{text, speaker_id, conversation_id?, history?}`.  Gated by `config.debug=true`. |
+| `/calibrate/{extract,anonymize,plausibility}` | POST | Live prompt-iteration probes for each pipeline stage.  No call modifies weights or writes production data on disk.  Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
 
 **Chat request:**
 
