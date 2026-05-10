@@ -490,6 +490,9 @@ class TestPerChunkOOMSkip:
             # No HA, no speaker_store, no background trainer for this test
             app_module._state["ha_client"] = None
             app_module._state["speaker_store"] = None
+            # router is populated by lifespan startup in production; the
+            # cycle-completion finalize calls router.reload() unconditionally.
+            app_module._state["router"] = MagicMock()
 
             # GPU lock + voice profile helper + vram_scope + assert_free_vram
             # are no-ops for this test — we only care about the OOM-skip flow.

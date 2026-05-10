@@ -77,6 +77,10 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
         "mode": "local" if target_profile == "gpu" else "cloud-only",
         "voice_profile": target_profile,
         "chunk_failures": [],
+        # router is populated by the lifespan startup in production; the
+        # cycle-completion finalize calls router.reload() unconditionally
+        # so tests that exercise any completion path need a mock here.
+        "router": MagicMock(),
     }
 
     with (

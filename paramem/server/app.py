@@ -3181,17 +3181,38 @@ async def refresh_ha():
     }
 
 
-@app.post("/debug/assign-orphans")
-async def debug_assign_orphans(speaker_id: str | None = None):
-    """Test-only: attribute all orphan sessions to a single speaker.
+@app.post("/admin/assign-orphans")
+async def admin_assign_orphans(speaker_id: str | None = None):
+    """Operator-only: permanently attribute orphan sessions to a single speaker.
 
-    Requires debug mode. Uses the given speaker_id, or the first
-    enrolled profile if omitted. Mutates in-memory turns and, in
-    debug persistence mode, rewrites the jsonl files on disk.
+    This is an admin/corrective operation, not a debug helper: it claims
+    orphan session turns under a single enrolled speaker and persists the
+    binding through the next consolidation cycle.  For ephemeral,
+    non-polluting probing of a speaker↔transcript combination, use
+    ``/debug/probe`` instead.
+
+    **Auth:** requires ``PARAMEM_API_TOKEN`` to be set (i.e. bearer-token
+    auth active).  The token check itself happens in
+    :class:`BearerTokenMiddleware`; this endpoint refuses to operate at
+    all when auth is disabled — admin actions must not be reachable
+    anonymously, regardless of ``config.debug``.
+
+    Body: optional ``speaker_id`` query parameter — defaults to the first
+    enrolled profile when omitted.  When ``buffer.debug=True`` the on-disk
+    session jsonls are rewritten in place; in production-mode (no on-disk
+    transcripts) the binding lives only in memory but still flows through
+    the next consolidation into permanent keyed_pairs / weights — the
+    durable medium changes with the deployment posture, the operation is
+    the same.
     """
-    config = _state["config"]
-    if not getattr(config, "debug", False):
-        return {"status": "forbidden_not_debug"}
+    if not _api_token:
+        return JSONResponse(
+            {
+                "status": "admin_auth_required",
+                "detail": "Admin endpoints require PARAMEM_API_TOKEN to be set.",
+            },
+            status_code=403,
+        )
     store = _state.get("speaker_store")
     buffer = _state.get("session_buffer")
     if store is None or buffer is None:
@@ -3209,14 +3230,124 @@ async def debug_assign_orphans(speaker_id: str | None = None):
             turn["speaker"] = sname
             turn["speaker_id"] = sid
         claimed += 1
-        if buffer.debug:
-            path = buffer.session_dir / f"{conv_id}.jsonl"
-            if path.exists():
-                with open(path, "w") as f:
-                    for turn in turns:
-                        f.write(json.dumps(turn) + "\n")
-    logger.info("debug/assign-orphans: %d sessions → speaker %s (%s)", claimed, sname, sid)
+        # Rewrite the on-disk jsonl when one exists.  In production
+        # (debug=false) no jsonls are written, so ``path.exists()`` is
+        # False and the rewrite skips — the in-memory mutation above is
+        # the only durable medium until consolidation runs.  Mode-agnostic.
+        path = buffer.session_dir / f"{conv_id}.jsonl"
+        if path.exists():
+            with open(path, "w") as f:
+                for turn in turns:
+                    f.write(json.dumps(turn) + "\n")
+    logger.info("admin/assign-orphans: %d sessions → speaker %s (%s)", claimed, sname, sid)
     return {"status": "ok", "claimed": claimed, "speaker": sname, "speaker_id": sid}
+
+
+# --------------------------------------------------------------------------
+# Debug probe endpoint — non-polluting speaker↔transcript probe.
+# Gated by config.debug.  Bypasses _resolve_speaker so the chat handler
+# can be exercised against an enrolled speaker without binding the
+# speaker to any session_buffer entry: no mutation of buffer._turns or
+# buffer._sessions, no jsonl rewrite on disk, no buffer.append on the
+# conversation_id, no consolidation impact.  Pure single-call probe in
+# RAM only.
+#
+# Generic by design — additional probe modes (live PA voice probe,
+# document ingest probe by an admin) may share this endpoint or extend
+# it later.  Today only the chat-style invocation is wired.
+# --------------------------------------------------------------------------
+
+
+class DebugProbeRequest(BaseModel):
+    """Probe the chat handler with explicit speaker_id injection."""
+
+    text: str
+    speaker_id: str  # explicit; bypasses _resolve_speaker
+    conversation_id: str = "debug-probe"
+    history: list[dict] | None = None
+
+
+@app.post("/debug/probe", response_model=ChatResponse)
+async def debug_probe(request: DebugProbeRequest):
+    """Single-call /chat-equivalent probe with operator-supplied speaker_id.
+
+    Returns ``forbidden_not_debug`` when ``config.debug=false``.  An
+    unknown ``speaker_id`` returns 404.  Mirrors the dispatch shape of
+    ``/chat`` (cloud-only branch + local branch with gpu_lock and
+    background-trainer pause), minus the buffer.append, greeting flow,
+    and language detection — those produce side-effects that the probe
+    must not emit.
+    """
+    config = _state["config"]
+    if not getattr(config, "debug", False):
+        return JSONResponse({"status": "forbidden_not_debug"}, status_code=403)
+
+    store = _state.get("speaker_store")
+    if store is None:
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+
+    speaker_name = store.get_name(request.speaker_id)
+    if speaker_name is None:
+        return JSONResponse(
+            {"status": "speaker_not_found", "speaker_id": request.speaker_id},
+            status_code=404,
+        )
+
+    # Cloud-only mode mirrors /chat dispatch — no GPU lock, no model.
+    if _state["mode"] == "cloud-only":
+        cloud_result = _cloud_only_route(
+            text=request.text,
+            speaker=speaker_name,
+            history=request.history,
+            config=config,
+            router=_state.get("router"),
+            ha_client=_state.get("ha_client"),
+            sota_agent=_state.get("sota_agent"),
+            language=None,
+        )
+        return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
+
+    # Local mode — pause BG trainer + acquire gpu_lock, mirroring /chat.
+    bg_trainer = _state.get("background_trainer")
+    training_paused = False
+    if bg_trainer is not None and bg_trainer.is_training:
+        if bg_trainer.pause():
+            training_paused = True
+        else:
+            bg_trainer.stop(timeout=30)
+
+    from paramem.server.gpu_lock import gpu_lock
+
+    try:
+        async with gpu_lock():
+            loop = asyncio.get_running_loop()
+            result: ChatResult = await loop.run_in_executor(
+                None,
+                lambda: handle_chat(
+                    text=request.text,
+                    conversation_id=request.conversation_id,
+                    speaker=speaker_name,
+                    speaker_id=request.speaker_id,
+                    history=request.history,
+                    model=_state["model"],
+                    tokenizer=_state["tokenizer"],
+                    config=config,
+                    router=_state["router"],
+                    sota_agent=_state.get("sota_agent"),
+                    ha_client=_state.get("ha_client"),
+                    language=None,
+                    effective_mode=_state.get("effective_mode"),
+                ),
+            )
+    finally:
+        if training_paused and bg_trainer is not None:
+            bg_trainer.resume()
+
+    return ChatResponse(
+        text=result.text,
+        escalated=result.escalated,
+        speaker=speaker_name,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -6747,17 +6878,36 @@ def _extract_and_start_training():
     if not all_episodic_qa and not all_procedural_rels:
         logger.info("No QA pairs extracted — skipping")
         session_buffer.mark_consolidated(_completed_session_ids())
-        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-        _state["last_consolidation_result"] = {
-            "status": "no_facts",
-            "sessions": len(session_ids),
-            "skipped_oom": len(failed_session_ids),
-            "episodic_qa": 0,
-            "procedural_rels": 0,
-        }
+
         if document_only_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
-        _state["consolidating"] = False
+
+        # State mutations + router reload — post to the event loop so the
+        # router cache and inference path see post-cycle state atomically with
+        # the consolidating flag clear.  Mode-agnostic AND yield-agnostic:
+        # every consolidation cycle ends with router.reload() so /chat
+        # handlers never see stale state for any reason.  When no new keyed
+        # pairs were written, the reload is a no-op against unchanged disk
+        # state — the routing-point invariant still holds, which is what
+        # callers rely on when they treat document ingest and transcript
+        # ingest as equivalent inputs (project_document_transcript_equivalence).
+        def _finalize_no_facts() -> None:
+            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+            _state["router"].reload()
+            _state["last_consolidation_result"] = {
+                "status": "no_facts",
+                "sessions": len(session_ids),
+                "skipped_oom": len(failed_session_ids),
+                "episodic_qa": 0,
+                "procedural_rels": 0,
+            }
+            _state["consolidating"] = False
+
+        aio_loop = _state.get("event_loop")
+        if aio_loop is not None and aio_loop.is_running():
+            aio_loop.call_soon_threadsafe(_finalize_no_facts)
+        else:
+            _finalize_no_facts()
         return
 
     # --- Simulate mode: peer storage backend ---
@@ -6801,25 +6951,40 @@ def _extract_and_start_training():
         # like train. OOM-skipped chunks stay pending for retry.
         session_buffer.mark_consolidated(_completed_session_ids())
 
-        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-        _state["last_consolidation_result"] = {
-            "status": "simulated",
-            "sessions": len(session_ids),
-            "skipped_oom": len(failed_session_ids),
-            "episodic_qa": len(all_episodic_qa),
-            "procedural_rels": len(all_procedural_rels),
-            "newly_promoted": len(newly_promoted),
-            "simulated": sim_result.get("simulated", True),
-        }
         if document_only_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
-        _state["consolidating"] = False
-        logger.info(
-            "Simulation complete: %d episodic QA, %d procedural rels, %d promoted",
-            len(all_episodic_qa),
-            len(all_procedural_rels),
-            len(newly_promoted),
-        )
+
+        # State mutations + router reload — post to the event loop so the
+        # router cache and inference path see the freshly-written keyed_pairs
+        # atomically with the consolidating flag clear.  Mode-agnostic at the
+        # routing point: mirrors `_finalize_interim` / `_finalize_full` so a
+        # simulate-mode cycle is queryable without a server restart, identical
+        # to a trained cycle.
+        def _finalize_simulate() -> None:
+            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+            _state["router"].reload()
+            _state["last_consolidation_result"] = {
+                "status": "simulated",
+                "sessions": len(session_ids),
+                "skipped_oom": len(failed_session_ids),
+                "episodic_qa": len(all_episodic_qa),
+                "procedural_rels": len(all_procedural_rels),
+                "newly_promoted": len(newly_promoted),
+                "simulated": sim_result.get("simulated", True),
+            }
+            _state["consolidating"] = False
+            logger.info(
+                "Simulation complete: %d episodic QA, %d procedural rels, %d promoted",
+                len(all_episodic_qa),
+                len(all_procedural_rels),
+                len(newly_promoted),
+            )
+
+        aio_loop = _state.get("event_loop")
+        if aio_loop is not None and aio_loop.is_running():
+            aio_loop.call_soon_threadsafe(_finalize_simulate)
+        else:
+            _finalize_simulate()
         return
 
     # --- Phase 2 + 3: Train into a fresh interim slot via the BG trainer ---
