@@ -383,7 +383,7 @@ if a.get('enabled', True):
         start_ms=$(($(date +%s%N) / 1000000))
         ab_resp=$(curl -sf -X POST "$SERVER/chat" \
             -H "Content-Type: application/json" \
-            -d '{"text":"Where do I live?","conversation_id":"abstention-test-'$$'","speaker":"TestUser"}' 2>/dev/null) || {
+            -d '{"text":"Where do I live?","conversation_id":"abstention-test-'$$'"}' 2>/dev/null) || {
             echo "  FAIL  abstention: self-referential — server unreachable"
             FAIL=$((FAIL + 1))
             ab_resp=""
@@ -412,12 +412,12 @@ if a.get('enabled', True):
             fi
         fi
 
-        # Anonymous speaker: speaker=null. speaker_id is sufficient for
-        # attribution per deferred-identity-binding design; the short-circuit
-        # must still fire without a disclosed name.
+        # Anonymous speaker: no greeting flow has run, no voice embedding
+        # supplied — the short-circuit must still fire without a disclosed
+        # name (deferred-identity-binding design).
         anon_resp=$(curl -sf -X POST "$SERVER/chat" \
             -H "Content-Type: application/json" \
-            -d '{"text":"What is my birthday?","conversation_id":"abstention-anon-'$$'","speaker":null}' 2>/dev/null)
+            -d '{"text":"What is my birthday?","conversation_id":"abstention-anon-'$$'"}' 2>/dev/null)
         if [ -n "$anon_resp" ]; then
             anon_text=$(echo "$anon_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('text',''))" 2>/dev/null)
             if [ "$anon_text" = "$abstention_resp" ]; then

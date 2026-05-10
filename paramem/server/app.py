@@ -169,7 +169,6 @@ _state = {
 class ChatRequest(BaseModel):
     text: str
     conversation_id: str = "default"
-    speaker: str | None = None
     speaker_embedding: list[float] | None = None  # Voice embedding from STT
     history: list[dict] | None = None
     route: str | None = None  # Force routing: "ha", "sota", or None (auto)
