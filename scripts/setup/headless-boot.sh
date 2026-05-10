@@ -24,8 +24,16 @@ TASK_NAME="ParaMem-Start-WSL-Boot"
 IS_WSL=false
 grep -qi microsoft /proc/version 2>/dev/null && IS_WSL=true
 
-# Desired state from config (empty/missing -> false)
-PYTHON="${PARAMEM_PYTHON:-python}"
+# Desired state from config (empty/missing -> false).
+# Interpreter resolution order: PARAMEM_PYTHON (set by systemd unit) ->
+# `python` on PATH (conda-activated shell) -> `python3` (system fallback).
+# Without this, an interactive run from a shell that hasn't activated the
+# paramem env exits early because `python` is not on PATH.
+PYTHON="${PARAMEM_PYTHON:-$(command -v python 2>/dev/null || command -v python3 2>/dev/null)}"
+if [ -z "$PYTHON" ]; then
+    echo "headless-boot: skipping (no python/python3 on PATH; set PARAMEM_PYTHON)"
+    exit 0
+fi
 if ! DESIRED=$("$PYTHON" -c "
 import sys, yaml
 try:
@@ -188,10 +196,17 @@ if $IS_WSL; then
             echo "  Run from an interactive WSL shell: bash $0" >&2
         else
             echo "  Registering Windows scheduled task '$TASK_NAME' for distro '$DISTRO'..."
+            # AtStartup fires as soon as Task Scheduler is up, which beats
+            # LxssManager / vmcompute on cold boot — wsl.exe then returns -1
+            # and the distro never comes up.  Two mitigations on the trigger
+            # and settings: a 60s start delay to let WSL services initialize,
+            # and 3 retries at 1-minute intervals if the first launch still
+            # races.  Verified failure mode in Task Scheduler operational log
+            # (Id 201, return code 4294967295) on a 2026-05-10 boot.
             PS="\$a=New-ScheduledTaskAction -Execute 'wsl.exe' -Argument '-d $DISTRO -u $USER_NAME --exec /bin/true';"
-            PS+="\$t=New-ScheduledTaskTrigger -AtStartup;"
+            PS+="\$t=New-ScheduledTaskTrigger -AtStartup; \$t.Delay='PT60S';"
             PS+="\$p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest;"
-            PS+="\$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
+            PS+="\$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);"
             PS+="Register-ScheduledTask -TaskName '$TASK_NAME' -Action \$a -Trigger \$t -Principal \$p -Settings \$s -Force | Out-Null;"
             PS+="Write-Host 'Task $TASK_NAME registered.'"
             _run_elevated_ps "$PS" \
