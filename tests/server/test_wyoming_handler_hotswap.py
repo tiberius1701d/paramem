@@ -10,6 +10,13 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+# Wyoming is an optional dependency (`pip install paramem[wyoming]`).
+# CI installs only [dev]; skip the whole module when wyoming is absent
+# rather than failing at the inner imports below.
+pytest.importorskip("wyoming")
+
 
 def _make_reader_writer():
     """Minimal asyncio stream pair stubs."""
