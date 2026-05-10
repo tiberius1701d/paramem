@@ -531,6 +531,28 @@ tts:
       # device: cpu            # per-voice override (default: inherit from tts.device)
 
 # ============================================================================
+# TEXT-SIDE LANGUAGE DETECTION (fastText lid.176)
+# ============================================================================
+# STT carries Whisper's language detection. Pure-text /chat requests have no
+# equivalent signal, so the cloud path falls through to English regardless of
+# the actual query language. This block enables an offline fastText classifier
+# (126 MB model file fetched once via scripts/setup/download-langid-model.sh)
+# that fills the gap on text-only requests.
+#
+# enabled:               turn the text-path detector on/off (default off so
+#                        deployments without the model file don't warn).
+# confidence_threshold:  detector probability required to commit a verdict.
+#                        Conservative because text /chat has no fallback chain
+#                        — speaker preference is structurally unavailable
+#                        without a voice embedding.
+# model_path:            absolute path; empty falls back to
+#                        ~/.cache/paramem/lang_id/lid.176.bin.
+text_lang_detection:
+  enabled: false
+  confidence_threshold: 0.65
+  # model_path: ""
+
+# ============================================================================
 # PROCESS
 # ============================================================================
 # systemd restart policy for the paramem-server service.

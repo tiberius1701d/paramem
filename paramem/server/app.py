@@ -1748,6 +1748,16 @@ async def lifespan(app: FastAPI):
         ha_client=_state.get("ha_client"),
     )
 
+    # Text-side language detector — eager-loaded so the first /chat does
+    # not pay the ~200 ms cold-read for the 126 MB lid.176 model. Runs in
+    # both local and cloud-only modes (CPU-only, no VRAM cost). Disabled
+    # config silently skips the load; missing model file warns once and
+    # falls through to language=None at request time.
+    if config.text_lang_detection.enabled:
+        from paramem.server import lang_id
+
+        lang_id.load_at_startup(config.text_lang_detection.model_path)
+
     # Reconcile the systemd user timer with the DERIVED full consolidation
     # period (= refresh_cadence × max_interim_count). The yaml exposes only
     # refresh_cadence; the timer sees the full cycle via the derived
@@ -2079,6 +2089,21 @@ async def chat(request: ChatRequest):
         tracker = _state.get("language_tracker")
         if tracker is not None:
             tracker.record(detected_language, detected_language_prob)
+
+    # Text-only path fallback: STT didn't fire and the request carries no
+    # voice embedding, so Whisper produced nothing. Run the offline fastText
+    # detector against the request text so cloud routing can speak the
+    # language the user wrote in instead of defaulting to English.
+    text_lang_cfg = _state["config"].text_lang_detection
+    if detected_language is None and not request.speaker_embedding and text_lang_cfg.enabled:
+        from paramem.server import lang_id
+
+        model_path = Path(text_lang_cfg.model_path) if text_lang_cfg.model_path else None
+        text_lang, text_prob = lang_id.detect(request.text, model_path=model_path)
+        if text_lang and text_prob >= text_lang_cfg.confidence_threshold:
+            detected_language = text_lang
+            detected_language_prob = text_prob
+            logger.info("Text-side lang_id: %s (prob=%.2f)", text_lang, text_prob)
 
     # Speaker resolution: embedding → session history → anonymous.
     # Never let speaker ID failure kill the request — proceed as anonymous.

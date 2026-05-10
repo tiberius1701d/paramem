@@ -537,6 +537,17 @@ tts:
       # device: cpu            # per-voice override (default: inherit from tts.device)
 
 # ============================================================================
+# TEXT-SIDE LANGUAGE DETECTION (fastText lid.176)
+# ============================================================================
+# Disabled in the test fixture so CI does not require the 126 MB model file.
+# Production deployments turn this on after running
+# scripts/setup/download-langid-model.sh.
+text_lang_detection:
+  enabled: false
+  confidence_threshold: 0.65
+  # model_path: ""
+
+# ============================================================================
 # PROCESS
 # ============================================================================
 process:
