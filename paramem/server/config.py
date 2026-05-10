@@ -1010,6 +1010,31 @@ class ServerAdaptersConfig:
 
 
 @dataclass
+class TextLangDetectionConfig:
+    """fastText lid.176-based language detection on the text /chat path.
+
+    STT carries Whisper's language signal. Pure-text /chat requests have no
+    equivalent; when both ``enabled`` is true and the request lacks a
+    speaker embedding, ``paramem.server.lang_id`` is invoked on the request
+    text and its verdict feeds the same resolver chain Whisper detection
+    flows through.
+
+    Disabled by default so existing deployments and the CI fixture do not
+    require the 126 MB model file. Enable in production after running
+    ``scripts/setup/download-langid-model.sh``.
+    """
+
+    enabled: bool = False
+    # Conservative — text-side detection is the only language signal on the
+    # text /chat path (no STT, no speaker preference fallback in practice).
+    # Below this threshold, leave ``effective_language`` unset rather than
+    # commit to a wrong language and harden the response in the wrong tongue.
+    confidence_threshold: float = 0.65
+    # Empty → falls back to ``~/.cache/paramem/lang_id/lid.176.bin``.
+    model_path: str = ""
+
+
+@dataclass
 class ServerConfig:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     server: ServerNetConfig = field(default_factory=ServerNetConfig)
@@ -1044,6 +1069,7 @@ class ServerConfig:
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
+    text_lang_detection: TextLangDetectionConfig = field(default_factory=TextLangDetectionConfig)
     vram: VramConfig = field(default_factory=VramConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
 
@@ -1408,6 +1434,10 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
         for lang_code, voice_data in voices_raw.items():
             if isinstance(voice_data, dict):
                 config.tts.voices[lang_code] = TTSVoiceConfig(**voice_data)
+
+    text_lang_raw = raw.get("text_lang_detection", {})
+    if text_lang_raw:
+        config.text_lang_detection = TextLangDetectionConfig(**text_lang_raw)
 
     # Security — nested: security.backups.{orphan_sweep, retention, schedule,
     # artifacts, max_total_disk_gb}
