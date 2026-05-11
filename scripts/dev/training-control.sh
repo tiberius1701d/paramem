@@ -10,7 +10,7 @@
 #   source ~/.local/bin/training-control.sh
 #
 #   training_pause       # Signal: stop after current cycle/checkpoint
-#   training_resume [N]  # Launch test N (8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15).
+#   training_resume [N]  # Launch test N (8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15, 16).
 #   training_status      # Show pause state + GPU + progress for all tests
 #
 # Recommended aliases (add to ~/.bashrc):
@@ -162,6 +162,7 @@ TEST_SCRIPTS[14]="experiments/test14.py"
 # the V3/seed42 apples-to-apples validation at linear+B50+decay=600.
 TEST_SCRIPTS["14s"]="experiments/test14.py"
 TEST_SCRIPTS[15]="experiments/test15_retention_multiseed.py"
+TEST_SCRIPTS[16]="experiments/test16_repair_sweep.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
@@ -173,6 +174,7 @@ TEST_OUTPUT_DIRS["13b"]="outputs/test13b_retention_curve"
 TEST_OUTPUT_DIRS[14]="outputs/test14_pre"
 TEST_OUTPUT_DIRS["14s"]="outputs/test14_pre"
 TEST_OUTPUT_DIRS[15]="outputs/test15_retention_multiseed"
+TEST_OUTPUT_DIRS[16]="outputs/test16_repair_sweep"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
@@ -187,6 +189,7 @@ TEST_PGREP[14]="test14"
 # order so the more-specific match wins.
 TEST_PGREP["14s"]="test14.*--variant V3"
 TEST_PGREP[15]="test15_retention_multiseed"
+TEST_PGREP[16]="test16_repair_sweep"
 
 # Smoke flags for 14s.  Hardcoded here rather than persisted to
 # run_config.json so the smoke remains an explicit, repeatable probe and
@@ -364,7 +367,7 @@ _find_running_test() {
     # (14s, 13b, 10b) share their script with a broader sibling (14, 13,
     # 10) and must be checked first so a running variant doesn't get
     # mis-attributed to the broader entry.
-    for t in 8 9 10b 10 11 13b 13 14s 14 15; do
+    for t in 8 9 10b 10 11 13b 13 14s 14 15 16; do
         [[ -z "${TEST_PGREP[$t]:-}" ]] && continue
         local pids
         pids=$(pgrep -f "${TEST_PGREP[$t]}" 2>/dev/null)
@@ -532,7 +535,7 @@ training_pause() {
 #
 # Clear the pause signal and launch the specified test.
 # Default: test 8. Usage: tresume, tresume 13, tresume --yes 10b
-# Registered tests: 8, 9, 10, 10b, 11, 13
+# Registered tests: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15, 16
 #
 training_resume() {
     local auto_yes=false
@@ -544,7 +547,7 @@ training_resume() {
 
     # Validate test number
     if [[ -z "${TEST_SCRIPTS[$test_num]}" ]]; then
-        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15."
+        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15, 16."
         return 1
     fi
 
@@ -832,7 +835,7 @@ print(labels.get(r, r or ''))
     fi
 
     # Show status for each test (reuses $running from above)
-    for test_num in 8 9 10 10b 11 13 13b 14 15; do
+    for test_num in 8 9 10 10b 11 13 13b 14 15 16; do
         _show_test_status "$test_num" "$running"
     done
 
@@ -932,6 +935,32 @@ _show_test_status() {
         echo -e "  ${BOLD}Test 15${RESET}${is_running}"
         echo "  ────────────────────────────────────────"
         _show_test15_status "$latest_run_dir"
+        return
+    fi
+
+    # Test 16 uses per-seed *_done.json markers under seedN/{base_D,corrupted_D,repair_*}/.
+    # Exclude the _smoke/ dir itself (it sorts after YYYYMMDD_* timestamps in ASCII) AND its
+    # subtree, so smoke-test run dirs never appear as the prod "latest".
+    if [[ "$test_num" == "16" ]]; then
+        local latest_run_dir
+        latest_run_dir=$(find "$PROJECT_DIR/$output_dir" -mindepth 2 -maxdepth 2 -type d -not -name "_smoke" -not -path "*/_smoke/*" 2>/dev/null | sort | tail -1)
+        if [[ -z "$latest_run_dir" ]]; then
+            if [[ "$running_test" == "$test_num" ]]; then
+                echo ""
+                echo -e "  ${BOLD}Test 16${RESET} ${GREEN}RUNNING${RESET}"
+                echo "  ────────────────────────────────────────"
+                echo -e "  ${DIM}Preparing run directory...${RESET}"
+            fi
+            return
+        fi
+        local is_running=""
+        if [[ "$running_test" == "$test_num" ]]; then
+            is_running=" ${GREEN}RUNNING${RESET}"
+        fi
+        echo ""
+        echo -e "  ${BOLD}Test 16${RESET}${is_running}"
+        echo "  ────────────────────────────────────────"
+        _show_test16_status "$latest_run_dir"
         return
     fi
 
@@ -1480,6 +1509,108 @@ ratio_s = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "?"
 print(f"  Aggregate:  n={n}  retB={mb_s}  retC2={mc_s}  ratio={ratio_s}  threshold={thr:.1f}× → {verdict_color}{verdict}{RESET}")
 PYEOF
         echo -e "  Final:      ${GREEN}all seeds complete${RESET}"
+    fi
+}
+
+_show_test16_status() {
+    # Argument: path to a specific run dir, e.g.
+    #   outputs/test16_repair_sweep/mistral/20260511_HHMMSS
+    #
+    # Test 16 runs base_D → corrupted_D → repair_D_* per seed.
+    # Status reads *_done.json markers + the most-recent progress.json.
+    local run_dir="$1"
+    local model_name=$(basename "$(dirname "$run_dir")")
+    local run_name=$(basename "$run_dir")
+
+    echo -e "  Model:      ${CYAN}${model_name}${RESET}"
+    echo -e "  Run:        ${DIM}${run_name}${RESET}"
+
+    # Read seeds and depths from run_config.json.
+    local seeds_csv depths_csv
+    seeds_csv=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$run_dir/run_config.json'))
+    seeds = cfg.get('seeds', [42])
+except Exception:
+    seeds = [42]
+print(' '.join(str(s) for s in seeds))
+" 2>/dev/null)
+    depths_csv=$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('$run_dir/run_config.json'))
+    depths = cfg.get('depths', [30, 50])
+except Exception:
+    depths = [30, 50]
+print(' '.join(str(d) for d in depths))
+" 2>/dev/null)
+    [[ -z "$seeds_csv" ]] && seeds_csv="42"
+    [[ -z "$depths_csv" ]] && depths_csv="30 50"
+
+    # Per-seed summary: count base/corrupted/repair done markers.
+    python3 - "$run_dir" $seeds_csv <<PYEOF 2>/dev/null
+import json, sys, os, glob
+run_dir = sys.argv[1]
+seeds = [int(s) for s in sys.argv[2:]]
+GREEN = "\x1b[32m"
+DIM = "\x1b[2m"
+YELLOW = "\x1b[33m"
+RESET = "\x1b[0m"
+for s in seeds:
+    seed_dir = os.path.join(run_dir, f"seed{s}")
+    base_done = len(glob.glob(os.path.join(seed_dir, "base_*", "base_*_done.json")))
+    corrupted_done = len(glob.glob(os.path.join(seed_dir, "corrupted_*", "corrupted_*_done.json")))
+    repair_done = len(glob.glob(os.path.join(seed_dir, "repair_*", "repair_*_done.json")))
+    status = f"base={base_done}  corrupted={corrupted_done}  repair_cells={repair_done}"
+    # Show RP2 from the most recently completed corrupted_done if available.
+    latest_rp2 = None
+    for cd_path in sorted(glob.glob(os.path.join(seed_dir, "corrupted_*", "corrupted_*_done.json"))):
+        try:
+            d = json.load(open(cd_path))
+            latest_rp2 = d.get("rp2_rate")
+        except Exception:
+            pass
+    if latest_rp2 is not None:
+        status += f"  latest_RP2={latest_rp2:.3f}"
+    print(f"  seed{s:>4}:    {status}")
+PYEOF
+
+    # Show most-recent progress.json if running.
+    local latest_progress
+    latest_progress=$(find "$run_dir" -name "progress.json" -not -path "*/_smoke/*" 2>/dev/null | sort | tail -1)
+    if [[ -n "$latest_progress" ]]; then
+        python3 - "$latest_progress" <<'PYEOF' 2>/dev/null
+import json, sys, os
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+    ep = d.get("epoch", "?")
+    tgt = d.get("target_epoch") or d.get("total_epochs") or "?"
+    phase = d.get("phase_name", os.path.basename(os.path.dirname(p)))
+    print(f"  Progress:   {phase}  epoch {ep}/{tgt}")
+except Exception:
+    pass
+PYEOF
+    fi
+
+    # Paused marker.
+    if [[ -f "$run_dir/paused.json" ]]; then
+        local after
+        after=$(python3 -c "import json; print(json.load(open('$run_dir/paused.json')).get('stopped_after_phase','?'))" 2>/dev/null)
+        echo -e "  State:      ${YELLOW}PAUSED${RESET} ${DIM}(stopped after ${after} — tresume 16 to continue)${RESET}"
+    fi
+
+    # Aggregate if present.
+    if [[ -f "$run_dir/test16_aggregate.json" ]]; then
+        python3 - "$run_dir/test16_aggregate.json" <<'PYEOF' 2>/dev/null
+import json, sys
+a = json.load(open(sys.argv[1]))
+n = a.get("n_completed_cells", 0)
+CYAN = "\x1b[36m"
+RESET = "\x1b[0m"
+print(f"  Aggregate:  {CYAN}{n}{RESET} cell rows completed")
+PYEOF
     fi
 }
 
