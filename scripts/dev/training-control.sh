@@ -163,6 +163,17 @@ TEST_SCRIPTS[14]="experiments/test14.py"
 TEST_SCRIPTS["14s"]="experiments/test14.py"
 TEST_SCRIPTS[15]="experiments/test15_retention_multiseed.py"
 TEST_SCRIPTS[16]="experiments/test16_repair_sweep.py"
+# quad = Quadruple-encoded adapter scaling probe (replaces the pending Test 8
+# continuation as the new path to the recall ceiling). Single-phase per
+# cycle: train-then-probe over the source graph's quadruples. Extends via
+# --resume --n-keys N (N > saved). Pause-aware via TrainingHooks +
+# per-25-key probe checkpoints.
+TEST_SCRIPTS["quad"]="experiments/quadruple_adapter.py"
+# LME = LongMemEval → graph_snapshot.json builder (graph source for the quad-adapter probe).
+# Incrementally extracts LME sessions and accumulates triples into a
+# canonical graph_snapshot.json used as --graph-snapshot for the quad probe.
+# Pause-aware at every session boundary. Resume via tresume lme.
+TEST_SCRIPTS["lme"]="experiments/lme_graph_builder.py"
 
 TEST_OUTPUT_DIRS[8]="outputs/test8_large_scale"
 TEST_OUTPUT_DIRS[9]="outputs/test9_natural_recall"
@@ -175,6 +186,8 @@ TEST_OUTPUT_DIRS[14]="outputs/test14_pre"
 TEST_OUTPUT_DIRS["14s"]="outputs/test14_pre"
 TEST_OUTPUT_DIRS[15]="outputs/test15_retention_multiseed"
 TEST_OUTPUT_DIRS[16]="outputs/test16_repair_sweep"
+TEST_OUTPUT_DIRS["quad"]="outputs/quad_scale"
+TEST_OUTPUT_DIRS["lme"]="outputs/lme_graph"
 
 TEST_PGREP[8]="test8_large_scale"
 TEST_PGREP[9]="test9_natural_recall"
@@ -190,6 +203,8 @@ TEST_PGREP[14]="test14"
 TEST_PGREP["14s"]="test14.*--variant V3"
 TEST_PGREP[15]="test15_retention_multiseed"
 TEST_PGREP[16]="test16_repair_sweep"
+TEST_PGREP["quad"]="quadruple_adapter"
+TEST_PGREP["lme"]="lme_graph_builder"
 
 # Smoke flags for 14s.  Hardcoded here rather than persisted to
 # run_config.json so the smoke remains an explicit, repeatable probe and
@@ -367,7 +382,7 @@ _find_running_test() {
     # (14s, 13b, 10b) share their script with a broader sibling (14, 13,
     # 10) and must be checked first so a running variant doesn't get
     # mis-attributed to the broader entry.
-    for t in 8 9 10b 10 11 13b 13 14s 14 15 16; do
+    for t in 8 9 10b 10 11 13b 13 14s 14 15 16 quad lme; do
         [[ -z "${TEST_PGREP[$t]:-}" ]] && continue
         local pids
         pids=$(pgrep -f "${TEST_PGREP[$t]}" 2>/dev/null)
@@ -535,7 +550,7 @@ training_pause() {
 #
 # Clear the pause signal and launch the specified test.
 # Default: test 8. Usage: tresume, tresume 13, tresume --yes 10b
-# Registered tests: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15, 16
+# Registered tests: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15, 16, quad, lme
 #
 training_resume() {
     local auto_yes=false
@@ -547,7 +562,7 @@ training_resume() {
 
     # Validate test number
     if [[ -z "${TEST_SCRIPTS[$test_num]}" ]]; then
-        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15, 16."
+        echo -e "  ${RED}Unknown test: ${test_num}${RESET}. Valid: 8, 9, 10, 10b, 11, 13, 13b, 14, 14s, 15, 16, quad, lme."
         return 1
     fi
 
@@ -835,7 +850,7 @@ print(labels.get(r, r or ''))
     fi
 
     # Show status for each test (reuses $running from above)
-    for test_num in 8 9 10 10b 11 13 13b 14 15 16; do
+    for test_num in 8 9 10 10b 11 13 13b 14 15 16 quad lme; do
         _show_test_status "$test_num" "$running"
     done
 
@@ -987,6 +1002,38 @@ _show_test_status() {
         echo -e "  ${BOLD}Test 13b${RESET}${is_running}"
         echo "  ────────────────────────────────────────"
         _show_test13b_status "$latest_run_dir"
+        return
+    fi
+
+    # quad uses per-phase *_done.json markers, not state.json — dispatch early.
+    if [[ "$test_num" == "quad" ]]; then
+        local latest_run_dir
+        latest_run_dir=$(find "$PROJECT_DIR/$output_dir" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+        local is_running=""
+        if [[ "$running_test" == "$test_num" ]]; then
+            is_running=" ${GREEN}RUNNING${RESET}"
+        fi
+        echo ""
+        echo -e "  ${BOLD}Quadruple Adapter${RESET}${is_running}"
+        echo "  ────────────────────────────────────────"
+        if [[ -z "$latest_run_dir" ]]; then
+            echo -e "  ${DIM}not started${RESET}"
+        else
+            _show_test_quad_status "$latest_run_dir"
+        fi
+        return
+    fi
+
+    # LME graph builder uses build_state.json / graph_done.json, not state.json.
+    if [[ "$test_num" == "lme" ]]; then
+        local is_running=""
+        if [[ "$running_test" == "$test_num" ]]; then
+            is_running=" ${GREEN}RUNNING${RESET}"
+        fi
+        echo ""
+        echo -e "  ${BOLD}LME Graph Builder${RESET}${is_running}"
+        echo "  ────────────────────────────────────────"
+        _show_test_lme_status "$PROJECT_DIR/$output_dir"
         return
     fi
 
@@ -2253,6 +2300,260 @@ print(p.get('keys','?'), p.get('epoch','?'), p.get('total_epochs', p.get('target
     info="${info}elapsed ${elapsed:-?}"
 
     echo -e "  Training:   ${YELLOW}${info}${RESET}"
+}
+
+_show_test_quad_status() {
+    # Argument: path to the latest quad-adapter run dir, e.g.
+    #   outputs/quad_scale/mistral/20260511_120000
+    #
+    # Reads: run_config.json, train_done.json, probe_done.json,
+    #        probe_results.json, epoch_log.json, paused.json, metrics.json.
+    local run_dir="$1"
+    local model_name
+    model_name=$(basename "$(dirname "$run_dir")")
+    local run_name
+    run_name=$(basename "$run_dir")
+
+    echo -e "  Model:      ${CYAN}${model_name}${RESET}"
+    echo -e "  Run:        ${DIM}${run_name}${RESET}"
+
+    # Read run_config.json.
+    if [[ -f "$run_dir/run_config.json" ]]; then
+        python3 - "$run_dir/run_config.json" <<'PYEOF' 2>/dev/null
+import json, sys, os
+cfg = json.load(open(sys.argv[1]))
+snap = cfg.get("graph_snapshot", "?")
+# Shorten snapshot path to basename if long.
+if len(snap) > 60:
+    snap = "..." + snap[-57:]
+n_keys = cfg.get("n_keys", "?")
+num_epochs = cfg.get("num_epochs", "?")
+rank = cfg.get("rank", "?")
+es_from = cfg.get("es_from_epoch", "?")
+es_win = cfg.get("es_window", "?")
+CYAN = "\x1b[36m"
+DIM = "\x1b[2m"
+RESET = "\x1b[0m"
+print(f"  Source:     {DIM}{snap}{RESET}")
+print(f"  Config:     n_keys={CYAN}{n_keys}{RESET}  epochs={num_epochs}  rank={rank}  es_from={es_from}  es_window={es_win}")
+PYEOF
+    fi
+
+    # Phase summary line.
+    python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+import json, sys, os, glob
+
+run_dir = sys.argv[1]
+GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
+DIM = "\x1b[2m"
+RESET = "\x1b[0m"
+CYAN = "\x1b[36m"
+
+# Train phase.
+train_done = os.path.exists(os.path.join(run_dir, "train_done.json"))
+if train_done:
+    try:
+        td = json.load(open(os.path.join(run_dir, "train_done.json")))
+        stop_e = td.get("stop_epoch")
+        req_e = td.get("n_epochs_requested", "?")
+        run_e = td.get("n_epochs_run", stop_e or req_e)
+        first = td.get("first_perfect_epoch")
+        stable = td.get("stable_perfect_epoch")
+        train_s = f"{GREEN}✓{RESET} e{run_e}/{req_e}"
+        if first is not None:
+            train_s += f"  first={first}"
+        if stable is not None:
+            train_s += f"  stable={stable}"
+    except Exception:
+        train_s = f"{GREEN}✓{RESET}"
+else:
+    # Check epoch_log.json for in-progress epoch.
+    el_path = os.path.join(run_dir, "epoch_log.json")
+    if os.path.exists(el_path):
+        try:
+            el = json.load(open(el_path))
+            if el:
+                last = el[-1]
+                ep = last.get("epoch", "?")
+                sr = last.get("strict_rate")
+                sr_s = f"{sr:.3f}" if isinstance(sr, float) else "?"
+                train_s = f"{YELLOW}◐{RESET} e{ep}  strict={sr_s}"
+            else:
+                train_s = f"{DIM}-{RESET}"
+        except Exception:
+            train_s = f"{DIM}-{RESET}"
+    else:
+        # Check for HF checkpoint dirs as a heartbeat.
+        ckpts = glob.glob(os.path.join(run_dir, "adapter", "checkpoint-*"))
+        if ckpts:
+            # Numeric sort to get latest.
+            nums = []
+            for c in ckpts:
+                try:
+                    nums.append(int(os.path.basename(c).split("-")[-1]))
+                except ValueError:
+                    pass
+            latest_step = max(nums) if nums else "?"
+            train_s = f"{YELLOW}◐{RESET} step {latest_step}"
+        else:
+            train_s = f"{DIM}-{RESET}"
+
+# Probe phase.
+probe_done = os.path.exists(os.path.join(run_dir, "probe_done.json"))
+if probe_done:
+    probe_s = f"{GREEN}✓{RESET}"
+else:
+    pr_path = os.path.join(run_dir, "probe_results.json")
+    if os.path.exists(pr_path):
+        try:
+            pr = json.load(open(pr_path))
+            n_done = len(pr)
+            cfg = json.load(open(os.path.join(run_dir, "run_config.json")))
+            n_total = cfg.get("n_keys") or n_done
+            probe_s = f"{YELLOW}◐{RESET} {n_done}/{n_total}"
+        except Exception:
+            probe_s = f"{YELLOW}◐{RESET}"
+    else:
+        probe_s = f"{DIM}-{RESET}"
+
+print(f"  Phases:     train: [{train_s}]  probe: [{probe_s}]")
+PYEOF
+
+    # Metrics if complete.
+    if [[ -f "$run_dir/metrics.json" ]]; then
+        python3 - "$run_dir/metrics.json" <<'PYEOF' 2>/dev/null
+import json, sys
+m = json.load(open(sys.argv[1])).get("overall", {})
+strict = m.get("source_triple_recovered_rate")
+so = m.get("subject_object_match_rate")
+n = m.get("n", "?")
+GREEN = "\x1b[32m"
+RESET = "\x1b[0m"
+strict_s = f"{strict:.1%}" if isinstance(strict, float) else "?"
+so_s = f"{so:.1%}" if isinstance(so, float) else "?"
+print(f"  Results:    {GREEN}strict={strict_s}  s+o={so_s}  n={n}{RESET}")
+PYEOF
+    fi
+
+    # Paused marker.
+    if [[ -f "$run_dir/paused.json" ]]; then
+        python3 - "$run_dir/paused.json" <<'PYEOF' 2>/dev/null
+import json, sys
+p = json.load(open(sys.argv[1]))
+after = p.get("stopped_after", "?")
+ckpt = p.get("latest_checkpoint")
+YELLOW = "\x1b[33m"
+DIM = "\x1b[2m"
+RESET = "\x1b[0m"
+msg = f"  State:      {YELLOW}PAUSED{RESET} {DIM}(stopped after {after}"
+if ckpt:
+    import os
+    msg += f", checkpoint: {os.path.basename(ckpt)}"
+msg += f" — tresume quad to continue){RESET}"
+print(msg)
+PYEOF
+    fi
+
+    # Last-updated timestamp from run directory mtime.
+    local last_time
+    last_time=$(date -r "$run_dir" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "?")
+    echo -e "  Updated:    ${DIM}${last_time}${RESET}"
+}
+
+_show_test_lme_status() {
+    # Argument: path to the canonical LME output dir (outputs/lme_graph/).
+    # Reads: build_state.json, graph_done.json, paused.json.
+    local output_dir="$1"
+
+    if [[ ! -d "$output_dir" ]]; then
+        echo -e "  ${DIM}not started${RESET}"
+        return
+    fi
+
+    python3 - "$output_dir" <<'PYEOF' 2>/dev/null
+import json, sys, os, time
+
+output_dir = sys.argv[1]
+GREEN = "\x1b[32m"
+YELLOW = "\x1b[33m"
+DIM = "\x1b[2m"
+CYAN = "\x1b[36m"
+RESET = "\x1b[0m"
+
+state_path = os.path.join(output_dir, "build_state.json")
+done_path = os.path.join(output_dir, "graph_done.json")
+paused_path = os.path.join(output_dir, "paused.json")
+
+state = {}
+done = {}
+paused = {}
+
+if os.path.exists(state_path):
+    try:
+        state = json.load(open(state_path))
+    except Exception:
+        pass
+
+if os.path.exists(done_path):
+    try:
+        done = json.load(open(done_path))
+    except Exception:
+        pass
+
+if os.path.exists(paused_path):
+    try:
+        paused = json.load(open(paused_path))
+    except Exception:
+        pass
+
+# Key fields.
+n_sessions = state.get("n_unique_triples") and len(state.get("sessions_done", []))
+n_sessions_done = len(state.get("sessions_done", []))
+n_triples = state.get("n_unique_triples", 0)
+target = state.get("target_keys")
+lme_split = state.get("lme_split", "?")
+lme_seed = state.get("lme_seed", "?")
+updated_at = state.get("updated_at")
+
+print(f"  Split:      {CYAN}{lme_split}{RESET}  seed={lme_seed}")
+
+if target is not None:
+    triple_s = f"{n_triples}/{target}"
+    pct = int(n_triples * 100 / target) if target > 0 else 0
+    print(f"  Triples:    {CYAN}{triple_s}{RESET} ({pct}%)")
+elif n_triples > 0:
+    print(f"  Triples:    {CYAN}{n_triples}{RESET}")
+
+if n_sessions_done > 0:
+    print(f"  Sessions:   {n_sessions_done} extracted")
+
+# State.
+if done:
+    final_n = done.get("n_triples", n_triples)
+    final_s = done.get("n_sessions_extracted", n_sessions_done)
+    print(f"  State:      {GREEN}DONE{RESET} ({final_n} triples, {final_s} sessions)")
+elif paused:
+    after = paused.get("stopped_after_session", "?")
+    p_n = paused.get("n_sessions_extracted", "?")
+    p_t = paused.get("n_unique_triples", "?")
+    ts = paused.get("timestamp")
+    ts_s = ""
+    if ts:
+        import datetime
+        ts_s = " @ " + datetime.datetime.fromtimestamp(ts).strftime("%H:%M")
+    print(f"  State:      {YELLOW}PAUSED{RESET} {DIM}(after session {after}, {p_t} triples{ts_s} — tresume lme to continue){RESET}")
+elif n_triples > 0:
+    print(f"  State:      {YELLOW}RUNNING{RESET}")
+else:
+    print(f"  State:      {DIM}no progress yet{RESET}")
+
+# Last-updated time.
+if updated_at:
+    import datetime
+    dt = datetime.datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M")
+    print(f"  Updated:    {DIM}{dt}{RESET}")
+PYEOF
 }
 
 # ============================================================================

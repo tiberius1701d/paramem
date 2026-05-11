@@ -1,0 +1,68 @@
+Recover the single (subject, predicate, object) triple this question-answer pair was generated from. The QA generator distilled exactly one triple per pair; your task is to invert that mapping.
+
+In the examples below, `{{SPEAKER_NAME}}` is a SLOT — at runtime it is substituted with the speaker's real identifier when the QA's subject was the speaker. Never emit the literal string `{{SPEAKER_NAME}}` in your output.
+
+
+POSITIVE example — Q: "Where does Alex live?" A: "Berlin."
+{{"subject": "Alex", "predicate": "lives_in", "object": "Berlin"}}
+
+
+POSITIVE example — Q: "What is Sam's email address?" A: "sam.rivera@example.com"
+{{"subject": "Sam", "predicate": "email", "object": "sam.rivera@example.com"}}
+
+
+POSITIVE example — Q: "When did the engagement at Team Lead, Software Integration start?" A: "November 2014."
+{{"subject": "Team Lead, Software Integration", "predicate": "start_date", "object": "November 2014"}}
+
+
+POSITIVE example — Q: "What is the DOI of 'Indexed Key Retrieval from LoRA Adapters for Continual Learning'?" A: "10.5281/zenodo.19502523"
+{{"subject": "Indexed Key Retrieval from LoRA Adapters for Continual Learning", "predicate": "has_doi", "object": "10.5281/zenodo.19502523"}}
+
+
+POSITIVE example — Q: "What is {{SPEAKER_NAME}} interested in?" A: "Autonomous Systems & Safety-Critical Production Systems."
+{{"subject": "{{SPEAKER_NAME}}", "predicate": "is_interested_in", "object": "Autonomous Systems & Safety-Critical Production Systems"}}
+
+
+POSITIVE example — Q: "What achievement did Team Lead, Software Integration accomplish?" A: "Reduced customer issue turnaround time by 50% through pre-merge validation and CI integration gates."
+{{"subject": "Team Lead, Software Integration", "predicate": "achievement", "object": "Reduced customer issue turnaround time by 50% through pre-merge validation and CI integration gates"}}
+
+
+NEGATIVE example — Q: "When did the role of Project Engineer end?" A: "March 2018."
+BAD output (subject pivoted to the speaker, predicate verbalized to a verb form):
+{{"subject": "{{SPEAKER_NAME}}", "predicate": "ended_position", "object": "Project Engineer"}}
+CORRECT output (subject is the role the question is structured around; predicate is the noun-form date label):
+{{"subject": "Project Engineer", "predicate": "end_date", "object": "March 2018"}}
+
+
+NEGATIVE example — Q: "Whom did Alex interview?" A: "Engineers."
+BAD output (predicate verbalized to passive voice):
+{{"subject": "Alex", "predicate": "has_been_interviewed_by", "object": "Engineers"}}
+CORRECT output (predicate is the active noun-form relation as a knowledge-graph extractor would emit):
+{{"subject": "Alex", "predicate": "interviewed", "object": "Engineers"}}
+
+
+NEGATIVE example — Q: "What is the goal of Team Lead, Software Integration?" A: "Establish software integration capability for 5+ major OEMs."
+BAD output (object paraphrased / abbreviated):
+{{"subject": "Team Lead, Software Integration", "predicate": "goal", "object": "OEM integration"}}
+CORRECT output (object preserved verbatim, modulo trailing punctuation):
+{{"subject": "Team Lead, Software Integration", "predicate": "goal", "object": "Establish software integration capability for 5+ major OEMs"}}
+
+
+NEGATIVE example — Q: "What does Sam do at Brightfield Labs?" A: "Senior Engineer."
+BAD output (split into two triples; the QA is one fact):
+[{{"subject": "Sam", "predicate": "works_at", "object": "Brightfield Labs"}}, {{"subject": "Sam", "predicate": "role", "object": "Senior Engineer"}}]
+CORRECT output (one triple, taking the question's primary relation):
+{{"subject": "Sam", "predicate": "role_at_brightfield_labs", "object": "Senior Engineer"}}
+
+
+NEGATIVE example — Q: "What awards did {{SPEAKER_NAME}} secure?" A: "Recognition awards."
+BAD output (refused / empty triple because the answer is short):
+{{"subject": "", "predicate": "", "object": ""}}
+CORRECT output (always emit one triple; every QA was generated from a real triple):
+{{"subject": "{{SPEAKER_NAME}}", "predicate": "secured", "object": "Recognition awards"}}
+
+
+Question: {question}
+Answer: {answer}
+
+Output the recovered triple as JSON: {{"subject": "...", "predicate": "...", "object": "..."}}.
