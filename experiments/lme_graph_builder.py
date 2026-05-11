@@ -252,9 +252,22 @@ def main() -> None:
     # --- Resume / done check ---
     sessions_done: list[str] = []
     if args.resume:
+        done_data = json.loads(done_path.read_text()) if done_path.exists() else None
+        # When resuming without an explicit --target-keys (e.g. plain
+        # `tresume lme`), adopt the target the prior run recorded — otherwise
+        # the loop's target check never fires and we silently extract all
+        # remaining sessions instead of stopping at the original cap.
+        if args.target_keys is None:
+            if done_data is not None:
+                args.target_keys = done_data.get("target_keys")
+            elif state_path.exists():
+                try:
+                    args.target_keys = json.loads(state_path.read_text()).get("target_keys")
+                except (json.JSONDecodeError, OSError):
+                    pass
+
         # If graph_done.json exists and target-keys not raised, nothing to do.
-        if done_path.exists():
-            done_data = json.loads(done_path.read_text())
+        if done_data is not None:
             existing_triples = done_data.get("n_triples", 0)
             if args.target_keys is None or args.target_keys <= existing_triples:
                 logger.info(

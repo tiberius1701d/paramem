@@ -48,7 +48,6 @@ sys.path.insert(0, str(project_root))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("fluency")
 
-DEFAULT_QUAD_RUN = project_root / "outputs/quad_scale/mistral/20260511_082251"
 DEFAULT_GRAPH_SNAPSHOT = (
     project_root / "data/ha/debug/run_20260510T170022Z_8c1cca/cycle_26/graph_snapshot.json"
 )
@@ -753,9 +752,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quad-run",
         type=Path,
-        default=DEFAULT_QUAD_RUN,
+        default=None,
         dest="quad_run",
-        help="Path to the quadruple-adapter run directory (default: %(default)s).",
+        help=(
+            "Quadruple-adapter run directory. Default: the latest run under "
+            "outputs/quad_scale/<model>/."
+        ),
     )
     parser.add_argument(
         "--graph-snapshot",
@@ -816,12 +818,23 @@ def main() -> None:
     args = parse_args()
     _load_env()
 
+    if args.quad_run is None:
+        from experiments.quadruple_adapter import find_latest_run_dir
+
+        args.quad_run = find_latest_run_dir(args.model)
+        if args.quad_run is None:
+            raise SystemExit(
+                f"No quadruple-adapter run found under outputs/quad_scale/{args.model}/ "
+                "— run experiments/quadruple_adapter.py first, or pass --quad-run."
+            )
+        logger.info("Using latest quad-adapter run: %s", args.quad_run)
+
     # Resolve output directory (never overwrite a prior run).
     if args.output is not None:
         output_dir = args.output
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = project_root / "outputs" / "a21_fluency" / timestamp
+        output_dir = project_root / "outputs" / "reasoning_fluency" / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Output dir: %s", output_dir)
 
