@@ -167,7 +167,7 @@ def clear_paused_marker(run_dir: Path) -> None:
 
 
 def find_latest_run_dir(model_name: str) -> Path | None:
-    parent = project_root / "outputs" / "a2_quad_scale" / model_name
+    parent = project_root / "outputs" / "quad_scale" / model_name
     if not parent.is_dir():
         return None
     candidates = [
@@ -1202,7 +1202,7 @@ def main() -> None:
         logger.info("Resuming run at %s", run_dir)
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = project_root / "outputs" / "a2_quad_scale" / args.model / timestamp
+        run_dir = project_root / "outputs" / "quad_scale" / args.model / timestamp
         run_dir.mkdir(parents=True, exist_ok=True)
         logger.info("New run dir: %s", run_dir)
 
