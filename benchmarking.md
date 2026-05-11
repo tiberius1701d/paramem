@@ -2243,11 +2243,15 @@ epoch  fill   retention   note
   that training longer at lower LR during the consolidation tail
   might amplify recovery. One-phase variant of 13b with
   `fill_lr=1e-5` (10× lower) would test this. ~6h GPU.
-- **Phase B companion is still valuable** as the no-scaffold
-  baseline. Hypothesis: B's retention decays earlier AND lower
-  than C2's, which would preserve the scaffold's "6.7× better
-  retention than naive overwrite" framing even after early-stop
-  is off the table.
+- **Phase B companion as the no-scaffold baseline.** Tested in
+  Test 15 (n=5, production early-stop): the "6.7× better retention
+  than naive overwrite" framing did **not** hold — `ratio_raw =
+  3.56`, bootstrap `lower_CI = 0.76` (both below the pre-registered
+  5.0 / 2.5 bars). After ≤5 LR=1e-5 repair episodes B and C2 both
+  recover to ~92–95% and are indistinguishable (`ratio_repaired ≈
+  1.04`). See "Test 15: Results". Net: the scaffold's retention edge
+  was a pre-repair measurement artifact; the surviving scaffold
+  findings are faster fill and zero leakage.
 - **Production early-stop** as an operational win (≥50% GPU-time
   reduction on fill phases at no quality cost).
 
@@ -2345,10 +2349,12 @@ fill-speed: V1 first_perfect = 19.0 ± 2.45, V2 = 20.3 ± 2.62, V3 =
 20.7 ± 1.89; pooled std = 2.31 epochs. V3 is the slowest mean. Zero
 leakage, 1.0 final recall across all 9 cells. Aggregate at
 `outputs/test14_pre/mistral/20260426_012907/multiseed_aggregate.json`.
-V5–V8 dropped, 14a deferred on Test 15. V4 closed at single-seed (see
-"V4 status" below). Test 14's "retention" column measured placeholder
-erasure, not real-answer preservation, and is not comparable to Test
-13's retention figure.
+V5–V8 dropped. **14a (and the dependent 14b) cut** — Test 15 returned
+`verdict: DOES NOT HOLD` on the scaffold retention advantage that 14a's
+N=500 scale study presupposed (see "Test 15: Results"). V4 closed at
+single-seed (see "V4 status" below). Test 14's "retention" column
+measured placeholder erasure, not real-answer preservation, and is not
+comparable to Test 13's retention figure.
 
 ### What it tests
 
@@ -2388,9 +2394,13 @@ independently and gated on the prior result:
     Convergence target: `both/total ≥ 0.95`, `q_only/total ≤ 0.05` (no
     discriminator collapse), `stable_perfect ≤ 22` (faster than warm-start
     baseline).
-- **14a — winner scaled to N=500.** Same A→B→C structure as 14a-pre, single
-  variant. Output: 500-key filled adapter as the input artifact for 14b.
-- **14b — multi-round early-stop + touch-up validation at N=500.** Five
+- **14a — winner scaled to N=500. [CUT 2026-05-11]** Same A→B→C structure as
+  14a-pre, single variant; output was to be a 500-key filled adapter as the
+  input artifact for 14b. Cut because Test 15 found the scaffold retention
+  advantage does not replicate (see "Test 15: Results") — scaling a
+  non-effect is not worth the GPU-days.
+- **14b — multi-round early-stop + touch-up validation at N=500. [CUT 2026-05-11
+  — depended on 14a's artifact]** Five
   phases: P0 loads 14a's filled adapter (baseline retention probe), P1
   re-fills all 500 keys with `EarlyStopPolicy` active and touch-up on any
   failing keys, P2 swaps 40 disjoint keys' answers, P3 swaps another 40
@@ -2768,10 +2778,16 @@ the bar, 14a is reactivated; otherwise 14a is cut.
 ## Test 15: Retention Multi-Seed (Scaffold-Fill vs Answer-Swap, Production Early-Stop)
 
 **Script:** `experiments/test15_retention_multiseed.py`
-**Status (2026-05-07):** in design. Multi-seed protocol with n=5 seeds
-(42, 7, 1337, 1, 11) at the apples-to-apples scheduler (`linear +
-warmup_steps=10 + decay_steps_for(n,epochs)`) and `weight_decay=0.01`,
-with `RecallEarlyStopCallback` active in `ANALYSIS_POLICY` to match the
+**Status (2026-05-11):** complete. Full 5-seed run at
+`outputs/test15_retention_multiseed/mistral/20260507_141622/` (the
+`20260507_123111` dir is the n=10 smoke — ignore). **Verdict: DOES NOT
+HOLD** — Test 13's 6.7× scaffold retention advantage does not replicate
+under multi-seed + production early-stop. Consequence per the
+pre-registered rule: Test 14a (N=500 scale follow-up) cut. See
+"Results" below. Multi-seed protocol with n=5 seeds (42, 7, 1337, 1, 11)
+at the apples-to-apples scheduler (`linear + warmup_steps=10 +
+decay_steps_for(n,epochs)`) and `weight_decay=0.01`, with
+`RecallEarlyStopCallback` active in `ANALYSIS_POLICY` to match the
 production training configuration (`BackgroundTrainer` behind
 `consolidation.recall_early_stopping`).
 
@@ -2795,6 +2811,59 @@ on the retention advantage being real beyond seed noise). Secondary
 observations (post-repair) reported but not gating: `ratio_repaired`,
 per-seed `alignment_delta`, `corruption_residual`, mean recovery rate
 across the 5 seeds.
+
+### Results (run 20260507_141622, all 5 seeds complete)
+
+**Headline — `verdict: DOES NOT HOLD`.** The pre-registered rule
+(`ratio_raw = mean(C2 RP2)/mean(B RP2) ≥ 5.0` AND bootstrap `lower_CI
+≥ 2.5`, 10 000 resamples) is not met:
+
+| | mean | per-seed (42 / 7 / 1337 / 1 / 11) |
+|---|---|---|
+| RP2 — B (answer-swap), retention at stop_epoch | **0.045** | 0.100 / 0.050 / 0.0125 / 0.000 / 0.0625 |
+| RP2 — C2 (scaffold-fill) | **0.16** | 0.0375 / 0.050 / 0.150 / 0.4625 / 0.100 |
+| `ratio_raw` | **3.56** | — (threshold ≥ 5.0) |
+| bootstrap `lower_CI` | **0.76** | — (threshold ≥ 2.5) |
+
+So Test 13's 6.7× retention advantage (n=1) does **not** survive
+multi-seed + production early-stop — it was an artifact of the single
+seed plus the measurement epoch. n=5 is small and one seed dominates:
+seed 1 has C2 RP2 = 0.4625 (vs 0.04–0.15 elsewhere) while having the
+worst B RP2 = 0.000; the wide CI reflects this. The verdict is correct
+under the rule, but the claim it kills is better stated as
+"scaffold-as-retention-lever unsupported at n=5" than "disproven".
+
+**What does replicate — post-overwrite forgetting is decoding-alignment,
+not weight-erasure** (Test 13b's n=1 latent-recovery finding, now
+confirmed across 5 seeds and *both* arms). After ≤5 repair episodes
+(1 epoch each at LR=1e-5, `weight_decay=0.01`, on the failing-key
+subset of the unchanged 80):
+
+| | mean | per-seed (42 / 7 / 1337 / 1 / 11) |
+|---|---|---|
+| RP3 — B repaired | **0.915** | 0.975 / 0.9125 / 0.8375 / 0.8875 / 0.9625 |
+| RP3 — C2 repaired | **0.95** | 0.950 / 0.9125 / 0.950 / 0.9875 / 0.950 |
+| `alignment_delta` (RP3 − RP2) — B | 0.83–0.90 | 0.875 / 0.8625 / 0.825 / 0.8875 / 0.900 |
+| `alignment_delta` — C2 | 0.53–0.91 | 0.9125 / 0.8625 / 0.800 / 0.525 / 0.850 |
+| `ratio_repaired = mean(C2 RP3)/mean(B RP3)` | **1.04** (lower_CI 0.98) | — |
+
+`corruption_residual` (1 − RP3) ≤ 0.16 (B) / ≤ 0.09 (C2); all five
+repair loops used the full 5-episode budget (none reached 80/80 within
+the budget, but all reached ~84–99%). After repair B and C2 are
+statistically indistinguishable (`ratio_repaired ≈ 1.04`, CI 0.98) —
+the apparent scaffold advantage was the gap *before* alignment repair,
+not a property of the encoded weights.
+
+**Surviving scaffold findings** (from Test 13, not contradicted here):
+C2 fills somewhat faster than B (mean `stop_epoch` ≈ 17.4 vs ≈ 22.2
+across the 5 seeds — though seed 7 reverses it, C2 = 29) and leakage
+= 0. Neither was the headline; on their own they do not justify the
+N=500 scale study.
+
+**Consequence:** Test 14a (the N=500 content-free-scaffold scale
+follow-up) is cut per the pre-registered rule. The lever worth a scale
+study is the repair primitive itself, not the scaffold — that is
+**Test 16**.
 
 ### Phases
 
@@ -2981,6 +3050,142 @@ outputs/test15_retention_multiseed/<model>/<ts>/
 - **Adapter set:** two adapters across the seed loop — `episodic`
   carries Phase A → B; `journal` is created fresh at C1 and continues
   into C2.
+
+---
+
+## Test 16: Repair-Loop Sensitivity Sweep
+
+**Script:** `experiments/test16_repair_sweep.py`
+**Status:** in design
+
+### Research questions
+
+1. Does recovery (episodes-to-full-recovery, final retention RP3, collateral
+   loss on already-passing keys, overwrite reversion) depend on **how deeply the
+   original knowledge was trained before the overwrite** (encoding depth D)?
+2. How sensitive is recovery to **repair learning rate** (1e-5 / 2e-5 / 5e-5)?
+3. How sensitive is recovery to **repair epochs-per-episode** (1 / 3)?
+4. Spot-check: does `weight_decay=0.1 vs 0.01` in the repair loop move any metric?
+
+### Motivation
+
+Test 15 (n=5 seeds, N=100, K=20) killed the scaffold-as-retention-lever
+hypothesis (`verdict: DOES NOT HOLD` — see "Test 15: Results"): the
+no-scaffold (B) and scaffold-fill (C2) paths converge after repair
+(`ratio_repaired ≈ 1.04`). What survived is the repair loop itself — a
+cheap ≤5-episode, 1-epoch-at-LR=1e-5-per-episode, re-probe-between-episodes
+loop that recovers ~91.5% (B) / ~95% (C2) of unchanged keys from a
+post-overwrite retention floor of ~4.5%, with `alignment_delta` ~0.8–0.9
+across all seeds (post-overwrite forgetting is decoding-misalignment, not
+weight-erasure). So the lever worth a sensitivity study is the **repair
+primitive**, not the scaffold. Test 16 characterises it across two encoding
+depths (D=30, D=50) and a 6-cell `repair_lr` × `repair_epochs_per_episode`
+grid, with one weight-decay spot-check — B-path only (Test 15 showed the
+repair loop is path-agnostic).
+
+### N≈50 / K≈12 rationale
+
+Shrinking from Test 15's N=100 / K=20 to N=50 / K=12 (24% swap fraction vs
+20%) reduces per-epoch cost by ≈0.55× while keeping a large-enough unchanged
+set (38 keys) for meaningful per-episode retention curves. The encoding floor
+at N=50 is expected around epoch 20–25 (extrapolated from Test 15's
+`stable_perfect_epoch` distribution).
+
+### No-early-stop pin
+
+Pretrain and overwrite phases run the **full epoch budget** with no early stop.
+Early stop is disabled by passing `EarlyStopPolicy(signal_from_epoch=10**9)` —
+the probe still fires every epoch (so `epoch_log.json` + `stable_perfect_epoch`
+populate for encoding-floor analysis) but the stop trigger never fires.
+This ensures the overwrite epoch budget is identical across all D, holding
+corruption level constant as a fixed-epoch invariant. The aggregator flags the
+depth comparison as confounded if cross-D RP2 spread exceeds the cross-seed CI
+half-width.
+
+### Protocol
+
+| Phase | What it does | Epoch budget | LR decay |
+|---|---|---|---|
+| pretrain (`base_D`) | Fresh `episodic` adapter on N keys | D ∈ {30, 50} | `decay_steps_for(N, D)` |
+| overwrite (`corrupted_D`) | Continue training on K swap keys (new answers) | 20 (fixed, all D) | `decay_steps_for(K, 20)` |
+| repair cells | Reload `corrupted_D`; run `run_repair_loop_v2` on failing unchanged keys | ≤5 episodes | None |
+
+### Repair grid
+
+| Cell | `repair_lr` | `repair_epochs_per_episode` | `repair_weight_decay` | Note |
+|---|---|---|---|---|
+| 1 | 1e-5 | 1 | 0.01 | baseline (matches Test 15) |
+| 2 | 2e-5 | 1 | 0.01 | LR ×2 |
+| 3 | 5e-5 | 1 | 0.01 | LR ×5 |
+| 4 | 1e-5 | 3 | 0.01 | ep ×3 |
+| 5 | 2e-5 | 3 | 0.01 | LR ×2, ep ×3 |
+| 6 | 5e-5 | 3 | 0.01 | LR ×5, ep ×3 |
+| 7 (spot-check) | 1e-5 | 1 | **0.1** | wd spot-check at D=30 only |
+
+Both depths D=30 and D=50 run cells 1–6.  Cell 7 runs for D=30 only.
+
+### New Test-16 metrics
+
+After each repair cell, two overwrite-integrity probes run via `_safe_probe`:
+
+- **`overwrite_recall_after_repair`** — probe `overwrite_swap_keyed` (new answers);
+  < 0.95 ⇒ repair leaked into the swap set.
+- **`original_answer_resurfaced_rate`** — probe `overwritten_keyed` (original
+  answers); > 0.0 ⇒ active reversion (not just degradation).
+
+### Output layout
+
+```
+outputs/test16_repair_sweep/mistral/<ts>/
+  run_config.json               # frozen at first launch (includes repair_grid)
+  test16_aggregate.json         # recomputed after each (seed, D)
+  paused.json                   # boundary-pause marker
+  seed42/
+    base_30/                    # episodic_adapter/, epoch_log.json, base_30_done.json
+    base_50/
+    corrupted_30/               # episodic_adapter/, unchanged_keyed.json,
+                                #   overwrite_swap_keyed.json, overwritten_keyed.json,
+                                #   corrupted_30_done.json
+    corrupted_50/
+    repair_30_lr1e-05_ep1/      # repair_log.json, cell_result.json,
+                                #   episodic_adapter_repaired/, *_done.json
+    repair_30_lr2e-05_ep1/ ...
+    repair_30_lr5e-05_ep1/ ...
+    repair_30_lr1e-05_ep3/ ...
+    repair_30_lr2e-05_ep3/ ...
+    repair_30_lr5e-05_ep3/ ...
+    repair_30_lr1e-05_ep1_wd0.1/  # weight-decay spot-check
+    repair_50_lr1e-05_ep1/ ... (6 cells)
+  seed7/ ... seed1337/ ... seed1/ ... seed11/ ...
+```
+
+Smoke run writes to `outputs/test16_repair_sweep/mistral/_smoke/<ts>/`;
+`tresume 16` always excludes `_smoke/` when finding the latest run dir.
+
+### Placeholder results table
+
+| Axis | D | repair_lr | repair_ep | weight_decay | mean_RP2 | mean_RP3 | mean_episodes | overwrite_after_repair |
+|---|---|---|---|---|---|---|---|---|
+| depth (lr=1e-5, ep=1, wd=0.01) | 30 | — | — | — | TBD | TBD | TBD | TBD |
+| depth | 50 | — | — | — | TBD | TBD | TBD | TBD |
+| lr (D=30, ep=1, wd=0.01) | — | 1e-5 | — | — | TBD | TBD | TBD | TBD |
+| lr | — | 2e-5 | — | — | TBD | TBD | TBD | TBD |
+| lr | — | 5e-5 | — | — | TBD | TBD | TBD | TBD |
+| ep (D=30, lr=1e-5, wd=0.01) | — | — | 1 | — | TBD | TBD | TBD | TBD |
+| ep | — | — | 3 | — | TBD | TBD | TBD | TBD |
+| wd spot-check (D=30, lr=1e-5, ep=1) | — | — | — | 0.01 | TBD | TBD | TBD | TBD |
+| wd spot-check | — | — | — | 0.10 | TBD | TBD | TBD | TBD |
+
+All results exploratory — no pass/fail gate.
+
+### Concerns
+
+- Fixed `overwrite_epochs=20` is a guess (Test 15's B stopped at e16–e29 under
+  early-stop). Smoke gate checks: 0 < rp2_exact_count < unchanged_total AND
+  episode_1_retention > rp2_rate AND overwrite_recall_rate ≥ 0.95.
+- The cross-D RP2 spread is the primary confound in the depth axis; the
+  aggregator flags it when `|mean_RP2(D50) − mean_RP2(D30)| > CI half-width`.
+  `weight_decay` spot-check covers single LR (1e-5) only — no LR×wd interaction.
 
 ---
 
