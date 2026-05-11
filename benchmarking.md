@@ -1135,10 +1135,12 @@ Other approaches from literature:
 
 ---
 
-## Test 8: Large-Scale Incremental (500-Key Target)
+## Test 8: Large-Scale Incremental (500-Key Target) — RETIRED (superseded by Test 17)
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** IN PROGRESS — 56 cycles complete, **536 keys**, 100% recall (2026-04-08). Running. No ceiling found.
+**Status:** RETIRED 2026-05-11 — superseded by **Test 17** (quadruple-encoded indexed-key adapter at scale, 550 keys, 100% strict, one 30-epoch full-replay pass). Test 8 used the QA-pair encoding with incremental full-replay (56 cycles to reach 550 keys, multi-day wall time, no mid-training recall probes); Test 17 is the canonical scaling reference under the new production encoding decision. Numbers below preserved for historical comparison.
+
+**Original status (before retirement):** IN PROGRESS — 56 cycles complete, **536 keys**, 100% recall (2026-04-08). Running. No ceiling found.
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -3808,3 +3810,80 @@ via replay. True incremental learning without replay remains unsolved
 the systemd timer fires outside active hours, interim adapters cover
 sub-cycle recall, and the epoch-resume mechanism lets a single cycle span
 wall-clock interruptions. Listed as future work.
+
+---
+
+## Test 17: Quadruple-Encoded Indexed-Key Adapter at Scale
+
+**Scripts:** `experiments/quadruple_adapter.py` (the adapter / training / probe), `experiments/lme_graph_builder.py` (LongMemEval → graph), `experiments/utils/quadruple_format.py` (format helpers). Plus the probes: `experiments/reverse_extraction_fidelity.py`, `reasoning_fluency_probe.py`, `direct_recall_probe.py`, `lme_qa_from_triples_probe.py`.
+**Status:** **DONE 2026-05-11 — decision recorded.** Replaces Test 8 as the canonical indexed-key scaling reference.
+
+### Decision
+
+Production indexed-key memory **switches from the QA-pair encoding** `(key, question, answer)` **to the quadruple encoding** `(key, subject, predicate, object)` — i.e., train the adapter directly on the merged-graph triples and drop the LLM-mediated QA-generator step. One training example per fact, no standalone-natural-question second example. Implementation is a staged refactor (see the project's internal migration plan); the historical Test-8 numbers stay in this document for the QA-pair encoding's record.
+
+### Why
+
+Today's pipeline runs `extractor → graph triples → QA generator (LLM) → (key, question, answer) → train (2 examples/fact)`. The quadruple pipeline runs `extractor → graph triples → (key, subject, predicate, object) → train (1 example/fact)` — dropping the QA-generator LLM call and the standalone-natural-question training example. The case for the switch, measured this session:
+
+| Axis | QA-pair encoding | Quadruple encoding |
+|---|---|---|
+| Round-trip fidelity to source triples (reverse-extract from recalled unit → source `(s,p,o)`) | **32.1% strict / 70.5% subj+obj** (A1, 193 CV-cycle kps; predicate paraphrase dominant) | **100% strict / 100% subj+obj** (A2 at 95 keys *and* 550 keys) |
+| Per-fact training cost | 2 examples/fact (`format_indexed_training`, `paramem/training/indexed_memory.py:345-386`) | 1 example/fact (`format_quadruple_training`) |
+| LLM calls per cycle | extractor + QA-gen | extractor only |
+| Recalled-fact context (what the reasoner sees) | bare `- {answer}` bullet (`inference.py:722`) — drops the subject | `- {subject} {predicate} {object}` — carries it |
+| Reasoning over recalled context | (A2.1 baseline) | A2.1: **≈ wash**; the triple form is *strictly better on anchored facts* (Q14: `- Nov 2014` is uninterpretable, `- Senior Software Project Manager end date Nov 2014` is not) |
+| Natural-language recall path (adapter answers plain NL question, no context) | ~99% on training-question wordings; unreliable on novel phrasings (`feedback_recall_then_reason`) | A22: **≈ base-model floor** — by design (the dropped NL training example is what the QA adapter spends 2× per-fact on). Re-addable as a separate adapter; production's interface is the keyed prompt anyway. |
+
+### Round-trip fidelity at scale
+
+| Run | Source graph | n_keys | Strict triple recovery | subj+obj | predicate drift | parse failures | Wall time |
+|---|---|---|---|---|---|---|---|
+| A2 (95-key) | `data/ha/debug/run_20260510T170022Z_8c1cca/cycle_26/graph_snapshot.json` (CV) | 95 | **100%** | 100% | 0% | 0 | train ~24 min + probe ~1 min (~25 min total) |
+| A2 (550-key) | `outputs/lme_graph/graph_snapshot.json` (LongMemEval, 227/948 sessions extracted) | 550 | **100%** | 100% | 0% | 0 | train ~1 h 49 m (early-stopped epoch 22, `first_perfect_epoch=20`) + probe ~28 min (~2 h 17 m total) |
+
+Training config (`paramem/utils/config.TrainingConfig`): rank 8, alpha 16, `num_epochs=30` (early-stopped at 22), batch 1, grad-accum 2, linear LR scheduler, warmup_steps=30, weight_decay=0.1, recall-based early stop probing every epoch from epoch 20 over a fixed seeded 100-key sample (`_QuadRecallEarlyStop` in `quadruple_adapter.py`). The 100% strict on the *full* 550-key probe-phase confirms the sampled-perfect-by-epoch-20 generalised.
+
+**Caveat:** convergence by epoch ≤ 20 at 550 keys is a *headroom hint* — the actual capacity ceiling is **unmeasured**. Test 8's "no ceiling found at 550" plus Test 17's early-convergence-at-550 together support "capacity > 550", not anything tighter. Whether the quadruple format converges *faster* than the QA format at the same N is **not established** (Test 8 trained 30 epochs by default with no mid-training recall probes; no matched baseline).
+
+### Reasoning fluency probe (A2.1)
+
+`reasoning_fluency_probe.py` — apples-to-apples: same 93-fact set (the 95 cycle_26 triples that have ≥ 1 matching kp in the CV simulate kp store, mapped via `(source_subject, source_predicate, source_object)`), 15 natural-language questions, base Mistral with adapter disabled, **same identical system prompt** for both context shapes. Output: `outputs/reasoning_fluency/20260511_140725/`.
+
+Result: **≈ a wash** on overall correctness (crude `contains_truth` heuristic 12/15 QA vs 11/15 triple — within noise, the scorer has false positives on token-overlap with the question echo). The substantive observation is on **anchored facts**: production's QA context is bare answer bullets (`- Nov 2014`) which the reasoner cannot connect to the *subject* of the fact; the triple context (`- Senior Software Project Manager end date Nov 2014`) carries it and the reasoner answers correctly. The triple form is **strictly better** in that case; never strictly worse beyond one awkward predicate-phrasing case (Q8 — a predicate `transformed` with a run-on object). Verbosity-on-collision-key questions ("what is X skilled at?" → 20-item skill list) is shared by both — independent of the encoding (a QA-generator collision-key artifact).
+
+### Direct-recall probe (A22)
+
+`direct_recall_probe.py` — 15 questions, three conditions:
+1. `adapter_natural` (adapter active, natural question, no context)
+2. `base_natural` (adapter disabled, same question)
+3. `adapter_keyed` (`"Recall the fact stored under key 'graphN'."`)
+
+Output: `outputs/direct_recall/20260511_145102/`. Result: `adapter_natural` ≈ `base_natural` (~1/15 genuine), `adapter_keyed` = **15/15 (100%)**. The quadruple adapter is a pure keyed-retrieval device; the keyed prompt is the only working interface — exactly as the design intends (the dropped NL training example is what the QA adapter spends 2× per-fact on). Production's inference path is keyed-probe-then-reason, not NL-probe-the-adapter, so this is not a real loss; re-addable as a separate adapter per tier if a use case ever appears.
+
+### LongMemEval QA from triples (`lme_qa_from_triples_probe.py`)
+
+Negative-but-useful result, included per "store negative results in benchmarking.md alongside positive ones" (CLAUDE.md).
+
+Setup: of LongMemEval's 500 `longmemeval_oracle` question_ids, our 227 extracted sessions fully cover **88** — all of them `temporal-reasoning` (60) or `multi-session` (28); the easier types' answer sessions are past session 227. Sampled 40 (20 + 20). Base Mistral, no adapter; feed the recalled triples as context; answer LongMemEval's own question; score vs LongMemEval ground truth + an LLM-judge ("does the candidate convey the same info as the reference? YES/NO").
+
+| Run | Context | judge-correct | contains-truth |
+|---|---|---|---|
+| All 550 triples | all recalled triples in the prompt | 8/40 (20%) | 5/40 (12.5%) |
+| Oracle retrieval | per-question, only the evidence-session triples (~0–29 each) | 5/40 (12.5%) | 7/40 (17.5%) |
+
+The 8 "judge-correct" cases are inflated — only ~2 are genuine (Q6 and Q32, where LongMemEval's own ground truth IS an abstention "you didn't mention this"); the other ~6 are LLM-judge false positives (the model wrongly abstained on questions with real answers, and the lenient judge said YES). **Real correct-substantive-answer count: ~1 + ~2 correct abstentions out of 40.** Oracle retrieval doesn't help → **context dilution is not the bottleneck.** One genuine win in oracle mode: Q3 "how many cuisines have I tried?" (GT=4) — with all 550 triples the model said "no clear indication"; with just the 29 evidence triples it answered "Ethiopian, Indian, Vegan(Italian), Korean…" and the judge said YES — so dilution does hurt *some* aggregation cases, but it's the exception.
+
+**Root cause** (probe `triples_from_evidence_sessions` listings, examined per-question): the extraction pipeline produces *topical/abstracted* triples (`experiments with bitters`, `consulted Dr. Lee`, `saw beautiful_bungalow`) rather than *enumerable instance-level* facts (`used lemon`, `visited dermatologist`, `viewed property X`) — counting/aggregation questions cannot be answered even with perfect retrieval. Compounded by: the triples carry **no temporal metadata** (deliberately — temporal metadata in the registry, not training data — but the registry-side population is unbuilt today), so "which X first / most recently / how long between" is unanswerable.
+
+**Both limits are upstream of the encoding choice and shared with the QA pipeline** (same extractor, same no-temporal-metadata design). The LME-QA result is therefore *not a quadruple-encoding regression*; it characterises a known set of pipeline gaps (extraction granularity, temporal-metadata plumbing, count-aware retrieval). The model never confabulated — every miss was a clean "the facts don't contain this," which is the desired failure mode. Outputs: `outputs/lme_qa_probe/20260511_215110/` (all-550) and `outputs/lme_qa_probe/20260511_225824/` (oracle).
+
+### What the switch buys / costs (summary)
+
+- ✅ 100% faithful round-trip to the source graph (vs 32% via the QA-generator detour).
+- ✅ ~½ the per-fact training cost (1 example vs 2); the QA-generator LLM call is removed entirely.
+- ✅ Recalled facts carry the subject; the reasoner gains anchored-fact answers (A2.1 Q14).
+- ≈ Reasoning over recalled context unchanged on the median question; strictly better on anchored facts.
+- ⚠️ No natural-language-recall path on the quadruple adapter (A22) — re-addable as a separate adapter per tier; production's interface is the keyed prompt.
+- (Unrelated to the encoding — *known gaps shared with the QA pipeline*: temporal-question recovery is gated on temporal metadata in the registry; counting/aggregation recovery is gated on enumerable instance-level extraction and a count-aware retrieval. Both are tracked separately.)
+
