@@ -246,6 +246,7 @@ def handle_chat(
     language: str | None = None,
     known_entities: set[str] | None = None,
     effective_mode: str | None = None,
+    adapter_formats: dict[str, str] | None = None,
 ) -> ChatResult:
     """Process a chat message via intent-keyed dispatch.
 
@@ -267,6 +268,9 @@ def handle_chat(
     When ``config.debug`` is True a per-request routing-decision
     diagnostic is emitted via ``logging.info(extra={"routing": …})`` at
     function exit.
+
+    ``adapter_formats`` maps adapter name → ``"qa"`` | ``"quad"``.
+    ``None`` defaults all adapters to ``"qa"`` (backward-compatible).
     """
     routing_diags: dict = {
         "conversation_id": conversation_id,
@@ -330,6 +334,7 @@ def handle_chat(
                 language=language,
                 effective_mode=effective_mode,
                 is_personal=True,
+                adapter_formats=adapter_formats,
             )
 
         # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
@@ -641,6 +646,7 @@ def _probe_and_reason(
     language: str | None = None,
     is_personal: bool = False,
     effective_mode: str | None = None,
+    adapter_formats: dict[str, str] | None = None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -658,6 +664,11 @@ def _probe_and_reason(
     Privacy gate: ``is_personal`` flows through to every internal SOTA
     fallback site (no-layers branch, base-model fallthrough, post-reason
     [ESCALATE]).  Personal-class queries never reach the cloud.
+
+    ``adapter_formats`` maps adapter name → ``"qa"`` | ``"quad"``.
+    ``None`` defaults all adapters to ``"qa"`` (backward-compatible).
+    Each key result carries a ``fact_text`` field pre-rendered for the
+    bullet list regardless of format.
     """
     from peft import PeftModel
 
@@ -695,7 +706,11 @@ def _probe_and_reason(
     # whole pending window. Falls through to the yaml mode otherwise.
     _active_mode = effective_mode if effective_mode else config.consolidation.mode
     if _active_mode == "simulate":
-        probe_results = probe_keys_from_disk(config.simulate_dir, keys_by_adapter)
+        probe_results = probe_keys_from_disk(
+            config.simulate_dir,
+            keys_by_adapter,
+            formats_by_adapter=adapter_formats,
+        )
     else:
         # One switch_adapter call per adapter group.
         probe_results = probe_keys_grouped_by_adapter(
@@ -703,6 +718,7 @@ def _probe_and_reason(
             tokenizer,
             keys_by_adapter,
             registry=registry,
+            formats_by_adapter=adapter_formats,
         )
 
         # Restore predictable adapter state: episodic is the main adapter for
@@ -720,7 +736,11 @@ def _probe_and_reason(
         for key in step.keys_to_probe:
             result = probe_results.get(key)
             if result and "failure_reason" not in result:
-                layer_facts.append(f"- {result.get('answer', '')}")
+                # fact_text is guaranteed on every success result from
+                # probe_keys_grouped_by_adapter / probe_keys_from_disk
+                # post-3b.  The get() fallback covers mocked/legacy callers
+                # that return a bare {answer: ...} dict without the field.
+                layer_facts.append(f"- {result.get('fact_text', result.get('answer', ''))}")
                 successful_keys.append(key)
 
         if layer_facts:

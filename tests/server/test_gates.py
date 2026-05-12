@@ -2,7 +2,8 @@
 
 All tests run without GPU.  The model and tokenizer are MagicMocks.
 ``paramem.training.indexed_memory.probe_key`` is patched in every test that
-exercises gates 3 or 4.  Registry files are written to ``tmp_path``.
+exercises gates 3 or 4 in QA mode.  ``paramem.training.quadruple_memory.probe_quad``
+is patched for quad-mode tests.  Registry files are written to ``tmp_path``.
 
 Coverage targets (spec §Tests):
   - Each gate's pass/fail/skip paths including the 2 new skip conditions.
@@ -22,6 +23,9 @@ Coverage targets (spec §Tests):
   - Unmount: delete_adapter NOT called when trial_probe is the sole adapter.
   - Unmount survives delete_adapter raising.
   - Enriched registry format ({key: {"simhash": int, ...}}) works in gate 4.
+  - Gate 3 quad-path: read_keyed_pairs_quad + probe_quad → PASS / FAIL.
+  - Gate 4 quad-path: probe_quad + quad verify_confidence → PASS.
+  - Gate 4 cross-format skip (indexed_format != live_registry_format).
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ from paramem.server.gates import (
     _unmount_trial_probe,
     evaluate_gates,
 )
+from paramem.training.keyed_pairs_io import write_keyed_pairs_quad
 
 
 @pytest.fixture(autouse=True)
@@ -965,6 +970,264 @@ class TestEvaluateGatesNoNewSessions:
         assert "import torch" not in top_level_src
         assert "import peft" not in top_level_src
         assert "import transformers" not in top_level_src
+
+
+# ---------------------------------------------------------------------------
+# Gate 3 — quad path (indexed_format="quad")
+# ---------------------------------------------------------------------------
+
+
+def _make_trial_adapter_quad(tmp_path: Path) -> Path:
+    """Create a minimal trial adapter directory with quad-format keyed_pairs.json.
+
+    Uses the six-field quad schema required by ``read_keyed_pairs_quad``.
+    """
+    d = tmp_path / "trial_adapter_quad"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "adapter_config.json").write_text("{}")
+    (d / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
+    quad_pairs = [
+        {
+            "key": "graph1",
+            "subject": "Alex",
+            "predicate": "lives_in",
+            "object": "Heilbronn",
+            "speaker_id": "spk1",
+            "first_seen_cycle": 1,
+        },
+        {
+            "key": "graph2",
+            "subject": "Alex",
+            "predicate": "works_at",
+            "object": "Acme",
+            "speaker_id": "spk1",
+            "first_seen_cycle": 1,
+        },
+    ]
+    write_keyed_pairs_quad(d / "keyed_pairs.json", quad_pairs)
+    return d
+
+
+class TestGate3AdapterReloadQuad:
+    """Gate 3 quad-path: read_keyed_pairs_quad + probe_quad dispatch."""
+
+    def test_pass_successful_quad_probe(self, tmp_path):
+        """Successful mount + probe_quad → PASS."""
+        trial_dir = _make_trial_adapter_quad(tmp_path)
+        model = _make_mock_model()
+        tokenizer = MagicMock()
+
+        probe_result = {
+            "key": "graph1",
+            "subject": "Alex",
+            "predicate": "lives_in",
+            "object": "Heilbronn",
+            "confidence": 0.95,
+            "raw_output": (
+                '{"key": "graph1", "subject": "Alex", '
+                '"predicate": "lives_in", "object": "Heilbronn"}'
+            ),
+        }
+
+        with patch("paramem.training.quadruple_memory.probe_quad", return_value=probe_result):
+            g = _gate_3_reload_smoke(
+                session_buffer_empty=False,
+                summary={"status": "complete"},
+                model=model,
+                tokenizer=tokenizer,
+                trial_adapter_dir=trial_dir,
+                mount_state={},
+                indexed_format="quad",
+            )
+
+        assert g.status == "pass"
+        assert g.gate == 3
+
+    def test_fail_probe_quad_returns_failure_reason(self, tmp_path):
+        """probe_quad returning failure_reason dict → gate 3 FAIL."""
+        trial_dir = _make_trial_adapter_quad(tmp_path)
+        model = _make_mock_model()
+
+        fail_result = {"raw_output": "", "failure_reason": "quad_parse_failure"}
+
+        with patch("paramem.training.quadruple_memory.probe_quad", return_value=fail_result):
+            g = _gate_3_reload_smoke(
+                session_buffer_empty=False,
+                summary={"status": "complete"},
+                model=model,
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                mount_state={},
+                indexed_format="quad",
+            )
+
+        assert g.status == "fail"
+        assert "quad_parse_failure" in g.reason
+
+    def test_skipped_empty_buffer_quad(self, tmp_path):
+        """session_buffer_empty=True → SKIPPED regardless of indexed_format."""
+        g = _gate_3_reload_smoke(
+            session_buffer_empty=True,
+            summary=None,
+            model=_make_mock_model(),
+            tokenizer=MagicMock(),
+            trial_adapter_dir=tmp_path / "trial_adapter",
+            mount_state={},
+            indexed_format="quad",
+        )
+        assert g.status == "skipped"
+
+    def test_default_qa_path_unchanged(self, tmp_path):
+        """Default indexed_format='qa' uses probe_key, not probe_quad."""
+        trial_dir = _make_trial_adapter(tmp_path)
+        model = _make_mock_model()
+
+        probe_result = {
+            "key": "graph1",
+            "question": "Q?",
+            "answer": "A.",
+            "confidence": 1.0,
+            "raw_output": '{"key": "graph1", "question": "Q?", "answer": "A."}',
+        }
+
+        with patch(
+            "paramem.training.indexed_memory.probe_key", return_value=probe_result
+        ) as mock_qa_probe:
+            with patch("paramem.training.quadruple_memory.probe_quad") as mock_quad_probe:
+                g = _gate_3_reload_smoke(
+                    session_buffer_empty=False,
+                    summary={"status": "complete"},
+                    model=model,
+                    tokenizer=MagicMock(),
+                    trial_adapter_dir=trial_dir,
+                    mount_state={},
+                    # default indexed_format="qa" — probe_key must be used
+                )
+
+        assert g.status == "pass"
+        assert mock_qa_probe.called
+        assert not mock_quad_probe.called
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 — quad path (indexed_format="quad")
+# ---------------------------------------------------------------------------
+
+
+def _make_quad_registry(n: int, tmp_path: Path, fname: str = "registry_quad.json") -> Path:
+    """Write a flat registry with ``n`` keys (quad simhashes are integers like QA)."""
+    registry = {f"qgraph{i}": i * 7919 + 3 for i in range(1, n + 1)}
+    p = tmp_path / fname
+    p.write_text(json.dumps(registry))
+    return p
+
+
+class TestGate4RecallCheckQuad:
+    """Gate 4 quad-path: probe_quad + quad verify_confidence dispatch."""
+
+    def test_pass_quad_20_of_20(self, tmp_path):
+        """20/20 quad probes passing → PASS."""
+        reg_path = _make_quad_registry(25, tmp_path)
+        trial_dir = _make_trial_adapter_quad(tmp_path)
+        model = _make_mock_model()
+
+        def _probe_quad(m, tok, key, registry=None, **kw):
+            return {
+                "key": key,
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Heilbronn",
+                "confidence": 1.0,
+                "raw_output": (
+                    f'{{"key": "{key}", "subject": "Alex", '
+                    '"predicate": "lives_in", "object": "Heilbronn"}'
+                ),
+            }
+
+        with patch("paramem.training.quadruple_memory.probe_quad", side_effect=_probe_quad):
+            with patch("paramem.training.quadruple_memory.verify_confidence", return_value=1.0):
+                g = _gate_4_recall_check(
+                    model=model,
+                    tokenizer=MagicMock(),
+                    trial_adapter_dir=trial_dir,
+                    live_registry_path=reg_path,
+                    mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
+                    indexed_format="quad",
+                    live_registry_format="quad",
+                )
+
+        assert g.status == "pass"
+        assert g.metrics["retried"] is False
+
+    def test_skipped_cross_format_transition(self, tmp_path):
+        """indexed_format='quad' != live_registry_format='qa' → SKIPPED."""
+        reg_path = _make_registry(25, tmp_path)
+        trial_dir = _make_trial_adapter_quad(tmp_path)
+        model = _make_mock_model()
+
+        g = _gate_4_recall_check(
+            model=model,
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            live_registry_path=reg_path,
+            mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
+            indexed_format="quad",
+            live_registry_format="qa",
+        )
+
+        assert g.status == "skipped"
+        assert "format-transition" in g.reason
+        assert "quad" in g.reason
+
+    def test_skipped_cross_format_reverse(self, tmp_path):
+        """indexed_format='qa' != live_registry_format='quad' → SKIPPED."""
+        reg_path = _make_quad_registry(25, tmp_path)
+        trial_dir = _make_trial_adapter(tmp_path)
+        model = _make_mock_model()
+
+        g = _gate_4_recall_check(
+            model=model,
+            tokenizer=MagicMock(),
+            trial_adapter_dir=trial_dir,
+            live_registry_path=reg_path,
+            mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
+            indexed_format="qa",
+            live_registry_format="quad",
+        )
+
+        assert g.status == "skipped"
+        assert "format-transition" in g.reason
+
+    def test_default_qa_path_unchanged_gate4(self, tmp_path):
+        """Default indexed_format='qa' / live_registry_format='qa' uses probe_key."""
+        reg_path = _make_registry(25, tmp_path)
+        trial_dir = _make_trial_adapter(tmp_path)
+        model = _make_mock_model()
+
+        def _probe_qa(m, tok, key, registry=None, **kw):
+            return {
+                "key": key,
+                "question": "Q?",
+                "answer": "A.",
+                "confidence": 1.0,
+                "raw_output": f'{{"key": "{key}", "question": "Q?", "answer": "A."}}',
+            }
+
+        with patch("paramem.training.indexed_memory.probe_key", side_effect=_probe_qa) as mock_qa:
+            with patch("paramem.training.quadruple_memory.probe_quad") as mock_quad:
+                with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
+                    g = _gate_4_recall_check(
+                        model=model,
+                        tokenizer=MagicMock(),
+                        trial_adapter_dir=trial_dir,
+                        live_registry_path=reg_path,
+                        mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
+                        # defaults: indexed_format="qa", live_registry_format="qa"
+                    )
+
+        assert g.status == "pass"
+        assert mock_qa.called
+        assert not mock_quad.called
 
 
 # ---------------------------------------------------------------------------

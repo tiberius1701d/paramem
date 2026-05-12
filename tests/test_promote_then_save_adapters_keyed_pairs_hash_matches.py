@@ -121,6 +121,11 @@ def _make_loop(tmp_path: Path) -> ConsolidationLoop:
     registry_path = tmp_path / "indexed_key_registry.json"
     loop.indexed_key_registry.save(registry_path)
 
+    # _is_quad / _indexed_format are set by __init__; tests that bypass
+    # __init__ via __new__ / object.__new__ must set them explicitly.
+    loop._indexed_format = "qa"
+    loop._is_quad = False
+
     return loop
 
 

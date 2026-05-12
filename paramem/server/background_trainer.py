@@ -82,7 +82,7 @@ def _fingerprint_keyed_pairs(keyed_pairs: list[dict]) -> str:
     """Return a SHA-256 hex digest of the canonical serialisation of keyed_pairs.
 
     Order-sensitive: two lists with the same items in different orders produce
-    different fingerprints.  This is intentional — the QA generator output
+    different fingerprints.  This is intentional — the distillation output
     order encodes the key insertion sequence, so a genuinely identical job
     produces identical pairs in the same order.
 
@@ -228,6 +228,8 @@ class BackgroundTrainer:
         training_config: TrainingConfig,
         output_dir: str | Path = "data/ha/adapters",
         thermal_policy: ThermalPolicy | None = None,
+        *,
+        indexed_format: str = "qa",
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -240,6 +242,11 @@ class BackgroundTrainer:
         # don't override the default get fast unthrottled runs by
         # construction.  Live-server only when a non-zero limit is set.
         self._thermal_policy = thermal_policy
+        # Indexed key training format: ``"qa"`` (default) or ``"quad"``.
+        # Passed explicitly by callers that have a ``ServerConfig`` in scope
+        # (``app.py`` passes ``config.consolidation.indexed_format``).  The
+        # ``TrainingConfig`` received here does not carry this field.
+        self._indexed_format = indexed_format
 
         self._inference_requested = threading.Event()
         self._inference_done = threading.Event()
@@ -861,7 +868,13 @@ class BackgroundTrainer:
         switch_adapter(self.model, "in_training")
         self.model.train()
 
-        examples = format_indexed_training(job.keyed_pairs, self.tokenizer, max_length=1024)
+        if self._indexed_format == "quad":
+            from paramem.training.quadruple_memory import (
+                format_quadruple_training as _fmt,
+            )
+        else:
+            _fmt = format_indexed_training
+        examples = _fmt(job.keyed_pairs, self.tokenizer, max_length=1024)
         dataset = _SimpleDataset(examples)
 
         if not examples:
@@ -969,6 +982,7 @@ class BackgroundTrainer:
                 production_name,
                 registry_path=registry_path if registry_path.exists() else None,
                 keyed_pairs_path=kp_path if kp_path.exists() else None,
+                indexed_format=self._indexed_format,
             )
         except Exception:
             logger.warning(

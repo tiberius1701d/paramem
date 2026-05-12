@@ -2161,6 +2161,10 @@ class TestCollectSemanticKeys:
                     "proc1": {"key": "proc1", "question": "QP", "answer": "AP"},
                 }
                 self.semantic_simhash = {"graph1": 12345}
+                # _is_quad / _indexed_format must be set on any object that
+                # binds ConsolidationLoop methods directly.
+                self._indexed_format = "qa"
+                self._is_quad = False
 
         from paramem.training.consolidation import ConsolidationLoop
 

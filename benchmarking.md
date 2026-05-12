@@ -1,8 +1,11 @@
 # ParaMem Benchmarking Suite
 
 Comprehensive evaluation of parametric memory across realistic scenarios.
-Each model owns the full pipeline end-to-end: graph extraction → QA generation →
-indexed key training → recall evaluation.
+Each model owns the full pipeline end-to-end: graph extraction → indexed-key
+encoding → indexed key training → recall evaluation. (The keyed-fact encoding
+moved from the LLM-generated `(key, question, answer)` form to the
+`(key, subject, predicate, object)` quadruple form — see Test 17; Tests 1–16
+were run on the QA-pair encoding and their numbers stand as recorded.)
 
 ## Benchmark Models
 

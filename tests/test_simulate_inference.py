@@ -46,6 +46,7 @@ import pytest
 from paramem.server.config import PathsConfig, load_server_config
 from paramem.server.inference import ChatResult, handle_chat
 from paramem.server.router import Intent, RoutingPlan, RoutingStep
+from paramem.training.keyed_pairs_io import write_keyed_pairs_quad
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -652,11 +653,15 @@ class TestSimulateInferenceEndToEnd:
         tokenizer = _chat_template_tokenizer()
 
         # Simulate a successful adapter probe result for train mode.
+        # fact_text is required on every success result post-3b (bullet loop
+        # uses result["fact_text"]).
         adapter_probe_result = {
             "graph1": {
                 "question": "Where does Alex live?",
                 "answer": "TRAIN-from-adapter",
                 "confidence": 0.95,
+                "format": "qa",
+                "fact_text": "TRAIN-from-adapter",
             }
         }
 
@@ -696,4 +701,75 @@ class TestSimulateInferenceEndToEnd:
         assert "DECOY-from-simulate" not in prompt_arg, (
             f"'DECOY-from-simulate' must not appear in train-mode prompt, "
             f"but found it in: {prompt_arg!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # T-quad: quad simulate store — de-underscored bullet reaches prompt
+    # ------------------------------------------------------------------
+
+    def test_quad_simulate_store_fact_text_in_prompt(self, tmp_path):
+        """Quad keyed_pairs.json in simulate store → de-underscored bullet in prompt.
+
+        This is the A2.1 win (the subject is no longer dropped): the fact
+        ``Alex lives_in Heilbronn`` becomes the bullet
+        ``"Alex lives in Heilbronn"`` (predicate de-underscored) in the
+        context assembled by ``_probe_and_reason``.
+
+        Setup:
+        - ``paths.simulate/episodic/keyed_pairs.json`` written via
+          ``write_keyed_pairs_quad`` with one quad entry.
+        - ``adapter_formats={"episodic":"quad"}`` passed to ``handle_chat``.
+        - Config is simulate mode.
+
+        Assertions:
+        - ``generate_answer`` called once.
+        - Prompt contains ``"Alex lives in Heilbronn"`` (de-underscored triple).
+        - QA-style ``"Heilbronn."`` single token (without subject/predicate) must
+          NOT be the only content — the subject and predicate must be present.
+        """
+        config = _simulate_config(tmp_path)
+
+        quad_pair = {
+            "key": "graph1",
+            "subject": "Alex",
+            "predicate": "lives_in",
+            "object": "Heilbronn",
+            "speaker_id": "spk-test",
+            "first_seen_cycle": 1,
+        }
+        kp_path = config.simulate_dir / "episodic" / "keyed_pairs.json"
+        kp_path.parent.mkdir(parents=True, exist_ok=True)
+        write_keyed_pairs_quad(kp_path, [quad_pair])
+
+        router = _pa_router_stub("episodic", ["graph1"])
+        model = _stub_model()
+        tokenizer = _chat_template_tokenizer()
+
+        with patch(
+            "paramem.server.inference.generate_answer",
+            return_value="Alex lives in Heilbronn.",
+        ) as mock_ga:
+            result = handle_chat(
+                text="Where does Alex live?",
+                conversation_id="t-quad-simulate-test",
+                speaker="Alex",
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                router=router,
+                sota_agent=None,
+                ha_client=None,
+                speaker_id="spk-test",
+                adapter_formats={"episodic": "quad"},
+            )
+
+        assert result.escalated is False
+        assert "graph1" in result.probed_keys
+
+        mock_ga.assert_called_once()
+        prompt_arg = str(mock_ga.call_args.args[2])
+        # The de-underscored triple must appear as a bullet in the prompt.
+        assert "Alex lives in Heilbronn" in prompt_arg, (
+            f"De-underscored quad fact not found in prompt: {prompt_arg!r}"
         )

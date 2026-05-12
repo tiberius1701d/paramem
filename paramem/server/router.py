@@ -285,11 +285,30 @@ class QueryRouter:
 
     def _load_keyed_pairs(self, adapter_name: str, path: Path) -> None:
         """Index entities from a keyed_pairs.json file.  Transparently
-        decrypts age-wrapped content when the daily identity is loaded."""
-        from paramem.training.keyed_pairs_io import read_keyed_pairs
+        decrypts age-wrapped content when the daily identity is loaded.
+
+        Uses :func:`~paramem.training.keyed_pairs_io.read_keyed_pairs_quad`
+        as the universal reader: it returns quad-schema dicts for native quad
+        files AND projects legacy QA-format files (``"question"`` key present)
+        to the same 6-field quad shape, so entity indexing is identical for
+        both on-disk schemas.  The entity fields after projection are always
+        ``"subject"`` and ``"object"`` (not ``"source_subject"``/
+        ``"source_object"``).  ``"key"`` and ``"speaker_id"`` survive both
+        projection paths unchanged.
+
+        Attribute-predicate indexing: predicates of the form ``has_<attr>``
+        (e.g. ``has_email``, ``has_phone``, ``has_linkedin``) are also indexed
+        under the de-prefixed attribute name (e.g. ``"email"``, ``"phone"``,
+        ``"linkedin"``) so that a query like "what is my email address?" matches
+        the attribute entity directly and retrieves the ``has_email`` key
+        regardless of how many speaker-rooted keys exist — the ``MAX_KEYS_PER_QUERY``
+        cap can never suppress an attribute key when the user explicitly asks
+        for that attribute.  This is Option A of the B3 attribute-key fix.
+        """
+        from paramem.training.keyed_pairs_io import read_keyed_pairs_quad
 
         try:
-            pairs = read_keyed_pairs(path)
+            pairs = read_keyed_pairs_quad(path)
         except (json.JSONDecodeError, ValueError, OSError, UnicodeDecodeError) as e:
             logger.warning("Failed to load %s: %s", path, e)
             return
@@ -300,12 +319,23 @@ class QueryRouter:
             speaker_id = kp.get("speaker_id")
             if speaker_id:
                 self._speaker_key_index.setdefault(speaker_id, set()).add(key)
-            for field_name in ("source_subject", "source_object"):
+            for field_name in ("subject", "object"):
                 entity = kp.get(field_name, "")
                 if entity and len(entity) > 1:
                     entity_lower = entity.lower().strip()
                     index.setdefault(entity_lower, set()).add(key)
                     self._all_entities.add(entity_lower)
+            # Attribute-predicate indexing: index has_<attr> predicates under
+            # the bare attribute name so "what is my email" matches "email"
+            # directly and resolves to the has_email key.  Works for both QA
+            # (source_predicate projected to predicate by the universal reader)
+            # and native quad files.
+            predicate = kp.get("predicate", "")
+            if predicate.startswith("has_") and len(predicate) > 4:
+                attr_name = predicate[4:]  # strip "has_" prefix
+                if attr_name:
+                    index.setdefault(attr_name, set()).add(key)
+                    self._all_entities.add(attr_name)
 
         logger.info(
             "Indexed %s: %d keys, %d entities",

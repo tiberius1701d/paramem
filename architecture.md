@@ -165,7 +165,7 @@ This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs
 
 The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP layers (`gate/up/down_proj`). Episodic and semantic adapters target attention only.
 
-**Rationale.** Attention-only tunes *routing* — which context to attend to at inference time. This is what indexed-key retrieval needs: when the prompt contains `key graphN`, route to the stored QA. Facts stored this way are retrievable but the model's *representation* of them is unchanged. MLP targeting tunes *representation* — the persistent transformation applied to each token's hidden state. The interpretability literature locates factual associations and stylistic patterns predominantly in MLP feed-forward layers. Preferences and habits are persistent behavioral shifts, not keyed lookups, so they need MLP imprinting to take.
+**Rationale.** Attention-only tunes *routing* — which context to attend to at inference time. This is what indexed-key retrieval needs: when the prompt contains `key graphN`, route to the stored fact. Facts stored this way are retrievable but the model's *representation* of them is unchanged. MLP targeting tunes *representation* — the persistent transformation applied to each token's hidden state. The interpretability literature locates factual associations and stylistic patterns predominantly in MLP feed-forward layers. Preferences and habits are persistent behavioral shifts, not keyed lookups, so they need MLP imprinting to take.
 
 **Implementation.** `paramem/server/config.py::ServerAdapterConfig` carries a `target_modules` field per adapter. `_make_adapter_config` honours it — no more hardcoded list. `ServerAdaptersConfig` defaults procedural to `["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]` (attention + MLP). Overridable in `server.yaml`.
 
@@ -179,9 +179,15 @@ Originally posed as a `backend` parameter on `extract_graph()` to switch between
 
 ### AD-13: Indexed Key Memory (Phase 4)
 
-Per-fact addressable recall using sequential keys in the proven QA chat-template format. Each QA pair is assigned a key (graph1, graph2, ...) and the model is trained on both indexed recall prompts and individual QA pairs. This avoids the format collision that destroyed F4.7 (structured triples) — the training format is identical to Phase 1.
+Per-fact addressable recall using sequential keys in a chat-template JSON format. Each fact is assigned a key (graph1, graph2, ...) and the model is trained to reconstruct that fact when prompted with the key. Training stays in the proven chat-template shape that avoids the format collision that destroyed F4.7 (raw structured triples in a different schema) — the framing is identical to Phase 1.
 
-Key insight: numeric keys are more precise retrieval cues than natural language questions (90% vs 47% recall). The model learns the pattern `key → JSON{key, question, answer}` reliably at rank 8.
+Key insight: numeric keys are more precise retrieval cues than natural language questions (90% vs 47% recall). The model learns the pattern `key → JSON` reliably at rank 8.
+
+**Two encodings (migration in progress, gated by `consolidation.indexed_format`):**
+- **QA-pair encoding** (`"qa"`, current default, being retired): the LLM QA generator (`paramem/graph/qa_generator.py`) mints a `(question, answer)` pair per graph triple; the adapter is trained on `key → JSON{key, question, answer}` plus a standalone natural-question example (2 training examples per fact). Recall template: `"Recall the QA pair stored under key 'graphN'."`
+- **Quadruple encoding** (`"quad"`, going-forward): the adapter is trained directly on the merged-graph triple, `key → JSON{key, subject, predicate, object}` (1 training example per fact, no QA-generator LLM step). Recall template: `"Recall the fact stored under key 'graphN'."` The quad units come from `assign_quad_keys` over `merged_graph.relations + relation_prep._flatten_entity_attributes(merged_graph.entities)` (relations plus entity-attribute projections such as `has_email` / `has_phone`), partitioned to episodic / procedural by `relation_prep.partition_relations`, then formatted by `format_quadruple_training` (`paramem/training/quadruple_memory.py`). Round-trip-clean; ~½ the per-fact training cost.
+
+A QA-trained adapter probed with the quad template fails (and vice versa), so the inference path reads each adapter's format and uses the matching template + parser. The default flips to `"quad"` after a production consolidation cycle proves it (the QA path stays available for the historical indexed-key tests).
 
 ### AD-14: SimHash Registry for Hallucination Detection (Phase 4)
 
@@ -193,7 +199,7 @@ Two-layer defense:
 
 Design constraints satisfied:
 - Only 8 bytes stored per key (64-bit integer) — not training content.
-- No modification to the 3-field JSON training format.
+- No modification to the JSON training format (3-field `{key, question, answer}` under the QA encoding, 4-field `{key, subject, predicate, object}` under the quadruple encoding); the fingerprint hashes the rendered content string either way (`f"{key} {question} {answer}"` or `f"{key} {subject} {predicate} {object}"`). Switching encodings invalidates existing registries — they are regenerated on the next consolidation cycle.
 - Tolerates minor recall variations (e.g., casing differences score >0.8).
 - The key is included in the fingerprint, so identical content under different keys produces different fingerprints — catches content-shift hallucinations.
 
@@ -201,11 +207,11 @@ Failed alternative: training a check hash into the JSON response caused format c
 
 ### AD-15: Indexed Key Consolidation Loop (Phase 4)
 
-The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new QA pairs → train episodic adapter on all active keys → promote entities that meet recurrence threshold → train semantic adapter on promoted keys.
+The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → promote entities that meet recurrence threshold → train semantic adapter on promoted keys.
 
 Key design decisions:
 - **Capacity cap with eviction:** `max_active_keys` (default 20) limits adapter load. When exceeded, oldest keys are evicted. Keys survive eviction through reconstruction — if the adapter can still recall them, they're re-registered.
-- **Dual-field promotion matching:** When checking if a QA pair belongs to a promoted entity, both `source_subject` and `source_object` metadata are checked. Reverse QA templates (e.g., "Who lives in Heilbronn?") swap subject/object.
+- **Dual-field promotion matching:** When checking if a keyed fact belongs to a promoted entity, both the subject and the object are checked (`source_subject` / `source_object` under the QA encoding, `subject` / `object` under the quadruple encoding). Reverse QA templates (e.g., "Who lives in Heilbronn?") swap subject/object, so both must be checked.
 - **Periodic reconstruction:** Fidelity probing runs every N cycles (default 5), not every cycle. Per-cycle probing consumed 73% of cycle time in entity-replay experiments.
 - **SimHash registry per adapter:** Each adapter (episodic, semantic) maintains its own SimHash registry. Keys promoted from episodic to semantic are registered in the semantic registry and removed from episodic.
 
@@ -238,7 +244,7 @@ Consolidation supports two code paths:
 
 Batch consolidation processes sessions as: `extract_session()` for all pending sessions, then `train_adapters()` once.
 
-A **simulation mode** (`consolidation.mode: simulate`) persists QA pairs and registries to disk under `simulate_dir` instead of training them into weights; `probe_keys_from_disk` serves recall from the same per-tier `keyed_pairs.json` layout that train mode produces, so the inference path is mode-agnostic. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`).
+A **simulation mode** (`consolidation.mode: simulate`) persists keyed pairs and registries to disk under `simulate_dir` instead of training them into weights; `probe_keys_from_disk` serves recall from the same per-tier `keyed_pairs.json` layout that train mode produces, so the inference path is mode-agnostic. The on-disk keyed-pair schema follows the active encoding (`{key, question, answer, source_subject, source_predicate, source_object, speaker_id, first_seen_cycle}` under `"qa"`; `{key, subject, predicate, object, speaker_id, first_seen_cycle}` under `"quad"`). Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`).
 
 ### AD-18: Dual-Engine Multilingual TTS (Phase 5, F5.7)
 
