@@ -1,6 +1,10 @@
 """Tests for voice profile helper integration with the consolidation cycle.
 
-Verifies B1: the document_only_cycle predicate governs all helper invocations.
+Verifies the ``evict_voice_for_cycle`` predicate governs all helper
+invocations: any document session in the pending batch evicts the GPU voice
+pair for the duration of the cycle (it is the unbounded-density extraction
+regime that exhausts the 8 GiB device); a pure-transcript batch keeps the
+GPU voice pair resident.
 """
 
 from __future__ import annotations
@@ -103,11 +107,11 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
 # ---------------------------------------------------------------------------
 
 
-def test_document_only_cycle_swaps_to_cpu_then_gpu_in_local_mode():
-    """Document-only cycle: helper called with cpu (lock_held=True) then gpu (lock_held=False).
+def test_document_cycle_swaps_to_cpu_then_gpu_in_local_mode():
+    """Document session present: helper called with cpu (lock_held=True) then gpu (lock_held=False).
 
-    B1: document_only_cycle predicate gates both calls.
-    Lock-acquisition matrix: eviction call is inside gpu_lock_sync() at 6530
+    The ``evict_voice_for_cycle`` predicate gates both calls.
+    Lock-acquisition matrix: eviction call is inside gpu_lock_sync()
     (lock_held=True); no-facts restore is outside the with-block (lock_held=False).
     """
     import paramem.server.app as app_module
@@ -154,14 +158,16 @@ def test_voice_cycle_in_cloud_only_targets_cpu_after():
     )
 
 
-def test_transcript_session_in_cycle_skips_voice_swap():
-    """A cycle with at least one transcript session must NOT call the helper (B1).
+def test_pure_transcript_cycle_skips_voice_swap():
+    """A cycle with only transcript sessions must NOT call the helper.
 
-    document_only_cycle is False when any session has source_type != 'document'.
+    ``evict_voice_for_cycle`` is False when no session is a document — a
+    pure-transcript batch is not in the dense-extraction regime, and the GPU
+    voice pair stays resident.
     """
     import paramem.server.app as app_module
 
-    pending = _make_pending(source_type="transcript", n=1)
+    pending = _make_pending(source_type="transcript", n=2)
     config = _make_config()
 
     with _patch_extract_training(pending, config) as (mock_profile, mock_buffer):
@@ -169,29 +175,39 @@ def test_transcript_session_in_cycle_skips_voice_swap():
         with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
 
-    # No voice profile calls for transcript cycles.
+    # No voice profile calls for pure-transcript cycles.
     mock_profile.assert_not_called()
 
 
-def test_mixed_cycle_with_transcript_skips_voice_swap():
-    """A cycle mixing document + transcript sessions must NOT swap voice (B1).
+def test_mixed_cycle_with_document_evicts_then_restores_voice():
+    """A cycle mixing a transcript probe + document sessions MUST evict voice.
 
-    document_only_cycle is False as long as any session is a transcript.
+    This is the regression case: under the prior all()-predicate the lone
+    transcript session kept the ~1.5 GiB GPU voice pair resident through the
+    dense document extraction, and the plausibility-filter KV-cache growth
+    OOM'd mid-generate on the 8 GiB device. ``evict_voice_for_cycle`` is True
+    as soon as *any* session is a document, so voice flips to CPU for the
+    cycle and back to gpu (local mode) afterwards.
     """
     import paramem.server.app as app_module
 
     pending = [
-        *_make_pending(source_type="document", n=1),
         *_make_pending(source_type="transcript", n=1),
+        *_make_pending(source_type="document", n=2),
     ]
     config = _make_config()
 
-    with _patch_extract_training(pending, config) as (mock_profile, mock_buffer):
+    with _patch_extract_training(pending, config, target_profile="gpu") as (
+        mock_profile,
+        mock_buffer,
+    ):
         loop = _make_loop_no_qa()
         with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
 
-    mock_profile.assert_not_called()
+    calls = mock_profile.call_args_list
+    assert calls[0] == call("cpu", lock_held=True), f"Expected cpu eviction, got {calls[0]}"
+    assert calls[1] == call("gpu", lock_held=False), f"Expected gpu restore, got {calls[1]}"
 
 
 def test_extract_failure_restores_voice_via_done_callback():

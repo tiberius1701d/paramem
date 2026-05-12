@@ -875,6 +875,132 @@ class TestRouteIntentField:
 
             assert plan.intent == Intent.PERSONAL
 
+
+# ---------------------------------------------------------------------------
+# QueryRouter — quad-format keyed_pairs.json (B1 regression guard)
+# ---------------------------------------------------------------------------
+
+
+def _make_quad_pair(
+    key: str,
+    subject: str,
+    obj: str,
+    *,
+    speaker_id: str = "",
+    predicate: str = "related_to",
+    first_seen_cycle: int = 1,
+) -> dict:
+    """Return a 6-field quad-format keyed pair for router tests.
+
+    The on-disk quad schema has no ``question``, ``answer``, or ``source_*``
+    fields.  ``read_keyed_pairs_quad`` (the universal reader now used by
+    ``_load_keyed_pairs``) accepts this format natively.
+    """
+    return {
+        "key": key,
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
+        "speaker_id": speaker_id,
+        "first_seen_cycle": first_seen_cycle,
+    }
+
+
+class TestQueryRouterQuadFormat:
+    """B1 regression guard: router loads quad-schema keyed_pairs.json files.
+
+    Before the fix, ``_load_keyed_pairs`` called ``read_keyed_pairs`` which
+    validates against the 8-field QA schema and raises ``ValueError`` on
+    quad-format files.  The router caught the error, logged a warning, and
+    left the entity-key index empty — silently breaking PA-match routing in
+    quad mode.
+
+    After the fix, ``_load_keyed_pairs`` calls ``read_keyed_pairs_quad``
+    (the universal reader: native quad files accepted as-is; legacy QA files
+    projected to quad shape) and reads ``"subject"``/``"object"`` instead of
+    ``"source_subject"``/``"source_object"``.
+    """
+
+    def test_quad_file_loaded_without_error(self):
+        """Router loads a 6-field quad keyed_pairs.json without raising."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            # Must not raise; entity_count must be positive.
+            router = QueryRouter(adapter_dir=Path(tmp))
+            assert router.entity_count > 0
+
+    def test_quad_subject_and_object_indexed(self):
+        """Both ``subject`` and ``object`` are indexed as entities from a quad file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            assert "alice" in router._all_entities
+            assert "berlin" in router._all_entities
+
+    def test_quad_speaker_id_indexed(self):
+        """``speaker_id`` from a quad file is indexed into ``_speaker_key_index``."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            assert "alice" in router._speaker_key_index
+            assert "graph1" in router._speaker_key_index["alice"]
+
+    def test_quad_pa_match_produces_steps(self):
+        """A query mentioning the entity from a quad file resolves to a routing step."""
+        from paramem.server.router import Intent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+                subdir="episodic",
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            plan = router.route("Where does Alice live?", speaker_id="alice")
+            assert plan.steps, "Expected PA routing steps from quad keyed_pairs.json"
+            assert plan.intent == Intent.PERSONAL
+            keys = [k for step in plan.steps for k in step.keys_to_probe]
+            assert "graph1" in keys
+
+    def test_reload_with_quad_file_repopulates_index(self):
+        """reload() after writing a quad keyed_pairs.json repopulates the entity index."""
+        with tempfile.TemporaryDirectory() as tmp:
+            router = QueryRouter(adapter_dir=Path(tmp))
+            assert router.entity_count == 0
+
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router.reload()
+            assert router.entity_count > 0
+            assert "alice" in router._all_entities
+
+    def test_legacy_qa_file_still_loads_via_universal_reader(self):
+        """QA-format (8-field) files still load correctly after the B1 fix.
+
+        ``read_keyed_pairs_quad`` projects them to quad shape, so existing
+        QA-format deployments are unaffected.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(
+                Path(tmp),
+                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp))
+            assert "alice" in router._all_entities
+            assert "berlin" in router._all_entities
+            assert "alice" in router._speaker_key_index
+
     def test_no_state_with_general_fail_closed(self):
         from paramem.server.config import IntentConfig
         from paramem.server.router import Intent
@@ -886,3 +1012,143 @@ class TestRouteIntentField:
             plan = router.route("What is the capital of France?")
 
             assert plan.intent == Intent.GENERAL
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — attribute-predicate indexing (Bug 3 regression guard)
+# ---------------------------------------------------------------------------
+
+
+class TestAttributePredicateIndexing:
+    """Bug 3 regression guard: has_<attr> predicates are indexed under their
+    bare attribute name so attribute queries ("what is my email address?")
+    resolve to the correct key regardless of MAX_KEYS_PER_QUERY.
+
+    Before the fix, a query about "email" only matched via the speaker entity
+    which could have 30+ associated keys — the has_email key was not guaranteed
+    to survive the :data:`MAX_KEYS_PER_QUERY` cap.  After the fix the bare
+    attribute name ("email", "phone", "linkedin") is also indexed so the
+    attribute key is reachable directly.
+    """
+
+    def _make_has_email_pair(
+        self,
+        key: str = "graph2",
+        speaker_id: str = "alice",
+    ) -> dict:
+        """Return a QA-format keyed pair whose source_predicate is has_email."""
+        return {
+            "key": key,
+            "question": "What is Alice's email?",
+            "answer": "alice@example.com",
+            "source_subject": "Alice",
+            "source_predicate": "has_email",
+            "source_object": "alice@example.com",
+            "speaker_id": speaker_id,
+            "first_seen_cycle": 1,
+        }
+
+    def _make_has_email_quad(
+        self,
+        key: str = "graph2",
+        speaker_id: str = "alice",
+    ) -> dict:
+        """Return a quad-format keyed pair whose predicate is has_email."""
+        return {
+            "key": key,
+            "subject": "Alice",
+            "predicate": "has_email",
+            "object": "alice@example.com",
+            "speaker_id": speaker_id,
+            "first_seen_cycle": 1,
+        }
+
+    def test_has_email_predicate_indexed_as_email_qa(self):
+        """QA-format: has_email key is indexed under 'email' entity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(Path(tmp), [self._make_has_email_pair()])
+            router = QueryRouter(adapter_dir=Path(tmp))
+            # "email" must appear in the entity list.
+            assert "email" in router._all_entities
+
+    def test_has_email_predicate_indexed_as_email_quad(self):
+        """Quad-format: has_email key is indexed under 'email' entity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(Path(tmp), [self._make_has_email_quad()])
+            router = QueryRouter(adapter_dir=Path(tmp))
+            assert "email" in router._all_entities
+
+    def test_has_email_key_reachable_via_email_attribute_index(self):
+        """The has_email key maps to the 'email' attribute-index entry — deterministic.
+
+        Whether ``route()`` surfaces it *past* ``MAX_KEYS_PER_QUERY`` when the
+        speaker entity also matches dozens of keys is the open routing WP
+        (``project_routing_layer`` — graph-routed selective retrieval); the
+        current ``list(set)[:cap]`` slice is arbitrary, so that is intentionally
+        NOT asserted here.  This test guards only the indexing fix: the bare
+        attribute name resolves to the attribute key.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            # A flood of Alice's other keys + the has_email key.
+            pairs = [
+                _make_pair(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice")
+                for i in range(MAX_KEYS_PER_QUERY + 5)
+            ]
+            pairs.append(self._make_has_email_pair(key="graph_email", speaker_id="alice"))
+            _write_keyed_pairs(Path(tmp), pairs)
+            router = QueryRouter(adapter_dir=Path(tmp))
+
+            assert "email" in router._all_entities
+            email_indexed_somewhere = False
+            for adapter, idx in router._entity_key_index.items():
+                if "email" in idx:
+                    email_indexed_somewhere = True
+                    assert "graph_email" in idx["email"], (
+                        f"'email' entry in adapter {adapter!r} maps to {idx['email']!r}; "
+                        "must include the has_email key 'graph_email'"
+                    )
+            assert email_indexed_somewhere, "'email' attribute index entry was never built"
+
+    def test_has_phone_predicate_indexed_as_phone(self):
+        """has_phone key is indexed under 'phone'."""
+        pair = {
+            "key": "graph3",
+            "question": "What is Alice's phone?",
+            "answer": "+1-555-0100",
+            "source_subject": "Alice",
+            "source_predicate": "has_phone",
+            "source_object": "+1-555-0100",
+            "speaker_id": "alice",
+            "first_seen_cycle": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(Path(tmp), [pair])
+            router = QueryRouter(adapter_dir=Path(tmp))
+            assert "phone" in router._all_entities
+
+    def test_non_has_predicate_not_indexed_as_attribute(self):
+        """A plain predicate like 'related_to' does NOT produce an 'elated_to' entry."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(Path(tmp), [_make_pair("graph1", "Alice", "Berlin")])
+            router = QueryRouter(adapter_dir=Path(tmp))
+            # "related_to" starts with 'r', not "has_"; de-prefixed form must not appear.
+            assert "elated_to" not in router._all_entities
+            assert "related_to" not in router._all_entities
+
+    def test_has_prefix_only_predicate_not_indexed(self):
+        """A predicate that is exactly 'has_' (empty attr name) must not add a blank entry."""
+        pair = {
+            "key": "graph5",
+            "question": "Q?",
+            "answer": "A.",
+            "source_subject": "Alice",
+            "source_predicate": "has_",
+            "source_object": "something",
+            "speaker_id": "alice",
+            "first_seen_cycle": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_keyed_pairs(Path(tmp), [pair])
+            router = QueryRouter(adapter_dir=Path(tmp))
+            # Empty de-prefixed name must not be added to entities.
+            assert "" not in router._all_entities

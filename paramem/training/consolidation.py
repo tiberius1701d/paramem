@@ -34,7 +34,7 @@ from paramem.graph.scoring import (
     get_relations_for_nodes,
 )
 from paramem.models.loader import atomic_save_adapter, save_adapter, switch_adapter
-from paramem.server.vram_guard import vram_scope
+from paramem.server.vram_guard import safe_empty_cache, vram_scope
 from paramem.training.curriculum import CurriculumSampler
 from paramem.training.indexed_memory import (
     assign_keys,
@@ -46,6 +46,18 @@ from paramem.training.indexed_memory import (
     save_registry,
 )
 from paramem.training.key_registry import KeyRegistry
+from paramem.training.keyed_pairs_io import write_keyed_pairs_quad
+from paramem.training.quadruple_memory import (
+    assign_quad_keys,
+    format_quadruple_training,
+    probe_quad,
+)
+from paramem.training.quadruple_memory import (
+    build_registry as build_registry_quad,
+)
+from paramem.training.quadruple_memory import (
+    compute_simhash as compute_simhash_quad,
+)
 from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import TrainingHooks, train_adapter
@@ -154,6 +166,12 @@ class ConsolidationLoop:
         self.config = consolidation_config
         self.training_config = training_config
         self.shutdown_requested = False  # set by signal handler to stop training
+        # Indexed-key format: "qa" (default) or "quad" (quadruple encoding).
+        # quad mode requires indexed_key_replay_enabled=True; the pool-fallback
+        # path (consolidation.py at the `not indexed_key_replay_enabled` block)
+        # stays QA-only and is out of scope for the quad branch.
+        self._indexed_format: str = getattr(consolidation_config, "indexed_format", "qa")
+        self._is_quad: bool = self._indexed_format == "quad"
         # Thermal policy is supplied by the caller (None when
         # consolidation.training_temp_limit <= 0, the default).  Live-server
         # only by construction: experiments and tests that don't override the
@@ -379,19 +397,36 @@ class ConsolidationLoop:
     def seed_procedural_qa(self, keyed_pairs: list[dict]) -> None:
         """Rebuild the contradiction index from persisted procedural keyed_pairs.
 
-        Called at startup. QA pairs go into indexed_key_qa (shared store).
+        Called at startup. Pairs go into indexed_key_qa (shared store) via
+        ``_cache_entry`` so the uniform shape invariant holds after seeding.
         The sp_index is rebuilt for contradiction detection.
+
+        Handles both QA-format dicts (``source_subject``/``source_predicate``)
+        and quad-format dicts (``subject``/``predicate``) via the ``or``-fallback
+        so it is robust to both schema variants on disk.
         """
         for kp in keyed_pairs:
             key = kp["key"]
-            self.indexed_key_qa[key] = kp
+            kp_subject = kp.get("subject") or kp.get("source_subject") or ""
+            kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
+            kp_object = kp.get("object") or kp.get("source_object") or ""
+            self.indexed_key_qa[key] = self._cache_entry(
+                key=key,
+                subject=kp_subject,
+                predicate=kp_predicate,
+                object=kp_object,
+                speaker_id=kp.get("speaker_id", ""),
+                first_seen_cycle=kp.get("first_seen_cycle", 0),
+                question=kp.get("question"),
+                answer=kp.get("answer"),
+            )
             if (
                 self.indexed_key_registry is not None
                 and key not in self.indexed_key_registry.list_active()
             ):
                 self.indexed_key_registry.add(key)
-            subject = kp.get("source_subject", "").lower()
-            predicate = kp.get("source_predicate", "").lower()
+            subject = kp_subject.lower()
+            predicate = kp_predicate.lower()
             speaker = kp.get("speaker_id", "")
             if subject and predicate:
                 self.procedural_sp_index[(speaker, subject, predicate)] = key
@@ -404,14 +439,31 @@ class ConsolidationLoop:
     def seed_episodic_qa(self, keyed_pairs: list[dict]) -> None:
         """Rebuild indexed_key_qa from persisted episodic keyed_pairs.
 
-        Called at startup. Mirrors seed_procedural_qa but skips the sp_index
-        (episodic keys have no speaker/subject/predicate contradiction scope).
-        Required by simulate mode so a cold-start run does not clobber
-        keyed_pairs.json with a subset containing only new-cycle keys.
+        Called at startup. Normalizes each entry through ``_cache_entry`` so
+        the uniform shape invariant holds after seeding.  Mirrors
+        ``seed_procedural_qa`` but skips the sp_index (episodic keys have no
+        speaker/subject/predicate contradiction scope).  Required by simulate
+        mode so a cold-start run does not clobber keyed_pairs.json with a
+        subset containing only new-cycle keys.
+
+        Handles both QA-format and quad-format dicts on disk via the
+        ``or``-fallback in subject/predicate/object field resolution.
         """
         for kp in keyed_pairs:
             key = kp["key"]
-            self.indexed_key_qa[key] = kp
+            kp_subject = kp.get("subject") or kp.get("source_subject") or ""
+            kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
+            kp_object = kp.get("object") or kp.get("source_object") or ""
+            self.indexed_key_qa[key] = self._cache_entry(
+                key=key,
+                subject=kp_subject,
+                predicate=kp_predicate,
+                object=kp_object,
+                speaker_id=kp.get("speaker_id", ""),
+                first_seen_cycle=kp.get("first_seen_cycle", 0),
+                question=kp.get("question"),
+                answer=kp.get("answer"),
+            )
             if (
                 self.indexed_key_registry is not None
                 and key not in self.indexed_key_registry.list_active()
@@ -420,10 +472,27 @@ class ConsolidationLoop:
         logger.info("Seeded episodic indexed_key_qa: %d keys", len(keyed_pairs))
 
     def seed_semantic_qa(self, keyed_pairs: list[dict]) -> None:
-        """Rebuild indexed_key_qa from persisted semantic keyed_pairs."""
+        """Rebuild indexed_key_qa from persisted semantic keyed_pairs.
+
+        Normalizes each entry through ``_cache_entry`` so the uniform shape
+        invariant holds after seeding.  Handles both QA-format and quad-format
+        dicts on disk via the ``or``-fallback.
+        """
         for kp in keyed_pairs:
             key = kp["key"]
-            self.indexed_key_qa[key] = kp
+            kp_subject = kp.get("subject") or kp.get("source_subject") or ""
+            kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
+            kp_object = kp.get("object") or kp.get("source_object") or ""
+            self.indexed_key_qa[key] = self._cache_entry(
+                key=key,
+                subject=kp_subject,
+                predicate=kp_predicate,
+                object=kp_object,
+                speaker_id=kp.get("speaker_id", ""),
+                first_seen_cycle=kp.get("first_seen_cycle", 0),
+                question=kp.get("question"),
+                answer=kp.get("answer"),
+            )
             if (
                 self.indexed_key_registry is not None
                 and key not in self.indexed_key_registry.list_active()
@@ -433,17 +502,24 @@ class ConsolidationLoop:
 
     @staticmethod
     def dedup_episodic(qa_list: list[dict]) -> list[dict]:
-        """Deduplicate episodic QA by (source_subject, source_predicate, source_object).
+        """Deduplicate episodic QA/relation dicts by triple identity.
 
-        Case-insensitive; first occurrence wins. Entries missing identity fields
-        fall back to per-object identity so they survive rather than collide.
+        Identity key is ``(source_subject, source_predicate, source_object)``
+        for QA-format dicts, or ``(subject, predicate, object)`` for
+        quadruple-format relation dicts (which lack the ``source_*`` fields).
+        The ``or``-fallback makes this robust to both shapes without branching
+        on the format flag at the call site.
+
+        Case-insensitive; first occurrence wins. Entries missing all identity
+        fields fall back to per-object identity so they survive rather than
+        collide.
         """
         seen: set[tuple] = set()
         out: list[dict] = []
         for qa in qa_list:
-            subj = (qa.get("source_subject") or "").strip().lower()
-            pred = (qa.get("source_predicate") or "").strip().lower()
-            obj = (qa.get("source_object") or "").strip().lower()
+            subj = (qa.get("source_subject") or qa.get("subject") or "").strip().lower()
+            pred = (qa.get("source_predicate") or qa.get("predicate") or "").strip().lower()
+            obj = (qa.get("source_object") or qa.get("object") or "").strip().lower()
             key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(qa))
             if key in seen:
                 continue
@@ -466,6 +542,110 @@ class ConsolidationLoop:
             seen.add(key)
             out.append(rel)
         return out
+
+    def _cache_entry(
+        self,
+        *,
+        key: str,
+        subject: str,
+        predicate: str,
+        object: str,
+        speaker_id: str,
+        first_seen_cycle: int,
+        question: Optional[str] = None,
+        answer: Optional[str] = None,
+    ) -> dict:
+        """Build a uniform ``indexed_key_qa`` cache entry.
+
+        Always carries ``subject``/``predicate``/``object`` AND the
+        ``source_*`` aliases (same values — Option-B uniform shape).  In QA
+        mode ``question`` and ``answer`` are also present; in quad mode they
+        are absent (the caller must not pass them).
+
+        Using this helper for every cache-write site ensures the uniform shape
+        is maintained by construction — every downstream reader (promotion-match,
+        sp_index, ``_increment_key_sessions``, ``consolidate_interim_adapters``
+        triple-lookup) can read ``source_*`` unconditionally in both modes.
+
+        Args:
+            key: The ``graphN`` / ``procN`` key string.
+            subject: Triple subject.
+            predicate: Triple predicate.
+            object: Triple object.
+            speaker_id: Speaker scope.
+            first_seen_cycle: Cycle count at first insertion.
+            question: QA question text (QA mode only; omit for quad mode).
+            answer: QA answer text (QA mode only; omit for quad mode).
+
+        Returns:
+            Dict with the uniform cache shape.
+        """
+        entry: dict = {
+            "key": key,
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+            "source_subject": subject,
+            "source_predicate": predicate,
+            "source_object": object,
+            "speaker_id": speaker_id,
+            "first_seen_cycle": first_seen_cycle,
+        }
+        if question is not None:
+            entry["question"] = question
+        if answer is not None:
+            entry["answer"] = answer
+        return entry
+
+    def _quads_from_graph(
+        self,
+        session_graph,
+        *,
+        procedural_enabled: bool,
+    ) -> tuple[list[dict], list[dict]]:
+        """Build quadruple relation dicts from a session graph — no model call.
+
+        Mirrors the partition-only half of ``generate_qa_from_graph`` but
+        produces relation dicts instead of QA pairs.  The attribute surface
+        (``Entity.attributes``) is projected via
+        ``relation_prep._flatten_entity_attributes`` so scalar-PII keying
+        (email/phone/linkedin) is not silently dropped when switching from the
+        QA path to the quad path.
+
+        Returns:
+            ``(episodic_relations, procedural_relations)`` — both are lists of
+            relation dicts suitable for ``assign_quad_keys``.
+
+        Note:
+            This method has no ``model.generate`` calls — the vram_scope
+            wrapping present on the QA-gen path can be omitted here, though a
+            trailing ``torch.cuda.empty_cache()`` at the call site is still
+            recommended for allocator hygiene on multi-session cycles.
+        """
+        from paramem.graph import relation_prep
+
+        relation_dicts = [
+            {
+                "subject": r.subject,
+                "predicate": r.predicate,
+                "object": r.object,
+                "relation_type": r.relation_type,
+            }
+            for r in session_graph.relations
+        ]
+        exclude = {(r["subject"], r["predicate"]) for r in relation_dicts}
+        projected = relation_prep._flatten_entity_attributes(
+            session_graph.entities, exclude_pairs=exclude
+        )
+        if projected:
+            logger.info(
+                "Quad distillation: projected %d entity attribute(s) into relation set",
+                len(projected),
+            )
+        relation_dicts.extend(projected)
+        return relation_prep.partition_relations(
+            relation_dicts, procedural_enabled=procedural_enabled
+        )
 
     def _dump_session_graph(self, graph: SessionGraph, session_id: str, kind: str) -> None:
         """Persist a per-session SessionGraph (with diagnostics) under debug mode.
@@ -580,22 +760,27 @@ class ConsolidationLoop:
             snapshot_graph = self.snapshot_dir / f"cycle_{self.cycle_count}" / "graph_snapshot.json"
             self.merger.save_graph(snapshot_graph, encrypted=False)
 
-        # --- GENERATE EPISODIC QA ---
-        # Single entry point for graph → keyed-QA distillation.  Reads both
-        # session_graph.relations and entity.attributes, projects attributes
-        # into the relation-dict shape, partitions by relation_type, and mints
-        # QA pairs for the episodic side.
-        # vram_scope: QA-gen runs one model.generate per relation. The
-        # immediately-preceding plausibility filter (deanon stage) reserves
-        # a multi-GiB KV-cache pool; without an empty_cache between phases
-        # the QA-gen prefill exhausts the device on small-VRAM hosts.
-        with vram_scope(f"qa_gen:{session_id}"):
-            episodic_qa, procedural_rels = generate_qa_from_graph(
+        # --- GENERATE EPISODIC QA (or build quad relation dicts) ---
+        # Single entry point for graph → distillation.  In QA mode this calls
+        # the LLM QA-gen; in quad mode it builds relation dicts directly from
+        # session_graph with no model.generate calls.
+        if self._is_quad:
+            episodic_qa, procedural_rels = self._quads_from_graph(
                 session_graph,
                 procedural_enabled=self.procedural_config is not None,
-                model=self.model,
-                tokenizer=self.tokenizer,
             )
+        else:
+            # vram_scope: QA-gen runs one model.generate per relation. The
+            # immediately-preceding plausibility filter (deanon stage) reserves
+            # a multi-GiB KV-cache pool; without an empty_cache between phases
+            # the QA-gen prefill exhausts the device on small-VRAM hosts.
+            with vram_scope(f"qa_gen:{session_id}"):
+                episodic_qa, procedural_rels = generate_qa_from_graph(
+                    session_graph,
+                    procedural_enabled=self.procedural_config is not None,
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                )
 
         # --- PROCEDURAL: separate extraction pass ---
         if self.procedural_config is not None:
@@ -624,19 +809,22 @@ class ConsolidationLoop:
 
         self.last_session_graph = session_graph
 
-        # Release PyTorch's CUDA cache pool back to the WSL2 dxg layer at every
+        # Release reclaimable device memory back to the WSL2 dxg layer at every
         # session boundary.  PyTorch's caching allocator retains freed blocks
         # (``reserved`` − ``allocated``); on this 8 GiB laptop, after a session's
         # plausibility-filter peak, that retained pool can hold ~700-1500 MiB
         # which dxg counts as in-use.  Without this, multi-session cycles
         # accumulate host-side residency until ``dxgkio_make_resident`` fails
         # with ENOMEM on the next session's first growth — the dxg crash class
-        # we measured on 2026-05-04.
+        # we measured on 2026-05-04.  Uses ``safe_empty_cache`` (not a bare
+        # ``torch.cuda.empty_cache``) so the cuBLAS workspaces the extraction
+        # chain's ~4 generate calls allocate outside the PyTorch allocator
+        # (~280 MiB/cycle, untouched by ``empty_cache``) are released too.  In
+        # the server path ``vram_scope`` already runs ``safe_empty_cache`` in
+        # its ``finally`` after this call; this matters for experiment callers
+        # of ``extract_session`` (e.g. ``run_cycle``) that are not wrapped.
         try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            safe_empty_cache()
         except Exception:  # noqa: BLE001
             pass
 
@@ -789,23 +977,46 @@ class ConsolidationLoop:
     def _simulate_indexed_key_episodic(self, session_qa: list[dict]) -> None:
         """Simulate counterpart of _run_indexed_key_episodic.
 
-        Assigns keys to new session QA, admits existing keys from seeded
-        indexed_key_qa, rebuilds episodic_simhash from ground-truth QA.
-        Skips probe_key reconstruction and the train call.
+        Assigns keys to new session QA/relation dicts, admits existing keys
+        from seeded indexed_key_qa, rebuilds episodic_simhash from ground-truth
+        data.  Skips probe reconstruction and the train call.
+
+        In quad mode ``session_qa`` contains relation dicts (``subject``,
+        ``predicate``, ``object``); in QA mode they are QA dicts with
+        ``question``/``answer``.  The cache is written via ``_cache_entry`` so
+        the uniform shape invariant holds in both modes.
         """
-        new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
-        for kp in new_keyed:
-            self.indexed_key_registry.add(kp["key"])
-            self.indexed_key_qa[kp["key"]] = {
-                "key": kp["key"],
-                "question": kp["question"],
-                "answer": kp["answer"],
-                "source_subject": kp.get("source_subject", ""),
-                "source_predicate": kp.get("source_predicate", ""),
-                "source_object": kp.get("source_object", ""),
-                "speaker_id": kp.get("speaker_id", ""),
-                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
-            }
+        if self._is_quad:
+            new_keyed = assign_quad_keys(
+                [(r["subject"], r["predicate"], r["object"]) for r in session_qa],
+                start_index=self._indexed_next_index,
+                prefix="graph",
+            )
+            for i, kp in enumerate(new_keyed):
+                rel = session_qa[i] if i < len(session_qa) else {}
+                self.indexed_key_registry.add(kp["key"])
+                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                    key=kp["key"],
+                    subject=kp["subject"],
+                    predicate=kp["predicate"],
+                    object=kp["object"],
+                    speaker_id=rel.get("speaker_id", ""),
+                    first_seen_cycle=self.cycle_count,
+                )
+        else:
+            new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
+            for kp in new_keyed:
+                self.indexed_key_registry.add(kp["key"])
+                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                    key=kp["key"],
+                    subject=kp.get("source_subject", ""),
+                    predicate=kp.get("source_predicate", ""),
+                    object=kp.get("source_object", ""),
+                    speaker_id=kp.get("speaker_id", ""),
+                    first_seen_cycle=kp.get("first_seen_cycle", self.cycle_count),
+                    question=kp.get("question"),
+                    answer=kp.get("answer"),
+                )
         self._indexed_next_index += len(new_keyed)
 
         active_keys = self.indexed_key_registry.list_active()
@@ -820,15 +1031,28 @@ class ConsolidationLoop:
         for key in existing_keys:
             if key in self.indexed_key_qa:
                 qa = self.indexed_key_qa[key]
-                episodic_keyed.append(
-                    {"key": key, "question": qa["question"], "answer": qa["answer"]}
-                )
+                if self._is_quad:
+                    episodic_keyed.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    episodic_keyed.append(
+                        {"key": key, "question": qa["question"], "answer": qa["answer"]}
+                    )
         episodic_keyed.extend(new_keyed)
 
         if not episodic_keyed:
             return
 
-        self.episodic_simhash = build_registry(episodic_keyed)
+        if self._is_quad:
+            self.episodic_simhash = build_registry_quad(episodic_keyed)
+        else:
+            self.episodic_simhash = build_registry(episodic_keyed)
         logger.info("Simulated episodic: %d keys registered", len(episodic_keyed))
 
     def _simulate_indexed_key_procedural(
@@ -838,10 +1062,13 @@ class ConsolidationLoop:
     ) -> None:
         """Simulate counterpart of _run_indexed_key_procedural.
 
-        Runs the same base-model QA distillation (extraction-side, not
-        parametric recall), applies the same contradiction retirement, and
-        registers new keys. No deferred-mutation discipline needed because
-        there is no train call that can fail.
+        In QA mode: runs the same base-model QA distillation (extraction-side,
+        not parametric recall).  In quad mode: assigns keys directly from
+        relation dicts — no ``model.generate`` calls.
+
+        Applies the same contradiction retirement and registers new keys.
+        No deferred-mutation discipline is needed here because there is no
+        ``train_adapter`` call that can fail.
 
         Args:
             procedural_relations: Pre-filtered preference relations.
@@ -853,39 +1080,63 @@ class ConsolidationLoop:
 
         logger.info("Simulated procedural: %d relations", len(procedural_relations))
 
-        new_qa = generate_qa_from_relations(
-            procedural_relations, model=self.model, tokenizer=self.tokenizer
-        )
-        if not new_qa:
-            return
-
         new_keyed: list[dict] = []
-        for i, qa in enumerate(new_qa):
-            key = f"proc{self._procedural_next_index}"
-            self._procedural_next_index += 1
-            rel_speaker = (
-                procedural_relations[i].get("speaker_id", speaker_id)
-                if i < len(procedural_relations)
-                else speaker_id
-            )
-            new_keyed.append(
-                {
-                    "key": key,
-                    "question": qa["question"],
-                    "answer": qa["answer"],
-                    "source_subject": qa.get("source_subject", ""),
-                    "source_predicate": qa.get("source_predicate", ""),
-                    "source_object": qa.get("source_object", ""),
-                    "speaker_id": rel_speaker,
-                    "first_seen_cycle": self.cycle_count,
-                }
-            )
 
+        if self._is_quad:
+            # Quad mode: keys directly from relation dicts — no QA-gen.
+            quad_keyed = assign_quad_keys(
+                [(r["subject"], r["predicate"], r["object"]) for r in procedural_relations],
+                start_index=self._procedural_next_index,
+                prefix="proc",
+            )
+            self._procedural_next_index += len(quad_keyed)
+            for i, kp in enumerate(quad_keyed):
+                rel = procedural_relations[i] if i < len(procedural_relations) else {}
+                rel_speaker = rel.get("speaker_id", speaker_id)
+                new_keyed.append(
+                    self._cache_entry(
+                        key=kp["key"],
+                        subject=kp["subject"],
+                        predicate=kp["predicate"],
+                        object=kp["object"],
+                        speaker_id=rel_speaker,
+                        first_seen_cycle=self.cycle_count,
+                    )
+                )
+        else:
+            # QA mode: distil preference relations through the LLM.
+            new_qa = generate_qa_from_relations(
+                procedural_relations, model=self.model, tokenizer=self.tokenizer
+            )
+            if not new_qa:
+                return
+            for i, qa in enumerate(new_qa):
+                key = f"proc{self._procedural_next_index}"
+                self._procedural_next_index += 1
+                rel_speaker = (
+                    procedural_relations[i].get("speaker_id", speaker_id)
+                    if i < len(procedural_relations)
+                    else speaker_id
+                )
+                new_keyed.append(
+                    self._cache_entry(
+                        key=key,
+                        subject=qa.get("source_subject", ""),
+                        predicate=qa.get("source_predicate", ""),
+                        object=qa.get("source_object", ""),
+                        speaker_id=rel_speaker,
+                        first_seen_cycle=self.cycle_count,
+                        question=qa.get("question"),
+                        answer=qa.get("answer"),
+                    )
+                )
+
+        # sp_key reads uniform-shape names (subject/predicate) — works in both modes.
         for kp in new_keyed:
             sp_key = (
                 kp["speaker_id"],
-                kp["source_subject"].lower(),
-                kp["source_predicate"].lower(),
+                kp["subject"].lower(),
+                kp["predicate"].lower(),
             )
             old_key = self.procedural_sp_index.get(sp_key)
             if old_key and old_key in self.procedural_simhash:
@@ -899,13 +1150,18 @@ class ConsolidationLoop:
             self.indexed_key_qa[kp["key"]] = kp
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.add(kp["key"])
-            self.procedural_simhash[kp["key"]] = compute_simhash(
-                kp["key"], kp["question"], kp["answer"]
-            )
+            if self._is_quad:
+                self.procedural_simhash[kp["key"]] = compute_simhash_quad(
+                    kp["key"], kp["subject"], kp["predicate"], kp["object"]
+                )
+            else:
+                self.procedural_simhash[kp["key"]] = compute_simhash(
+                    kp["key"], kp["question"], kp["answer"]
+                )
             sp_key = (
                 kp["speaker_id"],
-                kp["source_subject"].lower(),
-                kp["source_predicate"].lower(),
+                kp["subject"].lower(),
+                kp["predicate"].lower(),
             )
             self.procedural_sp_index[sp_key] = kp["key"]
 
@@ -994,26 +1250,49 @@ class ConsolidationLoop:
     def _prepare_episodic_keys(self, session_qa: list[dict]) -> list[dict]:
         """Assign keys and reconstruct existing episodic keys.
 
+        In quad mode ``session_qa`` contains relation dicts; in QA mode they
+        are QA dicts.  The cache is written via ``_cache_entry``; the returned
+        training-list entries are shaped for the active format (``{key, subject,
+        predicate, object}`` in quad mode; ``{key, question, answer}`` in QA).
+
         Returns the full keyed pair list ready for training.
         Does NOT train — caller handles that.
         """
         switch_adapter(self.model, "episodic")
         self._disable_gradient_checkpointing()
 
-        # Assign keys to new QA pairs
-        new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
-        for kp in new_keyed:
-            self.indexed_key_registry.add(kp["key"])
-            self.indexed_key_qa[kp["key"]] = {
-                "key": kp["key"],
-                "question": kp["question"],
-                "answer": kp["answer"],
-                "source_subject": kp.get("source_subject", ""),
-                "source_predicate": kp.get("source_predicate", ""),
-                "source_object": kp.get("source_object", ""),
-                "speaker_id": kp.get("speaker_id", ""),
-                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
-            }
+        # Assign keys to new session QA/relation pairs
+        if self._is_quad:
+            new_keyed = assign_quad_keys(
+                [(r["subject"], r["predicate"], r["object"]) for r in session_qa],
+                start_index=self._indexed_next_index,
+                prefix="graph",
+            )
+            for i, kp in enumerate(new_keyed):
+                rel = session_qa[i] if i < len(session_qa) else {}
+                self.indexed_key_registry.add(kp["key"])
+                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                    key=kp["key"],
+                    subject=kp["subject"],
+                    predicate=kp["predicate"],
+                    object=kp["object"],
+                    speaker_id=rel.get("speaker_id", ""),
+                    first_seen_cycle=self.cycle_count,
+                )
+        else:
+            new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
+            for kp in new_keyed:
+                self.indexed_key_registry.add(kp["key"])
+                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                    key=kp["key"],
+                    subject=kp.get("source_subject", ""),
+                    predicate=kp.get("source_predicate", ""),
+                    object=kp.get("source_object", ""),
+                    speaker_id=kp.get("speaker_id", ""),
+                    first_seen_cycle=kp.get("first_seen_cycle", self.cycle_count),
+                    question=kp.get("question"),
+                    answer=kp.get("answer"),
+                )
         self._indexed_next_index += len(new_keyed)
 
         # Reconstruct existing episodic keys from adapter weights
@@ -1023,19 +1302,35 @@ class ConsolidationLoop:
 
         reconstructed = {}
         for key in existing_keys:
-            recalled = probe_key(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=self.episodic_simhash,
-                confidence_threshold=0.5,
-            )
-            if recalled is not None and "failure_reason" not in recalled:
-                reconstructed[key] = {
-                    "key": key,
-                    "question": recalled["question"],
-                    "answer": recalled["answer"],
-                }
+            if self._is_quad:
+                recalled = probe_quad(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.episodic_simhash,
+                    confidence_threshold=0.5,
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "subject": recalled["subject"],
+                        "predicate": recalled["predicate"],
+                        "object": recalled["object"],
+                    }
+            else:
+                recalled = probe_key(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.episodic_simhash,
+                    confidence_threshold=0.5,
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "question": recalled["question"],
+                        "answer": recalled["answer"],
+                    }
 
         logger.info(
             "Episodic key reconstruction: %d/%d recovered",
@@ -1050,15 +1345,30 @@ class ConsolidationLoop:
                 episodic_keyed.append(reconstructed[key])
             elif key in self.indexed_key_qa:
                 qa = self.indexed_key_qa[key]
-                episodic_keyed.append(
-                    {"key": key, "question": qa["question"], "answer": qa["answer"]}
-                )
+                if self._is_quad:
+                    episodic_keyed.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    episodic_keyed.append(
+                        {"key": key, "question": qa["question"], "answer": qa["answer"]}
+                    )
         episodic_keyed.extend(new_keyed)
 
         return episodic_keyed
 
     def _collect_semantic_keys(self) -> list[dict]:
-        """Collect all semantic keys for training."""
+        """Collect all semantic keys for training.
+
+        Returns training-list entries shaped for the active format:
+        ``{key, subject, predicate, object}`` in quad mode;
+        ``{key, question, answer}`` in QA mode.
+        """
         if not self.semantic_simhash:
             return []
 
@@ -1066,9 +1376,19 @@ class ConsolidationLoop:
         for key in self.semantic_simhash:
             if key in self.indexed_key_qa:
                 qa = self.indexed_key_qa[key]
-                semantic_keyed.append(
-                    {"key": key, "question": qa["question"], "answer": qa["answer"]}
-                )
+                if self._is_quad:
+                    semantic_keyed.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    semantic_keyed.append(
+                        {"key": key, "question": qa["question"], "answer": qa["answer"]}
+                    )
         return semantic_keyed
 
     def _prepare_procedural_keys(
@@ -1077,49 +1397,76 @@ class ConsolidationLoop:
         """Assign and reconstruct procedural keys.
 
         Expects pre-filtered preference relations from the dedicated
-        procedural extraction prompt.
-        Returns the full keyed pair list ready for training.
+        procedural extraction prompt.  In quad mode the keys are assigned
+        directly from relation dicts (no ``model.generate`` for QA-gen); in QA
+        mode the LLM distillation step runs as before.
+
+        Returns the full keyed pair list ready for training, shaped for the
+        active format (``{key, subject, predicate, object}`` in quad mode;
+        ``{key, question, answer}`` in QA mode).
         """
         if not procedural_relations:
             return []
 
         logger.info("Found %d procedural relations", len(procedural_relations))
 
-        # Generate QA pairs
-        new_qa = generate_qa_from_relations(
-            procedural_relations, model=self.model, tokenizer=self.tokenizer
-        )
-        if not new_qa:
-            return []
-
-        # Assign keys with proc prefix, per-relation speaker
         new_keyed = []
-        for i, qa in enumerate(new_qa):
-            key = f"proc{self._procedural_next_index}"
-            self._procedural_next_index += 1
-            rel_speaker = (
-                procedural_relations[i].get("speaker_id", speaker_id)
-                if i < len(procedural_relations)
-                else speaker_id
-            )
-            keyed = {
-                "key": key,
-                "question": qa["question"],
-                "answer": qa["answer"],
-                "source_subject": qa.get("source_subject", ""),
-                "source_predicate": qa.get("source_predicate", ""),
-                "source_object": qa.get("source_object", ""),
-                "speaker_id": rel_speaker,
-                "first_seen_cycle": self.cycle_count,
-            }
-            new_keyed.append(keyed)
 
-        # Contradiction check
+        if self._is_quad:
+            # Quad mode: assign keys directly — no QA-gen.
+            quad_keyed = assign_quad_keys(
+                [(r["subject"], r["predicate"], r["object"]) for r in procedural_relations],
+                start_index=self._procedural_next_index,
+                prefix="proc",
+            )
+            self._procedural_next_index += len(quad_keyed)
+            for i, kp in enumerate(quad_keyed):
+                rel = procedural_relations[i] if i < len(procedural_relations) else {}
+                rel_speaker = rel.get("speaker_id", speaker_id)
+                new_keyed.append(
+                    self._cache_entry(
+                        key=kp["key"],
+                        subject=kp["subject"],
+                        predicate=kp["predicate"],
+                        object=kp["object"],
+                        speaker_id=rel_speaker,
+                        first_seen_cycle=self.cycle_count,
+                    )
+                )
+        else:
+            # QA mode: distil preference relations through the LLM.
+            new_qa = generate_qa_from_relations(
+                procedural_relations, model=self.model, tokenizer=self.tokenizer
+            )
+            if not new_qa:
+                return []
+            for i, qa in enumerate(new_qa):
+                key = f"proc{self._procedural_next_index}"
+                self._procedural_next_index += 1
+                rel_speaker = (
+                    procedural_relations[i].get("speaker_id", speaker_id)
+                    if i < len(procedural_relations)
+                    else speaker_id
+                )
+                new_keyed.append(
+                    self._cache_entry(
+                        key=key,
+                        subject=qa.get("source_subject", ""),
+                        predicate=qa.get("source_predicate", ""),
+                        object=qa.get("source_object", ""),
+                        speaker_id=rel_speaker,
+                        first_seen_cycle=self.cycle_count,
+                        question=qa.get("question"),
+                        answer=qa.get("answer"),
+                    )
+                )
+
+        # Contradiction check — sp_key reads uniform-shape names in both modes.
         for kp in new_keyed:
             sp_key = (
                 kp["speaker_id"],
-                kp["source_subject"].lower(),
-                kp["source_predicate"].lower(),
+                kp["subject"].lower(),
+                kp["predicate"].lower(),
             )
             old_key = self.procedural_sp_index.get(sp_key)
             if old_key and old_key in self.procedural_simhash:
@@ -1129,15 +1476,15 @@ class ConsolidationLoop:
                 if self.indexed_key_registry is not None:
                     self.indexed_key_registry.remove(old_key)
 
-        # Store new keys
+        # Store new keys — sp_key reads uniform-shape names.
         for kp in new_keyed:
             self.indexed_key_qa[kp["key"]] = kp
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.add(kp["key"])
             sp_key = (
                 kp["speaker_id"],
-                kp["source_subject"].lower(),
-                kp["source_predicate"].lower(),
+                kp["subject"].lower(),
+                kp["predicate"].lower(),
             )
             self.procedural_sp_index[sp_key] = kp["key"]
 
@@ -1150,19 +1497,35 @@ class ConsolidationLoop:
         ]
         reconstructed = {}
         for key in existing_keys:
-            recalled = probe_key(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=self.procedural_simhash,
-                confidence_threshold=0.5,
-            )
-            if recalled is not None and "failure_reason" not in recalled:
-                reconstructed[key] = {
-                    "key": key,
-                    "question": recalled["question"],
-                    "answer": recalled["answer"],
-                }
+            if self._is_quad:
+                recalled = probe_quad(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.procedural_simhash,
+                    confidence_threshold=0.5,
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "subject": recalled["subject"],
+                        "predicate": recalled["predicate"],
+                        "object": recalled["object"],
+                    }
+            else:
+                recalled = probe_key(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.procedural_simhash,
+                    confidence_threshold=0.5,
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "question": recalled["question"],
+                        "answer": recalled["answer"],
+                    }
 
         logger.info(
             "Procedural key reconstruction: %d/%d recovered",
@@ -1176,9 +1539,19 @@ class ConsolidationLoop:
                 all_procedural.append(reconstructed[key])
             elif key in self.indexed_key_qa:
                 qa = self.indexed_key_qa[key]
-                all_procedural.append(
-                    {"key": key, "question": qa["question"], "answer": qa["answer"]}
-                )
+                if self._is_quad:
+                    all_procedural.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    all_procedural.append(
+                        {"key": key, "question": qa["question"], "answer": qa["answer"]}
+                    )
         all_procedural.extend(new_keyed)
 
         return all_procedural
@@ -1268,18 +1641,24 @@ class ConsolidationLoop:
             # Entity-level promotion disabled (server uses key-level promotion)
             new_promotions = []
 
-        # --- 4. GENERATE QA PAIRS ---
-        # Single entry point: graph → (episodic_qa, procedural_rels).  Reads
-        # both session_graph.relations and entity.attributes, projects
-        # attributes into the relation-dict shape, partitions by relation_type,
-        # and mints QA pairs for the episodic side.  Replay pool below
-        # provides continuity with past sessions.
-        episodic_qa, procedural_rels = generate_qa_from_graph(
-            session_graph,
-            procedural_enabled=self.procedural_config is not None,
-            model=self.model,
-            tokenizer=self.tokenizer,
-        )
+        # --- 4. GENERATE QA PAIRS (or quad relation dicts) ---
+        # Single entry point: graph → (episodic_qa/relations, procedural_rels).
+        # In QA mode: calls the LLM QA-gen (reads both session_graph.relations
+        # and entity.attributes, projects attributes, partitions by
+        # relation_type, mints QA pairs).  In quad mode: builds relation dicts
+        # directly via _quads_from_graph — no model.generate calls.
+        if self._is_quad:
+            episodic_qa, procedural_rels = self._quads_from_graph(
+                session_graph,
+                procedural_enabled=self.procedural_config is not None,
+            )
+        else:
+            episodic_qa, procedural_rels = generate_qa_from_graph(
+                session_graph,
+                procedural_enabled=self.procedural_config is not None,
+                model=self.model,
+                tokenizer=self.tokenizer,
+            )
 
         # Mirror extract_session(): run the dedicated procedural prompt so
         # experiments exercise the same pipeline as production.
@@ -1306,8 +1685,15 @@ class ConsolidationLoop:
         episodic_qa = self.dedup_episodic(episodic_qa)
         procedural_rels = self.dedup_procedural(procedural_rels)
 
-        # Promotion: relations for promoted entities (cap to keep training bounded)
-        if new_promotions:
+        # Promotion: relations for promoted entities (cap to keep training bounded).
+        # In quad mode ``indexed_key_replay_enabled`` is always True (required invariant)
+        # so ``promote_qa`` is consumed only by the ``not indexed_key_replay_enabled``
+        # branch below (dead in quad mode).  Skip the ``model.generate`` loop entirely
+        # in quad mode — ``promote_relations`` still flows to
+        # ``_run_indexed_key_episodic`` / ``_run_indexed_key_semantic`` via
+        # ``new_promotions`` as before.
+        promote_qa: list[dict] = []
+        if new_promotions and not self._is_quad:
             promote_relations = get_relations_for_nodes(graph, new_promotions)
             if len(promote_relations) > 20:
                 promote_relations = random.sample(promote_relations, 20)
@@ -1316,8 +1702,6 @@ class ConsolidationLoop:
                 model=self.model,
                 tokenizer=self.tokenizer,
             )
-        else:
-            promote_qa = []
 
         # --- 4b. INDEXED KEY REPLAY (F4.9c validated) ---
         if self.indexed_key_registry is not None:
@@ -1435,25 +1819,44 @@ class ConsolidationLoop:
         switch_adapter(self.model, "episodic")
         self._disable_gradient_checkpointing()
 
-        # Assign keys to new session QA pairs
-        new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
-        for kp in new_keyed:
-            self.indexed_key_registry.add(kp["key"])
-            self.indexed_key_qa[kp["key"]] = {
-                "key": kp["key"],
-                "question": kp["question"],
-                "answer": kp["answer"],
-                "source_subject": kp.get("source_subject", ""),
-                "source_predicate": kp.get("source_predicate", ""),
-                "source_object": kp.get("source_object", ""),
-                "speaker_id": kp.get("speaker_id", ""),
-                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
-            }
+        # Assign keys to new session QA/relation pairs
+        if self._is_quad:
+            new_keyed = assign_quad_keys(
+                [(r["subject"], r["predicate"], r["object"]) for r in session_qa],
+                start_index=self._indexed_next_index,
+                prefix="graph",
+            )
+            for i, kp in enumerate(new_keyed):
+                rel = session_qa[i] if i < len(session_qa) else {}
+                self.indexed_key_registry.add(kp["key"])
+                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                    key=kp["key"],
+                    subject=kp["subject"],
+                    predicate=kp["predicate"],
+                    object=kp["object"],
+                    speaker_id=rel.get("speaker_id", ""),
+                    first_seen_cycle=self.cycle_count,
+                )
+        else:
+            new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
+            for kp in new_keyed:
+                self.indexed_key_registry.add(kp["key"])
+                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                    key=kp["key"],
+                    subject=kp.get("source_subject", ""),
+                    predicate=kp.get("source_predicate", ""),
+                    object=kp.get("source_object", ""),
+                    speaker_id=kp.get("speaker_id", ""),
+                    first_seen_cycle=kp.get("first_seen_cycle", self.cycle_count),
+                    question=kp.get("question"),
+                    answer=kp.get("answer"),
+                )
         self._indexed_next_index += len(new_keyed)
 
         # Promote keys for promoted entities (move to semantic before episodic training)
         # Check both source_subject and source_object — reverse QA templates
         # swap subject/object, so a promoted entity may appear in either field.
+        # Under Option-B uniform shape, source_* aliases are always present.
         promoted_keys = []
         if new_promotions:
             promoted_set = {n.lower() for n in new_promotions}
@@ -1481,19 +1884,35 @@ class ConsolidationLoop:
 
         reconstructed = {}
         for key in existing_keys:
-            recalled = probe_key(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=self.episodic_simhash,
-                confidence_threshold=0.5,  # Lower threshold for reconstruction
-            )
-            if recalled is not None and "failure_reason" not in recalled:
-                reconstructed[key] = {
-                    "key": key,
-                    "question": recalled["question"],
-                    "answer": recalled["answer"],
-                }
+            if self._is_quad:
+                recalled = probe_quad(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.episodic_simhash,
+                    confidence_threshold=0.5,
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "subject": recalled["subject"],
+                        "predicate": recalled["predicate"],
+                        "object": recalled["object"],
+                    }
+            else:
+                recalled = probe_key(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.episodic_simhash,
+                    confidence_threshold=0.5,  # Lower threshold for reconstruction
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "question": recalled["question"],
+                        "answer": recalled["answer"],
+                    }
 
         logger.info(
             "Indexed key reconstruction: %d/%d existing keys recovered",
@@ -1509,15 +1928,25 @@ class ConsolidationLoop:
             if key in reconstructed:
                 episodic_keyed.append(reconstructed[key])
             elif key in self.indexed_key_qa:
-                # Fallback to stored QA if reconstruction failed
+                # Fallback to stored data if reconstruction failed
                 qa = self.indexed_key_qa[key]
-                episodic_keyed.append(
-                    {
-                        "key": key,
-                        "question": qa["question"],
-                        "answer": qa["answer"],
-                    }
-                )
+                if self._is_quad:
+                    episodic_keyed.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    episodic_keyed.append(
+                        {
+                            "key": key,
+                            "question": qa["question"],
+                            "answer": qa["answer"],
+                        }
+                    )
 
         # Add new session keys
         episodic_keyed.extend(new_keyed)
@@ -1533,7 +1962,10 @@ class ConsolidationLoop:
             return None
 
         # Format and train
-        examples = format_indexed_training(episodic_keyed, self.tokenizer, max_length=1024)
+        if self._is_quad:
+            examples = format_quadruple_training(episodic_keyed, self.tokenizer, max_length=1024)
+        else:
+            examples = format_indexed_training(episodic_keyed, self.tokenizer, max_length=1024)
         dataset = self._indexed_dataset(examples)
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
@@ -1560,8 +1992,11 @@ class ConsolidationLoop:
             callbacks_extra=[recall_cb] if recall_cb is not None else None,
         )
 
-        # Update episodic SimHash registry from ground-truth QA
-        self.episodic_simhash = build_registry(episodic_keyed)
+        # Update episodic SimHash registry from ground-truth pairs
+        if self._is_quad:
+            self.episodic_simhash = build_registry_quad(episodic_keyed)
+        else:
+            self.episodic_simhash = build_registry(episodic_keyed)
 
         return metrics.get("train_loss")
 
@@ -1575,8 +2010,10 @@ class ConsolidationLoop:
         the semantic adapter on them with the indexed format.
         """
         # Collect promoted keys (already transferred in _run_indexed_key_episodic)
+        # Under Option-B uniform shape, source_* aliases are always present.
         promoted_set = {n.lower() for n in new_promotions}
         semantic_keyed = []
+        # Loop A — newly-promoted keys
         for key, qa_info in self.indexed_key_qa.items():
             subject = qa_info.get("source_subject", "").lower()
             obj = qa_info.get("source_object", "").lower()
@@ -1584,25 +2021,46 @@ class ConsolidationLoop:
                 obj and obj in promoted_set
             )
             if mentions_promoted and key in self.semantic_simhash:
-                semantic_keyed.append(
-                    {
-                        "key": key,
-                        "question": qa_info["question"],
-                        "answer": qa_info["answer"],
-                    }
-                )
+                if self._is_quad:
+                    semantic_keyed.append(
+                        {
+                            "key": key,
+                            "subject": qa_info["subject"],
+                            "predicate": qa_info["predicate"],
+                            "object": qa_info["object"],
+                        }
+                    )
+                else:
+                    semantic_keyed.append(
+                        {
+                            "key": key,
+                            "question": qa_info["question"],
+                            "answer": qa_info["answer"],
+                        }
+                    )
 
-        # Also include previously promoted keys still in semantic
+        # Loop B — previously promoted keys still in semantic
+        seen_semantic_keys = {kp["key"] for kp in semantic_keyed}
         for key in list(self.semantic_simhash.keys()):
-            if key not in {kp["key"] for kp in semantic_keyed} and key in self.indexed_key_qa:
+            if key not in seen_semantic_keys and key in self.indexed_key_qa:
                 qa = self.indexed_key_qa[key]
-                semantic_keyed.append(
-                    {
-                        "key": key,
-                        "question": qa["question"],
-                        "answer": qa["answer"],
-                    }
-                )
+                if self._is_quad:
+                    semantic_keyed.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    semantic_keyed.append(
+                        {
+                            "key": key,
+                            "question": qa["question"],
+                            "answer": qa["answer"],
+                        }
+                    )
 
         if not semantic_keyed:
             logger.info("No promoted keys for semantic training")
@@ -1611,7 +2069,10 @@ class ConsolidationLoop:
         logger.info("Training semantic adapter on %d promoted keys", len(semantic_keyed))
 
         switch_adapter(self.model, "semantic")
-        examples = format_indexed_training(semantic_keyed, self.tokenizer, max_length=1024)
+        if self._is_quad:
+            examples = format_quadruple_training(semantic_keyed, self.tokenizer, max_length=1024)
+        else:
+            examples = format_indexed_training(semantic_keyed, self.tokenizer, max_length=1024)
         dataset = self._indexed_dataset(examples)
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
@@ -1631,7 +2092,10 @@ class ConsolidationLoop:
         )
 
         # Update semantic SimHash registry
-        self.semantic_simhash = build_registry(semantic_keyed)
+        if self._is_quad:
+            self.semantic_simhash = build_registry_quad(semantic_keyed)
+        else:
+            self.semantic_simhash = build_registry(semantic_keyed)
 
         return metrics.get("train_loss")
 
@@ -1672,51 +2136,78 @@ class ConsolidationLoop:
             len(procedural_relations),
         )
 
-        # Generate QA pairs from preference relations
-        new_qa = generate_qa_from_relations(
-            procedural_relations, model=self.model, tokenizer=self.tokenizer
-        )
-        if not new_qa:
-            return None
-
         # Assign keys with proc prefix — use per-relation speaker_id.
         # Use a local tentative counter so self._procedural_next_index is not
         # advanced until after train_adapter returns successfully.  If training
         # raises, the index slots are not burned and a retry will reuse them.
         new_keyed = []
         tentative_next_index = self._procedural_next_index
-        for i, qa in enumerate(new_qa):
-            key = f"proc{tentative_next_index}"
-            tentative_next_index += 1
-            # Get speaker from the original relation if available
-            rel_speaker = (
-                procedural_relations[i].get("speaker_id", speaker_id)
-                if i < len(procedural_relations)
-                else speaker_id
+
+        if self._is_quad:
+            # Quad mode: assign keys directly from relation dicts — no QA-gen.
+            quad_keyed = assign_quad_keys(
+                [(r["subject"], r["predicate"], r["object"]) for r in procedural_relations],
+                start_index=tentative_next_index,
+                prefix="proc",
             )
-            keyed = {
-                "key": key,
-                "question": qa["question"],
-                "answer": qa["answer"],
-                "source_subject": qa.get("source_subject", ""),
-                "source_predicate": qa.get("source_predicate", ""),
-                "source_object": qa.get("source_object", ""),
-                "speaker_id": rel_speaker,
-                "first_seen_cycle": self.cycle_count,
-            }
-            new_keyed.append(keyed)
+            tentative_next_index += len(quad_keyed)
+            for i, kp in enumerate(quad_keyed):
+                rel = procedural_relations[i] if i < len(procedural_relations) else {}
+                rel_speaker = rel.get("speaker_id", speaker_id)
+                new_keyed.append(
+                    self._cache_entry(
+                        key=kp["key"],
+                        subject=kp["subject"],
+                        predicate=kp["predicate"],
+                        object=kp["object"],
+                        speaker_id=rel_speaker,
+                        first_seen_cycle=self.cycle_count,
+                    )
+                )
+        else:
+            # QA mode: generate QA pairs from preference relations.
+            new_qa = generate_qa_from_relations(
+                procedural_relations, model=self.model, tokenizer=self.tokenizer
+            )
+            if not new_qa:
+                return None
+
+            for i, qa in enumerate(new_qa):
+                key = f"proc{tentative_next_index}"
+                tentative_next_index += 1
+                rel_speaker = (
+                    procedural_relations[i].get("speaker_id", speaker_id)
+                    if i < len(procedural_relations)
+                    else speaker_id
+                )
+                new_keyed.append(
+                    self._cache_entry(
+                        key=key,
+                        subject=qa.get("source_subject", ""),
+                        predicate=qa.get("source_predicate", ""),
+                        object=qa.get("source_object", ""),
+                        speaker_id=rel_speaker,
+                        first_seen_cycle=self.cycle_count,
+                        question=qa.get("question"),
+                        answer=qa.get("answer"),
+                    )
+                )
+
+        if not new_keyed:
+            return None
 
         # Compute intended mutations without touching shared state yet.
         # keys_to_retire: old contradicted keys that will be removed on success.
         # new_sp_mappings: (sp_key -> new_key) entries for procedural_sp_index.
+        # sp_key reads from uniform-shape names (subject/predicate in both modes).
         keys_to_retire: list[str] = []
         new_sp_mappings: dict[tuple, str] = {}
         new_key_set = {kp["key"] for kp in new_keyed}
         for kp in new_keyed:
             sp_key = (
                 kp["speaker_id"],
-                kp["source_subject"].lower(),
-                kp["source_predicate"].lower(),
+                kp["subject"].lower(),
+                kp["predicate"].lower(),
             )
             old_key = self.procedural_sp_index.get(sp_key)
             if old_key and old_key in self.procedural_simhash:
@@ -1740,19 +2231,35 @@ class ConsolidationLoop:
         ]
         reconstructed = {}
         for key in existing_keys:
-            recalled = probe_key(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=self.procedural_simhash,
-                confidence_threshold=0.5,
-            )
-            if recalled is not None and "failure_reason" not in recalled:
-                reconstructed[key] = {
-                    "key": key,
-                    "question": recalled["question"],
-                    "answer": recalled["answer"],
-                }
+            if self._is_quad:
+                recalled = probe_quad(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.procedural_simhash,
+                    confidence_threshold=0.5,
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "subject": recalled["subject"],
+                        "predicate": recalled["predicate"],
+                        "object": recalled["object"],
+                    }
+            else:
+                recalled = probe_key(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=self.procedural_simhash,
+                    confidence_threshold=0.5,
+                )
+                if recalled is not None and "failure_reason" not in recalled:
+                    reconstructed[key] = {
+                        "key": key,
+                        "question": recalled["question"],
+                        "answer": recalled["answer"],
+                    }
 
         logger.info(
             "Procedural key reconstruction: %d/%d existing keys recovered",
@@ -1760,8 +2267,8 @@ class ConsolidationLoop:
             len(existing_keys),
         )
 
-        # Build full procedural training set from reconstructed + fallback QA + new.
-        # Read existing QA from self.indexed_key_qa directly — shared state is still
+        # Build full procedural training set from reconstructed + fallback + new.
+        # Read existing data from self.indexed_key_qa — shared state is still
         # unmodified at this point.
         all_procedural = []
         for key in existing_keys:
@@ -1769,9 +2276,19 @@ class ConsolidationLoop:
                 all_procedural.append(reconstructed[key])
             elif key in self.indexed_key_qa:
                 qa = self.indexed_key_qa[key]
-                all_procedural.append(
-                    {"key": key, "question": qa["question"], "answer": qa["answer"]}
-                )
+                if self._is_quad:
+                    all_procedural.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    all_procedural.append(
+                        {"key": key, "question": qa["question"], "answer": qa["answer"]}
+                    )
         all_procedural.extend(new_keyed)
 
         if not all_procedural:
@@ -1783,7 +2300,10 @@ class ConsolidationLoop:
             len(new_keyed),
         )
 
-        examples = format_indexed_training(all_procedural, self.tokenizer, max_length=1024)
+        if self._is_quad:
+            examples = format_quadruple_training(all_procedural, self.tokenizer, max_length=1024)
+        else:
+            examples = format_indexed_training(all_procedural, self.tokenizer, max_length=1024)
         dataset = self._indexed_dataset(examples)
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
@@ -1822,17 +2342,22 @@ class ConsolidationLoop:
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.remove(old_key)
 
-        # 3. Register new QA pairs, update sp_index, and add simhash entries.
+        # 3. Register new pairs, update sp_index, and add simhash entries.
         #    Explicit incremental mutations keep all four indexes consistent and
         #    symmetric — no full reconstruction needed, since existing-key hashes
-        #    are unchanged (compute_simhash is deterministic from key/question/answer).
+        #    are unchanged (compute_simhash is deterministic).
         for kp in new_keyed:
             self.indexed_key_qa[kp["key"]] = kp
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.add(kp["key"])
-            self.procedural_simhash[kp["key"]] = compute_simhash(
-                kp["key"], kp["question"], kp["answer"]
-            )
+            if self._is_quad:
+                self.procedural_simhash[kp["key"]] = compute_simhash_quad(
+                    kp["key"], kp["subject"], kp["predicate"], kp["object"]
+                )
+            else:
+                self.procedural_simhash[kp["key"]] = compute_simhash(
+                    kp["key"], kp["question"], kp["answer"]
+                )
         for sp_key, new_key in new_sp_mappings.items():
             self.procedural_sp_index[sp_key] = new_key
 
@@ -2102,11 +2627,14 @@ class ConsolidationLoop:
             ]
             if not pairs:
                 return None
-            from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
-
             adapter_dir = self.output_dir / adapter_name
             kp_path = adapter_dir / "keyed_pairs.json"
-            _wkp(kp_path, pairs)
+            if self._is_quad:
+                write_keyed_pairs_quad(kp_path, pairs)
+            else:
+                from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
+
+                _wkp(kp_path, pairs)
             return kp_path
 
         def _build(name: str, kp_path: "Path | None") -> "object | None":
@@ -2122,6 +2650,7 @@ class ConsolidationLoop:
                     registry_sha256_override=registry_sha256,
                     window_stamp=full_window_stamp,
                     adapter_root=self.output_dir,
+                    indexed_format=self._indexed_format,
                 )
             except Exception:  # noqa: BLE001
                 return None
@@ -2132,19 +2661,32 @@ class ConsolidationLoop:
             Mirrors the filtering logic in ``_write_kp`` without writing to disk
             so that ``_verify_saved_adapter_from_disk`` receives the same set of
             pairs that were encoded into the saved weights.
+
+            In quad mode returns ``{key, subject, predicate, object}`` entries;
+            in QA mode returns ``{key, question, answer}`` entries.
             """
             pairs: list[dict] = []
             for key in simhash_registry:
                 qa = self.indexed_key_qa.get(key) if self.indexed_key_qa else None
                 if qa is None:
                     continue
-                pairs.append(
-                    {
-                        "key": key,
-                        "question": qa["question"],
-                        "answer": qa["answer"],
-                    }
-                )
+                if self._is_quad:
+                    pairs.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                        }
+                    )
+                else:
+                    pairs.append(
+                        {
+                            "key": key,
+                            "question": qa["question"],
+                            "answer": qa["answer"],
+                        }
+                    )
             return pairs
 
         def _save_and_verify(
@@ -2420,11 +2962,31 @@ class ConsolidationLoop:
             "mode", "error"}``.
         """
         from paramem.server.interim_adapter import create_interim_adapter
-        from paramem.training.indexed_memory import (
-            assign_keys,
-            build_registry,
-            format_indexed_training,
-        )
+
+        # Format-conditional imports: local aliases so the body below can
+        # reference ``_format_training``, ``_build_reg``, and ``_wkp_fn``
+        # without scattering ``if self._is_quad`` in every line.
+        # ``_assign_keys`` is only needed in the QA path (the quad path calls
+        # ``assign_quad_keys`` directly via the module-level import).
+        if self._is_quad:
+            _format_training = format_quadruple_training
+            _build_reg = build_registry_quad
+            _wkp_fn = write_keyed_pairs_quad
+        else:
+            from paramem.training.indexed_memory import (
+                assign_keys as _assign_keys_qa,
+            )
+            from paramem.training.indexed_memory import (
+                build_registry as _build_reg_qa,
+            )
+            from paramem.training.indexed_memory import (
+                format_indexed_training as _fmt_qa,
+            )
+
+            _assign_keys = _assign_keys_qa
+            _format_training = _fmt_qa
+            _build_reg = _build_reg_qa
+            from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp_fn
 
         triples_extracted = len(episodic_qa)
 
@@ -2573,7 +3135,18 @@ class ConsolidationLoop:
             if "speaker_id" not in qa:
                 qa["speaker_id"] = speaker_id
 
-        new_keyed = assign_keys(episodic_qa, start_index=self._indexed_next_index)
+        if self._is_quad:
+            new_keyed = assign_quad_keys(
+                [(r["subject"], r["predicate"], r["object"]) for r in episodic_qa],
+                start_index=self._indexed_next_index,
+                prefix="graph",
+            )
+            # Attach speaker_id from the source relation dict (already tagged above).
+            for i, kp in enumerate(new_keyed):
+                rel = episodic_qa[i] if i < len(episodic_qa) else {}
+                kp["speaker_id"] = rel.get("speaker_id", speaker_id)
+        else:
+            new_keyed = _assign_keys(episodic_qa, start_index=self._indexed_next_index)
 
         # Collect all existing keys for this interim adapter so we can rebuild
         # the full training set (avoids catastrophic forgetting — same pattern
@@ -2610,7 +3183,7 @@ class ConsolidationLoop:
 
         switch_adapter(self.model, adapter_name)
         self._disable_gradient_checkpointing()
-        examples = format_indexed_training(all_interim_keyed, self.tokenizer, max_length=1024)
+        examples = _format_training(all_interim_keyed, self.tokenizer, max_length=1024)
         dataset = self._indexed_dataset(examples)
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
@@ -2670,16 +3243,20 @@ class ConsolidationLoop:
         for kp in new_keyed:
             k = kp["key"]
             self.indexed_key_registry.add(k, adapter_id=adapter_name)
-            self.indexed_key_qa[k] = {
-                "key": k,
-                "question": kp["question"],
-                "answer": kp["answer"],
-                "source_subject": kp.get("source_subject", ""),
-                "source_predicate": kp.get("source_predicate", ""),
-                "source_object": kp.get("source_object", ""),
-                "speaker_id": kp.get("speaker_id", speaker_id),
-                "first_seen_cycle": kp.get("first_seen_cycle", self.cycle_count),
-            }
+            # In quad mode kp has {key, subject, predicate, object, speaker_id};
+            # _cache_entry fills source_* aliases and omits question/answer.
+            # In QA mode kp has {key, question, answer, source_*}; _cache_entry
+            # passes question/answer through.
+            self.indexed_key_qa[k] = self._cache_entry(
+                key=k,
+                subject=kp.get("subject") or kp.get("source_subject", ""),
+                predicate=kp.get("predicate") or kp.get("source_predicate", ""),
+                object=kp.get("object") or kp.get("source_object", ""),
+                speaker_id=kp.get("speaker_id", speaker_id),
+                first_seen_cycle=kp.get("first_seen_cycle", self.cycle_count),
+                question=kp.get("question"),
+                answer=kp.get("answer"),
+            )
             new_key_ids.append(k)
         self._indexed_next_index += len(new_keyed)
 
@@ -2720,15 +3297,13 @@ class ConsolidationLoop:
         # returns dicts without first_seen_cycle, so using new_keyed directly
         # would fail facade validation.  indexed_key_qa was populated with all
         # 8 canonical fields in step 7 above.
-        from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
-
         all_interim_keys = [kp["key"] for kp in all_interim_keyed]
         all_interim_keyed_full = [
             self.indexed_key_qa[k] for k in all_interim_keys if k in self.indexed_key_qa
         ]
         interim_dir = self.output_dir / adapter_name
         kp_path = interim_dir / "keyed_pairs.json"
-        _wkp(kp_path, all_interim_keyed_full)
+        _wkp_fn(kp_path, all_interim_keyed_full)
 
         # Step 5: Build manifest with pre-computed registry_sha256.  The
         # interim slot's window IS the cadence boundary stamp — same value
@@ -2747,6 +3322,7 @@ class ConsolidationLoop:
                 registry_sha256_override=registry_sha256,
                 window_stamp=stamp,
                 adapter_root=self.output_dir,
+                indexed_format=self._indexed_format,
             )
         except Exception:
             logger.warning("post_session_train: manifest build failed — saving without manifest")
@@ -2769,11 +3345,9 @@ class ConsolidationLoop:
                     if k in self.indexed_key_qa
                 ]
                 if proc_pairs:
-                    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
-
                     proc_dir = self.output_dir / "procedural"
                     proc_kp_path = proc_dir / "keyed_pairs.json"
-                    _wkp(proc_kp_path, proc_pairs)
+                    _wkp_fn(proc_kp_path, proc_pairs)
 
             try:
                 proc_manifest = _build_manifest_for(
@@ -2787,6 +3361,7 @@ class ConsolidationLoop:
                     registry_sha256_override=registry_sha256,
                     window_stamp=stamp,
                     adapter_root=self.output_dir,
+                    indexed_format=self._indexed_format,
                 )
             except Exception:
                 logger.warning(
@@ -2801,7 +3376,7 @@ class ConsolidationLoop:
             )
 
         # Step 7: Save SimHash registries.
-        interim_simhash = build_registry(all_interim_keyed)
+        interim_simhash = _build_reg(all_interim_keyed)
         save_registry(
             interim_simhash,
             self.output_dir / f"simhash_registry_{adapter_name}.json",
@@ -3310,13 +3885,23 @@ class ConsolidationLoop:
                         else "episodic"
                     )
 
-            tier_keyed[tier].append(
-                {
-                    "key": key,
-                    "question": qa_info["question"],
-                    "answer": qa_info["answer"],
-                }
-            )
+            if self._is_quad:
+                tier_keyed[tier].append(
+                    {
+                        "key": key,
+                        "subject": qa_info["subject"],
+                        "predicate": qa_info["predicate"],
+                        "object": qa_info["object"],
+                    }
+                )
+            else:
+                tier_keyed[tier].append(
+                    {
+                        "key": key,
+                        "question": qa_info["question"],
+                        "answer": qa_info["answer"],
+                    }
+                )
 
         # Warn if graph drift exceeds 10 % of active keys.
         if active_keys and graph_drift_count > len(active_keys) * 0.10:
@@ -3461,10 +4046,20 @@ class ConsolidationLoop:
                 trainer._set_is_training(True)
             try:
                 # Format training data and update job config for refresh epochs.
-                from paramem.training.indexed_memory import format_indexed_training
+                # In quad mode the tier_keyed entries are {key,subject,predicate,object};
+                # in QA mode they are {key,question,answer}.
                 from paramem.training.trainer import train_adapter as _train_adapter_fn
 
-                examples = format_indexed_training(job.keyed_pairs, self.tokenizer, max_length=1024)
+                if self._is_quad:
+                    examples = format_quadruple_training(
+                        job.keyed_pairs, self.tokenizer, max_length=1024
+                    )
+                else:
+                    from paramem.training.indexed_memory import (
+                        format_indexed_training as _fmt_consolidate,
+                    )
+
+                    examples = _fmt_consolidate(job.keyed_pairs, self.tokenizer, max_length=1024)
                 if examples:
                     dataset = self._indexed_dataset(examples)
                     self._enable_gradient_checkpointing()
@@ -3612,21 +4207,36 @@ class ConsolidationLoop:
         if len(probe_pairs) > max_probe:
             probe_pairs = random.sample(probe_pairs, max_probe)
 
-        from paramem.training.indexed_memory import build_registry as _build_reg
-
-        probe_registry = _build_reg(probe_pairs)
-
         try:
-            from experiments.utils.test_harness import evaluate_indexed_recall
+            if self._is_quad:
+                from experiments.utils.test_harness import evaluate_indexed_recall_quad
+                from paramem.training.quadruple_memory import (
+                    build_registry as _build_reg_quad,
+                )
 
-            self._disable_gradient_checkpointing()
-            recall_result = evaluate_indexed_recall(
-                self.model,
-                self.tokenizer,
-                probe_pairs,
-                probe_registry,
-                adapter_name=adapter_name,
-            )
+                probe_registry = _build_reg_quad(probe_pairs)
+                self._disable_gradient_checkpointing()
+                recall_result = evaluate_indexed_recall_quad(
+                    self.model,
+                    self.tokenizer,
+                    probe_pairs,
+                    probe_registry,
+                    adapter_name=adapter_name,
+                )
+            else:
+                from paramem.training.indexed_memory import build_registry as _build_reg
+
+                probe_registry = _build_reg(probe_pairs)
+                from experiments.utils.test_harness import evaluate_indexed_recall
+
+                self._disable_gradient_checkpointing()
+                recall_result = evaluate_indexed_recall(
+                    self.model,
+                    self.tokenizer,
+                    probe_pairs,
+                    probe_registry,
+                    adapter_name=adapter_name,
+                )
             return float(recall_result["rate"])
         except Exception:
             logger.exception(
@@ -3971,7 +4581,6 @@ class ConsolidationLoop:
             RecallEarlyStopCallback,
             _EarlyStopState,
         )
-        from paramem.training.indexed_memory import build_registry
 
         output_dir = Path(output_dir)
         policy = EarlyStopPolicy(
@@ -3980,11 +4589,23 @@ class ConsolidationLoop:
             window=self.training_config.recall_window,
             probe_every_n_epochs=self.training_config.recall_probe_every_n_epochs,
         )
+
+        if self._is_quad:
+            # Quad mode: use the quad build_registry and quad eval function so
+            # the fill+retention probes use probe_quad with (s,p,o) exact-match.
+            from experiments.utils.test_harness import evaluate_indexed_recall_quad as _eval_fn
+            from paramem.training.quadruple_memory import (
+                build_registry as _build_registry,
+            )
+        else:
+            from experiments.utils.test_harness import evaluate_indexed_recall as _eval_fn
+            from paramem.training.indexed_memory import build_registry as _build_registry
+
         return RecallEarlyStopCallback(
             model=self.model,
             tokenizer=self.tokenizer,
             target_keyed=keyed_pairs,
-            target_registry=build_registry(keyed_pairs),
+            target_registry=_build_registry(keyed_pairs),
             adapter_name=adapter_name,
             policy=policy,
             state_out=_EarlyStopState(),
@@ -3994,6 +4615,8 @@ class ConsolidationLoop:
             phase_name=phase_name,
             num_epochs=self.training_config.num_epochs,
             pause_file=None,  # production pause via gpu_lock_sync, not file
+            eval_fn=_eval_fn,
+            is_quad=self._is_quad,
         )
 
 

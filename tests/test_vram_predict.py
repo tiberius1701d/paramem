@@ -15,13 +15,22 @@ from unittest.mock import patch
 
 
 def _make_fake_snap(tmp_path: Path, files: dict[str, int]) -> Path:
-    """Create fake snapshot dir with named files of given byte sizes."""
+    """Create fake snapshot dir with named files of given byte sizes.
+
+    Files are created *sparse* (``truncate`` extends an empty file to the
+    target length without allocating disk blocks) — ``vram_predict`` only
+    reads ``stat().st_size``, so we get the right reported size for ~zero
+    I/O.  This matters: the multi-GB shard sizes used below would otherwise
+    write/delete tens of GB per run and blow the ``pytest-timeout`` budget
+    on a slow CI runner.
+    """
     snap = tmp_path / "snap"
     snap.mkdir(parents=True, exist_ok=True)
     for name, size in files.items():
         f = snap / name
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_bytes(b"\x00" * size)
+        with open(f, "wb") as fh:
+            fh.truncate(size)
     return snap
 
 

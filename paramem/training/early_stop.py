@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING
 from transformers import TrainerCallback
 
 if TYPE_CHECKING:
-    pass
+    from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -182,8 +182,37 @@ class RecallEarlyStopCallback(TrainerCallback):
         pause_file: Path | None,
         retention_keyed: list[dict] | None = None,
         retention_registry: dict[str, int] | None = None,
+        eval_fn: "Callable | None" = None,
+        is_quad: bool = False,
     ) -> None:
-        """Initialise callback state."""
+        """Initialise callback state.
+
+        Args:
+            eval_fn: Probe function called for both the fill probe and the
+                optional retention probe at each epoch boundary.  ``None``
+                (default) selects
+                :func:`experiments.utils.test_harness.evaluate_indexed_recall`
+                via a lazy import at each ``on_epoch_end`` call — preserving
+                the pre-2c-bis behaviour so existing call sites and
+                test-suite patches that target the module-level name continue
+                to work unchanged.  Pass
+                :func:`experiments.utils.test_harness.evaluate_indexed_recall_quad`
+                when training a quad-format adapter so the probes use
+                :func:`~paramem.training.quadruple_memory.probe_quad` with
+                exact-match on ``(subject, predicate, object)``.
+            is_quad: When ``True``, the Q/A split diagnostics
+                (``per_field_split_counts`` / ``update_first_perfect_log``) are
+                skipped because quad ``per_key`` entries carry
+                ``recalled_subject``/``recalled_predicate``/``recalled_object``
+                rather than ``question_match``/``answer_match``/``recalled``
+                — reporting all-zero "q/a split" when recall is actually
+                perfect would produce misleading log noise.  The early-stop
+                *decision* logic (``fill["rate"]`` + ``_consecutive_perfect``)
+                is unaffected.  Set by
+                :meth:`~paramem.training.consolidation.ConsolidationLoop._maybe_make_recall_callback`
+                alongside ``eval_fn=evaluate_indexed_recall_quad``; QA-path
+                callers leave this at the default ``False``.
+        """
         self._model = model
         self._tokenizer = tokenizer
         self._target_keyed = target_keyed
@@ -199,6 +228,8 @@ class RecallEarlyStopCallback(TrainerCallback):
         self._pause_file = pause_file
         self._retention_keyed = retention_keyed
         self._retention_registry = retention_registry
+        self._eval_fn = eval_fn
+        self._is_quad = is_quad
 
         # Internal state (§6 pseudocode variable names).
         self._last_epoch: int = -1
@@ -289,12 +320,11 @@ class RecallEarlyStopCallback(TrainerCallback):
           returning (callback-exempt re-enable per §14.3).
         - Pause file checked AFTER probe completes and epoch_log is persisted.
         """
-        # Lazy import here to allow unit-testing without GPU.
+        # Lazy import for diagnostics helpers (GPU-free; no startup penalty).
         from experiments.utils.recall_diagnostics import (
             per_field_split_counts,
             update_first_perfect_log,
         )
-        from experiments.utils.test_harness import evaluate_indexed_recall
 
         epoch = int(round(state.epoch))
 
@@ -328,8 +358,16 @@ class RecallEarlyStopCallback(TrainerCallback):
                 control.should_training_stop = True
             return
 
+        # Resolve the probe function.  ``None`` → lazy import so that the
+        # QA-format default is looked up at call time, preserving test-suite
+        # patchability of the module-level name in test_harness.py.
+        if self._eval_fn is None:
+            from experiments.utils.test_harness import evaluate_indexed_recall as _probe_fn
+        else:
+            _probe_fn = self._eval_fn
+
         # --- Fill probe ---
-        fill = evaluate_indexed_recall(
+        fill = _probe_fn(
             self._model,
             self._tokenizer,
             self._target_keyed,
@@ -340,7 +378,7 @@ class RecallEarlyStopCallback(TrainerCallback):
         # --- Optional retention probe ---
         retention = None
         if self._retention_keyed is not None and self._retention_registry is not None:
-            retention = evaluate_indexed_recall(
+            retention = _probe_fn(
                 self._model,
                 self._tokenizer,
                 self._retention_keyed,
@@ -362,9 +400,29 @@ class RecallEarlyStopCallback(TrainerCallback):
         if getattr(args, "gradient_checkpointing", False):
             self._model.gradient_checkpointing_enable()
 
-        # --- Diagnostics ---
-        split = per_field_split_counts(fill["per_key"])
-        update_first_perfect_log(fill["per_key"], self._first_perfect_log, epoch)
+        # --- Diagnostics (QA-path only) ---
+        # ``per_field_split_counts`` and ``update_first_perfect_log`` consume
+        # ``question_match``/``answer_match``/``recalled`` keys that are absent
+        # from quad ``per_key`` entries (which carry
+        # ``recalled_subject``/``recalled_predicate``/``recalled_object``
+        # instead).  Calling them in quad mode would log all-zero "q/a split"
+        # even when recall is perfect — misleading noise with no diagnostic
+        # value.  The early-stop decision (``fill["rate"]`` +
+        # ``_consecutive_perfect``) is driven by ``fill["exact_count"]`` and
+        # ``fill["total"]`` which are format-agnostic and are unaffected.
+        if not self._is_quad:
+            split = per_field_split_counts(fill["per_key"])
+            update_first_perfect_log(fill["per_key"], self._first_perfect_log, epoch)
+        else:
+            split = {
+                "both": 0,
+                "q_only": 0,
+                "a_only": 0,
+                "neither": 0,
+                "total": 0,
+                "q_correct": 0,
+                "a_correct": 0,
+            }
 
         # --- Epoch log entry ---
         entry: dict = {

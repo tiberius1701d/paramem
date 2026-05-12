@@ -121,6 +121,10 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.graph_enrichment_interim_enabled = False
     loop.graph_enrichment_min_triples_floor = 20
     loop._triples_since_last_enrichment = 0
+    # _is_quad / _indexed_format are set by __init__; tests that bypass
+    # __init__ via __new__ / object.__new__ must set them explicitly.
+    loop._indexed_format = "qa"
+    loop._is_quad = False
 
     return loop
 

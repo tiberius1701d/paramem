@@ -11,9 +11,9 @@ Knowledge lives in LoRA adapter weights, not in files.
 
 Personal AI agents need persistent memory. Current approaches — RAG, text-based memory, conversation logs — store and retrieve text, but the model itself learns nothing. Every session starts from the same frozen weights.
 
-ParaMem takes a different approach inspired by biological memory consolidation. Session experiences are extracted into a knowledge graph, converted to QA training pairs, and compressed into LoRA adapter weights through replay-and-consolidation cycles. The model *learns* your facts — they become part of its parameters, not entries in a database.
+ParaMem takes a different approach inspired by biological memory consolidation. Session experiences are extracted into a knowledge graph, encoded as indexed-key training data, and compressed into LoRA adapter weights through replay-and-consolidation cycles. The model *learns* your facts — they become part of its parameters, not entries in a database.
 
-The core mechanism is **indexed key retrieval**: each fact gets a unique key (`graph1`, `graph2`, ...) and the adapter learns to recall the exact QA pair when prompted with that key. A SimHash registry provides hallucination detection — the system knows what it knows and rejects queries for facts it hasn't learned. At inference, the full pipeline is **enumerate → reconstruct → reason**: the adapter surfaces every fact under its key, the recalled facts become explicit context, and the base model reasons over them.
+The core mechanism is **indexed key retrieval**: each fact gets a unique key (`graph1`, `graph2`, ...) and the adapter learns to recall the exact fact — the `(subject, predicate, object)` triple — when prompted with that key. A SimHash registry provides hallucination detection — the system knows what it knows and rejects queries for facts it hasn't learned. At inference, the full pipeline is **enumerate → reconstruct → reason**: the adapter surfaces every fact under its key, the recalled facts become explicit context, and the base model reasons over them. (The keyed-fact encoding is migrating from an LLM-generated `(key, question, answer)` form to a `(key, subject, predicate, object)` form built directly from the merged graph; gated by `consolidation.indexed_format`.)
 
 ## Status
 
@@ -88,7 +88,7 @@ Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/ext
 
 At every **full consolidation** the cumulative merged graph then passes through a **graph-level SOTA enrichment** stage that per-transcript extraction cannot see: the SOTA model receives N-hop subgraphs (serialized as triples, chunked by focal entity) and emits cross-session second-order relations plus `same_as` pairs for entity coreference. Duplicates are contracted into canonical nodes under a token-subset / Jaro-Winkler safety gate; new edges are tagged `source="graph_enrichment"` and feed the downstream partition + training pipeline unchanged. A **mini-enrichment** pass also fires at each interim-adapter rollover (per sub-interval, default 12h) when enough new triples have accumulated since the last pass (`graph_enrichment_min_triples_floor`), amortising the SOTA cost across the 84h cycle instead of concentrating it at the final boundary. Both passes are budget-bound by `graph_enrichment_neighborhood_hops` and `graph_enrichment_max_entities_per_pass`.
 
-**Background training** is driven by a systemd user timer whose period derives from `consolidation.refresh_cadence` (default `"12h"`). The full-consolidation period is derived, not configured: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Interim adapters absorb new facts between full cycles so recall does not wait a full period. `BackgroundTrainer` pauses at step boundaries for inference requests, switches the model between eval/train mode, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes from the last completed epoch rather than restarting from zero. A missed post-session training trigger is replayed from a persistent queue (`post_session_queue.json`) on startup. **Optional recall-based early stopping** (`consolidation.recall_early_stopping`, default `false`) cuts training at the first `recall_window` consecutive 100%-recall probes past `recall_signal_from_epoch`, replacing the fixed-budget run with a recall-driven stop; validated at multi-seed N=100 (Test 14). A **simulation mode** (`consolidation.mode: simulate`) persists QA pairs and registries to disk instead of weights; `probe_keys_from_disk` serves recall from the same per-tier `keyed_pairs.json` layout that train mode produces. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`; `pstatus` shows a `REHYDRATING` banner while it runs).
+**Background training** is driven by a systemd user timer whose period derives from `consolidation.refresh_cadence` (default `"12h"`). The full-consolidation period is derived, not configured: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Interim adapters absorb new facts between full cycles so recall does not wait a full period. `BackgroundTrainer` pauses at step boundaries for inference requests, switches the model between eval/train mode, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes from the last completed epoch rather than restarting from zero. A missed post-session training trigger is replayed from a persistent queue (`post_session_queue.json`) on startup. **Optional recall-based early stopping** (`consolidation.recall_early_stopping`, default `false`) cuts training at the first `recall_window` consecutive 100%-recall probes past `recall_signal_from_epoch`, replacing the fixed-budget run with a recall-driven stop; validated at multi-seed N=100 (Test 14). A **simulation mode** (`consolidation.mode: simulate`) persists the keyed pairs — `(key, subject, predicate, object, …)` under the quadruple encoding, `(key, question, answer, …)` under the legacy QA encoding — and registries to disk instead of weights; `probe_keys_from_disk` serves recall from the same per-tier `keyed_pairs.json` layout that train mode produces. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`; `pstatus` shows a `REHYDRATING` banner while it runs).
 
 **Speaker identification** uses pyannote 512-dim voice embeddings with multi-embedding centroid matching and auto-enrichment on confirmed matches.
 
@@ -237,8 +237,8 @@ This forces sequential weight loading. Models load slightly slower but reliably.
 1. **Extract:** LLM-based graph extraction pulls entities and relations from session text (optionally using a dedicated distillation model for higher quality)
 2. **Merge:** Entity resolution deduplicates and aggregates knowledge across sessions
 3. **Score:** Composite scoring (PageRank + degree + recurrence + recency) identifies promotion candidates
-4. **Assign keys:** Each QA pair gets a unique key (`graph1`, `graph2`, ...) for addressable recall
-5. **Train:** LoRA adapters learn the key→QA mapping via chat-template formatted training
+4. **Assign keys:** Each fact gets a unique key (`graph1`, `graph2`, ...) for addressable recall
+5. **Train:** LoRA adapters learn the key→fact mapping via chat-template formatted training
 6. **Verify:** SimHash registry detects hallucination with continuous confidence scoring
 7. **Promote:** Well-reinforced facts move from episodic to semantic adapter
 8. **Decay:** Unreinforced facts fade after configurable window
@@ -313,8 +313,10 @@ enumerate alternatives:
 
 This split is the contract: closed-set fields are constrained by example
 exhaustiveness; open-set fields are filled by demonstration of shape. The
-QA generator (`paramem/graph/qa_generator.py`) auto-prefixes attribute keys
-with `has_` so the prompt should emit bare keys (`email`, not `has_email`).
+attribute-projection step (`paramem/graph/relation_prep.py`; the legacy QA
+path in `paramem/graph/qa_generator.py` reaches the same helper) auto-prefixes
+attribute keys with `has_` so the prompt should emit bare keys (`email`, not
+`has_email`).
 
 ### Calibration loop
 
@@ -552,7 +554,7 @@ curl -X POST http://localhost:8420/chat \
   -d '{"text": "Where does Marcus work?", "conversation_id": "session1"}'
 ```
 
-The server buffers conversation turns automatically. On the next consolidation cycle, it extracts knowledge from buffered sessions, merges into the knowledge graph, generates QA pairs, and retrains the adapter.
+The server buffers conversation turns automatically. On the next consolidation cycle, it extracts knowledge from buffered sessions, merges into the knowledge graph, encodes the merged facts as indexed-key training data, and retrains the adapter.
 
 ### Home Assistant Integration
 
@@ -608,7 +610,7 @@ Tests fall back to synthetic data if PerLTQA is not available, but results may d
 
 ### Dataset probe
 
-`experiments/dataset_probe.py` runs any supported dataset through the full consolidation pipeline (extract → merge → QA → indexed-key train → recall smoke) and emits identically-shaped per-session diagnostics. Useful for comparing extraction quality across corpora and regression-testing the pipeline end-to-end. Resume-safe; outputs land in `outputs/dataset_probe/{dataset}/{model}/{timestamp}/`.
+`experiments/dataset_probe.py` runs any supported dataset through the full consolidation pipeline (extract → merge → encode keyed facts → indexed-key train → recall smoke) and emits identically-shaped per-session diagnostics. Useful for comparing extraction quality across corpora and regression-testing the pipeline end-to-end. Resume-safe; outputs land in `outputs/dataset_probe/{dataset}/{model}/{timestamp}/`.
 
 ```bash
 python experiments/dataset_probe.py --dataset perltqa --limit 20

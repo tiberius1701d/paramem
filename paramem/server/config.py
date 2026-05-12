@@ -671,6 +671,7 @@ class ConsolidationScheduleConfig:
     retain_sessions: bool = True
     indexed_key_replay: bool = True  # indexed key training mechanism
     decay_window: int = 10  # cycles before unreinforced keys decay
+    indexed_format: str = "qa"  # "qa" = QA-pair format (default), "quad" = quadruple format
     # Maximum LoRA training epochs per consolidation cycle. None = use the
     # validated 30 from VALIDATED_TRAINING_CONFIG (the Test 1-8 campaign
     # floor for 100% indexed-key recall on the validated models).
@@ -815,6 +816,9 @@ class ConsolidationScheduleConfig:
         - judge="off"   + any stage  → plausibility disabled, no cloud exposure
         - judge=<cloud> + stage="anon" → cloud judge on anonymized data only
         """
+        if self.indexed_format not in ("qa", "quad"):
+            raise ValueError(f"indexed_format={self.indexed_format!r} must be one of 'qa', 'quad'.")
+
         judge = self.extraction_plausibility_judge
         stage = self.extraction_plausibility_stage
         # "auto" and "off" are always safe (local or disabled). Any other value
@@ -1178,6 +1182,7 @@ class ServerConfig:
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
+            indexed_format=self.consolidation.indexed_format,
         )
 
     @property

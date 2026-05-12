@@ -17,11 +17,13 @@ class TestSeedProceduralQA:
                 self.procedural_sp_index = {}
                 self.indexed_key_registry = None
 
-        # Import and bind the real method
+        # Import and bind the real methods.  seed_procedural_qa now delegates
+        # to _cache_entry so both must be bound on the stub.
         from paramem.training.consolidation import ConsolidationLoop
 
         stub = LoopStub()
         stub.seed_procedural_qa = ConsolidationLoop.seed_procedural_qa.__get__(stub)
+        stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
         return stub
 
     def test_seeds_into_indexed_key_qa(self):
@@ -156,8 +158,10 @@ class TestLastSessionGraph:
                 self.last_session_graph = None
 
         stub = LoopStub()
-        # Bind seed_procedural_qa so we confirm stub is compatible with the real method.
+        # Bind seed_procedural_qa and _cache_entry (the latter is now called by
+        # seed_procedural_qa) so the stub is compatible with the real methods.
         stub.seed_procedural_qa = ConsolidationLoop.seed_procedural_qa.__get__(stub)
+        stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
         return stub
 
     def test_last_session_graph_initialises_to_none(self):
@@ -312,6 +316,10 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 self._thermal_policy = None
                 self.cycle_count = 0
                 self.training_config = TrainingConfig()
+                # _is_quad / _indexed_format: stubs that bind ConsolidationLoop
+                # methods must set these so methods which branch on _is_quad work.
+                self._indexed_format = "qa"
+                self._is_quad = False
 
             def _disable_gradient_checkpointing(self):
                 """No-op stub."""
@@ -343,6 +351,8 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub._run_indexed_key_procedural = ConsolidationLoop._run_indexed_key_procedural.__get__(
             stub
         )
+        # _run_indexed_key_procedural delegates to _cache_entry; bind it too.
+        stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
         return stub, fake_qa
 
     def test_next_index_not_advanced_when_training_raises(self, monkeypatch, tmp_path):

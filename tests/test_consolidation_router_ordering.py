@@ -104,6 +104,10 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_qa=None):
     loop.save_cycle_snapshots = False
     loop.persist_graph = False
     loop._thermal_policy = None
+    # _is_quad / _indexed_format are set by __init__; tests that bypass
+    # __init__ via __new__ must set them explicitly.
+    loop._indexed_format = "qa"
+    loop._is_quad = False
     return loop
 
 

@@ -1309,3 +1309,140 @@ class TestBuildManifestForHashPaths:
         expected_hash = "sha256:" + hashlib.sha256(f_b.read_bytes() + f_a.read_bytes()).hexdigest()
         actual_hash = _hash_safetensors_files(paths)
         assert actual_hash == expected_hash
+
+
+# ---------------------------------------------------------------------------
+# 11. indexed_format field (v3 schema)
+# ---------------------------------------------------------------------------
+
+
+class TestIndexedFormat:
+    """Tests for the ``indexed_format`` field added in schema v3."""
+
+    def _make_model(self) -> MagicMock:
+        model = MagicMock()
+        model.config._name_or_path = "hf/base"
+        model.config._commit_hash = "abc123"
+        peft_cfg = MagicMock()
+        peft_cfg.r = 8
+        peft_cfg.lora_alpha = 16
+        peft_cfg.lora_dropout = 0.0
+        peft_cfg.target_modules = ["q_proj", "v_proj"]
+        model.peft_config = {"episodic": peft_cfg}
+        return model
+
+    def _make_tokenizer(self) -> MagicMock:
+        tok = MagicMock()
+        tok.name_or_path = "hf/base"
+        tok.__len__ = lambda self: 32000
+        tok.backend_tokenizer.to_str.return_value = '{"model": "bpe"}'
+        tok.vocab_file = None
+        return tok
+
+    def test_schema_version_is_3(self) -> None:
+        """MANIFEST_SCHEMA_VERSION must be 3 after this bump."""
+        assert MANIFEST_SCHEMA_VERSION == 3
+
+    def test_quad_indexed_format_roundtrips(self, tmp_path: Path) -> None:
+        """A manifest with indexed_format='quad' survives write→read unchanged."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name="episodic",
+            trained_at="2026-04-21T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:dead"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafe"
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
+            registry_sha256="reg",
+            keyed_pairs_sha256="kp",
+            key_count=5,
+            indexed_format="quad",
+        )
+        write_manifest(slot, m)
+        m2 = read_manifest(slot)
+        assert m2.indexed_format == "quad"
+
+    def test_qa_indexed_format_roundtrips(self, tmp_path: Path) -> None:
+        """A manifest with the default indexed_format='qa' survives write→read unchanged."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = AdapterManifest(
+            schema_version=MANIFEST_SCHEMA_VERSION,
+            name="episodic",
+            trained_at="2026-04-21T00:00:00Z",
+            base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:dead"),
+            tokenizer=TokenizerFingerprint(
+                name_or_path="hf/model", vocab_size=32000, merges_hash="cafe"
+            ),
+            lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj",)),
+            registry_sha256="reg",
+            keyed_pairs_sha256="kp",
+            key_count=5,
+            indexed_format="qa",
+        )
+        write_manifest(slot, m)
+        m2 = read_manifest(slot)
+        assert m2.indexed_format == "qa"
+
+    def test_v2_manifest_reads_back_as_qa(self, tmp_path: Path) -> None:
+        """A v2-style on-disk manifest (no indexed_format field) must read as 'qa'."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = _minimal_manifest()
+        write_manifest(slot, m)
+        # Simulate a v2 file: remove indexed_format from the on-disk JSON
+        raw = json.loads((slot / "meta.json").read_text())
+        raw.pop("indexed_format", None)
+        (slot / "meta.json").write_text(json.dumps(raw))
+        m2 = read_manifest(slot)
+        assert m2.indexed_format == "qa"
+
+    def test_bad_type_indexed_format_raises(self, tmp_path: Path) -> None:
+        """indexed_format with a non-string value raises ManifestSchemaError."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = _minimal_manifest()
+        write_manifest(slot, m)
+        raw = json.loads((slot / "meta.json").read_text())
+        raw["indexed_format"] = 42  # bad type
+        (slot / "meta.json").write_text(json.dumps(raw))
+        with pytest.raises(ManifestSchemaError, match="indexed_format must be str"):
+            read_manifest(slot)
+
+    def test_bad_value_indexed_format_raises(self, tmp_path: Path) -> None:
+        """indexed_format with an unknown value raises ManifestSchemaError."""
+        slot = tmp_path / "slot0"
+        slot.mkdir()
+        m = _minimal_manifest()
+        write_manifest(slot, m)
+        raw = json.loads((slot / "meta.json").read_text())
+        raw["indexed_format"] = "bogus"
+        (slot / "meta.json").write_text(json.dumps(raw))
+        with pytest.raises(ManifestSchemaError, match="indexed_format must be 'qa' or 'quad'"):
+            read_manifest(slot)
+
+    def test_build_manifest_for_stamps_quad(self, tmp_path: Path) -> None:
+        """build_manifest_for(..., indexed_format='quad') stamps indexed_format='quad'."""
+        m = build_manifest_for(
+            self._make_model(),
+            self._make_tokenizer(),
+            "episodic",
+            registry_path=None,
+            keyed_pairs_path=None,
+            indexed_format="quad",
+        )
+        assert m.indexed_format == "quad"
+
+    def test_build_manifest_for_defaults_to_qa(self, tmp_path: Path) -> None:
+        """build_manifest_for without indexed_format kwarg defaults to 'qa'."""
+        m = build_manifest_for(
+            self._make_model(),
+            self._make_tokenizer(),
+            "episodic",
+            registry_path=None,
+            keyed_pairs_path=None,
+        )
+        assert m.indexed_format == "qa"

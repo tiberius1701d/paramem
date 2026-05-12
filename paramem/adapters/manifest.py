@@ -1,6 +1,6 @@
 """Per-adapter meta.json schema and live-slot resolver.
 
-Schema version: MANIFEST_SCHEMA_VERSION = 2.
+Schema version: MANIFEST_SCHEMA_VERSION = 3.
 
 Schema history:
   * v1: original schema (no ``window_stamp``).
@@ -8,14 +8,18 @@ Schema history:
     Set at write time by the producer (interim or full-cycle path) and
     used by the Phase 4 full-cycle gate to decide "have we already
     consolidated the current window?" via stamp identity comparison.
+  * v3: adds ``indexed_format`` — the keyed-key encoding the adapter was
+    trained with (``"qa"`` = QA-pair format, ``"quad"`` = quadruple format).
+    v1/v2 manifests read back with ``indexed_format`` defaulted to ``"qa"``
+    (every adapter trained before the quad switch is QA-format).
 
-Forward-compat / auto-upgrade: ``_dict_to_manifest`` accepts v1 manifests
-on read and treats absent ``window_stamp`` as the empty string. Empty
-``window_stamp`` on the canonical main ``episodic`` slot is interpreted
-by the gate as "unknown window — first full cycle is due", so v1 slots
-naturally trigger a re-consolidation that overwrites them with v2 on
-first run. ``synthesized`` retains the same forward-compat default of
-``False`` when absent.
+Forward-compat / auto-upgrade: ``_dict_to_manifest`` accepts v1 and v2
+manifests on read, treating absent ``window_stamp`` as ``""`` and absent
+``indexed_format`` as ``"qa"``. Empty ``window_stamp`` on the canonical main
+``episodic`` slot is interpreted by the gate as "unknown window — first full
+cycle is due", so v1/v2 slots naturally trigger a re-consolidation that
+overwrites them with v3 on first run. ``synthesized`` retains the same
+forward-compat default of ``False`` when absent.
 
 On-disk layout
 --------------
@@ -57,7 +61,7 @@ from typing import Final
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_SCHEMA_VERSION: int = 2
+MANIFEST_SCHEMA_VERSION: int = 3
 UNKNOWN: Final[str] = "unknown"
 
 _MANIFEST_FILENAME = "meta.json"
@@ -124,7 +128,7 @@ class AdapterManifest:
     """Immutable per-adapter manifest written alongside every saved adapter.
 
     Attributes:
-        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (currently 2).
+        schema_version: Always ``MANIFEST_SCHEMA_VERSION`` (currently 3).
         name: Adapter name string (e.g. ``"episodic"``).
         trained_at: ISO-8601 UTC timestamp (``"YYYY-MM-DDTHH:MM:SSZ"``).
         window_stamp: ``"YYYYMMDDTHHMM"`` cadence-window this slot represents.
@@ -148,6 +152,14 @@ class AdapterManifest:
             UNKNOWN severity: synthesized + UNKNOWN → yellow; fresh +
             UNKNOWN → red.  Defaults to ``False`` when absent from on-disk
             JSON (forward-compat).
+        indexed_format: The keyed-recall encoding the adapter was trained with.
+            ``"qa"`` = QA-pair format (``{"key","question","answer"}``);
+            ``"quad"`` = quadruple format (``{"key","subject","predicate","object"}``).
+            Absent in v1/v2 on-disk files — read back as ``"qa"`` (every adapter
+            written before the quad switch is QA-format). This field is metadata
+            only and is NOT included in fingerprint comparison — a slot whose
+            ``indexed_format`` differs from the live config is expected during the
+            migration window and must still mount.
     """
 
     schema_version: int
@@ -161,6 +173,7 @@ class AdapterManifest:
     key_count: int | str  # int or UNKNOWN
     synthesized: bool = False
     window_stamp: str = ""  # cadence-window stamp; "" = legacy / unknown
+    indexed_format: str = "qa"  # "qa" | "quad"; v1/v2 read-back → "qa"
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +228,11 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
         to ``""``. The on-disk file is left untouched until the next save,
         which writes v2.  Empty ``window_stamp`` is interpreted by the
         Phase 4 gate as "unknown window — first full cycle is due".
-      * v2 (current): ``window_stamp`` required.
+      * v2: adds ``window_stamp``. v1/v2 manifests have ``indexed_format``
+        absent; read back with ``indexed_format`` defaulted to ``"qa"``.
+      * v3 (current): adds ``indexed_format`` — ``"qa"`` or ``"quad"`` —
+        recording the keyed-recall encoding the adapter was trained with.
+        Type and value are validated; unknown values raise ManifestSchemaError.
       * Newer-than-current: rejected with ManifestSchemaError so callers
         do not silently downgrade.
 
@@ -278,6 +295,14 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
     if not isinstance(window_stamp, str):
         raise ManifestSchemaError(f"window_stamp must be str, got {type(window_stamp)!r}")
 
+    # v1/v2 → v3 auto-upgrade: indexed_format absent in v1/v2; default to "qa".
+    # Every adapter trained before the quad switch is QA-format.
+    indexed_format = d.get("indexed_format", "qa")
+    if not isinstance(indexed_format, str):
+        raise ManifestSchemaError(f"indexed_format must be str, got {type(indexed_format)!r}")
+    if indexed_format not in ("qa", "quad"):
+        raise ManifestSchemaError(f"indexed_format must be 'qa' or 'quad', got {indexed_format!r}")
+
     return AdapterManifest(
         schema_version=d["schema_version"],
         name=d["name"],
@@ -290,6 +315,7 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
         keyed_pairs_sha256=d["keyed_pairs_sha256"],
         key_count=d["key_count"],
         synthesized=d.get("synthesized", False),
+        indexed_format=indexed_format,
     )
 
 
@@ -671,6 +697,7 @@ def build_manifest_for(
     registry_sha256_override: "str | None" = None,
     window_stamp: str = "",
     adapter_root: "Path | None" = None,
+    indexed_format: str = "qa",
 ) -> AdapterManifest:
     """Build an :class:`AdapterManifest` for a live model/tokenizer.
 
@@ -731,6 +758,12 @@ def build_manifest_for(
             ``Path(config.adapter_dir)`` from the migration helper.
             Experiment callers should leave this ``None`` — they skip
             read-back and get the file-hash speedup instead.
+        indexed_format: The keyed-recall encoding the adapter was trained with.
+            ``"qa"`` (default) for QA-pair format; ``"quad"`` for quadruple
+            format.  Callers pass ``self._indexed_format`` from
+            ``ConsolidationLoop`` / ``BackgroundTrainer``.  This field is
+            stamped into ``meta.json`` so the inference path can dispatch the
+            matching recall template + parser at read time.
 
     Returns:
         A fully-populated :class:`AdapterManifest` with ``synthesized=False``.
@@ -923,4 +956,5 @@ def build_manifest_for(
         keyed_pairs_sha256=keyed_pairs_sha256,
         key_count=resolved_key_count,
         synthesized=False,
+        indexed_format=indexed_format,
     )

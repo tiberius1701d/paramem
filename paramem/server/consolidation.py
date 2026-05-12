@@ -158,12 +158,17 @@ def create_consolidation_loop(
             config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
         )
 
-        from paramem.training.keyed_pairs_io import read_keyed_pairs
+        # In quad mode use read_keyed_pairs_quad (has legacy-QA→quad back-compat
+        # projection built in).  In QA mode use the standard read_keyed_pairs.
+        if config.consolidation.indexed_format == "quad":
+            from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _read_kp
+        else:
+            from paramem.training.keyed_pairs_io import read_keyed_pairs as _read_kp
 
         ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
         if ep_kp_path.exists():
             try:
-                loop.seed_episodic_qa(read_keyed_pairs(ep_kp_path))
+                loop.seed_episodic_qa(_read_kp(ep_kp_path))
             except Exception:
                 logger.exception(
                     "Failed to seed indexed_key_qa from episodic store %s — skipping",
@@ -173,7 +178,7 @@ def create_consolidation_loop(
         sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
         if sem_kp_path.exists():
             try:
-                loop.seed_semantic_qa(read_keyed_pairs(sem_kp_path))
+                loop.seed_semantic_qa(_read_kp(sem_kp_path))
             except Exception:
                 logger.exception(
                     "Failed to seed indexed_key_qa from semantic store %s — skipping",
@@ -183,7 +188,7 @@ def create_consolidation_loop(
         proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
         if proc_kp_path.exists():
             try:
-                loop.seed_procedural_qa(read_keyed_pairs(proc_kp_path))
+                loop.seed_procedural_qa(_read_kp(proc_kp_path))
             except Exception:
                 logger.exception(
                     "Failed to seed indexed_key_qa from procedural store %s — skipping",
@@ -200,7 +205,7 @@ def create_consolidation_loop(
             if not kp.exists():
                 continue
             try:
-                loop.seed_episodic_qa(read_keyed_pairs(kp))
+                loop.seed_episodic_qa(_read_kp(kp))
             except Exception:
                 logger.exception(
                     "Failed to seed indexed_key_qa from interim slot %s — skipping",
@@ -448,6 +453,8 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
     )
     store_dir.mkdir(parents=True, exist_ok=True)
 
+    _fmt = config.consolidation.indexed_format
+
     # Episodic keyed_pairs in the canonical episodic subdirectory.
     if loop.episodic_simhash:
         ep_dir = store_dir / "episodic"
@@ -456,6 +463,7 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
             loop.indexed_key_qa,
             loop.episodic_simhash,
             ep_dir / "keyed_pairs.json",
+            indexed_format=_fmt,
         )
 
     if loop.semantic_simhash:
@@ -465,6 +473,7 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
             loop.indexed_key_qa,
             loop.semantic_simhash,
             sem_dir / "keyed_pairs.json",
+            indexed_format=_fmt,
         )
 
     if loop.procedural_simhash:
@@ -474,6 +483,7 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
             loop.indexed_key_qa,
             loop.procedural_simhash,
             proc_dir / "keyed_pairs.json",
+            indexed_format=_fmt,
         )
 
 
@@ -481,15 +491,28 @@ def _write_keyed_pairs(
     indexed_key_qa: dict,
     simhash_registry: dict,
     path: Path,
+    *,
+    indexed_format: str = "qa",
 ) -> None:
     """Write keyed_pairs.json for keys in the given SimHash registry.
 
     Delegates to :func:`paramem.training.keyed_pairs_io.write_keyed_pairs`
-    so the canonical schema is enforced by construction.  Every entry in
-    *indexed_key_qa* must carry all eight canonical fields before this
-    function is called — a missing field raises ``KeyError`` at write time.
+    (QA mode) or :func:`paramem.training.keyed_pairs_io.write_keyed_pairs_quad`
+    (quad mode) so the canonical schema is enforced by construction.  Every
+    entry in *indexed_key_qa* must carry the fields expected by the chosen
+    writer before this function is called — a missing field raises
+    ``KeyError`` at write time.
+
+    Parameters
+    ----------
+    indexed_format:
+        ``"quad"`` routes to ``write_keyed_pairs_quad``; any other value (incl.
+        the default ``"qa"``) routes to the standard ``write_keyed_pairs``.
     """
-    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
+    if indexed_format == "quad":
+        from paramem.training.keyed_pairs_io import write_keyed_pairs_quad as _wkp
+    else:
+        from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
 
     pairs = [indexed_key_qa[k] for k in simhash_registry if k in indexed_key_qa]
     _wkp(path, pairs)

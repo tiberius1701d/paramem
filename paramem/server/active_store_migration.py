@@ -260,6 +260,12 @@ def _migrate_tier_train_to_simulate(
 
     Rollback: on probe failure the simulate-store write is removed and
     ``RuntimeError`` is raised. The adapter tier dir stays intact.
+
+    Format dispatch: when ``config.consolidation.indexed_format == "quad"`` the
+    source and target files use the 6-field quad schema; ``read_keyed_pairs_quad``
+    and ``write_keyed_pairs_quad`` are used.  Otherwise the 8-field QA schema is
+    preserved unchanged.  Mirrors the branch pattern in
+    ``consolidation.py::_run_indexed_key_episodic``.
     """
     from paramem.training.indexed_memory import probe_keys_from_disk
 
@@ -267,8 +273,19 @@ def _migrate_tier_train_to_simulate(
     if not source_kp.exists():
         raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
 
-    from paramem.training.keyed_pairs_io import read_keyed_pairs as _rkp
-    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
+    _indexed_format = getattr(config.consolidation, "indexed_format", "qa")
+    _is_quad = _indexed_format == "quad"
+
+    if _is_quad:
+        from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _rkp
+        from paramem.training.keyed_pairs_io import write_keyed_pairs_quad as _wkp
+    else:
+        from paramem.training.keyed_pairs_io import (
+            read_keyed_pairs as _rkp,  # type: ignore[assignment]
+        )
+        from paramem.training.keyed_pairs_io import (
+            write_keyed_pairs as _wkp,  # type: ignore[assignment]
+        )
 
     keyed_pairs = _rkp(source_kp)
     if not keyed_pairs:
@@ -278,13 +295,15 @@ def _migrate_tier_train_to_simulate(
     target_dir.mkdir(parents=True, exist_ok=True)
     target_kp = target_dir / "keyed_pairs.json"
 
-    # Atomic-ish write + probe. write_keyed_pairs delegates to write_infra_bytes
+    # Atomic-ish write + probe. write_keyed_pairs* delegates to write_infra_bytes
     # which uses _atomic_write_bytes internally, so a crash mid-write doesn't
     # leave a partial file.
     _wkp(target_kp, keyed_pairs)
 
     # Probe via the existing simulate-mode disk-probe harness. Same call
     # shape as the inference dispatcher uses (paramem/server/inference.py:650).
+    # Pass formats_by_adapter so probe_keys_from_disk uses the quad reader for
+    # quad simulate stores instead of defaulting to the QA reader.
     keys = [kp["key"] for kp in keyed_pairs if "key" in kp]
     if not keys:
         # No keys to probe — write succeeded, accept it. Rare edge case.
@@ -293,7 +312,11 @@ def _migrate_tier_train_to_simulate(
             tier,
         )
     else:
-        probe_results = probe_keys_from_disk(Path(config.simulate_dir), {tier: keys})
+        probe_results = probe_keys_from_disk(
+            Path(config.simulate_dir),
+            {tier: keys},
+            formats_by_adapter={tier: _indexed_format},
+        )
         hits = sum(1 for v in probe_results.values() if v is not None)
         recall = hits / len(keys)
         if recall < 1.0:
@@ -350,8 +373,8 @@ def _migrate_tier_simulate_to_train(
     3. Reset the tier adapter to LoRA-zero
        (``delete_adapter`` + ``create_adapter`` from the tier's config),
        then ``switch_adapter`` so training writes into this tier.
-    4. ``format_indexed_training`` + ``_indexed_dataset`` to build the
-       HF dataset; gradient checkpointing toggled around the format
+    4. ``format_indexed_training`` / ``format_quadruple_training`` + ``_indexed_dataset``
+       to build the HF dataset; gradient checkpointing toggled around the format
        call to mirror the existing post_session_train pattern.
     5. ``train_adapter`` with the tier's adapter config and the loop's
        configured num_epochs.
@@ -365,16 +388,21 @@ def _migrate_tier_simulate_to_train(
        ``<simulate>/<tier>/keyed_pairs.json``.
     8. On fail: reset the adapter back to LoRA-zero so failure does not
        leave half-trained weights resident, raise ``RuntimeError``.
+
+    Format dispatch: when ``config.consolidation.indexed_format == "quad"`` the
+    source file uses the 6-field quad schema; ``read_keyed_pairs_quad`` is used
+    for the source read; ``build_registry_quad`` for the SimHash; ``_cache_entry``
+    for the ``indexed_key_qa`` hot-load (uniform shape invariant);
+    ``format_quadruple_training`` for the training examples; and
+    ``write_keyed_pairs_quad`` for the tier-level kp write.  Mirrors the branch
+    pattern in ``consolidation.py::_run_indexed_key_episodic`` and
+    ``background_trainer.py``.
     """
     from paramem.adapters.manifest import build_manifest_for
     from paramem.models.loader import (
         atomic_save_adapter,
         create_adapter,
         switch_adapter,
-    )
-    from paramem.training.indexed_memory import (
-        build_registry,
-        format_indexed_training,
     )
     from paramem.training.trainer import TrainingHooks
     from paramem.training.trainer import train_adapter as _train_adapter
@@ -383,7 +411,33 @@ def _migrate_tier_simulate_to_train(
     if not source_kp.exists():
         raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
 
-    from paramem.training.keyed_pairs_io import read_keyed_pairs as _rkp
+    _indexed_format = getattr(config.consolidation, "indexed_format", "qa")
+    _is_quad = _indexed_format == "quad"
+
+    # Format-conditional imports — mirrors the alias pattern in
+    # consolidation.py::post_session_train (lines 2971-2989).
+    if _is_quad:
+        from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _rkp
+        from paramem.training.keyed_pairs_io import write_keyed_pairs_quad as _wkp
+        from paramem.training.quadruple_memory import (
+            build_registry as _build_reg,
+        )
+        from paramem.training.quadruple_memory import (
+            format_quadruple_training as _format_training,
+        )
+    else:
+        from paramem.training.indexed_memory import (
+            build_registry as _build_reg,  # type: ignore[assignment]
+        )
+        from paramem.training.indexed_memory import (  # type: ignore[assignment]
+            format_indexed_training as _format_training,
+        )
+        from paramem.training.keyed_pairs_io import (
+            read_keyed_pairs as _rkp,  # type: ignore[assignment]
+        )
+        from paramem.training.keyed_pairs_io import (
+            write_keyed_pairs as _wkp,  # type: ignore[assignment]
+        )
 
     keyed_pairs = _rkp(source_kp)
     if not keyed_pairs:
@@ -393,11 +447,28 @@ def _migrate_tier_simulate_to_train(
 
     # Step 2: hot-load into loop in-memory state so the recall probe (which
     # reads from loop.indexed_key_qa via build_registry) can find the keys.
-    setattr(loop, f"{tier}_simhash", build_registry(keyed_pairs))
+    # Use loop._cache_entry for uniform shape (Option-B invariant) so every
+    # downstream reader (promotion-match, sp_index, triple-lookup) can access
+    # source_* aliases unconditionally in both modes.  Mirrors seed_episodic_qa
+    # / seed_semantic_qa / seed_procedural_qa in consolidation.py.
+    setattr(loop, f"{tier}_simhash", _build_reg(keyed_pairs))
     for kp in keyed_pairs:
-        loop.indexed_key_qa[kp["key"]] = kp
-        if loop.indexed_key_registry is not None and kp["key"] not in loop.indexed_key_registry:
-            loop.indexed_key_registry.add(kp["key"], adapter_id=tier)
+        key = kp["key"]
+        kp_subject = kp.get("subject") or kp.get("source_subject") or ""
+        kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
+        kp_object = kp.get("object") or kp.get("source_object") or ""
+        loop.indexed_key_qa[key] = loop._cache_entry(
+            key=key,
+            subject=kp_subject,
+            predicate=kp_predicate,
+            object=kp_object,
+            speaker_id=kp.get("speaker_id", ""),
+            first_seen_cycle=kp.get("first_seen_cycle", 0),
+            question=kp.get("question"),
+            answer=kp.get("answer"),
+        )
+        if loop.indexed_key_registry is not None and key not in loop.indexed_key_registry:
+            loop.indexed_key_registry.add(key, adapter_id=tier)
 
     # Step 3: reset adapter to LoRA-zero so training starts from a clean state.
     if tier in loop.model.peft_config:
@@ -409,9 +480,9 @@ def _migrate_tier_simulate_to_train(
     # tokenizer call (matches the post_session_train pattern at
     # consolidation.py:2692-2696); re-enable before training.
     loop._disable_gradient_checkpointing()
-    examples = format_indexed_training(keyed_pairs, loop.tokenizer, max_length=1024)
+    examples = _format_training(keyed_pairs, loop.tokenizer, max_length=1024)
     if not examples:
-        raise _TierSkipped(f"format_indexed_training produced no examples for tier {tier}")
+        raise _TierSkipped(f"_format_training produced no examples for tier {tier}")
     dataset = loop._indexed_dataset(examples)
     loop._enable_gradient_checkpointing()
     training_config = loop._make_training_config(num_epochs=loop.training_config.num_epochs)
@@ -440,6 +511,8 @@ def _migrate_tier_simulate_to_train(
     )
 
     # Step 6: recall probe at threshold=1.0 (stricter than 0.95 default).
+    # _run_recall_sanity_probe already branches on loop._is_quad so the probe
+    # harness matches the format the adapter was trained in.
     recall = loop._run_recall_sanity_probe(tier, keyed_pairs)
     if recall < 1.0:
         # Rollback: reset adapter to LoRA-zero. The slot was not yet saved to
@@ -465,6 +538,7 @@ def _migrate_tier_simulate_to_train(
             key_count=len(keyed_pairs),
             base_model_hash_cache=fingerprint_cache,
             adapter_root=Path(config.adapter_dir),
+            indexed_format=_indexed_format,
         )
     except Exception:
         logger.warning(
@@ -480,12 +554,28 @@ def _migrate_tier_simulate_to_train(
     )
 
     # Step 7b: write the canonical tier-level keyed_pairs.json.
-    from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
-
     kp_path = Path(config.adapter_dir) / tier / "keyed_pairs.json"
     _wkp(kp_path, keyed_pairs)
 
-    # Step 7c: delete source (target is now authoritative + probe-confirmed).
+    # Step 7c: persist the per-tier SimHash registry next to the adapter.
+    # Mirrors training/consolidation.py::_save_adapters — without this file the
+    # boot-time _load_simhash_registry returns an empty {} for this tier, and
+    # probe_quad / probe_key then treat every recalled key as untrained
+    # (verify_confidence → 0.0 → low_confidence:0.000), so every personal query
+    # silently abstains even though the adapter recalls correctly. The simhash
+    # was already built in Step 2 (setattr loop.<tier>_simhash); persist it as
+    # {key: int} (same shape build_registry / build_registry_quad emit and that
+    # _load_simhash_registry / get_simhash expect).
+    from paramem.training.indexed_memory import save_registry as _save_registry
+
+    _simhash = getattr(loop, f"{tier}_simhash", None)
+    if _simhash:
+        _save_registry(
+            _simhash,
+            Path(config.adapter_dir) / f"simhash_registry_{tier}.json",
+        )
+
+    # Step 7d: delete source (target is now authoritative + probe-confirmed).
     source_kp.unlink()
 
     logger.info(

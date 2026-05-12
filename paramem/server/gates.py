@@ -728,6 +728,7 @@ def _gate_3_reload_smoke(
     tokenizer: Any,
     trial_adapter_dir: Path,
     mount_state: dict,
+    indexed_format: str = "qa",
 ) -> GateResult:
     """Gate 3 — trial adapter reload smoke test.
 
@@ -752,6 +753,13 @@ def _gate_3_reload_smoke(
     was loaded — the gate's purpose is ADAPTER LOAD verification, not
     enforcement of a specific kind.
 
+    ``indexed_format`` selects the probe template and key-pair reader:
+    ``"qa"`` uses ``probe_key`` + ``read_keyed_pairs``; ``"quad"`` uses
+    ``probe_quad`` + ``read_keyed_pairs_quad``.  The QA-hardcoded
+    ``parse_recalled_pair`` belt-and-suspenders check is dropped — both
+    probes already return ``failure_reason`` on parse failure, making the
+    second check redundant.
+
     Parameters
     ----------
     session_buffer_empty:
@@ -766,6 +774,9 @@ def _gate_3_reload_smoke(
         Directory containing the trial adapter.
     mount_state:
         Shared mount-state dict passed to mount/unmount helpers.
+    indexed_format:
+        The encoding the trial adapter was trained with: ``"qa"`` or
+        ``"quad"``.  Defaults to ``"qa"`` (back-compat).
 
     Returns
     -------
@@ -807,9 +818,14 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        from paramem.training.keyed_pairs_io import read_keyed_pairs
+        if indexed_format == "quad":
+            from paramem.training.keyed_pairs_io import read_keyed_pairs_quad
 
-        keyed_pairs = read_keyed_pairs(keyed_pairs_path)
+            keyed_pairs = read_keyed_pairs_quad(keyed_pairs_path)
+        else:
+            from paramem.training.keyed_pairs_io import read_keyed_pairs
+
+            keyed_pairs = read_keyed_pairs(keyed_pairs_path)
         if not keyed_pairs:
             return GateResult(
                 gate=3,
@@ -842,27 +858,25 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        from paramem.training.indexed_memory import parse_recalled_pair, probe_key
+        if indexed_format == "quad":
+            from paramem.training.quadruple_memory import probe_quad
 
-        result = probe_key(model, tokenizer, first_key)
+            result = probe_quad(model, tokenizer, first_key)
+        else:
+            from paramem.training.indexed_memory import probe_key
+
+            result = probe_key(model, tokenizer, first_key)
+
+        # Both probe_key and probe_quad return failure_reason on any parse
+        # failure, key mismatch, or low confidence — the failure_reason check
+        # is the single discriminator; no secondary parse check needed.
         if result is None or "failure_reason" in result:
-            reason = (result or {}).get("failure_reason", "probe_key returned None")
+            reason = (result or {}).get("failure_reason", "probe returned None")
             return GateResult(
                 gate=3,
                 name="adapter_reload",
                 status="fail",
                 reason=f"probe failed for key '{first_key}': {reason}",
-                metrics=None,
-            )
-
-        # Verify the recalled pair can be parsed (belt-and-suspenders check).
-        raw_output = result.get("raw_output", "")
-        if parse_recalled_pair(raw_output) is None and "question" not in result:
-            return GateResult(
-                gate=3,
-                name="adapter_reload",
-                status="fail",
-                reason=f"parse_recalled_pair returned None for key '{first_key}'",
                 metrics=None,
             )
 
@@ -885,6 +899,8 @@ def _gate_4_recall_check(
     trial_adapter_dir: Path,
     live_registry_path: Path,
     mount_state: dict,
+    indexed_format: str = "qa",
+    live_registry_format: str = "qa",
 ) -> GateResult:
     """Gate 4 — live-registry cross-adapter recall check.
 
@@ -898,7 +914,12 @@ def _gate_4_recall_check(
 
     SKIPPED when the live registry has fewer than
     :data:`GATE_4_MIN_REGISTRY_SIZE` keys, or when ``trial_adapter_dir`` has
-    no files (NO_NEW_SESSIONS — no trial adapter exists).
+    no files (NO_NEW_SESSIONS — no trial adapter exists).  Also SKIPPED when
+    ``indexed_format != live_registry_format`` (format-transition trial: the
+    trial adapter was trained in a different format from the live registry, so
+    the simhash content strings are mismatched and a cross-format check is not
+    meaningful; the first full cycle after the flip will have both formats
+    aligned).
 
     GUARDRAIL G1 — the ``"sampled_keys"`` field in ``metrics`` is the deciding
     sample list.  The comparison report uses the same list so the same 20 keys
@@ -916,13 +937,36 @@ def _gate_4_recall_check(
         Path to the current live ``registry.json``.
     mount_state:
         Shared mount-state dict passed to mount/unmount helpers.
+    indexed_format:
+        The encoding the trial adapter was trained with: ``"qa"`` or
+        ``"quad"``.  Determines the probe function and ``verify_confidence``
+        dispatch.  Defaults to ``"qa"`` (back-compat).
+    live_registry_format:
+        The encoding used when the live ``registry.json`` simhashes were
+        built.  Defaults to ``"qa"``.  When this differs from
+        ``indexed_format``, the gate skips to avoid a spurious fail caused by
+        mismatched simhash content strings during a format-transition trial.
 
     Returns
     -------
     GateResult
         Gate 4 result with full metrics dict.
     """
-    from paramem.training.indexed_memory import probe_key, verify_confidence
+    # Cross-format guard: trial format ≠ live registry format means the
+    # simhash content strings are mismatched — the check is not meaningful.
+    if indexed_format != live_registry_format:
+        return GateResult(
+            gate=4,
+            name="live_registry_recall",
+            status="skipped",
+            reason=(
+                f"format-transition trial — trial adapter is '{indexed_format}' "
+                f"but live registry was built with '{live_registry_format}' simhashes; "
+                "cross-format recall check is not meaningful; the first full cycle "
+                "after the format flip will have both formats aligned"
+            ),
+            metrics=None,
+        )
 
     # --- Precondition: live registry must exist and have enough keys ---
     # SKIP on missing file (legitimate fresh-install OR pre-Slice-3a layout
@@ -988,15 +1032,33 @@ def _gate_4_recall_check(
                 metrics=None,
             )
 
+    # Resolve probe function and confidence verifier based on the trial
+    # adapter's indexed_format.  Imports are lazy to keep the module
+    # torch-free at import time (matching the existing pattern in this file).
+    if indexed_format == "quad":
+        from paramem.training.quadruple_memory import (
+            probe_quad as _probe_fn,
+        )
+        from paramem.training.quadruple_memory import (
+            verify_confidence as _verify_confidence,
+        )
+    else:
+        from paramem.training.indexed_memory import (
+            probe_key as _probe_fn,
+        )
+        from paramem.training.indexed_memory import (
+            verify_confidence as _verify_confidence,
+        )
+
     def _run_sample(suffix: bytes = b"") -> tuple[list[str], int, str]:
         """Return (sampled_keys, pass_count, seed_hex)."""
         seed_hex = hashlib.sha256(registry_content + suffix).hexdigest()[:16]
         keys = _sample_registry_keys(registry_content, seed_suffix=suffix)
         passed = 0
         for k in keys:
-            result = probe_key(model, tokenizer, k, registry=registry_parsed)
+            result = _probe_fn(model, tokenizer, k, registry=registry_parsed)
             if result is not None and "failure_reason" not in result:
-                conf = verify_confidence(result, registry_parsed)
+                conf = _verify_confidence(result, registry_parsed)
                 if conf >= GATE_4_THRESHOLD:
                     passed += 1
         return keys, passed, seed_hex
@@ -1089,6 +1151,8 @@ def evaluate_gates(
     session_buffer_empty: bool,
     consolidation_summary: dict | None,
     consolidation_exception: BaseException | None,
+    indexed_format: str = "qa",
+    live_registry_format: str = "qa",
 ) -> list[GateResult]:
     """Evaluate all four sanity gates for a trial consolidation run.
 
@@ -1121,6 +1185,14 @@ def evaluate_gates(
         was skipped (buffer empty) or raised.
     consolidation_exception:
         Exception captured from ``_run_extraction_phase``, or ``None``.
+    indexed_format:
+        The encoding the trial adapter was trained with: ``"qa"`` or
+        ``"quad"``.  Threaded into Gates 3 and 4.  Defaults to ``"qa"``.
+    live_registry_format:
+        The encoding used when the live ``registry.json`` simhashes were
+        built.  Used by Gate 4 to detect format-transition trials.  When
+        ``indexed_format != live_registry_format``, Gate 4 is skipped.
+        Defaults to ``"qa"``.
 
     Returns
     -------
@@ -1148,6 +1220,7 @@ def evaluate_gates(
             tokenizer=tokenizer,
             trial_adapter_dir=trial_adapter_dir,
             mount_state=mount_state,
+            indexed_format=indexed_format,
         )
         g4 = _gate_4_recall_check(
             model=model,
@@ -1155,6 +1228,8 @@ def evaluate_gates(
             trial_adapter_dir=trial_adapter_dir,
             live_registry_path=live_registry_path,
             mount_state=mount_state,
+            indexed_format=indexed_format,
+            live_registry_format=live_registry_format,
         )
     finally:
         # Acceptance criterion D — trial_probe MUST NOT remain in

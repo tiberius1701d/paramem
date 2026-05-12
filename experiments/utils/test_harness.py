@@ -453,6 +453,102 @@ def evaluate_indexed_recall(
     }
 
 
+def evaluate_indexed_recall_quad(
+    model,
+    tokenizer,
+    quad_pairs: list[dict],
+    registry: dict[str, int],
+    adapter_name: str = "episodic",
+) -> dict:
+    """Evaluate indexed key recall for quadruple-format pairs.
+
+    Parallel to :func:`evaluate_indexed_recall` but uses :func:`probe_quad`
+    for reconstruction and exact-match on ``(subject, predicate, object)``
+    instead of ``(question, answer)``.
+
+    Follows the same ``switch_adapter`` + ``gradient_checkpointing_disable``
+    discipline as the QA variant so that both can be used interchangeably as
+    the ``eval_fn`` for :class:`~paramem.training.early_stop.RecallEarlyStopCallback`.
+
+    Args:
+        model: The PeftModel to probe.
+        tokenizer: Tokenizer matching the model.
+        quad_pairs: List of ``{key, subject, predicate, object}`` dicts.
+        registry: Quad SimHash registry built by
+            :func:`paramem.training.quadruple_memory.build_registry`.
+        adapter_name: Adapter to activate before probing.
+
+    Returns:
+        Dict with the same keys as :func:`evaluate_indexed_recall`:
+        ``exact_count``, ``total``, ``rate``, ``mean_confidence``, ``per_key``,
+        ``mean_expected_word_count`` (always 0 — quads have no natural word count),
+        ``mean_recalled_word_count`` (always 0).  ``per_key`` entries are
+        ``{key, exact_match, confidence, subject, predicate, object,
+        recalled_subject, recalled_predicate, recalled_object, failure_reason}``.
+    """
+    from paramem.training.quadruple_memory import probe_quad, verify_confidence
+
+    model.gradient_checkpointing_disable()
+    switch_adapter(model, adapter_name)
+
+    exact_count = 0
+    confidences = []
+    per_key = []
+
+    for kp in quad_pairs:
+        key = kp["key"]
+        recalled = probe_quad(model, tokenizer, key, registry=registry)
+        if recalled is None or "failure_reason" in recalled:
+            confidence = 0.0
+            exact_match = False
+            entry = {
+                "key": key,
+                "exact_match": False,
+                "confidence": 0.0,
+                "subject": kp["subject"],
+                "predicate": kp["predicate"],
+                "object": kp["object"],
+                "recalled_subject": None,
+                "recalled_predicate": None,
+                "recalled_object": None,
+                "failure_reason": (recalled or {}).get("failure_reason", "null_result"),
+            }
+        else:
+            confidence = recalled.get("confidence", verify_confidence(recalled, registry))
+            exact_match = (
+                recalled.get("subject", "").strip() == kp["subject"].strip()
+                and recalled.get("predicate", "").strip() == kp["predicate"].strip()
+                and recalled.get("object", "").strip() == kp["object"].strip()
+            )
+            entry = {
+                "key": key,
+                "exact_match": exact_match,
+                "confidence": confidence,
+                "subject": kp["subject"],
+                "predicate": kp["predicate"],
+                "object": kp["object"],
+                "recalled_subject": recalled.get("subject"),
+                "recalled_predicate": recalled.get("predicate"),
+                "recalled_object": recalled.get("object"),
+                "failure_reason": None,
+            }
+        if exact_match:
+            exact_count += 1
+        confidences.append(confidence)
+        per_key.append(entry)
+
+    mean_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    return {
+        "exact_count": exact_count,
+        "total": len(quad_pairs),
+        "rate": exact_count / len(quad_pairs) if quad_pairs else 0.0,
+        "mean_confidence": mean_confidence,
+        "mean_expected_word_count": 0,
+        "mean_recalled_word_count": 0,
+        "per_key": per_key,
+    }
+
+
 def evaluate_individual_qa(
     model,
     tokenizer,

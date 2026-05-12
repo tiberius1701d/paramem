@@ -461,13 +461,22 @@ def probe_key(
 ) -> dict | None:
     """Prompt the model to recall a single key.
 
-    Returns parsed {"key", "question", "answer", "confidence", "raw_output"}
-    dict, or None if the output is unparseable, the key mismatches, or
-    confidence falls below the threshold. The raw_output field is always
-    present when a dict is returned. For failures, returns a dict with
-    "raw_output" and "failure_reason" so diagnostic data is never lost.
+    Returns a dict on success or failure — never ``None``.
 
-    If registry is provided, verifies the recalled content against it.
+    On success, returns ``{"key", "question", "answer", "confidence",
+    "raw_output", "format", "fact_text"}`` where:
+
+    * ``format`` is always ``"qa"`` for this function.
+    * ``fact_text`` is ``answer`` — a pre-rendered string for context-bullet
+      assembly.  Consumers should read ``result["fact_text"]`` rather than
+      branching on ``result["format"]``; this keeps format knowledge in the
+      probe layer.
+
+    On failure, returns ``{"raw_output", "failure_reason"}`` so diagnostic
+    data is never lost.
+
+    If *registry* is provided, verifies the recalled content against it using
+    the QA-format SimHash.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.training.dataset import _format_inference_prompt
@@ -506,6 +515,8 @@ def probe_key(
 
     recalled["confidence"] = confidence
     recalled["raw_output"] = raw
+    recalled["format"] = "qa"
+    recalled["fact_text"] = recalled.get("answer", "")
     return recalled
 
 
@@ -531,6 +542,7 @@ def probe_keys_grouped_by_adapter(
     max_new_tokens: int = 200,
     registry: dict[str, int] | None = None,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    formats_by_adapter: dict[str, str] | None = None,
 ) -> dict[str, dict | None]:
     """Probe keys grouped by owning adapter. One switch_adapter per group.
 
@@ -543,10 +555,17 @@ def probe_keys_grouped_by_adapter(
       and maps every key in the group to ``None`` (matches the missing-key
       convention of ``probe_all_keys``).
     - Otherwise switches to the adapter once via ``switch_adapter`` and calls
-      ``probe_key`` for every key in the group.
+      either ``probe_quad`` (quad format) or ``probe_key`` (QA format) for
+      every key in the group, based on ``formats_by_adapter``.
 
-    Returns a merged ``dict[str, dict | None]`` keyed by individual key names
-    across all groups.
+    Every success result carries ``"format"`` (``"qa"`` | ``"quad"``) and
+    ``"fact_text"`` (pre-rendered string for context-bullet assembly).  Failure
+    dicts stay ``{"raw_output", "failure_reason"}``.  ``None`` means the
+    adapter or key was not available.
+
+    Import note: ``quadruple_memory`` is imported lazily inside the quad branch
+    to avoid a circular import (``quadruple_memory`` already imports from
+    ``indexed_memory`` at module level).
 
     Args:
         model: A PeftModel instance with one or more loaded adapters.
@@ -555,11 +574,18 @@ def probe_keys_grouped_by_adapter(
             probe under that adapter.
         max_new_tokens: Maximum tokens to generate per probe.
         registry: Optional SimHash registry for confidence verification.
+            Passed to both the QA and quad probe paths — registry format must
+            match the adapter format (QA simhash for QA adapters, quad simhash
+            for quad adapters).
         confidence_threshold: Minimum confidence to accept a recalled pair.
+        formats_by_adapter: Optional mapping of adapter name → format string
+            (``"qa"`` or ``"quad"``).  ``None`` or a missing entry defaults to
+            ``"qa"`` (back-compat — every adapter before the quad switch is
+            QA-format).
 
     Returns:
-        Flat dict mapping each key name to its ``probe_key`` result (a result
-        dict on success, or ``None`` / a failure dict on failure).
+        Flat dict mapping each key name to its probe result (a result dict on
+        success, or ``None`` / a failure dict on failure).
     """
     from paramem.models.loader import switch_adapter
 
@@ -577,17 +603,35 @@ def probe_keys_grouped_by_adapter(
                 results[key] = None
             continue
 
+        fmt = (formats_by_adapter or {}).get(adapter_name, "qa")
         switch_adapter(model, adapter_name)
 
-        for key in keys:
-            results[key] = probe_key(
-                model,
-                tokenizer,
-                key,
-                max_new_tokens=max_new_tokens,
-                registry=registry,
-                confidence_threshold=confidence_threshold,
-            )
+        if fmt == "quad":
+            from paramem.training.quadruple_memory import probe_quad, quad_fact_text
+
+            for key in keys:
+                result = probe_quad(
+                    model,
+                    tokenizer,
+                    key,
+                    max_new_tokens=max_new_tokens,
+                    registry=registry,
+                    confidence_threshold=confidence_threshold,
+                )
+                if result is not None and "failure_reason" not in result:
+                    result["format"] = "quad"
+                    result["fact_text"] = quad_fact_text(result)
+                results[key] = result
+        else:
+            for key in keys:
+                results[key] = probe_key(
+                    model,
+                    tokenizer,
+                    key,
+                    max_new_tokens=max_new_tokens,
+                    registry=registry,
+                    confidence_threshold=confidence_threshold,
+                )
 
     return results
 
@@ -595,6 +639,7 @@ def probe_keys_grouped_by_adapter(
 def probe_keys_from_disk(
     adapter_dir: Path,
     keys_by_adapter: dict[str, list[str]],
+    formats_by_adapter: dict[str, str] | None = None,
 ) -> dict[str, dict | None]:
     """Disk-recall counterpart of probe_keys_grouped_by_adapter.
 
@@ -607,23 +652,45 @@ def probe_keys_from_disk(
 
     A backwards-compat fallback reads the legacy top-level path
     ``adapter_dir/keyed_pairs.json`` for episodic when the canonical path
-    is missing AND a top-level file exists. This fallback may be removed
-    after operators have run one consolidation cycle on the new layout.
+    is missing AND a top-level file exists. The fallback also applies when
+    ``fmt == "quad"`` (the quad-format file at the canonical path is absent
+    but a top-level file exists). This fallback may be removed after operators
+    have run one consolidation cycle on the new layout.
+
+    Format dispatch: when ``formats_by_adapter[adapter_name] == "quad"``,
+    reads via :func:`paramem.training.keyed_pairs_io.read_keyed_pairs_quad`
+    (which also projects legacy QA-on-disk files to quad shape).  Otherwise
+    reads via :func:`paramem.training.keyed_pairs_io.read_keyed_pairs`
+    (strict QA schema) — this preserves the QA-generator-condensed ``answer``
+    text, which would be lost if QA files were projected to quad shape on read.
+
+    Every success result carries ``"format"`` (``"qa"`` | ``"quad"``) and
+    ``"fact_text"`` (pre-rendered string for context-bullet assembly):
+    * QA: ``fact_text = answer``
+    * quad: ``fact_text = f"{subject} {predicate_spaced} {object}"``
 
     Missing files, missing keys, and malformed JSON all map to ``None`` —
     matches the per-key failure shape of ``probe_keys_grouped_by_adapter``.
 
+    Args:
+        adapter_dir: Directory containing per-adapter ``keyed_pairs.json`` files.
+        keys_by_adapter: Ordered mapping of adapter name → list of key names.
+        formats_by_adapter: Optional mapping of adapter name → format string
+            (``"qa"`` or ``"quad"``).  ``None`` or a missing entry defaults to
+            ``"qa"`` (back-compat).
+
     Returns:
         Flat ``dict[str, dict | None]`` keyed by individual key names.
-        Hits include ``{key, question, answer, confidence=1.0, raw_output}``
-        so downstream consumers can treat the result identically to a live
-        probe under perfect recall.
+        Hits include the canonical result fields plus ``format`` and ``fact_text``
+        so downstream consumers can treat the result identically to a live probe.
     """
     results: dict[str, dict | None] = {}
 
     for adapter_name, keys in keys_by_adapter.items():
         if not keys:
             continue
+
+        fmt = (formats_by_adapter or {}).get(adapter_name, "qa")
 
         kp_path = adapter_dir / adapter_name / "keyed_pairs.json"
         # Backwards-compat: legacy production wrote episodic keyed_pairs at the
@@ -653,9 +720,14 @@ def probe_keys_from_disk(
             continue
 
         try:
-            from paramem.training.keyed_pairs_io import read_keyed_pairs
+            if fmt == "quad":
+                from paramem.training.keyed_pairs_io import read_keyed_pairs_quad
 
-            pairs = read_keyed_pairs(kp_path)
+                pairs = read_keyed_pairs_quad(kp_path)
+            else:
+                from paramem.training.keyed_pairs_io import read_keyed_pairs
+
+                pairs = read_keyed_pairs(kp_path)
         except (OSError, json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
             logger.warning("Failed to read %s: %s — %d key(s) unresolved", kp_path, exc, len(keys))
             for key in keys:
@@ -664,24 +736,53 @@ def probe_keys_from_disk(
 
         index = {entry["key"]: entry for entry in pairs if "key" in entry}
 
-        for key in keys:
-            entry = index.get(key)
-            if entry is None:
-                results[key] = None
-                continue
-            results[key] = {
-                "key": key,
-                "question": entry.get("question", ""),
-                "answer": entry.get("answer", ""),
-                "confidence": 1.0,
-                "raw_output": json.dumps(
-                    {
-                        "key": key,
-                        "question": entry.get("question", ""),
-                        "answer": entry.get("answer", ""),
-                    }
-                ),
-            }
+        if fmt == "quad":
+            from paramem.training.quadruple_memory import quad_fact_text
+
+            for key in keys:
+                entry = index.get(key)
+                if entry is None:
+                    results[key] = None
+                    continue
+                results[key] = {
+                    "key": key,
+                    "subject": entry.get("subject", ""),
+                    "predicate": entry.get("predicate", ""),
+                    "object": entry.get("object", ""),
+                    "confidence": 1.0,
+                    "format": "quad",
+                    "fact_text": quad_fact_text(entry),
+                    "raw_output": json.dumps(
+                        {
+                            "key": key,
+                            "subject": entry.get("subject", ""),
+                            "predicate": entry.get("predicate", ""),
+                            "object": entry.get("object", ""),
+                        }
+                    ),
+                }
+        else:
+            for key in keys:
+                entry = index.get(key)
+                if entry is None:
+                    results[key] = None
+                    continue
+                answer_val = entry.get("answer", "")
+                results[key] = {
+                    "key": key,
+                    "question": entry.get("question", ""),
+                    "answer": answer_val,
+                    "confidence": 1.0,
+                    "format": "qa",
+                    "fact_text": answer_val,
+                    "raw_output": json.dumps(
+                        {
+                            "key": key,
+                            "question": entry.get("question", ""),
+                            "answer": answer_val,
+                        }
+                    ),
+                }
 
     return results
 

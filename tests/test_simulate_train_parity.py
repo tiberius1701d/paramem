@@ -47,6 +47,10 @@ def _make_bare_loop(tmp_path, procedural: bool = False) -> ConsolidationLoop:
     loop.procedural_simhash = {}
     loop.procedural_sp_index = {}
     loop.merger = MagicMock()
+    # _is_quad / _indexed_format are set by __init__; tests that bypass
+    # __init__ via __new__ / object.__new__ must set them explicitly.
+    loop._indexed_format = "qa"
+    loop._is_quad = False
     return loop
 
 

@@ -984,6 +984,13 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     from paramem.backup.backup import sweep_orphan_pending
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
+    # Reset the format map on every call — this function runs once at boot and
+    # produces a per-boot snapshot.  Each adapter name maps to the
+    # indexed_format field from its meta.json ("qa" | "quad"); absent/legacy
+    # manifests default to "qa" (every adapter trained before the quad switch
+    # is QA-format).
+    state["adapter_formats"] = {}
+    adapter_formats: dict[str, str] = state["adapter_formats"]
     live_registry_sha256 = _compute_live_registry_sha256(config)
     _registry_path = config.adapter_dir / "indexed_key_registry.json"
 
@@ -1038,6 +1045,13 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         )
         if should_mount and slot is not None:
             _load_one(name, slot)
+        # Record indexed_format from the manifest for the inference path.
+        # _manifest is None when the slot has no meta.json (legacy); default "qa".
+        if _manifest is not None:
+            adapter_formats[name] = getattr(_manifest, "indexed_format", "qa")
+        elif slot is not None:
+            # slot present but manifest missing or unreadable — default "qa"
+            adapter_formats[name] = "qa"
 
     # ---- Interim adapters ----
     for _interim_path in sorted(config.adapter_dir.glob("episodic_interim_*")):
@@ -1065,11 +1079,37 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
                             )
                 except Exception as exc:
                     logger.error("Failed to load interim adapter %s: %s", _interim_name, exc)
+                # Flat layout has no meta.json → default "qa"
+                adapter_formats[_interim_name] = "qa"
             else:
                 logger.warning("Interim adapter %s: no matching slot — skipping", _interim_name)
             continue
 
         _load_one(_interim_name, slot)
+        # Read indexed_format from the slot manifest; default "qa" on any error.
+        try:
+            from paramem.adapters.manifest import ManifestNotFoundError as _MNF
+            from paramem.adapters.manifest import ManifestSchemaError as _MSE
+            from paramem.adapters.manifest import read_manifest as _read_manifest
+
+            _im = _read_manifest(slot)
+            adapter_formats[_interim_name] = getattr(_im, "indexed_format", "qa")
+        except (_MNF, _MSE):
+            adapter_formats[_interim_name] = "qa"
+
+    # ---- Simulate-mode keyed-pair stores ----
+    # Simulate-mode per-tier ``keyed_pairs.json`` files carry no per-adapter
+    # manifest, so the loops above don't record their format.  The simulate
+    # store is always written in the server's configured
+    # ``consolidation.indexed_format``; record it for each tier that has a
+    # store so the inference path's ``probe_keys_from_disk`` picks the matching
+    # reader / recall template / parser (without this, a quad simulate store is
+    # read with the strict QA reader, every key fails to parse, and every
+    # personal query silently abstains).  ``setdefault`` so a real mounted
+    # adapter's manifest-derived format (train mode) is never clobbered.
+    for _tier in ("episodic", "semantic", "procedural"):
+        if (config.simulate_dir / _tier / "keyed_pairs.json").exists():
+            adapter_formats.setdefault(_tier, config.consolidation.indexed_format)
 
     # ---- I5 — Registry consistency check ----
     # Drop orphan registry entries whose adapter slot is missing.
@@ -1863,12 +1903,21 @@ async def lifespan(app: FastAPI):
     # the GPU lock. Inference falls back to ``source_mode`` while a
     # migration is pending so the system stays consistent until ALL tiers
     # have cleared the 1.0 recall gate.
-    from paramem.server.active_store_migration import detect_mode_switch
+    from paramem.server.active_store_migration import detect_mode_switch, save_state
 
     _migration_state = detect_mode_switch(config)
     if _migration_state is not None:
         _state["pending_rehydration"] = True
         _state["effective_mode"] = _migration_state.source_mode
+        # Persist the (possibly freshly-synthesized) migration state so the
+        # next /consolidate's `load_state` finds it and actually runs the
+        # tier-by-tier rebuild. detect_mode_switch synthesizes a fresh state
+        # on a yaml-mode flip; without this save_state it lives only in this
+        # frame and the consolidate dispatcher logs "state file absent —
+        # clearing pending flag" forever (the migration never starts).
+        # Idempotent when an in-flight state file already existed (re-saves it).
+        # Read-only w.r.t. the GPU — the actual rebuild still runs at /consolidate.
+        save_state(config.adapter_dir, _migration_state)
         logger.warning(
             "Active-store migration pending: %s; falling back to %s mode for "
             "inference until tier-by-tier rebuild completes "
@@ -1923,6 +1972,7 @@ async def lifespan(app: FastAPI):
                         thermal_policy=ThermalPolicy.from_consolidation_config(
                             config.consolidation
                         ),
+                        indexed_format=config.consolidation.indexed_format,
                     )
                     _state["background_trainer"] = _replay_bt
 
@@ -2300,6 +2350,7 @@ async def chat(request: ChatRequest):
                 # progress or interrupted, the inference path falls back to
                 # the source mode's store. None == use config.consolidation.mode.
                 effective_mode=_state.get("effective_mode"),
+                adapter_formats=_state.get("adapter_formats"),
             ),
         )
 
@@ -3337,6 +3388,7 @@ async def debug_probe(request: DebugProbeRequest):
                     ha_client=_state.get("ha_client"),
                     language=None,
                     effective_mode=_state.get("effective_mode"),
+                    adapter_formats=_state.get("adapter_formats"),
                 ),
             )
     finally:
@@ -4377,6 +4429,17 @@ async def _run_trial_consolidation() -> None:
                 if not session_buffer_empty and "loop" in locals() and loop is not None
                 else model
             )
+            # indexed_format: the trial adapter's format (what it was trained
+            # with). live_registry_format: the live registry's format (what
+            # format the live simhashes were built from). When the two differ
+            # (format-transition trial), Gate 4 skips to avoid a spurious FAIL
+            # caused by mismatched simhash content strings.
+            _trial_indexed_format = getattr(
+                loop if ("loop" in locals() and loop is not None) else None,
+                "_indexed_format",
+                getattr(live_config.consolidation, "indexed_format", "qa"),
+            )
+            _live_registry_format = getattr(live_config.consolidation, "indexed_format", "qa")
             results = evaluate_gates(
                 model=gate_model,
                 tokenizer=tokenizer,
@@ -4385,6 +4448,8 @@ async def _run_trial_consolidation() -> None:
                 session_buffer_empty=session_buffer_empty,
                 consolidation_summary=summary,
                 consolidation_exception=exc_captured,
+                indexed_format=_trial_indexed_format,
+                live_registry_format=_live_registry_format,
             )
 
             overall_status = _rollup_gate_status(results, session_buffer_empty)
@@ -6769,20 +6834,28 @@ def _extract_and_start_training():
     # on voice activity, so the bg cycle still sees the headroom).
     failed_session_ids: set[str] = set()
 
-    # Voice eviction is scoped to document-only cycles. Live conversation
-    # transcripts (source_type="transcript") are bounded in density by the
-    # turn-by-turn dialog that produced them and the existing GPU-lock
-    # pause/resume contract relies on STT/TTS staying resident so they can
-    # interleave with extraction. Document chunks have no such bound — a
-    # dense ~1500-word resume chunk is the regime that exhausts VRAM —
-    # and the user driving an /ingest-sessions run is on a CLI, not a
-    # voice path, so eviction has no UX cost. The predicate guards the
-    # whole pending batch: a single transcript session in the cycle keeps
-    # voice resident.
-    document_only_cycle = bool(pending) and all(s.get("source_type") == "document" for s in pending)
+    # Voice eviction triggers when the pending batch contains ANY document
+    # session. Document chunks have no density bound — a dense ~1500-word
+    # resume chunk is the regime that exhausts VRAM on this 8 GiB host once
+    # the ~1.5 GiB STT(Whisper)+TTS(Piper) GPU pair is added on top of the
+    # 4-bit Mistral 7B base and the extraction chain's ~6 GiB working-set
+    # peak. A *mixed* batch (one transcript probe + several dense docs) is
+    # the case that bit us: under the prior all()-predicate one transcript
+    # session kept voice resident through the dense doc extraction and the
+    # plausibility filter's KV-cache growth OOM'd mid-generate. Eviction is
+    # cheap — the CPU STT/TTS pair stays resident (loaded at startup), so
+    # voice still works during the cycle, just on CPU; the GPU pair is
+    # lazily reconstructed on the next voice activity or restored to
+    # _target_profile() at cycle end. A pure-transcript batch keeps the GPU
+    # voice pair resident: those sessions are produced by turn-by-turn
+    # dialog, are not in the dense-document regime, and likely imply recent
+    # voice activity where the lazy GPU reload would add latency.
+    evict_voice_for_cycle = bool(pending) and any(
+        s.get("source_type") == "document" for s in pending
+    )
 
     with gpu_lock_sync():
-        if document_only_cycle:
+        if evict_voice_for_cycle:
             _set_voice_pipeline_profile("cpu", lock_held=True)
         for session in pending:
             session_id = session["session_id"]
@@ -6879,7 +6952,7 @@ def _extract_and_start_training():
         logger.info("No QA pairs extracted — skipping")
         session_buffer.mark_consolidated(_completed_session_ids())
 
-        if document_only_cycle:
+        if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
 
         # State mutations + router reload — post to the event loop so the
@@ -6951,7 +7024,7 @@ def _extract_and_start_training():
         # like train. OOM-skipped chunks stay pending for retry.
         session_buffer.mark_consolidated(_completed_session_ids())
 
-        if document_only_cycle:
+        if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
 
         # State mutations + router reload — post to the event loop so the
@@ -6963,6 +7036,22 @@ def _extract_and_start_training():
         def _finalize_simulate() -> None:
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
+            # Refresh adapter_formats for simulate-mode tiers that now have a
+            # keyed_pairs.json written by _save_keyed_pairs_for_router.  Without
+            # this, a boot→/consolidate(simulate)→/debug/probe sequence leaves
+            # adapter_formats empty (the files are created *after* boot, so
+            # _mount_adapters_from_slots never saw them) and probe_keys_from_disk
+            # defaults to the QA reader — which raises ValueError on 6-field quad
+            # files and causes silent abstention on every personal query.
+            # Mirrors _mount_adapters_from_slots's simulate-tier block
+            # (app.py:1110-1112) and the _finalize_full adapter_formats refresh
+            # (app.py:7362-7369).  setdefault preserves a real train-mode
+            # manifest-derived format if one is already present.
+            _sim_fmt = getattr(config.consolidation, "indexed_format", "qa")
+            _adapter_formats = _state.setdefault("adapter_formats", {})
+            for _tier in ("episodic", "semantic", "procedural"):
+                if (config.simulate_dir / _tier / "keyed_pairs.json").exists():
+                    _adapter_formats.setdefault(_tier, _sim_fmt)
             _state["last_consolidation_result"] = {
                 "status": "simulated",
                 "sessions": len(session_ids),
@@ -6999,7 +7088,7 @@ def _extract_and_start_training():
     if not loop.config.indexed_key_replay_enabled:
         logger.warning("Indexed key replay disabled — skipping training")
         session_buffer.mark_consolidated(_completed_session_ids())
-        if document_only_cycle:
+        if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
         _state["consolidating"] = False
         return
@@ -7018,6 +7107,7 @@ def _extract_and_start_training():
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        indexed_format=config.consolidation.indexed_format,
     )
     _state["background_trainer"] = bt
 
@@ -7051,8 +7141,19 @@ def _extract_and_start_training():
             # Restore voice pipeline even on training failure — we evicted
             # at cycle start, the device should return to its post-startup
             # baseline regardless of whether training succeeded.
-            if document_only_cycle:
+            if evict_voice_for_cycle:
                 _set_voice_pipeline_profile(_target_profile(), lock_held=True)
+            # A partial interim adapter may have been created (create_interim_adapter)
+            # before _train_extracted_into_interim raised — it's now in peft_config
+            # but never reached _finalize_interim, so it's absent from adapter_formats.
+            # Backfill any such entry with the current loop format so the inference
+            # path doesn't later probe it with the wrong recall template (it would
+            # default to "qa" otherwise). setdefault: never clobber a known format.
+            if hasattr(loop.model, "peft_config"):
+                _adapter_formats = _state.setdefault("adapter_formats", {})
+                _loop_fmt = getattr(loop, "_indexed_format", "qa")
+                for _name in loop.model.peft_config:
+                    _adapter_formats.setdefault(_name, _loop_fmt)
             _state["consolidating"] = False
             return
 
@@ -7081,7 +7182,7 @@ def _extract_and_start_training():
         # GPU work; running it on the event loop would block asyncio.
         # Symmetric with the eviction at cycle start: paired with the
         # _state["consolidating"] = False signal inside _finalize_interim.
-        if document_only_cycle:
+        if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=True)
 
         # State mutations + router reload — post to the event loop so the
@@ -7090,6 +7191,14 @@ def _extract_and_start_training():
             loop.model.eval()
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
+            # Refresh adapter_formats for the newly-trained interim adapter.
+            # The interim adapter was saved with a meta.json stamped with
+            # loop._indexed_format; we read it back so the inference path
+            # uses the right recall template immediately after training.
+            _new_adapter_name = result.get("adapter_name")
+            if _new_adapter_name:
+                _adapter_formats = _state.setdefault("adapter_formats", {})
+                _adapter_formats[_new_adapter_name] = getattr(loop, "_indexed_format", "qa")
             # Count via the indexed_key_registry — it tracks every active key
             # regardless of which adapter (main or interim) currently holds it.
             # The previous main-tier-simhash sum under-reported by the count of
@@ -7164,6 +7273,7 @@ def _run_full_consolidation_sync() -> None:
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        indexed_format=config.consolidation.indexed_format,
     )
     _state["background_trainer"] = bt
 
@@ -7265,6 +7375,14 @@ def _run_full_consolidation_sync() -> None:
             # operators see "FINGERPRINT MISMATCH … PA routing DISABLED" red
             # rows even though main is healthy.
             _revalidate_main_adapter_manifests(_state)
+            # Refresh adapter_formats for all main tiers now trained.
+            # The full-cycle loop trained them with loop._indexed_format;
+            # update so the inference path uses the right template immediately.
+            _fmt = getattr(loop, "_indexed_format", "qa")
+            _adapter_formats = _state.setdefault("adapter_formats", {})
+            for _tier in ("episodic", "semantic", "procedural"):
+                if hasattr(loop.model, "peft_config") and _tier in loop.model.peft_config:
+                    _adapter_formats[_tier] = _fmt
             total_keys = (
                 len(loop.indexed_key_registry) if loop.indexed_key_registry is not None else 0
             )
@@ -7339,6 +7457,7 @@ def _run_active_store_migration_sync() -> None:
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        indexed_format=config.consolidation.indexed_format,
     )
     _state["background_trainer"] = bt
 
@@ -7380,6 +7499,14 @@ def _run_active_store_migration_sync() -> None:
                 )
             # Partial completion: pending_rehydration stays True so a re-trigger
             # picks up remaining tiers. effective_mode stays at source_mode.
+            # Refresh adapter_formats for all main tiers now (re-)trained.
+            # Parity with _finalize_full: keeps inference templates consistent
+            # after a simulate→train or train→simulate migration.
+            _fmt = getattr(loop, "_indexed_format", "qa")
+            _adapter_formats = _state.setdefault("adapter_formats", {})
+            for _tier in ("episodic", "semantic", "procedural"):
+                if hasattr(loop.model, "peft_config") and _tier in loop.model.peft_config:
+                    _adapter_formats[_tier] = _fmt
             _state["consolidating"] = False
 
         aio_loop = _state.get("event_loop")

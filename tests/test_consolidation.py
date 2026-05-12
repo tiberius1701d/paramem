@@ -724,6 +724,10 @@ class TestSaveAdaptersManifest:
         loop.episodic_simhash = {}
         loop.semantic_simhash = {}
         loop.procedural_simhash = {}
+        # _is_quad / _indexed_format are set by __init__; tests that bypass
+        # __init__ via __new__ / object.__new__ must set them explicitly.
+        loop._indexed_format = "qa"
+        loop._is_quad = False
         return loop
 
     def test_save_adapters_writes_meta_json(self, tmp_path):
