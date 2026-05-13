@@ -787,6 +787,81 @@ def probe_keys_from_disk(
     return results
 
 
+def probe_keys_from_graph(
+    simulate_dir: Path,
+    keys_by_adapter: dict[str, list[str]],
+) -> dict[str, dict | None]:
+    """Graph-recall counterpart of :func:`probe_keys_from_disk`.
+
+    Reads per-tier ``<simulate_dir>/<tier>/graph.json`` files instead of
+    ``keyed_pairs.json`` files.  Used by simulate mode when the on-disk
+    format is a NetworkX graph.
+
+    The return shape is identical to the quad branch of
+    :func:`probe_keys_from_disk` (lines 747-763 of this file) so callers
+    can swap the two functions without touching downstream consumers:
+
+    .. code-block:: python
+
+        {"key": str, "subject": str, "predicate": str, "object": str,
+         "confidence": 1.0, "format": "quad",
+         "fact_text": <quad_fact_text(entry)>,
+         "raw_output": json.dumps({key, subject, predicate, object})}
+
+    Missing tier files are silently treated as empty graphs so every key in
+    that adapter's list resolves to ``None`` without raising.
+
+    Args:
+        simulate_dir: Directory whose per-tier subdirectories contain
+            ``graph.json`` files (e.g. ``data/ha/simulate``).
+        keys_by_adapter: Ordered mapping of adapter name → list of key names.
+            Valid adapter names match the per-tier subdirectory names
+            (``"episodic"``, ``"semantic"``, ``"procedural"``).
+
+    Returns:
+        Flat ``dict[str, dict | None]`` keyed by individual key names.
+        Hits carry the canonical result fields (``key``, ``subject``,
+        ``predicate``, ``object``, ``confidence``, ``format``, ``fact_text``,
+        ``raw_output``).  Misses map the key to ``None``.
+    """
+    from paramem.server.simulate_store import load_simulate_graph, quad_by_key
+    from paramem.training.quadruple_memory import quad_fact_text
+
+    results: dict[str, dict | None] = {}
+
+    for adapter_name, keys in keys_by_adapter.items():
+        if not keys:
+            continue
+
+        graph_path = Path(simulate_dir) / adapter_name / "graph.json"
+        graph = load_simulate_graph(graph_path)
+
+        for key in keys:
+            entry = quad_by_key(graph, key)
+            if entry is None:
+                results[key] = None
+                continue
+            results[key] = {
+                "key": key,
+                "subject": entry.get("subject", ""),
+                "predicate": entry.get("predicate", ""),
+                "object": entry.get("object", ""),
+                "confidence": 1.0,
+                "format": "quad",
+                "fact_text": quad_fact_text(entry),
+                "raw_output": json.dumps(
+                    {
+                        "key": key,
+                        "subject": entry.get("subject", ""),
+                        "predicate": entry.get("predicate", ""),
+                        "object": entry.get("object", ""),
+                    }
+                ),
+            }
+
+    return results
+
+
 def validate_recall(
     recalled: dict | None,
     original: dict,

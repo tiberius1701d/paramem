@@ -819,6 +819,13 @@ class ConsolidationScheduleConfig:
         if self.indexed_format not in ("qa", "quad"):
             raise ValueError(f"indexed_format={self.indexed_format!r} must be one of 'qa', 'quad'.")
 
+        if self.mode == "simulate" and self.indexed_format != "quad":
+            raise ValueError(
+                "consolidation.mode='simulate' requires indexed_format='quad' "
+                "(QA in simulate is not supported; simulate persistence uses graph.json which "
+                "only carries the quad shape)."
+            )
+
         judge = self.extraction_plausibility_judge
         stage = self.extraction_plausibility_stage
         # "auto" and "off" are always safe (local or disabled). Any other value

@@ -101,3 +101,42 @@ class TestConsolidationScheduleConfigValidation:
 
         # Must not raise
         ConsolidationScheduleConfig(indexed_format="quad")
+
+    def test_simulate_mode_with_qa_format_raises_value_error(self) -> None:
+        """mode='simulate' + indexed_format='qa' must raise ValueError at construction.
+
+        Simulate-mode persistence uses graph.json which only carries the quad
+        shape.  A QA-format simulate cycle would KeyError on the second run
+        (iter_quads is quad-only; qa["question"] does not exist on the quad
+        path).  The validator blocks this at config-load time with a clear
+        message so the operator sees the problem before any cycle runs.
+
+        This is the C1 fix from the chunk-3 code review: the validator was
+        present in config.py but had no test, so regressions (removing the
+        validator) would be silent.
+        """
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="mode='simulate' requires indexed_format='quad'"):
+            ConsolidationScheduleConfig(mode="simulate", indexed_format="qa")
+
+    def test_simulate_mode_with_quad_format_is_valid(self) -> None:
+        """mode='simulate' + indexed_format='quad' is the only valid simulate combo."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        # Must not raise — this is the only valid simulate-mode combination.
+        ConsolidationScheduleConfig(mode="simulate", indexed_format="quad")
+
+    def test_train_mode_with_qa_format_is_valid(self) -> None:
+        """mode='train' + indexed_format='qa' is the default train-mode combination."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        # Must not raise — this is the production default.
+        ConsolidationScheduleConfig(mode="train", indexed_format="qa")
+
+    def test_train_mode_with_quad_format_is_valid(self) -> None:
+        """mode='train' + indexed_format='quad' is valid (quadruple-format train mode)."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        # Must not raise — quad train mode is supported.
+        ConsolidationScheduleConfig(mode="train", indexed_format="quad")

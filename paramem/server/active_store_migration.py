@@ -1,4 +1,4 @@
-"""Migrate keyed pairs between train (LoRA weights) and simulate (JSON) stores.
+"""Migrate keyed facts between train (LoRA weights) and simulate (graph.json) stores.
 
 Triggered when the operator flips ``consolidation.mode`` in server.yaml.
 The migration is per-tier with a 1.0 recall gate before cleanup; the
@@ -11,16 +11,17 @@ State file location: ``<paths.adapters>/.active_store_migration.json``
 
 Two directions:
 
-* ``simulate_to_train``: read ``<simulate>/<tier>/keyed_pairs.json`` →
+* ``simulate_to_train``: read ``<simulate>/<tier>/graph.json`` →
   train into ``<tier>`` adapter → recall probe at threshold=1.0 → on
-  pass, atomic-save the slot and delete the simulate-store file. On
+  pass, atomic-save the slot and delete the simulate-store graph.json. On
   fail, leave both stores intact.
 
-* ``train_to_simulate``: read ``<adapters>/<tier>/<latest_ts>/keyed_pairs.json``
-  → write to ``<simulate>/<tier>/keyed_pairs.json`` → recall probe via
-  ``probe_keys_from_disk`` at threshold=1.0 → on pass, delete the
-  adapter slots. On fail, remove the simulate-store write and leave the
-  adapter slots intact.
+* ``train_to_simulate``: reconstruct the tier graph from the adapter weights
+  via ``reconstruct_graph(loop, tier=tier, strict=True)`` → decorate edges
+  with speaker_id/first_seen_cycle from ``loop.indexed_key_cache`` →
+  write to ``<simulate>/<tier>/graph.json`` → sanity-check every active key
+  present in graph → on pass, delete the adapter tier dir.  On fail, remove
+  the graph.json and leave the adapter slots intact.
 
 Per-tier failures are recorded in the state file but do not abort the
 remaining tiers — the operator can re-trigger to retry.
@@ -133,8 +134,9 @@ def clear_state(adapter_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _has_simulate_kp(simulate_dir: Path, tier: str) -> bool:
-    return (Path(simulate_dir) / tier / "keyed_pairs.json").exists()
+def _has_simulate_graph(simulate_dir: Path, tier: str) -> bool:
+    """Return True when a simulate-mode ``graph.json`` exists for *tier*."""
+    return (Path(simulate_dir) / tier / "graph.json").exists()
 
 
 def _has_adapter_kp(adapter_dir: Path, tier: str) -> bool:
@@ -173,7 +175,7 @@ def detect_mode_switch(config: "ServerConfig") -> Optional[MigrationState]:
     if target_mode not in ("simulate", "train"):
         return None  # unsupported mode — let upstream complain
 
-    simulate_present = any(_has_simulate_kp(config.simulate_dir, t) for t in TIERS)
+    simulate_present = any(_has_simulate_graph(config.simulate_dir, t) for t in TIERS)
     adapter_present = any(_has_adapter_kp(config.adapter_dir, t) for t in TIERS)
 
     if target_mode == "train" and simulate_present and not adapter_present:
@@ -251,89 +253,105 @@ def migrate(
 def _migrate_tier_train_to_simulate(
     loop: "ConsolidationLoop", config: "ServerConfig", tier: str
 ) -> None:
-    """Read tier-level keyed_pairs.json → write to simulate-store →
-    probe at threshold=1.0 → on pass, delete the adapter tier dir.
+    """Reconstruct the tier's graph from adapter WEIGHTS and persist as simulate store.
 
-    Source layout (verified live, see _save_adapters._write_kp):
-        ``<adapter_dir>/<tier>/keyed_pairs.json``  (tier level)
-        ``<adapter_dir>/<tier>/<ts>/adapter_model.safetensors`` etc. (slot level)
+    Source: adapter weights in ``<adapter_dir>/<tier>/``.
+    Target: ``<simulate_dir>/<tier>/graph.json``.
 
-    Rollback: on probe failure the simulate-store write is removed and
-    ``RuntimeError`` is raised. The adapter tier dir stays intact.
+    The previous implementation copied ``<adapter_dir>/<tier>/keyed_pairs.json``
+    to ``<simulate_dir>/<tier>/keyed_pairs.json`` without ever touching the
+    weights.  The invariant now enforced: every fact is extracted from the
+    adapter's weights into the graph and persisted, so the simulate store is
+    always a faithful reconstruction of what the model knows, not a copy of a
+    sidecar that may have drifted.
 
-    Format dispatch: when ``config.consolidation.indexed_format == "quad"`` the
-    source and target files use the 6-field quad schema; ``read_keyed_pairs_quad``
-    and ``write_keyed_pairs_quad`` are used.  Otherwise the 8-field QA schema is
-    preserved unchanged.  Mirrors the branch pattern in
-    ``consolidation.py::_run_indexed_key_episodic``.
+    Steps:
+    1. Verify there are active registry keys for this tier (else ``_TierSkipped``).
+    2. ``reconstruct_graph(loop, tier=tier, strict=True)`` — probes every active
+       key for this tier from the weights via probe_quad; raises
+       ``ReconstructionError`` if any key fails (strict=True).
+    3. Decorate every edge with ``speaker_id`` and ``first_seen_cycle`` from
+       ``loop.indexed_key_cache[key]``.  Defaults to ``""`` / ``0`` when absent.
+    4. ``save_simulate_graph(graph, <simulate_dir>/<tier>/graph.json)``.
+    5. Sanity-check: every active registry key for this tier has an edge with
+       that key in the loaded graph.  On mismatch: unlink the file and raise.
+    6. ``shutil.rmtree(<adapter_dir>/<tier>)`` — same as before; the adapter
+       slot is no longer the canonical store for this tier.
+
+    Rollback: on step-5 sanity failure the graph.json is unlinked and
+    ``RuntimeError`` is raised.  The adapter tier dir stays intact.
+
+    Raises:
+        _TierSkipped: When there are no active registry keys for this tier
+            (clean state, nothing to migrate).
+        paramem.graph.reconstruct.ReconstructionError: When any weight-probe
+            fails under strict=True (the adapter's recall is below 1.0).
+        RuntimeError: When the post-write sanity check fails (key present in
+            registry but missing from the written graph).
     """
-    from paramem.training.indexed_memory import probe_keys_from_disk
+    from paramem.graph.reconstruct import ReconstructionError, reconstruct_graph
+    from paramem.server.simulate_store import (
+        _IK_KEY_ATTR,
+        iter_quads,
+        load_simulate_graph,
+        save_simulate_graph,
+    )
 
-    source_kp = Path(config.adapter_dir) / tier / "keyed_pairs.json"
-    if not source_kp.exists():
-        raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
+    # Step 1: check active keys for this tier.
+    registry = loop.indexed_key_registry
+    if registry is None:
+        raise _TierSkipped(f"no indexed_key_registry on loop; tier {tier} skipped")
+    active_keys = [k for k in registry.list_active() if registry.get_adapter_id(k) == tier]
+    if not active_keys:
+        raise _TierSkipped(f"no active registry keys for tier {tier}")
 
-    _indexed_format = getattr(config.consolidation, "indexed_format", "qa")
-    _is_quad = _indexed_format == "quad"
+    # Step 2: reconstruct graph from weights (strict=True raises on any probe failure).
+    try:
+        result = reconstruct_graph(loop, tier=tier, strict=True)
+    except ReconstructionError as exc:
+        raise RuntimeError(
+            f"train_to_simulate tier {tier}: weight reconstruction failed: {exc}"
+        ) from exc
+    graph = result.graph
 
-    if _is_quad:
-        from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _rkp
-        from paramem.training.keyed_pairs_io import write_keyed_pairs_quad as _wkp
-    else:
-        from paramem.training.keyed_pairs_io import (
-            read_keyed_pairs as _rkp,  # type: ignore[assignment]
-        )
-        from paramem.training.keyed_pairs_io import (
-            write_keyed_pairs as _wkp,  # type: ignore[assignment]
-        )
+    # Step 3: decorate edges with speaker_id + first_seen_cycle from indexed_key_cache.
+    cache = getattr(loop, "indexed_key_cache", {})
+    for subject, obj, eid, data in graph.edges(keys=True, data=True):
+        ik_key = data.get(_IK_KEY_ATTR)
+        if ik_key is None:
+            continue
+        cache_entry = cache.get(ik_key, {})
+        data["speaker_id"] = cache_entry.get("speaker_id", "")
+        data["first_seen_cycle"] = cache_entry.get("first_seen_cycle", 0)
 
-    keyed_pairs = _rkp(source_kp)
-    if not keyed_pairs:
-        raise _TierSkipped(f"empty keyed_pairs.json at {source_kp}")
-
+    # Step 4: persist graph.
     target_dir = Path(config.simulate_dir) / tier
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_kp = target_dir / "keyed_pairs.json"
+    target_graph = target_dir / "graph.json"
+    save_simulate_graph(graph, target_graph)
 
-    # Atomic-ish write + probe. write_keyed_pairs* delegates to write_infra_bytes
-    # which uses _atomic_write_bytes internally, so a crash mid-write doesn't
-    # leave a partial file.
-    _wkp(target_kp, keyed_pairs)
-
-    # Probe via the existing simulate-mode disk-probe harness. Same call
-    # shape as the inference dispatcher uses (paramem/server/inference.py:650).
-    # Pass formats_by_adapter so probe_keys_from_disk uses the quad reader for
-    # quad simulate stores instead of defaulting to the QA reader.
-    keys = [kp["key"] for kp in keyed_pairs if "key" in kp]
-    if not keys:
-        # No keys to probe — write succeeded, accept it. Rare edge case.
-        logger.warning(
-            "active_store_migration: tier %s has 0 keys; accepting write as trivially complete",
-            tier,
+    # Step 5: sanity-check — every active registry key must be in the graph.
+    loaded = load_simulate_graph(target_graph)
+    graph_keys = {q["key"] for q in iter_quads(loaded)}
+    missing = [k for k in active_keys if k not in graph_keys]
+    if missing:
+        target_graph.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"train_to_simulate tier {tier}: sanity check failed — {len(missing)} key(s) "
+            f"missing from written graph: {missing[:5]!r}{'...' if len(missing) > 5 else ''}; "
+            f"rolled back simulate-store write"
         )
-    else:
-        probe_results = probe_keys_from_disk(
-            Path(config.simulate_dir),
-            {tier: keys},
-            formats_by_adapter={tier: _indexed_format},
-        )
-        hits = sum(1 for v in probe_results.values() if v is not None)
-        recall = hits / len(keys)
-        if recall < 1.0:
-            target_kp.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"train_to_simulate tier {tier} recall {recall:.3f} < 1.0; "
-                f"rolled back simulate-store write"
-            )
 
-    # Cleanup: remove the entire adapter tier dir (kp file + all slot subdirs +
-    # .pending). Source authoritative state has been transferred to the target
-    # store and probe-confirmed.
+    # Step 6: remove adapter tier dir (kp file + all slot subdirs + .pending).
+    # Source authoritative state has been weight-reconstructed and graph-persisted.
     tier_dir = Path(config.adapter_dir) / tier
-    shutil.rmtree(tier_dir)
+    if tier_dir.exists():
+        shutil.rmtree(tier_dir)
     logger.info(
-        "active_store_migration: tier %s migrated to simulate; deleted adapter dir %s",
+        "active_store_migration: tier %s migrated to simulate via weight reconstruction;"
+        " %d keys; deleted adapter dir %s",
         tier,
+        len(active_keys),
         tier_dir,
     )
 
@@ -358,24 +376,31 @@ def _tier_adapter_config(loop: "ConsolidationLoop", tier: str):
 def _migrate_tier_simulate_to_train(
     loop: "ConsolidationLoop", config: "ServerConfig", tier: str
 ) -> None:
-    """Read simulate-store keyed_pairs → train into <tier> adapter →
-    probe at threshold=1.0 → on pass, persist slot + delete source.
+    """Read simulate-store graph.json → train into <tier> adapter →
+    probe at threshold=1.0 → on pass, persist slot + delete source graph.
 
     Caller must hold the GPU lock — training and the recall probe both
     drive the model forward and would race STT/TTS otherwise.
 
+    The simulate-mode store is always quad-only (``graph.json``); the
+    ``ConsolidationScheduleConfig`` validator enforces
+    ``mode=simulate → indexed_format=quad``.  All format-conditional
+    imports are therefore dropped in this path — only the quad helpers
+    are used.
+
     Sequence:
 
-    1. Load source kp from ``<simulate>/<tier>/keyed_pairs.json``.
-    2. Hot-load into ``loop.indexed_key_qa`` + register keys into
+    1. Load source graph from ``<simulate>/<tier>/graph.json``; extract
+       quad dicts via ``iter_quads``.
+    2. Hot-load into ``loop.indexed_key_cache`` + register keys into
        ``loop.indexed_key_registry`` with ``adapter_id=tier`` so the
        recall probe can find them.
     3. Reset the tier adapter to LoRA-zero
        (``delete_adapter`` + ``create_adapter`` from the tier's config),
        then ``switch_adapter`` so training writes into this tier.
-    4. ``format_indexed_training`` / ``format_quadruple_training`` + ``_indexed_dataset``
-       to build the HF dataset; gradient checkpointing toggled around the format
-       call to mirror the existing post_session_train pattern.
+    4. ``format_quadruple_training`` + ``_indexed_dataset`` to build the
+       HF dataset; gradient checkpointing toggled around the format call
+       to mirror the existing post_session_train pattern.
     5. ``train_adapter`` with the tier's adapter config and the loop's
        configured num_epochs.
     6. Recall probe via ``loop._run_recall_sanity_probe(tier, keyed_pairs)``
@@ -385,79 +410,55 @@ def _migrate_tier_simulate_to_train(
        canonical tier-level path
        ``<adapter_dir>/<tier>/keyed_pairs.json`` (matches
        ``_save_adapters._write_kp`` layout). Delete the source
-       ``<simulate>/<tier>/keyed_pairs.json``.
+       ``<simulate>/<tier>/graph.json``.
     8. On fail: reset the adapter back to LoRA-zero so failure does not
        leave half-trained weights resident, raise ``RuntimeError``.
-
-    Format dispatch: when ``config.consolidation.indexed_format == "quad"`` the
-    source file uses the 6-field quad schema; ``read_keyed_pairs_quad`` is used
-    for the source read; ``build_registry_quad`` for the SimHash; ``_cache_entry``
-    for the ``indexed_key_qa`` hot-load (uniform shape invariant);
-    ``format_quadruple_training`` for the training examples; and
-    ``write_keyed_pairs_quad`` for the tier-level kp write.  Mirrors the branch
-    pattern in ``consolidation.py::_run_indexed_key_episodic`` and
-    ``background_trainer.py``.
     """
+    # Simulate-mode store is always graph.json (quad-only; enforced by the
+    # ConsolidationScheduleConfig validator: mode=simulate requires indexed_format=quad).
     from paramem.adapters.manifest import build_manifest_for
     from paramem.models.loader import (
         atomic_save_adapter,
         create_adapter,
         switch_adapter,
     )
+    from paramem.server.simulate_store import iter_quads, load_simulate_graph
+    from paramem.training.keyed_pairs_io import write_keyed_pairs_quad as _wkp
+    from paramem.training.quadruple_memory import (
+        build_registry as _build_reg,
+    )
+    from paramem.training.quadruple_memory import (
+        format_quadruple_training as _format_training,
+    )
     from paramem.training.trainer import TrainingHooks
     from paramem.training.trainer import train_adapter as _train_adapter
 
-    source_kp = Path(config.simulate_dir) / tier / "keyed_pairs.json"
-    if not source_kp.exists():
-        raise _TierSkipped(f"no keyed_pairs.json at {source_kp}")
+    _indexed_format = "quad"  # simulate mode is always quad
 
-    _indexed_format = getattr(config.consolidation, "indexed_format", "qa")
-    _is_quad = _indexed_format == "quad"
+    source_graph = Path(config.simulate_dir) / tier / "graph.json"
+    if not source_graph.exists():
+        raise _TierSkipped(f"no graph.json at {source_graph}")
 
-    # Format-conditional imports — mirrors the alias pattern in
-    # consolidation.py::post_session_train (lines 2971-2989).
-    if _is_quad:
-        from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _rkp
-        from paramem.training.keyed_pairs_io import write_keyed_pairs_quad as _wkp
-        from paramem.training.quadruple_memory import (
-            build_registry as _build_reg,
-        )
-        from paramem.training.quadruple_memory import (
-            format_quadruple_training as _format_training,
-        )
-    else:
-        from paramem.training.indexed_memory import (
-            build_registry as _build_reg,  # type: ignore[assignment]
-        )
-        from paramem.training.indexed_memory import (  # type: ignore[assignment]
-            format_indexed_training as _format_training,
-        )
-        from paramem.training.keyed_pairs_io import (
-            read_keyed_pairs as _rkp,  # type: ignore[assignment]
-        )
-        from paramem.training.keyed_pairs_io import (
-            write_keyed_pairs as _wkp,  # type: ignore[assignment]
-        )
-
-    keyed_pairs = _rkp(source_kp)
+    graph = load_simulate_graph(source_graph)
+    keyed_pairs = list(iter_quads(graph))
     if not keyed_pairs:
-        raise _TierSkipped(f"empty keyed_pairs.json at {source_kp}")
+        raise _TierSkipped(f"empty graph.json at {source_graph}")
 
     tier_config = _tier_adapter_config(loop, tier)
 
     # Step 2: hot-load into loop in-memory state so the recall probe (which
-    # reads from loop.indexed_key_qa via build_registry) can find the keys.
+    # reads from loop.indexed_key_cache via build_registry) can find the keys.
     # Use loop._cache_entry for uniform shape (Option-B invariant) so every
     # downstream reader (promotion-match, sp_index, triple-lookup) can access
-    # source_* aliases unconditionally in both modes.  Mirrors seed_episodic_qa
-    # / seed_semantic_qa / seed_procedural_qa in consolidation.py.
+    # source_* aliases unconditionally in both modes.  Mirrors seed_episodic_cache
+    # / seed_semantic_cache / seed_procedural_cache in consolidation.py.
     setattr(loop, f"{tier}_simhash", _build_reg(keyed_pairs))
     for kp in keyed_pairs:
         key = kp["key"]
         kp_subject = kp.get("subject") or kp.get("source_subject") or ""
         kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
         kp_object = kp.get("object") or kp.get("source_object") or ""
-        loop.indexed_key_qa[key] = loop._cache_entry(
+        loop.indexed_key_cache[key] = loop._cache_entry(
             key=key,
             subject=kp_subject,
             predicate=kp_predicate,
@@ -576,7 +577,7 @@ def _migrate_tier_simulate_to_train(
         )
 
     # Step 7d: delete source (target is now authoritative + probe-confirmed).
-    source_kp.unlink()
+    source_graph.unlink()
 
     logger.info(
         "active_store_migration: tier %s migrated to train; slot=%s, %d keys",

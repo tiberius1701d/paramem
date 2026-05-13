@@ -6,23 +6,23 @@ filter integration without requiring GPU/model.
 
 
 class TestSeedProceduralQA:
-    """Test seed_procedural_qa restores state correctly."""
+    """Test seed_procedural_cache restores state correctly."""
 
     def _make_loop_stub(self):
-        """Create a minimal stub with the fields seed_procedural_qa needs."""
+        """Create a minimal stub with the fields seed_procedural_cache needs."""
 
         class LoopStub:
             def __init__(self):
-                self.indexed_key_qa = {}
+                self.indexed_key_cache = {}
                 self.procedural_sp_index = {}
                 self.indexed_key_registry = None
 
-        # Import and bind the real methods.  seed_procedural_qa now delegates
+        # Import and bind the real methods.  seed_procedural_cache now delegates
         # to _cache_entry so both must be bound on the stub.
         from paramem.training.consolidation import ConsolidationLoop
 
         stub = LoopStub()
-        stub.seed_procedural_qa = ConsolidationLoop.seed_procedural_qa.__get__(stub)
+        stub.seed_procedural_cache = ConsolidationLoop.seed_procedural_cache.__get__(stub)
         stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
         return stub
 
@@ -38,9 +38,9 @@ class TestSeedProceduralQA:
                 "speaker_id": "speaker1",
             },
         ]
-        stub.seed_procedural_qa(pairs)
-        assert "proc1" in stub.indexed_key_qa
-        assert stub.indexed_key_qa["proc1"]["question"] == "What does Alex prefer?"
+        stub.seed_procedural_cache(pairs)
+        assert "proc1" in stub.indexed_key_cache
+        assert stub.indexed_key_cache["proc1"]["question"] == "What does Alex prefer?"
 
     def test_rebuilds_sp_index(self):
         stub = self._make_loop_stub()
@@ -62,14 +62,14 @@ class TestSeedProceduralQA:
                 "speaker_id": "sp2",
             },
         ]
-        stub.seed_procedural_qa(pairs)
+        stub.seed_procedural_cache(pairs)
         assert stub.procedural_sp_index[("sp1", "alex", "prefers")] == "proc1"
         assert stub.procedural_sp_index[("sp2", "anna", "likes")] == "proc2"
 
     def test_empty_input(self):
         stub = self._make_loop_stub()
-        stub.seed_procedural_qa([])
-        assert len(stub.indexed_key_qa) == 0
+        stub.seed_procedural_cache([])
+        assert len(stub.indexed_key_cache) == 0
         assert len(stub.procedural_sp_index) == 0
 
     def test_missing_fields_handled(self):
@@ -77,8 +77,8 @@ class TestSeedProceduralQA:
         pairs = [
             {"key": "proc1", "question": "Q", "answer": "A"},
         ]
-        stub.seed_procedural_qa(pairs)
-        assert "proc1" in stub.indexed_key_qa
+        stub.seed_procedural_cache(pairs)
+        assert "proc1" in stub.indexed_key_cache
         # No sp_index entry because subject and predicate are empty
         assert len(stub.procedural_sp_index) == 0
 
@@ -149,18 +149,18 @@ class TestLastSessionGraph:
 
         class LoopStub:
             # Mirror the attributes __init__ sets that are needed for
-            # seed_procedural_qa (already tested above) plus last_session_graph.
+            # seed_procedural_cache (already tested above) plus last_session_graph.
             def __init__(self):
-                self.indexed_key_qa = {}
+                self.indexed_key_cache = {}
                 self.procedural_sp_index = {}
                 self.indexed_key_registry = None
                 # Replicate the line under test:
                 self.last_session_graph = None
 
         stub = LoopStub()
-        # Bind seed_procedural_qa and _cache_entry (the latter is now called by
-        # seed_procedural_qa) so the stub is compatible with the real methods.
-        stub.seed_procedural_qa = ConsolidationLoop.seed_procedural_qa.__get__(stub)
+        # Bind seed_procedural_cache and _cache_entry (the latter is now called by
+        # seed_procedural_cache) so the stub is compatible with the real methods.
+        stub.seed_procedural_cache = ConsolidationLoop.seed_procedural_cache.__get__(stub)
         stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
         return stub
 
@@ -225,7 +225,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
     """Deferred-mutation invariant for _run_indexed_key_procedural.
 
     All shared-state mutations (_procedural_next_index, procedural_simhash,
-    indexed_key_qa, indexed_key_registry, procedural_sp_index) must be
+    indexed_key_cache, indexed_key_registry, procedural_sp_index) must be
     applied ONLY after train_adapter returns successfully.  If training
     raises, every field must remain byte-identical to its pre-call value.
     """
@@ -309,7 +309,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 self._procedural_next_index = 1
                 self.procedural_sp_index: dict = {}
                 self.procedural_simhash: dict = {}
-                self.indexed_key_qa: dict = {}
+                self.indexed_key_cache: dict = {}
                 self.indexed_key_registry = None
                 self.procedural_config = MagicMock()
                 self.wandb_config = None
@@ -466,7 +466,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         # An existing key that was already trained — must survive unchanged.
         existing_hash = compute_simhash("proc0", "Old question?", "Old answer.")
         stub.procedural_simhash["proc0"] = existing_hash
-        stub.indexed_key_qa["proc0"] = {
+        stub.indexed_key_cache["proc0"] = {
             "key": "proc0",
             "question": "Old question?",
             "answer": "Old answer.",

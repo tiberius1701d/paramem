@@ -10,12 +10,12 @@ Covers:
   model.generate called, contradiction handling works.
 - _simulate_indexed_key_episodic quad mode: existing-key re-access branch
   (the ``if self._is_quad:`` loop at ~:1031) runs without KeyError when
-  indexed_key_qa is pre-seeded with quad-shaped entries.
+  indexed_key_cache is pre-seeded with quad-shaped entries.
 - _simulate_indexed_key_procedural quad mode: compute_simhash-quad path
   (``compute_simhash_quad``) called without KeyError; procedural_sp_index
   updated.
-- _save_keyed_pairs_for_router (server/consolidation.py) simulate-mode quad
-  write produces a 6-field quad-schema keyed_pairs.json on disk.
+- _save_simulate_store_graph (server/consolidation.py) simulate-mode write
+  produces a graph.json on disk; train mode is a no-op.
 
 No GPU required — model interactions replaced with MagicMock stubs and
 all heavy operations are patched out.
@@ -23,7 +23,6 @@ all heavy operations are patched out.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -82,7 +81,7 @@ def _make_loop(tmp_path: Path, *, indexed_format: str = "quad") -> Any:
     loop.persist_graph = False
     loop._thermal_policy = None
     loop.indexed_key_registry = KeyRegistry()
-    loop.indexed_key_qa: dict[str, Any] = {}
+    loop.indexed_key_cache: dict[str, Any] = {}
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
     loop.episodic_simhash: dict = {}
@@ -153,7 +152,9 @@ class TestRunIndexedKeySemanticQuad:
         loop = _make_loop(tmp_path, indexed_format="quad")
 
         # Pre-seed one key whose source_subject matches the promoted entity.
-        loop.indexed_key_qa["graph1"] = _quad_cache_entry("graph1", "Alice", "lives_in", "Berlin")
+        loop.indexed_key_cache["graph1"] = _quad_cache_entry(
+            "graph1", "Alice", "lives_in", "Berlin"
+        )
         loop.indexed_key_registry.add("graph1")
         loop.semantic_simhash["graph1"] = 0xABCD
 
@@ -186,7 +187,7 @@ class TestRunIndexedKeySemanticQuad:
         loop = _make_loop(tmp_path, indexed_format="quad")
 
         # Pre-seed a key in semantic (previously promoted, no longer in new_promotions).
-        loop.indexed_key_qa["graph2"] = _quad_cache_entry("graph2", "Bob", "works_at", "ACME")
+        loop.indexed_key_cache["graph2"] = _quad_cache_entry("graph2", "Bob", "works_at", "ACME")
         loop.indexed_key_registry.add("graph2")
         loop.semantic_simhash["graph2"] = 0xDEAD
 
@@ -219,12 +220,16 @@ class TestRunIndexedKeySemanticQuad:
         loop = _make_loop(tmp_path, indexed_format="quad")
 
         # key A — subject matches promoted entity (Loop A).
-        loop.indexed_key_qa["graph1"] = _quad_cache_entry("graph1", "Alice", "lives_in", "Berlin")
+        loop.indexed_key_cache["graph1"] = _quad_cache_entry(
+            "graph1", "Alice", "lives_in", "Berlin"
+        )
         loop.indexed_key_registry.add("graph1")
         loop.semantic_simhash["graph1"] = 0xAAAA
 
         # key B — in semantic but source_subject != promoted entity (Loop B).
-        loop.indexed_key_qa["graph2"] = _quad_cache_entry("graph2", "Charlie", "works_at", "Corp")
+        loop.indexed_key_cache["graph2"] = _quad_cache_entry(
+            "graph2", "Charlie", "works_at", "Corp"
+        )
         loop.indexed_key_registry.add("graph2")
         loop.semantic_simhash["graph2"] = 0xBBBB
 
@@ -260,7 +265,7 @@ class TestRunIndexedKeySemanticQuad:
         loop = _make_loop(tmp_path, indexed_format="qa")
 
         # QA-shaped cache entry.
-        loop.indexed_key_qa["graph1"] = {
+        loop.indexed_key_cache["graph1"] = {
             "key": "graph1",
             "question": "Where does Alice live?",
             "answer": "Berlin.",
@@ -337,11 +342,11 @@ class TestRunIndexedKeyEpisodicQuad:
             loop._run_indexed_key_episodic(rels, new_promotions=[])
 
         # Keys assigned
-        assert "graph1" in loop.indexed_key_qa
-        assert "graph2" in loop.indexed_key_qa
+        assert "graph1" in loop.indexed_key_cache
+        assert "graph2" in loop.indexed_key_cache
 
         # Cache entries are quad-shaped (subject/predicate/object present)
-        e1 = loop.indexed_key_qa["graph1"]
+        e1 = loop.indexed_key_cache["graph1"]
         assert "subject" in e1
         assert "predicate" in e1
         assert "object" in e1
@@ -396,9 +401,9 @@ class TestRunIndexedKeyProceduralQuad:
         # QA-gen must NOT be called in quad mode.
         qa_gen_mock.assert_not_called()
 
-        # proc1 must be in indexed_key_qa with quad shape.
-        assert "proc1" in loop.indexed_key_qa
-        entry = loop.indexed_key_qa["proc1"]
+        # proc1 must be in indexed_key_cache with quad shape.
+        assert "proc1" in loop.indexed_key_cache
+        entry = loop.indexed_key_cache["proc1"]
         assert entry["subject"] == "Alice"
         assert entry["predicate"] == "prefers"
         assert entry["object"] == "Coffee"
@@ -419,7 +424,9 @@ class TestSimulateIndexedKeyEpisodicQuadExistingKeys:
         loop = _make_loop(tmp_path, indexed_format="quad")
 
         # Pre-seed a key that already exists (simulates restart-from-disk seed).
-        loop.indexed_key_qa["graph1"] = _quad_cache_entry("graph1", "Alice", "lives_in", "Berlin")
+        loop.indexed_key_cache["graph1"] = _quad_cache_entry(
+            "graph1", "Alice", "lives_in", "Berlin"
+        )
         loop.indexed_key_registry.add("graph1")
         loop._indexed_next_index = 2
         # graph1 is NOT in semantic_simhash → it shows up in existing_keys.
@@ -438,7 +445,7 @@ class TestSimulateIndexedKeyEpisodicQuadExistingKeys:
         loop._simulate_indexed_key_episodic(new_rels)
 
         # New key assigned.
-        assert "graph2" in loop.indexed_key_qa
+        assert "graph2" in loop.indexed_key_cache
         # Existing key still in simhash.
         assert "graph1" in loop.episodic_simhash
         assert "graph2" in loop.episodic_simhash
@@ -449,7 +456,9 @@ class TestSimulateIndexedKeyEpisodicQuadExistingKeys:
 
         loop = _make_loop(tmp_path, indexed_format="quad")
 
-        loop.indexed_key_qa["graph1"] = _quad_cache_entry("graph1", "Alice", "lives_in", "Berlin")
+        loop.indexed_key_cache["graph1"] = _quad_cache_entry(
+            "graph1", "Alice", "lives_in", "Berlin"
+        )
         loop.indexed_key_registry.add("graph1")
         loop._indexed_next_index = 2
 
@@ -488,9 +497,9 @@ class TestSimulateIndexedKeyProceduralQuad:
         loop._simulate_indexed_key_procedural(proc_rels, speaker_id="Speaker0")
 
         assert "proc1" in loop.procedural_simhash
-        assert "proc1" in loop.indexed_key_qa
+        assert "proc1" in loop.indexed_key_cache
 
-        entry = loop.indexed_key_qa["proc1"]
+        entry = loop.indexed_key_cache["proc1"]
         assert entry["subject"] == "Alice"
         assert entry["predicate"] == "prefers"
         assert entry["object"] == "Tea"
@@ -519,7 +528,7 @@ class TestSimulateIndexedKeyProceduralQuad:
 
 
 # ---------------------------------------------------------------------------
-# simulated_training — quad mode with pre-seeded quad indexed_key_qa
+# simulated_training — quad mode with pre-seeded quad indexed_key_cache
 # ---------------------------------------------------------------------------
 
 
@@ -531,7 +540,9 @@ class TestSimulatedTrainingQuadPreseeded:
         loop = _make_loop(tmp_path, indexed_format="quad")
 
         # Pre-seed an existing quad key (simulates the seeded-from-disk startup path).
-        loop.indexed_key_qa["graph1"] = _quad_cache_entry("graph1", "Alice", "lives_in", "Berlin")
+        loop.indexed_key_cache["graph1"] = _quad_cache_entry(
+            "graph1", "Alice", "lives_in", "Berlin"
+        )
         loop.indexed_key_registry.add("graph1")
         loop._indexed_next_index = 2
 
@@ -549,19 +560,19 @@ class TestSimulatedTrainingQuadPreseeded:
 
         assert result["simulated"] is True
         # New key assigned.
-        assert "graph2" in loop.indexed_key_qa
+        assert "graph2" in loop.indexed_key_cache
         # Both keys in episodic_simhash.
         assert "graph1" in loop.episodic_simhash
         assert "graph2" in loop.episodic_simhash
 
     def test_simulated_training_quad_kp_schema(self, tmp_path: Path) -> None:
-        """After simulated_training, indexed_key_qa entries have quad shape."""
+        """After simulated_training, indexed_key_cache entries have quad shape."""
         loop = _make_loop(tmp_path, indexed_format="quad")
         rels = _fake_quad_rels(1)
 
         loop.simulated_training(rels, [], speaker_id="Speaker0")
 
-        entry = loop.indexed_key_qa.get("graph1")
+        entry = loop.indexed_key_cache.get("graph1")
         assert entry is not None
         assert "subject" in entry
         assert "predicate" in entry
@@ -574,57 +585,79 @@ class TestSimulatedTrainingQuadPreseeded:
 
 
 # ---------------------------------------------------------------------------
-# _save_keyed_pairs_for_router simulate mode + quad schema (server/consolidation.py)
+# _save_simulate_store_graph simulate mode (server/consolidation.py)
 # ---------------------------------------------------------------------------
 
 
-class TestSaveKeypairsForRouterQuad:
-    """_save_keyed_pairs_for_router writes 6-field quad schema in quad simulate mode."""
+class TestSaveSimulateStoreGraph:
+    """_save_simulate_store_graph writes graph.json in simulate mode."""
 
-    def test_simulate_mode_quad_writes_6_field_schema(self, tmp_path: Path) -> None:
-        """The keyed_pairs.json written in simulate+quad mode has the 6-field schema.
+    def test_simulate_mode_writes_graph_json(self, tmp_path: Path) -> None:
+        """In simulate mode, graph.json is written under simulate_dir/<tier>/.
 
-        ``_save_keyed_pairs_for_router`` reads ``config.consolidation.mode``
-        (for store-dir selection), ``config.simulate_dir`` / ``config.adapter_dir``
-        (computed properties on ServerConfig), and
-        ``config.consolidation.indexed_format`` (the format flag).  This test
-        uses a MagicMock to supply those attributes directly without requiring a
-        full ServerConfig construction (which would need a valid server.yaml).
+        ``_save_simulate_store_graph`` reads ``config.consolidation.mode``
+        (early-returns in train mode), ``config.simulate_dir``
+        (computed property on ServerConfig), and iterates the three tier
+        simhash registries on the loop.  This test uses a MagicMock to supply
+        those attributes directly without requiring a full ServerConfig
+        construction (which would need a valid server.yaml).
         """
-        from paramem.server.consolidation import _save_keyed_pairs_for_router
+        from paramem.server import simulate_store
+        from paramem.server.consolidation import _save_simulate_store_graph
 
-        # Build a minimal config stub that satisfies the _save_keyed_pairs_for_router contract.
+        # Build a minimal config stub for simulate mode.
         cfg = MagicMock()
         cfg.consolidation.mode = "simulate"
-        cfg.consolidation.indexed_format = "quad"
         cfg.simulate_dir = tmp_path / "simulate"
         cfg.adapter_dir = tmp_path / "adapters"
 
-        # Build a minimal loop stub with quad-shaped indexed_key_qa.
+        # Build a minimal loop stub with quad-shaped indexed_key_cache.
         loop = MagicMock()
-        loop.indexed_key_qa = {
+        loop.indexed_key_cache = {
             "graph1": _quad_cache_entry("graph1", "Alice", "lives_in", "Berlin"),
         }
         loop.episodic_simhash = {"graph1": 0xABCD}
         loop.semantic_simhash = {}
         loop.procedural_simhash = {}
 
-        _save_keyed_pairs_for_router(loop, cfg)
+        _save_simulate_store_graph(loop, cfg)
 
-        kp_path = tmp_path / "simulate" / "episodic" / "keyed_pairs.json"
-        assert kp_path.exists(), "keyed_pairs.json must be written in simulate dir"
+        graph_path = tmp_path / "simulate" / "episodic" / "graph.json"
+        assert graph_path.exists(), "graph.json must be written under simulate_dir/episodic/"
 
-        data = json.loads(kp_path.read_text())
-        assert isinstance(data, list) and len(data) == 1
-        entry = data[0]
+        # Verify graph round-trips via the public API.
+        graph = simulate_store.load_simulate_graph(graph_path)
+        quads = list(simulate_store.iter_quads(graph))
+        assert len(quads) == 1
 
-        # Exactly the 6-field quad schema; no QA fields.
-        from paramem.training.keyed_pairs_io import KEYED_PAIR_FIELDS_QUAD
+        quad = quads[0]
+        assert quad["key"] == "graph1"
+        assert quad["subject"] == "Alice"
+        assert quad["predicate"] == "lives_in"
+        assert quad["object"] == "Berlin"
+        assert quad["speaker_id"] == "Speaker0"
+        assert quad["first_seen_cycle"] == 1
 
-        for field_name in KEYED_PAIR_FIELDS_QUAD:
-            assert field_name in entry, (
-                f"Required quad field {field_name!r} missing from on-disk entry"
-            )
-        assert "question" not in entry
-        assert "answer" not in entry
-        assert "source_subject" not in entry
+    def test_train_mode_is_no_op(self, tmp_path: Path) -> None:
+        """In train mode, _save_simulate_store_graph writes nothing to disk."""
+        from paramem.server.consolidation import _save_simulate_store_graph
+
+        cfg = MagicMock()
+        cfg.consolidation.mode = "train"
+        cfg.simulate_dir = tmp_path / "simulate"
+        cfg.adapter_dir = tmp_path / "adapters"
+
+        loop = MagicMock()
+        loop.indexed_key_cache = {
+            "graph1": _quad_cache_entry("graph1", "Alice", "lives_in", "Berlin"),
+        }
+        loop.episodic_simhash = {"graph1": 0xABCD}
+        loop.semantic_simhash = {}
+        loop.procedural_simhash = {}
+
+        _save_simulate_store_graph(loop, cfg)
+
+        # Nothing should have been written to the simulate dir.
+        assert not (tmp_path / "simulate").exists(), (
+            "simulate_dir must not be created in train mode"
+        )

@@ -557,7 +557,7 @@ class TestAnonymousSpeakerNotSkipped:
         loop.merger = MagicMock()
         loop.merger.graph = MagicMock()
         loop.merger.graph.nodes = []
-        loop.indexed_key_qa = {}
+        loop.indexed_key_cache = {}
         loop.key_sessions = {}
         loop.promoted_keys = set()
         loop.episodic_simhash = {}
@@ -718,7 +718,7 @@ class TestSaveAdaptersManifest:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop.indexed_key_registry = KeyRegistry()
-        loop.indexed_key_qa = {}
+        loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
@@ -775,7 +775,7 @@ class TestSaveAdaptersManifest:
         # Seed registry + keyed_pairs state so every hash input is populated.
         loop.indexed_key_registry = KeyRegistry()
         loop.indexed_key_registry.add("graph1", adapter_id="episodic")
-        loop.indexed_key_qa = {
+        loop.indexed_key_cache = {
             "graph1": {
                 "key": "graph1",
                 "question": "What colour is the sky?",
@@ -1359,5 +1359,5 @@ class TestPostSessionTrainWritesFullSchema:
         missing = [f for f in KEYED_PAIR_FIELDS if f not in kp]
         assert missing == [], (
             f"Producer site dict is missing fields: {missing}. "
-            "Update the four indexed_key_qa[k] = {{...}} sites in consolidation.py."
+            "Update the four indexed_key_cache[k] = {{...}} sites in consolidation.py."
         )

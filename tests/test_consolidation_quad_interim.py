@@ -6,7 +6,7 @@ Covers:
   a 6-field keyed_pairs.json via write_keyed_pairs_quad.
 - consolidate_interim_adapters with indexed_format="quad": tier_keyed
   entries take the {key, subject, predicate, object} quad branch (the
-  :3313-3319 branch in the plan), no KeyError when indexed_key_qa holds
+  :3313-3319 branch in the plan), no KeyError when indexed_key_cache holds
   uniform-shape entries, and format_quadruple_training is called per tier.
 
 No GPU required — model interactions replaced with MagicMock stubs and
@@ -75,7 +75,7 @@ def _make_loop(tmp_path: Path, *, indexed_format: str = "qa") -> Any:
     loop.persist_graph = False
     loop._thermal_policy = None
     loop.indexed_key_registry = KeyRegistry()
-    loop.indexed_key_qa: dict[str, Any] = {}
+    loop.indexed_key_cache: dict[str, Any] = {}
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
     loop.episodic_simhash: dict = {}
@@ -306,7 +306,7 @@ class TestConsolidateInterimAdaptersQuadTierKeyed:
     """consolidate_interim_adapters builds quad-shaped tier_keyed in quad mode."""
 
     def _make_quad_indexed_key_qa(self) -> dict[str, dict]:
-        """Return indexed_key_qa with quad-mode uniform-shape entries."""
+        """Return indexed_key_cache with quad-mode uniform-shape entries."""
         from paramem.training.consolidation import ConsolidationLoop
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
@@ -349,7 +349,7 @@ class TestConsolidateInterimAdaptersQuadTierKeyed:
         loop = _make_loop(tmp_path, indexed_format="quad")
         loop.model = model
         loop.indexed_key_registry = registry
-        loop.indexed_key_qa = qa
+        loop.indexed_key_cache = qa
 
         stub_trainer = MagicMock()
         stub_trainer._current_job = None
@@ -466,7 +466,7 @@ class TestConsolidateInterimAdaptersQuadTierKeyed:
         loop = _make_loop(tmp_path, indexed_format="qa")
         loop.model = model
         loop.indexed_key_registry = registry
-        loop.indexed_key_qa = qa
+        loop.indexed_key_cache = qa
 
         stub_trainer = MagicMock()
         stub_trainer._current_job = None

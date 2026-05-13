@@ -82,7 +82,7 @@ def _minimal_consolidation_config() -> ConsolidationConfig:
     return ConsolidationConfig(indexed_key_replay_enabled=True)
 
 
-def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_qa=None):
+def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     """Construct a bare ConsolidationLoop without calling __init__."""
     from paramem.training.consolidation import ConsolidationLoop
 
@@ -99,7 +99,7 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_qa=None):
     loop.merger = MagicMock()
     loop.merger.graph = MagicMock(relations=[])
     loop.indexed_key_registry = registry if registry is not None else MagicMock()
-    loop.indexed_key_qa = indexed_key_qa if indexed_key_qa is not None else {}
+    loop.indexed_key_cache = indexed_key_cache if indexed_key_cache is not None else {}
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop.persist_graph = False
@@ -215,7 +215,7 @@ class TestB2RearmPattern:
         registry.list_active.return_value = ["graph1"]
         registry.get_adapter_id.return_value = "episodic"
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         # Create a stub trainer to record _set_is_training calls.
         stub_trainer = MagicMock()
@@ -325,7 +325,7 @@ class TestB2RearmPattern:
 
         registry.get_adapter_id.side_effect = _get_adapter_id
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         stub_trainer = MagicMock()
         stub_trainer._current_job = None
@@ -457,7 +457,7 @@ class TestPerTierInferenceFallbackAdapter:
 
         registry.get_adapter_id.side_effect = _get_adapter_id
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         # Stub trainer with real attribute tracking.
         stub_trainer = MagicMock()
@@ -571,7 +571,7 @@ class TestPerTierInferenceFallbackAdapter:
 
         registry.get_adapter_id.side_effect = _get_adapter_id
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         # Set a sentinel as the "outer" _current_job so we can detect restoration.
         sentinel_job = TrainingJob(
@@ -706,7 +706,7 @@ class TestCapacityCeilingRollback:
         registry.list_active.return_value = ["graph1"]
         registry.get_adapter_id.return_value = "episodic"
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         _gpu_thread_lock.acquire()
         try:
@@ -771,7 +771,7 @@ class TestCapacityCeilingRollback:
         registry.list_active.return_value = ["graph1"]
         registry.get_adapter_id.return_value = "episodic"
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         _gpu_thread_lock.acquire()
         try:
@@ -841,7 +841,7 @@ class TestAtomicFinalizeOrdering:
         registry.list_active.return_value = ["graph1"]
         registry.get_adapter_id.return_value = "episodic"
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         call_order: list[str] = []
 
@@ -947,7 +947,7 @@ class TestAtomicFinalizeOrdering:
         registry = KeyRegistry()
         registry.add("graph1", adapter_id="episodic_interim_20260418T0000")
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_qa=qa)
+        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
 
         _gpu_thread_lock.acquire()
         try:

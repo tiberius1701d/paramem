@@ -90,7 +90,7 @@ def _make_loop(tmp_path: Path) -> ConsolidationLoop:
     loop.procedural_simhash = {}
 
     # Seed QA pairs so _write_kp has content to write.
-    loop.indexed_key_qa = {
+    loop.indexed_key_cache = {
         "graph1": {
             "key": "graph1",
             "question": "Where does Alice live?",
@@ -140,8 +140,8 @@ def _fake_promote(loop: ConsolidationLoop) -> list[str]:
     loop.semantic_simhash["graph2"] = hash_val
 
     # Add a QA entry for the semantic slot if needed.
-    if "graph2" not in loop.indexed_key_qa:
-        loop.indexed_key_qa["graph2"] = {
+    if "graph2" not in loop.indexed_key_cache:
+        loop.indexed_key_cache["graph2"] = {
             "key": "graph2",
             "question": "What is Alice's job?",
             "answer": "Engineer.",
@@ -247,7 +247,7 @@ class TestPromoteThenSaveAdaptersKeyedPairsHashMatches:
         # Simulate _save_keyed_pairs_for_router rewriting keyed_pairs.json.
         # After promotion, episodic_simhash no longer has graph2.
         new_ep_pairs = [
-            loop.indexed_key_qa[k] for k in loop.episodic_simhash if k in loop.indexed_key_qa
+            loop.indexed_key_cache[k] for k in loop.episodic_simhash if k in loop.indexed_key_cache
         ]
         tmp_kp = ep_kp_path.with_suffix(".json.tmp")
         tmp_kp.write_text(

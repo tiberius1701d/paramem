@@ -6,7 +6,7 @@ Covers:
   question/answer absent in quad mode).
 - dedup_episodic works on both QA-format and quad-format dicts.
 - dedup_episodic deduplicates by (s,p,o) in quad mode.
-- seed_episodic_qa / seed_semantic_qa / seed_procedural_qa normalise via
+- seed_episodic_cache / seed_semantic_cache / seed_procedural_cache normalise via
   _cache_entry (source_* present after seed).
 - _quads_from_graph builds relation dicts from session_graph relations and
   entity attributes (attribute-projection canary).
@@ -46,7 +46,7 @@ def _make_loop(*, indexed_format: str = "qa") -> ConsolidationLoop:
     loop._is_quad = loop._indexed_format == "quad"
 
     # Minimal state expected by seeding helpers.
-    loop.indexed_key_qa: dict[str, Any] = {}
+    loop.indexed_key_cache: dict[str, Any] = {}
     loop.indexed_key_registry = None  # seeding helpers guard with `is not None`
     loop.procedural_sp_index: dict = {}
     loop.cycle_count: int = 1
@@ -245,8 +245,8 @@ class TestSeedHelpers:
     def test_seed_episodic_qa_quad_format_adds_source_aliases(self):
         loop = _make_loop(indexed_format="quad")
         kp = _make_quad_kp(key="graph1")
-        loop.seed_episodic_qa([kp])
-        stored = loop.indexed_key_qa.get("graph1")
+        loop.seed_episodic_cache([kp])
+        stored = loop.indexed_key_cache.get("graph1")
         assert stored is not None
         assert stored["source_subject"] == "Alice"
         assert stored["source_predicate"] == "lives_in"
@@ -257,8 +257,8 @@ class TestSeedHelpers:
     def test_seed_semantic_qa_quad_format(self):
         loop = _make_loop(indexed_format="quad")
         kp = _make_quad_kp(key="graph3", subject="Bob", predicate="works_at", object="ACME")
-        loop.seed_semantic_qa([kp])
-        stored = loop.indexed_key_qa.get("graph3")
+        loop.seed_semantic_cache([kp])
+        stored = loop.indexed_key_cache.get("graph3")
         assert stored is not None
         assert stored["source_subject"] == "Bob"
         assert stored["source_predicate"] == "works_at"
@@ -266,16 +266,16 @@ class TestSeedHelpers:
     def test_seed_procedural_qa_quad_format(self):
         loop = _make_loop(indexed_format="quad")
         kp = _make_quad_kp(key="proc1", subject="User", predicate="prefers", object="tea")
-        loop.seed_procedural_qa([kp])
-        stored = loop.indexed_key_qa.get("proc1")
+        loop.seed_procedural_cache([kp])
+        stored = loop.indexed_key_cache.get("proc1")
         assert stored is not None
         assert stored["source_subject"] == "User"
 
     def test_seed_qa_format_preserved_in_qa_mode(self):
         loop = _make_loop(indexed_format="qa")
         kp = _make_qa_kp(key="graph1")
-        loop.seed_episodic_qa([kp])
-        stored = loop.indexed_key_qa.get("graph1")
+        loop.seed_episodic_cache([kp])
+        stored = loop.indexed_key_cache.get("graph1")
         assert stored is not None
         assert stored["question"] == "Where does Alice live?"
         assert stored["answer"] == "Alice lives in Berlin."

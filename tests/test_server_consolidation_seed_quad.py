@@ -174,7 +174,7 @@ class TestSaveKeyedPairsForRouterFormat:
         cfg.simulate_dir = tmp_path / "simulate"
 
         loop = MagicMock()
-        loop.indexed_key_qa = {
+        loop.indexed_key_cache = {
             "graph1": {
                 "key": "graph1",
                 "subject": "A",
@@ -219,7 +219,7 @@ class TestSaveKeyedPairsForRouterFormat:
         cfg.simulate_dir = tmp_path / "simulate"
 
         loop = MagicMock()
-        loop.indexed_key_qa = {
+        loop.indexed_key_cache = {
             "graph1": {
                 "key": "graph1",
                 "question": "Q?",

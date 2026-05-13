@@ -1,6 +1,52 @@
 """Shared pytest configuration and fixtures."""
 
-import pytest
+# --- WSL2 / CUDA isolation gate (must run before any torch import) ----------
+#
+# On WSL2, ``import torch`` lazily loads ``libcuda.so`` and the first call to
+# ``torch.cuda.is_available()`` opens ``/dev/dxg`` and allocates a cuBLAS
+# workspace (~280 MiB) on the GPU.  Pytest collection imports every test
+# module, and any decorator argument evaluated at collection time (e.g. a
+# bare ``pytest.mark.skipif(not torch.cuda.is_available(), ...)``) will fire
+# CUDA init even when ``-m "not gpu"`` would deselect the test.  That blocks
+# parallel ML workloads on the same card.
+#
+# Default-off CUDA: set ``CUDA_VISIBLE_DEVICES=""`` before any test module
+# imports torch.  ``torch.cuda.is_available()`` then returns ``False``
+# without driver initialization, no ``/dev/dxg`` open, no workspace
+# allocation.  GPU-marked tests opt back in by passing ``--gpu`` to pytest
+# (this conftest re-exposes the device for those runs) or by being explicitly
+# selected via ``-m gpu``.
+import os
+import sys
+
+
+def _gpu_explicitly_requested(argv: list[str]) -> bool:
+    """True when the operator wants real CUDA exposed to this pytest run.
+
+    Triggers: ``--gpu`` flag (already understood by ``pytest_addoption`` below),
+    or ``-m`` selector that includes "gpu" without "not gpu".
+    """
+    if "--gpu" in argv:
+        return True
+    if "-m" in argv:
+        idx = argv.index("-m")
+        if idx + 1 < len(argv):
+            expr = argv[idx + 1]
+            return "gpu" in expr and "not gpu" not in expr
+    return False
+
+
+if not _gpu_explicitly_requested(sys.argv):
+    # ``setdefault`` so an operator who exports ``CUDA_VISIBLE_DEVICES``
+    # explicitly (e.g. ``CUDA_VISIBLE_DEVICES=0 pytest -m gpu``) is not
+    # clobbered.  Setting to "" disables CUDA driver init without unloading
+    # libcuda (the shared-lib mapping is unavoidable; the allocation/handle
+    # acquisition is what actually contends).
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402  (must follow the CUDA gate above)
 
 
 def pytest_addoption(parser):
@@ -11,6 +57,36 @@ def pytest_addoption(parser):
         default=False,
         help="Run memory recall tests (train ~30 epochs + probe; requires --gpu)",
     )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-deselect ``@pytest.mark.gpu`` tests unless ``--gpu`` or ``-m gpu``.
+
+    Pairs with the CUDA isolation gate at the top of this file: by default,
+    ``CUDA_VISIBLE_DEVICES=""`` is set and gpu-marked tests would crash on
+    the first ``device='cuda'`` allocation.  Auto-skipping them keeps
+    ``pytest tests/`` (no flags) usable while the gate is active.
+
+    Operator opts in via:
+      * ``pytest --gpu``      — runs every test including gpu-marked.
+      * ``pytest -m gpu``     — runs only gpu-marked tests (also re-exposes CUDA).
+      * default invocation    — every gpu-marked test is skipped.
+
+    When ``-m`` is supplied explicitly, pytest's own marker filter takes
+    precedence and we leave the items list alone (so ``-m "not gpu"`` and
+    ``-m gpu`` continue to do exactly what the operator asked).
+    """
+    if config.getoption("--gpu"):
+        return
+    if config.getoption("-m"):
+        # Operator passed an explicit marker expression — respect it.
+        return
+    skip_gpu = pytest.mark.skip(
+        reason="gpu-marked test skipped by default; pass --gpu or -m gpu to run"
+    )
+    for item in items:
+        if "gpu" in item.keywords:
+            item.add_marker(skip_gpu)
 
 
 @pytest.fixture(autouse=True)

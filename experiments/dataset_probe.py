@@ -421,7 +421,7 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     shim_dir.mkdir(parents=True, exist_ok=True)
 
     # (a) keyed_pairs.json
-    _write_keyed_pairs(loop.indexed_key_qa, loop.episodic_simhash, shim_dir / "keyed_pairs.json")
+    _write_keyed_pairs(loop.indexed_key_cache, loop.episodic_simhash, shim_dir / "keyed_pairs.json")
 
     # (b) simhash_registry.json
     src_registry = run_dir / "simhash_registry_episodic.json"

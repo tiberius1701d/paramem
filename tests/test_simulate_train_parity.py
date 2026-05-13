@@ -2,8 +2,15 @@
 
 Simulate runs the full extraction + key-assignment + SimHash pipeline but
 skips the LoRA weight update.  Under perfect recall, on-disk state
-(keyed_pairs + SimHash registries) is identical to what train mode would
-produce.
+(graph.json for simulate, keyed_pairs for train) is identical in content to
+what train mode would produce.
+
+The ``TestProbeKeysFromDisk`` class covers the train-mode disk reader
+(``probe_keys_from_disk`` against ``keyed_pairs.json``).  The companion
+``TestProbeKeysFromGraph`` class covers the simulate-mode graph reader
+(``probe_keys_from_graph`` against ``graph.json``).  Both verify that the
+returned result shape is identical so callers can swap the two functions
+without touching downstream consumers.
 """
 
 from __future__ import annotations
@@ -11,11 +18,15 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
+import networkx as nx
+
+from paramem.server.simulate_store import _IK_KEY_ATTR, save_simulate_graph
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.indexed_memory import (
     build_registry,
     compute_simhash,
     probe_keys_from_disk,
+    probe_keys_from_graph,
 )
 from paramem.training.key_registry import KeyRegistry
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
@@ -38,7 +49,7 @@ def _make_bare_loop(tmp_path, procedural: bool = False) -> ConsolidationLoop:
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop.indexed_key_registry = KeyRegistry()
-    loop.indexed_key_qa = {}
+    loop.indexed_key_cache = {}
     loop.cycle_count = 0
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
@@ -77,8 +88,8 @@ class TestSimulatedTrainingEpisodic:
         loop._simulate_indexed_key_episodic(session_qa)
 
         # Keys assigned graph1, graph2
-        assert "graph1" in loop.indexed_key_qa
-        assert "graph2" in loop.indexed_key_qa
+        assert "graph1" in loop.indexed_key_cache
+        assert "graph2" in loop.indexed_key_cache
         assert loop._indexed_next_index == 3
 
         # Registry has the keys
@@ -101,10 +112,10 @@ class TestSimulatedTrainingEpisodic:
         assert loop.episodic_simhash == build_registry(expected_pairs)
 
     def test_existing_keys_admitted_from_seed(self, tmp_path):
-        """Existing keys come from seeded indexed_key_qa, not probe_key."""
+        """Existing keys come from seeded indexed_key_cache, not probe_key."""
         loop = _make_bare_loop(tmp_path)
         # Pre-existing key, seeded from disk on startup
-        loop.indexed_key_qa["graph1"] = {
+        loop.indexed_key_cache["graph1"] = {
             "key": "graph1",
             "question": "Where does Alex live?",
             "answer": "Heilbronn.",
@@ -138,7 +149,7 @@ class TestSimulatedTrainingProcedural:
         loop = _make_bare_loop(tmp_path, procedural=True)
 
         # Seed an existing procedural key that will be contradicted.
-        loop.indexed_key_qa["proc1"] = {
+        loop.indexed_key_cache["proc1"] = {
             "key": "proc1",
             "question": "What does Alex like?",
             "answer": "Coffee.",
@@ -182,12 +193,12 @@ class TestSimulatedTrainingProcedural:
 
         # Old key retired from all indexes
         assert "proc1" not in loop.procedural_simhash
-        assert "proc1" not in loop.indexed_key_qa
+        assert "proc1" not in loop.indexed_key_cache
         assert "proc1" not in set(loop.indexed_key_registry.list_active())
 
         # New key registered and sp_index points to it
         assert "proc2" in loop.procedural_simhash
-        assert "proc2" in loop.indexed_key_qa
+        assert "proc2" in loop.indexed_key_cache
         assert loop.procedural_sp_index[("speaker_alice", "alex", "likes")] == "proc2"
 
         # SimHash matches direct compute_simhash on ground-truth
@@ -220,7 +231,7 @@ class TestSimulatedTrainingResult:
             speaker_id="Speaker0",
         )
         assert loop.cycle_count == 1
-        assert "graph1" in loop.indexed_key_qa
+        assert "graph1" in loop.indexed_key_cache
 
 
 class TestProbeKeysFromDisk:
@@ -365,7 +376,7 @@ class TestProbeKeysFromDisk:
 
 
 class TestSeedHelpers:
-    """seed_episodic_qa / seed_semantic_qa rebuild indexed_key_qa from disk pairs."""
+    """seed_episodic_cache / seed_semantic_cache rebuild indexed_key_cache from disk pairs."""
 
     def test_seed_episodic_populates_qa_and_registry(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
@@ -373,23 +384,217 @@ class TestSeedHelpers:
             {"key": "graph1", "question": "Q1?", "answer": "A1."},
             {"key": "graph2", "question": "Q2?", "answer": "A2."},
         ]
-        loop.seed_episodic_qa(pairs)
-        assert loop.indexed_key_qa["graph1"]["answer"] == "A1."
-        assert loop.indexed_key_qa["graph2"]["answer"] == "A2."
+        loop.seed_episodic_cache(pairs)
+        assert loop.indexed_key_cache["graph1"]["answer"] == "A1."
+        assert loop.indexed_key_cache["graph2"]["answer"] == "A2."
         active = set(loop.indexed_key_registry.list_active())
         assert {"graph1", "graph2"} <= active
 
     def test_seed_semantic_populates_qa_and_registry(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
         pairs = [{"key": "graph7", "question": "Q?", "answer": "A."}]
-        loop.seed_semantic_qa(pairs)
-        assert loop.indexed_key_qa["graph7"]["answer"] == "A."
+        loop.seed_semantic_cache(pairs)
+        assert loop.indexed_key_cache["graph7"]["answer"] == "A."
         assert "graph7" in set(loop.indexed_key_registry.list_active())
 
     def test_seed_episodic_does_not_duplicate_existing_registry_keys(self, tmp_path):
         loop = _make_bare_loop(tmp_path)
         loop.indexed_key_registry.add("graph1")
         pairs = [{"key": "graph1", "question": "Q?", "answer": "A."}]
-        loop.seed_episodic_qa(pairs)
+        loop.seed_episodic_cache(pairs)
         # Adding the same key twice would raise; reaching this assert proves idempotency.
         assert "graph1" in set(loop.indexed_key_registry.list_active())
+
+
+# ---------------------------------------------------------------------------
+# Helpers for TestProbeKeysFromGraph
+# ---------------------------------------------------------------------------
+
+
+def _write_graph(path, quads: list[dict]) -> None:
+    """Write *quads* as a simulate-mode graph.json at *path*.
+
+    Builds a ``MultiDiGraph`` with one edge per quad using ``_IK_KEY_ATTR``
+    for the indexed-memory key, then persists via ``save_simulate_graph``
+    with ``encrypted=False`` so tests read plaintext.
+    """
+    from pathlib import Path
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    graph = nx.MultiDiGraph()
+    for quad in quads:
+        graph.add_edge(
+            quad["subject"],
+            quad["object"],
+            **{
+                _IK_KEY_ATTR: quad["key"],
+                "predicate": quad.get("predicate", ""),
+                "speaker_id": quad.get("speaker_id", ""),
+                "first_seen_cycle": quad.get("first_seen_cycle", 0),
+            },
+        )
+    save_simulate_graph(graph, path, encrypted=False)
+
+
+class TestProbeKeysFromGraph:
+    """probe_keys_from_graph reads graph.json matching the grouped-probe shape.
+
+    Parity property: the returned result shape is identical to
+    ``probe_keys_from_disk`` on a quad file so callers can swap the two
+    without touching downstream consumers.  Under perfect recall both return::
+
+        {"key": str, "subject": str, "predicate": str, "object": str,
+         "confidence": 1.0, "format": "quad",
+         "fact_text": str, "raw_output": str}
+
+    Missing tiers / missing keys → ``None``.
+    """
+
+    def test_reads_episodic_from_subdir(self, tmp_path):
+        """Canonical layout: episodic graph lives under episodic/ subdir."""
+        _write_graph(
+            tmp_path / "episodic" / "graph.json",
+            [
+                {
+                    "key": "graph1",
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "",
+                    "first_seen_cycle": 0,
+                }
+            ],
+        )
+        results = probe_keys_from_graph(tmp_path, {"episodic": ["graph1"]})
+        assert results["graph1"] is not None
+        assert results["graph1"]["subject"] == "Alex"
+        assert results["graph1"]["object"] == "Berlin"
+        assert results["graph1"]["predicate"] == "lives_in"
+        assert results["graph1"]["confidence"] == 1.0
+        assert results["graph1"]["format"] == "quad"
+
+    def test_reads_semantic_from_subdir(self, tmp_path):
+        """Semantic tier reads from semantic/ subdir."""
+        _write_graph(
+            tmp_path / "semantic" / "graph.json",
+            [
+                {
+                    "key": "graph5",
+                    "subject": "Bob",
+                    "predicate": "works_at",
+                    "object": "Acme",
+                    "speaker_id": "",
+                    "first_seen_cycle": 0,
+                }
+            ],
+        )
+        results = probe_keys_from_graph(tmp_path, {"semantic": ["graph5"]})
+        assert results["graph5"]["subject"] == "Bob"
+
+    def test_reads_procedural_from_subdir(self, tmp_path):
+        """Procedural tier reads from procedural/ subdir."""
+        _write_graph(
+            tmp_path / "procedural" / "graph.json",
+            [
+                {
+                    "key": "proc3",
+                    "subject": "Carol",
+                    "predicate": "likes",
+                    "object": "Tea",
+                    "speaker_id": "",
+                    "first_seen_cycle": 0,
+                }
+            ],
+        )
+        results = probe_keys_from_graph(tmp_path, {"procedural": ["proc3"]})
+        assert results["proc3"]["object"] == "Tea"
+
+    def test_missing_file_returns_none(self, tmp_path):
+        """Missing graph.json → all keys return None."""
+        results = probe_keys_from_graph(tmp_path, {"episodic": ["graph1", "graph2"]})
+        assert results == {"graph1": None, "graph2": None}
+
+    def test_missing_key_returns_none(self, tmp_path):
+        """Key absent from graph → None; key present → hit."""
+        _write_graph(
+            tmp_path / "episodic" / "graph.json",
+            [
+                {
+                    "key": "graph1",
+                    "subject": "X",
+                    "predicate": "p",
+                    "object": "Y",
+                    "speaker_id": "",
+                    "first_seen_cycle": 0,
+                }
+            ],
+        )
+        results = probe_keys_from_graph(tmp_path, {"episodic": ["graph1", "graph999"]})
+        assert results["graph1"] is not None
+        assert results["graph999"] is None
+
+    def test_empty_keys_skipped(self, tmp_path):
+        """Empty key list for an adapter → no entries in result."""
+        results = probe_keys_from_graph(tmp_path, {"episodic": []})
+        assert results == {}
+
+    def test_raw_output_is_json_with_fields(self, tmp_path):
+        """raw_output is a JSON string with key/subject/predicate/object fields."""
+        _write_graph(
+            tmp_path / "episodic" / "graph.json",
+            [
+                {
+                    "key": "graph1",
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": "Munich",
+                    "speaker_id": "",
+                    "first_seen_cycle": 0,
+                }
+            ],
+        )
+        results = probe_keys_from_graph(tmp_path, {"episodic": ["graph1"]})
+        raw = json.loads(results["graph1"]["raw_output"])
+        assert raw["key"] == "graph1"
+        assert raw["subject"] == "Alex"
+        assert raw["object"] == "Munich"
+
+    def test_parity_with_probe_keys_from_disk_result_shape(self, tmp_path):
+        """Result shape is identical to probe_keys_from_disk on a quad file.
+
+        Verifies that both functions return the same set of top-level keys
+        for a hit result so downstream consumers can swap them transparently.
+        """
+        from paramem.training.keyed_pairs_io import write_keyed_pairs_quad
+
+        quad = {
+            "key": "graph1",
+            "subject": "Alice",
+            "predicate": "knows",
+            "object": "Bob",
+            "speaker_id": "",
+            "first_seen_cycle": 0,
+        }
+
+        # Write as graph.json for probe_keys_from_graph
+        graph_sim_dir = tmp_path / "sim"
+        _write_graph(graph_sim_dir / "episodic" / "graph.json", [quad])
+
+        # Write as quad keyed_pairs.json for probe_keys_from_disk
+        kp_dir = tmp_path / "kp"
+        kp_path = kp_dir / "episodic" / "keyed_pairs.json"
+        kp_path.parent.mkdir(parents=True, exist_ok=True)
+        write_keyed_pairs_quad(kp_path, [quad])
+
+        graph_result = probe_keys_from_graph(graph_sim_dir, {"episodic": ["graph1"]})
+        disk_result = probe_keys_from_disk(
+            kp_dir, {"episodic": ["graph1"]}, formats_by_adapter={"episodic": "quad"}
+        )
+
+        assert set(graph_result["graph1"].keys()) == set(disk_result["graph1"].keys()), (
+            "probe_keys_from_graph and probe_keys_from_disk must return identical "
+            f"top-level keys.\n"
+            f"graph_result keys: {sorted(graph_result['graph1'].keys())}\n"
+            f"disk_result keys:  {sorted(disk_result['graph1'].keys())}"
+        )

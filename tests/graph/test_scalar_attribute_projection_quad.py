@@ -41,7 +41,7 @@ def _make_loop(*, indexed_format: str = "quad") -> ConsolidationLoop:
     loop.training_config = TrainingConfig()
     loop._indexed_format = indexed_format
     loop._is_quad = indexed_format == "quad"
-    loop.indexed_key_qa: dict[str, Any] = {}
+    loop.indexed_key_cache: dict[str, Any] = {}
     loop.indexed_key_registry = None
     loop.procedural_sp_index: dict = {}
     loop.cycle_count = 1

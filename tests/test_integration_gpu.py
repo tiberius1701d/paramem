@@ -90,7 +90,7 @@ class TestRollbackPreparation:
 
         orig_cycle = loop.cycle_count
         orig_next_idx = loop._indexed_next_index
-        orig_qa = dict(loop.indexed_key_qa)
+        orig_qa = dict(loop.indexed_key_cache)
 
         loop.prepare_training_data([], [])
 
@@ -99,7 +99,7 @@ class TestRollbackPreparation:
         loop.rollback_preparation()
         assert loop.cycle_count == orig_cycle
         assert loop._indexed_next_index == orig_next_idx
-        assert loop.indexed_key_qa == orig_qa
+        assert loop.indexed_key_cache == orig_qa
 
     def test_rollback_without_snapshot(self, tmp_path):
         """Rollback with no prior prepare should not crash."""

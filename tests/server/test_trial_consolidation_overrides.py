@@ -21,7 +21,9 @@ import paramem.server.app as app_module
 def _make_state(tmp_path: Path) -> dict:
     """Build a TRIAL _state with a real live config file."""
     live_yaml = tmp_path / "server.yaml"
-    live_yaml.write_bytes(b"model: mistral\nconsolidation:\n  mode: simulate\n")
+    live_yaml.write_bytes(
+        b"model: mistral\nconsolidation:\n  mode: simulate\n  indexed_format: quad\n"
+    )
 
     config = MagicMock()
     config.paths.data = tmp_path / "data"
@@ -388,7 +390,9 @@ class TestTrialDoesNotMarkConsolidated:
                     from paramem.server.config import ConsolidationScheduleConfig
 
                     real_cfg = MagicMock()
-                    real_cfg.consolidation = ConsolidationScheduleConfig(mode="simulate")
+                    real_cfg.consolidation = ConsolidationScheduleConfig(
+                        mode="simulate", indexed_format="quad"
+                    )
                     mock_load.return_value = real_cfg
 
                     with patch("paramem.server.gpu_lock.gpu_lock_sync") as mock_gpu:
