@@ -1152,3 +1152,202 @@ class TestAttributePredicateIndexing:
             router = QueryRouter(adapter_dir=Path(tmp))
             # Empty de-prefixed name must not be added to entities.
             assert "" not in router._all_entities
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — simulate_dir: graph.json loading
+# ---------------------------------------------------------------------------
+
+
+def _write_simulate_graph(path: Path, quads: list[dict]) -> None:
+    """Write *quads* as a simulate-mode ``graph.json`` at *path*.
+
+    Builds a ``MultiDiGraph`` with one edge per quad, stores the indexed-memory
+    key in the ``_IK_KEY_ATTR`` edge attribute, and persists via
+    :func:`paramem.server.simulate_store.save_simulate_graph` with
+    ``encrypted=False`` so tests read plaintext.
+    """
+    import networkx as nx
+
+    from paramem.server.simulate_store import _IK_KEY_ATTR, save_simulate_graph
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    graph = nx.MultiDiGraph()
+    for quad in quads:
+        graph.add_edge(
+            quad["subject"],
+            quad["object"],
+            **{
+                _IK_KEY_ATTR: quad["key"],
+                "predicate": quad.get("predicate", "related_to"),
+                "speaker_id": quad.get("speaker_id", ""),
+                "first_seen_cycle": quad.get("first_seen_cycle", 0),
+            },
+        )
+    save_simulate_graph(graph, path, encrypted=False)
+
+
+def _make_sim_quad(
+    key: str,
+    subject: str,
+    obj: str,
+    *,
+    speaker_id: str = "",
+    predicate: str = "related_to",
+    first_seen_cycle: int = 1,
+) -> dict:
+    """Return a six-field quad dict for simulate-store router fixtures."""
+    return {
+        "key": key,
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
+        "speaker_id": speaker_id,
+        "first_seen_cycle": first_seen_cycle,
+    }
+
+
+class TestQueryRouterSimulateDir:
+    """simulate_dir graph.json loading: router indexes entities from simulate store.
+
+    When ``simulate_dir`` is supplied to ``QueryRouter.__init__``, ``reload()``
+    scans ``<simulate_dir>/<tier>/graph.json`` for each tier and adds those
+    entities and speaker-key mappings to the same indexes used by the
+    keyed-pairs path.  Train-mode kp files and simulate-mode graph.json files
+    can coexist without conflict.
+    """
+
+    def test_empty_simulate_dir_loads_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            sim_dir.mkdir()
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            assert router.entity_count == 0
+
+    def test_nonexistent_simulate_dir_loads_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = QueryRouter(
+                adapter_dir=Path(tmp) / "adapters",
+                simulate_dir=Path(tmp) / "no_such_dir",
+            )
+            assert router.entity_count == 0
+
+    def test_episodic_graph_json_entities_indexed(self):
+        """Entities from episodic graph.json appear in _all_entities."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            _write_simulate_graph(
+                sim_dir / "episodic" / "graph.json",
+                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            assert "alice" in router._all_entities
+            assert "berlin" in router._all_entities
+
+    def test_semantic_and_procedural_graph_json_indexed(self):
+        """All three tiers' graph.json files contribute to the index."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            _write_simulate_graph(
+                sim_dir / "semantic" / "graph.json",
+                [_make_sim_quad("sem1", "Bob", "Python", speaker_id="bob")],
+            )
+            _write_simulate_graph(
+                sim_dir / "procedural" / "graph.json",
+                [_make_sim_quad("proc1", "Carol", "Tea", speaker_id="carol")],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            assert "bob" in router._all_entities
+            assert "carol" in router._all_entities
+
+    def test_speaker_id_from_graph_json_indexed(self):
+        """speaker_id from graph.json edges appears in _speaker_key_index."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            _write_simulate_graph(
+                sim_dir / "episodic" / "graph.json",
+                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            assert "alice" in router._speaker_key_index
+            assert "graph1" in router._speaker_key_index["alice"]
+
+    def test_simulate_graph_produces_pa_routing_steps(self):
+        """A query mentioning an entity from graph.json resolves to a PA step."""
+        from paramem.server.router import Intent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            _write_simulate_graph(
+                sim_dir / "episodic" / "graph.json",
+                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            plan = router.route("Where does Alice live?", speaker_id="alice")
+            assert plan.steps, "Expected PA routing steps from simulate-mode graph.json"
+            assert plan.intent == Intent.PERSONAL
+            keys = [k for step in plan.steps for k in step.keys_to_probe]
+            assert "graph1" in keys
+
+    def test_simulate_dir_and_adapter_dir_coexist(self):
+        """Entities from both stores are indexed without conflict."""
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter_dir = Path(tmp) / "adapters"
+            sim_dir = Path(tmp) / "simulate"
+            # Train-mode kp in adapter_dir
+            _write_keyed_pairs(
+                adapter_dir,
+                [_make_pair("train1", "TrainEntity", "Berlin", speaker_id="alice")],
+                subdir="episodic",
+            )
+            # Simulate-mode graph.json in sim_dir
+            _write_simulate_graph(
+                sim_dir / "episodic" / "graph.json",
+                [_make_sim_quad("sim1", "SimEntity", "Munich", speaker_id="alice")],
+            )
+            router = QueryRouter(adapter_dir=adapter_dir, simulate_dir=sim_dir)
+            assert "trainentity" in router._all_entities
+            assert "simentity" in router._all_entities
+
+    def test_reload_picks_up_new_graph_json(self):
+        """After writing graph.json to simulate_dir, reload() picks it up."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            assert router.entity_count == 0
+
+            _write_simulate_graph(
+                sim_dir / "episodic" / "graph.json",
+                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
+            )
+            router.reload()
+            assert router.entity_count > 0
+            assert "alice" in router._all_entities
+
+    def test_missing_graph_json_does_not_crash(self):
+        """simulate_dir with no graph.json under any tier → entity_count stays 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            sim_dir.mkdir()
+            (sim_dir / "episodic").mkdir()  # subdir present but no graph.json
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            assert router.entity_count == 0
+
+    def test_has_email_predicate_indexed_from_graph_json(self):
+        """has_email predicate in graph.json edge is indexed under 'email' entity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sim_dir = Path(tmp) / "simulate"
+            _write_simulate_graph(
+                sim_dir / "episodic" / "graph.json",
+                [
+                    _make_sim_quad(
+                        "graph2",
+                        "Alice",
+                        "alice@example.com",
+                        speaker_id="alice",
+                        predicate="has_email",
+                    )
+                ],
+            )
+            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
+            assert "email" in router._all_entities

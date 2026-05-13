@@ -1,6 +1,6 @@
 """End-to-end simulate-mode /chat coverage.
 
-Exercises ``handle_chat`` → ``_probe_and_reason`` → ``probe_keys_from_disk``
+Exercises ``handle_chat`` → ``_probe_and_reason`` → ``probe_keys_from_graph``
 in simulate mode using an on-disk simulate store, a stubbed model, and a
 stubbed router.  No real LLM is invoked — ``generate_answer`` is patched at
 the inference module boundary.
@@ -9,14 +9,14 @@ Pattern reference: ``tests/test_abstention_integration.py``.
 
 Six tests are grouped in ``TestSimulateInferenceEndToEnd``:
 
-* T1  — PA match with canonical episodic keyed_pairs in ``paths.simulate``
-        returns the disk answer.
-* T2  — PA match with no keyed_pairs.json walks HA → SOTA → fallback.
+* T1  — PA match with canonical episodic graph.json in ``paths.simulate``
+        returns the graph answer.
+* T2  — PA match with no graph.json walks HA → SOTA → fallback.
 * T2b — PA match, HA fails + SOTA unavailable → base-model helper reached.
 * T3  — All three tiers (episodic, semantic, procedural) read from
-        ``<paths.simulate>/<tier>/keyed_pairs.json``.
+        ``<paths.simulate>/<tier>/graph.json``.
 * T4  — simulate-mode chat ignores stale keyed_pairs under ``paths.adapters``.
-* T4b — train-mode chat never calls ``probe_keys_from_disk``.
+* T4b — train-mode chat never calls ``probe_keys_from_graph``.
 
 Tokenizer setup note
 --------------------
@@ -24,15 +24,19 @@ In these tests the tokenizer is a ``MagicMock``.  The
 ``tokenizer.apply_chat_template(messages, ...)`` call inside
 ``_probe_and_reason`` produces the prompt string that ``generate_answer``
 receives as its third positional argument.  To make the prompt a real string
-that carries the disk-read facts, every test configures::
+that carries the graph-read facts, every test configures::
 
     tokenizer.apply_chat_template.side_effect = lambda msgs, **_: json.dumps(msgs)
 
 This causes ``apply_chat_template`` to return a JSON serialisation of the
 messages list, which contains the ``augmented_text`` (and therefore the
-disk-read answer token) as the user-turn content.  Without this configuration
+graph-read answer token) as the user-turn content.  Without this configuration
 the call returns a ``MagicMock`` object, not a string, and ``"Heilbronn." in
 str(mock_obj)`` is vacuously false.
+
+Simulate mode requires ``indexed_format='quad'`` (enforced by
+``ConsolidationScheduleConfig.__post_init__``).  Every test that enables
+simulate mode also sets ``indexed_format='quad'`` on the config.
 """
 
 from __future__ import annotations
@@ -41,63 +45,66 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import networkx as nx
 import pytest
 
 from paramem.server.config import PathsConfig, load_server_config
 from paramem.server.inference import ChatResult, handle_chat
 from paramem.server.router import Intent, RoutingPlan, RoutingStep
-from paramem.training.keyed_pairs_io import write_keyed_pairs_quad
+from paramem.server.simulate_store import _IK_KEY_ATTR, save_simulate_graph
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _full_pair(
+def _write_simulate_graph(path: Path, quads: list[dict]) -> None:
+    """Write *quads* as a simulate-mode ``graph.json`` at *path*.
+
+    Builds a ``MultiDiGraph`` with one edge per quad, stores the indexed-memory
+    key in the ``_IK_KEY_ATTR`` edge attribute (``"ik_key"``), and persists via
+    :func:`paramem.server.simulate_store.save_simulate_graph`.
+
+    Args:
+        path: Absolute path to the target ``graph.json`` file.
+        quads: List of six-field quad dicts with at minimum ``key``,
+            ``subject``, ``predicate``, ``object``, ``speaker_id``,
+            and ``first_seen_cycle``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    graph = nx.MultiDiGraph()
+    for quad in quads:
+        graph.add_edge(
+            quad["subject"],
+            quad["object"],
+            **{
+                _IK_KEY_ATTR: quad["key"],
+                "predicate": quad.get("predicate", ""),
+                "speaker_id": quad.get("speaker_id", ""),
+                "first_seen_cycle": quad.get("first_seen_cycle", 0),
+            },
+        )
+    save_simulate_graph(graph, path, encrypted=False)
+
+
+def _full_quad(
     key: str,
-    question: str,
-    answer: str,
+    subject: str = "Alex",
+    predicate: str = "lives_in",
+    object_: str = "Heilbronn",
     *,
-    source_subject: str = "Alex",
-    source_predicate: str = "related_to",
-    source_object: str = "Unknown",
     speaker_id: str = "spk-test",
     first_seen_cycle: int = 1,
 ) -> dict:
-    """Build a canonical keyed pair with all eight required fields.
-
-    Tests that only care about a subset of fields can rely on the defaults
-    for the remainder.  The facade enforces the full schema on every write,
-    so this helper centralises default-filling instead of duplicating it
-    across every call site.
-    """
+    """Build a canonical six-field quad dict for simulate-store fixtures."""
     return {
         "key": key,
-        "question": question,
-        "answer": answer,
-        "source_subject": source_subject,
-        "source_predicate": source_predicate,
-        "source_object": source_object,
+        "subject": subject,
+        "predicate": predicate,
+        "object": object_,
         "speaker_id": speaker_id,
         "first_seen_cycle": first_seen_cycle,
     }
-
-
-def _write_keyed_pairs(path: Path, pairs: list[dict]) -> None:
-    """Write *pairs* to *path* via the canonical facade, creating parent dirs.
-
-    Delegates to :func:`paramem.training.keyed_pairs_io.write_keyed_pairs`
-    so the full eight-field schema is enforced at write time.  Call sites that
-    previously passed three-field dicts must now use :func:`_full_pair` to
-    supply the missing fields.
-
-    Args:
-        path: Absolute path to the target ``keyed_pairs.json`` file.
-        pairs: List of keyed-pair dicts, each with all eight canonical fields.
-    """
-    from paramem.training.keyed_pairs_io import write_keyed_pairs
-
-    write_keyed_pairs(path, pairs)
 
 
 def _simulate_config(tmp_path: Path):
@@ -107,6 +114,7 @@ def _simulate_config(tmp_path: Path):
     overrides:
 
     * ``consolidation.mode`` → ``"simulate"``
+    * ``consolidation.indexed_format`` → ``"quad"`` (required by the validator)
     * ``paths.simulate``      → ``tmp_path / "simulate"``
     * ``paths.data``          → ``tmp_path / "data"``  (drives ``paths.adapters``)
 
@@ -126,6 +134,7 @@ def _simulate_config(tmp_path: Path):
     """
     config = load_server_config("tests/fixtures/server.yaml")
     config.consolidation.mode = "simulate"
+    config.consolidation.indexed_format = "quad"
     config.paths = PathsConfig(
         data=tmp_path / "data",
         sessions=tmp_path / "data" / "sessions",
@@ -186,7 +195,7 @@ def _stub_model() -> MagicMock:
     model = MagicMock()
     model.gradient_checkpointing_disable = MagicMock()
     model.generate.side_effect = RuntimeError(
-        "model.generate() must not be called — simulate-mode disk recall failed"
+        "model.generate() must not be called — simulate-mode graph recall failed"
     )
     return model
 
@@ -197,7 +206,7 @@ def _chat_template_tokenizer() -> MagicMock:
     ``apply_chat_template(messages, ...)`` is configured to return a JSON
     serialisation of the messages list.  This makes the prompt argument
     passed to ``generate_answer`` a real string that contains the
-    user-turn content (i.e. the disk-read answer token) so that
+    user-turn content (i.e. the graph-read answer token) so that
     ``assert "Heilbronn." in prompt`` works as expected.
 
     Without this configuration the call returns a ``MagicMock`` object;
@@ -224,6 +233,9 @@ class TestSimulateInferenceEndToEnd:
     function itself), a real ``configs/server.yaml`` loaded config, a
     ``MagicMock`` model, and a ``MagicMock`` router.  ``generate_answer``
     is always patched so no LLM is invoked.
+
+    Simulate mode requires ``indexed_format='quad'``; every test's config
+    has both set via ``_simulate_config``.
     """
 
     # ------------------------------------------------------------------
@@ -231,18 +243,18 @@ class TestSimulateInferenceEndToEnd:
     # ------------------------------------------------------------------
 
     def test_pa_match_reads_canonical_episodic_from_simulate_store(self, tmp_path):
-        """Disk-read answer from paths.simulate reaches the generate_answer prompt.
+        """Graph-read answer from paths.simulate reaches the generate_answer prompt.
 
         Setup:
-        - ``paths.simulate/episodic/keyed_pairs.json`` contains one pair with
-          ``answer="Heilbronn."``.
+        - ``paths.simulate/episodic/graph.json`` contains one quad with
+          ``object="Heilbronn"`` (fact_text: "Alex lives in Heilbronn").
         - ``paths.adapters`` (paths.data/adapters) is empty.
-        - Config is simulate mode.
+        - Config is simulate mode + quad format.
 
         Assertions:
         - ``generate_answer`` called once.
-        - Prompt arg contains ``"Heilbronn."`` — proves disk-read fact
-          reached the layered context.
+        - Prompt arg contains ``"Alex lives in Heilbronn"`` — proves graph-read
+          fact reached the layered context.
         - ``result.text == "Alex lives in Heilbronn."`` (echoed from mock).
         - ``result.escalated is False``.
         - ``"graph1" in result.probed_keys``.
@@ -253,16 +265,9 @@ class TestSimulateInferenceEndToEnd:
         """
         config = _simulate_config(tmp_path)
 
-        _write_keyed_pairs(
-            config.simulate_dir / "episodic" / "keyed_pairs.json",
-            [
-                _full_pair(
-                    "graph1",
-                    "Where does Alex live?",
-                    "Heilbronn.",
-                    source_subject="Alex",
-                )
-            ],
+        _write_simulate_graph(
+            config.simulate_dir / "episodic" / "graph.json",
+            [_full_quad("graph1", "Alex", "lives_in", "Heilbronn")],
         )
         # adapters directory intentionally left absent — simulate mode must NOT
         # read from it.
@@ -297,20 +302,21 @@ class TestSimulateInferenceEndToEnd:
         call_args = mock_ga.call_args
         # The prompt is the third positional arg (model, tokenizer, prompt, …).
         prompt_arg = call_args.args[2] if call_args.args else call_args.kwargs.get("prompt", "")
-        assert "Heilbronn." in str(prompt_arg), (
-            f"Disk-read fact 'Heilbronn.' not found in generate_answer prompt arg: {prompt_arg!r}"
+        assert "Alex lives in Heilbronn" in str(prompt_arg), (
+            f"Graph-read fact 'Alex lives in Heilbronn' not found in "
+            f"generate_answer prompt arg: {prompt_arg!r}"
         )
 
     # ------------------------------------------------------------------
     # T2
     # ------------------------------------------------------------------
 
-    def test_pa_match_kp_missing_falls_through_to_ha_then_abstains(self, tmp_path):
-        """No keyed_pairs.json → fallback chain HA → abstention.
+    def test_pa_match_graph_missing_falls_through_to_ha_then_abstains(self, tmp_path):
+        """No graph.json → fallback chain HA → abstention.
 
         Under the intent-keyed dispatch, ``intent=PERSONAL`` (set by the
         ``_pa_router_stub``) blocks SOTA at every internal escalation site.
-        When PA disk-recall fails for a personal-class query the chain is:
+        When PA graph-recall fails for a personal-class query the chain is:
 
             HA tool fallback (tools may help even for personal queries)
             ↓ (returns None)
@@ -321,7 +327,7 @@ class TestSimulateInferenceEndToEnd:
             circuit prevents that)
 
         Setup:
-        - ``paths.simulate`` exists but is empty (no keyed_pairs).
+        - ``paths.simulate`` exists but is empty (no graph.json).
         - HA returns ``None``.
         - SOTA mock present but must NOT be invoked.
         - ``_base_model_answer`` patched but must NOT be invoked either —
@@ -332,22 +338,12 @@ class TestSimulateInferenceEndToEnd:
         - SOTA was NOT called (privacy invariant for PERSONAL).
         - ``_base_model_answer`` was NOT called (abstention pre-empts it).
         - The returned text is the configured abstention response.
-
-        Why this catches a regression: any future change that re-enables
-        the SOTA fallback for PERSONAL queries on disk-recall failure
-        breaks this test.  Equally, any change that puts ``_base_model_answer``
-        back on the personal-no-recall path (re-introducing confabulation
-        risk) breaks the abstention assertion below.
         """
         config = _simulate_config(tmp_path)
         # The privacy invariant tested here ("PERSONAL never reaches
         # SOTA via direct escalation") only holds under cloud_mode=block
-        # — under cloud_mode=anonymize PERSONAL queries DO reach SOTA
-        # via the anonymization+deanonymization round-trip.  Pin
-        # cloud_mode here so the test's stated invariant is the one
-        # being asserted, regardless of the deployed default.
         config.sanitization.cloud_mode = "block"
-        # Create the simulate_dir but write no keyed_pairs.json.
+        # Create the simulate_dir but write no graph.json.
         config.simulate_dir.mkdir(parents=True, exist_ok=True)
 
         router = _pa_router_stub("episodic", ["graph1"])
@@ -396,8 +392,8 @@ class TestSimulateInferenceEndToEnd:
     # T2b
     # ------------------------------------------------------------------
 
-    def test_pa_match_kp_missing_all_cloud_failed_abstains(self, tmp_path):
-        """No keyed_pairs + HA fails + SOTA unavailable → abstention.
+    def test_pa_match_graph_missing_all_cloud_failed_abstains(self, tmp_path):
+        """No graph.json + HA fails + SOTA unavailable → abstention.
 
         Setup:
         - ``paths.simulate`` exists but empty.
@@ -405,27 +401,9 @@ class TestSimulateInferenceEndToEnd:
         - ``_base_model_answer`` patched but must NOT fire — abstention
           pre-empts it.
 
-        Code path: inside ``_probe_and_reason``, when ``layers`` is empty and
-        ``sanitize_for_cloud`` allows escalation:
-
-            result = _escalate_to_ha_agent(...)  # → None
-            if result is not None: return result  # skipped
-            if sota_agent is not None: ...        # skipped (sota_agent is None)
-            # Personal interrogative + abstention enabled (default) →
-            # canned response.  The bare base model would otherwise
-            # confabulate personal facts here.
-            return ChatResult(text=config.abstention.load_response())
-
         Assertion:
         - The returned text is the abstention canned response.
         - ``_base_model_answer`` was NOT called.
-
-        Why this catches a regression: when probes fail for a PERSONAL
-        interrogative and no tool/cloud answer exists, the bare base
-        model must NEVER be reached.  AbstentionBench (NeurIPS 2025)
-        confirms 7B-class models cannot be relied on for prompt-only
-        abstention — the deterministic short-circuit is the only fix
-        with zero hallucination risk.
         """
         config = _simulate_config(tmp_path)
         config.simulate_dir.mkdir(parents=True, exist_ok=True)
@@ -471,32 +449,23 @@ class TestSimulateInferenceEndToEnd:
 
     @pytest.mark.parametrize("tier", ["episodic", "semantic", "procedural"])
     def test_canonical_layout_per_tier(self, tmp_path, tier):
-        """Per-tier canonical layout: each tier's disk answer reaches generate_answer.
+        """Per-tier canonical layout: each tier's graph answer reaches generate_answer.
 
         Parametrized over ``("episodic", "semantic", "procedural")``.  For each
-        tier, writes a single keyed pair under
-        ``paths.simulate/<tier>/keyed_pairs.json`` and asserts the pair's answer
+        tier, writes a single quad under
+        ``paths.simulate/<tier>/graph.json`` and asserts the quad's object
         appears in the ``generate_answer`` prompt argument.
 
         Why this catches a regression: validates the canonicalization is
-        correct for all three tiers, not just episodic — the special case was
-        on episodic, but the fix touches the path expression for all tiers
-        in ``probe_keys_from_disk``.
+        correct for all three tiers, not just episodic.
         """
         config = _simulate_config(tmp_path)
 
         answer_token = f"ANSWER-FOR-{tier.upper()}"
         key = f"{tier[:3]}1"
-        _write_keyed_pairs(
-            config.simulate_dir / tier / "keyed_pairs.json",
-            [
-                _full_pair(
-                    key,
-                    f"Question for {tier}?",
-                    answer_token,
-                    source_subject="Alex",
-                )
-            ],
+        _write_simulate_graph(
+            config.simulate_dir / tier / "graph.json",
+            [_full_quad(key, "Alex", "object_is", answer_token)],
         )
 
         router = _pa_router_stub(tier, [key])
@@ -524,7 +493,7 @@ class TestSimulateInferenceEndToEnd:
         mock_ga.assert_called_once()
         prompt_arg = mock_ga.call_args.args[2]
         assert answer_token in str(prompt_arg), (
-            f"Tier '{tier}' disk answer {answer_token!r} not found in "
+            f"Tier '{tier}' graph answer {answer_token!r} not found in "
             f"generate_answer prompt: {prompt_arg!r}"
         )
 
@@ -538,43 +507,25 @@ class TestSimulateInferenceEndToEnd:
         Setup:
         - Decoy keyed_pairs under ``paths.adapters/episodic/keyed_pairs.json``
           with ``answer="WRONG-from-adapters"``.
-        - Correct keyed_pairs under ``paths.simulate/episodic/keyed_pairs.json``
-          with ``answer="CORRECT-from-simulate"``.
+        - Correct graph.json under ``paths.simulate/episodic/graph.json``
+          with ``object="CORRECT-from-simulate"``.
 
         Assertions:
         - ``generate_answer`` prompt contains ``"CORRECT-from-simulate"``.
         - ``generate_answer`` prompt does NOT contain ``"WRONG-from-adapters"``.
-
-        Why this catches a regression: guards locked decision #2 boundary.
-        Without this test, a future refactor could make the reader scan both
-        stores (e.g. via an rglob over ``paths.data``) and silently produce
-        wrong answers when both stores have data.
         """
         config = _simulate_config(tmp_path)
 
         # Decoy in adapters store — must NOT be read in simulate mode.
-        _write_keyed_pairs(
-            config.adapter_dir / "episodic" / "keyed_pairs.json",
-            [
-                _full_pair(
-                    "graph1",
-                    "Where does Alex live?",
-                    "WRONG-from-adapters",
-                    source_subject="Alex",
-                )
-            ],
+        decoy_kp = config.adapter_dir / "episodic" / "keyed_pairs.json"
+        decoy_kp.parent.mkdir(parents=True, exist_ok=True)
+        decoy_kp.write_text(
+            json.dumps([{"key": "graph1", "question": "Q?", "answer": "WRONG-from-adapters"}])
         )
         # Real data in simulate store — MUST be read in simulate mode.
-        _write_keyed_pairs(
-            config.simulate_dir / "episodic" / "keyed_pairs.json",
-            [
-                _full_pair(
-                    "graph1",
-                    "Where does Alex live?",
-                    "CORRECT-from-simulate",
-                    source_subject="Alex",
-                )
-            ],
+        _write_simulate_graph(
+            config.simulate_dir / "episodic" / "graph.json",
+            [_full_quad("graph1", "Alex", "object_is", "CORRECT-from-simulate")],
         )
 
         router = _pa_router_stub("episodic", ["graph1"])
@@ -614,38 +565,27 @@ class TestSimulateInferenceEndToEnd:
     # ------------------------------------------------------------------
 
     def test_train_mode_ignores_simulate_store(self, tmp_path):
-        """Train mode never calls probe_keys_from_disk — simulate store is unused.
+        """Train mode never calls probe_keys_from_graph — simulate store is unused.
 
         Setup:
         - Config set to ``mode="train"``.
-        - Decoy keyed_pairs under ``paths.simulate/episodic/keyed_pairs.json``.
+        - Decoy graph.json under ``paths.simulate/episodic/graph.json``.
         - ``probe_keys_grouped_by_adapter`` patched to return a successful result
           (simulates a trained adapter with the answer ``"TRAIN-from-adapter"``).
 
         Assertions:
-        - ``probe_keys_from_disk`` is never called.
+        - ``probe_keys_from_graph`` is never called.
         - ``generate_answer`` prompt contains ``"TRAIN-from-adapter"`` (the
           in-memory/adapter probe result, not the simulate-store decoy).
-
-        Why this catches a regression: guards the mode branch at
-        ``paramem/server/inference.py:547-548``.  Without this test, a future
-        refactor could activate the disk-read path in train mode, silently
-        returning stale simulate-store data when a fresh adapter is available.
         """
         config = _simulate_config(tmp_path)
         config.consolidation.mode = "train"
+        config.consolidation.indexed_format = "qa"  # train mode can use qa
 
         # Decoy in simulate store — must NOT be read in train mode.
-        _write_keyed_pairs(
-            config.simulate_dir / "episodic" / "keyed_pairs.json",
-            [
-                _full_pair(
-                    "graph1",
-                    "Where does Alex live?",
-                    "DECOY-from-simulate",
-                    source_subject="Alex",
-                )
-            ],
+        _write_simulate_graph(
+            config.simulate_dir / "episodic" / "graph.json",
+            [_full_quad("graph1", "Alex", "lives_in", "DECOY-from-simulate")],
         )
 
         router = _pa_router_stub("episodic", ["graph1"])
@@ -653,8 +593,6 @@ class TestSimulateInferenceEndToEnd:
         tokenizer = _chat_template_tokenizer()
 
         # Simulate a successful adapter probe result for train mode.
-        # fact_text is required on every success result post-3b (bullet loop
-        # uses result["fact_text"]).
         adapter_probe_result = {
             "graph1": {
                 "question": "Where does Alex live?",
@@ -667,8 +605,8 @@ class TestSimulateInferenceEndToEnd:
 
         with (
             patch(
-                "paramem.training.indexed_memory.probe_keys_from_disk",
-            ) as mock_disk_read,
+                "paramem.training.indexed_memory.probe_keys_from_graph",
+            ) as mock_graph_read,
             patch(
                 "paramem.server.inference.generate_answer",
                 return_value="Alex lives somewhere nice.",
@@ -692,7 +630,7 @@ class TestSimulateInferenceEndToEnd:
                 speaker_id="spk-test",
             )
 
-        mock_disk_read.assert_not_called()
+        mock_graph_read.assert_not_called()
         mock_ga.assert_called_once()
         prompt_arg = str(mock_ga.call_args.args[2])
         assert "TRAIN-from-adapter" in prompt_arg, (
@@ -708,7 +646,7 @@ class TestSimulateInferenceEndToEnd:
     # ------------------------------------------------------------------
 
     def test_quad_simulate_store_fact_text_in_prompt(self, tmp_path):
-        """Quad keyed_pairs.json in simulate store → de-underscored bullet in prompt.
+        """Quad graph.json in simulate store → de-underscored bullet in prompt.
 
         This is the A2.1 win (the subject is no longer dropped): the fact
         ``Alex lives_in Heilbronn`` becomes the bullet
@@ -716,30 +654,20 @@ class TestSimulateInferenceEndToEnd:
         context assembled by ``_probe_and_reason``.
 
         Setup:
-        - ``paths.simulate/episodic/keyed_pairs.json`` written via
-          ``write_keyed_pairs_quad`` with one quad entry.
-        - ``adapter_formats={"episodic":"quad"}`` passed to ``handle_chat``.
-        - Config is simulate mode.
+        - ``paths.simulate/episodic/graph.json`` written via
+          ``_write_simulate_graph`` with one quad entry.
+        - Config is simulate mode + quad format.
 
         Assertions:
         - ``generate_answer`` called once.
         - Prompt contains ``"Alex lives in Heilbronn"`` (de-underscored triple).
-        - QA-style ``"Heilbronn."`` single token (without subject/predicate) must
-          NOT be the only content — the subject and predicate must be present.
         """
         config = _simulate_config(tmp_path)
 
-        quad_pair = {
-            "key": "graph1",
-            "subject": "Alex",
-            "predicate": "lives_in",
-            "object": "Heilbronn",
-            "speaker_id": "spk-test",
-            "first_seen_cycle": 1,
-        }
-        kp_path = config.simulate_dir / "episodic" / "keyed_pairs.json"
-        kp_path.parent.mkdir(parents=True, exist_ok=True)
-        write_keyed_pairs_quad(kp_path, [quad_pair])
+        _write_simulate_graph(
+            config.simulate_dir / "episodic" / "graph.json",
+            [_full_quad("graph1", "Alex", "lives_in", "Heilbronn")],
+        )
 
         router = _pa_router_stub("episodic", ["graph1"])
         model = _stub_model()
@@ -761,7 +689,6 @@ class TestSimulateInferenceEndToEnd:
                 sota_agent=None,
                 ha_client=None,
                 speaker_id="spk-test",
-                adapter_formats={"episodic": "quad"},
             )
 
         assert result.escalated is False

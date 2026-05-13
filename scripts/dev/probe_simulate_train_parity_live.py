@@ -2,7 +2,7 @@
 
 Proves that ``ConsolidationLoop.simulated_training`` is blackbox-equivalent to
 ``ConsolidationLoop.train_adapters`` for all in-memory state that drives
-inference (indexed_key_qa, episodic/semantic/procedural SimHash registries,
+inference (indexed_key_cache, episodic/semantic/procedural SimHash registries,
 KeyRegistry membership, procedural_sp_index, next-index counters) — the only
 intentional delta being that train writes adapter weights and simulate does not.
 
@@ -145,7 +145,7 @@ def _make_loop(model, tokenizer, output_dir: Path) -> ConsolidationLoop:
     )
 
 
-def _write_keyed_pairs(indexed_key_qa: dict, simhash_registry: dict, path: Path) -> None:
+def _write_keyed_pairs(indexed_key_cache: dict, simhash_registry: dict, path: Path) -> None:
     """Local copy of paramem.server.consolidation._write_keyed_pairs.
 
     Kept inline so the probe is self-contained and we verify the exact on-disk
@@ -153,8 +153,8 @@ def _write_keyed_pairs(indexed_key_qa: dict, simhash_registry: dict, path: Path)
     """
     pairs = []
     for key in simhash_registry:
-        if key in indexed_key_qa:
-            qa = indexed_key_qa[key]
+        if key in indexed_key_cache:
+            qa = indexed_key_cache[key]
             entry = {
                 "key": key,
                 "question": qa["question"],
@@ -172,17 +172,17 @@ def _save_disk_artifacts(loop: ConsolidationLoop, root: Path) -> dict[str, Path]
     """Emit per-adapter keyed_pairs.json and return path map."""
     paths: dict[str, Path] = {}
     ep_path = root / "keyed_pairs.json"
-    _write_keyed_pairs(loop.indexed_key_qa, loop.episodic_simhash, ep_path)
+    _write_keyed_pairs(loop.indexed_key_cache, loop.episodic_simhash, ep_path)
     paths["episodic"] = ep_path
 
     if loop.semantic_simhash:
         sem_path = root / "semantic" / "keyed_pairs.json"
-        _write_keyed_pairs(loop.indexed_key_qa, loop.semantic_simhash, sem_path)
+        _write_keyed_pairs(loop.indexed_key_cache, loop.semantic_simhash, sem_path)
         paths["semantic"] = sem_path
 
     if loop.procedural_simhash:
         proc_path = root / "procedural" / "keyed_pairs.json"
-        _write_keyed_pairs(loop.indexed_key_qa, loop.procedural_simhash, proc_path)
+        _write_keyed_pairs(loop.indexed_key_cache, loop.procedural_simhash, proc_path)
         paths["procedural"] = proc_path
 
     return paths
@@ -196,7 +196,7 @@ def _snapshot_state(loop: ConsolidationLoop) -> dict:
     with a delimiter for JSON compatibility.
     """
     return {
-        "indexed_key_qa": loop.indexed_key_qa,
+        "indexed_key_cache": loop.indexed_key_cache,
         "episodic_simhash": dict(loop.episodic_simhash),
         "semantic_simhash": dict(loop.semantic_simhash),
         "procedural_simhash": dict(loop.procedural_simhash),
@@ -212,7 +212,7 @@ def _diff_state(sim: dict, train: dict) -> dict:
     """Compute field-level parity verdicts.
 
     For SimHash registries, parity is exact equality of the {key: fp64} map.
-    For indexed_key_qa, we compare only (question, answer, source_subject,
+    For indexed_key_cache, we compare only (question, answer, source_subject,
     source_object, source_predicate) — speaker_id is pass-through metadata
     that both paths populate identically.
     """
@@ -249,7 +249,7 @@ def _diff_state(sim: dict, train: dict) -> dict:
             "train": train[field],
         }
 
-    # indexed_key_qa content comparison — subject/predicate/object facts only.
+    # indexed_key_cache content comparison — subject/predicate/object facts only.
     CONTENT_FIELDS = (
         "question",
         "answer",
@@ -257,8 +257,8 @@ def _diff_state(sim: dict, train: dict) -> dict:
         "source_object",
         "source_predicate",
     )
-    qa_sim = sim["indexed_key_qa"]
-    qa_train = train["indexed_key_qa"]
+    qa_sim = sim["indexed_key_cache"]
+    qa_train = train["indexed_key_cache"]
     all_keys = set(qa_sim) | set(qa_train)
     qa_mismatches = []
     for k in sorted(all_keys):
@@ -275,7 +275,7 @@ def _diff_state(sim: dict, train: dict) -> dict:
                         "train": qa_train[k].get(f, ""),
                     }
                 )
-    diffs["indexed_key_qa"] = {
+    diffs["indexed_key_cache"] = {
         "equal": not qa_mismatches,
         "mismatches": qa_mismatches[:20],
         "sim_size": len(qa_sim),
@@ -299,7 +299,7 @@ def _diff_state(sim: dict, train: dict) -> dict:
             "registry_active",
             "indexed_next_index",
             "procedural_next_index",
-            "indexed_key_qa",
+            "indexed_key_cache",
             "procedural_sp_index",
         )
     )
@@ -470,7 +470,7 @@ def main() -> int:
         "semantic_simhash",
         "procedural_simhash",
         "registry_active",
-        "indexed_key_qa",
+        "indexed_key_cache",
         "procedural_sp_index",
         "indexed_next_index",
         "procedural_next_index",

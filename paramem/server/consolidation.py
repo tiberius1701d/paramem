@@ -139,94 +139,119 @@ def create_consolidation_loop(
         if metadata:
             loop.seed_key_metadata(metadata)
 
-        # Seed indexed_key_qa from disk-persisted keyed_pairs.json files.  This
-        # populates the loop's in-memory QA store across restarts so
+        # Seed indexed_key_cache from disk-persisted state so
         # consolidate_interim_adapters has the question/answer text it needs to
         # re-derive each active key's tier from the cumulative graph.  Without
         # the seed, a full cycle that runs before any in-process training has
-        # populated indexed_key_qa would log "no QA metadata for key X" for
+        # populated indexed_key_cache would log "no QA metadata for key X" for
         # every active key and skip every per-tier rebuild — observably the
         # gate fires forever because the rebuild never advances main slots'
         # window_stamp.  Transparently decrypts age-wrapped content when the
         # daily identity is loaded.
         #
-        # Seed reads from the canonical store for the active mode (locked
-        # decision #2). Train mode reads from paths.adapters (where _save_adapters
-        # wrote canonical bytes); simulate mode reads from paths.simulate (where
-        # _save_keyed_pairs_for_router writes canonical bytes).
+        # Simulate mode reads graph.json from paths.simulate (written by
+        # _save_simulate_store_graph).  Train mode reads keyed_pairs.json from
+        # paths.adapters (written by ConsolidationLoop._save_adapters).
         store_dir = (
             config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
         )
 
-        # In quad mode use read_keyed_pairs_quad (has legacy-QA→quad back-compat
-        # projection built in).  In QA mode use the standard read_keyed_pairs.
-        if config.consolidation.indexed_format == "quad":
-            from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _read_kp
+        if config.consolidation.mode == "simulate":
+            from paramem.server import simulate_store
+
+            for tier in ("episodic", "semantic", "procedural"):
+                gpath = store_dir / tier / "graph.json"
+                if not gpath.exists():
+                    continue
+                try:
+                    graph = simulate_store.load_simulate_graph(gpath)
+                    pairs = list(simulate_store.iter_quads(graph))
+                    seed_method = getattr(loop, f"seed_{tier}_cache")
+                    seed_method(pairs)
+                except Exception:
+                    logger.exception(
+                        "Failed to seed indexed_key_cache from simulate graph %s — skipping",
+                        gpath,
+                    )
         else:
-            from paramem.training.keyed_pairs_io import read_keyed_pairs as _read_kp
+            # Train mode — read keyed_pairs.json via read_keyed_pairs[_quad].
+            # This path is removed in the train-mode kp sunset (next task).
+            if config.consolidation.indexed_format == "quad":
+                from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _read_kp
+            else:
+                from paramem.training.keyed_pairs_io import read_keyed_pairs as _read_kp
 
-        ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
-        if ep_kp_path.exists():
-            try:
-                loop.seed_episodic_qa(_read_kp(ep_kp_path))
-            except Exception:
-                logger.exception(
-                    "Failed to seed indexed_key_qa from episodic store %s — skipping",
-                    ep_kp_path,
-                )
+            ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
+            if ep_kp_path.exists():
+                try:
+                    loop.seed_episodic_cache(_read_kp(ep_kp_path))
+                except Exception:
+                    logger.exception(
+                        "Failed to seed indexed_key_cache from episodic store %s — skipping",
+                        ep_kp_path,
+                    )
 
-        sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
-        if sem_kp_path.exists():
-            try:
-                loop.seed_semantic_qa(_read_kp(sem_kp_path))
-            except Exception:
-                logger.exception(
-                    "Failed to seed indexed_key_qa from semantic store %s — skipping",
-                    sem_kp_path,
-                )
+            sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
+            if sem_kp_path.exists():
+                try:
+                    loop.seed_semantic_cache(_read_kp(sem_kp_path))
+                except Exception:
+                    logger.exception(
+                        "Failed to seed indexed_key_cache from semantic store %s — skipping",
+                        sem_kp_path,
+                    )
 
-        proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
-        if proc_kp_path.exists():
-            try:
-                loop.seed_procedural_qa(_read_kp(proc_kp_path))
-            except Exception:
-                logger.exception(
-                    "Failed to seed indexed_key_qa from procedural store %s — skipping",
-                    proc_kp_path,
-                )
+            proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
+            if proc_kp_path.exists():
+                try:
+                    loop.seed_procedural_cache(_read_kp(proc_kp_path))
+                except Exception:
+                    logger.exception(
+                        "Failed to seed indexed_key_cache from procedural store %s — skipping",
+                        proc_kp_path,
+                    )
 
-        # Interim slots are training-only (locked decision #3) — always under
-        # paths.adapters regardless of mode. The simulate store has no interim
-        # concept by design.
-        for interim_dir in sorted(config.adapter_dir.glob("episodic_interim_*")):
-            if not interim_dir.is_dir():
-                continue
-            kp = interim_dir / "keyed_pairs.json"
-            if not kp.exists():
-                continue
-            try:
-                loop.seed_episodic_qa(_read_kp(kp))
-            except Exception:
-                logger.exception(
-                    "Failed to seed indexed_key_qa from interim slot %s — skipping",
-                    interim_dir.name,
-                )
+            # Interim slots are training-only (locked decision #3) — always under
+            # paths.adapters regardless of mode. The simulate store has no interim
+            # concept by design.
+            for interim_dir in sorted(config.adapter_dir.glob("episodic_interim_*")):
+                if not interim_dir.is_dir():
+                    continue
+                kp = interim_dir / "keyed_pairs.json"
+                if not kp.exists():
+                    continue
+                try:
+                    loop.seed_episodic_cache(_read_kp(kp))
+                except Exception:
+                    logger.exception(
+                        "Failed to seed indexed_key_cache from interim slot %s — skipping",
+                        interim_dir.name,
+                    )
 
-    # One-time startup WARN when the non-active store has stale keyed_pairs
+    # One-time startup WARN when the non-active store has stale artifacts
     # from a previous mode. The startup path runs once per process so this
     # does not spam logs. Runs unconditionally — operator telemetry for
     # detecting mode-switch drift, not a seeding side-effect.
-    inactive_dir = (
-        config.adapter_dir if config.consolidation.mode == "simulate" else config.simulate_dir
-    )
+    #
+    # Simulate mode is active → scan the inactive train store for stale
+    # keyed_pairs.json (the train-mode artifact).
+    # Train mode is active → scan the inactive simulate store for stale
+    # graph.json (the simulate-mode artifact, post-chunk-2).
+    if config.consolidation.mode == "simulate":
+        inactive_dir = config.adapter_dir
+        stale_glob = "keyed_pairs.json"
+    else:
+        inactive_dir = config.simulate_dir
+        stale_glob = "graph.json"
     if inactive_dir.exists():
-        stale = list(inactive_dir.rglob("keyed_pairs.json"))
+        stale = list(inactive_dir.rglob(stale_glob))
         if stale:
             logger.warning(
-                "Found %d stale keyed_pairs.json under %s (active mode is %r). "
+                "Found %d stale %s under %s (active mode is %r). "
                 "Inference reads only the active store; remove the inactive "
                 "store or re-run consolidation in the matching mode to clear.",
                 len(stale),
+                stale_glob,
                 inactive_dir,
                 config.consolidation.mode,
             )
@@ -294,7 +319,7 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
         return
 
     # Increment session count for keys referencing these entities
-    for key, qa in loop.indexed_key_qa.items():
+    for key, qa in loop.indexed_key_cache.items():
         if key in loop.promoted_keys:
             continue
         subject = qa.get("source_subject", "").lower()
@@ -434,19 +459,19 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
 def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) -> None:
     """Save keyed_pairs.json per adapter for router entity indexing.
 
-    Mode-aware: in simulate mode the canonical store is ``paths.simulate``;
-    in train mode the canonical store is ``paths.adapters``. Layout is
-    identical in both stores: ``<store_dir>/<tier>/keyed_pairs.json`` for
-    all three tiers.
+    DEPRECATED — UNREACHABLE FROM PRODUCTION CODE POST-D1-CHUNK-2.
+    Simulate-mode persistence flipped to :func:`_save_simulate_store_graph`
+    (per-tier ``graph.json``).  Train-mode persistence runs through
+    :func:`ConsolidationLoop._save_adapters`
+    (``paramem/training/consolidation.py:2154-2158``), which writes the kp
+    bytes directly during the I5 reorder.  This helper is retained only so
+    legacy tests (``tests/test_server_consolidation_seed_quad.py``,
+    ``tests/test_promote_then_save_adapters_keyed_pairs_hash_matches.py``)
+    and dev probes (``scripts/dev/probe_simulate_train_parity_live.py``,
+    ``scripts/dev/verify_pr1_extraction.py``) keep working.
 
-    Note: in train mode this helper is no longer the primary writer —
-    ``ConsolidationLoop._save_adapters`` writes canonical keyed_pairs
-    bytes-identically as part of the I5 reorder before the manifest is
-    built (paramem/training/consolidation.py:2154-2158). This helper
-    runs only on the simulate path today (see run_consolidation L386-393).
-    Post-canonicalization: this is the **only** simulate-mode persistence —
-    the cycle_<N>/ snapshot writer (``_save_simulate_store``) is retired
-    because it produced no load-bearing artifacts.
+    TODO(task-#4): remove this helper and its train-mode tests when the
+    train-mode ``keyed_pairs.json`` sidecar is retired.
     """
     store_dir = (
         config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
@@ -460,7 +485,7 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
         ep_dir = store_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
         _write_keyed_pairs(
-            loop.indexed_key_qa,
+            loop.indexed_key_cache,
             loop.episodic_simhash,
             ep_dir / "keyed_pairs.json",
             indexed_format=_fmt,
@@ -470,7 +495,7 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
         sem_dir = store_dir / "semantic"
         sem_dir.mkdir(parents=True, exist_ok=True)
         _write_keyed_pairs(
-            loop.indexed_key_qa,
+            loop.indexed_key_cache,
             loop.semantic_simhash,
             sem_dir / "keyed_pairs.json",
             indexed_format=_fmt,
@@ -480,15 +505,53 @@ def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) 
         proc_dir = store_dir / "procedural"
         proc_dir.mkdir(parents=True, exist_ok=True)
         _write_keyed_pairs(
-            loop.indexed_key_qa,
+            loop.indexed_key_cache,
             loop.procedural_simhash,
             proc_dir / "keyed_pairs.json",
             indexed_format=_fmt,
         )
 
 
+def _save_simulate_store_graph(loop: ConsolidationLoop, config: ServerConfig) -> None:
+    """Save per-tier graph.json for the simulate-mode store.
+
+    Mode-aware: only runs when ``config.consolidation.mode == "simulate"``.
+    Train mode is a no-op here — train-mode kp is still written by
+    ``ConsolidationLoop._save_adapters`` (paramem/training/consolidation.py:2154-2158)
+    and gets removed in the train-mode kp sunset (next task).
+
+    For each tier whose ``loop.<tier>_simhash`` is non-empty, projects
+    ``loop.indexed_key_cache`` ∩ ``<tier>_simhash`` into an ``nx.MultiDiGraph``
+    via :func:`paramem.server.simulate_store.build_tier_graph_from_loop` and
+    persists it under ``config.simulate_dir/<tier>/graph.json``.  Same per-tier
+    layout the kp writer used; only the bytes change.
+
+    Parameters
+    ----------
+    loop:
+        Active ``ConsolidationLoop`` (provides simhash registries and
+        ``indexed_key_cache``).
+    config:
+        Server configuration (provides ``consolidation.mode`` and
+        ``simulate_dir``).
+    """
+    if config.consolidation.mode != "simulate":
+        return
+
+    from paramem.server import simulate_store
+
+    for tier in ("episodic", "semantic", "procedural"):
+        simhash_registry = getattr(loop, f"{tier}_simhash")
+        if not bool(simhash_registry):
+            continue
+        tier_graph = simulate_store.build_tier_graph_from_loop(loop, tier)
+        tier_dir = config.simulate_dir / tier
+        tier_dir.mkdir(parents=True, exist_ok=True)
+        simulate_store.save_simulate_graph(tier_graph, tier_dir / "graph.json")
+
+
 def _write_keyed_pairs(
-    indexed_key_qa: dict,
+    indexed_key_cache: dict,
     simhash_registry: dict,
     path: Path,
     *,
@@ -499,7 +562,7 @@ def _write_keyed_pairs(
     Delegates to :func:`paramem.training.keyed_pairs_io.write_keyed_pairs`
     (QA mode) or :func:`paramem.training.keyed_pairs_io.write_keyed_pairs_quad`
     (quad mode) so the canonical schema is enforced by construction.  Every
-    entry in *indexed_key_qa* must carry the fields expected by the chosen
+    entry in *indexed_key_cache* must carry the fields expected by the chosen
     writer before this function is called — a missing field raises
     ``KeyError`` at write time.
 
@@ -514,5 +577,5 @@ def _write_keyed_pairs(
     else:
         from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
 
-    pairs = [indexed_key_qa[k] for k in simhash_registry if k in indexed_key_qa]
+    pairs = [indexed_key_cache[k] for k in simhash_registry if k in indexed_key_cache]
     _wkp(path, pairs)

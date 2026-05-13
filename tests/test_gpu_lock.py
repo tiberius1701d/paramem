@@ -138,7 +138,7 @@ class TestDevicePlacement:
         # Should not raise
         _verify_device_placement(model, config)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+    @pytest.mark.gpu
     def test_all_gpu_params_pass(self):
         from paramem.models.loader import _verify_device_placement
 

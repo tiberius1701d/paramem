@@ -674,7 +674,7 @@ def _probe_and_reason(
 
     from paramem.models.loader import switch_adapter
     from paramem.training.indexed_memory import (
-        probe_keys_from_disk,
+        probe_keys_from_graph,
         probe_keys_grouped_by_adapter,
     )
 
@@ -706,10 +706,12 @@ def _probe_and_reason(
     # whole pending window. Falls through to the yaml mode otherwise.
     _active_mode = effective_mode if effective_mode else config.consolidation.mode
     if _active_mode == "simulate":
-        probe_results = probe_keys_from_disk(
+        # Simulate mode reads from per-tier graph.json instead of keyed_pairs.json.
+        # probe_keys_from_graph is quad-only by design — simulate mode requires
+        # indexed_format='quad' (enforced by the ConsolidationScheduleConfig validator).
+        probe_results = probe_keys_from_graph(
             config.simulate_dir,
             keys_by_adapter,
-            formats_by_adapter=adapter_formats,
         )
     else:
         # One switch_adapter call per adapter group.

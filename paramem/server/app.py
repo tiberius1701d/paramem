@@ -1097,20 +1097,6 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         except (_MNF, _MSE):
             adapter_formats[_interim_name] = "qa"
 
-    # ---- Simulate-mode keyed-pair stores ----
-    # Simulate-mode per-tier ``keyed_pairs.json`` files carry no per-adapter
-    # manifest, so the loops above don't record their format.  The simulate
-    # store is always written in the server's configured
-    # ``consolidation.indexed_format``; record it for each tier that has a
-    # store so the inference path's ``probe_keys_from_disk`` picks the matching
-    # reader / recall template / parser (without this, a quad simulate store is
-    # read with the strict QA reader, every key fails to parse, and every
-    # personal query silently abstains).  ``setdefault`` so a real mounted
-    # adapter's manifest-derived format (train mode) is never clobbered.
-    for _tier in ("episodic", "semantic", "procedural"):
-        if (config.simulate_dir / _tier / "keyed_pairs.json").exists():
-            adapter_formats.setdefault(_tier, config.consolidation.indexed_format)
-
     # ---- I5 — Registry consistency check ----
     # Drop orphan registry entries whose adapter slot is missing.
     if _registry_path.exists():
@@ -1734,11 +1720,10 @@ async def lifespan(app: FastAPI):
 
     _state["ha_graph"] = ha_graph
     _state["router"] = QueryRouter(
-        adapter_dir=(
-            config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
-        ),
+        adapter_dir=config.adapter_dir,
         ha_graph=ha_graph,
         intent_config=config.intent,
+        simulate_dir=config.simulate_dir,
     )
 
     # Residual intent classifier — load the sentence-encoder once so the
@@ -3215,13 +3200,10 @@ async def refresh_ha():
         # Rebuild router with new graph
         config = _state["config"]
         _state["router"] = QueryRouter(
-            adapter_dir=(
-                config.simulate_dir
-                if config.consolidation.mode == "simulate"
-                else config.adapter_dir
-            ),
+            adapter_dir=config.adapter_dir,
             ha_graph=ha_graph,
             intent_config=config.intent,
+            simulate_dir=config.simulate_dir,
         )
 
     return {
@@ -6532,7 +6514,7 @@ def _run_extraction_phase(
         _promote_mature_keys,
         _save_debug_artifacts,
         _save_key_metadata,
-        _save_keyed_pairs_for_router,
+        _save_simulate_store_graph,
     )
 
     config = _state["config"]
@@ -6663,7 +6645,7 @@ def _run_extraction_phase(
                 all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker_sim
             )
             newly_promoted = _promote_mature_keys(loop, config)
-            _save_keyed_pairs_for_router(loop, config)
+            _save_simulate_store_graph(loop, config)
             _save_key_metadata(loop, config)
         except Exception:
             logger.exception(
@@ -6793,7 +6775,7 @@ def _extract_and_start_training():
         _promote_mature_keys,
         _save_debug_artifacts,
         _save_key_metadata,
-        _save_keyed_pairs_for_router,
+        _save_simulate_store_graph,
         create_consolidation_loop,
     )
 
@@ -7006,7 +6988,7 @@ def _extract_and_start_training():
                 all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker_sim
             )
             newly_promoted = _promote_mature_keys(loop, config)
-            _save_keyed_pairs_for_router(loop, config)
+            _save_simulate_store_graph(loop, config)
             # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
             # the combined SimHash registry at config.registry_path was not
             # maintained by interim or full-cycle production paths post-Phase-3+5,
@@ -7017,7 +6999,7 @@ def _extract_and_start_training():
             # them at read time.
             _save_key_metadata(loop, config)
             # _save_simulate_store retired with the canonicalization — the per-tier
-            # keyed_pairs.json written by _save_keyed_pairs_for_router is the
+            # graph.json written by _save_simulate_store_graph is the
             # only simulate-mode persistence (cycle_<N>/ snapshots dropped).
 
         # Simulate is peer storage — retire successfully-extracted sessions
@@ -7036,22 +7018,6 @@ def _extract_and_start_training():
         def _finalize_simulate() -> None:
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
-            # Refresh adapter_formats for simulate-mode tiers that now have a
-            # keyed_pairs.json written by _save_keyed_pairs_for_router.  Without
-            # this, a boot→/consolidate(simulate)→/debug/probe sequence leaves
-            # adapter_formats empty (the files are created *after* boot, so
-            # _mount_adapters_from_slots never saw them) and probe_keys_from_disk
-            # defaults to the QA reader — which raises ValueError on 6-field quad
-            # files and causes silent abstention on every personal query.
-            # Mirrors _mount_adapters_from_slots's simulate-tier block
-            # (app.py:1110-1112) and the _finalize_full adapter_formats refresh
-            # (app.py:7362-7369).  setdefault preserves a real train-mode
-            # manifest-derived format if one is already present.
-            _sim_fmt = getattr(config.consolidation, "indexed_format", "qa")
-            _adapter_formats = _state.setdefault("adapter_formats", {})
-            for _tier in ("episodic", "semantic", "procedural"):
-                if (config.simulate_dir / _tier / "keyed_pairs.json").exists():
-                    _adapter_formats.setdefault(_tier, _sim_fmt)
             _state["last_consolidation_result"] = {
                 "status": "simulated",
                 "sessions": len(session_ids),

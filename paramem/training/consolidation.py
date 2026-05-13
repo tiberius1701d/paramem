@@ -293,8 +293,10 @@ class ConsolidationLoop:
 
         # Indexed key replay (F4.9c validated)
         self.indexed_key_registry: Optional[KeyRegistry] = None
-        # key -> {"key": str, "question": str, "answer": str, "source_subject": str}
-        self.indexed_key_qa: dict[str, dict] = {}
+        # key -> uniform cache entry (quad-shape: key, subject, predicate, object,
+        # source_*, speaker_id, first_seen_cycle; question/answer only in QA mode).
+        # Built via self._cache_entry.
+        self.indexed_key_cache: dict[str, dict] = {}
         # Per-adapter SimHash registries: key -> 64-bit fingerprint
         self.episodic_simhash: dict[str, int] = {}
         self.semantic_simhash: dict[str, int] = {}
@@ -394,10 +396,10 @@ class ConsolidationLoop:
             len(self.key_sessions),
         )
 
-    def seed_procedural_qa(self, keyed_pairs: list[dict]) -> None:
+    def seed_procedural_cache(self, keyed_pairs: list[dict]) -> None:
         """Rebuild the contradiction index from persisted procedural keyed_pairs.
 
-        Called at startup. Pairs go into indexed_key_qa (shared store) via
+        Called at startup. Pairs go into indexed_key_cache (shared store) via
         ``_cache_entry`` so the uniform shape invariant holds after seeding.
         The sp_index is rebuilt for contradiction detection.
 
@@ -410,7 +412,7 @@ class ConsolidationLoop:
             kp_subject = kp.get("subject") or kp.get("source_subject") or ""
             kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
             kp_object = kp.get("object") or kp.get("source_object") or ""
-            self.indexed_key_qa[key] = self._cache_entry(
+            self.indexed_key_cache[key] = self._cache_entry(
                 key=key,
                 subject=kp_subject,
                 predicate=kp_predicate,
@@ -436,12 +438,12 @@ class ConsolidationLoop:
             len(keyed_pairs),
         )
 
-    def seed_episodic_qa(self, keyed_pairs: list[dict]) -> None:
-        """Rebuild indexed_key_qa from persisted episodic keyed_pairs.
+    def seed_episodic_cache(self, keyed_pairs: list[dict]) -> None:
+        """Rebuild indexed_key_cache from persisted episodic keyed_pairs.
 
         Called at startup. Normalizes each entry through ``_cache_entry`` so
         the uniform shape invariant holds after seeding.  Mirrors
-        ``seed_procedural_qa`` but skips the sp_index (episodic keys have no
+        ``seed_procedural_cache`` but skips the sp_index (episodic keys have no
         speaker/subject/predicate contradiction scope).  Required by simulate
         mode so a cold-start run does not clobber keyed_pairs.json with a
         subset containing only new-cycle keys.
@@ -454,7 +456,7 @@ class ConsolidationLoop:
             kp_subject = kp.get("subject") or kp.get("source_subject") or ""
             kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
             kp_object = kp.get("object") or kp.get("source_object") or ""
-            self.indexed_key_qa[key] = self._cache_entry(
+            self.indexed_key_cache[key] = self._cache_entry(
                 key=key,
                 subject=kp_subject,
                 predicate=kp_predicate,
@@ -469,10 +471,10 @@ class ConsolidationLoop:
                 and key not in self.indexed_key_registry.list_active()
             ):
                 self.indexed_key_registry.add(key)
-        logger.info("Seeded episodic indexed_key_qa: %d keys", len(keyed_pairs))
+        logger.info("Seeded episodic indexed_key_cache: %d keys", len(keyed_pairs))
 
-    def seed_semantic_qa(self, keyed_pairs: list[dict]) -> None:
-        """Rebuild indexed_key_qa from persisted semantic keyed_pairs.
+    def seed_semantic_cache(self, keyed_pairs: list[dict]) -> None:
+        """Rebuild indexed_key_cache from persisted semantic keyed_pairs.
 
         Normalizes each entry through ``_cache_entry`` so the uniform shape
         invariant holds after seeding.  Handles both QA-format and quad-format
@@ -483,7 +485,7 @@ class ConsolidationLoop:
             kp_subject = kp.get("subject") or kp.get("source_subject") or ""
             kp_predicate = kp.get("predicate") or kp.get("source_predicate") or ""
             kp_object = kp.get("object") or kp.get("source_object") or ""
-            self.indexed_key_qa[key] = self._cache_entry(
+            self.indexed_key_cache[key] = self._cache_entry(
                 key=key,
                 subject=kp_subject,
                 predicate=kp_predicate,
@@ -498,7 +500,7 @@ class ConsolidationLoop:
                 and key not in self.indexed_key_registry.list_active()
             ):
                 self.indexed_key_registry.add(key)
-        logger.info("Seeded semantic indexed_key_qa: %d keys", len(keyed_pairs))
+        logger.info("Seeded semantic indexed_key_cache: %d keys", len(keyed_pairs))
 
     @staticmethod
     def dedup_episodic(qa_list: list[dict]) -> list[dict]:
@@ -555,7 +557,7 @@ class ConsolidationLoop:
         question: Optional[str] = None,
         answer: Optional[str] = None,
     ) -> dict:
-        """Build a uniform ``indexed_key_qa`` cache entry.
+        """Build a uniform ``indexed_key_cache`` cache entry.
 
         Always carries ``subject``/``predicate``/``object`` AND the
         ``source_*`` aliases (same values — Option-B uniform shape).  In QA
@@ -950,7 +952,7 @@ class ConsolidationLoop:
         Simulate is a blackbox-equivalent of train: same extraction pipeline,
         key assignment, contradiction handling, and SimHash construction from
         ground-truth QA. The delta is that existing-key admission comes from
-        disk-seeded indexed_key_qa instead of probing adapter weights — under
+        disk-seeded indexed_key_cache instead of probing adapter weights — under
         perfect recall, probe_key would return identical content.
 
         Caller is responsible for the persistence venue (encrypted JSON store
@@ -978,7 +980,7 @@ class ConsolidationLoop:
         """Simulate counterpart of _run_indexed_key_episodic.
 
         Assigns keys to new session QA/relation dicts, admits existing keys
-        from seeded indexed_key_qa, rebuilds episodic_simhash from ground-truth
+        from seeded indexed_key_cache, rebuilds episodic_simhash from ground-truth
         data.  Skips probe reconstruction and the train call.
 
         In quad mode ``session_qa`` contains relation dicts (``subject``,
@@ -995,7 +997,7 @@ class ConsolidationLoop:
             for i, kp in enumerate(new_keyed):
                 rel = session_qa[i] if i < len(session_qa) else {}
                 self.indexed_key_registry.add(kp["key"])
-                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                self.indexed_key_cache[kp["key"]] = self._cache_entry(
                     key=kp["key"],
                     subject=kp["subject"],
                     predicate=kp["predicate"],
@@ -1007,7 +1009,7 @@ class ConsolidationLoop:
             new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
             for kp in new_keyed:
                 self.indexed_key_registry.add(kp["key"])
-                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                self.indexed_key_cache[kp["key"]] = self._cache_entry(
                     key=kp["key"],
                     subject=kp.get("source_subject", ""),
                     predicate=kp.get("source_predicate", ""),
@@ -1029,8 +1031,8 @@ class ConsolidationLoop:
 
         episodic_keyed: list[dict] = []
         for key in existing_keys:
-            if key in self.indexed_key_qa:
-                qa = self.indexed_key_qa[key]
+            if key in self.indexed_key_cache:
+                qa = self.indexed_key_cache[key]
                 if self._is_quad:
                     episodic_keyed.append(
                         {
@@ -1142,12 +1144,12 @@ class ConsolidationLoop:
             if old_key and old_key in self.procedural_simhash:
                 logger.info("Simulated procedural contradiction: retiring %s", old_key)
                 self.procedural_simhash.pop(old_key, None)
-                self.indexed_key_qa.pop(old_key, None)
+                self.indexed_key_cache.pop(old_key, None)
                 if self.indexed_key_registry is not None:
                     self.indexed_key_registry.remove(old_key)
 
         for kp in new_keyed:
-            self.indexed_key_qa[kp["key"]] = kp
+            self.indexed_key_cache[kp["key"]] = kp
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.add(kp["key"])
             if self._is_quad:
@@ -1192,7 +1194,7 @@ class ConsolidationLoop:
             "cycle_count": self.cycle_count,
             "indexed_next_index": self._indexed_next_index,
             "procedural_next_index": self._procedural_next_index,
-            "indexed_key_qa": copy.deepcopy(self.indexed_key_qa),
+            "indexed_key_cache": copy.deepcopy(self.indexed_key_cache),
             "procedural_sp_index": dict(self.procedural_sp_index),
             "episodic_simhash": dict(self.episodic_simhash),
             "semantic_simhash": dict(self.semantic_simhash),
@@ -1239,7 +1241,7 @@ class ConsolidationLoop:
         self.cycle_count = snap["cycle_count"]
         self._indexed_next_index = snap["indexed_next_index"]
         self._procedural_next_index = snap["procedural_next_index"]
-        self.indexed_key_qa = snap["indexed_key_qa"]
+        self.indexed_key_cache = snap["indexed_key_cache"]
         self.procedural_sp_index = snap["procedural_sp_index"]
         self.episodic_simhash = snap["episodic_simhash"]
         self.semantic_simhash = snap["semantic_simhash"]
@@ -1271,7 +1273,7 @@ class ConsolidationLoop:
             for i, kp in enumerate(new_keyed):
                 rel = session_qa[i] if i < len(session_qa) else {}
                 self.indexed_key_registry.add(kp["key"])
-                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                self.indexed_key_cache[kp["key"]] = self._cache_entry(
                     key=kp["key"],
                     subject=kp["subject"],
                     predicate=kp["predicate"],
@@ -1283,7 +1285,7 @@ class ConsolidationLoop:
             new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
             for kp in new_keyed:
                 self.indexed_key_registry.add(kp["key"])
-                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                self.indexed_key_cache[kp["key"]] = self._cache_entry(
                     key=kp["key"],
                     subject=kp.get("source_subject", ""),
                     predicate=kp.get("source_predicate", ""),
@@ -1343,8 +1345,8 @@ class ConsolidationLoop:
         for key in existing_keys:
             if key in reconstructed:
                 episodic_keyed.append(reconstructed[key])
-            elif key in self.indexed_key_qa:
-                qa = self.indexed_key_qa[key]
+            elif key in self.indexed_key_cache:
+                qa = self.indexed_key_cache[key]
                 if self._is_quad:
                     episodic_keyed.append(
                         {
@@ -1374,8 +1376,8 @@ class ConsolidationLoop:
 
         semantic_keyed = []
         for key in self.semantic_simhash:
-            if key in self.indexed_key_qa:
-                qa = self.indexed_key_qa[key]
+            if key in self.indexed_key_cache:
+                qa = self.indexed_key_cache[key]
                 if self._is_quad:
                     semantic_keyed.append(
                         {
@@ -1472,13 +1474,13 @@ class ConsolidationLoop:
             if old_key and old_key in self.procedural_simhash:
                 logger.info("Procedural contradiction: retiring %s", old_key)
                 self.procedural_simhash.pop(old_key, None)
-                self.indexed_key_qa.pop(old_key, None)
+                self.indexed_key_cache.pop(old_key, None)
                 if self.indexed_key_registry is not None:
                     self.indexed_key_registry.remove(old_key)
 
         # Store new keys — sp_key reads uniform-shape names.
         for kp in new_keyed:
-            self.indexed_key_qa[kp["key"]] = kp
+            self.indexed_key_cache[kp["key"]] = kp
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.add(kp["key"])
             sp_key = (
@@ -1537,8 +1539,8 @@ class ConsolidationLoop:
         for key in existing_keys:
             if key in reconstructed:
                 all_procedural.append(reconstructed[key])
-            elif key in self.indexed_key_qa:
-                qa = self.indexed_key_qa[key]
+            elif key in self.indexed_key_cache:
+                qa = self.indexed_key_cache[key]
                 if self._is_quad:
                     all_procedural.append(
                         {
@@ -1829,7 +1831,7 @@ class ConsolidationLoop:
             for i, kp in enumerate(new_keyed):
                 rel = session_qa[i] if i < len(session_qa) else {}
                 self.indexed_key_registry.add(kp["key"])
-                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                self.indexed_key_cache[kp["key"]] = self._cache_entry(
                     key=kp["key"],
                     subject=kp["subject"],
                     predicate=kp["predicate"],
@@ -1841,7 +1843,7 @@ class ConsolidationLoop:
             new_keyed = assign_keys(session_qa, start_index=self._indexed_next_index)
             for kp in new_keyed:
                 self.indexed_key_registry.add(kp["key"])
-                self.indexed_key_qa[kp["key"]] = self._cache_entry(
+                self.indexed_key_cache[kp["key"]] = self._cache_entry(
                     key=kp["key"],
                     subject=kp.get("source_subject", ""),
                     predicate=kp.get("source_predicate", ""),
@@ -1860,7 +1862,7 @@ class ConsolidationLoop:
         promoted_keys = []
         if new_promotions:
             promoted_set = {n.lower() for n in new_promotions}
-            for key, qa_info in list(self.indexed_key_qa.items()):
+            for key, qa_info in list(self.indexed_key_cache.items()):
                 if key.startswith("proc"):
                     continue  # Procedural keys never promote
                 subject = qa_info.get("source_subject", "").lower()
@@ -1927,9 +1929,9 @@ class ConsolidationLoop:
         for key in existing_keys:
             if key in reconstructed:
                 episodic_keyed.append(reconstructed[key])
-            elif key in self.indexed_key_qa:
+            elif key in self.indexed_key_cache:
                 # Fallback to stored data if reconstruction failed
-                qa = self.indexed_key_qa[key]
+                qa = self.indexed_key_cache[key]
                 if self._is_quad:
                     episodic_keyed.append(
                         {
@@ -2014,7 +2016,7 @@ class ConsolidationLoop:
         promoted_set = {n.lower() for n in new_promotions}
         semantic_keyed = []
         # Loop A — newly-promoted keys
-        for key, qa_info in self.indexed_key_qa.items():
+        for key, qa_info in self.indexed_key_cache.items():
             subject = qa_info.get("source_subject", "").lower()
             obj = qa_info.get("source_object", "").lower()
             mentions_promoted = (subject and subject in promoted_set) or (
@@ -2042,8 +2044,8 @@ class ConsolidationLoop:
         # Loop B — previously promoted keys still in semantic
         seen_semantic_keys = {kp["key"] for kp in semantic_keyed}
         for key in list(self.semantic_simhash.keys()):
-            if key not in seen_semantic_keys and key in self.indexed_key_qa:
-                qa = self.indexed_key_qa[key]
+            if key not in seen_semantic_keys and key in self.indexed_key_cache:
+                qa = self.indexed_key_cache[key]
                 if self._is_quad:
                     semantic_keyed.append(
                         {
@@ -2118,7 +2120,7 @@ class ConsolidationLoop:
         is retired and replaced.
 
         Registry/index invariant: all mutations to ``procedural_simhash``,
-        ``indexed_key_qa``, ``indexed_key_registry``, and
+        ``indexed_key_cache``, ``indexed_key_registry``, and
         ``procedural_sp_index`` are deferred until **after**
         ``train_adapter`` returns successfully.  If training raises, shared
         state is left unchanged so the caller can safely retry or skip.
@@ -2268,14 +2270,14 @@ class ConsolidationLoop:
         )
 
         # Build full procedural training set from reconstructed + fallback + new.
-        # Read existing data from self.indexed_key_qa — shared state is still
+        # Read existing data from self.indexed_key_cache — shared state is still
         # unmodified at this point.
         all_procedural = []
         for key in existing_keys:
             if key in reconstructed:
                 all_procedural.append(reconstructed[key])
-            elif key in self.indexed_key_qa:
-                qa = self.indexed_key_qa[key]
+            elif key in self.indexed_key_cache:
+                qa = self.indexed_key_cache[key]
                 if self._is_quad:
                     all_procedural.append(
                         {
@@ -2338,7 +2340,7 @@ class ConsolidationLoop:
         # 2. Retire contradicted keys from all indexes.
         for old_key in keys_to_retire:
             self.procedural_simhash.pop(old_key, None)
-            self.indexed_key_qa.pop(old_key, None)
+            self.indexed_key_cache.pop(old_key, None)
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.remove(old_key)
 
@@ -2347,7 +2349,7 @@ class ConsolidationLoop:
         #    symmetric — no full reconstruction needed, since existing-key hashes
         #    are unchanged (compute_simhash is deterministic).
         for kp in new_keyed:
-            self.indexed_key_qa[kp["key"]] = kp
+            self.indexed_key_cache[kp["key"]] = kp
             if self.indexed_key_registry is not None:
                 self.indexed_key_registry.add(kp["key"])
             if self._is_quad:
@@ -2621,9 +2623,9 @@ class ConsolidationLoop:
             if not simhash_registry:
                 return None
             pairs: list[dict] = [
-                self.indexed_key_qa[key]
+                self.indexed_key_cache[key]
                 for key in simhash_registry
-                if self.indexed_key_qa and key in self.indexed_key_qa
+                if self.indexed_key_cache and key in self.indexed_key_cache
             ]
             if not pairs:
                 return None
@@ -2667,7 +2669,7 @@ class ConsolidationLoop:
             """
             pairs: list[dict] = []
             for key in simhash_registry:
-                qa = self.indexed_key_qa.get(key) if self.indexed_key_qa else None
+                qa = self.indexed_key_cache.get(key) if self.indexed_key_cache else None
                 if qa is None:
                     continue
                 if self._is_quad:
@@ -3156,7 +3158,7 @@ class ConsolidationLoop:
         # first_seen_cycle) survive into the written keyed_pairs.json.
         existing_interim_keyed: list[dict] = []
         for k in self.indexed_key_registry.keys_for_adapter(adapter_name):
-            qa_info = self.indexed_key_qa.get(k)
+            qa_info = self.indexed_key_cache.get(k)
             if qa_info is not None:
                 existing_interim_keyed.append(qa_info)
 
@@ -3247,7 +3249,7 @@ class ConsolidationLoop:
             # _cache_entry fills source_* aliases and omits question/answer.
             # In QA mode kp has {key, question, answer, source_*}; _cache_entry
             # passes question/answer through.
-            self.indexed_key_qa[k] = self._cache_entry(
+            self.indexed_key_cache[k] = self._cache_entry(
                 key=k,
                 subject=kp.get("subject") or kp.get("source_subject", ""),
                 predicate=kp.get("predicate") or kp.get("source_predicate", ""),
@@ -3293,13 +3295,13 @@ class ConsolidationLoop:
         # preserved — using stripped dicts here was the bug that left the
         # router's entity and speaker indexes empty after post-session train.
         #
-        # Pull from indexed_key_qa rather than all_interim_keyed: assign_keys
+        # Pull from indexed_key_cache rather than all_interim_keyed: assign_keys
         # returns dicts without first_seen_cycle, so using new_keyed directly
-        # would fail facade validation.  indexed_key_qa was populated with all
+        # would fail facade validation.  indexed_key_cache was populated with all
         # 8 canonical fields in step 7 above.
         all_interim_keys = [kp["key"] for kp in all_interim_keyed]
         all_interim_keyed_full = [
-            self.indexed_key_qa[k] for k in all_interim_keys if k in self.indexed_key_qa
+            self.indexed_key_cache[k] for k in all_interim_keys if k in self.indexed_key_cache
         ]
         interim_dir = self.output_dir / adapter_name
         kp_path = interim_dir / "keyed_pairs.json"
@@ -3340,9 +3342,9 @@ class ConsolidationLoop:
             proc_kp_path: Path | None = None
             if self.procedural_simhash:
                 proc_pairs = [
-                    self.indexed_key_qa[k]
+                    self.indexed_key_cache[k]
                     for k in self.procedural_simhash
-                    if k in self.indexed_key_qa
+                    if k in self.indexed_key_cache
                 ]
                 if proc_pairs:
                     proc_dir = self.output_dir / "procedural"
@@ -3811,7 +3813,7 @@ class ConsolidationLoop:
         graph_drift_count = 0
 
         for key in active_keys:
-            qa_info = self.indexed_key_qa.get(key)
+            qa_info = self.indexed_key_cache.get(key)
             if qa_info is None:
                 # No QA metadata — skip (should not happen with intact registry)
                 logger.warning("consolidate_interim_adapters: no QA metadata for key %s", key)

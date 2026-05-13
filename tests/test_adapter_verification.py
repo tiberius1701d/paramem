@@ -97,7 +97,7 @@ def _make_verify_loop(tmp_path: Path, model: MagicMock | None = None) -> Consoli
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop.indexed_key_registry = KeyRegistry()
-    loop.indexed_key_qa = {}
+    loop.indexed_key_cache = {}
     loop.cycle_count = 0
     loop.merger = MagicMock()
     loop.episodic_simhash = {}
@@ -524,7 +524,7 @@ class TestSaveAdaptersCallsVerify:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop.indexed_key_registry = KeyRegistry()
-        loop.indexed_key_qa = {}
+        loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
@@ -652,7 +652,7 @@ class TestPreSaveProbeRemoved:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop.indexed_key_registry = KeyRegistry()
-        loop.indexed_key_qa = {}
+        loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
@@ -743,7 +743,7 @@ class TestPostSaveSlotCleanup:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop.indexed_key_registry = KeyRegistry()
-        loop.indexed_key_qa = {}
+        loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}

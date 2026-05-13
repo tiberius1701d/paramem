@@ -228,6 +228,7 @@ class QueryRouter:
         graph_path: Path | None = None,
         ha_graph: HAEntityGraph | None = None,
         intent_config: IntentConfig | None = None,
+        simulate_dir: Path | None = None,
     ):
         self.adapter_dir = Path(adapter_dir)
         self.graph_path = Path(graph_path) if graph_path else None
@@ -237,6 +238,10 @@ class QueryRouter:
         # fail-closed default.  None means callers receive Intent.UNKNOWN
         # when state signals don't fire — fine for tests that don't care.
         self._intent_config = intent_config
+        # Simulate-mode graph store directory.  When set, reload() also scans
+        # per-tier graph.json files under this directory for entity indexing.
+        # None keeps experiment/test callers working without arg changes.
+        self.simulate_dir = Path(simulate_dir) if simulate_dir is not None else None
 
         # adapter_name -> {entity_lower -> set[key]}
         self._entity_key_index: dict[str, dict[str, set[str]]] = {}
@@ -255,22 +260,28 @@ class QueryRouter:
         self._speaker_key_index.clear()
         self._all_entities.clear()
 
-        # Scan adapter directories for keyed_pairs.json
+        # Scan adapter directories for keyed_pairs.json (train-mode store).
         if not self.adapter_dir.exists():
             logger.info("No adapter directory at %s", self.adapter_dir)
-            return
+        else:
+            for kp_path in self.adapter_dir.rglob("keyed_pairs.json"):
+                # Infer adapter name from directory structure
+                # Expected: adapter_dir/adapter_name/keyed_pairs.json
+                # or: adapter_dir/keyed_pairs.json (single adapter)
+                rel = kp_path.relative_to(self.adapter_dir)
+                if len(rel.parts) == 1:
+                    adapter_name = "episodic"
+                else:
+                    adapter_name = rel.parts[0]
 
-        for kp_path in self.adapter_dir.rglob("keyed_pairs.json"):
-            # Infer adapter name from directory structure
-            # Expected: adapter_dir/adapter_name/keyed_pairs.json
-            # or: adapter_dir/keyed_pairs.json (single adapter)
-            rel = kp_path.relative_to(self.adapter_dir)
-            if len(rel.parts) == 1:
-                adapter_name = "episodic"
-            else:
-                adapter_name = rel.parts[0]
+                self._load_keyed_pairs(adapter_name, kp_path)
 
-            self._load_keyed_pairs(adapter_name, kp_path)
+        # Scan simulate-mode store for per-tier graph.json files.
+        if self.simulate_dir is not None and self.simulate_dir.exists():
+            for tier in ("episodic", "semantic", "procedural"):
+                graph_path = self.simulate_dir / tier / "graph.json"
+                if graph_path.exists():
+                    self._load_graph_pairs(tier, graph_path)
 
         # Also load from graph nodes if available
         if self.graph_path and self.graph_path.exists():
@@ -313,6 +324,56 @@ class QueryRouter:
             logger.warning("Failed to load %s: %s", path, e)
             return
 
+        self._index_pairs(adapter_name, pairs)
+
+    def _load_graph_pairs(self, adapter_name: str, graph_path: Path) -> None:
+        """Index entities from a simulate-mode per-tier ``graph.json`` file.
+
+        Calls :func:`~paramem.server.simulate_store.load_simulate_graph` and
+        :func:`~paramem.server.simulate_store.iter_quads` to convert the graph
+        into the same six-field quad dicts consumed by :meth:`_index_pairs`.
+
+        Falls back silently on read errors so a corrupted or missing graph.json
+        does not abort the boot-time router rebuild.
+
+        Args:
+            adapter_name: Tier name (``"episodic"``, ``"semantic"``, or
+                ``"procedural"``).
+            graph_path: Absolute path to the ``graph.json`` file under
+                ``simulate_dir/<tier>/graph.json``.
+        """
+        try:
+            from paramem.server.simulate_store import iter_quads, load_simulate_graph
+
+            graph = load_simulate_graph(graph_path)
+            pairs = list(iter_quads(graph))
+        except Exception as e:
+            logger.warning("Failed to load simulate graph %s: %s", graph_path, e)
+            return
+
+        self._index_pairs(adapter_name, pairs)
+
+    def _index_pairs(self, adapter_name: str, pairs: list[dict]) -> None:
+        """Index entity and speaker data from a list of quad-schema dicts.
+
+        Shared by :meth:`_load_keyed_pairs` (which reads ``keyed_pairs.json``)
+        and :meth:`_load_graph_pairs` (which reads ``graph.json``).  Both
+        sources project to the same six-field ``KEYED_PAIR_FIELDS_QUAD`` shape
+        so the indexing logic is identical:
+
+        * ``subject`` and ``object`` are indexed as entity names (lowercase).
+        * ``speaker_id`` is indexed in the per-speaker key set.
+        * Predicates of the form ``has_<attr>`` are additionally indexed under
+          the de-prefixed attribute name (``"email"``, ``"phone"``, etc.) so
+          natural-language attribute queries match the keyed fact directly.
+
+        Args:
+            adapter_name: Tier name used as the key in
+                ``self._entity_key_index``.
+            pairs: List of six-field quad dicts (``key``, ``subject``,
+                ``predicate``, ``object``, ``speaker_id``,
+                ``first_seen_cycle``).
+        """
         index = self._entity_key_index.setdefault(adapter_name, {})
         for kp in pairs:
             key = kp.get("key", "")

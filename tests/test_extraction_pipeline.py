@@ -2155,7 +2155,7 @@ class TestCollectSemanticKeys:
     def _make_loop_stub(self):
         class Stub:
             def __init__(self):
-                self.indexed_key_qa = {
+                self.indexed_key_cache = {
                     "graph1": {"key": "graph1", "question": "Q1", "answer": "A1"},
                     "graph2": {"key": "graph2", "question": "Q2", "answer": "A2"},
                     "proc1": {"key": "proc1", "question": "QP", "answer": "AP"},
@@ -3103,7 +3103,8 @@ class TestConsolidationScheduleConfigPrivacyGuard:
 
         minimal_yaml = tmp_path / "server.yaml"
         minimal_yaml.write_text(
-            "model: mistral\nconsolidation:\n  schedule: every 2h\n  mode: simulate\n"
+            "model: mistral\nconsolidation:\n  schedule: every 2h\n"
+            "  mode: simulate\n  indexed_format: quad\n"
         )
         config = load_server_config(minimal_yaml)
         # New fields must be present with defaults

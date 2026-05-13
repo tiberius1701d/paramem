@@ -96,7 +96,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
         prompts_dir=None,
     )
     loop.indexed_key_registry = KeyRegistry()
-    loop.indexed_key_qa = {}
+    loop.indexed_key_cache = {}
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
     loop.episodic_simhash = {}
@@ -782,14 +782,14 @@ class TestProceduralRelsRoutedToProceduralAdapter:
         Pre-conditions
         --------------
         - One old procedural key ``proc0`` exists in ``procedural_simhash``,
-          ``indexed_key_qa``, and ``procedural_sp_index`` with the same
+          ``indexed_key_cache``, and ``procedural_sp_index`` with the same
           (speaker, subject, predicate) as the incoming relation, so it would
           normally be retired.
 
         Post-conditions after the procedural training failure
         -----------------------------------------------------
         - ``indexed_key_registry`` is empty: episodic step 7 never ran.
-        - ``indexed_key_qa`` does NOT contain any new procedural key.
+        - ``indexed_key_cache`` does NOT contain any new procedural key.
         - ``procedural_simhash`` is unchanged: old key still present.
         - ``procedural_sp_index`` still maps to the old key (not the new one).
         - Old procedural key ``proc0`` was NOT removed from any index.
@@ -813,7 +813,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             "speaker_id": "",
         }
         loop.procedural_simhash = {old_proc_key: 0xDEADBEEF}
-        loop.indexed_key_qa[old_proc_key] = old_qa_entry
+        loop.indexed_key_cache[old_proc_key] = old_qa_entry
         loop.procedural_sp_index[old_sp_key] = old_proc_key
 
         call_count = {"n": 0}
@@ -885,10 +885,10 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             "Episodic keys must not be registered when procedural training fails."
         )
 
-        # No new procedural key in indexed_key_qa — only the pre-existing old entry.
-        proc_keys_in_qa = [k for k in loop.indexed_key_qa if k.startswith("proc")]
+        # No new procedural key in indexed_key_cache — only the pre-existing old entry.
+        proc_keys_in_qa = [k for k in loop.indexed_key_cache if k.startswith("proc")]
         assert proc_keys_in_qa == [old_proc_key], (
-            f"Expected only old procedural key '{old_proc_key}' in indexed_key_qa; "
+            f"Expected only old procedural key '{old_proc_key}' in indexed_key_cache; "
             f"found: {proc_keys_in_qa}"
         )
 
@@ -897,9 +897,9 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             "Old procedural key must still be in procedural_simhash after training failure."
         )
 
-        # Old key must NOT have been removed from indexed_key_qa.
-        assert old_proc_key in loop.indexed_key_qa, (
-            "Old procedural key must still be in indexed_key_qa after training failure."
+        # Old key must NOT have been removed from indexed_key_cache.
+        assert old_proc_key in loop.indexed_key_cache, (
+            "Old procedural key must still be in indexed_key_cache after training failure."
         )
 
         # procedural_sp_index must still point to the old key.
