@@ -100,12 +100,12 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 raise RuntimeError("simulated training failure")
 
             monkeypatch.setattr(
-                "paramem.training.consolidation.train_adapter",
+                "paramem.training.trainer.train_adapter",
                 _raising_train,
             )
         else:
             monkeypatch.setattr(
-                "paramem.training.consolidation.train_adapter",
+                "paramem.training.trainer.train_adapter",
                 lambda **kw: {"train_loss": 0.42},
             )
 
@@ -155,6 +155,10 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub = _LoopStub()
         stub._run_indexed_key_procedural = ConsolidationLoop._run_indexed_key_procedural.__get__(
             stub
+        )
+        # _run_indexed_key_procedural delegates to _prepare_procedural_keys_for_tier; bind it.
+        stub._prepare_procedural_keys_for_tier = (
+            ConsolidationLoop._prepare_procedural_keys_for_tier.__get__(stub)
         )
         # _run_indexed_key_procedural delegates to _cache_entry; bind it too.
         stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)

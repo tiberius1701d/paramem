@@ -1,12 +1,15 @@
 """Live-GPU parity probe: simulate vs train produce identical loop state.
 
-Proves that ``ConsolidationLoop.simulated_training`` is blackbox-equivalent to
-``ConsolidationLoop.train_adapters`` for all in-memory state that drives
-inference (indexed_key_cache, episodic/semantic/procedural SimHash registries,
-KeyRegistry membership, procedural_sp_index, next-index counters) — the only
-intentional delta being that train writes adapter weights and simulate does not.
+.. deprecated::
+    This script targets ``ConsolidationLoop.simulated_training`` and the
+    ``_save_keyed_pairs_for_router`` helper, both of which were removed in the
+    simulate/train unification refactor (2026-05-14).  The script is broken and
+    kept for historical reference only.  The parity property it validated is now
+    structural: both modes execute ``run_consolidation_cycle``; the only
+    mode-conditional code is the commit venue inside ``commit_tier_slot``
+    (adapter weights for train, ``graph.json`` sidecar for simulate).
 
-Strategy:
+Original design (for reference):
   1. Load Mistral 7B NF4 once.
   2. Use one shared ``extract_loop`` to run extraction over a fixed transcript
      set. Extraction depends on the base-model weights only (no training has
@@ -14,14 +17,11 @@ Strategy:
   3. Snapshot the produced (episodic_qa, procedural_relations) pair. From here
      the two paths diverge only in how they consume identical input.
   4. Build two fresh loops sharing the same PeftModel-wrapped base:
-       - ``sim_loop``  → ``simulated_training(qa)``
+       - ``sim_loop``  → ``simulated_training(qa)``   [DELETED]
        - ``train_loop`` → ``train_adapters(qa, num_epochs=1)``
-     Simulate runs FIRST so its ``generate_qa_from_relations`` call (for the
-     procedural branch) sees the pristine base-model weights, matching the
-     train path's own call which also happens before any weight update.
   5. Snapshot loop state after each call. Compare key-by-key. Also compare
      the on-disk keyed_pairs.json each path would emit via a local equivalent
-     of ``_save_keyed_pairs_for_router``.
+     of ``_save_keyed_pairs_for_router``.  [DELETED]
 
 Outputs to outputs/sim_train_parity/<timestamp>/results.json. No existing
 training data, server adapters, or session archive files are touched.
@@ -411,7 +411,7 @@ def run_probe(out_dir: Path) -> dict:
     #     call inside the train path. Both calls happen BEFORE any weight
     #     update. ---
     sim_loop = _make_loop(model, tokenizer, sim_dir)
-    logger.info("Running simulated_training on fresh loop...")
+    logger.info("Running simulate path on fresh loop (NOTE: simulated_training deleted — script broken)...")
     sim_result = sim_loop.simulated_training(
         list(all_episodic_qa),
         list(all_procedural),

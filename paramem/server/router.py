@@ -228,7 +228,6 @@ class QueryRouter:
         graph_path: Path | None = None,
         ha_graph: "HAEntityGraph | None" = None,
         intent_config: "IntentConfig | None" = None,
-        simulate_dir: Path | None = None,
     ):
         self.adapter_dir = Path(adapter_dir)
         self.graph_path = Path(graph_path) if graph_path else None
@@ -238,9 +237,6 @@ class QueryRouter:
         # fail-closed default.  None means callers receive Intent.UNKNOWN
         # when state signals don't fire — fine for tests that don't care.
         self._intent_config = intent_config
-        # Simulate-mode graph store directory retained for back-compat;
-        # no longer used by reload() (cache is canonical source).
-        self.simulate_dir = Path(simulate_dir) if simulate_dir is not None else None
         # The MemoryStore — canonical source of indexed-key entries.
         self._memory_store = memory_store
 

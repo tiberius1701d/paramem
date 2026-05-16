@@ -303,9 +303,13 @@ def main() -> None:
     # --- Run consolidation in simulate mode ---
     # run_consolidation calls filtered_buffer.get_pending() internally and
     # filtered_buffer.mark_consolidated() (which is a no-op here).
-    # With mode="simulate" + debug=True it writes per-tier keyed_pairs.json
-    # under config.simulate_dir (via _save_keyed_pairs_for_router) and
-    # plaintext snapshots under config.debug_dir (via _save_debug_artifacts).
+    # With mode="simulate" + debug=True it writes per-tier graph.json /
+    # simhash_registry.json / indexed_key_registry.json under the adapter dir
+    # (via commit_tier_slot) and plaintext snapshots under config.debug_dir
+    # (via _save_debug_artifacts).
+    # NOTE: config.simulate_dir and _save_keyed_pairs_for_router were removed
+    # in the 2026-05-14 unification refactor.  This script is broken below
+    # (line "sim_root = config.simulate_dir") and needs updating.
     logger.info("Starting simulate-mode consolidation")
     result = run_consolidation(
         model=model,
@@ -324,9 +328,11 @@ def main() -> None:
         logger.error("Unexpected consolidation status: %s", status)
         sys.exit(1)
 
-    # Locate the simulate-mode peer-storage output. Post-canonicalization, the simulate
-    # store layout is <simulate_dir>/<tier>/keyed_pairs.json with no per-cycle
-    # subdirectory.
+    # Locate the simulate-mode peer-storage output. The unified layout writes
+    # graph.json / simhash_registry.json / indexed_key_registry.json per tier
+    # under <adapter_dir>/<tier>/  (main) or <adapter_dir>/episodic/interim_<stamp>/
+    # (interim). The code below references config.simulate_dir which no longer
+    # exists — see the NOTE above.
     sim_root = config.simulate_dir
     ep_kp = sim_root / "episodic" / "keyed_pairs.json"
     if ep_kp.exists():

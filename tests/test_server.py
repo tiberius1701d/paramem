@@ -546,3 +546,120 @@ class TestProbeAndReasonDispatch:
         )
         assert kba["procedural"] == ["p1", "p2"]
         assert kba["episodic"] == ["e1"]
+
+    def test_interim_episodic_facts_reach_prompt(self, monkeypatch, tmp_path):
+        """Regression: facts probed under ``episodic_interim_<stamp>`` must
+        appear in the augmented_text under the ``[Recent knowledge]`` layer.
+
+        Before fix (R2): the hard-coded layer-iteration loop only checked
+        ``["procedural", "episodic", "semantic"]`` and silently dropped any
+        ``episodic_interim_<stamp>`` bucket from layers — so the cycle's
+        freshly trained interim facts (attribute keys included) never
+        reached Mistral's prompt despite ``Total recalled: N facts`` showing
+        them as successfully probed.
+        """
+        from paramem.server.config import ServerConfig, VoiceConfig
+
+        captured = {}
+
+        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
+            results = {}
+            for keys in keys_by_adapter.values():
+                for k in keys:
+                    results[k] = {
+                        "key": k,
+                        "fact_text": f"Tobias has_attr_{k} value_{k}",
+                        "confidence": 1.0,
+                    }
+            return results
+
+        monkeypatch.setattr(
+            "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+            fake_grouped,
+        )
+        monkeypatch.setattr(
+            "paramem.models.loader.switch_adapter",
+            lambda model, name: None,
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference._load_simhash_registry",
+            lambda path: {},
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.sanitize_for_cloud",
+            lambda text, mode=None: (text, []),
+        )
+        monkeypatch.setattr(
+            "paramem.server.inference.generate_answer",
+            lambda model, tokenizer, prompt, **kwargs: "stub answer",
+        )
+
+        # Capture the augmented text reaching _build_messages — that's the
+        # exact string handed to the chat template before tokenization.
+        def capture_augmented(text, history, system_prompt, tokenizer):
+            captured["augmented_text"] = text
+            return [{"role": "user", "content": text}]
+
+        monkeypatch.setattr(
+            "paramem.server.inference._build_messages",
+            capture_augmented,
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
+
+        model = self._make_model(["episodic", "procedural", "episodic_interim_20260516T1200"])
+        monkeypatch.setattr(
+            "paramem.server.inference.PeftModel",
+            type(None),
+            raising=False,
+        )
+
+        prompt_file = tmp_path / "prompt.txt"
+        prompt_file.write_text("You are an assistant.")
+        config = ServerConfig()
+        config.voice = VoiceConfig(prompt_file=str(prompt_file))
+
+        plan = self._make_plan(
+            [
+                ("procedural", ["p1"]),
+                ("episodic_interim_20260516T1200", ["phone_key", "email_key"]),
+            ]
+        )
+
+        from paramem.server.inference import _probe_and_reason
+
+        _probe_and_reason(
+            text="What is my phone number?",
+            plan=plan,
+            history=None,
+            model=model,
+            tokenizer=tokenizer,
+            config=config,
+            memory_store=_MS(replay_enabled=False),
+        )
+
+        assert "augmented_text" in captured, "_build_messages was not called"
+        text = captured["augmented_text"]
+
+        # Procedural facts present.
+        assert "Tobias has_attr_p1 value_p1" in text, (
+            f"procedural fact missing from prompt; augmented_text:\n{text}"
+        )
+        # Interim-episodic facts present — this is the regression check.
+        assert "Tobias has_attr_phone_key value_phone_key" in text, (
+            f"episodic_interim phone fact missing from prompt; augmented_text:\n{text}"
+        )
+        assert "Tobias has_attr_email_key value_email_key" in text, (
+            f"episodic_interim email fact missing from prompt; augmented_text:\n{text}"
+        )
+        # Layer label is "Recent knowledge" (the canonical episodic-tier label),
+        # not the bare adapter name — multiple interim slots collapse under one
+        # heading.
+        assert "[Recent knowledge]" in text, (
+            f"interim facts should appear under [Recent knowledge]; got:\n{text}"
+        )
+        assert "[episodic_interim_20260516T1200]" not in text, (
+            "interim adapter name should NOT leak as a section heading; "
+            "merge them under [Recent knowledge] instead"
+        )

@@ -253,7 +253,7 @@ class ModeProbe:
     plaintext_paths: list[Path] = field(default_factory=list)
 
 
-def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
+def infra_paths(data_dir: Path) -> list[Path]:
     """Return the list of infrastructure files subject to envelope encryption.
 
     Single source of truth for the startup mode-consistency scan
@@ -270,8 +270,10 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
       restore trumps the marginal info hiding.
 
     Included (full-file encryption):
+    - ``adapters/<tier>/graph.json`` — canonical structured persistence
+      written by ``commit_tier_slot`` in both simulate and train modes.
     - ``adapters/<tier>/<slot>/adapter_model.safetensors`` (and any
-      ``episodic_interim_*`` siblings) — LoRA weight tensors encrypted
+      ``episodic/interim_*`` siblings) — LoRA weight tensors encrypted
       in-place by :func:`~paramem.models.loader._encrypt_adapter_safetensors`
       at save time; decrypted into anonymous RAM at load time via
       :func:`~paramem.models.loader._adapter_slot_for_load`.
@@ -281,14 +283,6 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
     data_dir:
         Root of the ParaMem data directory (typically
         ``configs/server.yaml``'s ``paths.data``).
-    simulate_dir:
-        Optional path to the simulate-mode peer-storage root
-        (``configs/server.yaml``'s ``paths.simulate``). When provided,
-        the per-tier ``graph.json`` files under it are appended to the
-        candidate set so rotation, restore, and the startup
-        mode-consistency scan all cover the simulate store. Callers
-        that do not have a config (e.g. legacy callers) may pass
-        ``None`` to keep the historical data-dir-only behaviour.
 
     Returns
     -------
@@ -305,34 +299,47 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
         data_dir / "speaker_profiles.json",
         data_dir / "adapters" / "post_session_queue.json",
     ]
-    # Per-tier adapter registry + simhash (new layout: <adapters>/<tier>/<file>).
+    # Per-tier adapter registry + simhash + graph (unified layout:
+    # <adapters>/<tier>/<file> for main slots;
+    # <adapters>/<tier>/interim_<stamp>/<file> for interim simulate-mode slots).
+    # graph.json, simhash_registry.json, and indexed_key_registry.json are written
+    # by commit_tier_slot in both simulate and train modes; in simulate mode they
+    # may land under an interim_<stamp> subdirectory instead of the tier root.
     adapters_root = data_dir / "adapters"
     for _tier in ("episodic", "semantic", "procedural"):
-        paths.append(adapters_root / _tier / "indexed_key_registry.json")
-        paths.append(adapters_root / _tier / "simhash_registry.json")
+        _tier_root = adapters_root / _tier
+        # Main-slot files at the tier root.
+        paths.append(_tier_root / "indexed_key_registry.json")
+        paths.append(_tier_root / "simhash_registry.json")
+        paths.append(_tier_root / "graph.json")
+        # Interim simulate-mode slots under <tier>/interim_<stamp>/ subdirs.
+        if _tier_root.exists():
+            for _interim_file in _tier_root.rglob("graph.json"):
+                if _interim_file != _tier_root / "graph.json":
+                    paths.append(_interim_file)
+            for _interim_file in _tier_root.rglob("simhash_registry.json"):
+                if _interim_file != _tier_root / "simhash_registry.json":
+                    paths.append(_interim_file)
+            for _interim_file in _tier_root.rglob("indexed_key_registry.json"):
+                if _interim_file != _tier_root / "indexed_key_registry.json":
+                    paths.append(_interim_file)
     # BG-trainer resume states live under per-job in_training directories.
     if adapters_root.exists():
         for resume in adapters_root.rglob("in_training/resume_state.json"):
             paths.append(resume)
     # Adapter safetensors — full-file encrypted when daily identity is loaded.
-    # Each tier's slot directories (and episodic_interim_* siblings) may hold
+    # Each tier's slot directories (and episodic/interim_* siblings) may hold
     # one or more adapter_model.safetensors files.  Enumerate them so
     # rotation, restore, and the startup mode-consistency scan all cover the
     # adapter weight blobs alongside the JSON metadata.
     if adapters_root.exists():
         for safetensors in adapters_root.rglob("adapter_model.safetensors"):
             paths.append(safetensors)
-    # Simulate-mode per-tier graph.json files (canonical simulate-mode store).
-    if simulate_dir is not None:
-        simulate_dir = Path(simulate_dir)
-        for _tier in ("episodic", "semantic", "procedural"):
-            paths.append(simulate_dir / _tier / "graph.json")
     return paths
 
 
-def _probe_data_dir(data_dir: Path, simulate_dir: Path | None = None) -> ModeProbe:
-    """Scan *data_dir* (and *simulate_dir* if provided) for infrastructure
-    files and classify each as age / plaintext.
+def _probe_data_dir(data_dir: Path) -> ModeProbe:
+    """Scan *data_dir* for infrastructure files and classify each as age / plaintext.
 
     Uses ``infra_paths`` as the authoritative candidate set.  Missing files
     do NOT contribute to either classification — only files that actually
@@ -340,13 +347,10 @@ def _probe_data_dir(data_dir: Path, simulate_dir: Path | None = None) -> ModePro
     """
     probe = ModeProbe()
     data_dir = Path(data_dir)
-    # data_dir is the primary root; simulate_dir is optionally a sibling root.
-    # Either may be missing on first start; that's fine — the candidate set
-    # is filtered by existence below.
-    if not data_dir.exists() and (simulate_dir is None or not Path(simulate_dir).exists()):
+    if not data_dir.exists():
         return probe
 
-    for path in infra_paths(data_dir, simulate_dir=simulate_dir):
+    for path in infra_paths(data_dir):
         if not path.exists() or not path.is_file():
             continue
         if is_age_envelope(path):
@@ -361,7 +365,6 @@ def assert_mode_consistency(
     data_dir: Path,
     *,
     daily_identity_loadable: bool = False,
-    simulate_dir: Path | None = None,
 ) -> None:
     """Refuse startup when on-disk encryption state conflicts with the loaded keys.
 
@@ -395,7 +398,7 @@ def assert_mode_consistency(
     """
     from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
 
-    probe = _probe_data_dir(Path(data_dir), simulate_dir=simulate_dir)
+    probe = _probe_data_dir(Path(data_dir))
 
     has_age = bool(probe.age_paths)
     has_pt = bool(probe.plaintext_paths)

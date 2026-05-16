@@ -153,7 +153,6 @@ def test_factory_threads_every_config_knob(
     cfg = load_server_config("tests/fixtures/server.yaml")
     # Re-route paths so the factory's seed-from-disk block has nothing to read.
     cfg.paths.data = tmp_path
-    cfg.paths.simulate = tmp_path / "simulate"
     cfg.paths.debug = tmp_path / "debug"
 
     for dotted_key, value in cfg_mutations.items():
@@ -277,7 +276,6 @@ def test_factory_skips_seeding_when_seed_state_from_disk_false(tmp_path, monkeyp
 
     cfg = load_server_config("tests/fixtures/server.yaml")
     cfg.paths.data = tmp_path
-    cfg.paths.simulate = tmp_path / "simulate"
     cfg.paths.debug = tmp_path / "debug"
 
     server_consolidation.create_consolidation_loop(
@@ -294,22 +292,22 @@ def test_factory_skips_seeding_when_seed_state_from_disk_false(tmp_path, monkeyp
     loop_instance.seed_procedural_cache.assert_not_called()
 
 
-def test_factory_simulate_mode_does_not_seed_from_kp(tmp_path, monkeypatch):
-    """In simulate mode, a quads.json in simulate_dir is NOT seeded.
+def test_factory_simulate_mode_does_not_seed_cache(tmp_path, monkeypatch):
+    """In simulate mode, stale quads.json / graph.json files are NOT seeded by the factory.
 
-    Guards against regression where the new simulate-mode seed path falls
-    through to the train-mode kp reader.  Even if a stale quads.json
-    exists under paths.simulate (from a previous run before the store
-    migration), the boot seed must ignore it.
+    The factory delegates entry-level seeding to the lifespan preload path
+    (paramem.server.app.preload_cache).  A stale quads.json placed in the
+    adapter_dir subtree must not trigger seeding of episodic/semantic/procedural
+    caches, regardless of consolidation mode.
     """
     from paramem.server import consolidation as server_consolidation
     from paramem.server.config import load_server_config
 
-    # Place a decoy quads.json — must NOT trigger seeding.
-    ep_dir = tmp_path / "simulate" / "episodic"
+    # Place a decoy quads.json under the adapter_dir tree — must NOT trigger seeding.
+    ep_dir = tmp_path / "adapters" / "episodic"
     ep_dir.mkdir(parents=True)
     (ep_dir / "quads.json").write_text('[{"key": "graph1", "question": "Q?", "answer": "A."}]')
-    # No graph.json present — simulate seed path should find nothing and skip.
+    # No key_metadata.json present — the factory has nothing to seed from.
 
     loop_instance = MagicMock()
 
@@ -321,7 +319,6 @@ def test_factory_simulate_mode_does_not_seed_from_kp(tmp_path, monkeypatch):
     cfg = load_server_config("tests/fixtures/server.yaml")
     cfg.consolidation.mode = "simulate"
     cfg.paths.data = tmp_path
-    cfg.paths.simulate = tmp_path / "simulate"
     cfg.paths.debug = tmp_path / "debug"
 
     server_consolidation.create_consolidation_loop(
@@ -331,8 +328,7 @@ def test_factory_simulate_mode_does_not_seed_from_kp(tmp_path, monkeypatch):
         memory_store=_MS(replay_enabled=False),
     )
 
-    # No seed calls — the graph.json is absent so the loop for each tier
-    # finds gpath.exists() == False and continues.
+    # No entry-cache seed calls — seeding is lifespan's responsibility.
     loop_instance.seed_episodic_cache.assert_not_called()
     loop_instance.seed_semantic_cache.assert_not_called()
     loop_instance.seed_procedural_cache.assert_not_called()

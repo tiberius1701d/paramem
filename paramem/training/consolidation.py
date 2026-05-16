@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from torch.utils.data import Dataset
 
@@ -922,8 +922,22 @@ class ConsolidationLoop:
     ) -> dict:
         """Train all adapters once on accumulated relations (blocking).
 
-        Called after all sessions have been extracted.
-        Returns dict with train losses per adapter.
+        Called after all sessions have been extracted.  Returns dict with
+        train losses per adapter.
+
+        Delegates to :meth:`run_consolidation_cycle` (unified episodic +
+        procedural pipeline) so experiment scripts exercise the same code path
+        as the production post-session training hook.  After the cycle, calls
+        :meth:`consolidate_interim_adapters` to fold the freshly-trained interim
+        slot into the main ``"episodic"`` adapter so callers that probe
+        ``model.set_adapter("episodic")`` read the trained weights, not the
+        stale main slot.  This mirrors production's full-cycle
+        consolidate-interim-adapters step, compressed for the one-shot
+        experiment use case.
+
+        The method is retained as the stable public API used by experiment
+        scripts; its body is a single-call delegation — not a parallel
+        implementation.
 
         Args:
             all_episodic_rels: Deduplicated episodic relations for this cycle.
@@ -931,227 +945,392 @@ class ConsolidationLoop:
             speaker_id: Fallback speaker scope for procedural contradiction
                 detection. Required — callers must always supply a real ID.
 
-        Note: this method trains AND saves.  The server consolidation path
-        (paramem/server/consolidation.py train branch) uses
-        ``train_adapters_no_save`` followed by ``_promote_mature_keys`` then
-        ``_save_adapters`` so the manifest's registry hash reflects
-        post-promotion membership (Task #7 fix).  Experiment scripts use this
-        combined method directly and are unaffected (no promotion step exists
-        in the experiment path).
+        Note: this method trains AND saves.  Experiment scripts use this
+        combined method directly.
         """
-        self.cycle_count += 1
-        result = {}
-
         if not self.store.replay_enabled:
             logger.warning("No indexed key registry — skipping training")
-            return result
+            return {}
 
-        # --- EPISODIC ---
-        if all_episodic_rels:
-            episodic_loss = self._run_indexed_key_episodic(all_episodic_rels, new_promotions=[])
-            if episodic_loss is not None:
-                result["episodic_train_loss"] = episodic_loss
+        # cycle_count is incremented inside run_consolidation_cycle.
+        cycle_result = self.run_consolidation_cycle(
+            all_episodic_rels,
+            all_procedural_relations,
+            speaker_id=speaker_id,
+            mode="train",
+            run_label=f"train-adapters-cycle{self.cycle_count + 1}",
+            new_promotions=None,
+        )
 
-        # --- PROCEDURAL ---
-        if self.procedural_config is not None and all_procedural_relations:
-            procedural_loss = self._run_indexed_key_procedural(
-                all_procedural_relations, speaker_id=speaker_id
+        # --- Roll interim slot into main ---
+        # run_consolidation_cycle trains into episodic_interim_<stamp>.  Callers
+        # that probe model.set_adapter("episodic") need the trained weights in the
+        # main slot.  Submit consolidate_interim_adapters via an ephemeral
+        # BackgroundTrainer so the GPU lock is held for the full per-tier rebuild
+        # (consolidate_interim_adapters requires this — see its entry guard).
+        # submit_and_wait blocks until the worker finishes and re-raises on error.
+        if "episodic" in self.model.peft_config or any(
+            k.startswith("episodic_interim_") for k in self.model.peft_config
+        ):
+            from paramem.server.background_trainer import BackgroundTrainer
+
+            _bt = BackgroundTrainer(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                training_config=self.training_config,
+                output_dir=self.output_dir,
+                thermal_policy=getattr(self, "_thermal_policy", None),
             )
-            if procedural_loss is not None:
-                result["procedural_train_loss"] = procedural_loss
 
-        # --- SAVE ---
+            def _consolidate() -> None:
+                self.consolidate_interim_adapters(trainer=_bt)
+
+            try:
+                _bt.submit_and_wait(_consolidate)
+            finally:
+                _bt.close()
+
+        # --- SAVE main slots ---
         self._save_adapters()
 
-        logger.info("Training complete: %s", result)
+        # Propagate per-tier train losses from the cycle result so callers
+        # (experiment scripts) can inspect convergence without re-parsing logs.
+        result = {
+            "episodic_train_loss": cycle_result.get("episodic_train_loss"),
+            "procedural_train_loss": cycle_result.get("procedural_train_loss"),
+        }
+        logger.info("Training complete: %s", cycle_result)
         return result
 
-    def train_adapters_no_save(
-        self,
-        all_episodic_rels: list[dict],
-        all_procedural_relations: list[dict],
-        speaker_id: str,
-    ) -> dict:
-        """Train all adapters without saving to disk.
+    def _tag_speaker_id_defaults(self, rels: list[dict], speaker_id: str) -> None:
+        """Tag relations missing a ``speaker_id`` with the caller-supplied default.
 
-        Identical to ``train_adapters`` except ``_save_adapters()`` is NOT
-        called.  The server consolidation train branch uses this method so
-        that ``_promote_mature_keys`` can run between training and the save,
-        ensuring the adapter manifest's registry hash reflects post-promotion
-        SimHash membership (Task #7 fix).
+        Mutates *rels* in place — every entry that does not already carry a
+        ``speaker_id`` key receives the caller-supplied *speaker_id*.  Entries
+        that already carry one (even an empty string) are left unchanged so
+        per-relation speaker scoping is not overwritten.
 
-        Callers are responsible for calling ``_save_adapters()`` after
-        promotion.
-
-        Parameters
-        ----------
-        all_episodic_rels:
-            Deduplicated episodic relations for this cycle.
-        all_procedural_relations:
-            Deduplicated procedural relations for this cycle.
-        speaker_id:
-            Fallback speaker scope for procedural contradiction detection.
-            Required — callers must always supply a real speaker ID.
-
-        Returns
-        -------
-        dict
-            Same structure as ``train_adapters``: ``episodic_train_loss``,
-            ``procedural_train_loss`` (when applicable).
+        Args:
+            rels: Relation dicts to tag.  Modified in place.
+            speaker_id: Default speaker identifier to inject.
         """
-        self.cycle_count += 1
-        result = {}
+        for r in rels:
+            if "speaker_id" not in r:
+                r["speaker_id"] = speaker_id
 
-        if not self.store.replay_enabled:
-            logger.warning("No indexed key registry — skipping training (no_save)")
-            return result
+    def _maybe_run_interim_enrichment(self) -> None:
+        """Fire a mini graph-enrichment pass at sub-interval rollover if the floor is crossed.
 
-        # --- EPISODIC ---
-        if all_episodic_rels:
-            episodic_loss = self._run_indexed_key_episodic(all_episodic_rels, new_promotions=[])
-            if episodic_loss is not None:
-                result["episodic_train_loss"] = episodic_loss
+        Checks ``graph_enrichment_interim_enabled`` and
+        ``_triples_since_last_enrichment >= graph_enrichment_min_triples_floor``
+        before calling ``_run_graph_enrichment``.  Any SOTA failure is logged
+        but never blocks interim adapter creation — the try/except is boundary
+        error handling (external Anthropic API call), not control-flow suppression.
 
-        # --- PROCEDURAL ---
-        if self.procedural_config is not None and all_procedural_relations:
-            procedural_loss = self._run_indexed_key_procedural(
-                all_procedural_relations, speaker_id=speaker_id
+        Called from :meth:`run_consolidation_cycle` at sub-interval rollover
+        (when the new stamp minted a fresh interim adapter slot).  Lifted verbatim
+        from the former ``_train_extracted_into_interim`` rollover branch so the
+        same guards and semantics are preserved exactly.
+        """
+        if not (
+            self.graph_enrichment_interim_enabled
+            and self._triples_since_last_enrichment >= self.graph_enrichment_min_triples_floor
+        ):
+            return
+
+        logger.info(
+            "_maybe_run_interim_enrichment: running mini graph-enrichment "
+            "(triples_since_last=%d >= floor=%d)",
+            self._triples_since_last_enrichment,
+            self.graph_enrichment_min_triples_floor,
+        )
+        try:
+            self._run_graph_enrichment()
+        except Exception as _mini_exc:
+            logger.warning(
+                "_maybe_run_interim_enrichment: mini graph-enrichment raised "
+                "— interim creation continues: %s",
+                _mini_exc,
             )
-            if procedural_loss is not None:
-                result["procedural_train_loss"] = procedural_loss
 
-        logger.info("Training complete (no save): %s", result)
-        return result
-
-    def simulated_training(
+    def _resolve_target_slot(
         self,
-        all_episodic_rels: list[dict],
-        all_procedural_relations: list[dict],
+        stamp: str,
+        max_interim_count: int,
+        *,
+        mode: "Literal['simulate', 'train']",
+    ) -> "tuple[str, bool, bool, bool]":
+        """Compute the target interim adapter name and control-flow flags.
+
+        Returns a 4-tuple ``(adapter_name, cap_reached_absorb, queue_only,
+        degenerated_skip)``:
+
+        - ``adapter_name``: The PEFT adapter name for this sub-interval
+          (``episodic_interim_<stamp>``).
+        - ``cap_reached_absorb``: When ``True``, the cap was reached and the
+          new facts should be absorbed into the newest existing interim adapter
+          via a full retrain.  **Train mode only** — always ``False`` in
+          simulate mode (no PEFT slots to count).
+        - ``queue_only``: When ``True``, the caller passed
+          ``max_interim_count == 0`` and facts should be queued without
+          creating an adapter.  Mode-agnostic.
+        - ``degenerated_skip``: When ``True``, the newest interim adapter is
+          marked degenerated and new facts should be queued.  **Train mode
+          only** — always ``False`` in simulate mode.
+
+        In simulate mode the slot is always freshly minted (no PEFT config to
+        consult) so ``cap_reached_absorb`` and ``degenerated_skip`` are both
+        ``False``.
+
+        Args:
+            stamp: The sub-interval stamp (``YYYYMMDDTHHMM``).
+            max_interim_count: Cap on concurrent interim adapters.
+                ``0`` → queue-only branch.
+            mode: ``"train"`` or ``"simulate"``.
+
+        Returns:
+            ``(adapter_name, cap_reached_absorb, queue_only, degenerated_skip)``
+        """
+        adapter_name = f"episodic_interim_{stamp}"
+
+        if max_interim_count == 0:
+            return adapter_name, False, True, False
+
+        if mode == "simulate":
+            # Simulate never touches PEFT config — fresh slot by definition.
+            return adapter_name, False, False, False
+
+        # Train mode: check PEFT config for cap-reached / degenerated conditions.
+        if adapter_name not in self.model.peft_config:
+            existing_interim = sorted(
+                a for a in self.model.peft_config if a.startswith("episodic_interim_")
+            )
+            if self.store.replay_enabled and len(existing_interim) >= max_interim_count:
+                newest = existing_interim[-1]
+                _newest_reg = (
+                    self.store.registry(newest) if self.store.has_registry(newest) else None
+                )
+                if _newest_reg is None or not _newest_reg.is_healthy():
+                    return adapter_name, False, False, True
+                # Cap reached and newest is healthy — absorb into newest.
+                return newest, True, False, False
+
+        return adapter_name, False, False, False
+
+    def _prepare_episodic_keys_for_tier(
+        self,
+        adapter_name: str,
+        rels: list[dict],
         speaker_id: str,
-    ) -> dict:
-        """Mirror train_adapters without weight updates or adapter saves.
+        *,
+        mode: "Literal['simulate', 'train']",
+    ) -> list[dict]:
+        """Assign new keys and gather existing keys for the target interim tier.
 
-        Simulate is a blackbox-equivalent of train: same extraction pipeline,
-        key assignment, contradiction handling, and SimHash construction from
-        ground-truth QA. The delta is that existing-key admission comes from
-        disk-seeded indexed_key_cache instead of probing adapter weights — under
-        perfect recall, probe_key would return identical content.
+        Unified replacement for ``_simulate_indexed_key_episodic``,
+        ``_run_indexed_key_episodic`` (key-prep body), and the
+        ``_train_extracted_into_interim`` key-prep block (lines 2864-2901 of
+        the original file).
 
-        Caller is responsible for the persistence venue (encrypted JSON store
-        in simulate mode vs. LoRA weights in train mode) and for the
-        bookkeeping that the consolidation outer layer normally performs
-        (key-metadata persist, registry persist, session retirement).
+        Tier scope: ``self.store.active_keys_in_tier(adapter_name)`` — per-tier
+        only.  Cross-tier scoping (``_all_active_keys()``) is NOT used here;
+        each interim slot manages its own membership.
+
+        First-seen preservation: existing entries retain their original
+        ``first_seen_cycle`` rather than being stamped with the current cycle.
+
+        Speaker-ID default: each new keyed pair receives
+        ``kp.get("speaker_id", speaker_id)`` — the caller's id, never ``""``.
+
+        Reconstruction policy (TRAIN mode only):
+            Calls ``probe_entry`` on each existing key and uses the adapter
+            weights as the authoritative source.  Falls back to
+            ``_safe_kp_from_cache`` when probe fails.
+
+        Simulate policy:
+            Reads existing entries from ``self.store.get(key)`` — no
+            ``model.generate`` calls.
+
+        DOES NOT train.  DOES NOT update simhash registries.  DOES NOT call
+        ``store.put`` or advance ``self._indexed_next_index`` — callers own that
+        mutation and must apply it at the correct point in their failure-safety
+        boundary (after ``train_adapter`` for the interim path, immediately for
+        the full-train paths where failure rolls back the whole cycle).
+
+        New entries are returned with ``"_new": True`` so callers can identify
+        them for deferred store.put / index-counter advancement.  Existing
+        entries never carry ``"_new"``.
+
+        Args:
+            adapter_name: Target tier name (e.g. ``"episodic_interim_YYYYMMDDTHHMM"``
+                or ``"episodic"``).  Determines which per-tier key set is used for
+                existing-key reconstruction.
+            rels: Pre-extracted episodic relation dicts, already tagged with
+                ``speaker_id`` by ``_tag_speaker_id_defaults``.
+            speaker_id: Fallback speaker tag for new keys missing one.
+            mode: ``"train"`` probes adapter weights; ``"simulate"`` reads cache.
+
+        Returns:
+            Full keyed-pair list (new + existing) ready for training (train) or
+            registry rebuild (simulate).  Each entry has
+            ``{key, subject, predicate, object, speaker_id, first_seen_cycle}``.
+            New entries additionally carry ``"_new": True``.
         """
-        self.cycle_count += 1
-        result: dict = {"simulated": True}
-
-        if not self.store.replay_enabled:
-            logger.warning("No indexed key registry — skipping simulated training")
-            return result
-
-        if all_episodic_rels:
-            self._simulate_indexed_key_episodic(all_episodic_rels)
-
-        if self.procedural_config is not None and all_procedural_relations:
-            self._simulate_indexed_key_procedural(all_procedural_relations, speaker_id=speaker_id)
-
-        logger.info("Simulated training complete (no weight update)")
-        return result
-
-    def _simulate_indexed_key_episodic(self, session_entries: list[dict]) -> None:
-        """Simulate counterpart of _run_indexed_key_episodic.
-
-        Assigns keys to new session relation dicts, admits existing keys
-        from seeded indexed_key_cache, rebuilds episodic simhash from ground-truth
-        data.  Skips probe reconstruction and the train call.
-
-        ``session_entries`` contains relation dicts (``subject``, ``predicate``,
-        ``object``).  The cache is written via ``_cache_entry`` so the uniform
-        shape invariant holds.
-        """
-        new_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in session_entries],
+        # Assign new keys from the incoming relations.
+        new_keyed_raw = assign_keys(
+            [(r["subject"], r["predicate"], r["object"]) for r in rels],
             start_index=self._indexed_next_index,
             prefix="graph",
         )
-        for i, kp in enumerate(new_keyed):
-            rel = session_entries[i] if i < len(session_entries) else {}
-            self.store.put(
-                "episodic",
-                kp["key"],
-                self._cache_entry(
-                    key=kp["key"],
-                    subject=kp["subject"],
-                    predicate=kp["predicate"],
-                    object=kp["object"],
-                    speaker_id=rel.get("speaker_id", ""),
-                    first_seen_cycle=self.cycle_count,
-                ),
+        new_keyed: list[dict] = []
+        for i, kp in enumerate(new_keyed_raw):
+            rel = rels[i] if i < len(rels) else {}
+            sid = kp.get("speaker_id") or rel.get("speaker_id", speaker_id)
+            entry = self._cache_entry(
+                key=kp["key"],
+                subject=kp["subject"],
+                predicate=kp["predicate"],
+                object=kp["object"],
+                speaker_id=sid,
+                first_seen_cycle=self.cycle_count,
             )
-        self._indexed_next_index += len(new_keyed)
+            entry["_new"] = True
+            new_keyed.append(entry)
+        # NOTE: store.put and _indexed_next_index advancement are intentionally
+        # deferred to the caller — see docstring.
 
-        active_keys = self._all_active_keys()
+        # Gather existing keys for the target tier (full-replay anti-forgetting).
         new_key_set = {kp["key"] for kp in new_keyed}
-        existing_keys = [
-            k
-            for k in active_keys
-            if k.startswith("graph")
-            and k not in new_key_set
-            and not self.store.has_simhash("semantic", k)
+        existing_tier_keys = [
+            k for k in self.store.active_keys_in_tier(adapter_name) if k not in new_key_set
         ]
 
-        episodic_keyed: list[dict] = []
-        for key in existing_keys:
-            qa = self.store.get(key)
-            if qa is not None:
-                episodic_keyed.append(
-                    {
-                        "key": key,
-                        "subject": qa["subject"],
-                        "predicate": qa["predicate"],
-                        "object": qa["object"],
-                    }
+        existing_keyed: list[dict] = []
+        if mode == "train":
+            # TRAIN: reconstruct from adapter weights.
+            # Keys with no simhash fingerprint cannot be verified by probe_entry
+            # (no reference hash to compute confidence against) — fall back to
+            # cache immediately for those keys and only probe the rest.
+            self._disable_gradient_checkpointing()
+            tier_simhash = self.store.simhashes_in_tier(adapter_name)
+            keys_with_hash = [k for k in existing_tier_keys if k in tier_simhash]
+            keys_without_hash = [k for k in existing_tier_keys if k not in tier_simhash]
+            reconstructed: dict[str, dict] = {}
+            for key in keys_with_hash:
+                recalled = probe_entry(
+                    self.model,
+                    self.tokenizer,
+                    key,
+                    registry=tier_simhash,
+                    confidence_threshold=0.5,
                 )
-        episodic_keyed.extend(new_keyed)
+                if recalled is not None and "failure_reason" not in recalled:
+                    cached = self.store.get(key) or {}
+                    first_seen = cached.get("first_seen_cycle", self.cycle_count)
+                    reconstructed[key] = {
+                        "key": key,
+                        "subject": recalled["subject"],
+                        "predicate": recalled["predicate"],
+                        "object": recalled["object"],
+                        "speaker_id": cached.get("speaker_id", speaker_id),
+                        "first_seen_cycle": first_seen,
+                    }
+            logger.info(
+                "_prepare_episodic_keys_for_tier: reconstruction %d/%d (adapter=%s)",
+                len(reconstructed),
+                len(keys_with_hash),
+                adapter_name,
+            )
+            for key in keys_with_hash:
+                if key in reconstructed:
+                    existing_keyed.append(reconstructed[key])
+                    continue
+                kp = self._safe_kp_from_cache(key)
+                if kp is not None:
+                    existing_keyed.append(kp)
+            for key in keys_without_hash:
+                # No simhash — cannot probe; use cache as ground truth.
+                kp = self._safe_kp_from_cache(key)
+                if kp is not None:
+                    existing_keyed.append(kp)
+        else:
+            # SIMULATE: read from cache — no model.generate calls.
+            for key in existing_tier_keys:
+                qa = self.store.get(key)
+                if qa is not None:
+                    first_seen = qa.get("first_seen_cycle", self.cycle_count)
+                    existing_keyed.append(
+                        {
+                            "key": key,
+                            "subject": qa["subject"],
+                            "predicate": qa["predicate"],
+                            "object": qa["object"],
+                            "speaker_id": qa.get("speaker_id", speaker_id),
+                            "first_seen_cycle": first_seen,
+                        }
+                    )
 
-        if not episodic_keyed:
-            return
+        return existing_keyed + new_keyed
 
-        self.store.replace_simhashes_in_tier("episodic", build_registry(episodic_keyed))
-        logger.info("Simulated episodic: %d keys registered", len(episodic_keyed))
-
-    def _simulate_indexed_key_procedural(
+    def _prepare_procedural_keys_for_tier(
         self,
-        procedural_relations: list[dict],
+        rels: list[dict],
         speaker_id: str,
-    ) -> None:
-        """Simulate counterpart of _run_indexed_key_procedural.
+        *,
+        mode: "Literal['simulate', 'train']",
+    ) -> list[dict]:
+        """Assign new procedural keys and gather existing keys for retraining.
 
-        Assigns keys directly from relation dicts — no ``model.generate``
-        calls.  Applies the same contradiction retirement and registers new
-        keys.  No deferred-mutation discipline is needed here because there
-        is no ``train_adapter`` call that can fail.
+        Symmetric counterpart of :meth:`_prepare_episodic_keys_for_tier` for
+        the procedural tier.  Always targets the stable ``"procedural"`` main
+        adapter — there is no interim tier for procedural.
+
+        Deferred-mutation discipline (TRAIN mode):
+            Contradiction detection and sp_index / store mutations are applied
+            tentatively before the train call in
+            :meth:`run_consolidation_cycle`.  The index counter
+            (``_procedural_next_index``) is advanced only after this helper
+            returns successfully.
+
+        Simulate mode:
+            Applies contradiction retirement and writes the store immediately
+            (no train call can fail so no deferral is needed).
 
         Args:
-            procedural_relations: Pre-filtered preference relations.
-            speaker_id: Fallback speaker scope for contradiction keying.
-                Required — callers must always supply a real speaker ID.
-        """
-        if not procedural_relations:
-            return
+            rels: Pre-extracted procedural relation dicts, already tagged with
+                ``speaker_id`` by ``_tag_speaker_id_defaults``.
+            speaker_id: Fallback speaker tag for new keys missing one.
+            mode: ``"train"`` or ``"simulate"``.
 
-        logger.info("Simulated procedural: %d relations", len(procedural_relations))
+        Returns:
+            ``(new_keyed, existing_keyed, keys_to_retire, new_sp_mappings)``
+            as a 4-tuple so ``run_consolidation_cycle`` can apply post-train
+            deferred mutations atomically.
+
+            - ``new_keyed``: cache-entry dicts for the new procedural keys.
+            - ``existing_keyed``: reconstructed / cache-read dicts for existing
+              procedural keys that survive retirement.
+            - ``keys_to_retire``: old keys to delete after training succeeds
+              (TRAIN mode only — simulate deletes immediately).
+            - ``new_sp_mappings``: ``sp_key -> new_key`` entries for
+              ``procedural_sp_index`` (TRAIN mode only — simulate writes immediately).
+        """
+        if not rels:
+            return [], [], [], {}
+
+        logger.info("_prepare_procedural_keys_for_tier: %d relations (mode=%s)", len(rels), mode)
+
+        tentative_next = self._procedural_next_index
+        entries_keyed = assign_keys(
+            [(r["subject"], r["predicate"], r["object"]) for r in rels],
+            start_index=tentative_next,
+            prefix="proc",
+        )
+        tentative_next += len(entries_keyed)
 
         new_keyed: list[dict] = []
-
-        entries_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in procedural_relations],
-            start_index=self._procedural_next_index,
-            prefix="proc",
-        )
-        self._procedural_next_index += len(entries_keyed)
         for i, kp in enumerate(entries_keyed):
-            rel = procedural_relations[i] if i < len(procedural_relations) else {}
+            rel = rels[i] if i < len(rels) else {}
             rel_speaker = rel.get("speaker_id", speaker_id)
             new_keyed.append(
                 self._cache_entry(
@@ -1164,245 +1343,10 @@ class ConsolidationLoop:
                 )
             )
 
-        # sp_key reads uniform-shape names (subject/predicate).
-        for kp in new_keyed:
-            sp_key = (
-                kp["speaker_id"],
-                kp["subject"].lower(),
-                kp["predicate"].lower(),
-            )
-            old_key = self.procedural_sp_index.get(sp_key)
-            if old_key and self.store.has_simhash("procedural", old_key):
-                logger.info("Simulated procedural contradiction: retiring %s", old_key)
-                self.store.delete(old_key)
-
-        for kp in new_keyed:
-            fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
-            self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
-            sp_key = (
-                kp["speaker_id"],
-                kp["subject"].lower(),
-                kp["predicate"].lower(),
-            )
-            self.procedural_sp_index[sp_key] = kp["key"]
-
-    def prepare_training_data(
-        self,
-        all_episodic_rels: list[dict],
-        all_procedural_relations: list[dict],
-        speaker_id: str,
-    ) -> list[tuple[str, list[dict]]]:
-        """Prepare keyed pairs for background training without training.
-
-        Does key assignment, reconstruction, contradiction detection.
-        Returns list of (adapter_name, entries) tuples ready for training.
-
-        State is snapshotted before preparation. Call rollback_preparation()
-        if training fails to restore pre-preparation state.
-
-        Args:
-            all_episodic_rels: Deduplicated episodic relations for this cycle.
-            all_procedural_relations: Deduplicated procedural relations.
-            speaker_id: Fallback speaker scope for procedural contradiction
-                detection. Required — callers must always supply a real ID.
-        """
-        # Snapshot mutable state for rollback on training failure
-
-        self._prep_snapshot = {
-            "cycle_count": self.cycle_count,
-            "indexed_next_index": self._indexed_next_index,
-            "procedural_next_index": self._procedural_next_index,
-            "store": self.store.snapshot(),
-            "procedural_sp_index": dict(self.procedural_sp_index),
-        }
-
-        self.cycle_count += 1
-        jobs = []
-
-        if not self.store.replay_enabled:
-            logger.warning("No indexed key registry — skipping preparation")
-            return jobs
-
-        # --- EPISODIC: assign keys + reconstruct ---
-        if all_episodic_rels:
-            episodic_keyed = self._prepare_episodic_keys(all_episodic_rels)
-            if episodic_keyed:
-                jobs.append(("episodic", episodic_keyed))
-
-        # --- SEMANTIC: collect promoted keys ---
-        semantic_keyed = self._collect_semantic_keys()
-        if semantic_keyed:
-            jobs.append(("semantic", semantic_keyed))
-
-        # --- PROCEDURAL: assign + reconstruct ---
-        if self.procedural_config is not None and all_procedural_relations:
-            procedural_keyed = self._prepare_procedural_keys(all_procedural_relations, speaker_id)
-            if procedural_keyed:
-                jobs.append(("procedural", procedural_keyed))
-
-        return jobs
-
-    def rollback_preparation(self) -> None:
-        """Restore state to before prepare_training_data was called.
-
-        Called when background training fails to ensure no stale keys
-        remain in the registry or QA store.
-        """
-        snap = getattr(self, "_prep_snapshot", None)
-        if snap is None:
-            logger.warning("No preparation snapshot to roll back")
-            return
-
-        self.cycle_count = snap["cycle_count"]
-        self._indexed_next_index = snap["indexed_next_index"]
-        self._procedural_next_index = snap["procedural_next_index"]
-        self.store.restore(snap["store"])
-        self.procedural_sp_index = snap["procedural_sp_index"]
-        self._prep_snapshot = None
-        logger.info("Preparation state rolled back")
-
-    def _prepare_episodic_keys(self, session_entries: list[dict]) -> list[dict]:
-        """Assign keys and reconstruct existing episodic keys.
-
-        ``session_entries`` contains relation dicts (``subject``, ``predicate``,
-        ``object``).  The cache is written via ``_cache_entry``; the returned
-        training-list entries have the canonical shape
-        ``{key, subject, predicate, object}``.
-
-        Returns the full keyed pair list ready for training.
-        Does NOT train — caller handles that.
-        """
-        switch_adapter(self.model, "episodic")
-        self._disable_gradient_checkpointing()
-
-        # Assign keys to new session relation dicts
-        new_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in session_entries],
-            start_index=self._indexed_next_index,
-            prefix="graph",
-        )
-        for i, kp in enumerate(new_keyed):
-            rel = session_entries[i] if i < len(session_entries) else {}
-            self.store.put(
-                "episodic",
-                kp["key"],
-                self._cache_entry(
-                    key=kp["key"],
-                    subject=kp["subject"],
-                    predicate=kp["predicate"],
-                    object=kp["object"],
-                    speaker_id=rel.get("speaker_id", ""),
-                    first_seen_cycle=self.cycle_count,
-                ),
-            )
-        self._indexed_next_index += len(new_keyed)
-
-        # Reconstruct existing episodic keys from adapter weights
-        active_keys = self._all_active_keys()
+        # Compute intended mutations (sp_key contradiction check).
+        keys_to_retire: list[str] = []
+        new_sp_mappings: dict[tuple, str] = {}
         new_key_set = {kp["key"] for kp in new_keyed}
-        existing_keys = [k for k in active_keys if k.startswith("graph") and k not in new_key_set]
-
-        reconstructed = {}
-        for key in existing_keys:
-            recalled = probe_entry(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=self.store.simhashes_in_tier("episodic"),
-                confidence_threshold=0.5,
-            )
-            if recalled is not None and "failure_reason" not in recalled:
-                reconstructed[key] = {
-                    "key": key,
-                    "subject": recalled["subject"],
-                    "predicate": recalled["predicate"],
-                    "object": recalled["object"],
-                }
-
-        logger.info(
-            "Episodic key reconstruction: %d/%d recovered",
-            len(reconstructed),
-            len(existing_keys),
-        )
-
-        # Build full keyed pair list.  When probe fails AND the cache only
-        # carries a partial entry from the boot-time key_metadata.json seed
-        # (speaker_id + first_seen_cycle, no content), drop the key
-        # silently rather than crash with KeyError.
-        episodic_keyed = []
-        for key in existing_keys:
-            if key in reconstructed:
-                episodic_keyed.append(reconstructed[key])
-                continue
-            kp = self._safe_kp_from_cache(key)
-            if kp is not None:
-                episodic_keyed.append(kp)
-        episodic_keyed.extend(new_keyed)
-
-        return episodic_keyed
-
-    def _collect_semantic_keys(self) -> list[dict]:
-        """Collect all semantic keys for training.
-
-        Returns training-list entries with the canonical shape
-        ``{key, subject, predicate, object}``.
-        """
-        if not self.store.simhashes_in_tier("semantic"):
-            return []
-
-        semantic_keyed = []
-        for key in self.store.simhashes_in_tier("semantic"):
-            qa = self.store.get(key)
-            if qa is not None:
-                semantic_keyed.append(
-                    {
-                        "key": key,
-                        "subject": qa["subject"],
-                        "predicate": qa["predicate"],
-                        "object": qa["object"],
-                    }
-                )
-        return semantic_keyed
-
-    def _prepare_procedural_keys(
-        self, procedural_relations: list[dict], speaker_id: str
-    ) -> list[dict]:
-        """Assign and reconstruct procedural keys.
-
-        Expects pre-filtered preference relations.  Keys are assigned directly
-        from relation dicts; no ``model.generate`` calls.
-
-        Returns the full keyed pair list ready for training with shape
-        ``{key, subject, predicate, object}``.
-        """
-        if not procedural_relations:
-            return []
-
-        logger.info("Found %d procedural relations", len(procedural_relations))
-
-        new_keyed = []
-
-        entries_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in procedural_relations],
-            start_index=self._procedural_next_index,
-            prefix="proc",
-        )
-        self._procedural_next_index += len(entries_keyed)
-        for i, kp in enumerate(entries_keyed):
-            rel = procedural_relations[i] if i < len(procedural_relations) else {}
-            rel_speaker = rel.get("speaker_id", speaker_id)
-            new_keyed.append(
-                self._cache_entry(
-                    key=kp["key"],
-                    subject=kp["subject"],
-                    predicate=kp["predicate"],
-                    object=kp["object"],
-                    speaker_id=rel_speaker,
-                    first_seen_cycle=self.cycle_count,
-                )
-            )
-
-        # Contradiction check — sp_key reads uniform-shape names in both modes.
         for kp in new_keyed:
             sp_key = (
                 kp["speaker_id"],
@@ -1411,62 +1355,76 @@ class ConsolidationLoop:
             )
             old_key = self.procedural_sp_index.get(sp_key)
             if old_key and self.store.has_simhash("procedural", old_key):
-                logger.info("Procedural contradiction: retiring %s", old_key)
+                keys_to_retire.append(old_key)
+            new_sp_mappings[sp_key] = kp["key"]
+
+        if mode == "simulate":
+            # Apply mutations immediately — no train call that can fail.
+            for old_key in keys_to_retire:
+                logger.info("_prepare_procedural_keys_for_tier: retiring %s (simulate)", old_key)
                 self.store.delete(old_key)
+            for kp in new_keyed:
+                fingerprint = compute_simhash(
+                    kp["key"], kp["subject"], kp["predicate"], kp["object"]
+                )
+                self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
+            for sp_key, new_key in new_sp_mappings.items():
+                self.procedural_sp_index[sp_key] = new_key
+            self._procedural_next_index = tentative_next
+            return new_keyed, [], [], {}
 
-        # Store new keys — sp_key reads uniform-shape names.
-        for kp in new_keyed:
-            self.store.put("procedural", kp["key"], kp)
-            sp_key = (
-                kp["speaker_id"],
-                kp["subject"].lower(),
-                kp["predicate"].lower(),
-            )
-            self.procedural_sp_index[sp_key] = kp["key"]
-
-        # Reconstruct existing procedural keys
-        switch_adapter(self.model, "procedural")
-        self._disable_gradient_checkpointing()
-
-        existing_keys = [
+        # TRAIN mode: gather existing keys for reconstruction (deferred mutations).
+        retired_set = set(keys_to_retire)
+        existing_proc_keys = [
             k
             for k in self.store.simhashes_in_tier("procedural")
-            if k not in {kp["key"] for kp in new_keyed}
+            if k not in new_key_set and k not in retired_set
         ]
-        reconstructed = {}
-        for key in existing_keys:
+
+        self._disable_gradient_checkpointing()
+        proc_simhash = self.store.simhashes_in_tier("procedural")
+        reconstructed: dict[str, dict] = {}
+        for key in existing_proc_keys:
             recalled = probe_entry(
                 self.model,
                 self.tokenizer,
                 key,
-                registry=self.store.simhashes_in_tier("procedural"),
+                registry=proc_simhash,
                 confidence_threshold=0.5,
             )
             if recalled is not None and "failure_reason" not in recalled:
+                cached = self.store.get(key) or {}
                 reconstructed[key] = {
                     "key": key,
                     "subject": recalled["subject"],
                     "predicate": recalled["predicate"],
                     "object": recalled["object"],
+                    "speaker_id": cached.get("speaker_id", speaker_id),
+                    "first_seen_cycle": cached.get("first_seen_cycle", self.cycle_count),
                 }
 
         logger.info(
-            "Procedural key reconstruction: %d/%d recovered",
+            "_prepare_procedural_keys_for_tier: reconstruction %d/%d",
             len(reconstructed),
-            len(existing_keys),
+            len(existing_proc_keys),
         )
 
-        all_procedural = []
-        for key in existing_keys:
+        existing_keyed: list[dict] = []
+        for key in existing_proc_keys:
             if key in reconstructed:
-                all_procedural.append(reconstructed[key])
+                existing_keyed.append(reconstructed[key])
                 continue
             kp = self._safe_kp_from_cache(key)
             if kp is not None:
-                all_procedural.append(kp)
-        all_procedural.extend(new_keyed)
+                existing_keyed.append(kp)
 
-        return all_procedural
+        # Commit the counter ONLY if we return successfully (train path
+        # does not advance the counter here — it is advanced in
+        # run_consolidation_cycle after train_adapter returns).
+        # Store tentative_next on self so the caller can commit it.
+        self._procedural_tentative_next_index = tentative_next
+
+        return new_keyed, existing_keyed, keys_to_retire, new_sp_mappings
 
     def finalize_training(self) -> None:
         """Save adapters and registries after background training completes."""
@@ -1595,24 +1553,39 @@ class ConsolidationLoop:
         promote_qa: list[dict] = []
 
         # --- 4b. INDEXED KEY REPLAY (F4.9c validated) ---
+        # Delegate to run_consolidation_cycle (unified episodic + procedural
+        # pipeline) so experiments exercise the same code path as production.
+        # cycle_count was already incremented at the top of this method; pass
+        # stamp=None so run_consolidation_cycle computes a fresh sub-interval
+        # stamp and does NOT double-increment (it increments internally).
+        # Caller undoes the pre-increment so run_consolidation_cycle owns the
+        # authoritative count for this cycle.
         if self.store.replay_enabled:
-            episodic_loss = self._run_indexed_key_episodic(episodic_rels, new_promotions)
-            if episodic_loss is not None:
-                result.episodic_train_loss = episodic_loss
+            # Undo the cycle_count increment done at the top of run_cycle so
+            # run_consolidation_cycle's own increment lands on the correct value.
+            self.cycle_count -= 1
+            cycle_result = self.run_consolidation_cycle(
+                episodic_rels,
+                procedural_rels,
+                speaker_id=speaker_id,
+                mode="train",
+                run_label=session_id,
+                new_promotions=new_promotions if new_promotions else None,
+            )
+            # cycle_count is now managed by run_consolidation_cycle.
+            # Propagate per-tier train losses from the cycle result dict.
+            _epi_loss = cycle_result.get("episodic_train_loss")
+            _proc_loss = cycle_result.get("procedural_train_loss")
+            if _epi_loss is not None:
+                result.episodic_train_loss = _epi_loss
+            if _proc_loss is not None:
+                result.procedural_train_loss = _proc_loss
 
             if new_promotions:
                 semantic_loss = self._run_indexed_key_semantic(new_promotions)
                 if semantic_loss is not None:
                     result.semantic_train_loss = semantic_loss
                 self.promoted_nodes.update(new_promotions)
-
-            # --- 4c. PROCEDURAL (behavioral preferences) ---
-            if self.procedural_config is not None and procedural_rels:
-                procedural_loss = self._run_indexed_key_procedural(
-                    procedural_rels, speaker_id=speaker_id
-                )
-                if procedural_loss is not None:
-                    result.procedural_train_loss = procedural_loss
         else:
             # --- 4b-alt. CURRICULUM PROBE (optional) ---
             episodic_recall_scores: dict[str, float] = {}
@@ -1693,155 +1666,6 @@ class ConsolidationLoop:
 
         return result
 
-    def _run_indexed_key_episodic(
-        self,
-        session_entries: list[dict],
-        new_promotions: list[str],
-    ) -> Optional[float]:
-        """Run indexed key replay for the episodic adapter.
-
-        1. Assign graphN keys to new session relations
-        2. Probe existing episodic keys → reconstruct from adapter weights
-        3. Transfer promoted keys to semantic (remove from episodic)
-        4. Build training data from all active episodic keys
-        5. Train episodic adapter
-        6. Update SimHash registry
-        7. Retire stale keys on reconstruction cycles
-        """
-        switch_adapter(self.model, "episodic")
-        self._disable_gradient_checkpointing()
-
-        # Assign keys to new session relation dicts
-        new_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in session_entries],
-            start_index=self._indexed_next_index,
-            prefix="graph",
-        )
-        for i, kp in enumerate(new_keyed):
-            rel = session_entries[i] if i < len(session_entries) else {}
-            self.store.put(
-                "episodic",
-                kp["key"],
-                self._cache_entry(
-                    key=kp["key"],
-                    subject=kp["subject"],
-                    predicate=kp["predicate"],
-                    object=kp["object"],
-                    speaker_id=rel.get("speaker_id", ""),
-                    first_seen_cycle=self.cycle_count,
-                ),
-            )
-        self._indexed_next_index += len(new_keyed)
-
-        # Promote keys for promoted entities (move to semantic before episodic training)
-        # Check both subject and object — reverse QA templates swap subject/object,
-        # so a promoted entity may appear in either field.
-        promoted_keys = []
-        if new_promotions:
-            promoted_set = {n.lower() for n in new_promotions}
-            for _tier, key, qa_info in list(self.store.iter_entries()):
-                if key.startswith("proc"):
-                    continue  # Procedural keys never promote
-                subject = qa_info.get("subject", "").lower()
-                obj = qa_info.get("object", "").lower()
-                mentions_promoted = (subject and subject in promoted_set) or (
-                    obj and obj in promoted_set
-                )
-                if mentions_promoted and not self.store.has_simhash("semantic", key):
-                    promoted_keys.append(key)
-
-        # Reconstruct existing episodic keys from adapter weights
-        active_keys = self._all_active_keys()
-        # Only episodic keys (graph prefix), exclude new and promoted
-        new_key_set = {kp["key"] for kp in new_keyed}
-        promoted_key_set = set(promoted_keys)
-        existing_keys = [
-            k
-            for k in active_keys
-            if k.startswith("graph") and k not in new_key_set and k not in promoted_key_set
-        ]
-
-        reconstructed = {}
-        for key in existing_keys:
-            recalled = probe_entry(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=self.store.simhashes_in_tier("episodic"),
-                confidence_threshold=0.5,
-            )
-            if recalled is not None and "failure_reason" not in recalled:
-                reconstructed[key] = {
-                    "key": key,
-                    "subject": recalled["subject"],
-                    "predicate": recalled["predicate"],
-                    "object": recalled["object"],
-                }
-
-        logger.info(
-            "Indexed key reconstruction: %d/%d existing keys recovered",
-            len(reconstructed),
-            len(existing_keys),
-        )
-
-        # Build full episodic keyed pair set
-        episodic_keyed = []
-
-        # Add reconstructed existing keys.  Cache-fallback is safe: partial
-        # boot-time seeds (speaker_id + first_seen_cycle only) are skipped
-        # rather than crashing the cycle with KeyError on missing fields.
-        for key in existing_keys:
-            if key in reconstructed:
-                episodic_keyed.append(reconstructed[key])
-                continue
-            kp = self._safe_kp_from_cache(key)
-            if kp is not None:
-                episodic_keyed.append(kp)
-
-        # Add new session keys
-        episodic_keyed.extend(new_keyed)
-
-        # Remove promoted keys from episodic, move to semantic registry.
-        # MemoryStore.move handles entry+simhash+registry atomically.
-        for key in promoted_keys:
-            self.store.move(key, "semantic")
-
-        if not episodic_keyed:
-            return None
-
-        # Format and train
-        examples = format_entry_training(episodic_keyed, self.tokenizer, max_length=1024)
-        dataset = self._indexed_dataset(examples)
-        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
-        self._enable_gradient_checkpointing()
-
-        recall_cb = self._maybe_make_recall_callback(
-            entries=episodic_keyed,
-            adapter_name="episodic",
-            output_dir=self._training_output_dir("episodic"),
-            phase_name=f"phase4-episodic-cycle{self.cycle_count}",
-        )
-
-        metrics = train_adapter(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            train_dataset=dataset,
-            adapter_name="episodic",
-            training_config=training_config,
-            adapter_config=self.episodic_config,
-            wandb_config=self.wandb_config,
-            output_dir=self._training_output_dir("episodic"),
-            run_name=f"phase4-indexed-episodic-cycle{self.cycle_count}",
-            thermal_policy=self._thermal_policy,
-            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
-            callbacks_extra=[recall_cb] if recall_cb is not None else None,
-        )
-
-        # Update episodic SimHash registry from ground-truth pairs
-        self.store.replace_simhashes_in_tier("episodic", build_registry(episodic_keyed))
-
-        return metrics.get("train_loss")
-
     def _run_indexed_key_semantic(
         self,
         new_promotions: list[str],
@@ -1851,7 +1675,7 @@ class ConsolidationLoop:
         Collects all keys that belong to promoted entities and trains
         the semantic adapter on them with the indexed format.
         """
-        # Collect promoted keys (already transferred in _run_indexed_key_episodic)
+        # Collect promoted keys (already transferred in the run_cycle episodic block)
         promoted_set = {n.lower() for n in new_promotions}
         semantic_keyed = []
         # Loop A — newly-promoted keys
@@ -1915,204 +1739,6 @@ class ConsolidationLoop:
 
         # Update semantic SimHash registry
         self.store.replace_simhashes_in_tier("semantic", build_registry(semantic_keyed))
-
-        return metrics.get("train_loss")
-
-    def _run_indexed_key_procedural(
-        self,
-        procedural_relations: list[dict],
-        speaker_id: str,
-    ) -> Optional[float]:
-        """Train procedural adapter on preference/habit relations.
-
-        Expects pre-filtered preference relations (caller runs
-        partition_relations before passing).
-
-        Same mechanism as episodic: reconstruct existing keys from adapter
-        weights, add new keys, retrain the full set. Knowledge lives in
-        the weights.
-
-        Contradiction handling: when a new preference shares the same
-        (speaker_id, subject, predicate) as an existing key, the old key
-        is retired and replaced.
-
-        Registry/index invariant: all mutations to ``procedural_simhash``,
-        ``indexed_key_cache``, ``indexed_key_registry``, and
-        ``procedural_sp_index`` are deferred until **after**
-        ``train_adapter`` returns successfully.  If training raises, shared
-        state is left unchanged so the caller can safely retry or skip.
-
-        Args:
-            procedural_relations: Pre-filtered preference relations.
-            speaker_id: Fallback speaker scope for contradiction keying.
-                Required — callers must always supply a real speaker ID.
-        """
-        if not procedural_relations:
-            return None
-
-        logger.info(
-            "Found %d procedural relations",
-            len(procedural_relations),
-        )
-
-        # Assign keys with proc prefix — use per-relation speaker_id.
-        # Use a local tentative counter so self._procedural_next_index is not
-        # advanced until after train_adapter returns successfully.  If training
-        # raises, the index slots are not burned and a retry will reuse them.
-        new_keyed = []
-        tentative_next_index = self._procedural_next_index
-
-        entries_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in procedural_relations],
-            start_index=tentative_next_index,
-            prefix="proc",
-        )
-        tentative_next_index += len(entries_keyed)
-        for i, kp in enumerate(entries_keyed):
-            rel = procedural_relations[i] if i < len(procedural_relations) else {}
-            rel_speaker = rel.get("speaker_id", speaker_id)
-            new_keyed.append(
-                self._cache_entry(
-                    key=kp["key"],
-                    subject=kp["subject"],
-                    predicate=kp["predicate"],
-                    object=kp["object"],
-                    speaker_id=rel_speaker,
-                    first_seen_cycle=self.cycle_count,
-                )
-            )
-
-        if not new_keyed:
-            return None
-
-        # Compute intended mutations without touching shared state yet.
-        # keys_to_retire: old contradicted keys that will be removed on success.
-        # new_sp_mappings: (sp_key -> new_key) entries for procedural_sp_index.
-        # sp_key reads from uniform-shape names (subject/predicate in both modes).
-        keys_to_retire: list[str] = []
-        new_sp_mappings: dict[tuple, str] = {}
-        new_key_set = {kp["key"] for kp in new_keyed}
-        for kp in new_keyed:
-            sp_key = (
-                kp["speaker_id"],
-                kp["subject"].lower(),
-                kp["predicate"].lower(),
-            )
-            old_key = self.procedural_sp_index.get(sp_key)
-            if old_key and self.store.has_simhash("procedural", old_key):
-                logger.info(
-                    "Procedural contradiction: retiring %s for %s",
-                    old_key,
-                    sp_key,
-                )
-                keys_to_retire.append(old_key)
-            new_sp_mappings[sp_key] = kp["key"]
-
-        # Reconstruct existing procedural keys from adapter weights.
-        # existing_keys excludes both new keys and keys scheduled for retirement
-        # so the training set is identical to what a post-commit read would see.
-        retired_set = set(keys_to_retire)
-        switch_adapter(self.model, "procedural")
-        self._disable_gradient_checkpointing()
-
-        existing_keys = [
-            k
-            for k in self.store.simhashes_in_tier("procedural")
-            if k not in new_key_set and k not in retired_set
-        ]
-        reconstructed = {}
-        for key in existing_keys:
-            recalled = probe_entry(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=self.store.simhashes_in_tier("procedural"),
-                confidence_threshold=0.5,
-            )
-            if recalled is not None and "failure_reason" not in recalled:
-                reconstructed[key] = {
-                    "key": key,
-                    "subject": recalled["subject"],
-                    "predicate": recalled["predicate"],
-                    "object": recalled["object"],
-                }
-
-        logger.info(
-            "Procedural key reconstruction: %d/%d existing keys recovered",
-            len(reconstructed),
-            len(existing_keys),
-        )
-
-        # Build full procedural training set from reconstructed + fallback + new.
-        # ``_safe_kp_from_cache`` returns ``None`` for partial cache entries
-        # (boot-time seed without content fields) so the cycle survives a
-        # probe-failed-AND-cache-partial state instead of crashing with
-        # ``KeyError: 'subject'``.
-        all_procedural = []
-        for key in existing_keys:
-            if key in reconstructed:
-                all_procedural.append(reconstructed[key])
-                continue
-            kp = self._safe_kp_from_cache(key)
-            if kp is not None:
-                all_procedural.append(kp)
-        all_procedural.extend(new_keyed)
-
-        if not all_procedural:
-            return None
-
-        logger.info(
-            "Training procedural adapter on %d keys (%d new)",
-            len(all_procedural),
-            len(new_keyed),
-        )
-
-        examples = format_entry_training(all_procedural, self.tokenizer, max_length=1024)
-        dataset = self._indexed_dataset(examples)
-        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
-        self._enable_gradient_checkpointing()
-
-        recall_cb = self._maybe_make_recall_callback(
-            entries=all_procedural,
-            adapter_name="procedural",
-            output_dir=self._training_output_dir("procedural"),
-            phase_name=f"phase4-procedural-cycle{self.cycle_count}",
-        )
-
-        # train_adapter may raise — shared state must not have been mutated yet.
-        metrics = train_adapter(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            train_dataset=dataset,
-            adapter_name="procedural",
-            training_config=training_config,
-            adapter_config=self.procedural_config,
-            wandb_config=self.wandb_config,
-            output_dir=self._training_output_dir("procedural"),
-            run_name=f"phase4-indexed-procedural-cycle{self.cycle_count}",
-            thermal_policy=self._thermal_policy,
-            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
-            callbacks_extra=[recall_cb] if recall_cb is not None else None,
-        )
-
-        # Training succeeded — apply all deferred mutations atomically.
-        # 1. Commit the next-index counter now that key slots are confirmed used.
-        self._procedural_next_index = tentative_next_index
-
-        # 2. Retire contradicted keys from all indexes.
-        for old_key in keys_to_retire:
-            self.store.delete(old_key)
-
-        # 3. Register new pairs, update sp_index, and add simhash entries.
-        #    Explicit incremental mutations keep all three store layers
-        #    (entry, simhash, registry) consistent — no full reconstruction
-        #    needed, since existing-key hashes are unchanged (compute_simhash
-        #    is deterministic).
-        for kp in new_keyed:
-            fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
-            self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
-        for sp_key, new_key in new_sp_mappings.items():
-            self.procedural_sp_index[sp_key] = new_key
 
         return metrics.get("train_loss")
 
@@ -2366,23 +1992,25 @@ class ConsolidationLoop:
                 tier_payloads[_tier_name] = (_payload, _hashlib.sha256(_payload).hexdigest())
         total_key_count = len(self._all_active_keys()) if self.store.replay_enabled else None
 
-        def _build(name: str) -> "object | None":
+        def _build(name: str) -> "object":
             # Use the tier's own registry hash when available.
+            # A manifest failure is a load-bearing bug — the slot becomes
+            # unmountable because find_live_slot cannot match the registry
+            # hash.  Let the exception propagate to the caller so sessions
+            # stay pending and are retried rather than silently losing the
+            # manifest.
             _sha = tier_payloads.get(name, (None, None))[1]
-            try:
-                return build_manifest_for(
-                    self.model,
-                    self.tokenizer,
-                    name,
-                    registry_path=None,
-                    key_count=total_key_count,
-                    base_model_hash_cache=fingerprint_cache,
-                    registry_sha256_override=_sha,
-                    window_stamp=full_window_stamp,
-                    adapter_root=self.output_dir,
-                )
-            except Exception:  # noqa: BLE001
-                return None
+            return build_manifest_for(
+                self.model,
+                self.tokenizer,
+                name,
+                registry_path=None,
+                key_count=total_key_count,
+                base_model_hash_cache=fingerprint_cache,
+                registry_sha256_override=_sha,
+                window_stamp=full_window_stamp,
+                adapter_root=self.output_dir,
+            )
 
         def _entries_for_tier(simhash_registry: dict) -> list[dict]:
             """Return the entries list for one adapter tier.
@@ -2533,17 +2161,18 @@ class ConsolidationLoop:
           ``<output_dir>/episodic/interim_<stamp>/``
         - Full cycle, ``adapter_name in {episodic, semantic, procedural}``:
           ``<output_dir>/<adapter_name>/cycle_<N>/``
-        - Interim cycle (``_current_interim_stamp`` set), tier-level adapter:
-          ``<output_dir>/<adapter_name>/interim_<stamp>/``
+        - Interim cycle (stamp explicit via ``interim_stamp`` kwarg), tier-level
+          adapter: ``<output_dir>/<adapter_name>/interim_<stamp>/``
 
         Args:
             adapter_name: The PEFT adapter being trained.  One of
                 ``"episodic"``, ``"semantic"``, ``"procedural"``, or
                 ``"episodic_interim_<stamp>"``.
-            interim_stamp: Optional YYYYMMDDTHHMM stamp used by
-                ``post_session_train`` to thread the stamp into helper
-                methods that don't accept it directly.  Also resolved from
-                ``self._current_interim_stamp`` when not passed explicitly.
+            interim_stamp: Optional YYYYMMDDTHHMM stamp passed directly by
+                callers (e.g. ``run_consolidation_cycle`` → ``_run_indexed_key_procedural``).
+                The ``_current_interim_stamp`` instance-attribute fallback is
+                preserved for backward-compat but is always ``None`` now that
+                the attribute is never set.
 
         Returns:
             Absolute :class:`~pathlib.Path` to give HF Trainer.
@@ -2660,99 +2289,240 @@ class ConsolidationLoop:
             len(episodic_rels),
         )
 
-        return self._train_extracted_into_interim(
+        return self.run_consolidation_cycle(
             episodic_rels,
             procedural_rels,
-            run_label=session_id,
             speaker_id=speaker_id,
+            mode="train",
+            run_label=session_id,
             schedule=schedule,
             max_interim_count=max_interim_count,
             stamp=stamp,
             recall_sanity_threshold=recall_sanity_threshold,
         )
 
-    def _train_extracted_into_interim(
+    def _run_indexed_key_procedural(
+        self,
+        rels: list[dict],
+        speaker_id: str,
+        *,
+        mode: "Literal['simulate', 'train']" = "train",
+        stamp: "str | None" = None,
+        run_label: str = "interim",
+    ) -> Optional[float]:
+        """Train (or simulate) the procedural adapter on *rels*.
+
+        Called by :meth:`run_consolidation_cycle` (primary) and the legacy
+        :meth:`run_cycle` path.  The method is extracted (rather than inlined)
+        so tests can patch it at the instance level to intercept the call.
+
+        All context that formerly leaked through instance attributes
+        (``_current_run_mode``, ``_current_run_label``, ``_current_interim_stamp``)
+        is now passed as explicit keyword arguments, eliminating the
+        set-before-call / clear-in-finally smuggling pattern.
+
+        Args:
+            rels: Deduplicated procedural relations for this cycle, already
+                tagged with ``speaker_id`` by ``_tag_speaker_id_defaults``.
+            speaker_id: Fallback speaker scope for contradiction detection.
+            mode: ``"train"`` writes adapter weights; ``"simulate"`` writes
+                sidecar JSON registry without touching PEFT.  Default ``"train"``.
+            stamp: Sub-interval stamp forwarded to ``_training_output_dir`` via
+                the ``interim_stamp`` parameter.  ``None`` when not called from
+                an interim cycle.
+            run_label: Tag woven into the wandb ``run_name`` for traceability.
+                Default ``"interim"``.
+
+        Returns:
+            Train loss as ``float`` if training ran, otherwise ``None``.
+        """
+        if not rels:
+            return None
+
+        # Local import alias so tests can patch paramem.training.trainer.train_adapter.
+        from paramem.training.trainer import train_adapter as _train_adapter
+
+        if mode == "train":
+            switch_adapter(self.model, "procedural")
+        new_proc_keyed, existing_proc_keyed, keys_to_retire, new_sp_mappings = (
+            self._prepare_procedural_keys_for_tier(rels, speaker_id, mode=mode)
+        )
+        all_procedural = existing_proc_keyed + new_proc_keyed
+        if not (mode == "train" and all_procedural):
+            return None
+        examples = format_entry_training(all_procedural, self.tokenizer, max_length=1024)
+        dataset = self._indexed_dataset(examples)
+        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
+        self._enable_gradient_checkpointing()
+        recall_cb = self._maybe_make_recall_callback(
+            entries=all_procedural,
+            adapter_name="procedural",
+            output_dir=self._training_output_dir("procedural", interim_stamp=stamp),
+            phase_name=f"interim-procedural-{run_label}",
+        )
+        proc_metrics = _train_adapter(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            train_dataset=dataset,
+            adapter_name="procedural",
+            training_config=training_config,
+            adapter_config=self.procedural_config,
+            wandb_config=self.wandb_config,
+            output_dir=self._training_output_dir("procedural", interim_stamp=stamp),
+            run_name=f"interim-procedural-{run_label}",
+            thermal_policy=self._thermal_policy,
+            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+            callbacks_extra=[recall_cb] if recall_cb is not None else None,
+        )
+        # Deferred mutations — apply only after _train_adapter succeeds.
+        self._procedural_next_index = self._procedural_tentative_next_index
+        for old_key in keys_to_retire:
+            self.store.delete(old_key)
+        for kp in new_proc_keyed:
+            fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
+            self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
+        for sp_key, new_key in new_sp_mappings.items():
+            self.procedural_sp_index[sp_key] = new_key
+        return proc_metrics.get("train_loss") if proc_metrics is not None else None
+
+    def run_consolidation_cycle(
         self,
         episodic_rels: list[dict],
         procedural_rels: list[dict],
         *,
-        run_label: str,
         speaker_id: str,
+        mode: "Literal['simulate', 'train']",
+        run_label: str,
         schedule: str = "",
         max_interim_count: int = 7,
         stamp: str | None = None,
         recall_sanity_threshold: float = 0.95,
+        new_promotions: "list[str] | None" = None,
     ) -> dict:
-        """Train pre-extracted episodic + procedural relations into the interim adapter.
+        """Unified interim-cycle entry: key prep + optional training + I5 persistence.
 
-        Shared by :meth:`post_session_train` (single session) and the
-        scheduled-tick batch path (a window of pending sessions extracted
-        together under one GPU lock then fed in here as a batch).
+        Replaces the former ``_train_extracted_into_interim`` (train) and
+        ``simulated_training`` (simulate) methods.  Both modes execute the same
+        pipeline — the ONLY mode-conditional code is:
 
-        Behaviour is preserved verbatim from the original post_session_train
-        phases 2-final, including I5 atomic registry-write ordering and the
-        ``triples_extracted / new_keys / adapter_name / mode / error`` return
-        shape.  The pre-save in-RAM recall sanity probe has been removed;
-        disk-integrity is gated post-save by ``_save_adapters`` (via
-        ``_verify_saved_adapter_from_disk``).
+        * :meth:`_resolve_target_slot` — slot-selection / cap logic (train-mode
+          only; simulate always mints fresh).
+        * :meth:`_prepare_episodic_keys_for_tier` — reconstruction source (probe
+          weights in train; read cache in simulate).
+        * :func:`paramem.training.memory_persistence.commit_tier_slot` — venue
+          write (train: save adapter weights; simulate: write sidecar JSON).
+
+        Everything else — cycle counter, guards, speaker tagging, enrichment,
+        procedural key prep, simhash update, end-of-cycle adapter switch — is
+        mode-agnostic.
+
+        Internal flow:
+
+        1. ``self.cycle_count += 1``.
+        2. Guard: no registry → early return ``{"status": "skipped", ...}``.
+        3. Guard: no relations → early return ``{"status": "noop", ...}``.
+        4. Tag relations with caller's ``speaker_id`` as default.
+        5. ``_maybe_run_interim_enrichment()`` at sub-interval rollover.
+        6. Compute stamp (when not provided) and call ``_resolve_target_slot``
+           to obtain ``(adapter_name, cap_reached_absorb, queue_only,
+           degenerated_skip)``.
+        7. Handle control-flow branches: queue-only and degenerated-skip.
+        8. Mint PEFT slot (train only); run ``_maybe_run_interim_enrichment``
+           (simulate skips enrichment, train runs it at rollover).
+        9. Prepare episodic key list via ``_prepare_episodic_keys_for_tier``.
+           When *new_promotions* is non-empty, move matching keys from episodic
+           to semantic before training (mirrors the former
+           ``_run_indexed_key_episodic`` promotion-transfer step).
+        10. Train (train mode) or skip training (simulate mode).
+        11. Procedural: ``_prepare_procedural_keys_for_tier`` + train (train) or
+            skip (simulate).
+        12. Persist both tiers via ``commit_tier_slot``.
+        13. Restore ``"episodic"`` as the active adapter (mode-agnostic).
+        14. Return result dict.
 
         Args:
-            episodic_rels: Pre-extracted episodic relations.  Each MAY
-                already carry ``speaker_id``; entries missing it are tagged
-                with the *speaker_id* parameter below.
-            procedural_rels: Pre-extracted procedural relations (trained onto
-                the stable ``procedural`` main adapter — no interim tier).
+            episodic_rels: Pre-extracted episodic relations.  May already carry
+                ``speaker_id``; missing entries are tagged with *speaker_id*.
+            procedural_rels: Pre-extracted procedural relations.  Always trained
+                onto the stable ``"procedural"`` main adapter (no interim tier).
+            speaker_id: Default speaker tag for relations missing one; also
+                used for procedural contradiction scoping.  Required — callers
+                must always supply a real speaker ID.
+            mode: ``"train"`` writes adapter weights; ``"simulate"`` writes
+                sidecar JSON registry without touching PEFT.
             run_label: Tag woven into the wandb ``run_name`` for traceability.
                 Pass ``session_id`` for per-session calls, or
                 ``"tick-<stamp>"`` for batch calls from the scheduled tick.
-            speaker_id: Default speaker tag for relations missing one; also
-                passed through to ``_run_indexed_key_procedural`` for
-                contradiction scoping. Required — callers must always supply
-                a real speaker ID.
-            schedule: Consolidation refresh-cadence string (used to compute
-                the sub-interval stamp when *stamp* is not provided).
-            max_interim_count: Cap on concurrent interim adapters in VRAM.
-                ``0`` → queue-only branch (no interim adapter created).
+            schedule: Consolidation refresh-cadence string used to compute the
+                sub-interval stamp when *stamp* is not provided.
+            max_interim_count: Cap on concurrent interim adapters.
+                ``0`` → queue-until-consolidation branch (RAM-only, no training).
             stamp: Override the computed sub-interval stamp (test injection).
-            recall_sanity_threshold: Forwarded to ``_save_adapters`` for the
-                post-save disk-integrity probe threshold.  The pre-save
-                in-RAM cap-reached-retrain probe has been removed.
+            recall_sanity_threshold: Forwarded to ``commit_tier_slot`` for the
+                post-save disk-integrity probe threshold (train mode only).
+            new_promotions: Optional list of entity names promoted to semantic
+                this cycle.  When non-empty, matching episodic keys are moved to
+                the semantic tier via ``store.move`` before training, so they are
+                excluded from the episodic training set.  Only meaningful in
+                train mode; ignored in simulate mode.
 
         Returns:
-            Result dict: ``{"triples_extracted", "new_keys", "adapter_name",
-            "mode", "error"}``.
+            Result dict with keys ``{"triples_extracted", "new_keys",
+            "adapter_name", "mode", "venue", "error"}``.  ``mode`` is the
+            outcome (``"trained"``, ``"simulated"``, ``"queued"``,
+            ``"degenerated"``, or ``"noop"``); ``venue`` is the training
+            medium (``"train"`` or ``"simulate"``).
         """
-        from paramem.server.interim_adapter import create_interim_adapter
+        from paramem.training.memory_persistence import commit_tier_slot
 
-        _format_training = format_entry_training
-        _build_reg = build_registry
+        # --- 1. Cycle counter ---
+        self.cycle_count += 1
 
-        triples_extracted = len(episodic_rels)
-
-        # --- 2. Noop: no facts extracted ---
-        if triples_extracted == 0:
+        # --- 2. Guard: no registry ---
+        if not self.store.replay_enabled:
+            logger.warning("run_consolidation_cycle: no indexed key registry — skipping")
             return {
                 "triples_extracted": 0,
                 "new_keys": [],
                 "adapter_name": None,
                 "mode": "noop",
+                "venue": mode,
+                "error": "no_registry",
+            }
+
+        triples_extracted = len(episodic_rels)
+
+        # --- 3. Guard: no relations ---
+        if not episodic_rels and not procedural_rels:
+            return {
+                "triples_extracted": 0,
+                "new_keys": [],
+                "adapter_name": None,
+                "mode": "noop",
+                "venue": mode,
                 "error": None,
             }
 
-        # --- 3. Queue branch: max_interim_count == 0 ---
-        if max_interim_count == 0:
-            # Append to RAM queue for the next consolidation cycle (Step 7).
-            # The pending queue is picked up by consolidate() and folded into the
-            # cumulative graph before the main rebuild.  Queue lives in RAM;
-            # snapshot persistence is deferred — matches the privacy invariant
-            # "what isn't trained doesn't exist".
-            # TODO(Step 7): consume self.pending_interim_triples at the start of
-            # consolidate_interim_adapters() before training the full key set.
-            if not hasattr(self, "pending_interim_triples"):
-                self.pending_interim_triples: list[dict] = []
+        # --- 4. Tag speaker_id defaults ---
+        self._tag_speaker_id_defaults(episodic_rels, speaker_id)
+        self._tag_speaker_id_defaults(procedural_rels, speaker_id)
+
+        # --- 6. Resolve stamp and target slot ---
+        if stamp is None:
+            from paramem.server.interim_adapter import current_interim_stamp as _cis
+
+            stamp = _cis(schedule)
+
+        adapter_name, cap_reached_absorb, queue_only, degenerated_skip = self._resolve_target_slot(
+            stamp, max_interim_count, mode=mode
+        )
+
+        # --- 7a. Queue-only branch ---
+        if queue_only:
             self.pending_interim_triples.extend(episodic_rels)
             logger.info(
-                "post_session_train: max_interim_count=0 — queued %d triples (total pending: %d)",
+                "run_consolidation_cycle: max_interim_count=0 — queued %d triples "
+                "(total pending: %d)",
                 len(episodic_rels),
                 len(self.pending_interim_triples),
             )
@@ -2761,373 +2531,194 @@ class ConsolidationLoop:
                 "new_keys": [],
                 "adapter_name": None,
                 "mode": "queued",
+                "venue": mode,
                 "error": None,
             }
 
-        # --- 4. Normal branch: compute stamp and adapter name ---
-        # NOTE: ``schedule`` is the refresh_cadence here (historical parameter
-        # name kept on the method signature for call-site stability; semantics
-        # changed to match the new config model). The stamp IS the cadence
-        # boundary — no division by max_interim_count.
-        if stamp is None:
-            from paramem.server.interim_adapter import current_interim_stamp as _cis
-
-            stamp = _cis(schedule)
-        adapter_name = f"episodic_interim_{stamp}"
-
-        # Cap-reached detection.  When every VRAM slot is occupied by an
-        # interim adapter for a previous sub-interval and the current
-        # sub-interval has not yet minted one, redirect the new keys into
-        # the *newest* existing interim and retrain it from scratch on the
-        # union of its old keys + the new ones.  This keeps the PEFT
-        # adapter count at or below ``max_interim_count`` without rolling
-        # eviction (which would silently drop knowledge).  The retrain is
-        # followed by a recall sanity probe; a failed probe rolls back to
-        # the snapshot and marks the adapter ``degenerated`` for the rest
-        # of the cycle.
-        cap_reached_absorb = False
-        if adapter_name not in self.model.peft_config:
-            existing_interim = sorted(
-                a for a in self.model.peft_config if a.startswith("episodic_interim_")
+        # --- 7b. Degenerated-skip branch (train mode only) ---
+        if degenerated_skip:
+            self.pending_interim_triples.extend(episodic_rels)
+            logger.warning(
+                "run_consolidation_cycle: target adapter degenerated — "
+                "queued %d triples (pending: %d)",
+                len(episodic_rels),
+                len(self.pending_interim_triples),
             )
-            if self.store.replay_enabled and len(existing_interim) >= max_interim_count:
-                newest = existing_interim[-1]  # lex-max stamp = most recent
-                # Health gate: refuse to retrain an adapter already marked
-                # degenerated this cycle.  Queue the new facts in RAM so
-                # nothing is silently dropped; the next full consolidation
-                # clears the degenerated flag and folds the queue in.
-                _newest_reg = (
-                    self.store.registry(newest) if self.store.has_registry(newest) else None
-                )
-                if _newest_reg is None or not _newest_reg.is_healthy():
-                    if not hasattr(self, "pending_interim_triples"):
-                        self.pending_interim_triples: list[dict] = []
-                    self.pending_interim_triples.extend(episodic_rels)
-                    logger.warning(
-                        "post_session_train: newest interim %s is degenerated — "
-                        "queued %d triples for next full consolidation (pending: %d)",
-                        newest,
-                        len(episodic_rels),
-                        len(self.pending_interim_triples),
-                    )
-                    return {
-                        "triples_extracted": triples_extracted,
-                        "new_keys": [],
-                        "adapter_name": newest,
-                        "mode": "degenerated",
-                        "error": "target_adapter_degenerated",
-                    }
-                logger.info(
-                    "post_session_train: interim cap (%d >= %d) reached — "
-                    "absorbing %d new triples into newest interim %s via full retrain",
-                    len(existing_interim),
-                    max_interim_count,
-                    triples_extracted,
-                    newest,
-                )
-                adapter_name = newest
-                cap_reached_absorb = True
-            else:
-                # Sub-interval rollover: first session of a new stamp.  If the
-                # floor is crossed and interim enrichment is enabled, run a
-                # mini graph-enrichment pass on the cumulative graph now so
-                # the 84h full-consolidation amortises its SOTA cost across
-                # the interim windows.  Wrapped so any SOTA failure is
-                # logged but never blocks interim adapter creation.
-                if (
-                    self.graph_enrichment_interim_enabled
-                    and self._triples_since_last_enrichment
-                    >= self.graph_enrichment_min_triples_floor
-                ):
-                    logger.info(
-                        "post_session_train: interim rollover — running mini "
-                        "graph-enrichment (triples_since_last=%d ≥ floor=%d)",
-                        self._triples_since_last_enrichment,
-                        self.graph_enrichment_min_triples_floor,
-                    )
-                    try:
-                        self._run_graph_enrichment()
-                    except Exception as _mini_exc:
-                        logger.warning(
-                            "post_session_train: mini graph-enrichment raised "
-                            "— interim creation continues: %s",
-                            _mini_exc,
-                        )
-
-                # Normal: create a fresh interim adapter for this sub-interval.
-                # create_interim_adapter is idempotent — no-op when the adapter
-                # already exists.  The return value MUST be assigned back to
-                # self.model; PEFT's add_adapter may rebind the PeftModel wrapper.
-                self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
-                logger.info("post_session_train: created interim adapter %s", adapter_name)
-
-        # --- 5. Assign keys to the new relations ---
-        if not self.store.replay_enabled:
-            logger.warning("post_session_train: no indexed key registry — aborting")
             return {
                 "triples_extracted": triples_extracted,
                 "new_keys": [],
                 "adapter_name": adapter_name,
-                "mode": "noop",
-                "error": "no_registry",
+                "mode": "degenerated",
+                "venue": mode,
+                "error": "target_adapter_degenerated",
             }
 
-        # Tag relations with speaker_id before key assignment.
-        for qa in episodic_rels:
-            if "speaker_id" not in qa:
-                qa["speaker_id"] = speaker_id
-
-        new_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in episodic_rels],
-            start_index=self._indexed_next_index,
-            prefix="graph",
+        # --- 5. Interim enrichment at sub-interval rollover ---
+        # Runs AFTER queue/degenerate checks so it doesn't fire for queued
+        # sessions.  Only meaningful when a fresh slot is being minted.
+        # Enrichment is mode-agnostic — it mutates the cumulative graph used by
+        # both train (key assignment from graph triples) and simulate (registry
+        # rebuild from the same graph).  The "is_fresh_slot" guard preserves the
+        # original rollover-only cadence; mode is irrelevant.
+        is_fresh_slot = (
+            mode == "simulate"  # simulate has no peft_config; every cycle is "fresh"
+            or (adapter_name not in self.model.peft_config and not cap_reached_absorb)
         )
-        # Attach speaker_id from the source relation dict (already tagged above).
-        for i, kp in enumerate(new_keyed):
-            rel = episodic_rels[i] if i < len(episodic_rels) else {}
-            kp["speaker_id"] = rel.get("speaker_id", speaker_id)
+        if is_fresh_slot:
+            self._maybe_run_interim_enrichment()
 
-        # Collect all existing keys for this interim adapter so we can rebuild
-        # the full training set (avoids catastrophic forgetting — same pattern
-        # as _run_indexed_key_episodic's full-replay approach).
-        # Pass the full qa_info dict through so all canonical metadata fields
-        # (subject, predicate, object, speaker_id, first_seen_cycle) survive.
-        existing_interim_keyed: list[dict] = []
-        for k in self.store.active_keys_in_tier(adapter_name):
-            qa_info = self.store.get(k)
-            if qa_info is not None:
-                existing_interim_keyed.append(qa_info)
+        # --- 8. Mint PEFT slot (train only) ---
+        if mode == "train":
+            from paramem.models.loader import create_adapter as _create_adapter
+            from paramem.server.interim_adapter import create_interim_adapter
 
-        all_interim_keyed = existing_interim_keyed + new_keyed
+            if cap_reached_absorb:
+                # Reset absorb target to LoRA zeros for a clean retrain.
+                self.model.delete_adapter(adapter_name)
+                self.model = _create_adapter(self.model, self.episodic_config, adapter_name)
+                logger.info(
+                    "run_consolidation_cycle: cap-reached — reset %s to LoRA zeros",
+                    adapter_name,
+                )
+            elif adapter_name not in self.model.peft_config:
+                # Fresh slot for this sub-interval.
+                self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
+                logger.info("run_consolidation_cycle: created interim adapter %s", adapter_name)
 
-        # --- 6. Train episodic interim adapter ---
-        # On failure, let the exception propagate; caller logs and returns error.
-        # The registry is written AFTER both training passes succeed (I5 atomicity).
-        from paramem.models.loader import create_adapter, switch_adapter
+        # --- 9. Prepare episodic keys ---
+        if mode == "train":
+            switch_adapter(self.model, adapter_name)
+        all_interim_keyed = self._prepare_episodic_keys_for_tier(
+            adapter_name, episodic_rels, speaker_id, mode=mode
+        )
+        # Identify the new entries returned by _prepare_episodic_keys_for_tier
+        # (marked with "_new": True).  store.put and _indexed_next_index advancement
+        # are deferred: applied AFTER _train_adapter returns (train mode) or
+        # immediately (simulate mode — no training step can fail).
+        new_keyed_episodic = [kp for kp in all_interim_keyed if kp.get("_new")]
+        new_key_ids = [kp["key"] for kp in new_keyed_episodic]
 
-        # Cap-reached retrain: fresh-init the target adapter so the retrain
-        # starts from LoRA zeros rather than warm-starting from accumulated
-        # interference.  A side-slot snapshot is no longer kept for in-RAM
-        # rollback; disk-integrity is gated post-save by _save_adapters
-        # (via _verify_saved_adapter_from_disk on the saved slot).
-        if cap_reached_absorb:
-            # Reset adapter to LoRA zeros without keeping a snapshot.
-            self.model.delete_adapter(adapter_name)
-            self.model = create_adapter(self.model, self.episodic_config, adapter_name)
-            logger.info(
-                "post_session_train: cap-reached — reset %s to LoRA zeros for retrain",
-                adapter_name,
-            )
+        if mode == "simulate":
+            # No training step — apply store mutations immediately.
+            for kp in new_keyed_episodic:
+                self.store.put(adapter_name, kp["key"], kp)
+            self._indexed_next_index += len(new_keyed_episodic)
 
-        switch_adapter(self.model, adapter_name)
-        self._disable_gradient_checkpointing()
-        examples = _format_training(all_interim_keyed, self.tokenizer, max_length=1024)
-        dataset = self._indexed_dataset(examples)
-        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
-        self._enable_gradient_checkpointing()
+        # --- 9b. Semantic promotion transfer (train mode, when promotions supplied) ---
+        # Move keys for promoted entities from episodic to the semantic tier so
+        # they are excluded from the episodic training set and picked up by
+        # _run_indexed_key_semantic in the caller (run_cycle).  This mirrors the
+        # logic that formerly lived inside _run_indexed_key_episodic.
+        promoted_key_set: set[str] = set()
+        if mode == "train" and new_promotions:
+            promoted_set = {n.lower() for n in new_promotions}
+            for _tier, key, qa_info in list(self.store.iter_entries()):
+                if key.startswith("proc"):
+                    continue
+                subject = qa_info.get("subject", "").lower()
+                obj = qa_info.get("object", "").lower()
+                mentions = (subject and subject in promoted_set) or (obj and obj in promoted_set)
+                if mentions and not self.store.has_simhash("semantic", key):
+                    promoted_key_set.add(key)
+            for key in promoted_key_set:
+                self.store.move(key, "semantic")
+            # Exclude promoted keys from the episodic training set.
+            all_interim_keyed = [
+                kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
+            ]
 
+        # --- 10. Train (train mode) or skip (simulate) ---
+        # Local import alias so tests can patch paramem.training.trainer.train_adapter
+        # (matching the pattern of the former _train_extracted_into_interim).
         from paramem.training.trainer import train_adapter as _train_adapter
 
-        recall_cb = self._maybe_make_recall_callback(
-            entries=all_interim_keyed,
-            adapter_name=adapter_name,
-            output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
-            phase_name=f"interim-{adapter_name}-{run_label}",
-        )
+        epi_train_loss: float | None = None
+        if mode == "train" and all_interim_keyed:
+            examples = format_entry_training(all_interim_keyed, self.tokenizer, max_length=1024)
+            dataset = self._indexed_dataset(examples)
+            training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
+            self._enable_gradient_checkpointing()
+            recall_cb = self._maybe_make_recall_callback(
+                entries=all_interim_keyed,
+                adapter_name=adapter_name,
+                output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
+                phase_name=f"interim-{adapter_name}-{run_label}",
+            )
+            epi_metrics = _train_adapter(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                train_dataset=dataset,
+                adapter_name=adapter_name,
+                training_config=training_config,
+                adapter_config=self.episodic_config,
+                wandb_config=self.wandb_config,
+                output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
+                run_name=f"interim-{adapter_name}-{run_label}",
+                thermal_policy=self._thermal_policy,
+                hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+                callbacks_extra=[recall_cb] if recall_cb is not None else None,
+            )
+            epi_train_loss = epi_metrics.get("train_loss") if epi_metrics is not None else None
+            # Episodic store mutations are deferred until AFTER the procedural
+            # step completes — see the mutation block below the procedural gate.
+            # This guarantees full-cycle atomicity: if any training step fails,
+            # the registry stays clean.
 
-        _train_adapter(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            train_dataset=dataset,
-            adapter_name=adapter_name,
-            training_config=training_config,
-            adapter_config=self.episodic_config,
-            wandb_config=self.wandb_config,
-            # I3: use interim_stamp so consecutive post-session calls within the
-            # same sub-interval do NOT share a directory, and different stamps
-            # always produce distinct directories.
-            output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
-            run_name=f"interim-{adapter_name}-{run_label}",
-            thermal_policy=self._thermal_policy,
-            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
-            callbacks_extra=[recall_cb] if recall_cb is not None else None,
-        )
+        # Update episodic-interim simhash registry from ground-truth pairs.
+        self.store.replace_simhashes_in_tier(adapter_name, build_registry(all_interim_keyed))
 
-        # --- 6b. Train procedural main adapter (I1) ---
-        # Procedural relations always go to the stable 'procedural' main adapter —
-        # no interim tier for procedural (preferences are small-volume,
-        # slow-changing).  This pass runs inline so a failure here also leaves the
-        # registry clean (registry writes happen in step 7 below).
-        #
-        # _run_indexed_key_procedural calls self._training_output_dir("procedural")
-        # internally.  We set _current_interim_stamp so _training_output_dir routes
-        # checkpoints under the same interim_<stamp> directory rather than
-        # cycle_<N>, keeping each post-session pass in its own directory (I3).
-        # The attribute is cleared in a finally block regardless of outcome.
+        # --- 11. Procedural (always onto stable "procedural" main adapter) ---
+        proc_train_loss: float | None = None
         if self.procedural_config is not None and procedural_rels:
-            self._current_interim_stamp = stamp
-            try:
-                self._run_indexed_key_procedural(
-                    procedural_rels,
-                    speaker_id=speaker_id,
-                )
-            finally:
-                self._current_interim_stamp = None
-
-        # --- 7. Register episodic keys ONLY after both training passes succeed ---
-        # Procedural keys are registered inside _run_indexed_key_procedural (same
-        # invariant — keys added only after train_adapter returns).
-        new_key_ids: list[str] = []
-        for kp in new_keyed:
-            k = kp["key"]
-            # kp has {key, subject, predicate, object, speaker_id};
-            # _cache_entry stores canonical fields.
-            self.store.put(
-                adapter_name,
-                k,
-                self._cache_entry(
-                    key=k,
-                    subject=kp.get("subject", ""),
-                    predicate=kp.get("predicate", ""),
-                    object=kp.get("object", ""),
-                    speaker_id=kp.get("speaker_id", speaker_id),
-                    first_seen_cycle=kp.get("first_seen_cycle", self.cycle_count),
-                    question=kp.get("question"),
-                    answer=kp.get("answer"),
-                ),
+            proc_train_loss = self._run_indexed_key_procedural(
+                procedural_rels,
+                speaker_id,
+                mode=mode,
+                stamp=stamp,
+                run_label=run_label,
             )
-            new_key_ids.append(k)
-        self._indexed_next_index += len(new_keyed)
 
-        # I5 — Manifest-first registry-last write order (§2.5).
-        #
-        # The manifest must stamp ``registry_sha256`` at save time, but the
-        # registry isn't on disk yet.  We therefore serialize the registry to
-        # bytes first (``save_bytes``), hash those bytes, build the manifest
-        # with the hash override, write adapter weights (which embeds the
-        # manifest), and only then flush the registry bytes to disk via
-        # ``save_from_bytes``.  The registry is the commit signal: its
-        # presence on disk means every preceding file is complete.
-        #
-        # Crash semantics: a kill between step 6 and step 8 leaves the
-        # adapter on disk but the old registry hash.  ``find_live_slot``
-        # won't match → slot is latent, harmless.  Full recovery requires
-        # a new consolidation cycle.
-        import hashlib as _hashlib
+        # --- 11b. Apply deferred episodic store mutations ---
+        # Reached only when all training steps above completed without raising.
+        # In simulate mode this block was already handled before training.
+        if mode == "train":
+            for kp in new_keyed_episodic:
+                self.store.put(adapter_name, kp["key"], kp)
+            self._indexed_next_index += len(new_keyed_episodic)
 
-        from paramem.adapters.manifest import build_manifest_for as _build_manifest_for
-        from paramem.models.loader import save_adapter as _save_adapter
-
-        # Step 1+2: Serialise this interim tier's registry to bytes and hash.
-        _interim_tier_reg = self._tier_registry(adapter_name)
-        payload = _interim_tier_reg.save_bytes()
-        registry_sha256 = _hashlib.sha256(payload).hexdigest()
-
-        # Step 3: knowledge lives in adapter weights, not in sidecar files.
-
-        # Step 5: Build manifest with pre-computed registry_sha256.  The
-        # interim slot's window IS the cadence boundary stamp — same value
-        # already encoded in the adapter name suffix.  Recording it on the
-        # manifest gives the slot a self-describing window identity.
-        fingerprint_cache = getattr(self, "fingerprint_cache", None)
-        _total_key_count = len(self._all_active_keys()) if self.store.replay_enabled else None
-        try:
-            manifest = _build_manifest_for(
-                self.model,
-                self.tokenizer,
-                adapter_name,
-                registry_path=None,
-                key_count=_total_key_count,
-                base_model_hash_cache=fingerprint_cache,
-                registry_sha256_override=registry_sha256,
-                window_stamp=stamp,
-                adapter_root=self.output_dir,
-            )
-        except Exception:
-            logger.warning("post_session_train: manifest build failed — saving without manifest")
-            manifest = None
-
-        # Step 6: Save adapter weights + manifest (new commit point).
-        from paramem.server.interim_adapter import adapter_slot_root_for_name as _slot_root
-
-        _save_adapter(
-            self.model, _slot_root(self.output_dir, adapter_name), adapter_name, manifest=manifest
+        # --- 12. Persist both tiers ---
+        commit_tier_slot(
+            loop=self,
+            tier="episodic",
+            adapter_name=adapter_name,
+            stamp=stamp,
+            mode=mode,
+            all_keyed=all_interim_keyed,
+            output_dir=self.output_dir,
         )
-        if self.procedural_config is not None and "procedural" in self.model.peft_config:
-            # Build manifest for procedural and save with manifest so the slot's
-            # meta.json is present for read-back path hash short-circuit.
-            # Use procedural tier's own registry bytes for the hash.
-            _proc_tier_reg = self._tier_registry("procedural")
-            _proc_payload = _proc_tier_reg.save_bytes()
-            _proc_sha = _hashlib.sha256(_proc_payload).hexdigest()
-            try:
-                proc_manifest = _build_manifest_for(
-                    self.model,
-                    self.tokenizer,
-                    "procedural",
-                    registry_path=None,
-                    key_count=_total_key_count,
-                    base_model_hash_cache=fingerprint_cache,
-                    registry_sha256_override=_proc_sha,
-                    window_stamp=stamp,
-                    adapter_root=self.output_dir,
-                )
-            except Exception:
-                logger.warning(
-                    "post_session_train: procedural manifest build failed — saving without manifest"
-                )
-                proc_manifest = None
-            _save_adapter(
-                self.model,
-                self.output_dir / "procedural",
-                "procedural",
-                manifest=proc_manifest,
+        if self.procedural_config is not None and "procedural" in (
+            self.model.peft_config if mode == "train" else {"procedural"}
+        ):
+            commit_tier_slot(
+                loop=self,
+                tier="procedural",
+                adapter_name="procedural",
+                stamp=stamp,
+                mode=mode,
+                all_keyed=[],
+                output_dir=self.output_dir,
             )
 
-        # Step 7: Save SimHash registries to per-tier paths.
-        interim_simhash = _build_reg(all_interim_keyed)
-        _interim_tier_dir = _slot_root(self.output_dir, adapter_name)
-        _interim_tier_dir.mkdir(parents=True, exist_ok=True)
-        save_registry(
-            interim_simhash,
-            _interim_tier_dir / "simhash_registry.json",
-        )
-        # Procedural simhash is updated inside _run_indexed_key_procedural; persist
-        # the updated state here so it survives a restart even if the process is
-        # killed before the full _save_adapters() call at end of run_cycle.
-        if self.procedural_config is not None and procedural_rels:
-            _proc_tier_dir = self.output_dir / "procedural"
-            _proc_tier_dir.mkdir(parents=True, exist_ok=True)
-            save_registry(
-                self.store.simhashes_in_tier("procedural"),
-                _proc_tier_dir / "simhash_registry.json",
-            )
-
-        # Step 8 (LAST): Flush registry bytes per-tier — identical to the
-        # bytes hashed in step 2, so ``find_live_slot`` can match the manifest
-        # stamp.  Written to ``<adapter_dir>/<tier>/indexed_key_registry.json``.
-        _interim_registry_path = _interim_tier_dir / "indexed_key_registry.json"
-        _interim_tier_reg.save_from_bytes(payload, _interim_registry_path, consolidating=True)
-        # Procedural tier — symmetric flush.  Step 6b's gate is what stamps
-        # ``registry_sha256_override=_proc_sha`` into the procedural manifest;
-        # whenever 6b ran, the on-disk registry MUST be flushed to the same
-        # bytes, otherwise the manifest hash is dangling and ``find_live_slot``
-        # cannot verify the slot on restart (procedural adapter becomes
-        # orphaned).  Defensive ``mkdir`` covers the case where step 7 did not
-        # run (procedural_rels was empty this cycle) and therefore did not
-        # already create the tier dir.
-        if self.procedural_config is not None and "procedural" in self.model.peft_config:
-            _proc_registry_path = self.output_dir / "procedural" / "indexed_key_registry.json"
-            _proc_registry_path.parent.mkdir(parents=True, exist_ok=True)
-            _proc_tier_reg.save_from_bytes(_proc_payload, _proc_registry_path, consolidating=True)
-
-        # Restore the main episodic adapter as the active adapter so subsequent
-        # inference probes default to the consolidated tier.
+        # --- 13. End-of-cycle: restore episodic as active adapter ---
+        # Mode-agnostic: the peft_config check already short-circuits in simulate
+        # (no adapters were created), so the guard is sufficient without the
+        # mode == "train" clause.
         if "episodic" in self.model.peft_config:
             switch_adapter(self.model, "episodic")
 
         logger.info(
-            "post_session_train: trained %s — %d new keys, %d total keys",
+            "run_consolidation_cycle: %s %s — %d new keys, %d total episodic keys",
+            mode,
             adapter_name,
             len(new_key_ids),
             len(all_interim_keyed),
@@ -3137,8 +2728,11 @@ class ConsolidationLoop:
             "triples_extracted": triples_extracted,
             "new_keys": new_key_ids,
             "adapter_name": adapter_name,
-            "mode": "trained",
+            "mode": "trained" if mode == "train" else "simulated",
+            "venue": mode,
             "error": None,
+            "episodic_train_loss": epi_train_loss,
+            "procedural_train_loss": proc_train_loss,
         }
 
     def _run_graph_enrichment(self) -> dict:
@@ -3417,6 +3011,133 @@ class ConsolidationLoop:
             "same_as_merges": total_merges,
             "skipped": False,
             "skip_reason": None,
+        }
+
+    def consolidate_interim_graphs(self) -> dict:
+        """Full-cycle consolidation for simulate mode: merge interim graph.json sidecars.
+
+        Called by ``_run_full_consolidation_sync`` when
+        ``config.consolidation.mode == "simulate"``.  Simulate mode writes per-cycle
+        graph.json files under ``<adapter_dir>/episodic/interim_<stamp>/graph.json``
+        rather than PEFT adapter weights.  This method merges those interim graphs into
+        the canonical main-tier graph at ``<adapter_dir>/episodic/graph.json`` and
+        removes the interim slot directories.
+
+        Steps:
+
+        1. Optional SOTA enrichment (same guard as ``consolidate_interim_adapters`` step 0).
+        2. Walk all ``episodic/interim_<stamp>/graph.json`` files; load and merge each
+           into a combined graph, tagging edges from each slot with the slot's keys.
+        3. Write the merged graph to ``<adapter_dir>/episodic/graph.json`` via
+           :func:`paramem.training.memory_persistence.save_memory_to_disk`.
+        4. Remove the interim slot directories that were merged.
+        5. Return a result dict shaped like ``consolidate_interim_adapters``'s return
+           (``tiers_rebuilt``, ``graph_drift_count``, etc.) for compatibility with the
+           post-cycle bookkeeping in ``_run_full_consolidation_sync``.
+
+        Returns:
+            Result dict with keys matching ``consolidate_interim_adapters``'s schema
+            so the caller (``_run_full_consolidation_sync``) can handle both paths
+            with the same bookkeeping logic.  Simulate mode never rolls back, so
+            ``rolled_back`` is always ``False``.
+        """
+        import shutil as _shutil
+
+        from paramem.server.interim_adapter import iter_interim_dirs
+        from paramem.training.memory_persistence import (
+            iter_entries,
+            load_memory_from_disk,
+            save_memory_to_disk,
+        )
+
+        adapter_dir = self.output_dir
+
+        # --- Step 0: optional SOTA enrichment ---
+        try:
+            self._run_graph_enrichment()
+        except Exception as _enr_exc:
+            logger.warning(
+                "consolidate_interim_graphs: SOTA enrichment raised — continuing: %s",
+                _enr_exc,
+            )
+
+        # --- Step 2: walk interim simulate-mode graph.json sidecars ---
+        merged_keys: set[str] = set()
+        interim_dirs_merged: list[Path] = []
+
+        episodic_main_path = adapter_dir / "episodic" / "graph.json"
+        # Start from the existing main graph if present.
+        merged_graph = load_memory_from_disk(episodic_main_path)
+
+        for _interim_name, interim_dir in iter_interim_dirs(adapter_dir):
+            interim_graph_path = interim_dir / "graph.json"
+            if not interim_graph_path.exists():
+                # Skip train-mode interim slots (no graph.json).
+                continue
+            slot_graph = load_memory_from_disk(interim_graph_path)
+            for entry in iter_entries(slot_graph):
+                merged_keys.add(entry["key"])
+                # Add edge to merged graph (add_edge is idempotent on
+                # duplicate ik_key via the MultiDiGraph semantics — we
+                # re-add with the same attributes so the latest write wins).
+                from paramem.training.memory_persistence import _add_keyed_edge
+
+                _add_keyed_edge(
+                    merged_graph,
+                    entry["subject"],
+                    entry["object"],
+                    indexed_key=entry["key"],
+                    predicate=entry.get("predicate", ""),
+                    speaker_id=entry.get("speaker_id", ""),
+                    first_seen_cycle=entry.get("first_seen_cycle", 0),
+                )
+            interim_dirs_merged.append(interim_dir)
+            logger.debug(
+                "consolidate_interim_graphs: merged %d edges from %s",
+                slot_graph.number_of_edges(),
+                interim_dir,
+            )
+
+        if not interim_dirs_merged:
+            logger.info("consolidate_interim_graphs: no simulate-mode interim slots found — noop")
+            return {
+                "tiers_rebuilt": [],
+                "graph_drift_count": 0,
+                "keys_per_tier": {},
+                "recall_per_tier": {},
+                "rolled_back": False,
+                "rollback_tier": None,
+            }
+
+        # --- Step 3: write merged graph to main episodic slot ---
+        episodic_main_path.parent.mkdir(parents=True, exist_ok=True)
+        save_memory_to_disk(merged_graph, episodic_main_path)
+        logger.info(
+            "consolidate_interim_graphs: wrote merged graph to %s (%d edges, %d new keys)",
+            episodic_main_path,
+            merged_graph.number_of_edges(),
+            len(merged_keys),
+        )
+
+        # --- Step 4: remove merged interim slot directories ---
+        for interim_dir in interim_dirs_merged:
+            try:
+                _shutil.rmtree(interim_dir, ignore_errors=True)
+                logger.debug("consolidate_interim_graphs: removed interim slot %s", interim_dir)
+            except Exception as _rm_exc:
+                logger.warning(
+                    "consolidate_interim_graphs: failed to remove %s: %s",
+                    interim_dir,
+                    _rm_exc,
+                )
+
+        return {
+            "tiers_rebuilt": ["episodic"],
+            "graph_drift_count": 0,
+            "keys_per_tier": {"episodic": merged_graph.number_of_edges()},
+            "recall_per_tier": {"episodic": 1.0},  # graph merge is lossless
+            "rolled_back": False,
+            "rollback_tier": None,
         }
 
     def consolidate_interim_adapters(
@@ -4253,10 +3974,10 @@ class ConsolidationLoop:
         active-key set for ``adapter_name``, not an incremental delta.
 
         Production-reachable callers (must pass full per-tier active set):
-          - ConsolidationLoop._run_indexed_key_episodic    (this file:1529)
-          - ConsolidationLoop._run_indexed_key_procedural  (this file:1770)
-          - ConsolidationLoop._train_extracted_into_interim (this file:2588)
-          - ConsolidationLoop.consolidate_interim_adapters (this file:3429)
+          - ConsolidationLoop.run_cycle (episodic/procedural inline blocks)
+          - ConsolidationLoop.train_adapters (episodic/procedural inline blocks)
+          - ConsolidationLoop.run_consolidation_cycle (episodic/procedural blocks)
+          - ConsolidationLoop.consolidate_interim_adapters
           - active_store_migration._migrate_tier_simulate_to_train
             (paramem/server/active_store_migration.py:420)
 

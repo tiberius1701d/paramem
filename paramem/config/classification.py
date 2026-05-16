@@ -81,7 +81,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "paths.sessions": Tier.DESTRUCTIVE,
     "paths.prompts": Tier.DESTRUCTIVE,
     "paths.debug": Tier.OPERATIONAL,
-    "paths.simulate": Tier.OPERATIONAL,
     # --- server ---
     "server.host": Tier.OPERATIONAL,
     "server.port": Tier.OPERATIONAL,

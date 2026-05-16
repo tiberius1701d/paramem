@@ -9,28 +9,34 @@ and the system falls back to the source mode on next boot.
 State file location: ``<paths.adapters>/.active_store_migration.json``
 (age-encrypted via ``write_infra_bytes`` when the daily identity is loaded).
 
+Under the unified layout (2026-05-16), ``graph.json`` lives at
+``<adapter_dir>/<tier>/graph.json`` in **both** train and simulate modes.
+The distinction between modes is whether adapter weight slot subdirectories
+(containing ``adapter_model.safetensors``) exist alongside the graph.
+
 Two directions:
 
-* ``simulate_to_train``: read ``<simulate>/<tier>/graph.json`` →
+* ``simulate_to_train``: read ``<adapter_dir>/<tier>/graph.json`` →
   train into ``<tier>`` adapter → recall probe at threshold=1.0 → on
-  pass, atomic-save the slot and delete the simulate-store graph.json. On
-  fail, leave both stores intact.
+  pass, atomic-save the slot. On fail, leave the graph intact.
 
-* ``train_to_simulate``: reconstruct the tier graph from the adapter weights
-  via ``reconstruct_graph(loop, tier=tier, strict=True)`` → decorate edges
-  with speaker_id/first_seen_cycle from ``loop.store`` →
-  write to ``<simulate>/<tier>/graph.json`` → sanity-check every active key
-  present in graph → on pass, delete the adapter tier dir.  On fail, remove
-  the graph.json and leave the adapter slots intact.
+* ``train_to_simulate``: verify ``<adapter_dir>/<tier>/graph.json`` exists
+  and covers all active keys; reconstruct from weights if missing →
+  delete all timestamped weight slot subdirs under ``<adapter_dir>/<tier>/``
+  (graph.json and registries are preserved). On fail, remove any
+  freshly-written graph.json and leave the adapter slots intact.
 
 Per-tier failures are recorded in the state file but do not abort the
 remaining tiers — the operator can re-trigger to retry.
 
-Interim adapters are NOT migrated: per the locked design decision
-(see ``paramem/server/consolidation.py:170``), simulate mode has no
-interim concept. ``episodic_interim_*`` slots are torn down by the
-next full consolidation; the migration only operates on the three
-main tiers (episodic, semantic, procedural).
+Interim simulate-mode slots are NOT migrated individually: the migration
+collapses interim slots by reading from the canonical main-tier graph
+(or reconstructing from weights) and training / writing the consolidated
+result.  ``episodic_interim_*`` slot dirs are torn down by the subsequent
+full consolidation.  The migration only operates on the three main tiers
+(episodic, semantic, procedural).  ``_has_tier_graph`` walks subdirectories
+so interim simulate-mode graph.json files under
+``<adapter_dir>/<tier>/interim_<stamp>/`` are detected correctly.
 """
 
 from __future__ import annotations
@@ -134,9 +140,22 @@ def clear_state(adapter_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _has_simulate_graph(simulate_dir: Path, tier: str) -> bool:
-    """Return True when a simulate-mode ``graph.json`` exists for *tier*."""
-    return (Path(simulate_dir) / tier / "graph.json").exists()
+def _has_tier_graph(adapter_dir: Path, tier: str) -> bool:
+    """Return True when a per-tier ``graph.json`` exists under the unified layout.
+
+    Under the unified layout graph.json lives at
+    ``<adapter_dir>/<tier>/graph.json`` for both simulate and train modes.
+    In simulate mode, interim cycles write graph.json under
+    ``<adapter_dir>/<tier>/interim_<stamp>/graph.json`` — those subdirectory
+    files count as well.
+
+    Walks the tier directory tree so both the main-slot file and any
+    interim simulate-mode slot files are detected.
+    """
+    tier_root = Path(adapter_dir) / tier
+    if not tier_root.is_dir():
+        return False
+    return any(tier_root.rglob("graph.json"))
 
 
 def _has_adapter_registry(adapter_dir: Path, tier: str) -> bool:
@@ -157,10 +176,10 @@ def detect_mode_switch(config: "ServerConfig") -> Optional[MigrationState]:
        interrupted, must be resumed before inference is consistent).
     2. Otherwise compare disk contents to the operator's yaml ``mode``:
 
-       * ``mode=train`` and simulate-store kp present and adapter slots
-         absent → ``simulate_to_train`` migration is needed.
-       * ``mode=simulate`` and adapter slots present and simulate-store
-         kp absent → ``train_to_simulate`` migration is needed.
+       * ``mode=train`` and graph.json present but adapter registry absent
+         → ``simulate_to_train`` migration is needed.
+       * ``mode=simulate`` and adapter registry present but graph.json absent
+         → ``train_to_simulate`` migration is needed.
 
     Returns ``None`` when the active store is consistent with the mode
     (no migration needed).
@@ -173,7 +192,7 @@ def detect_mode_switch(config: "ServerConfig") -> Optional[MigrationState]:
     if target_mode not in ("simulate", "train"):
         return None  # unsupported mode — let upstream complain
 
-    simulate_present = any(_has_simulate_graph(config.simulate_dir, t) for t in TIERS)
+    simulate_present = any(_has_tier_graph(config.adapter_dir, t) for t in TIERS)
     adapter_present = any(_has_adapter_registry(config.adapter_dir, t) for t in TIERS)
 
     if target_mode == "train" and simulate_present and not adapter_present:
@@ -251,23 +270,27 @@ def migrate(
 def _migrate_tier_train_to_simulate(
     loop: "ConsolidationLoop", config: "ServerConfig", tier: str
 ) -> None:
-    """Switch a tier from train to simulate by removing adapter weights.
+    """Switch a tier from train to simulate by removing adapter weight slots.
 
-    Under the locked architecture (2026-05-15), ``graph.json`` is the
-    canonical structured persistence and is written in **both** train and
-    simulate modes at cycle finalize.  The "active store" distinction is
-    just "are adapter weights present alongside the graph?":
+    Under the unified layout (2026-05-16), ``graph.json`` lives at
+    ``<adapter_dir>/<tier>/graph.json`` in **both** train and simulate modes.
+    The "active store" distinction is just "are adapter weight slots present
+    alongside the graph?":
 
-    * train: weights + graph.json
-    * simulate: graph.json only
+    * train: timestamped weight slot dirs + graph.json + registries
+    * simulate: graph.json + registries only (no weight slots)
 
     The migration to simulate therefore reduces to:
 
-    1. Verify ``<simulate_dir>/<tier>/graph.json`` exists and carries every
+    1. Verify ``<adapter_dir>/<tier>/graph.json`` exists and carries every
        active registry key (sanity check).  If missing (legacy deployment
-       trained before graph.json was universal), fall back to weight
+       that ran before graph.json was universal), fall back to weight
        reconstruction once to materialise it.
-    2. ``shutil.rmtree(<adapter_dir>/<tier>)`` — drop the weights.
+    2. Delete all timestamped adapter weight slot subdirectories under
+       ``<adapter_dir>/<tier>/`` (directories containing
+       ``adapter_model.safetensors`` or ``adapter_config.json``).
+       The top-level tier directory, graph.json, and registries are
+       preserved — only the weight payload is removed.
 
     Raises:
         _TierSkipped: When there are no active registry keys for this tier.
@@ -285,8 +308,8 @@ def _migrate_tier_train_to_simulate(
     if not active_keys:
         raise _TierSkipped(f"no active registry keys for tier {tier}")
 
-    target_dir = Path(config.simulate_dir) / tier
-    target_graph = target_dir / "graph.json"
+    tier_dir = Path(config.adapter_dir) / tier
+    target_graph = tier_dir / "graph.json"
 
     # Step 1: ensure graph.json is current.  Post-architecture cycles
     # write it on every consolidation, so this is the fast path.  On
@@ -325,7 +348,7 @@ def _migrate_tier_train_to_simulate(
             cache_entry = loop.store.get(ik_key) or {}
             data["speaker_id"] = cache_entry.get("speaker_id", "")
             data["first_seen_cycle"] = cache_entry.get("first_seen_cycle", 0)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        tier_dir.mkdir(parents=True, exist_ok=True)
         save_memory_to_disk(graph, target_graph)
 
         # Sanity-check after reconstruction.
@@ -341,15 +364,26 @@ def _migrate_tier_train_to_simulate(
                 f"rolled back simulate-store write"
             )
 
-    # Step 2: drop the adapter tier dir (weights + per-slot manifests).
-    tier_dir = Path(config.adapter_dir) / tier
+    # Step 2: drop adapter weight slot subdirectories from the tier dir.
+    # Weight slots are subdirectories that contain adapter_model.safetensors
+    # or adapter_config.json.  graph.json, simhash_registry.json, and
+    # indexed_key_registry.json live at the top of tier_dir and are preserved.
+    deleted_slots = 0
     if tier_dir.exists():
-        shutil.rmtree(tier_dir)
+        for child in list(tier_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if (child / "adapter_model.safetensors").exists() or (
+                child / "adapter_config.json"
+            ).exists():
+                shutil.rmtree(child)
+                deleted_slots += 1
     logger.info(
         "active_store_migration: tier %s switched to simulate;"
-        " %d keys retained in graph.json; deleted adapter dir %s",
+        " %d keys retained in graph.json; deleted %d weight slot(s) from %s",
         tier,
         len(active_keys),
+        deleted_slots,
         tier_dir,
     )
 
@@ -406,7 +440,7 @@ def _migrate_tier_simulate_to_train(
     8. On fail: reset the adapter back to LoRA-zero so failure does not
        leave half-trained weights resident, raise ``RuntimeError``.
     """
-    # Simulate-mode store is always graph.json.
+    # Source graph is at the unified layout location: <adapter_dir>/<tier>/graph.json.
     from paramem.adapters.manifest import build_manifest_for
     from paramem.models.loader import (
         atomic_save_adapter,
@@ -423,7 +457,7 @@ def _migrate_tier_simulate_to_train(
     from paramem.training.trainer import TrainingHooks
     from paramem.training.trainer import train_adapter as _train_adapter
 
-    source_graph = Path(config.simulate_dir) / tier / "graph.json"
+    source_graph = Path(config.adapter_dir) / tier / "graph.json"
     if not source_graph.exists():
         raise _TierSkipped(f"no graph.json at {source_graph}")
 

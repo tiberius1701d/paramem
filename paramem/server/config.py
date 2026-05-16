@@ -311,12 +311,11 @@ class ServerNetConfig:
 
 @dataclass
 class PathsConfig:
-    """Mount points for persistent data, sessions, simulate-store, debug output, and prompts."""
+    """Mount points for persistent data, sessions, debug output, and prompts."""
 
     data: Path = Path("data/ha")
     sessions: Path = Path("data/ha/sessions")
     debug: Path = Path("data/ha/debug")
-    simulate: Path = Path("data/ha/simulate")
     prompts: Path = Path("configs/prompts")
 
     @property
@@ -1125,10 +1124,6 @@ class ServerConfig:
         return self.paths.debug
 
     @property
-    def simulate_dir(self) -> Path:
-        return self.paths.simulate
-
-    @property
     def prompts_dir(self) -> Path:
         return self.paths.prompts
 
@@ -1291,11 +1286,10 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             data=Path(paths_raw.get("data", config.paths.data)),
             sessions=Path(paths_raw.get("sessions", config.paths.sessions)),
             debug=Path(paths_raw.get("debug", config.paths.debug)),
-            simulate=Path(paths_raw.get("simulate", config.paths.simulate)),
             prompts=Path(paths_raw.get("prompts", config.paths.prompts)),
         )
     # Make relative paths absolute (anchored to project root)
-    for path_field in ("data", "sessions", "debug", "simulate", "prompts"):
+    for path_field in ("data", "sessions", "debug", "prompts"):
         p = getattr(config.paths, path_field)
         if not p.is_absolute():
             setattr(config.paths, path_field, config_dir / p)
@@ -1382,6 +1376,16 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
                 "is now refresh_cadence × max_interim_count.",
                 legacy_schedule,
             )
+    # Warn on legacy `simulate:` key rather than passing it to the dataclass
+    # constructor (which would raise TypeError).  The current API uses
+    # ``consolidation.mode: "simulate"`` as the authoritative knob.
+    _legacy_simulate = consolidation_raw.pop("simulate", None)
+    if _legacy_simulate is not None:
+        logger.warning(
+            "consolidation.simulate=%r is a legacy key — use "
+            "consolidation.mode='simulate' instead. The legacy key is ignored.",
+            _legacy_simulate,
+        )
     if consolidation_raw:
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
 

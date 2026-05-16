@@ -25,6 +25,7 @@ import pytest
 from paramem.server.active_store_migration import (
     TIERS,
     MigrationState,
+    _has_tier_graph,
     _migrate_tier_simulate_to_train,
     _migrate_tier_train_to_simulate,
     _TierSkipped,
@@ -210,9 +211,15 @@ class TestDetectModeSwitch:
         assert result.completed_tiers == ["episodic"]
 
     def test_simulate_to_train_detected_via_graph_json(self, tmp_path):
-        """graph.json present in simulate dir triggers simulate→train detection."""
+        """graph.json present in adapter_dir triggers simulate→train detection.
+
+        Under the unified layout, graph.json lives at adapter_dir/<tier>/graph.json
+        in both train and simulate modes.  Detection fires when graph.json is present
+        but no indexed_key_registry.json exists (simulate → train transition needed).
+        """
         cfg = _make_config(tmp_path, mode="train")
-        _write_simulate_graph(cfg.simulate_dir, "episodic", [_full_quad("g1")])
+        # Write graph to the unified layout location (adapter_dir), not simulate_dir.
+        _write_simulate_graph(cfg.adapter_dir, "episodic", [_full_quad("g1")])
         result = detect_mode_switch(cfg)
         assert result is not None
         assert result.direction == "simulate_to_train"
@@ -238,6 +245,48 @@ class TestDetectModeSwitch:
     def test_unsupported_mode_returns_none(self, tmp_path):
         cfg = _make_config(tmp_path, mode="cloud_only")
         assert detect_mode_switch(cfg) is None
+
+
+class TestHasTierGraph:
+    """``_has_tier_graph`` must detect graph.json in both main-slot and interim subdirs.
+
+    Regression for C4: encryption.py and active_store_migration.py previously
+    looked only at ``<adapter_dir>/<tier>/graph.json``.  Simulate-mode interim
+    cycles write to ``<adapter_dir>/<tier>/interim_<stamp>/graph.json`` — those
+    must also be detected.
+    """
+
+    def test_main_slot_detected(self, tmp_path):
+        """graph.json at tier root is detected."""
+        adapter_dir = tmp_path / "adapters"
+        tier_dir = adapter_dir / "episodic"
+        tier_dir.mkdir(parents=True)
+        (tier_dir / "graph.json").write_text("{}")
+        assert _has_tier_graph(adapter_dir, "episodic") is True
+
+    def test_interim_slot_detected(self, tmp_path):
+        """graph.json under <tier>/interim_<stamp>/ is detected.
+
+        This is the layout written by commit_tier_slot in simulate mode
+        for interim cycles.  Prior to C4, _has_tier_graph only checked the
+        tier root and would return False here.
+        """
+        adapter_dir = tmp_path / "adapters"
+        interim_dir = adapter_dir / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "graph.json").write_text("{}")
+        assert _has_tier_graph(adapter_dir, "episodic") is True
+
+    def test_missing_returns_false(self, tmp_path):
+        """Absent tier dir → False."""
+        adapter_dir = tmp_path / "adapters"
+        assert _has_tier_graph(adapter_dir, "episodic") is False
+
+    def test_tier_dir_exists_but_no_graph_returns_false(self, tmp_path):
+        """Tier dir present but no graph.json anywhere → False."""
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True)
+        assert _has_tier_graph(adapter_dir, "episodic") is False
 
 
 # ---------------------------------------------------------------------------
@@ -318,13 +367,21 @@ class TestMigrateTierTrainToSimulate:
         with pytest.raises(_TierSkipped):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
-    def test_happy_path_writes_graph_and_removes_adapter_dir(self, tmp_path):
-        """Happy path: graph.json written; adapter tier dir removed."""
+    def test_happy_path_writes_graph_and_removes_adapter_weight_slots(self, tmp_path):
+        """Happy path: graph.json written under adapter_dir; weight slot dirs removed.
+
+        Under the unified layout, graph.json lives at adapter_dir/<tier>/graph.json.
+        Migration to simulate deletes weight slot subdirectories (those containing
+        adapter_model.safetensors or adapter_config.json) but preserves graph.json
+        and registry files at the top of the tier directory.
+        """
         cfg = _make_config(tmp_path, mode="simulate")
         keys = ["g0", "g1"]
         loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-        # Create an adapter slot dir so rmtree has something to remove.
-        _write_adapter_slot_dir(cfg.adapter_dir, "episodic", "20260430-180000")
+        # Create an adapter slot dir so migration has something to remove.
+        slot_dir = _write_adapter_slot_dir(cfg.adapter_dir, "episodic", "20260430-180000")
+        # Create adapter_config.json so the slot is recognised as a weight slot.
+        (slot_dir / "adapter_config.json").write_text("{}")
 
         reconstruction = self._make_graph_result("episodic", keys)
 
@@ -334,8 +391,8 @@ class TestMigrateTierTrainToSimulate:
         ):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
-        # Simulate-store graph.json written
-        target = cfg.simulate_dir / "episodic" / "graph.json"
+        # Unified layout: graph.json lives under adapter_dir, not simulate_dir.
+        target = cfg.adapter_dir / "episodic" / "graph.json"
         assert target.exists()
 
         # Verify the written graph has all expected keys
@@ -345,8 +402,9 @@ class TestMigrateTierTrainToSimulate:
         graph_keys = {q["key"] for q in iter_entries(loaded)}
         assert graph_keys == set(keys)
 
-        # Adapter dir removed
-        assert not (cfg.adapter_dir / "episodic").exists()
+        # Weight slot subdirectory removed; tier dir still present (holds graph.json).
+        assert not slot_dir.exists()
+        assert (cfg.adapter_dir / "episodic").is_dir()
 
     def test_reconstruction_error_propagates(self, tmp_path):
         """ReconstructionError from reconstruct_graph → RuntimeError raised."""
@@ -365,8 +423,8 @@ class TestMigrateTierTrainToSimulate:
         ):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
-        # Adapter dir not removed on failure
-        assert not (cfg.simulate_dir / "episodic" / "graph.json").exists()
+        # Rollback: graph.json was not written (unified layout: adapter_dir).
+        assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
 
     def test_sanity_check_failure_rolls_back(self, tmp_path):
         """When sanity check detects missing key in written graph, graph.json is unlinked."""
@@ -391,8 +449,8 @@ class TestMigrateTierTrainToSimulate:
         ):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
-        # Rolled back: graph.json removed
-        assert not (cfg.simulate_dir / "episodic" / "graph.json").exists()
+        # Rolled back: graph.json removed (unified layout: adapter_dir).
+        assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
 
     def test_edge_decoration_uses_indexed_key_cache(self, tmp_path):
         """speaker_id and first_seen_cycle from indexed_key_cache appear on graph edges."""
@@ -412,7 +470,8 @@ class TestMigrateTierTrainToSimulate:
 
         from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
 
-        loaded = load_memory_from_disk(cfg.simulate_dir / "episodic" / "graph.json")
+        # Unified layout: graph written under adapter_dir, not simulate_dir.
+        loaded = load_memory_from_disk(cfg.adapter_dir / "episodic" / "graph.json")
         entries = list(iter_entries(loaded))
         assert len(entries) == 1
         assert entries[0]["speaker_id"] == "spk-alice"
@@ -441,9 +500,9 @@ class TestMigrateOrchestrator:
 
     def test_per_tier_failure_isolated(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
-        # Set up all three tiers with graph.json files
+        # Set up all three tiers with graph.json files under the unified layout.
         for tier in TIERS:
-            _write_simulate_graph(cfg.simulate_dir, tier, [_full_quad(f"{tier}_g1")])
+            _write_simulate_graph(cfg.adapter_dir, tier, [_full_quad(f"{tier}_g1")])
 
         state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
 
@@ -498,13 +557,13 @@ class TestMigrateOrchestrator:
         assert "procedural" in result.completed_tiers
         # State file persists because not all_tiers_done
         assert state_path(cfg.adapter_dir).exists()
-        # Source for failed tier still on disk
-        assert (cfg.simulate_dir / "episodic" / "graph.json").exists()
+        # Source for failed tier still on disk (unified layout: adapter_dir).
+        assert (cfg.adapter_dir / "episodic" / "graph.json").exists()
 
     def test_all_complete_clears_state_file(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
         for tier in TIERS:
-            _write_simulate_graph(cfg.simulate_dir, tier, [_full_quad(f"{tier}_g1")])
+            _write_simulate_graph(cfg.adapter_dir, tier, [_full_quad(f"{tier}_g1")])
 
         state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
 
@@ -630,13 +689,15 @@ class TestMigrateTierSimulateToTrain:
     def test_empty_source_skipped(self, tmp_path):
         """Empty graph.json (no edges) → _TierSkipped."""
         cfg = _make_config(tmp_path, mode="train")
-        _write_simulate_graph(cfg.simulate_dir, "episodic", [])
+        # Unified layout: graph.json lives under adapter_dir.
+        _write_simulate_graph(cfg.adapter_dir, "episodic", [])
         with pytest.raises(_TierSkipped, match="empty"):
             _migrate_tier_simulate_to_train(self._make_loop(), cfg, "episodic")
 
     def test_disabled_tier_skipped(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
-        _write_simulate_graph(cfg.simulate_dir, "procedural", [_full_quad("p1")])
+        # Unified layout: graph.json lives under adapter_dir.
+        _write_simulate_graph(cfg.adapter_dir, "procedural", [_full_quad("p1")])
         loop = self._make_loop()
         loop.procedural_config = None  # operator disabled procedural
         with pytest.raises(_TierSkipped, match="not enabled"):
@@ -645,7 +706,8 @@ class TestMigrateTierSimulateToTrain:
     def test_happy_path_orchestration(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
         entries = [_full_quad(f"g{i}") for i in range(2)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
+        # Unified layout: graph.json lives under adapter_dir.
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -672,8 +734,8 @@ class TestMigrateTierSimulateToTrain:
         # train_adapter was called with adapter_name=tier
         assert train_mock.call_count == 1
         assert train_mock.call_args.kwargs["adapter_name"] == "episodic"
-        # Source graph deleted post-success
-        assert not (cfg.simulate_dir / "episodic" / "graph.json").exists()
+        # Source graph deleted post-success (simulate_to_train always deletes source graph).
+        assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
         # Per-tier SimHash registry persisted at per-tier path
         assert (cfg.adapter_dir / "episodic" / "simhash_registry.json").exists()
 
@@ -681,7 +743,8 @@ class TestMigrateTierSimulateToTrain:
         """The persisted simhash file holds exactly the fingerprints from Step 2."""
         cfg = _make_config(tmp_path, mode="train")
         entries = [_full_quad(f"g{i}") for i in range(2)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
+        # Unified layout: graph.json lives under adapter_dir.
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -714,7 +777,8 @@ class TestMigrateTierSimulateToTrain:
     def test_probe_failure_rolls_back(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
         entries = [_full_quad(f"g{i}") for i in range(3)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
+        # Unified layout: graph.json lives under adapter_dir.
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 0.66  # below 1.0 → rollback
         loop._indexed_dataset.return_value = MagicMock()
@@ -737,8 +801,8 @@ class TestMigrateTierSimulateToTrain:
 
         # No save was attempted (probe failed first)
         save_mock.assert_not_called()
-        # Source preserved
-        assert (cfg.simulate_dir / "episodic" / "graph.json").exists()
+        # Source preserved (unified layout: adapter_dir).
+        assert (cfg.adapter_dir / "episodic" / "graph.json").exists()
         # No simhash registry written (probe failed before write)
         assert not (cfg.adapter_dir / "episodic" / "simhash_registry.json").exists()
 
@@ -750,7 +814,8 @@ class TestMigrateTierSimulateToTrain:
         """
         cfg = _make_config(tmp_path, mode="train")
         entries = [_full_quad(f"g{i}") for i in range(2)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
+        # Unified layout: graph.json lives under adapter_dir.
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()

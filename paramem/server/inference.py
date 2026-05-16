@@ -734,7 +734,7 @@ def _probe_and_reason(
     # the slow-path fallback when a key isn't already cached.
     _active_mode = effective_mode if effective_mode else config.consolidation.mode
     if _active_mode == "simulate":
-        source = DiskMemorySource(config.simulate_dir)
+        source = DiskMemorySource(config.adapter_dir)
     elif model is not None:
         source = WeightMemorySource(
             model,
@@ -852,14 +852,37 @@ def _probe_and_reason(
     total_facts = sum(len(f) for f in layers.values())
     logger.info("Total recalled: %d facts from %d layers", total_facts, len(layers))
 
-    # Assemble layered context: procedural → episodic → semantic.
+    # Assemble layered context: procedural → episodic (incl. interim slots) → semantic.
     # Later sections sit closer to the query, giving them higher recency bias.
+    #
+    # Adapter-name mapping: probe results land in ``layers`` under the
+    # ``step.adapter_name`` used during routing.  For interim windows that name
+    # is ``"episodic_interim_<stamp>"`` (per router.reload's
+    # do-not-strip-stamps policy at router.py:274-283 — required so
+    # ``switch_adapter`` lands on the trained slot).  The context-assembly
+    # layer is conceptually still "episodic", so we collect every
+    # ``episodic*`` adapter's facts under the single ``Recent knowledge``
+    # bucket.  Multiple interim slots are emitted newest-stamp-first,
+    # mirroring the router's probe-order policy.
     context_sections = []
-    for adapter_name in ["procedural", "episodic", "semantic"]:
-        if adapter_name in layers:
-            label = LAYER_LABELS.get(adapter_name, adapter_name)
-            facts_text = "\n".join(layers[adapter_name])
-            context_sections.append(f"[{label}]\n{facts_text}")
+    procedural_facts = layers.get("procedural")
+    if procedural_facts:
+        context_sections.append(f"[{LAYER_LABELS['procedural']}]\n" + "\n".join(procedural_facts))
+
+    episodic_adapter_names = sorted(
+        (n for n in layers if n == "episodic" or n.startswith("episodic_interim_")),
+        key=lambda n: (n != "episodic", n),
+        reverse=True,
+    )
+    episodic_facts: list[str] = []
+    for adapter_name in episodic_adapter_names:
+        episodic_facts.extend(layers[adapter_name])
+    if episodic_facts:
+        context_sections.append(f"[{LAYER_LABELS['episodic']}]\n" + "\n".join(episodic_facts))
+
+    semantic_facts = layers.get("semantic")
+    if semantic_facts:
+        context_sections.append(f"[{LAYER_LABELS['semantic']}]\n" + "\n".join(semantic_facts))
 
     layered_context = "\n\n".join(context_sections)
     augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
@@ -1006,11 +1029,11 @@ def _load_simhash_registry(adapter_dir) -> dict:
     Returns ``{key: simhash}`` across all main and interim adapter slots.
     Reads per-tier ``<adapter_dir>/<tier>/simhash_registry.json`` for the
     three main tiers (episodic, semantic, procedural) and
-    ``<adapter_dir>/episodic_interim_*/simhash_registry.json`` for all
-    interim slots — the layout written by ``_save_adapters`` / ``post_session_train``
-    since the per-tier KeyRegistry refactor.
+    ``<adapter_dir>/episodic/interim_<stamp>/simhash_registry.json`` for all
+    interim slots — the unified layout written by ``_save_adapters`` /
+    ``commit_tier_slot`` since the per-tier KeyRegistry refactor.
     ``training/consolidation.py:_save_adapters`` and
-    ``_train_extracted_into_interim``).
+    ``training/memory_persistence.py:commit_tier_slot``).
 
     Plan A retired the legacy combined ``data/ha/registry.json`` file in
     favour of these per-adapter files as the single source of truth.
