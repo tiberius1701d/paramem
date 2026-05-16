@@ -179,7 +179,6 @@ class TestConsolidationIntegration:
             data=ha,
             sessions=ha / "sessions",
             debug=ha / "debug",
-            simulate=ha / "simulate",
         )
         (ha / "adapters").mkdir(parents=True, exist_ok=True)
         return config
@@ -254,28 +253,81 @@ class TestConsolidationIntegration:
 
         assert loop.extract_session.call_count == 1
 
-    def test_oom_during_training_aborts_cycle(self, tmp_path):
-        """Training is wrapped in vram_scope("training") just like extract.
+    def test_training_oom_surfaces_training_phase_label(self, tmp_path):
+        """M2: vram_scope("training") at callsite 2 must label OOM as phase "training".
 
-        An OOM in train_adapters_no_save must surface as VramExhausted
-        with phase label "training" so operators can distinguish a
-        training crash from an extract crash.
+        ``_run_extraction_phase`` wraps the ``run_consolidation_cycle`` train call
+        in ``vram_scope("training")``.  An OOM during training must raise
+        ``VramExhausted("training")`` — not ``VramExhausted("some_session_id")`` —
+        so the ``/status`` operator endpoint can distinguish training failures from
+        extraction failures.
+        """
+        from unittest.mock import MagicMock
+
+        loop = self._make_mock_loop()
+        # Extraction succeeds; training raises OOM.
+        loop.extract_session = MagicMock(
+            return_value=(
+                [
+                    {
+                        "subject": "Alice",
+                        "predicate": "lives_in",
+                        "object": "Berlin",
+                        "relation_type": "factual",
+                        "speaker_id": "Speaker7",
+                    }
+                ],
+                [],
+            )
+        )
+        loop.run_consolidation_cycle = MagicMock(
+            side_effect=torch.cuda.OutOfMemoryError("training OOM")
+        )
+        # run_consolidation_cycle is called with mode="train" — the OOM must
+        # propagate through vram_scope("training") and surface as VramExhausted.
+
+        config = self._make_config(tmp_path)
+        # Add adapters.episodic.enabled to satisfy the guard in _run_extraction_phase.
+        config.adapters.episodic.enabled = True
+        config.consolidation.mode = "train"
+        buffer = self._make_session_buffer(tmp_path, "conv-vram-train-1", "Speaker7")
+
+        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
+            with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
+                with pytest.raises(VramExhausted) as exc_info:
+                    self._call_run_extraction_phase(loop, config, buffer)
+
+        assert exc_info.value.args == ("training",), (
+            f"Expected VramExhausted('training'), got VramExhausted{exc_info.value.args!r}"
+        )
+
+    def test_oom_during_training_aborts_cycle(self, tmp_path):
+        """OOM in run_consolidation_cycle aborts the cycle as VramExhausted.
+
+        The train callsite in _run_extraction_phase wraps run_consolidation_cycle
+        in vram_scope("training") so OutOfMemoryError surfaces as
+        VramExhausted("training") — the /status operator endpoint uses the phase
+        label to distinguish training failures from extraction failures.
         """
         loop = self._make_mock_loop()
         # Extract returns one QA pair so the cycle reaches the training step.
         loop.extract_session = lambda *_a, **_kw: ([{"key": "k1", "speaker_id": "Speaker7"}], [])
-        loop.train_adapters_no_save = lambda *_a, **_kw: (_ for _ in ()).throw(
+        loop.run_consolidation_cycle = lambda *_a, **_kw: (_ for _ in ()).throw(
             torch.cuda.OutOfMemoryError("training simulated")
         )
 
         config = self._make_config(tmp_path)
+        config.consolidation.mode = "train"
         buffer = self._make_session_buffer(tmp_path, "conv-vram-train", "Speaker7")
 
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
-                with pytest.raises(VramExhausted) as info:
+                with pytest.raises(VramExhausted) as exc_info:
                     self._call_run_extraction_phase(loop, config, buffer)
-        assert info.value.args == ("training",)
+
+        assert exc_info.value.args == ("training",), (
+            f"Expected VramExhausted('training'), got VramExhausted{exc_info.value.args!r}"
+        )
 
 
 class TestVramConfig:
@@ -420,7 +472,6 @@ class TestPerChunkOOMSkip:
             data=ha,
             sessions=ha / "sessions",
             debug=ha / "debug",
-            simulate=ha / "simulate",
         )
         # Disable indexed_key_replay so the no-facts/early-exit path
         # is the simplest and most testable shape (we're only verifying
@@ -573,7 +624,6 @@ class TestExtractionFailedAbortsCycle:
             data=ha,
             sessions=ha / "sessions",
             debug=ha / "debug",
-            simulate=ha / "simulate",
         )
         config.consolidation.indexed_key_replay = False
         (ha / "adapters").mkdir(parents=True, exist_ok=True)

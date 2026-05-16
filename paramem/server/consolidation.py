@@ -161,11 +161,14 @@ def session_retention_dir(loop, config) -> Path | None:
     """
     if not (config.consolidation.retain_sessions or config.debug):
         return None
-    interim_stamp = getattr(loop, "_current_interim_stamp", None)
+    # _current_interim_stamp is never set on the loop (the attribute was removed
+    # when the context-variable pattern was replaced by explicit parameter passing
+    # in run_consolidation_cycle).  Pass None so snapshot_dir_for uses the
+    # cycle-scoped path (paths.debug/episodic/cycle_<N>/run_<run_id>/).
     snap = None
     snap_fn = getattr(loop, "snapshot_dir_for", None)
     if callable(snap_fn):
-        snap = snap_fn(interim_stamp=interim_stamp)
+        snap = snap_fn(interim_stamp=None)
     if snap is None:
         cycle = getattr(loop, "cycle_count", 0)
         return config.debug_dir / f"cycle_{cycle}" / "sessions"
@@ -294,11 +297,14 @@ def _save_debug_artifacts(
     procedural_rels:
         Procedural relation triples produced by the consolidation pipeline.
     """
-    interim_stamp = getattr(loop, "_current_interim_stamp", None)
+    # _current_interim_stamp is never set on the loop (the attribute was removed
+    # when the context-variable pattern was replaced by explicit parameter passing
+    # in run_consolidation_cycle).  Pass None so snapshot_dir_for uses the
+    # cycle-scoped path (paths.debug/episodic/cycle_<N>/run_<run_id>/).
     snap = None
     snap_fn = getattr(loop, "snapshot_dir_for", None)
     if callable(snap_fn):
-        snap = snap_fn(interim_stamp=interim_stamp)
+        snap = snap_fn(interim_stamp=None)
     out_dir = snap if snap is not None else config.debug_dir / f"cycle_{loop.cycle_count}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -461,50 +467,3 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     # trial never writes to the live registry paths.
     dest = getattr(loop, "trial_key_metadata_path", None) or config.key_metadata_path
     _atomic_json_write(metadata, dest)
-
-
-def _save_tier_graphs(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Persist per-tier ``graph.json`` — the simulate-mode persistence form.
-
-    Simulate mode persists facts to disk as the per-tier ``graph.json``.
-    Train mode does NOT persist a graph: facts live in RAM during the
-    cycle and in adapter weights after training.  Debug-mode snapshots
-    use a different writer.
-
-    Defense-in-depth mode gate: a direct call in train mode is a no-op,
-    so a stray import / test cannot accidentally leave a stale graph.json
-    behind that would be re-read at boot.
-
-    For each tier whose simhash registry is non-empty, projects the store's
-    tier slice into an ``nx.MultiDiGraph`` via
-    :func:`paramem.training.memory_persistence.build_tier_graph_from_store`
-    and persists under ``<simulate_dir>/<tier>/graph.json``.
-    """
-    if config.consolidation.mode != "simulate":
-        return
-
-    from paramem.training import memory_persistence
-    from paramem.training.indexed_memory import save_registry
-
-    for tier in ("episodic", "semantic", "procedural"):
-        if loop.store.simhash_count_in_tier(tier) == 0:
-            continue
-        tier_graph = memory_persistence.build_tier_graph_from_store(loop.store, tier)
-        tier_dir = config.simulate_dir / tier
-        tier_dir.mkdir(parents=True, exist_ok=True)
-        memory_persistence.save_memory_to_disk(tier_graph, tier_dir / "graph.json")
-
-        # Persist registries so boot hydration can rehydrate the in-RAM
-        # store without re-extracting.  Train mode writes these inside
-        # `_save_adapters`; simulate mode has no `_save_adapters`, so we
-        # write them here alongside graph.json.  Same per-tier layout
-        # under `config.adapter_dir/<tier>/` as train mode.
-        adapter_tier_dir = config.adapter_dir / tier
-        adapter_tier_dir.mkdir(parents=True, exist_ok=True)
-        save_registry(
-            loop.store.simhashes_in_tier(tier),
-            adapter_tier_dir / "simhash_registry.json",
-        )
-        registry = loop.store.registry(tier)
-        if registry is not None:
-            registry.save(adapter_tier_dir / "indexed_key_registry.json")

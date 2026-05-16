@@ -1112,9 +1112,14 @@ class TestTrainingOutputDirUniqueness:
             # Temporarily patch _run_indexed_key_procedural to capture the stamp.
             original_proc = loop._run_indexed_key_procedural
 
-            def _proc_capture(rels, speaker_id):
+            def _proc_capture(rels, speaker_id, **kwargs):
                 # Record the output dir that would be used (via _training_output_dir).
-                captured_dirs.append(str(loop._training_output_dir("procedural")))
+                # Accepts mode/stamp/run_label forwarded by run_consolidation_cycle.
+                # Pass interim_stamp so the path includes the stamp segment.
+                interim_stamp = kwargs.get("stamp")
+                captured_dirs.append(
+                    str(loop._training_output_dir("procedural", interim_stamp=interim_stamp))
+                )
 
             loop._run_indexed_key_procedural = _proc_capture
             try:

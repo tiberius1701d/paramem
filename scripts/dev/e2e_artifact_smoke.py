@@ -37,7 +37,7 @@ What this verifies
     - Security OFF → production artifacts are plaintext (master switch);
       debug stays plaintext.
 * Forbidden patterns (e.g. simulate-mode never writes adapter weights;
-  no stale ``cycle_*/`` dirs under ``paths.simulate``).
+  no stale legacy ``cycle_*/`` dirs under the adapter directory).
 * Atomic-write discipline: no ``.tmp`` residue under any scenario dir.
 
 What this does NOT verify

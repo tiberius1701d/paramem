@@ -107,9 +107,14 @@ class DiskMemorySource:
     JSON decode.  Per-call cost scales with the per-tier graph size (a
     few hundred edges typically).
 
-    The per-tier directory layout is ``<store_dir>/<adapter_name>/graph.json``
-    where *adapter_name* is the tier name verbatim (``"episodic"``,
-    ``"semantic"``, ``"procedural"``, or ``"episodic_interim_<stamp>"``).
+    Path resolution uses :func:`paramem.server.interim_adapter.adapter_slot_root_for_name`
+    so both main tiers (``"episodic"``, ``"semantic"``, ``"procedural"`` — flat
+    under ``<store_dir>/<tier>/``) and interim adapters
+    (``"episodic_interim_<stamp>"`` — nested under
+    ``<store_dir>/episodic/interim_<stamp>/``) resolve correctly.
+
+    *store_dir* is the adapter root (``config.adapter_dir``) — the same
+    directory that ``commit_tier_slot`` writes graph.json into.
     """
 
     def __init__(self, store_dir: Path) -> None:
@@ -118,6 +123,7 @@ class DiskMemorySource:
     def probe(self, keys_by_adapter: dict[str, list[str]]) -> dict[str, dict | None]:
         import json
 
+        from paramem.server.interim_adapter import adapter_slot_root_for_name
         from paramem.training.entry_memory import entry_fact_text
         from paramem.training.memory_persistence import (
             entry_by_key,
@@ -128,7 +134,7 @@ class DiskMemorySource:
         for adapter_name, keys in keys_by_adapter.items():
             if not keys:
                 continue
-            graph_path = self.store_dir / adapter_name / "graph.json"
+            graph_path = adapter_slot_root_for_name(self.store_dir, adapter_name) / "graph.json"
             graph = load_memory_from_disk(graph_path)
             for key in keys:
                 entry = entry_by_key(graph, key)

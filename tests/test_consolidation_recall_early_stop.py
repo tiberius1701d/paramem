@@ -1,14 +1,14 @@
 """Unit tests for production recall-based early stopping.
 
-Covers the wiring at the FIVE production-reachable train_adapter call sites:
+Covers the wiring at the THREE production-reachable train_adapter call sites:
 
   - paramem/training/consolidation.py:
-      Site #1 _run_indexed_key_episodic
+      Site #1 run_consolidation_cycle (unified episodic interim path; formerly
+              _run_indexed_key_episodic + _train_extracted_into_interim)
       Site #2 _run_indexed_key_procedural
-      Site #3 _train_extracted_into_interim
-      Site #4 consolidate_interim_adapters (per-tier loop body)
+      Site #3 consolidate_interim_adapters (per-tier loop body)
   - paramem/server/active_store_migration.py:
-      Site #5 _migrate_tier_simulate_to_train
+      Site #4 _migrate_tier_simulate_to_train
 
 Plus the helper itself (Class A) and the structural AST gate (Class F)
 that prevents future architectural-mismatch regressions of the v1 class.
@@ -237,10 +237,16 @@ class TestCallSiteWiringSourcePresence:
             hf.visit(child)
         return hf.found
 
-    def test_site1_episodic(self) -> None:
+    def test_site1_unified_cycle(self) -> None:
+        """run_consolidation_cycle is the unified entry for episodic interim training.
+
+        _run_indexed_key_episodic and _train_extracted_into_interim were merged
+        into run_consolidation_cycle (Phase 1–3 refactor).  The recall callback
+        must be wired here.
+        """
         assert self._function_contains_helper(
             PROJECT_ROOT / "paramem/training/consolidation.py",
-            "_run_indexed_key_episodic",
+            "run_consolidation_cycle",
         )
 
     def test_site2_procedural(self) -> None:
@@ -249,19 +255,13 @@ class TestCallSiteWiringSourcePresence:
             "_run_indexed_key_procedural",
         )
 
-    def test_site3_interim(self) -> None:
-        assert self._function_contains_helper(
-            PROJECT_ROOT / "paramem/training/consolidation.py",
-            "_train_extracted_into_interim",
-        )
-
-    def test_site4_consolidate_interim(self) -> None:
+    def test_site3_consolidate_interim(self) -> None:
         assert self._function_contains_helper(
             PROJECT_ROOT / "paramem/training/consolidation.py",
             "consolidate_interim_adapters",
         )
 
-    def test_site5_migration(self) -> None:
+    def test_site4_migration(self) -> None:
         assert self._function_contains_helper(
             PROJECT_ROOT / "paramem/server/active_store_migration.py",
             "_migrate_tier_simulate_to_train",

@@ -4,14 +4,13 @@ Run with: pytest tests/test_integration_gpu.py -v --gpu
 Skip in CI: these tests are excluded by default (require --gpu flag).
 
 Tests cover:
-1. rollback_preparation
-2. extract_procedural_graph
-3. SOTA noise filter (anonymize → filter → de-anonymize)
-4. get_home_context
-5. _extract_and_start_training (mocked HA)
-6. _consolidation_scheduler (async)
-7. BackgroundTrainer._train_adapter
-8. Batch consolidation end-to-end
+1. extract_procedural_graph
+2. SOTA noise filter (anonymize → filter → de-anonymize)
+3. get_home_context
+4. _extract_and_start_training (mocked HA)
+5. _consolidation_scheduler (async)
+6. BackgroundTrainer._train_adapter
+7. Batch consolidation end-to-end
 """
 
 import os
@@ -58,56 +57,7 @@ def model_and_tokenizer():
         torch.cuda.empty_cache()
 
 
-# --- 1. rollback_preparation ---
-
-
-class TestRollbackPreparation:
-    def _make_loop(self, tmp_path):
-        from paramem.training.consolidation import ConsolidationLoop
-        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
-
-        model = MagicMock()
-        # Pretend all adapters (including staging) already exist to skip _ensure_adapters
-        model.peft_config = {
-            "episodic": MagicMock(),
-            "semantic": MagicMock(),
-            "in_training": MagicMock(),
-        }
-        loop = ConsolidationLoop(
-            model=model,
-            tokenizer=MagicMock(),
-            consolidation_config=ConsolidationConfig(indexed_key_replay_enabled=True),
-            training_config=TrainingConfig(),
-            episodic_adapter_config=AdapterConfig(),
-            semantic_adapter_config=AdapterConfig(),
-            output_dir=tmp_path,
-        )
-        return loop
-
-    def test_rollback_restores_state(self, tmp_path):
-        """Verify prepare_training_data → rollback restores original state."""
-        loop = self._make_loop(tmp_path)
-
-        orig_cycle = loop.cycle_count
-        orig_next_idx = loop._indexed_next_index
-        orig_qa = dict(loop.store._entries_flat_view())
-
-        loop.prepare_training_data([], [])
-
-        assert loop.cycle_count == orig_cycle + 1
-
-        loop.rollback_preparation()
-        assert loop.cycle_count == orig_cycle
-        assert loop._indexed_next_index == orig_next_idx
-        assert loop.store._entries_flat_view() == orig_qa
-
-    def test_rollback_without_snapshot(self, tmp_path):
-        """Rollback with no prior prepare should not crash."""
-        loop = self._make_loop(tmp_path)
-        loop.rollback_preparation()
-
-
-# --- 2. extract_procedural_graph ---
+# --- 1. extract_procedural_graph ---
 
 
 class TestExtractProceduralGraph:
@@ -937,11 +887,10 @@ class TestSimulateModePromptIteration:
     The full pipeline up to and including `ExtractionPipeline.run` and
     `ExtractionPipeline.run_procedural` runs unchanged: chunking,
     `extract_session`, the 8-stage SOTA chain (when configured), QA
-    generation, dedup, key assignment.  The branch in
-    `paramem/server/consolidation.py:423` flips to
-    `loop.simulated_training(...)` instead of `train_adapters` —
-    persistence venue is the simulate JSON store, not LoRA weights.
-    No `model.gradient_checkpointing_enable()` train cycle, no
+    generation, dedup, key assignment.  `run_consolidation_cycle` runs
+    with `mode="simulate"` — persistence venue is `graph.json` under
+    `adapter_dir/<tier>/`, not LoRA weights.  No
+    `model.gradient_checkpointing_enable()` train cycle, no
     `_save_adapters`, no per-cycle adapter checkpoints.
 
     Why
@@ -962,10 +911,9 @@ class TestSimulateModePromptIteration:
 
     Hermetic
     --------
-    All persistence directories (`paths.adapters`, `paths.simulate`,
-    `paths.debug`, `paths.sessions`, `paths.registry`,
-    `paths.key_metadata`) redirect under `tmp_path`.  No production
-    state is read or written.
+    All persistence directories (`paths.adapters`, `paths.debug`,
+    `paths.sessions`, `paths.registry`, `paths.key_metadata`) redirect
+    under `tmp_path`.  No production state is read or written.
     """
 
     @pytest.mark.parametrize("source_type", ["transcript", "document"])
@@ -990,7 +938,7 @@ class TestSimulateModePromptIteration:
             * No LoRA weight files written (``adapter_model.safetensors``
               / ``.bin``) anywhere under ``tmp_path``.
             * Indexed-key registry contains at least one key (assigned
-              by ``_simulate_indexed_key_episodic``).
+              by ``run_consolidation_cycle`` simulate path).
         """
         import json as _json
         from pathlib import Path as _Path
@@ -1008,16 +956,15 @@ class TestSimulateModePromptIteration:
 
         # Hermetic redirection of all persistence paths.  paths.adapters,
         # paths.registry, paths.key_metadata are derived from paths.data; the
-        # directly-settable fields (sessions, debug, simulate) must be aimed
-        # under the same root.
+        # directly-settable fields (sessions, debug) must be aimed under the
+        # same root.  simulate_dir is gone — simulate mode now writes
+        # graph.json under adapter_dir/<tier>/ alongside train mode.
         cfg.paths.data = tmp_path / "data"
-        cfg.paths.simulate = tmp_path / "data" / "simulate"
         cfg.paths.debug = tmp_path / "data" / "debug"
         cfg.paths.sessions = tmp_path / "data" / "sessions"
         for path in (
             cfg.paths.data,
             cfg.paths.adapters,
-            cfg.paths.simulate,
             cfg.paths.debug,
             cfg.paths.sessions,
             cfg.paths.registry_dir,
@@ -1091,7 +1038,8 @@ class TestSimulateModePromptIteration:
         assert loop is not None
         assert loop.indexed_key_registry is not None
         assert len(loop._all_active_keys()) >= 1, (
-            "Indexed-key registry empty — _simulate_indexed_key_episodic did not assign keys."
+            "Indexed-key registry empty — run_consolidation_cycle (simulate mode) "
+            "did not assign keys."
         )
 
         # --- Per-session snapshot present and structurally valid ---

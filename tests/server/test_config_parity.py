@@ -143,7 +143,6 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
         "paths.data",
         "paths.debug",
         "paths.sessions",
-        "paths.simulate",
     }
 )
 

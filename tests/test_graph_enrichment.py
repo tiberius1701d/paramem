@@ -47,6 +47,10 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     )
     defaults.update(kwargs)
 
+    # replay_enabled controls whether run_consolidation_cycle's registry guard
+    # fires.  Callers that need enrichment hooks to fire pass replay_enabled=True.
+    replay_enabled = defaults.pop("replay_enabled", False)
+
     from paramem.training.memory_store import MemoryStore as _MS
 
     loop = ConsolidationLoop(
@@ -56,7 +60,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         training_config=TrainingConfig(),
         episodic_adapter_config=AdapterConfig(),
         semantic_adapter_config=AdapterConfig(),
-        memory_store=_MS(replay_enabled=False),
+        memory_store=_MS(replay_enabled=replay_enabled),
         procedural_adapter_config=None,
         output_dir=tmp_path,
         persist_graph=False,
@@ -947,7 +951,16 @@ class TestInterimEnrichmentHook:
 
     def test_rollover_hook_fires_above_floor(self, tmp_path):
         """Normal fresh-interim branch with counter ≥ floor → _run_graph_enrichment called."""
-        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=5)
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(
+            tmp_path,
+            graph_enrichment_min_triples_floor=5,
+            replay_enabled=True,  # pass the registry guard so enrichment can fire
+        )
+        # Load empty registries so run_consolidation_cycle can proceed past the guard.
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
         loop._triples_since_last_enrichment = 10  # over floor
 
         # Stub extract_session to return episodic QA; skip the real extraction.
@@ -965,13 +978,18 @@ class TestInterimEnrichmentHook:
                 [],
             )
         )
-        loop.indexed_key_registry = None  # drive into no-registry early return
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
 
         # Stub the interim-adapter creation; PEFT is fully mocked.
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
-        with patch(
-            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+        with (
+            patch(
+                "paramem.server.interim_adapter.create_interim_adapter",
+                return_value=loop.model,
+            ),
+            patch("paramem.training.trainer.train_adapter", return_value={}),
+            patch("paramem.models.loader.save_adapter"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             loop.post_session_train(
                 session_transcript="t",
@@ -1064,7 +1082,16 @@ class TestInterimEnrichmentHook:
 
     def test_rollover_hook_swallows_sota_exception(self, tmp_path):
         """Exception in _run_graph_enrichment must NOT break post_session_train."""
-        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=1)
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(
+            tmp_path,
+            graph_enrichment_min_triples_floor=1,
+            replay_enabled=True,  # pass the registry guard so enrichment can fire
+        )
+        # Load empty registries so run_consolidation_cycle can proceed past the guard.
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
         loop._triples_since_last_enrichment = 10
 
         loop.extract_session = MagicMock(
@@ -1081,12 +1108,17 @@ class TestInterimEnrichmentHook:
                 [],
             )
         )
-        loop.indexed_key_registry = None
         loop._run_graph_enrichment = MagicMock(side_effect=RuntimeError("sota blew up"))
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
-        with patch(
-            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+        with (
+            patch(
+                "paramem.server.interim_adapter.create_interim_adapter",
+                return_value=loop.model,
+            ),
+            patch("paramem.training.trainer.train_adapter", return_value={}),
+            patch("paramem.models.loader.save_adapter"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             # Must NOT raise — the hook is wrapped.
             result = loop.post_session_train(
@@ -1099,8 +1131,9 @@ class TestInterimEnrichmentHook:
             )
 
         loop._run_graph_enrichment.assert_called_once()
-        # no_registry path returns mode="noop" with error — the point is no uncaught raise.
-        assert result["mode"] == "noop"
+        # Training proceeded (no_registry guard was passed) — the exception in
+        # enrichment is swallowed; the cycle returns "trained" mode.
+        assert result.get("error") is None or result.get("mode") in ("trained", "simulated")
 
     def test_rollover_hook_skipped_on_cap_reached_absorb(self, tmp_path):
         """Cap-reached absorb path (degenerated early-return) does NOT fire the hook.

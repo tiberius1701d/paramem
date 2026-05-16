@@ -255,7 +255,7 @@ class TestExtractionPathParity:
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
-            memory_store=_MS(replay_enabled=False),
+            memory_store=_MS(replay_enabled=True),
             procedural_adapter_config=procedural_adapter,
             output_dir=tmp_path,
             persist_graph=False,
@@ -273,28 +273,23 @@ class TestExtractionPathParity:
     def _run_cycle_and_capture(self, monkeypatch, loop, source_type: str = "transcript"):
         captured: dict[str, list[dict]] = {"episodic_rels": [], "procedural_rels": []}
 
-        def _capture_episodic(self_, episodic_rels, new_promotions):
+        def _capture_cycle(self_, episodic_rels, procedural_rels, **kwargs):
+            """Intercept run_consolidation_cycle to capture the relation lists."""
             captured["episodic_rels"] = episodic_rels
-            return None
+            captured["procedural_rels"] = procedural_rels
+            return {
+                "triples_extracted": len(episodic_rels),
+                "new_keys": [],
+                "mode": "trained",
+                "adapter_name": "episodic",
+                "venue": "train",
+                "error": None,
+            }
 
-        def _capture_procedural(self_, procedural_relations, speaker_id):
-            captured["procedural_rels"] = procedural_relations
-            return None
-
-        # Force the indexed-key branch so we can intercept. Stub registry + save.
-        from unittest.mock import MagicMock as _MM
-
-        loop.indexed_key_registry = _MM()
-        loop.indexed_key_registry.list_active = _MM(return_value=[])
-        monkeypatch.setattr(
-            type(loop), "_run_indexed_key_episodic", _capture_episodic, raising=False
-        )
-        monkeypatch.setattr(
-            type(loop),
-            "_run_indexed_key_procedural",
-            _capture_procedural,
-            raising=False,
-        )
+        # Patch run_consolidation_cycle so run_cycle's indexed-key branch can be
+        # intercepted without needing the removed _run_indexed_key_episodic /
+        # _run_indexed_key_procedural methods.
+        monkeypatch.setattr(type(loop), "run_consolidation_cycle", _capture_cycle, raising=False)
         monkeypatch.setattr(type(loop), "_save_adapters", lambda self_: None, raising=False)
         loop.run_cycle(
             session_transcript="Alex lives in Millfield. He prefers Acme Radio.",

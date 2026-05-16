@@ -496,6 +496,48 @@ class BackgroundTrainer:
                 )
                 self._worker_thread.start()
 
+    def submit_and_wait(
+        self,
+        fn: Callable[[], None],
+        *,
+        inference_fallback_adapter: str = "episodic",
+    ) -> None:
+        """Submit *fn* to the BG worker and block until it completes.
+
+        Equivalent to :meth:`submit` followed by a :class:`threading.Event`
+        wait.  This is the single canonical pattern for callers that need
+        synchronous completion semantics — it replaces the inline Event-wait
+        boilerplate that previously appeared in both
+        :func:`paramem.server.app._await_bg_cycle` and
+        :meth:`paramem.training.consolidation.ConsolidationLoop.train_adapters`.
+
+        Re-raises any exception thrown inside *fn* on the calling thread.
+
+        Args:
+            fn: Zero-argument callable to execute under the GPU lock.
+            inference_fallback_adapter: Adapter to activate if ``pause()``
+                is called while *fn* is executing.  Defaults to
+                ``"episodic"``.
+
+        Raises:
+            Exception: Re-raises the first exception raised inside *fn*.
+        """
+        done_event = threading.Event()
+        exc_holder: list[BaseException] = []
+
+        def _wrapped() -> None:
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001
+                exc_holder.append(exc)
+            finally:
+                done_event.set()
+
+        self.submit(_wrapped, inference_fallback_adapter=inference_fallback_adapter)
+        done_event.wait()
+        if exc_holder:
+            raise exc_holder[0]
+
     def _run_callable_queue(self) -> None:
         """Drain the callable-job queue serially under the GPU lock.
 
@@ -567,6 +609,31 @@ class BackgroundTrainer:
                 call; ``False`` to mark a non-training gap or the finalize block.
         """
         self._is_training = value
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop the ephemeral callable-worker thread and release its resources.
+
+        Intended for callers that construct a short-lived :class:`BackgroundTrainer`
+        for a single synchronous job (e.g. the ``train_adapters`` helper in
+        :class:`paramem.training.consolidation.ConsolidationLoop`).  The
+        persistent callable-worker thread started by the first :meth:`submit`
+        call is stopped by enqueueing the :data:`_WORKER_STOP` sentinel and
+        joining the thread.
+
+        Idempotent: calling ``close()`` on an instance that has already been
+        closed (or that never started a worker) is a no-op.
+
+        Production callers that keep a :class:`BackgroundTrainer` alive across
+        many sessions (``paramem/server/app.py``) should **not** call this
+        method — they intentionally keep the worker running for the process
+        lifetime.
+
+        Args:
+            timeout: Seconds to wait for the worker thread to join.  If the
+                thread is still alive after the timeout a warning is logged and
+                the method returns — the daemon will be killed on process exit.
+        """
+        self._stop_callable_worker(timeout=timeout)
 
     def _stop_callable_worker(self, timeout: float = 5.0) -> None:
         """Signal the callable worker to exit and wait for it to terminate.

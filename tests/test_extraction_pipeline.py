@@ -2154,63 +2154,6 @@ class TestBackgroundTrainer:
         bt.resume()
 
 
-# --- Consolidation: collect_semantic_keys ---
-
-
-class TestCollectSemanticKeys:
-    def _make_loop_stub(self):
-        from paramem.training.memory_store import MemoryStore as _MS
-
-        class Stub:
-            def __init__(self):
-                self.store = _MS(replay_enabled=False)
-                # Seed the store directly (skip registry; replay disabled).
-                for k, s, p, o in [
-                    ("graph1", "Alice", "lives_in", "Berlin"),
-                    ("graph2", "Bob", "works_at", "ACME"),
-                ]:
-                    self.store.put(
-                        "semantic",
-                        k,
-                        {"key": k, "subject": s, "predicate": p, "object": o},
-                        register=False,
-                    )
-                self.store.put(
-                    "procedural",
-                    "proc1",
-                    {
-                        "key": "proc1",
-                        "subject": "Alice",
-                        "predicate": "prefers",
-                        "object": "tea",
-                    },
-                    register=False,
-                )
-                self.store.put_simhash("semantic", "graph1", 12345)
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        stub = Stub()
-        stub._collect_semantic_keys = ConsolidationLoop._collect_semantic_keys.__get__(stub)
-        return stub
-
-    def test_collects_semantic_keys(self):
-        stub = self._make_loop_stub()
-        result = stub._collect_semantic_keys()
-        assert len(result) == 1
-        assert result[0]["key"] == "graph1"
-
-    def test_empty_semantic(self):
-        stub = self._make_loop_stub()
-        stub.store.replace_simhashes_in_tier("semantic", {})
-        assert stub._collect_semantic_keys() == []
-
-    def test_missing_qa_skipped(self):
-        stub = self._make_loop_stub()
-        stub.store.replace_simhashes_in_tier("semantic", {"graph99": 99999})
-        assert stub._collect_semantic_keys() == []
-
-
 # --- Debug-artifact writers ---
 
 

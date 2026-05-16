@@ -261,12 +261,14 @@ class TestAssertModeConsistency:
         # Must not raise — the carve-out files are not in the probed set.
         assert_mode_consistency(data, daily_identity_loadable=True)
 
-    def test_simulate_dir_plaintext_with_daily_refuses(self, tmp_path, monkeypatch):
-        """Plaintext under paths.simulate while daily is loaded → refuse.
+    def test_tier_graph_plaintext_with_daily_refuses(self, tmp_path, monkeypatch):
+        """Plaintext graph.json under adapter_dir while daily is loaded → refuse.
 
-        Pre-canonicalization the simulate store sat outside ``infra_paths``
-        and stale plaintext there silently slipped past startup. With the
-        simulate root now in the probed set, a mixed state is detected.
+        After consolidation the tier graph lives at
+        ``data/adapters/<tier>/graph.json``.  A mixed-encryption state
+        (age-encrypted registry.json + plaintext adapter graph) is detected
+        by ``assert_mode_consistency`` because ``infra_paths`` probes the
+        per-tier adapter paths.
         """
         ident = _setup_daily(tmp_path, monkeypatch)
         data = tmp_path / "data"
@@ -275,17 +277,17 @@ class TestAssertModeConsistency:
 
         (data / "registry.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
 
-        simulate = tmp_path / "simulate"
-        (simulate / "episodic").mkdir(parents=True)
-        (simulate / "episodic" / "graph.json").write_bytes(
-            b'{"nodes": [], "links": []}'
-        )  # plaintext
+        # Write plaintext under adapter_dir/episodic/ — this is the canonical
+        # path that infra_paths probes; mixed state must be detected.
+        adapter_ep = data / "adapters" / "episodic"
+        adapter_ep.mkdir(parents=True)
+        (adapter_ep / "graph.json").write_bytes(b'{"nodes": [], "links": []}')  # plaintext
 
         with pytest.raises(FatalConfigError, match="Mixed encryption state"):
-            assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=simulate)
+            assert_mode_consistency(data, daily_identity_loadable=True)
 
-    def test_simulate_dir_age_envelope_passes(self, tmp_path, monkeypatch):
-        """age envelopes under paths.simulate alongside age in data → OK with daily loaded."""
+    def test_tier_graph_age_envelope_passes(self, tmp_path, monkeypatch):
+        """age envelope in adapter_dir/semantic/graph.json alongside age in data → OK."""
         from paramem.backup.age_envelope import age_encrypt_bytes
 
         ident = _setup_daily(tmp_path, monkeypatch)
@@ -293,19 +295,23 @@ class TestAssertModeConsistency:
         data.mkdir()
         (data / "registry.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
 
-        simulate = tmp_path / "simulate"
-        (simulate / "semantic").mkdir(parents=True)
-        (simulate / "semantic" / "graph.json").write_bytes(
+        # Write an age-encrypted graph under the canonical adapter path.
+        adapter_sem = data / "adapters" / "semantic"
+        adapter_sem.mkdir(parents=True)
+        (adapter_sem / "graph.json").write_bytes(
             age_encrypt_bytes(b'{"nodes": [], "links": []}', [ident.to_public()])
         )
 
-        # Must not raise — both stores age-encrypted, daily identity available.
-        assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=simulate)
+        # Must not raise — both files are age-encrypted, daily identity available.
+        assert_mode_consistency(data, daily_identity_loadable=True)
 
-    def test_simulate_dir_none_falls_back_to_data_only(self, tmp_path, monkeypatch):
-        """Callers without a simulate config (legacy path) get the historical
-        behaviour: only data_dir is scanned. No regression on the existing
-        contract."""
+    def test_outside_data_dir_not_probed(self, tmp_path, monkeypatch):
+        """Files outside data_dir are not in infra_paths and do not affect the scan.
+
+        A plaintext file in a directory that is not under data_dir must NOT
+        trigger a mixed-encryption refusal — only files that infra_paths
+        returns are considered.
+        """
         ident = _setup_daily(tmp_path, monkeypatch)
         data = tmp_path / "data"
         data.mkdir()
@@ -313,14 +319,13 @@ class TestAssertModeConsistency:
 
         (data / "registry.json").write_bytes(age_encrypt_bytes(b"{}", [ident.to_public()]))
 
-        # A plaintext file under what WOULD be the simulate dir, if probed —
-        # but the caller passes simulate_dir=None, so it must NOT be probed.
-        rogue = tmp_path / "would-be-simulate"
+        # A plaintext file entirely outside data_dir — must not be probed.
+        rogue = tmp_path / "rogue-dir"
         (rogue / "episodic").mkdir(parents=True)
         (rogue / "episodic" / "quads.json").write_bytes(b"[]")
 
-        # Must not raise — simulate_dir=None means rogue is invisible.
-        assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=None)
+        # Must not raise — rogue-dir is not in infra_paths(data_dir).
+        assert_mode_consistency(data, daily_identity_loadable=True)
 
 
 # ---------------------------------------------------------------------------

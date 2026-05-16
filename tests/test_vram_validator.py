@@ -587,7 +587,6 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
         data=root,
         sessions=root / "sessions",
         debug=root / "debug",
-        simulate=root / "simulate",
     )
 
     saved_state = {

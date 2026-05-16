@@ -755,7 +755,7 @@ def _compute_tier_registry_sha256(config, tier: str) -> str:
     """SHA-256 of ``<adapter_dir>/<tier>/indexed_key_registry.json`` plaintext bytes.
 
     Each main-tier slot's manifest is stamped with that tier's OWN registry
-    hash (see ``_train_extracted_into_interim`` step 5/6b for the procedural
+    hash (see ``commit_tier_slot`` step 2 / I5 ordering for the procedural
     case).  Slot matching must therefore use the per-tier hash too — passing a
     single episodic hash across all tiers makes procedural and semantic slots
     unmountable on boot.
@@ -1124,8 +1124,19 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
         _load_one(_interim_name, slot)
 
     # ---- I5 — Registry consistency check ----
-    # Drop orphan interim-tier registries whose adapter weights are truly
-    # absent (torn save: registry written before the .safetensors landed).
+    # Drop orphan interim-tier registries that are genuinely torn: registry
+    # written but neither adapter weights NOR a simulate-mode graph.json
+    # landed on disk.
+    #
+    # Slot classification:
+    #   has_weights (adapter_model.safetensors anywhere under slot dir) →
+    #       train-mode slot — keep regardless of graph.json.
+    #   has_graph (graph.json at slot dir root) + no weights →
+    #       simulate-mode slot — keep; wiping it would destroy the prior
+    #       simulate cycle's persisted state on every restart.
+    #   neither →
+    #       genuinely torn write (crash between registry and payload writes)
+    #       — wipe.
     #
     # IMPORTANT: this is torn-save cleanup, NOT hash-mismatch cleanup.
     # ``find_live_slot is None`` is not proof that weights are missing —
@@ -1133,18 +1144,30 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     # ``registry_sha256`` does not match the live hash (registry drift
     # after a partial cycle).  Treating that case as "weights missing"
     # would ``rmtree`` a fully-trained adapter.  The only legitimate
-    # trigger is "no ``adapter_model.safetensors`` anywhere under the
-    # interim dir" — flat layout or any slot subdir.  Hash mismatch is a
-    # separate failure mode and is surfaced via I4 ``manifest_status``.
+    # trigger is "neither weights NOR graph.json present anywhere under
+    # the interim dir".  Hash mismatch is a separate failure mode and is
+    # surfaced via I4 ``manifest_status``.
     for _interim_name, _interim_reg_dir in iter_interim_dirs(config.adapter_dir):
         _interim_reg_path = _interim_reg_dir / "indexed_key_registry.json"
         if not _interim_reg_path.exists():
             continue
-        if any(_interim_reg_dir.rglob("adapter_model.safetensors")):
+        _has_weights = any(_interim_reg_dir.rglob("adapter_model.safetensors"))
+        if _has_weights:
+            # Train-mode slot — already handled above.
             continue
+        _has_graph = (_interim_reg_dir / "graph.json").exists()
+        if _has_graph:
+            # Simulate-mode slot — keep.
+            logger.debug(
+                "Startup registry check: interim adapter %s is a simulate-mode "
+                "slot (has graph.json, no safetensors) — preserving",
+                _interim_name,
+            )
+            continue
+        # Neither weights nor graph — genuinely torn write.
         logger.warning(
-            "Startup registry check: interim adapter %s weights missing — "
-            "removing its registry (adapter save was interrupted)",
+            "Startup registry check: interim adapter %s has no weights and no "
+            "graph.json — removing its registry (adapter save was interrupted)",
             _interim_name,
         )
         import shutil as _shutil
@@ -1279,7 +1302,6 @@ async def lifespan(app: FastAPI):
     _assert_mode(
         config.paths.data,
         daily_identity_loadable=_daily_ok,
-        simulate_dir=config.paths.simulate,
     )
     _line, _is_on = security_posture_log_line(
         daily_loadable=_daily_ok,
@@ -1788,7 +1810,7 @@ async def lifespan(app: FastAPI):
             _mode = config.consolidation.mode
             _source = None
             if _mode == "simulate":
-                _source = _DiskMemorySource(config.simulate_dir)
+                _source = _DiskMemorySource(config.adapter_dir)
             elif _state.get("model") is not None:
                 _source = _WeightMemorySource(
                     _state["model"],
@@ -1879,7 +1901,6 @@ async def lifespan(app: FastAPI):
         memory_store=memory_store,
         ha_graph=ha_graph,
         intent_config=config.intent,
-        simulate_dir=config.simulate_dir,
     )
 
     # Residual intent classifier — load the sentence-encoder once so the
@@ -3420,7 +3441,6 @@ async def refresh_ha():
             memory_store=_state["memory_store"],
             ha_graph=ha_graph,
             intent_config=config.intent,
-            simulate_dir=config.simulate_dir,
         )
 
     return {
@@ -6693,6 +6713,85 @@ def _set_voice_pipeline_profile(
     logger.info("Voice pipeline profile: %r", profile)
 
 
+def _await_bg_cycle(
+    *,
+    loop,
+    config,
+    episodic_rels: list,
+    procedural_rels: list,
+    speaker_id: str,
+    mode: "Literal['simulate', 'train']",
+    run_label: str,
+    schedule: str = "",
+    max_interim_count: int = 7,
+    inference_fallback_adapter: str = "episodic",
+) -> dict:
+    """Submit ``run_consolidation_cycle`` to the BG trainer and block until done.
+
+    Constructs a fresh :class:`~paramem.server.background_trainer.BackgroundTrainer`,
+    submits the cycle as a callable, and blocks on a ``threading.Event`` until
+    the worker finishes.  The BG worker thread acquires ``gpu_lock_sync()``
+    internally, so the caller must NOT already hold the lock (that would
+    deadlock — the non-reentrant ``threading.Lock`` in ``gpu_lock.py`` cannot
+    be acquired twice on the same thread).
+
+    Use this helper from sites that do NOT hold the GPU lock (e.g. the
+    simulate and train branches of ``_extract_and_start_training``).  Sites
+    that already hold the GPU lock (e.g. the trial-path caller of
+    ``_run_extraction_phase``) must call ``loop.run_consolidation_cycle``
+    directly.
+
+    Args:
+        loop: Active :class:`~paramem.training.consolidation.ConsolidationLoop`.
+        config: Live :class:`~paramem.server.config.ServerConfig` from ``_state``.
+        episodic_rels: Extracted episodic relations for this cycle.
+        procedural_rels: Extracted procedural relations for this cycle.
+        speaker_id: Default speaker tag for relations without one.
+        mode: ``"train"`` writes adapter weights; ``"simulate"`` writes sidecar JSON.
+        run_label: Traceability tag passed to ``run_consolidation_cycle``.
+        schedule: Consolidation refresh-cadence string for stamp computation.
+        max_interim_count: Cap on concurrent interim adapters.
+        inference_fallback_adapter: Adapter the BG pause mechanism switches to
+            when inference is requested mid-cycle.  Defaults to ``"episodic"``.
+
+    Returns:
+        Result dict from ``run_consolidation_cycle``:
+        ``{"triples_extracted", "new_keys", "adapter_name", "mode", "venue",
+        "error"}``.
+
+    Raises:
+        Exception: Re-raises any exception thrown inside the BG worker.
+    """
+    from paramem.server.background_trainer import BackgroundTrainer
+
+    bt = BackgroundTrainer(
+        model=_state["model"],
+        tokenizer=_state["tokenizer"],
+        training_config=config.training_config,
+        output_dir=config.adapter_dir,
+        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+    )
+    _state["background_trainer"] = bt
+
+    _result_holder: dict = {}
+
+    def _run() -> None:
+        _result_holder["result"] = loop.run_consolidation_cycle(
+            episodic_rels,
+            procedural_rels,
+            speaker_id=speaker_id,
+            mode=mode,
+            run_label=run_label,
+            schedule=schedule,
+            max_interim_count=max_interim_count,
+        )
+        # Propagate any PeftModel handle rebinding from create_interim_adapter.
+        _state["model"] = loop.model
+
+    bt.submit_and_wait(_run, inference_fallback_adapter=inference_fallback_adapter)
+    return _result_holder["result"]
+
+
 def _run_extraction_phase(
     loop,
     mark_callback=None,
@@ -6730,7 +6829,6 @@ def _run_extraction_phase(
         _promote_mature_keys,
         _save_debug_artifacts,
         _save_key_metadata,
-        _save_tier_graphs,
         session_retention_dir,
     )
 
@@ -6853,21 +6951,33 @@ def _run_extraction_phase(
             len(all_procedural_rels),
         )
 
-    if config.debug:
-        try:
-            _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
-        except Exception:
-            logger.exception("debug-artifact write failed; continuing consolidation")
-
     simulate = config.consolidation.mode == "simulate"
     if simulate:
         primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
         try:
-            sim_result = loop.simulated_training(
-                all_episodic_rels, all_procedural_rels, speaker_id=primary_speaker_sim
+            # Callsite 1: simulate branch.  The GPU lock is already held by the
+            # trial-path caller (``with gpu_lock_sync()`` at the migration
+            # endpoint), so ``_await_bg_cycle`` cannot be used here — its BG
+            # worker would deadlock trying to re-acquire the non-reentrant lock.
+            # Call ``run_consolidation_cycle`` directly: the GPU lock is held,
+            # the cycle is CPU-bound key-preparation + JSON persistence only,
+            # and the pause-for-inference contract is satisfied by the outer lock.
+            sim_result = loop.run_consolidation_cycle(
+                all_episodic_rels,
+                all_procedural_rels,
+                speaker_id=primary_speaker_sim,
+                mode="simulate",
+                run_label=f"full-{primary_speaker_sim or 'anon'}",
+                schedule=config.consolidation.refresh_cadence,
+                max_interim_count=config.consolidation.max_interim_count,
             )
+            # Gap 10 fix (option b): debug artifacts reflect post-cycle state.
+            if config.debug:
+                try:
+                    _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
+                except Exception:
+                    logger.exception("debug-artifact write failed; continuing consolidation")
             newly_promoted = _promote_mature_keys(loop, config)
-            _save_tier_graphs(loop, config)
             _save_key_metadata(loop, config)
         except Exception:
             logger.exception(
@@ -6894,7 +7004,7 @@ def _run_extraction_phase(
             "semantic_keys": loop.store.simhash_count_in_tier("semantic"),
             "procedural_keys": loop.store.simhash_count_in_tier("procedural"),
             "elapsed_seconds": round(elapsed, 1),
-            "simulated": sim_result.get("simulated", True),
+            "simulated": sim_result.get("mode") == "simulated",
             "loop": loop,
         }
         logger.info("Simulation complete: %s", {k: v for k, v in summary.items() if k != "loop"})
@@ -6908,10 +7018,32 @@ def _run_extraction_phase(
     )
     primary_speaker = speaker_ids[-1] if speaker_ids else ""
     try:
-        with vram_scope("training"):
-            train_result = loop.train_adapters_no_save(
-                all_episodic_rels, all_procedural_rels, speaker_id=primary_speaker
+        # Callsite 2: train branch.  Same lock-held constraint as callsite 1 —
+        # the trial-path caller holds ``gpu_lock_sync()``, so ``_await_bg_cycle``
+        # would deadlock.  Call ``run_consolidation_cycle`` directly.
+        # The ``vram_scope("training")`` wrapper surfaces OutOfMemoryError as
+        # VramExhausted("training") so the /status operator endpoint shows the
+        # phase label.  The trial-path outer lock already serialises GPU access
+        # for this synchronous call, so vram_scope adds only the phase label and
+        # empty_cache discipline — not a new lock.
+        from paramem.server.vram_guard import vram_scope as _vram_scope
+
+        with _vram_scope("training"):
+            train_result = loop.run_consolidation_cycle(
+                all_episodic_rels,
+                all_procedural_rels,
+                speaker_id=primary_speaker,
+                mode="train",
+                run_label=f"full-{primary_speaker or 'anon'}",
+                schedule=config.consolidation.refresh_cadence,
+                max_interim_count=config.consolidation.max_interim_count,
             )
+        # Gap 10 fix (option b): debug artifacts reflect post-cycle state.
+        if config.debug:
+            try:
+                _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
+            except Exception:
+                logger.exception("debug-artifact write failed; continuing consolidation")
         newly_promoted = _promote_mature_keys(loop, config)
         loop._save_adapters()
         _save_key_metadata(loop, config)
@@ -6938,7 +7070,7 @@ def _run_extraction_phase(
         "episodic_keys": loop.store.simhash_count_in_tier("episodic"),
         "semantic_keys": loop.store.simhash_count_in_tier("semantic"),
         "procedural_keys": loop.store.simhash_count_in_tier("procedural"),
-        "train_loss": train_result.get("episodic_train_loss"),
+        "train_loss": train_result.get("train_loss"),
         "elapsed_seconds": round(elapsed, 1),
         "loop": loop,
     }
@@ -7007,7 +7139,6 @@ def _extract_and_start_training():
         _promote_mature_keys,
         _save_debug_artifacts,
         _save_key_metadata,
-        _save_tier_graphs,
         create_consolidation_loop,
         session_retention_dir,
     )
@@ -7245,39 +7376,49 @@ def _extract_and_start_training():
     # --- Simulate mode: peer storage backend ---
     # Same upstream pipeline as train (extraction → dedup → key assignment →
     # contradiction handling → SimHash registry); the persistence venue is
-    # an encrypted JSON store under paths.simulate instead of LoRA weight
-    # updates. mark_consolidated runs in both branches — sessions retire
-    # when their work has been persisted, regardless of medium. Inference
-    # reads from the JSON store at retrieval time (Task #7 follow-up).
-
-    # Symmetric debug dump (both branches) — moved before mode split.
-    # Best-effort: a debug-write failure must NOT abort consolidation.
-    if config.debug:
-        try:
-            _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
-        except Exception:
-            logger.exception("debug-artifact write failed; continuing consolidation")
+    # graph.json under adapter_dir/<tier>/ instead of LoRA weight updates.
+    # mark_consolidated runs in both branches — sessions retire when their
+    # work has been persisted, regardless of medium. Inference reads from
+    # the graph.json via DiskMemorySource at retrieval time.
 
     if config.consolidation.mode == "simulate":
         primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
-        with gpu_lock_sync():
-            sim_result = loop.simulated_training(
-                all_episodic_rels, all_procedural_rels, speaker_id=primary_speaker_sim
-            )
-            newly_promoted = _promote_mature_keys(loop, config)
-            _save_tier_graphs(loop, config)
-            # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
-            # the combined SimHash registry at config.registry_path was not
-            # maintained by interim or full-cycle production paths post-Phase-3+5,
-            # and the temporal-query reader (filter_registry_by_date) — itself
-            # retired in Plan A.3 — needed fields the writer never emitted.
-            # Per-adapter simhash_registry_<adapter>.json files are now the
-            # canonical source of truth; inference._load_simhash_registry combines
-            # them at read time.
-            _save_key_metadata(loop, config)
-            # _save_simulate_store retired with the canonicalization — the per-tier
-            # graph.json written by _save_tier_graphs is the
-            # only simulate-mode persistence (cycle_<N>/ snapshots dropped).
+        # Callsite 3: post-session simulate.  The caller does NOT hold the GPU
+        # lock at this point (the old ``with gpu_lock_sync()`` wrapper is
+        # dropped — the BG worker thread acquires the lock internally via
+        # ``_run_callable_queue``).  ``_await_bg_cycle`` submits the cycle and
+        # blocks until the worker finishes, preserving the pause-for-inference
+        # contract without a redundant outer lock acquisition.
+        sim_result = _await_bg_cycle(
+            loop=loop,
+            config=config,
+            episodic_rels=all_episodic_rels,
+            procedural_rels=all_procedural_rels,
+            speaker_id=primary_speaker_sim,
+            mode="simulate",
+            run_label=f"tick-{primary_speaker_sim or 'anon'}",
+            schedule=config.consolidation.refresh_cadence,
+            max_interim_count=config.consolidation.max_interim_count,
+        )
+        # Gap 10 fix (option b): debug artifacts reflect post-cycle state.
+        # Best-effort: a debug-write failure must NOT abort consolidation.
+        if config.debug:
+            try:
+                _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
+            except Exception:
+                logger.exception("debug-artifact write failed; continuing consolidation")
+        newly_promoted = _promote_mature_keys(loop, config)
+        # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
+        # the combined SimHash registry at config.registry_path was not
+        # maintained by interim or full-cycle production paths post-Phase-3+5,
+        # and the temporal-query reader (filter_registry_by_date) — itself
+        # retired in Plan A.3 — needed fields the writer never emitted.
+        # Per-adapter simhash_registry_<adapter>.json files are now the
+        # canonical source of truth; inference._load_simhash_registry combines
+        # them at read time.
+        _save_key_metadata(loop, config)
+        # Per-tier graph.json is written by commit_tier_slot inside
+        # run_consolidation_cycle; cycle_<N>/ snapshots are dropped.
 
         # Simulate is peer storage — retire successfully-extracted sessions
         # like train. OOM-skipped chunks stay pending for retry.
@@ -7307,7 +7448,7 @@ def _extract_and_start_training():
                 "episodic_rels": len(all_episodic_rels),
                 "procedural_rels": len(all_procedural_rels),
                 "newly_promoted": len(newly_promoted),
-                "simulated": sim_result.get("simulated", True),
+                "simulated": sim_result.get("mode") == "simulated",
             }
             _state["consolidating"] = False
             logger.info(
@@ -7371,11 +7512,19 @@ def _extract_and_start_training():
         bound to BackgroundTrainer.start_jobs's on_complete callback.
         """
         try:
-            result = loop._train_extracted_into_interim(
+            # Callsite 4: post-session async-train.  Runs inside the BG worker
+            # thread under ``gpu_lock_sync()`` (acquired by
+            # ``_run_callable_queue``).  The surrounding BG-trainer construction
+            # and closure pattern are unchanged; only the deleted
+            # ``_train_extracted_into_interim`` is replaced with the unified
+            # ``run_consolidation_cycle``.  Fire-and-forget semantics are
+            # preserved — this is NOT converted to ``_await_bg_cycle``.
+            result = loop.run_consolidation_cycle(
                 all_episodic_rels,
                 all_procedural_rels,
-                run_label=f"tick-{primary_speaker or 'anon'}",
                 speaker_id=primary_speaker,
+                mode="train",
+                run_label=f"tick-{primary_speaker or 'anon'}",
                 schedule=schedule,
                 max_interim_count=max_interim_count,
             )
@@ -7518,11 +7667,22 @@ def _run_full_consolidation_sync() -> None:
         # the eviction was meant to mitigate. Voice eviction is scoped
         # to the extraction path in _extract_and_start_training, and
         # only when the pending batch is document-only.
+        #
+        # Mode dispatch: simulate mode has no PEFT interim adapters —
+        # calling consolidate_interim_adapters would trigger
+        # delete_adapter / create_adapter on a non-existent slot.
+        # Simulate mode uses consolidate_interim_graphs instead, which
+        # merges the per-cycle graph.json sidecars into the canonical
+        # main-tier graph without touching PEFT weights.
+        _mode = config.consolidation.mode
         try:
-            result = loop.consolidate_interim_adapters(
-                trainer=bt,
-                router=_state.get("router"),
-            )
+            if _mode == "simulate":
+                result = loop.consolidate_interim_graphs()
+            else:
+                result = loop.consolidate_interim_adapters(
+                    trainer=bt,
+                    router=_state.get("router"),
+                )
         except Exception:
             logger.exception("Full consolidation failed")
             _state["last_consolidation_result"] = {"status": "error"}

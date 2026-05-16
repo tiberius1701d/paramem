@@ -54,7 +54,6 @@ def _make_router_from_pairs(
     *,
     adapter_dir: "Path | None" = None,
     ha_graph: "MagicMock | None" = None,
-    simulate_dir: "Path | None" = None,
 ) -> "QueryRouter":
     """Create a QueryRouter backed by a mock ConsolidationLoop.
 
@@ -73,8 +72,6 @@ def _make_router_from_pairs(
         that also write graph files can specify where to look.
     ha_graph:
         Optional mock HA entity graph.
-    simulate_dir:
-        Optional simulate-mode directory (for graph-based entity loading).
     """
     from paramem.training.memory_store import MemoryStore
 
@@ -91,8 +88,6 @@ def _make_router_from_pairs(
     }
     if ha_graph is not None:
         kwargs["ha_graph"] = ha_graph
-    if simulate_dir is not None:
-        kwargs["simulate_dir"] = simulate_dir
     return QueryRouter(**kwargs)
 
 
@@ -1140,8 +1135,7 @@ class TestQueryRouterSimulateDir:
     In simulate mode, ``ConsolidationLoop`` populates ``store`` from
     the simulate store (graph.json) just as train mode populates it from adapter
     weights.  The router's ``reload()`` uses only ``loop.store`` as the
-    canonical source — ``simulate_dir`` is stored for back-compat but is not
-    read during reload.
+    canonical source — the router reads only ``loop.store`` during reload.
 
     These tests verify entity indexing and routing from simulate-mode cache entries.
     """

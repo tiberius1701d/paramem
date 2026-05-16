@@ -120,7 +120,6 @@ debug: true   # dev-test posture: full diagnostic artefacts (per-session graph d
 paths:
   data: tests/fixtures/sandbox/data/ha                # persistent artifacts (adapters, registry, key_metadata)
   sessions: tests/fixtures/sandbox/data/ha/sessions    # conversation transcripts pending consolidation
-  simulate: tests/fixtures/sandbox/data/ha/simulate    # encrypted JSON-store outputs when consolidation.mode = simulate
   debug: tests/fixtures/sandbox/data/ha/debug          # cycle snapshots, diagnostic output (debug=true)
   prompts: configs/prompts                              # extraction and voice prompt templates (read-only, shared with live)
 
@@ -219,7 +218,7 @@ adapters:
 consolidation:
   refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
-  mode: train                  # "train" persists to LoRA weights; "simulate" persists encrypted JSON store under paths.simulate
+  mode: train                  # "train" persists to LoRA weights; "simulate" persists graph.json under adapter_dir/<tier>/ (no weight training)
   promotion_threshold: 3       # sessions_seen count for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism

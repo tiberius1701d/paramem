@@ -89,7 +89,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _load_config(config_path: Path):
-    """Load server config; return a minimal object with paths.data and paths.simulate.
+    """Load server config; return a minimal object with paths.data.
 
     Falls back to defaults when the config file is missing so the CLI is
     usable in very early provisioning contexts.
@@ -97,7 +97,7 @@ def _load_config(config_path: Path):
     Returns
     -------
     object
-        Object with ``.paths.data`` and ``.paths.simulate`` attributes.
+        Object with ``.paths.data`` attribute.
     """
     try:
         from paramem.server.config import load_server_config
@@ -106,14 +106,13 @@ def _load_config(config_path: Path):
     except Exception as exc:  # noqa: BLE001
         print(
             f"WARNING: could not load config from {config_path}: {exc}. "
-            "Falling back to defaults (data=data/ha, simulate=data/ha/simulate).",
+            "Falling back to defaults (data=data/ha).",
             file=sys.stderr,
         )
 
         # Return a minimal stand-in.
         class _FallbackPaths:
             data = Path("data/ha")
-            simulate = Path("data/ha/simulate")
 
         class _FallbackCfg:
             paths = _FallbackPaths()
@@ -162,10 +161,9 @@ def run(args: argparse.Namespace) -> int:
     # Resolve paths from config.
     cfg = _load_config(Path(args.config))
     data_dir = Path(cfg.paths.data)
-    simulate_dir = Path(cfg.paths.simulate) if cfg.paths.simulate else None
 
     # Gather candidate paths (existence-filtered below).
-    candidates = infra_paths(data_dir, simulate_dir=simulate_dir)
+    candidates = infra_paths(data_dir)
 
     n_encrypted = 0
     n_skipped = 0
