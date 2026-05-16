@@ -304,7 +304,7 @@ def add_parser(subparsers) -> None:
         help=(
             "Override the simulate-mode peer-storage directory. When --data-dir "
             "is set, --simulate-dir defaults to None (simulate store untouched) "
-            "— pass it explicitly to rotate the simulate keyed_pairs alongside "
+            "— pass it explicitly to rotate the simulate store alongside "
             "the train-mode store. When neither --data-dir nor --simulate-dir "
             "is given, falls through to the server config's paths.simulate."
         ),

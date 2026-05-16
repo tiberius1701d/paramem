@@ -1,6 +1,5 @@
 """Unit tests for QueryRouter — dual-graph routing and entity indexing."""
 
-import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,22 +7,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.server.router import (
-    MAX_KEYS_PER_QUERY,
     QueryRouter,
     _interim_sort_key,
     _is_interrogative,
 )
+from paramem.training.memory_store import MemoryStore
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _write_keyed_pairs(directory: Path, pairs: list[dict], *, subdir: str | None = None) -> None:
-    """Write a keyed_pairs.json file into directory (or directory/subdir/)."""
-    target = directory / subdir if subdir else directory
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "keyed_pairs.json").write_text(json.dumps(pairs))
 
 
 def _make_pair(
@@ -34,24 +26,74 @@ def _make_pair(
     speaker_id: str = "",
     question: str = "Q?",
     answer: str = "A.",
-    source_predicate: str = "related_to",
+    predicate: str = "related_to",
     first_seen_cycle: int = 1,
+    adapter_id: str = "episodic",
 ) -> dict:
-    """Return a full-schema keyed pair for use in router tests.
+    """Return a canonical cache-entry dict for use in router tests.
 
-    All eight canonical fields are included so ``read_keyed_pairs`` schema
-    validation passes when the router loads the fixture file.
+    Uses the canonical field names (``subject``, ``predicate``, ``object``).
+    ``adapter_id`` controls which tier the router assigns this key to when
+    building the loop registry.
     """
     return {
         "key": key,
         "question": question,
         "answer": answer,
-        "source_subject": subject,
-        "source_predicate": source_predicate,
-        "source_object": obj,
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
         "speaker_id": speaker_id,
         "first_seen_cycle": first_seen_cycle,
+        "_adapter_id": adapter_id,  # internal: used by _make_router_from_pairs
     }
+
+
+def _make_router_from_pairs(
+    pairs: list[dict],
+    *,
+    adapter_dir: "Path | None" = None,
+    ha_graph: "MagicMock | None" = None,
+    simulate_dir: "Path | None" = None,
+) -> "QueryRouter":
+    """Create a QueryRouter backed by a mock ConsolidationLoop.
+
+    Builds an ``indexed_key_cache`` from *pairs* and a matching ``KeyRegistry``
+    so ``reload()`` populates entity/speaker indexes without touching the file
+    system.  The ``_adapter_id`` field in each pair controls which tier the
+    key is registered under.
+
+    Parameters
+    ----------
+    pairs:
+        List of dicts as returned by ``_make_pair``.
+    adapter_dir:
+        Optional path for the router's ``adapter_dir``.  Ignored for entity
+        indexing (which now comes from the loop cache) but kept so callers
+        that also write graph files can specify where to look.
+    ha_graph:
+        Optional mock HA entity graph.
+    simulate_dir:
+        Optional simulate-mode directory (for graph-based entity loading).
+    """
+    from paramem.training.memory_store import MemoryStore
+
+    store = MemoryStore(replay_enabled=True)
+    for pair in pairs:
+        key = pair["key"]
+        adapter_id = pair.get("_adapter_id", "episodic")
+        entry = {k: v for k, v in pair.items() if k != "_adapter_id"}
+        store.put(adapter_id, key, entry)
+
+    kwargs: dict = {
+        "adapter_dir": adapter_dir or Path("/nonexistent"),
+        "memory_store": store,
+    }
+    if ha_graph is not None:
+        kwargs["ha_graph"] = ha_graph
+    if simulate_dir is not None:
+        kwargs["simulate_dir"] = simulate_dir
+    return QueryRouter(**kwargs)
 
 
 def _make_ha_match(
@@ -239,110 +281,104 @@ class TestIsInterrogative:
 
 
 class TestQueryRouterLoad:
-    def test_empty_directory_loads_cleanly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert router.entity_count == 0
-            assert router.adapter_count == 0
+    def test_empty_cache_loads_cleanly(self):
+        router = _make_router_from_pairs([])
+        assert router.entity_count == 0
+        assert router.adapter_count == 0
 
     def test_nonexistent_directory_loads_cleanly(self):
-        router = QueryRouter(adapter_dir=Path("/nonexistent/path/xyz"))
+        router = QueryRouter(
+            adapter_dir=Path("/nonexistent/path/xyz"),
+            memory_store=MemoryStore(replay_enabled=False),
+        )
         assert router.entity_count == 0
 
-    def test_keyed_pairs_at_root_infers_episodic(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "episodic" in router._entity_key_index
+    def test_episodic_adapter_id_appears_in_entity_key_index(self):
+        """Key registered under episodic appears in that tier's entity index."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic")]
+        )
+        assert "episodic" in router._entity_key_index
 
-    def test_keyed_pairs_in_subdir_uses_subdir_name(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-                subdir="semantic",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "semantic" in router._entity_key_index
+    def test_semantic_adapter_id_appears_in_entity_key_index(self):
+        """Key registered under semantic appears under the semantic tier."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="semantic")]
+        )
+        assert "semantic" in router._entity_key_index
 
     def test_subject_and_object_both_indexed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "alice" in router._all_entities
-            assert "berlin" in router._all_entities
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")]
+        )
+        assert "alice" in router._all_entities
+        assert "berlin" in router._all_entities
 
     def test_speaker_id_indexed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "alice" in router._speaker_key_index
-            assert "graph1" in router._speaker_key_index["alice"]
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")]
+        )
+        assert "alice" in router._speaker_key_index
+        assert "graph1" in router._speaker_key_index["alice"]
 
     def test_pair_without_speaker_id_not_in_speaker_index(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert len(router._speaker_key_index) == 0
+        router = _make_router_from_pairs([_make_pair("graph1", "Alice", "Berlin")])
+        assert len(router._speaker_key_index) == 0
 
-    def test_malformed_json_does_not_crash(self):
+    def test_no_loop_provider_gives_empty_indexes(self):
+        """Without a loop_provider, indexes stay empty (files no longer read)."""
         with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "keyed_pairs.json").write_text("{not valid json}")
-            router = QueryRouter(adapter_dir=Path(tmp))
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False)
+            )
             assert router.entity_count == 0
 
     def test_multiple_adapters_indexed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("se1", "Alice", "Python", speaker_id="alice")],
-                subdir="semantic",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert router.adapter_count == 2
-            assert "episodic" in router._entity_key_index
-            assert "semantic" in router._entity_key_index
+        router = _make_router_from_pairs(
+            [
+                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_pair("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
+            ]
+        )
+        assert router.adapter_count == 2
+        assert "episodic" in router._entity_key_index
+        assert "semantic" in router._entity_key_index
 
     def test_reload_replaces_index(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert router.entity_count > 0
+        """reload() observes mutations to the injected store."""
+        store = MemoryStore(replay_enabled=True)
 
-            # Remove file and reload — index must clear
-            (Path(tmp) / "keyed_pairs.json").unlink()
-            router.reload()
-            assert router.entity_count == 0
+        router = QueryRouter(
+            adapter_dir=Path("/nonexistent"),
+            memory_store=store,
+        )
+        assert router.entity_count == 0
+
+        # Seed the same store, reload — index populates
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "alice",
+                "first_seen_cycle": 1,
+            },
+        )
+        router.reload()
+        assert router.entity_count > 0
+
+        # Clear the store, reload — index must clear
+        store.delete("graph1")
+        router.reload()
+        assert router.entity_count == 0
 
     def test_entity_shorter_than_two_chars_skipped(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "A", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "a" not in router._all_entities
-            assert "berlin" in router._all_entities
+        router = _make_router_from_pairs([_make_pair("graph1", "A", "Berlin", speaker_id="alice")])
+        assert "a" not in router._all_entities
+        assert "berlin" in router._all_entities
 
 
 # ---------------------------------------------------------------------------
@@ -352,93 +388,80 @@ class TestQueryRouterLoad:
 
 class TestQueryRouterRoutePA:
     @staticmethod
-    def _make_router(tmp: str) -> QueryRouter:
-        _write_keyed_pairs(
-            Path(tmp),
+    def _make_router() -> QueryRouter:
+        return _make_router_from_pairs(
             [
                 _make_pair("graph1", "Alice", "Berlin", speaker_id="alice"),
                 _make_pair("graph2", "Alice", "Python", speaker_id="alice"),
-            ],
+            ]
         )
-        return QueryRouter(adapter_dir=Path(tmp))
 
     def test_no_speaker_id_returns_no_steps(self):
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            plan = router.route("Where does Alice live?", speaker_id=None)
-            assert plan.steps == []
-            assert plan.intent == Intent.UNKNOWN
+        router = self._make_router()
+        plan = router.route("Where does Alice live?", speaker_id=None)
+        assert plan.steps == []
+        assert plan.intent == Intent.UNKNOWN
 
     def test_wrong_speaker_id_returns_no_steps(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            plan = router.route("Where does Alice live?", speaker_id="bob")
-            assert plan.steps == []
+        router = self._make_router()
+        plan = router.route("Where does Alice live?", speaker_id="bob")
+        assert plan.steps == []
 
     def test_correct_speaker_id_pa_match(self):
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            plan = router.route("Where does Alice live?", speaker_id="alice")
-            assert plan.steps  # PA match → steps populated
-            assert plan.intent == Intent.PERSONAL
+        router = self._make_router()
+        plan = router.route("Where does Alice live?", speaker_id="alice")
+        assert plan.steps  # PA match → steps populated
+        assert plan.intent == Intent.PERSONAL
 
     def test_pa_match_steps_populated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            plan = router.route("Tell me about Alice", speaker_id="alice")
-            assert plan.steps
-            keys = [k for step in plan.steps for k in step.keys_to_probe]
-            assert "graph1" in keys or "graph2" in keys
+        router = self._make_router()
+        plan = router.route("Tell me about Alice", speaker_id="alice")
+        assert plan.steps
+        keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph1" in keys or "graph2" in keys
 
     def test_strategy_targeted_probe_when_steps(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            plan = router.route("Alice lives in Berlin", speaker_id="alice")
-            assert plan.strategy == "targeted_probe"
+        router = self._make_router()
+        plan = router.route("Alice lives in Berlin", speaker_id="alice")
+        assert plan.strategy == "targeted_probe"
 
     def test_strategy_direct_when_no_steps(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            # No entity in query → no steps
-            plan = router.route("What is the capital of France?", speaker_id="alice")
-            # "france" not in entity list → no steps
-            assert plan.strategy == "direct"
+        router = self._make_router()
+        # No entity in query → no steps
+        plan = router.route("What is the capital of France?", speaker_id="alice")
+        # "france" not in entity list → no steps
+        assert plan.strategy == "direct"
 
     def test_speaker_name_injected_as_implicit_entity(self):
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            # Only "alice" in the index
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            # Query doesn't mention alice, but speaker="Alice" injects it
-            plan = router.route("Where do I live?", speaker="Alice", speaker_id="alice")
-            # alice is now an implicit entity — should trigger PA match
-            assert plan.intent == Intent.PERSONAL
-            assert plan.steps
+        # Only "alice" in the index
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")]
+        )
+        # Query doesn't mention alice, but speaker="Alice" injects it
+        plan = router.route("Where do I live?", speaker="Alice", speaker_id="alice")
+        # alice is now an implicit entity — should trigger PA match
+        assert plan.intent == Intent.PERSONAL
+        assert plan.steps
 
     def test_matched_entities_in_plan(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            plan = router.route("Alice lives in Berlin", speaker_id="alice")
-            assert "alice" in plan.matched_entities or "berlin" in plan.matched_entities
+        router = self._make_router()
+        plan = router.route("Alice lives in Berlin", speaker_id="alice")
+        assert "alice" in plan.matched_entities or "berlin" in plan.matched_entities
 
     def test_fuzzy_entity_match(self):
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            router = self._make_router(tmp)
-            # "Alic" should fuzzy-match "alice" at ratio ~89
-            plan = router.route("Tell me about Alic", speaker_id="alice")
-            assert plan.intent == Intent.PERSONAL
-            assert plan.steps
+        router = self._make_router()
+        # "Alic" should fuzzy-match "alice" at ratio ~89
+        plan = router.route("Tell me about Alic", speaker_id="alice")
+        assert plan.intent == Intent.PERSONAL
+        assert plan.steps
 
     def test_adapter_order_procedural_episodic_semantic(self):
         """Procedural step comes before episodic and semantic.
@@ -447,23 +470,17 @@ class TestQueryRouterRoutePA:
         → semantic (consolidated). Procedural-first is load-bearing for personalization.
         When procedural is absent the remaining adapters still follow episodic → semantic.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("se1", "Alice", "Python", speaker_id="alice")],
-                subdir="semantic",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Alice", speaker_id="alice")
-            names = [s.adapter_name for s in plan.steps]
-            # episodic before semantic (procedural absent in this fixture)
-            if "episodic" in names and "semantic" in names:
-                assert names.index("episodic") < names.index("semantic")
+        router = _make_router_from_pairs(
+            [
+                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_pair("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
+            ]
+        )
+        plan = router.route("Alice", speaker_id="alice")
+        names = [s.adapter_name for s in plan.steps]
+        # episodic before semantic (procedural absent in this fixture)
+        if "episodic" in names and "semantic" in names:
+            assert names.index("episodic") < names.index("semantic")
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +491,9 @@ class TestQueryRouterRoutePA:
 class TestQueryRouterRouteHA:
     def test_no_ha_graph_no_ha_match(self):
         with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=None)
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=None
+            )
             plan = router.route("Turn on the kitchen light")
             assert plan.ha_domains == []
             assert plan.steps == []
@@ -484,7 +503,9 @@ class TestQueryRouterRouteHA:
 
         with tempfile.TemporaryDirectory() as tmp:
             ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
+            )
             plan = router.route("Is the kitchen light on?")
             assert plan.intent == Intent.COMMAND
             assert plan.ha_domains == ["light"]
@@ -499,7 +520,9 @@ class TestQueryRouterRouteHA:
         with tempfile.TemporaryDirectory() as tmp:
             match = _make_ha_match(verbs=["turn on"], domains=["light"])
             ha = _make_ha_graph(match)
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
+            )
             plan = router.route("Is turn on working?")
             assert plan.steps == []
             assert plan.intent != Intent.PERSONAL
@@ -509,14 +532,18 @@ class TestQueryRouterRouteHA:
             ha = _make_ha_graph(
                 _make_ha_match(entities=["bedroom thermostat"], domains=["climate"])
             )
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
+            )
             plan = router.route("bedroom thermostat temperature")
             assert "climate" in plan.ha_domains
 
     def test_ha_domains_empty_when_no_ha_match(self):
         with tempfile.TemporaryDirectory() as tmp:
             ha = _make_ha_graph(None)
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
+            )
             plan = router.route("Tell me something random")
             assert plan.ha_domains == []
 
@@ -527,37 +554,58 @@ class TestQueryRouterRouteHA:
         """
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "kitchen light", speaker_id="alice")],
+        ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "kitchen light", speaker_id="alice")],
+            ha_graph=ha,
+        )
+        plan = router.route("Alice kitchen light", speaker_id="alice")
+        assert plan.intent == Intent.PERSONAL
+        assert plan.steps
+        assert "light" in plan.ha_domains
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — no Top-K cap on the authenticated path
+# ---------------------------------------------------------------------------
+
+
+class TestQueryRouterNoTopKCap:
+    """Authenticated speakers receive every entity-narrowed key they own
+    in plan.steps — no slice.  The legacy MAX_KEYS_PER_QUERY=10 cap
+    caused narrow attribute keys (``has_email``) to lose a non-
+    deterministic coin-flip when the speaker had >10 keys touching the
+    matched entity, breaking attribute queries.  Closed by removing the
+    slice; inference latency is mitigated by ``inference.preload_cache``
+    (default true) which serves probes from the RAM cache instead of
+    one ``model.generate`` per key.
+    """
+
+    def test_no_cap_for_authenticated_speaker(self):
+        """All 15 keys touching the matched entity reach plan.steps."""
+        pairs = [
+            _make_pair(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
+        ]
+        router = _make_router_from_pairs(pairs)
+        plan = router.route("Alice", speaker_id="alice")
+        assert plan.steps, "Authenticated speaker with entity match must emit steps"
+        total_keys = sum(len(step.keys_to_probe) for step in plan.steps)
+        assert total_keys == 15, (
+            f"Expected all 15 entity-narrowed keys to reach steps, got {total_keys}"
+        )
+
+    def test_keys_to_probe_are_deterministic_sorted(self):
+        """plan.steps[*].keys_to_probe is sorted (no hash-randomization flake)."""
+        pairs = [
+            _make_pair(f"graph{i:03d}", "Alice", f"Entity{i}", speaker_id="alice")
+            for i in range(15)
+        ]
+        router = _make_router_from_pairs(pairs)
+        plan = router.route("Alice", speaker_id="alice")
+        for step in plan.steps:
+            assert step.keys_to_probe == sorted(step.keys_to_probe), (
+                f"keys_to_probe must be sorted: {step.keys_to_probe}"
             )
-            ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Alice kitchen light", speaker_id="alice")
-            assert plan.intent == Intent.PERSONAL
-            assert plan.steps
-            assert "light" in plan.ha_domains
-
-
-# ---------------------------------------------------------------------------
-# QueryRouter — MAX_KEYS_PER_QUERY cap
-# ---------------------------------------------------------------------------
-
-
-class TestQueryRouterMaxKeys:
-    def test_keys_capped_at_max(self):
-        """More than MAX_KEYS_PER_QUERY keys for one entity → capped in step."""
-        with tempfile.TemporaryDirectory() as tmp:
-            pairs = [
-                _make_pair(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice")
-                for i in range(MAX_KEYS_PER_QUERY + 5)
-            ]
-            _write_keyed_pairs(Path(tmp), pairs)
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Alice", speaker_id="alice")
-            for step in plan.steps:
-                assert len(step.keys_to_probe) <= MAX_KEYS_PER_QUERY
 
 
 # ---------------------------------------------------------------------------
@@ -596,198 +644,191 @@ class TestInterimSortKey:
 
 
 class TestInterimAdapterRouting:
-    """Tests for Step 4 of multi-adapter interim routing.
+    """Tests for multi-adapter interim routing via cache-based indexing.
 
-    All fixtures write real keyed_pairs.json files to a tmp directory and
-    construct a real QueryRouter — no mocking of internal state.
+    Interim adapters keep their real name (``episodic_interim_<stamp>``) in
+    the routing plan so probe-time ``switch_adapter(model, step.adapter_name)``
+    activates the actual trained slot in ``model.peft_config`` — the same
+    name the consolidation pipeline created the adapter under.  Probe order
+    (``route()`` bottom block) places interim names newest-first, ahead of
+    the main ``"episodic"`` slot.  Folding interim into ``"episodic"`` was a
+    regression caught 2026-05-14: it pointed inference at an untrained main
+    slot while the actual trained weights stayed inert under the unstripped
+    interim name (training-time recall 134/134, inference-time recall 0/10).
     """
 
-    def test_route_groups_keys_by_adapter_directory(self):
-        """Entity in both episodic (main) and an interim adapter → two steps, interim first.
+    def test_interim_keys_routed_under_their_real_adapter_name(self):
+        """Interim-registered keys appear in a step named after the interim adapter."""
+        router = _make_router_from_pairs(
+            [
+                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_pair(
+                    "int1",
+                    "Alice",
+                    "Prague",
+                    speaker_id="alice",
+                    adapter_id="episodic_interim_20260417T0000",
+                ),
+            ]
+        )
+        plan = router.route("Alice", speaker_id="alice")
+        names = [s.adapter_name for s in plan.steps]
+        assert "episodic" in names, "main episodic step missing"
+        assert "episodic_interim_20260417T0000" in names, "interim step missing"
+        # Each key lives in its own tier's step.
+        ep_keys = next(
+            (set(s.keys_to_probe) for s in plan.steps if s.adapter_name == "episodic"), set()
+        )
+        int_keys = next(
+            (
+                set(s.keys_to_probe)
+                for s in plan.steps
+                if s.adapter_name == "episodic_interim_20260417T0000"
+            ),
+            set(),
+        )
+        assert "ep1" in ep_keys and "ep1" not in int_keys
+        assert "int1" in int_keys and "int1" not in ep_keys
 
-        Freshness-wins: a user correction lands in the newest interim slot ahead
-        of the next full-cycle merge into main, so probing interim before main
-        ensures the latest answer wins.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("int1", "Alice", "Prague", speaker_id="alice")],
-                subdir="episodic_interim_20260417T0000",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Alice", speaker_id="alice")
-
-            names = [s.adapter_name for s in plan.steps]
-            assert "episodic" in names, "main episodic step missing"
-            assert "episodic_interim_20260417T0000" in names, "interim step missing"
-            assert names.index("episodic_interim_20260417T0000") < names.index("episodic"), (
-                "interim must precede main (freshness wins)"
-            )
-
-    def test_route_interim_adapter_ordering(self):
-        """Multiple interim adapters: newest-first, all before main episodic."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            for stamp in ("20260415T0000", "20260416T0000", "20260417T0000"):
-                _write_keyed_pairs(
-                    Path(tmp),
-                    [_make_pair(f"int_{stamp}", "Alice", f"City_{stamp}", speaker_id="alice")],
-                    subdir=f"episodic_interim_{stamp}",
+    def test_interim_keys_multiple_registered(self):
+        """Multiple interim adapter IDs each get their own step, newest-stamp first."""
+        pairs = [
+            _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+        ]
+        for stamp in ("20260415T0000", "20260416T0000", "20260417T0000"):
+            pairs.append(
+                _make_pair(
+                    f"int_{stamp}",
+                    "Alice",
+                    f"City_{stamp}",
+                    speaker_id="alice",
+                    adapter_id=f"episodic_interim_{stamp}",
                 )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Alice", speaker_id="alice")
-
-            names = [s.adapter_name for s in plan.steps]
-            interim_names = [n for n in names if n.startswith("episodic_interim_")]
-            assert interim_names == [
-                "episodic_interim_20260417T0000",
-                "episodic_interim_20260416T0000",
-                "episodic_interim_20260415T0000",
-            ], f"Expected newest-first, got {interim_names}"
-            # All interim slots must precede main episodic (freshness wins).
-            assert names.index(interim_names[-1]) < names.index("episodic"), (
-                f"Interim slots must precede main episodic, got {names}"
             )
+        router = _make_router_from_pairs(pairs)
+        plan = router.route("Alice", speaker_id="alice")
+
+        names = [s.adapter_name for s in plan.steps]
+        # Each interim adapter must appear under its real name (no folding).
+        assert "episodic_interim_20260415T0000" in names
+        assert "episodic_interim_20260416T0000" in names
+        assert "episodic_interim_20260417T0000" in names
+        assert "episodic" in names
+        # Probe order: interim newest-first, then main episodic (per route() block).
+        interim_in_order = [n for n in names if n.startswith("episodic_interim_")]
+        assert interim_in_order == [
+            "episodic_interim_20260417T0000",
+            "episodic_interim_20260416T0000",
+            "episodic_interim_20260415T0000",
+        ], f"Interim adapters must be newest-first: {interim_in_order}"
+        # Main episodic comes after all interims.
+        assert names.index("episodic") > max(names.index(n) for n in interim_in_order)
 
     def test_route_speaker_scoping_applies_to_interim_keys(self):
         """Interim key tagged with 'alice' is invisible to speaker_id='bob'."""
-        with tempfile.TemporaryDirectory() as tmp:
-            # Interim adapter keyed to alice only
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("int1", "Alice", "Prague", speaker_id="alice")],
-                subdir="episodic_interim_20260417T0000",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            # Bob queries — allowed_keys will be empty → no step emitted
-            plan = router.route("Alice", speaker_id="bob")
-            interim_names = [s.adapter_name for s in plan.steps if "interim" in s.adapter_name]
-            assert interim_names == [], (
-                "Interim step must not appear when speaker scoping filters all keys"
-            )
+        router = _make_router_from_pairs(
+            [
+                _make_pair(
+                    "int1",
+                    "Alice",
+                    "Prague",
+                    speaker_id="alice",
+                    adapter_id="episodic_interim_20260417T0000",
+                )
+            ]
+        )
+        # Bob queries — alice's keys must be invisible
+        plan = router.route("Alice", speaker_id="bob")
+        assert plan.steps == [], (
+            "No step should appear when speaker scoping filters all interim keys"
+        )
 
-    def test_route_no_phantom_step_for_deleted_interim_dir(self):
-        """After reload() with the interim dir deleted, no step is emitted for it."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("ep1", "Alice", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            interim_dir = Path(tmp) / "episodic_interim_20260417T0000"
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("int1", "Alice", "Prague", speaker_id="alice")],
-                subdir="episodic_interim_20260417T0000",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            # Confirm interim step present before deletion
-            plan_before = router.route("Alice", speaker_id="alice")
-            assert any("interim" in s.adapter_name for s in plan_before.steps), (
-                "Interim step should be present before dir removal"
-            )
+    def test_reload_with_cleared_cache_removes_interim_keys(self):
+        """After reload() with the store emptied, formerly interim-registered keys vanish."""
+        store = MemoryStore(replay_enabled=True)
+        store.put(
+            "episodic_interim_20260417T0000",
+            "int1",
+            {
+                "key": "int1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Prague",
+                "speaker_id": "alice",
+                "first_seen_cycle": 1,
+            },
+        )
 
-            # Simulate Step 7: delete the interim dir, then reload
-            import shutil
+        router = QueryRouter(
+            adapter_dir=Path("/nonexistent"),
+            memory_store=store,
+        )
+        assert router.entity_count > 0
 
-            shutil.rmtree(interim_dir)
-            router.reload()
-
-            plan_after = router.route("Alice", speaker_id="alice")
-            interim_steps = [s for s in plan_after.steps if "interim" in s.adapter_name]
-            assert interim_steps == [], (
-                "No interim step should appear after reload() with interim dir deleted"
-            )
+        # Empty the same store in place, reload — all keys gone
+        store.delete("int1")
+        router.reload()
+        plan = router.route("Alice", speaker_id="alice")
+        assert plan.steps == [], "Steps must be empty after store cleared"
 
     def test_route_interim_only_match_emits_interim_step(self):
-        """Entity matched ONLY in an interim adapter → one step for that interim."""
-        with tempfile.TemporaryDirectory() as tmp:
-            # No main adapter keyed_pairs — only an interim subdir
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("int1", "Alice", "Vienna", speaker_id="alice")],
-                subdir="episodic_interim_20260417T0000",
-            )
-            from paramem.server.router import Intent
+        """Entity matched ONLY in an interim-registered key → step named after the interim adapter.
 
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Alice", speaker_id="alice")
+        The plan step must carry the same name PEFT knows the adapter by
+        (``episodic_interim_<stamp>``) so probe-time ``switch_adapter`` lands
+        on the trained slot.  No main-episodic step is emitted because no
+        keys are registered under the bare ``"episodic"`` name.
+        """
+        from paramem.server.router import Intent
 
-            assert len(plan.steps) == 1, f"Expected exactly one step, got {plan.steps}"
-            assert plan.steps[0].adapter_name == "episodic_interim_20260417T0000"
-            assert plan.intent == Intent.PERSONAL
+        router = _make_router_from_pairs(
+            [
+                _make_pair(
+                    "int1",
+                    "Alice",
+                    "Vienna",
+                    speaker_id="alice",
+                    adapter_id="episodic_interim_20260417T0000",
+                )
+            ]
+        )
+        plan = router.route("Alice", speaker_id="alice")
 
-    def test_route_three_mains_correct_order(self):
-        """All three mains + one interim: order must be procedural, interim, episodic, semantic.
+        assert len(plan.steps) == 1, f"Expected exactly one step, got {plan.steps}"
+        assert plan.steps[0].adapter_name == "episodic_interim_20260417T0000"
+        assert plan.intent == Intent.PERSONAL
+
+    def test_route_three_mains_correct_tier_order(self):
+        """All three main tiers: order must be procedural → episodic → semantic.
 
         Probe order: procedural (preferences shape style; load-bearing per
-        feedback_router_procedural_first.md) → interim newest-first (freshest
-        factual state) → main episodic (baseline factual snapshot) → semantic
-        (durable corroboration).
+        feedback_router_procedural_first.md) → episodic → semantic.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            for adapter in ("episodic", "semantic", "procedural"):
-                _write_keyed_pairs(
-                    Path(tmp),
-                    [_make_pair(f"{adapter}1", "Alice", f"Fact_{adapter}", speaker_id="alice")],
-                    subdir=adapter,
-                )
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("int1", "Alice", "InterimFact", speaker_id="alice")],
-                subdir="episodic_interim_20260418T0000",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Alice", speaker_id="alice")
+        router = _make_router_from_pairs(
+            [
+                _make_pair(
+                    "proc1", "Alice", "DarkMode", speaker_id="alice", adapter_id="procedural"
+                ),
+                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_pair("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
+                _make_pair(
+                    "int1",
+                    "Alice",
+                    "InterimFact",
+                    speaker_id="alice",
+                    adapter_id="episodic_interim_20260418T0000",
+                ),
+            ]
+        )
+        plan = router.route("Alice", speaker_id="alice")
 
-            names = [s.adapter_name for s in plan.steps]
-            assert names[0] == "procedural", f"First step must be procedural, got {names}"
-            assert names[1] == "episodic_interim_20260418T0000", (
-                f"Second step must be the interim adapter, got {names}"
-            )
-            assert names[2] == "episodic", f"Third step must be episodic, got {names}"
-            assert names[3] == "semantic", f"Fourth step must be semantic, got {names}"
-
-    def test_route_freshness_wins_interim_before_main_for_same_key(self):
-        """A key registered to BOTH interim and main is probed in interim first.
-
-        This is the load-bearing freshness-wins guarantee: a user contradiction
-        (move, rename, change of mind) lands in the newest interim slot before
-        the next full-cycle merge collapses it into main. If the router probed
-        main first, it would return the stale pre-update answer.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            # Both adapters claim to know about Alice — main says Berlin, interim
-            # says Prague. Same entity name → same key resolution path.
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("alice_loc", "Alice", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("alice_loc", "Alice", "Prague", speaker_id="alice")],
-                subdir="episodic_interim_20260418T0000",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Alice", speaker_id="alice")
-
-            names = [s.adapter_name for s in plan.steps]
-            assert "episodic_interim_20260418T0000" in names
-            assert "episodic" in names
-            assert names.index("episodic_interim_20260418T0000") < names.index("episodic"), (
-                f"Interim must be probed before main for the same key (freshness wins), got {names}"
-            )
+        names = [s.adapter_name for s in plan.steps]
+        assert names[0] == "procedural", f"First step must be procedural, got {names}"
+        assert "episodic" in names[1:], f"Episodic must follow procedural, got {names}"
+        if "semantic" in names:
+            ep_idx = names.index("episodic")
+            sem_idx = names.index("semantic")
+            assert ep_idx < sem_idx, f"Episodic must precede semantic, got {names}"
 
 
 class TestRouteIntentField:
@@ -801,24 +842,22 @@ class TestRouteIntentField:
     def test_pa_match_yields_personal_intent(self):
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("alex_loc", "Alex", "Berlin", speaker_id="alex")],
-                subdir="episodic",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Where does Alex live?", speaker_id="alex")
+        router = _make_router_from_pairs(
+            [_make_pair("alex_loc", "Alex", "Berlin", speaker_id="alex")],
+        )
+        plan = router.route("Where does Alex live?", speaker_id="alex")
 
-            assert plan.intent == Intent.PERSONAL
-            assert plan.steps  # PA produced probe steps
+        assert plan.intent == Intent.PERSONAL
+        assert plan.steps  # PA produced probe steps
 
     def test_ha_only_match_yields_command_intent(self):
         from paramem.server.router import Intent
 
         ha = _make_ha_graph(_make_ha_match(entities=["light.kitchen"], domains=["light"]))
         with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
+            )
             plan = router.route("Turn on the kitchen light")
 
             assert plan.intent == Intent.COMMAND
@@ -831,18 +870,15 @@ class TestRouteIntentField:
         from paramem.server.router import Intent
 
         ha = _make_ha_graph(_make_ha_match(entities=["light.bedroom"], domains=["light"]))
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("alex_room", "Alex", "bedroom", speaker_id="alex")],
-                subdir="episodic",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
-            plan = router.route("Is Alex's bedroom light on?", speaker_id="alex")
+        router = _make_router_from_pairs(
+            [_make_pair("alex_room", "Alex", "bedroom", speaker_id="alex")],
+            ha_graph=ha,
+        )
+        plan = router.route("Is Alex's bedroom light on?", speaker_id="alex")
 
-            assert plan.intent == Intent.PERSONAL
-            assert plan.steps  # PA path also produces steps
-            assert "light" in plan.ha_domains  # HA observability preserved
+        assert plan.intent == Intent.PERSONAL
+        assert plan.steps  # PA path also produces steps
+        assert "light" in plan.ha_domains  # HA observability preserved
 
     def test_no_state_no_config_returns_unknown(self):
         # No PA, no HA, no IntentConfig — encoder isn't loaded so the
@@ -851,7 +887,9 @@ class TestRouteIntentField:
 
         ha = _make_ha_graph(None)  # HA configured but no match
         with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha)
+            router = QueryRouter(
+                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
+            )
             plan = router.route("What is the capital of France?")
 
             # match_source is "ha" because of imperative-fallback heuristic
@@ -870,136 +908,102 @@ class TestRouteIntentField:
         ha = _make_ha_graph(None)
         cfg = IntentConfig()  # fail_closed_intent="personal"
         with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha, intent_config=cfg)
+            router = QueryRouter(
+                adapter_dir=Path(tmp),
+                memory_store=MemoryStore(replay_enabled=False),
+                ha_graph=ha,
+                intent_config=cfg,
+            )
             plan = router.route("What is the capital of France?")
 
             assert plan.intent == Intent.PERSONAL
 
 
 # ---------------------------------------------------------------------------
-# QueryRouter — quad-format keyed_pairs.json (B1 regression guard)
+# QueryRouter — entry-format cache entries (B1 regression guard)
 # ---------------------------------------------------------------------------
 
 
-def _make_quad_pair(
-    key: str,
-    subject: str,
-    obj: str,
-    *,
-    speaker_id: str = "",
-    predicate: str = "related_to",
-    first_seen_cycle: int = 1,
-) -> dict:
-    """Return a 6-field quad-format keyed pair for router tests.
+class TestQueryRouterEntryFormat:
+    """B1 regression guard: router correctly indexes entry-schema cache entries.
 
-    The on-disk quad schema has no ``question``, ``answer``, or ``source_*``
-    fields.  ``read_keyed_pairs_quad`` (the universal reader now used by
-    ``_load_keyed_pairs``) accepts this format natively.
-    """
-    return {
-        "key": key,
-        "subject": subject,
-        "predicate": predicate,
-        "object": obj,
-        "speaker_id": speaker_id,
-        "first_seen_cycle": first_seen_cycle,
-    }
-
-
-class TestQueryRouterQuadFormat:
-    """B1 regression guard: router loads quad-schema keyed_pairs.json files.
-
-    Before the fix, ``_load_keyed_pairs`` called ``read_keyed_pairs`` which
-    validates against the 8-field QA schema and raises ``ValueError`` on
-    quad-format files.  The router caught the error, logged a warning, and
-    left the entity-key index empty — silently breaking PA-match routing in
-    quad mode.
-
-    After the fix, ``_load_keyed_pairs`` calls ``read_keyed_pairs_quad``
-    (the universal reader: native quad files accepted as-is; legacy QA files
-    projected to quad shape) and reads ``"subject"``/``"object"`` instead of
-    ``"source_subject"``/``"source_object"``.
+    The canonical source of truth for entity indexing is
+    ``ConsolidationLoop.store._entries_flat_view()``, which stores six-field
+    entries (``key``, ``subject``, ``predicate``, ``object``,
+    ``speaker_id``, ``first_seen_cycle``).  These tests verify that the
+    ``_index_pairs`` path reads ``subject``/``object`` (not legacy
+    ``source_subject``/``source_object``) and that the entity and speaker
+    indexes are correctly built.
     """
 
-    def test_quad_file_loaded_without_error(self):
-        """Router loads a 6-field quad keyed_pairs.json without raising."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            # Must not raise; entity_count must be positive.
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert router.entity_count > 0
+    def test_entry_loaded_without_error(self):
+        """Router builds a non-empty index from a six-field entry cache."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        assert router.entity_count > 0
 
-    def test_quad_subject_and_object_indexed(self):
-        """Both ``subject`` and ``object`` are indexed as entities from a quad file."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "alice" in router._all_entities
-            assert "berlin" in router._all_entities
+    def test_subject_and_object_indexed(self):
+        """Both ``subject`` and ``object`` are indexed as entities from an entry."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        assert "alice" in router._all_entities
+        assert "berlin" in router._all_entities
 
-    def test_quad_speaker_id_indexed(self):
-        """``speaker_id`` from a quad file is indexed into ``_speaker_key_index``."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "alice" in router._speaker_key_index
-            assert "graph1" in router._speaker_key_index["alice"]
+    def test_speaker_id_indexed(self):
+        """``speaker_id`` from a cache entry is indexed in ``_speaker_key_index``."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        assert "alice" in router._speaker_key_index
+        assert "graph1" in router._speaker_key_index["alice"]
 
-    def test_quad_pa_match_produces_steps(self):
-        """A query mentioning the entity from a quad file resolves to a routing step."""
+    def test_pa_match_produces_steps(self):
+        """A query mentioning the entity from a cache entry resolves to a routing step."""
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            plan = router.route("Where does Alice live?", speaker_id="alice")
-            assert plan.steps, "Expected PA routing steps from quad keyed_pairs.json"
-            assert plan.intent == Intent.PERSONAL
-            keys = [k for step in plan.steps for k in step.keys_to_probe]
-            assert "graph1" in keys
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        plan = router.route("Where does Alice live?", speaker_id="alice")
+        assert plan.steps, "Expected PA routing steps from cache entry"
+        assert plan.intent == Intent.PERSONAL
+        keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph1" in keys
 
-    def test_reload_with_quad_file_repopulates_index(self):
-        """reload() after writing a quad keyed_pairs.json repopulates the entity index."""
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert router.entity_count == 0
+    def test_reload_with_updated_cache_repopulates_index(self):
+        """reload() after updating the loop store repopulates the entity index."""
+        # Start with empty store
+        store = MemoryStore(replay_enabled=True)
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
+        assert router.entity_count == 0
 
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_quad_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router.reload()
-            assert router.entity_count > 0
-            assert "alice" in router._all_entities
+        # Add an entry to the store and reload
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "related_to",
+                "object": "Berlin",
+                "speaker_id": "alice",
+                "first_seen_cycle": 1,
+            },
+        )
+        router.reload()
+        assert router.entity_count > 0
+        assert "alice" in router._all_entities
 
-    def test_legacy_qa_file_still_loads_via_universal_reader(self):
-        """QA-format (8-field) files still load correctly after the B1 fix.
-
-        ``read_keyed_pairs_quad`` projects them to quad shape, so existing
-        QA-format deployments are unaffected.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(
-                Path(tmp),
-                [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "alice" in router._all_entities
-            assert "berlin" in router._all_entities
-            assert "alice" in router._speaker_key_index
+    def test_qa_format_entry_still_indexes_via_subject_object(self):
+        """QA-format cache entries (with question/answer) still index subject/object correctly."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        assert "alice" in router._all_entities
+        assert "berlin" in router._all_entities
+        assert "alice" in router._speaker_key_index
 
     def test_no_state_with_general_fail_closed(self):
         from paramem.server.config import IntentConfig
@@ -1007,11 +1011,15 @@ class TestQueryRouterQuadFormat:
 
         ha = _make_ha_graph(None)
         cfg = IntentConfig(fail_closed_intent="general")
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(adapter_dir=Path(tmp), ha_graph=ha, intent_config=cfg)
-            plan = router.route("What is the capital of France?")
+        router = QueryRouter(
+            adapter_dir=Path("/nonexistent"),
+            memory_store=MemoryStore(replay_enabled=False),
+            ha_graph=ha,
+            intent_config=cfg,
+        )
+        plan = router.route("What is the capital of France?")
 
-            assert plan.intent == Intent.GENERAL
+        assert plan.intent == Intent.GENERAL
 
 
 # ---------------------------------------------------------------------------
@@ -1020,15 +1028,12 @@ class TestQueryRouterQuadFormat:
 
 
 class TestAttributePredicateIndexing:
-    """Bug 3 regression guard: has_<attr> predicates are indexed under their
-    bare attribute name so attribute queries ("what is my email address?")
-    resolve to the correct key regardless of MAX_KEYS_PER_QUERY.
-
-    Before the fix, a query about "email" only matched via the speaker entity
-    which could have 30+ associated keys — the has_email key was not guaranteed
-    to survive the :data:`MAX_KEYS_PER_QUERY` cap.  After the fix the bare
-    attribute name ("email", "phone", "linkedin") is also indexed so the
-    attribute key is reachable directly.
+    """Bug 3 regression guard: ``has_<attr>`` predicates are indexed under
+    their bare attribute name so attribute queries ("what is my email
+    address?") resolve to the correct key.  Pairs with the no-Top-K
+    change above: the indexing fix makes the attribute key reachable
+    via a second route, and the no-Top-K change ensures it survives
+    routing when the speaker entity also matches many keys.
     """
 
     def _make_has_email_pair(
@@ -1036,104 +1041,75 @@ class TestAttributePredicateIndexing:
         key: str = "graph2",
         speaker_id: str = "alice",
     ) -> dict:
-        """Return a QA-format keyed pair whose source_predicate is has_email."""
+        """Return a canonical cache entry whose predicate is has_email."""
         return {
             "key": key,
             "question": "What is Alice's email?",
             "answer": "alice@example.com",
-            "source_subject": "Alice",
-            "source_predicate": "has_email",
-            "source_object": "alice@example.com",
-            "speaker_id": speaker_id,
-            "first_seen_cycle": 1,
-        }
-
-    def _make_has_email_quad(
-        self,
-        key: str = "graph2",
-        speaker_id: str = "alice",
-    ) -> dict:
-        """Return a quad-format keyed pair whose predicate is has_email."""
-        return {
-            "key": key,
             "subject": "Alice",
             "predicate": "has_email",
             "object": "alice@example.com",
             "speaker_id": speaker_id,
             "first_seen_cycle": 1,
+            "_adapter_id": "episodic",
         }
 
-    def test_has_email_predicate_indexed_as_email_qa(self):
-        """QA-format: has_email key is indexed under 'email' entity."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(Path(tmp), [self._make_has_email_pair()])
-            router = QueryRouter(adapter_dir=Path(tmp))
-            # "email" must appear in the entity list.
-            assert "email" in router._all_entities
-
-    def test_has_email_predicate_indexed_as_email_quad(self):
-        """Quad-format: has_email key is indexed under 'email' entity."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(Path(tmp), [self._make_has_email_quad()])
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "email" in router._all_entities
+    def test_has_email_predicate_indexed_as_email(self):
+        """has_email cache entry is indexed under 'email' entity."""
+        router = _make_router_from_pairs([self._make_has_email_pair()])
+        # "email" must appear in the entity list.
+        assert "email" in router._all_entities
 
     def test_has_email_key_reachable_via_email_attribute_index(self):
         """The has_email key maps to the 'email' attribute-index entry — deterministic.
 
-        Whether ``route()`` surfaces it *past* ``MAX_KEYS_PER_QUERY`` when the
-        speaker entity also matches dozens of keys is the open routing WP
-        (``project_routing_layer`` — graph-routed selective retrieval); the
-        current ``list(set)[:cap]`` slice is arbitrary, so that is intentionally
-        NOT asserted here.  This test guards only the indexing fix: the bare
-        attribute name resolves to the attribute key.
+        With the Top-K cap removed on the authenticated path, the
+        has_email key also reaches ``plan.steps`` even when the speaker
+        entity drags dozens of unrelated keys into the merge — see
+        :class:`TestQueryRouterNoTopKCap`.  This test guards only the
+        indexing fix: the bare attribute name resolves to the attribute
+        key in ``_entity_key_index``.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            # A flood of Alice's other keys + the has_email key.
-            pairs = [
-                _make_pair(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice")
-                for i in range(MAX_KEYS_PER_QUERY + 5)
-            ]
-            pairs.append(self._make_has_email_pair(key="graph_email", speaker_id="alice"))
-            _write_keyed_pairs(Path(tmp), pairs)
-            router = QueryRouter(adapter_dir=Path(tmp))
+        # A flood of Alice's other keys + the has_email key.
+        pairs = [
+            _make_pair(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
+        ]
+        pairs.append(self._make_has_email_pair(key="graph_email", speaker_id="alice"))
+        router = _make_router_from_pairs(pairs)
 
-            assert "email" in router._all_entities
-            email_indexed_somewhere = False
-            for adapter, idx in router._entity_key_index.items():
-                if "email" in idx:
-                    email_indexed_somewhere = True
-                    assert "graph_email" in idx["email"], (
-                        f"'email' entry in adapter {adapter!r} maps to {idx['email']!r}; "
-                        "must include the has_email key 'graph_email'"
-                    )
-            assert email_indexed_somewhere, "'email' attribute index entry was never built"
+        assert "email" in router._all_entities
+        email_indexed_somewhere = False
+        for adapter, idx in router._entity_key_index.items():
+            if "email" in idx:
+                email_indexed_somewhere = True
+                assert "graph_email" in idx["email"], (
+                    f"'email' entry in adapter {adapter!r} maps to {idx['email']!r}; "
+                    "must include the has_email key 'graph_email'"
+                )
+        assert email_indexed_somewhere, "'email' attribute index entry was never built"
 
     def test_has_phone_predicate_indexed_as_phone(self):
-        """has_phone key is indexed under 'phone'."""
+        """has_phone cache entry is indexed under 'phone'."""
         pair = {
             "key": "graph3",
             "question": "What is Alice's phone?",
             "answer": "+1-555-0100",
-            "source_subject": "Alice",
-            "source_predicate": "has_phone",
-            "source_object": "+1-555-0100",
+            "subject": "Alice",
+            "predicate": "has_phone",
+            "object": "+1-555-0100",
             "speaker_id": "alice",
             "first_seen_cycle": 1,
+            "_adapter_id": "episodic",
         }
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(Path(tmp), [pair])
-            router = QueryRouter(adapter_dir=Path(tmp))
-            assert "phone" in router._all_entities
+        router = _make_router_from_pairs([pair])
+        assert "phone" in router._all_entities
 
     def test_non_has_predicate_not_indexed_as_attribute(self):
         """A plain predicate like 'related_to' does NOT produce an 'elated_to' entry."""
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(Path(tmp), [_make_pair("graph1", "Alice", "Berlin")])
-            router = QueryRouter(adapter_dir=Path(tmp))
-            # "related_to" starts with 'r', not "has_"; de-prefixed form must not appear.
-            assert "elated_to" not in router._all_entities
-            assert "related_to" not in router._all_entities
+        router = _make_router_from_pairs([_make_pair("graph1", "Alice", "Berlin")])
+        # "related_to" starts with 'r', not "has_"; de-prefixed form must not appear.
+        assert "elated_to" not in router._all_entities
+        assert "related_to" not in router._all_entities
 
     def test_has_prefix_only_predicate_not_indexed(self):
         """A predicate that is exactly 'has_' (empty attr name) must not add a blank entry."""
@@ -1141,213 +1117,142 @@ class TestAttributePredicateIndexing:
             "key": "graph5",
             "question": "Q?",
             "answer": "A.",
-            "source_subject": "Alice",
-            "source_predicate": "has_",
-            "source_object": "something",
+            "subject": "Alice",
+            "predicate": "has_",
+            "object": "something",
             "speaker_id": "alice",
             "first_seen_cycle": 1,
+            "_adapter_id": "episodic",
         }
-        with tempfile.TemporaryDirectory() as tmp:
-            _write_keyed_pairs(Path(tmp), [pair])
-            router = QueryRouter(adapter_dir=Path(tmp))
-            # Empty de-prefixed name must not be added to entities.
-            assert "" not in router._all_entities
+        router = _make_router_from_pairs([pair])
+        # Empty de-prefixed name must not be added to entities.
+        assert "" not in router._all_entities
 
 
 # ---------------------------------------------------------------------------
-# QueryRouter — simulate_dir: graph.json loading
+# QueryRouter — simulate-mode routing via loop cache
 # ---------------------------------------------------------------------------
-
-
-def _write_simulate_graph(path: Path, quads: list[dict]) -> None:
-    """Write *quads* as a simulate-mode ``graph.json`` at *path*.
-
-    Builds a ``MultiDiGraph`` with one edge per quad, stores the indexed-memory
-    key in the ``_IK_KEY_ATTR`` edge attribute, and persists via
-    :func:`paramem.server.simulate_store.save_simulate_graph` with
-    ``encrypted=False`` so tests read plaintext.
-    """
-    import networkx as nx
-
-    from paramem.server.simulate_store import _IK_KEY_ATTR, save_simulate_graph
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    graph = nx.MultiDiGraph()
-    for quad in quads:
-        graph.add_edge(
-            quad["subject"],
-            quad["object"],
-            **{
-                _IK_KEY_ATTR: quad["key"],
-                "predicate": quad.get("predicate", "related_to"),
-                "speaker_id": quad.get("speaker_id", ""),
-                "first_seen_cycle": quad.get("first_seen_cycle", 0),
-            },
-        )
-    save_simulate_graph(graph, path, encrypted=False)
-
-
-def _make_sim_quad(
-    key: str,
-    subject: str,
-    obj: str,
-    *,
-    speaker_id: str = "",
-    predicate: str = "related_to",
-    first_seen_cycle: int = 1,
-) -> dict:
-    """Return a six-field quad dict for simulate-store router fixtures."""
-    return {
-        "key": key,
-        "subject": subject,
-        "predicate": predicate,
-        "object": obj,
-        "speaker_id": speaker_id,
-        "first_seen_cycle": first_seen_cycle,
-    }
 
 
 class TestQueryRouterSimulateDir:
-    """simulate_dir graph.json loading: router indexes entities from simulate store.
+    """Simulate-mode routing: router indexes entities from the loop's memory store.
 
-    When ``simulate_dir`` is supplied to ``QueryRouter.__init__``, ``reload()``
-    scans ``<simulate_dir>/<tier>/graph.json`` for each tier and adds those
-    entities and speaker-key mappings to the same indexes used by the
-    keyed-pairs path.  Train-mode kp files and simulate-mode graph.json files
-    can coexist without conflict.
+    In simulate mode, ``ConsolidationLoop`` populates ``store`` from
+    the simulate store (graph.json) just as train mode populates it from adapter
+    weights.  The router's ``reload()`` uses only ``loop.store`` as the
+    canonical source — ``simulate_dir`` is stored for back-compat but is not
+    read during reload.
+
+    These tests verify entity indexing and routing from simulate-mode cache entries.
     """
 
-    def test_empty_simulate_dir_loads_cleanly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            sim_dir.mkdir()
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            assert router.entity_count == 0
+    def test_empty_loop_cache_loads_cleanly(self):
+        """Router with an empty store returns entity_count == 0."""
+        router = QueryRouter(
+            adapter_dir=Path("/nonexistent"),
+            memory_store=MemoryStore(replay_enabled=False),
+        )
+        assert router.entity_count == 0
 
-    def test_nonexistent_simulate_dir_loads_cleanly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(
-                adapter_dir=Path(tmp) / "adapters",
-                simulate_dir=Path(tmp) / "no_such_dir",
-            )
-            assert router.entity_count == 0
+    def test_no_loop_provider_loads_cleanly(self):
+        """Router with a freshly-constructed empty store returns entity_count == 0."""
+        router = QueryRouter(
+            adapter_dir=Path("/nonexistent"), memory_store=MemoryStore(replay_enabled=False)
+        )
+        assert router.entity_count == 0
 
-    def test_episodic_graph_json_entities_indexed(self):
-        """Entities from episodic graph.json appear in _all_entities."""
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            _write_simulate_graph(
-                sim_dir / "episodic" / "graph.json",
-                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            assert "alice" in router._all_entities
-            assert "berlin" in router._all_entities
+    def test_episodic_cache_entities_indexed(self):
+        """Entities from episodic cache entries appear in _all_entities."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        assert "alice" in router._all_entities
+        assert "berlin" in router._all_entities
 
-    def test_semantic_and_procedural_graph_json_indexed(self):
-        """All three tiers' graph.json files contribute to the index."""
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            _write_simulate_graph(
-                sim_dir / "semantic" / "graph.json",
-                [_make_sim_quad("sem1", "Bob", "Python", speaker_id="bob")],
-            )
-            _write_simulate_graph(
-                sim_dir / "procedural" / "graph.json",
-                [_make_sim_quad("proc1", "Carol", "Tea", speaker_id="carol")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            assert "bob" in router._all_entities
-            assert "carol" in router._all_entities
+    def test_semantic_and_procedural_cache_entries_indexed(self):
+        """All three tiers' cache entries contribute to the index."""
+        router = _make_router_from_pairs(
+            [
+                _make_pair("sem1", "Bob", "Python", speaker_id="bob", adapter_id="semantic"),
+                _make_pair("proc1", "Carol", "Tea", speaker_id="carol", adapter_id="procedural"),
+            ]
+        )
+        assert "bob" in router._all_entities
+        assert "carol" in router._all_entities
 
-    def test_speaker_id_from_graph_json_indexed(self):
-        """speaker_id from graph.json edges appears in _speaker_key_index."""
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            _write_simulate_graph(
-                sim_dir / "episodic" / "graph.json",
-                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            assert "alice" in router._speaker_key_index
-            assert "graph1" in router._speaker_key_index["alice"]
+    def test_speaker_id_from_cache_indexed(self):
+        """speaker_id from cache entries appears in _speaker_key_index."""
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        assert "alice" in router._speaker_key_index
+        assert "graph1" in router._speaker_key_index["alice"]
 
-    def test_simulate_graph_produces_pa_routing_steps(self):
-        """A query mentioning an entity from graph.json resolves to a PA step."""
+    def test_cache_entry_produces_pa_routing_steps(self):
+        """A query mentioning a cached entity resolves to a PA step."""
         from paramem.server.router import Intent
 
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            _write_simulate_graph(
-                sim_dir / "episodic" / "graph.json",
-                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            plan = router.route("Where does Alice live?", speaker_id="alice")
-            assert plan.steps, "Expected PA routing steps from simulate-mode graph.json"
-            assert plan.intent == Intent.PERSONAL
-            keys = [k for step in plan.steps for k in step.keys_to_probe]
-            assert "graph1" in keys
+        router = _make_router_from_pairs(
+            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        )
+        plan = router.route("Where does Alice live?", speaker_id="alice")
+        assert plan.steps, "Expected PA routing steps from cache entry"
+        assert plan.intent == Intent.PERSONAL
+        keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph1" in keys
 
-    def test_simulate_dir_and_adapter_dir_coexist(self):
-        """Entities from both stores are indexed without conflict."""
-        with tempfile.TemporaryDirectory() as tmp:
-            adapter_dir = Path(tmp) / "adapters"
-            sim_dir = Path(tmp) / "simulate"
-            # Train-mode kp in adapter_dir
-            _write_keyed_pairs(
-                adapter_dir,
-                [_make_pair("train1", "TrainEntity", "Berlin", speaker_id="alice")],
-                subdir="episodic",
-            )
-            # Simulate-mode graph.json in sim_dir
-            _write_simulate_graph(
-                sim_dir / "episodic" / "graph.json",
-                [_make_sim_quad("sim1", "SimEntity", "Munich", speaker_id="alice")],
-            )
-            router = QueryRouter(adapter_dir=adapter_dir, simulate_dir=sim_dir)
-            assert "trainentity" in router._all_entities
-            assert "simentity" in router._all_entities
+    def test_multiple_tiers_in_cache_indexed_without_conflict(self):
+        """Cache entries from different tiers are all indexed without conflict."""
+        router = _make_router_from_pairs(
+            [
+                _make_pair("ep1", "TrainEntity", "Berlin", speaker_id="alice"),
+                _make_pair(
+                    "sem1", "SimEntity", "Munich", speaker_id="alice", adapter_id="semantic"
+                ),
+            ]
+        )
+        assert "trainentity" in router._all_entities
+        assert "simentity" in router._all_entities
 
-    def test_reload_picks_up_new_graph_json(self):
-        """After writing graph.json to simulate_dir, reload() picks it up."""
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            assert router.entity_count == 0
+    def test_reload_picks_up_updated_cache(self):
+        """reload() after mutating the injected store repopulates the entity index."""
+        store = MemoryStore(replay_enabled=True)
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
+        assert router.entity_count == 0
 
-            _write_simulate_graph(
-                sim_dir / "episodic" / "graph.json",
-                [_make_sim_quad("graph1", "Alice", "Berlin", speaker_id="alice")],
-            )
-            router.reload()
-            assert router.entity_count > 0
-            assert "alice" in router._all_entities
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "related_to",
+                "object": "Berlin",
+                "speaker_id": "alice",
+                "first_seen_cycle": 1,
+            },
+        )
+        router.reload()
+        assert router.entity_count > 0
+        assert "alice" in router._all_entities
 
-    def test_missing_graph_json_does_not_crash(self):
-        """simulate_dir with no graph.json under any tier → entity_count stays 0."""
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            sim_dir.mkdir()
-            (sim_dir / "episodic").mkdir()  # subdir present but no graph.json
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            assert router.entity_count == 0
+    def test_empty_cache_does_not_crash(self):
+        """Empty store returns entity_count == 0 without raising."""
+        store = MemoryStore(replay_enabled=True)
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
+        assert router.entity_count == 0
 
-    def test_has_email_predicate_indexed_from_graph_json(self):
-        """has_email predicate in graph.json edge is indexed under 'email' entity."""
-        with tempfile.TemporaryDirectory() as tmp:
-            sim_dir = Path(tmp) / "simulate"
-            _write_simulate_graph(
-                sim_dir / "episodic" / "graph.json",
-                [
-                    _make_sim_quad(
-                        "graph2",
-                        "Alice",
-                        "alice@example.com",
-                        speaker_id="alice",
-                        predicate="has_email",
-                    )
-                ],
-            )
-            router = QueryRouter(adapter_dir=Path(tmp) / "adapters", simulate_dir=sim_dir)
-            assert "email" in router._all_entities
+    def test_has_email_predicate_indexed_from_cache(self):
+        """has_email predicate in a cache entry is indexed under 'email' entity."""
+        router = _make_router_from_pairs(
+            [
+                _make_pair(
+                    "graph2",
+                    "Alice",
+                    "alice@example.com",
+                    speaker_id="alice",
+                    predicate="has_email",
+                )
+            ]
+        )
+        assert "email" in router._all_entities

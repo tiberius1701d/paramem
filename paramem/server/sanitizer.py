@@ -60,12 +60,107 @@ _FIRST_PERSON_TOKENS = frozenset(
 _PUNCT = ".,!?;:'\"()[]{}"
 
 
+# Generic glue tokens dropped from entity-name token sets so a multi-word
+# entity is keyed on its content words.  Length-3+ filter also drops
+# single-letter articles ("a"/"an") implicitly.  Kept short and bilingual
+# (en/de) because that is the deployment language scope; expand if the
+# entity index broadens.
+_GENERIC_ENTITY_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "these",
+        "those",
+        "der",
+        "die",
+        "das",
+        "den",
+        "dem",
+        "des",
+        "und",
+        "oder",
+        "für",
+        "mit",
+    }
+)
+
+
 def _contains_first_person(text: str) -> bool:
     """Token-level scan for first-person pronouns.  No regex."""
     for raw in text.split():
         token = raw.strip(_PUNCT).lower()
         if token in _FIRST_PERSON_TOKENS:
             return True
+    return False
+
+
+def _entity_content_tokens(name: str) -> list[str]:
+    """Extract content tokens from an entity name for paraphrase matching.
+
+    Lowercases the name and splits on every non-alphanumeric character (so
+    ``"multi-OEM"`` → ``["multi", "oem"]`` and ``"acme/co"`` →
+    ``["acme", "co"]``).  Tokens shorter than 3 characters and members of
+    :data:`_GENERIC_ENTITY_STOPWORDS` are dropped so the residual is the
+    entity's distinguishing content.  Pure character iteration; no regex
+    (per the project's no-regex guidance).
+    """
+    tokens: list[str] = []
+    cursor = 0
+    raw = name.lower()
+    for i, ch in enumerate(raw):
+        if not (ch.isalnum() or ch == "_"):
+            if cursor < i:
+                tokens.append(raw[cursor:i])
+            cursor = i + 1
+    if cursor < len(raw):
+        tokens.append(raw[cursor:])
+    return [t for t in tokens if len(t) >= 3 and t not in _GENERIC_ENTITY_STOPWORDS]
+
+
+def _query_paraphrases_entity(
+    text_lower: str,
+    known_entities: set[str] | None,
+    *,
+    min_overlap: int = 2,
+) -> bool:
+    """Return True when *text_lower* contains at least ``min_overlap``
+    content tokens of any known entity name as case-insensitive substrings.
+
+    Closes the gap the surface-form scrub leaves: word-boundary
+    substitution misses pluralisation ("platforms" vs "platform"),
+    reordering ("ADAS compute platforms" vs "ADAS platform"), and
+    partial reference (omitting the modifier "multi-OEM").  The
+    ``min_overlap=2`` floor suppresses generic single-token hits — a
+    query mentioning the word "system" should not be classified as
+    personal just because some indexed entity contains "system".
+
+    Single-content-token entity names (e.g. ``"Alice"``) are already
+    fully covered by :func:`_anonymize_transcript`'s word-boundary
+    primitive in :func:`check_personal_content`, so this function
+    returns False for any entity whose content-token count is below
+    ``min_overlap``.  Substring (not word-boundary) is the deliberate
+    relaxation: it accepts "platforms" matching the entity token
+    "platform".
+    """
+    if not known_entities:
+        return False
+    for ent in known_entities:
+        if not ent:
+            continue
+        toks = _entity_content_tokens(ent)
+        if len(toks) < min_overlap:
+            continue
+        hits = 0
+        for tok in toks:
+            if tok in text_lower:
+                hits += 1
+                if hits >= min_overlap:
+                    return True
     return False
 
 
@@ -154,6 +249,7 @@ def check_personal_content(
     """
     findings: list[str] = []
 
+    text_lower = text.lower() if text else ""
     mapping = _build_known_entity_mapping(known_entities)
     if mapping:
         # Case-insensitive comparison: production stores lowercased entity
@@ -162,10 +258,20 @@ def check_personal_content(
         # sides and run _anonymize_transcript with the same word-boundary
         # substitution the extraction path uses; the original text is
         # preserved for the return value.
-        text_lower = text.lower()
         anonymized = _anonymize_transcript(text_lower, mapping)
         if anonymized != text_lower:
             findings.append("personal_entity")
+
+    # Paraphrase-aware second pass.  Word-boundary substitution misses
+    # plural / re-ordered / partial references to multi-word entities
+    # ("ADAS compute platforms" → entity "critical multi-OEM ADAS
+    # platform turnaround").  The 2-token overlap gate catches these
+    # without firing on single generic words.  Only runs when the
+    # surface scrub did not already flag, so callers see exactly one
+    # ``personal_entity`` finding per query regardless of which arm
+    # matched.
+    if "personal_entity" not in findings and _query_paraphrases_entity(text_lower, known_entities):
+        findings.append("personal_entity")
 
     if speaker_id and _is_about_speaker(text, personal_referent_config):
         findings.append("first_person_personal")

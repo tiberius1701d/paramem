@@ -21,7 +21,7 @@ Hard rules carried forward:
   - ConsolidationLoop is used exactly as in archive/experiments/phase3_consolidation.py.
   - Speaker-id tagging mirrors paramem/server/consolidation.py:155-158.
   - Write ordering: raw_qa → diagnostics → state (fsync at each step).
-  - Smoke test uses _write_keyed_pairs from paramem/server/consolidation.py.
+  - Smoke test shim writes quads.json from loop.indexed_key_cache.
 """
 
 import argparse
@@ -221,12 +221,12 @@ def _validate_resume_accumulator(
         processed_ids: Session IDs listed in state.processed_session_ids.
 
     Returns:
-        (all_episodic_qa, all_procedural_rels) re-accumulated from disk.
+        (all_episodic_rels, all_procedural_rels) re-accumulated from disk.
 
     Raises:
         RuntimeError: If any raw_qa.json is missing or unreadable.
     """
-    all_episodic_qa: list[dict] = []
+    all_episodic_rels: list[dict] = []
     all_procedural_rels: list[dict] = []
 
     for sid in processed_ids:
@@ -245,16 +245,16 @@ def _validate_resume_accumulator(
                 f"diagnostics/{sid}.raw_qa.json — {exc}. Start a new run."
             ) from exc
 
-        all_episodic_qa.extend(data.get("episodic_qa", []))
+        all_episodic_rels.extend(data.get("episodic_rels", []))
         all_procedural_rels.extend(data.get("procedural_rels", []))
 
     logger.info(
         "Resume: reloaded %d episodic + %d procedural QA from %d sessions",
-        len(all_episodic_qa),
+        len(all_episodic_rels),
         len(all_procedural_rels),
         len(processed_ids),
     )
-    return all_episodic_qa, all_procedural_rels
+    return all_episodic_rels, all_procedural_rels
 
 
 def _validate_no_train_resume(state: dict, no_train: bool) -> None:
@@ -293,7 +293,7 @@ def _build_session_diagnostics(
     edges_before: int,
     nodes_after: int,
     edges_after: int,
-    episodic_qa: list[dict],
+    episodic_rels: list[dict],
     procedural_rels: list[dict],
     elapsed_seconds: float,
 ) -> dict:
@@ -309,7 +309,7 @@ def _build_session_diagnostics(
             Passed in as a pre-captured snapshot; see population sources below.
         nodes_before / edges_before: Graph size before the session merge.
         nodes_after / edges_after: Graph size after the session merge.
-        episodic_qa: Tagged QA pairs returned by extract_session.
+        episodic_rels: Tagged QA pairs returned by extract_session.
         procedural_rels: Tagged procedural relations returned by extract_session.
         elapsed_seconds: Wall-clock time for extract_session call.
 
@@ -347,7 +347,7 @@ def _build_session_diagnostics(
 
     # raw_fact_count: facts from the original extraction (before SOTA enrichment).
     # post_plausibility_count: facts surviving all filtering (including enriched).
-    post_plausibility_count = len(episodic_qa)
+    post_plausibility_count = len(episodic_rels)
     raw_fact_count = post_plausibility_count + sum(drops.values()) - enrichment_added
     # When SOTA adds more than the original extraction produced, raw can go
     # below zero arithmetically. Floor at 0 — the real pre-enrichment count
@@ -387,7 +387,7 @@ def _build_session_diagnostics(
             "cumulative_edges": edges_after,
         },
         "qa": {
-            "episodic_qa_count": len(episodic_qa),
+            "episodic_qa_count": len(episodic_rels),
             "procedural_rel_count": len(procedural_rels),
         },
         "errors": [],
@@ -402,11 +402,15 @@ def _build_session_diagnostics(
 def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     """Build the {run_dir}/_smoke_shim layout while loop objects are alive.
 
-    ConsolidationLoop's _save_adapters does not write keyed_pairs.json.
-    This helper materializes keyed_pairs + simhash registry + adapter
-    symlink from the in-memory loop state so a later call to
-    smoke_test_adapter (which loads a fresh base model) can run on disk
-    alone — the caller is expected to free GPU memory between the two.
+    Materializes quads + simhash registry + adapter symlink from the
+    in-memory loop state so a later call to smoke_test_adapter (which loads a
+    fresh base model) can run on disk alone — the caller is expected to free
+    GPU memory between the two.
+
+    quads.json is written from ``loop.indexed_key_cache`` (the canonical
+    in-memory store).  Each cache entry already carries the canonical fields
+    (subject, predicate, object, speaker_id, first_seen_cycle; question/answer
+    in QA mode).
 
     Args:
         run_dir: The probe run directory (contains episodic/ adapter subdir).
@@ -415,13 +419,12 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     Returns:
         Path to the prepared shim directory.
     """
-    from paramem.server.consolidation import _write_keyed_pairs
-
     shim_dir = run_dir / "_smoke_shim"
     shim_dir.mkdir(parents=True, exist_ok=True)
 
-    # (a) keyed_pairs.json
-    _write_keyed_pairs(loop.indexed_key_cache, loop.episodic_simhash, shim_dir / "keyed_pairs.json")
+    # (a) quads.json — serialise from the canonical in-memory cache.
+    kp_list = list(loop.indexed_key_cache.values())
+    _atomic_json_write(kp_list, shim_dir / "quads.json")
 
     # (b) simhash_registry.json
     src_registry = run_dir / "simhash_registry_episodic.json"
@@ -718,10 +721,12 @@ def main() -> None:
         logger.info("New run: %s", run_dir)
 
     # --- 3. Reload accumulator from disk if resuming ---
-    all_episodic_qa: list[dict] = []
+    all_episodic_rels: list[dict] = []
     all_procedural_rels: list[dict] = []
     if processed_ids:
-        all_episodic_qa, all_procedural_rels = _validate_resume_accumulator(run_dir, processed_ids)
+        all_episodic_rels, all_procedural_rels = _validate_resume_accumulator(
+            run_dir, processed_ids
+        )
 
     # --- 4. Extraction flags ---
     if args.no_sota:
@@ -823,7 +828,7 @@ def main() -> None:
 
             t_start = time.time()
             try:
-                episodic_qa, procedural_rels = loop.extract_session(
+                episodic_rels, procedural_rels = loop.extract_session(
                     session_transcript=session.transcript,
                     session_id=session.session_id,
                     speaker_id=session.speaker_id,
@@ -872,8 +877,8 @@ def main() -> None:
                     "qa": {"episodic_qa_count": 0, "procedural_rel_count": 0},
                     "errors": [str(exc)],
                 }
-                episodic_qa, procedural_rels = [], []
-                _commit_session(run_dir, session, episodic_qa, procedural_rels, error_diag, state)
+                episodic_rels, procedural_rels = [], []
+                _commit_session(run_dir, session, episodic_rels, procedural_rels, error_diag, state)
                 primary_speaker = session.speaker_id
                 session_count += 1
                 continue
@@ -881,7 +886,7 @@ def main() -> None:
             elapsed = time.time() - t_start
 
             # Speaker-tag each QA pair immediately (mirrors server/consolidation.py:155-158).
-            for qa in episodic_qa:
+            for qa in episodic_rels:
                 qa["speaker_id"] = session.speaker_id
             for rel in procedural_rels:
                 rel["speaker_id"] = session.speaker_id
@@ -901,15 +906,15 @@ def main() -> None:
                 edges_before=edges_before,
                 nodes_after=nodes_after,
                 edges_after=edges_after,
-                episodic_qa=episodic_qa,
+                episodic_rels=episodic_rels,
                 procedural_rels=procedural_rels,
                 elapsed_seconds=elapsed,
             )
 
             # Commit session: raw_qa → diagnostics → state (fsync at each step).
-            _commit_session(run_dir, session, episodic_qa, procedural_rels, diag_data, state)
+            _commit_session(run_dir, session, episodic_rels, procedural_rels, diag_data, state)
 
-            all_episodic_qa.extend(episodic_qa)
+            all_episodic_rels.extend(episodic_rels)
             all_procedural_rels.extend(procedural_rels)
             primary_speaker = session.speaker_id
             session_count += 1
@@ -919,7 +924,7 @@ def main() -> None:
                 "Graph: +%d nodes, +%d edges (total: %d nodes, %d edges). "
                 "Elapsed: %.1fs",
                 session.session_id,
-                len(episodic_qa),
+                len(episodic_rels),
                 len(procedural_rels),
                 nodes_after - nodes_before,
                 edges_after - edges_before,
@@ -931,7 +936,7 @@ def main() -> None:
         logger.info(
             "Extraction complete: %d sessions processed, %d episodic QA, %d procedural rels",
             session_count,
-            len(all_episodic_qa),
+            len(all_episodic_rels),
             len(all_procedural_rels),
         )
 
@@ -941,18 +946,18 @@ def main() -> None:
 
         if args.no_train:
             logger.info("Training + smoke skipped (--no-train)")
-        elif all_episodic_qa or all_procedural_rels:
+        elif all_episodic_rels or all_procedural_rels:
             state["training_started"] = True
             _write_state(state, run_dir)
 
             logger.info(
                 "Training on %d episodic + %d procedural QA pairs",
-                len(all_episodic_qa),
+                len(all_episodic_rels),
                 len(all_procedural_rels),
             )
             try:
                 train_result = loop.train_adapters(
-                    all_episodic_qa,
+                    all_episodic_rels,
                     all_procedural_rels,
                     speaker_id=primary_speaker,
                 )
@@ -963,7 +968,7 @@ def main() -> None:
             # --- 10. Smoke-test recall ---
             if not train_result.get("error"):
                 logger.info("Running recall smoke test...")
-                # Build smoke-shim artifacts (keyed_pairs, registry, adapter
+                # Build smoke-shim artifacts (quads, registry, adapter
                 # symlink) while the loop's in-memory objects are still alive,
                 # then free the GPU so smoke_test_adapter can load a fresh model.
                 shim_dir = _prepare_smoke_shim(run_dir, loop)
@@ -995,7 +1000,7 @@ def main() -> None:
             "model": args.model,
             "limit": args.limit,
             "sessions_processed": session_count,
-            "total_episodic_qa": len(all_episodic_qa),
+            "total_episodic_qa": len(all_episodic_rels),
             "total_procedural_rels": len(all_procedural_rels),
             "train_result": {k: v for k, v in train_result.items() if k != "loop"},
             "smoke_result": smoke_result,
@@ -1026,7 +1031,7 @@ def main() -> None:
 def _commit_session(
     run_dir: Path,
     session: DatasetSession,
-    episodic_qa: list[dict],
+    episodic_rels: list[dict],
     procedural_rels: list[dict],
     diag_data: dict,
     state: dict,
@@ -1041,7 +1046,7 @@ def _commit_session(
     Args:
         run_dir: Run directory.
         session: The session just processed.
-        episodic_qa: Tagged episodic QA pairs.
+        episodic_rels: Tagged episodic QA pairs.
         procedural_rels: Tagged procedural relations.
         diag_data: Per-session diagnostics dict.
         state: Mutable state dict (updated in place, then written).
@@ -1051,7 +1056,7 @@ def _commit_session(
     diag_dir.mkdir(parents=True, exist_ok=True)
 
     # Step 1: raw_qa.json
-    raw_qa = {"episodic_qa": episodic_qa, "procedural_rels": procedural_rels}
+    raw_qa = {"episodic_rels": episodic_rels, "procedural_rels": procedural_rels}
     _atomic_json_write(raw_qa, diag_dir / f"{sid}.raw_qa.json")
 
     # Step 2: diagnostics.json

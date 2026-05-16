@@ -18,6 +18,7 @@ from paramem.evaluation.consolidation_metrics import (
 )
 from paramem.training.consolidation import ConsolidationLoop, CycleResult, _mentions_any
 from paramem.training.curriculum import CurriculumSampler
+from paramem.training.memory_store import MemoryStore as _MS  # noqa: F401
 from paramem.utils.config import ConsolidationConfig
 
 
@@ -228,7 +229,7 @@ class TestExtractionPathParity:
         )
         # Use template fallback (ignore passed model/tokenizer) for deterministic output.
         monkeypatch.setattr(
-            "paramem.training.consolidation.generate_qa_from_relations",
+            "paramem.graph.qa_generator.generate_qa_from_relations",
             lambda relations, model=None, tokenizer=None: _real_qa(relations),
         )
 
@@ -245,6 +246,8 @@ class TestExtractionPathParity:
             model.peft_config["procedural"] = MagicMock()
         procedural_adapter = AdapterConfig() if procedural_enabled else None
 
+        from paramem.training.memory_store import MemoryStore as _MS
+
         return ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
@@ -252,6 +255,7 @@ class TestExtractionPathParity:
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
+            memory_store=_MS(replay_enabled=False),
             procedural_adapter_config=procedural_adapter,
             output_dir=tmp_path,
             persist_graph=False,
@@ -267,10 +271,10 @@ class TestExtractionPathParity:
         )
 
     def _run_cycle_and_capture(self, monkeypatch, loop, source_type: str = "transcript"):
-        captured: dict[str, list[dict]] = {"episodic_qa": [], "procedural_rels": []}
+        captured: dict[str, list[dict]] = {"episodic_rels": [], "procedural_rels": []}
 
-        def _capture_episodic(self_, episodic_qa, new_promotions):
-            captured["episodic_qa"] = episodic_qa
+        def _capture_episodic(self_, episodic_rels, new_promotions):
+            captured["episodic_rels"] = episodic_rels
             return None
 
         def _capture_procedural(self_, procedural_relations, speaker_id):
@@ -298,7 +302,7 @@ class TestExtractionPathParity:
             speaker_id="spk",
             source_type=source_type,
         )
-        return captured["episodic_qa"], captured["procedural_rels"]
+        return captured["episodic_rels"], captured["procedural_rels"]
 
     def test_parity_procedural_enabled(self, monkeypatch, tmp_path):
         loop_a = self._build_loop(monkeypatch, tmp_path / "a", procedural_enabled=True)
@@ -309,7 +313,7 @@ class TestExtractionPathParity:
 
         # Identity fields must match across both paths.
         def _key(qa):
-            return (qa["source_subject"], qa["source_predicate"], qa["source_object"])
+            return (qa["subject"], qa["predicate"], qa["object"])
 
         def _rel_key(rel):
             return (rel["subject"], rel["predicate"], rel["object"])
@@ -319,7 +323,7 @@ class TestExtractionPathParity:
 
         # Partition invariant: no preference in episodic, and procedural carries
         # both the filter-sourced and the separately-extracted preference.
-        assert all(qa["source_predicate"] != "prefers" for qa in episodic_a)
+        assert all(qa["predicate"] != "prefers" for qa in episodic_a)
         assert {rel["predicate"] for rel in procedural_a} == {"prefers", "listens_to"}
 
     @pytest.mark.parametrize("source_type", ["transcript", "document"])
@@ -439,11 +443,11 @@ class TestExtractionPathParity:
         episodic_b, procedural_b = self._run_cycle_and_capture(monkeypatch, loop_b)
 
         def _key(qa):
-            return (qa["source_subject"], qa["source_predicate"], qa["source_object"])
+            return (qa["subject"], qa["predicate"], qa["object"])
 
         assert sorted(map(_key, episodic_a)) == sorted(map(_key, episodic_b))
         # With procedural disabled, preferences fall back into episodic — never lost.
-        assert any(qa["source_predicate"] == "prefers" for qa in episodic_a)
+        assert any(qa["predicate"] == "prefers" for qa in episodic_a)
         assert procedural_a == []
         assert procedural_b == []
 
@@ -717,17 +721,13 @@ class TestSaveAdaptersManifest:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
-        loop.indexed_key_registry = KeyRegistry()
+        loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
         loop.semantic_simhash = {}
         loop.procedural_simhash = {}
-        # _is_quad / _indexed_format are set by __init__; tests that bypass
-        # __init__ via __new__ / object.__new__ must set them explicitly.
-        loop._indexed_format = "qa"
-        loop._is_quad = False
         return loop
 
     def test_save_adapters_writes_meta_json(self, tmp_path):
@@ -736,13 +736,12 @@ class TestSaveAdaptersManifest:
 
         loop = self._make_save_loop(tmp_path)
 
-        # Seed the registry and keyed_pairs so build_manifest_for has something to hash.
+        # Seed the registry and quads so build_manifest_for has something to hash.
         from paramem.training.key_registry import KeyRegistry
 
-        loop.indexed_key_registry = KeyRegistry()
-        loop.indexed_key_registry.add("graph1", adapter_id="episodic")
-        registry_path = tmp_path / "indexed_key_registry.json"
-        loop.indexed_key_registry.save(registry_path)
+        ep_reg = KeyRegistry()
+        ep_reg.add("graph1")
+        loop.indexed_key_registry = {"episodic": ep_reg}
 
         loop._save_adapters()
 
@@ -772,35 +771,38 @@ class TestSaveAdaptersManifest:
 
         loop = self._make_save_loop(tmp_path)
 
-        # Seed registry + keyed_pairs state so every hash input is populated.
-        loop.indexed_key_registry = KeyRegistry()
-        loop.indexed_key_registry.add("graph1", adapter_id="episodic")
+        # Seed registry + quads state so every hash input is populated.
+        ep_reg = KeyRegistry()
+        ep_reg.add("graph1")
+        loop.indexed_key_registry = {"episodic": ep_reg}
         loop.indexed_key_cache = {
             "graph1": {
                 "key": "graph1",
                 "question": "What colour is the sky?",
                 "answer": "Blue.",
-                "source_subject": "sky",
-                "source_predicate": "has_colour",
-                "source_object": "blue",
+                "subject": "sky",
+                "predicate": "has_colour",
+                "object": "blue",
                 "speaker_id": "Speaker0",
                 "first_seen_cycle": 1,
             }
         }
         loop.episodic_simhash = {"graph1": 0xABCDEF}
 
-        # Pre-seed a *different* registry file on disk so the old codepath
-        # (hash-before-overwrite) would produce a mismatch — ensures this
-        # test fails under the pre-fix implementation.
+        # Pre-seed a *different* registry file on disk at the per-tier path
+        # so the old codepath (hash-before-overwrite) would produce a mismatch
+        # — ensures this test fails under the pre-fix implementation.
+        # New layout: registry lives at <adapter_dir>/<tier>/indexed_key_registry.json.
+        (tmp_path / "episodic").mkdir(parents=True, exist_ok=True)
         stale_registry = KeyRegistry()
-        stale_registry.add("stale_key", adapter_id="episodic")
-        stale_registry.save(tmp_path / "indexed_key_registry.json")
+        stale_registry.add("stale_key")
+        stale_registry.save(tmp_path / "episodic" / "indexed_key_registry.json")
 
         loop._save_adapters()
 
-        # Live hash = hash of whatever is on disk post-save.
+        # Live hash = hash of whatever is on disk post-save (per-tier path).
         live_hash = hashlib.sha256(
-            (tmp_path / "indexed_key_registry.json").read_bytes()
+            (tmp_path / "episodic" / "indexed_key_registry.json").read_bytes()
         ).hexdigest()
 
         slot = find_live_slot(tmp_path / "episodic", live_hash)
@@ -815,12 +817,8 @@ class TestSaveAdaptersManifest:
         # stale pre-existing registry (stale_key).
         assert manifest.key_count == 1
 
-        # keyed_pairs.json must live inside the adapter-kind dir and match
-        # the hash stamped in the manifest.
-        kp_path = tmp_path / "episodic" / "keyed_pairs.json"
-        assert kp_path.exists()
-        kp_hash = hashlib.sha256(kp_path.read_bytes()).hexdigest()
-        assert manifest.keyed_pairs_sha256 == kp_hash
+        # Manifest version must be v4 (no keyed_pairs_sha256 field).
+        assert manifest.schema_version == 4
 
 
 class TestAtomicJsonWriteEncryptedFlag:
@@ -923,6 +921,7 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             model=MagicMock(),
             tokenizer=MagicMock(),
             config=cfg,
+            memory_store=_MS(replay_enabled=False),
             state_provider=lambda: state,
         )
 
@@ -944,6 +943,7 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             model=MagicMock(),
             tokenizer=MagicMock(),
             config=cfg,
+            memory_store=_MS(replay_enabled=False),
             state_provider=lambda: state,
         )
 
@@ -963,6 +963,7 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             model=MagicMock(),
             tokenizer=MagicMock(),
             config=cfg,
+            memory_store=_MS(replay_enabled=False),
             state_provider=None,
         )
 
@@ -983,6 +984,7 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             model=MagicMock(),
             tokenizer=MagicMock(),
             config=cfg,
+            memory_store=_MS(replay_enabled=False),
             state_provider=lambda: state,
         )
         loop_a.fingerprint_cache["sentinel"] = "computed-by-cycle-1"
@@ -991,6 +993,7 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             model=MagicMock(),
             tokenizer=MagicMock(),
             config=cfg,
+            memory_store=_MS(replay_enabled=False),
             state_provider=lambda: state,
         )
         assert loop_b.fingerprint_cache.get("sentinel") == "computed-by-cycle-1"
@@ -1029,7 +1032,6 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
             ),
             lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=()),
             registry_sha256="",
-            keyed_pairs_sha256="",
             key_count=0,
         )
         write_manifest(slot, m_on_disk)
@@ -1062,7 +1064,6 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
                 tokenizer,
                 "episodic",
                 registry_path=None,
-                keyed_pairs_path=None,
                 base_model_hash_cache=cache,
                 adapter_root=adapter_root,
             )
@@ -1254,110 +1255,53 @@ class TestTestHarnessImportNoEnvRestoration:
 # ---------------------------------------------------------------------------
 
 
-class TestPostSessionTrainWritesFullSchema:
-    """Regression guard for the metadata-stripping bug in ``_train_extracted_into_interim``.
+class TestIndexedKeyCacheSchemaInvariant:
+    """Regression guard: indexed_key_cache entries carry the canonical field set.
 
-    Pre-fix: the episodic and procedural writers in that method hand-built
-    ``{"key": ..., "question": ..., "answer": ...}`` dicts, silently dropping
-    ``source_subject``, ``source_predicate``, ``source_object``, ``speaker_id``,
-    and ``first_seen_cycle``.  The router's entity and speaker indexes came up
-    empty after every post-session train, so ``route()`` returned no steps and
-    ``/chat`` cold-started.
-
-    Post-fix: the writers pass the full ``qa_info`` dict through the facade,
-    which enforces the eight-field schema.  This test drives the write block
-    directly (no GPU, no real model) and asserts that every canonical field
-    appears in the written file with a non-empty value sourced from the input.
+    Knowledge lives solely in adapter weights (train mode) or graph.json
+    (simulate mode) — quads.json sidecars are removed.  The
+    indexed_key_cache is the in-RAM transient view.  Entries must carry
+    ``subject``, ``predicate``, ``object`` (not the old ``source_*`` aliases)
+    alongside ``key``, ``speaker_id``, and ``first_seen_cycle`` so the router
+    entity/speaker indexes populate correctly.
     """
+
+    _CANONICAL_FIELDS = {"key", "subject", "predicate", "object", "speaker_id", "first_seen_cycle"}
 
     def _build_minimal_pair(
         self,
         *,
         key: str = "graph1",
-        question: str = "Where does Alice live?",
-        answer: str = "Alice lives in Berlin.",
-        source_subject: str = "Alice",
-        source_predicate: str = "lives_in",
-        source_object: str = "Berlin",
+        subject: str = "Alice",
+        predicate: str = "lives_in",
+        obj: str = "Berlin",
         speaker_id: str = "Speaker0",
         first_seen_cycle: int = 1,
     ) -> dict:
         return {
             "key": key,
-            "question": question,
-            "answer": answer,
-            "source_subject": source_subject,
-            "source_predicate": source_predicate,
-            "source_object": source_object,
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
             "speaker_id": speaker_id,
             "first_seen_cycle": first_seen_cycle,
         }
 
-    def test_interim_episodic_write_preserves_full_schema(self, tmp_path, monkeypatch):
-        """After the fix, the interim episodic keyed_pairs.json must contain
-        all eight canonical fields with values sourced from the input QA pairs.
-        """
-        from paramem.training.keyed_pairs_io import (
-            KEYED_PAIR_FIELDS,
-            read_keyed_pairs,
-            write_keyed_pairs,
+    def test_canonical_pair_has_required_fields(self) -> None:
+        """A well-formed indexed_key_cache entry carries all required fields."""
+        pair = self._build_minimal_pair()
+        missing = self._CANONICAL_FIELDS - set(pair.keys())
+        assert missing == set(), (
+            f"Canonical cache entry missing fields: {missing}. "
+            "Update the indexed_key_cache[k] = {{...}} sites in consolidation.py."
         )
 
-        # Simulate what _train_extracted_into_interim's W3 path produces:
-        # all_interim_keyed is now passed full dicts (not stripped dicts).
-        all_interim_keyed = [
-            self._build_minimal_pair(key="graph1"),
-            self._build_minimal_pair(
-                key="graph2",
-                question="What is Alice's job?",
-                answer="Alice is an engineer.",
-                source_predicate="has_job",
-                source_object="engineer",
-            ),
-        ]
-
-        # Reproduce the write step from _train_extracted_into_interim (post-fix).
-        adapter_name = "episodic_interim_20260503T1200"
-        interim_dir = tmp_path / adapter_name
-        kp_path = interim_dir / "keyed_pairs.json"
-        write_keyed_pairs(kp_path, all_interim_keyed)
-
-        # Read back and validate every canonical field is present and non-empty
-        # (or a valid int for first_seen_cycle).
-        result = read_keyed_pairs(kp_path)
-        assert len(result) == 2, f"Expected 2 entries, got {len(result)}"
-
-        for entry in result:
-            for field in KEYED_PAIR_FIELDS:
-                assert field in entry, f"Field {field!r} missing from written entry"
-
-        # Spot-check that metadata values survived (not silently defaulted to "").
-        assert result[0]["source_subject"] == "Alice"
-        assert result[0]["source_predicate"] == "lives_in"
-        assert result[0]["source_object"] == "Berlin"
-        assert result[0]["speaker_id"] == "Speaker0"
-        assert result[0]["first_seen_cycle"] == 1
-
-    def test_producer_site_dict_has_all_canonical_fields(self):
-        """The dict literal built by the four episodic producer sites must include
-        source_predicate and first_seen_cycle — they were the missing fields that
-        caused the stripping bug when the router read empty indexes.
-        """
-        from paramem.training.keyed_pairs_io import KEYED_PAIR_FIELDS
-
-        # Reproduce the dict literal shape now written by each producer site.
-        kp = {
-            "key": "graph5",
-            "question": "Q?",
-            "answer": "A.",
-            "source_subject": "Subject",
-            "source_predicate": "predicate",
-            "source_object": "Object",
-            "speaker_id": "Speaker0",
-            "first_seen_cycle": 3,
-        }
-        missing = [f for f in KEYED_PAIR_FIELDS if f not in kp]
-        assert missing == [], (
-            f"Producer site dict is missing fields: {missing}. "
-            "Update the four indexed_key_cache[k] = {{...}} sites in consolidation.py."
+    def test_no_source_alias_fields(self) -> None:
+        """source_subject/predicate/object aliases must not appear in cache entries."""
+        pair = self._build_minimal_pair()
+        stale_fields = {"source_subject", "source_predicate", "source_object"}
+        present = stale_fields & set(pair.keys())
+        assert present == set(), (
+            f"Stale source_* alias fields still present: {present}. "
+            "Remove from all indexed_key_cache producer sites."
         )

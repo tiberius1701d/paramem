@@ -192,7 +192,7 @@ def _parse_inference_json(raw: str) -> list[dict]:
 def reconstruct_all_facts(
     model,
     tokenizer,
-    keyed_pairs: list[dict],
+    quads: list[dict],
     registry: dict[str, int],
     adapter_name: str = "episodic",
 ) -> list[dict]:
@@ -206,7 +206,7 @@ def reconstruct_all_facts(
     model.gradient_checkpointing_disable()
     switch_adapter(model, adapter_name)
 
-    trained_keys = [kp["key"] for kp in keyed_pairs]
+    trained_keys = [kp["key"] for kp in quads]
     recalled = probe_all_keys(model, tokenizer, trained_keys, registry=registry)
 
     reconstructed = []
@@ -224,7 +224,7 @@ def reconstruct_all_facts(
     logger.info(
         "Reconstructed %d/%d facts from parametric memory",
         len(reconstructed),
-        len(keyed_pairs),
+        len(quads),
     )
     return reconstructed
 
@@ -412,7 +412,7 @@ def main():
 
         # Phase 2: Train indexed keys
         print(f"\n--- Phase 2: Training {len(qa_pairs)} indexed keys ---")
-        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+        model, quads, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
             qa_pairs,
@@ -441,7 +441,7 @@ def main():
         # Phase 3: Verify base fact recall (sanity check)
         print("\n--- Phase 3: Base fact recall (sanity check) ---")
         recall_result = evaluate_indexed_recall(
-            model, tokenizer, keyed_pairs, registry, adapter_name="episodic"
+            model, tokenizer, quads, registry, adapter_name="episodic"
         )
         print(f"  Base facts: {recall_result['exact_count']}/{recall_result['total']} exact recall")
 
@@ -450,17 +450,16 @@ def main():
         print("\n--- Phase 4: Reconstructing all facts from memory ---")
         t_recon_start = time.time()
         reconstructed = reconstruct_all_facts(
-            model, tokenizer, keyed_pairs, registry, adapter_name="episodic"
+            model, tokenizer, quads, registry, adapter_name="episodic"
         )
         reconstruction_time = time.time() - t_recon_start
         print(
-            f"  Reconstructed {len(reconstructed)}/{len(keyed_pairs)} facts "
-            f"in {reconstruction_time:.1f}s"
+            f"  Reconstructed {len(reconstructed)}/{len(quads)} facts in {reconstruction_time:.1f}s"
         )
 
         # Measure reconstruction quality against originals
         recon_sims = []
-        kp_by_key = {kp["key"]: kp for kp in keyed_pairs}
+        kp_by_key = {kp["key"]: kp for kp in quads}
         for r in reconstructed:
             orig = kp_by_key.get(r["key"])
             if orig:
@@ -604,7 +603,7 @@ def main():
         print(f"  Base fact recall:    {recall_result['exact_count']}/{recall_result['total']}")
         print(
             f"  Reconstructed:       "
-            f"{len(reconstructed)}/{len(keyed_pairs)} "
+            f"{len(reconstructed)}/{len(quads)} "
             f"(quality={mean_recon_sim:.3f})"
         )
         print(f"  Inference questions: {len(inference_questions)}")

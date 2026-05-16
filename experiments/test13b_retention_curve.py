@@ -574,7 +574,7 @@ def main():  # noqa: C901  (complexity acceptable for experiment orchestration)
         "--c1-source-run",
         type=Path,
         default=DEFAULT_C1_SOURCE_RUN,
-        help="Path to a Test 13 run dir whose C1 adapter + keyed_pairs.json will be loaded.",
+        help="Path to a Test 13 run dir whose C1 adapter + quads.json will be loaded.",
     )
     parser.add_argument(
         "--output-dir",
@@ -952,7 +952,7 @@ def main():  # noqa: C901  (complexity acceptable for experiment orchestration)
             tokenizer,
             adapter_name,
             registry_path=None,
-            keyed_pairs_path=output_dir / "fill_keyed.json",
+            quads_path=output_dir / "fill_keyed.json",
             key_count=len(fill_keyed),
         )
         save_adapter(model, adapter_output_dir, adapter_name, manifest=manifest)

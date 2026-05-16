@@ -59,7 +59,7 @@ def main():
     print(f"Using run: {run_dir}")
 
     # Load keyed pairs and registry
-    with open(run_dir / "session_1" / "keyed_pairs.json") as f:
+    with open(run_dir / "session_1" / "quads.json") as f:
         keyed_1 = json.load(f)
     with open(run_dir / "session_1" / "simhash_registry.json") as f:
         registry_1 = json.load(f)

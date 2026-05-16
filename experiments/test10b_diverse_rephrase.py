@@ -207,7 +207,7 @@ def discover_checkpoints(run_dir: Path) -> list[Path]:
 
 
 def generate_diverse_questions(
-    keyed_pairs: list[dict],
+    quads: list[dict],
     model,
     tokenizer,
     cache_path: Path,
@@ -223,11 +223,11 @@ def generate_diverse_questions(
             return json.load(f)
 
     logger.info(
-        "Generating diverse questions: %d pairs x %d styles", len(keyed_pairs), len(REPHRASE_STYLES)
+        "Generating diverse questions: %d pairs x %d styles", len(quads), len(REPHRASE_STYLES)
     )
     questions = []
 
-    for i, kp in enumerate(keyed_pairs):
+    for i, kp in enumerate(quads):
         original_q = kp["question"]
         expected_a = kp["answer"]
         expected_entity = kp.get("source_object", "")
@@ -269,9 +269,7 @@ def generate_diverse_questions(
             )
 
         if (i + 1) % 20 == 0:
-            logger.info(
-                "  Generated %d/%d pairs (%d questions)", i + 1, len(keyed_pairs), len(questions)
-            )
+            logger.info("  Generated %d/%d pairs (%d questions)", i + 1, len(quads), len(questions))
 
     logger.info("Generated %d diverse questions total", len(questions))
     save_json_atomic(questions, cache_path)
@@ -470,7 +468,7 @@ def run_test10b(
     if PAUSE_FILE.exists():
         PAUSE_FILE.unlink()
 
-    # Input: Test 10 run directory (adapters + keyed_pairs)
+    # Input: Test 10 run directory (adapters + quads)
     test10_dir = find_test10_run_dir(model_name, run_dir_override)
     logger.info("Test 10 input dir: %s", test10_dir)
 
@@ -496,12 +494,12 @@ def run_test10b(
     logger.info("Output dir: %s", output_dir)
 
     # Load keyed pairs from Test 10
-    kp_path = test10_dir / "keyed_pairs.json"
+    kp_path = test10_dir / "quads.json"
     if not kp_path.exists():
-        raise FileNotFoundError(f"keyed_pairs.json not found in {test10_dir}")
+        raise FileNotFoundError(f"quads.json not found in {test10_dir}")
     with open(kp_path) as f:
-        keyed_pairs = json.load(f)
-    logger.info("Loaded %d keyed pairs", len(keyed_pairs))
+        quads = json.load(f)
+    logger.info("Loaded %d keyed pairs", len(quads))
 
     # Check disk space
     stat = shutil.disk_usage(output_dir)
@@ -551,7 +549,7 @@ def run_test10b(
 
     # Generate diverse questions (cached in output dir)
     cache_path = output_dir / QUESTIONS_FILENAME
-    diverse_questions = generate_diverse_questions(keyed_pairs, model, tokenizer, cache_path)
+    diverse_questions = generate_diverse_questions(quads, model, tokenizer, cache_path)
     logger.info("Diverse questions ready: %d total", len(diverse_questions))
 
     # Warn about keys with empty expected_entity

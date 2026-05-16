@@ -1,8 +1,8 @@
 """Format-neutral relation/entity preparation helpers.
 
 Partitions preference relations to the procedural adapter, and projects
-entity scalar attributes into relation triples.  No LLM, no QA.  Used by
-both the QA-generation path (``qa_generator.py``) and the quadruple path.
+entity scalar attributes into relation triples.  No LLM.  Used by both
+``qa_generator.py`` (for human-readable fact text) and the indexed-key path.
 """
 
 from typing import TYPE_CHECKING

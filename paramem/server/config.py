@@ -671,7 +671,6 @@ class ConsolidationScheduleConfig:
     retain_sessions: bool = True
     indexed_key_replay: bool = True  # indexed key training mechanism
     decay_window: int = 10  # cycles before unreinforced keys decay
-    indexed_format: str = "qa"  # "qa" = QA-pair format (default), "quad" = quadruple format
     # Maximum LoRA training epochs per consolidation cycle. None = use the
     # validated 30 from VALIDATED_TRAINING_CONFIG (the Test 1-8 campaign
     # floor for 100% indexed-key recall on the validated models).
@@ -816,16 +815,6 @@ class ConsolidationScheduleConfig:
         - judge="off"   + any stage  → plausibility disabled, no cloud exposure
         - judge=<cloud> + stage="anon" → cloud judge on anonymized data only
         """
-        if self.indexed_format not in ("qa", "quad"):
-            raise ValueError(f"indexed_format={self.indexed_format!r} must be one of 'qa', 'quad'.")
-
-        if self.mode == "simulate" and self.indexed_format != "quad":
-            raise ValueError(
-                "consolidation.mode='simulate' requires indexed_format='quad' "
-                "(QA in simulate is not supported; simulate persistence uses graph.json which "
-                "only carries the quad shape)."
-            )
-
         judge = self.extraction_plausibility_judge
         stage = self.extraction_plausibility_stage
         # "auto" and "off" are always safe (local or disabled). Any other value
@@ -1046,6 +1035,35 @@ class TextLangDetectionConfig:
 
 
 @dataclass
+class InferenceConfig:
+    """Inference-time options that govern the per-query probe path.
+
+    ``preload_cache``: at boot, populate the lifespan-owned
+    :class:`paramem.training.memory_store.MemoryStore` by probing every
+    active key through the mode-appropriate
+    :class:`paramem.training.memory_source.MemorySource`
+    (:class:`~paramem.training.memory_source.WeightMemorySource` in
+    train mode, :class:`~paramem.training.memory_source.DiskMemorySource`
+    in simulate mode).  Inference then serves cache hits in O(1) and
+    falls through to the source only on cache miss.
+
+    The default is ``True``: with hundreds of keys per speaker, paying
+    the per-key source latency on every conversational turn does not
+    survive the latency budget (weight probe is ~0.3 s/key on Mistral
+    7B Q4, unverified; disk read is faster but still adds up).
+
+    Switching this to ``False`` is supported: the store stays empty for
+    entries (registries + simhashes still load) and every cache miss
+    delegates to the source.  Slower per query but correct — operators
+    who want to validate parametric recall against the weights live
+    on this path.  This is a temporary toggle until per-key probing is
+    fast enough to drop the cache entirely.
+    """
+
+    preload_cache: bool = True
+
+
+@dataclass
 class ServerConfig:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     server: ServerNetConfig = field(default_factory=ServerNetConfig)
@@ -1081,6 +1099,7 @@ class ServerConfig:
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     text_lang_detection: TextLangDetectionConfig = field(default_factory=TextLangDetectionConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
     vram: VramConfig = field(default_factory=VramConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
 
@@ -1189,7 +1208,6 @@ class ServerConfig:
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
-            indexed_format=self.consolidation.indexed_format,
         )
 
     @property
@@ -1450,6 +1468,10 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     text_lang_raw = raw.get("text_lang_detection", {})
     if text_lang_raw:
         config.text_lang_detection = TextLangDetectionConfig(**text_lang_raw)
+
+    inference_raw = raw.get("inference", {})
+    if inference_raw:
+        config.inference = InferenceConfig(**inference_raw)
 
     # Security — nested: security.backups.{orphan_sweep, retention, schedule,
     # artifacts, max_total_disk_gb}

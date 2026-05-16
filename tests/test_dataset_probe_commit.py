@@ -96,7 +96,7 @@ class TestCommitSessionWriteOrder:
         _commit_session(
             run_dir=tmp_path,
             session=session,
-            episodic_qa=[{"q": "Q1", "a": "A1"}],
+            episodic_rels=[{"q": "Q1", "a": "A1"}],
             procedural_rels=[],
             diag_data=diag_data,
             state=state,
@@ -138,7 +138,7 @@ class TestCommitSessionWriteOrder:
         _commit_session(
             run_dir=tmp_path,
             session=_make_session(),
-            episodic_qa=episodic,
+            episodic_rels=episodic,
             procedural_rels=proc,
             diag_data={},
             state=_base_state(),
@@ -146,7 +146,7 @@ class TestCommitSessionWriteOrder:
 
         path1, data1 = captured[0]
         assert str(path1).endswith(".raw_qa.json")
-        assert data1["episodic_qa"] == episodic
+        assert data1["episodic_rels"] == episodic
         assert data1["procedural_rels"] == proc
 
     def test_session_id_in_processed_session_ids_after_commit(self, tmp_path, monkeypatch):
@@ -159,7 +159,7 @@ class TestCommitSessionWriteOrder:
         _commit_session(
             run_dir=tmp_path,
             session=_make_session("sess_abc"),
-            episodic_qa=[],
+            episodic_rels=[],
             procedural_rels=[],
             diag_data={},
             state=state,
@@ -181,7 +181,7 @@ class TestCommitSessionWriteOrder:
         _commit_session(
             run_dir=tmp_path,
             session=_make_session("sess_dup"),
-            episodic_qa=[],
+            episodic_rels=[],
             procedural_rels=[],
             diag_data={},
             state=state,
@@ -189,7 +189,7 @@ class TestCommitSessionWriteOrder:
         _commit_session(
             run_dir=tmp_path,
             session=_make_session("sess_dup"),
-            episodic_qa=[],
+            episodic_rels=[],
             procedural_rels=[],
             diag_data={},
             state=state,
@@ -214,7 +214,7 @@ class TestCommitSessionWriteOrder:
         _commit_session(
             run_dir=tmp_path,
             session=_make_session("my_unique_session"),
-            episodic_qa=[],
+            episodic_rels=[],
             procedural_rels=[],
             diag_data={},
             state=_base_state(),

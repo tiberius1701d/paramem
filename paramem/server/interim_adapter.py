@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -42,6 +43,93 @@ from paramem.server.schedule_grammar import parse_schedule_atom
 from paramem.utils.config import AdapterConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# On-disk layout helpers (2026-05-14 hierarchy refactor)
+# ---------------------------------------------------------------------------
+#
+# PEFT adapter NAME is decoupled from on-disk DIR.  The NAME stays
+# ``"episodic_interim_<stamp>"`` so router patterns, inference, and
+# ``startswith("episodic_interim_")`` checks remain unchanged.  The DIR is
+# nested under ``<adapter_dir>/episodic/`` to mirror the conceptual hierarchy:
+#
+#   <adapter_dir>/
+#     episodic/
+#       <slot_date>/                 ← main episodic slot
+#       interim_<stamp>/<slot_date>/ ← interim under episodic
+#     semantic/<slot_date>/
+#     procedural/<slot_date>/
+#
+# Use these helpers everywhere a path is built or scanned; never glob the
+# legacy flat ``adapter_dir/episodic_interim_*`` pattern in new code.
+
+
+INTERIM_NAME_PREFIX = "episodic_interim_"
+_INTERIM_DIR_PREFIX = "interim_"
+
+
+def interim_stamp_from_name(name: str) -> str:
+    """Extract the YYYYMMDDTHHMM stamp from an interim adapter name."""
+    if not name.startswith(INTERIM_NAME_PREFIX):
+        raise ValueError(
+            f"Not an interim adapter name: {name!r} (expected '{INTERIM_NAME_PREFIX}<stamp>')"
+        )
+    return name[len(INTERIM_NAME_PREFIX) :]
+
+
+def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
+    """Return the on-disk directory for a PEFT interim adapter name.
+
+    Maps ``"episodic_interim_<stamp>"`` →
+    ``<adapter_dir>/episodic/interim_<stamp>/``.
+    """
+    return adapter_dir / "episodic" / f"{_INTERIM_DIR_PREFIX}{interim_stamp_from_name(name)}"
+
+
+def iter_interim_dirs(adapter_dir: Path) -> Iterator[tuple[str, Path]]:
+    """Yield ``(adapter_name, dir_path)`` for every interim slot on disk.
+
+    Scans ``<adapter_dir>/episodic/interim_*`` and synthesises the PEFT
+    adapter name as ``"episodic_interim_<stamp>"``.
+    """
+    episodic = adapter_dir / "episodic"
+    if not episodic.is_dir():
+        return
+    for path in sorted(episodic.glob(f"{_INTERIM_DIR_PREFIX}*")):
+        if not path.is_dir():
+            continue
+        stamp = path.name[len(_INTERIM_DIR_PREFIX) :]
+        yield f"{INTERIM_NAME_PREFIX}{stamp}", path
+
+
+def adapter_slot_root_for_name(adapter_dir: Path, name: str) -> Path:
+    """Return the slot-root directory for any adapter name.
+
+    Main tiers map directly to ``<adapter_dir>/<name>/``.  Interim adapters
+    map to ``<adapter_dir>/episodic/interim_<stamp>/`` per the 2026-05-14
+    hierarchy refactor.  Use this helper at every callsite that writes or
+    reads an adapter slot dir by NAME so the on-disk layout follows one
+    rule.
+    """
+    if name.startswith(INTERIM_NAME_PREFIX):
+        return interim_dir_for_name(adapter_dir, name)
+    return adapter_dir / name
+
+
+def detect_legacy_adapter_layout(adapter_dir: Path) -> list[Path]:
+    """Return any legacy top-level ``episodic_interim_<stamp>`` dirs.
+
+    Used by the boot lifespan to refuse start until the migration script
+    has been run.  Empty list = clean layout.
+    """
+    if not adapter_dir.is_dir():
+        return []
+    legacy: list[Path] = []
+    for path in adapter_dir.glob(f"{INTERIM_NAME_PREFIX}*"):
+        if path.is_dir():
+            legacy.append(path)
+    return sorted(legacy)
 
 
 def compute_schedule_period_seconds(schedule: str) -> int | None:
@@ -222,14 +310,13 @@ def unload_interim_adapters(model: PeftModel, adapter_dir: Path) -> list[str]:
     Returns:
         Sorted list of adapter names that were unloaded (may be empty).
     """
-    interim_names = sorted(n for n in model.peft_config if n.startswith("episodic_interim_"))
+    interim_names = sorted(n for n in model.peft_config if n.startswith(INTERIM_NAME_PREFIX))
     for name in interim_names:
         model.delete_adapter(name)
         logger.info("Deleted interim adapter from PEFT: %s", name)
 
-    for path in sorted(adapter_dir.glob("episodic_interim_*")):
-        if path.is_dir():
-            shutil.rmtree(path)
-            logger.info("Removed interim adapter directory: %s", path)
+    for _name, path in iter_interim_dirs(adapter_dir):
+        shutil.rmtree(path)
+        logger.info("Removed interim adapter directory: %s", path)
 
     return interim_names

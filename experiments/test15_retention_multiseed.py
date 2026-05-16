@@ -698,7 +698,7 @@ def _write_phase_done(
     final_recall: dict,
     extra: dict,
 ) -> None:
-    """Persist keyed_pairs, registry, and phase-done marker.
+    """Persist quads, registry, and phase-done marker.
 
     Args:
         phase_dir: Directory for this phase.
@@ -711,7 +711,7 @@ def _write_phase_done(
     """
     phase_dir.mkdir(parents=True, exist_ok=True)
     _safe_write_json(
-        phase_dir / "keyed_pairs.json",
+        phase_dir / "quads.json",
         [{"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed],
     )
     save_registry(registry, phase_dir / "simhash_registry.json")
@@ -1259,7 +1259,7 @@ def run_seed(
 
     if (phase_a_dir / "A_done.json").exists():
         logger.info("Seed %d Phase A: already done — loading from disk.", seed)
-        a_keyed = json.loads((phase_a_dir / "keyed_pairs.json").read_text())
+        a_keyed = json.loads((phase_a_dir / "quads.json").read_text())
         # Reload adapter.
         if isinstance(model, PeftModel):
             model = model.base_model.model
@@ -1320,7 +1320,7 @@ def run_seed(
             tokenizer,
             "episodic",
             registry_path=None,
-            keyed_pairs_path=phase_a_dir / "keyed_pairs.json",
+            quads_path=phase_a_dir / "quads.json",
             key_count=len(a_keyed),
         )
         save_adapter(model, phase_a_dir / "episodic_adapter", "episodic", manifest=_manifest_a)
@@ -1434,7 +1434,7 @@ def run_seed(
                 tokenizer,
                 "episodic",
                 registry_path=None,
-                keyed_pairs_path=phase_b_dir / "keyed_pairs.json",
+                quads_path=phase_b_dir / "quads.json",
                 key_count=len(b_swap_keyed),
             )
             save_adapter(model, phase_b_dir / "episodic_adapter", "episodic", manifest=_manifest_b)
@@ -1517,7 +1517,7 @@ def run_seed(
 
     if (phase_c1_dir / "C1_done.json").exists():
         logger.info("Seed %d Phase C1: already done — loading from disk.", seed)
-        c1_keyed = json.loads((phase_c1_dir / "keyed_pairs.json").read_text())
+        c1_keyed = json.loads((phase_c1_dir / "quads.json").read_text())
         if isinstance(model, PeftModel):
             model = model.base_model.model
         c1_slot = resolve_adapter_slot(phase_c1_dir / "journal_adapter", "journal", "")
@@ -1578,7 +1578,7 @@ def run_seed(
             tokenizer,
             "journal",
             registry_path=None,
-            keyed_pairs_path=phase_c1_dir / "keyed_pairs.json",
+            quads_path=phase_c1_dir / "quads.json",
             key_count=len(c1_keyed),
         )
         save_adapter(model, phase_c1_dir / "journal_adapter", "journal", manifest=_manifest_c1)
@@ -1686,7 +1686,7 @@ def run_seed(
                 tokenizer,
                 "journal",
                 registry_path=None,
-                keyed_pairs_path=phase_c2_dir / "keyed_pairs.json",
+                quads_path=phase_c2_dir / "quads.json",
                 key_count=len(c2_fill_keyed),
             )
             save_adapter(model, phase_c2_dir / "journal_adapter", "journal", manifest=_manifest_c2)

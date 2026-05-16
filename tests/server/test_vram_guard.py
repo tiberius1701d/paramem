@@ -477,7 +477,12 @@ class TestPerChunkOOMSkip:
         # without it having to manage real archive state.
         marked: list[list[str]] = []
         original_mark = buffer.mark_consolidated
-        buffer.mark_consolidated = lambda ids: marked.append(list(ids)) or original_mark([])
+
+        def _capture_mark(ids, *, retention_dir=None):
+            marked.append(list(ids))
+            original_mark([], retention_dir=retention_dir)
+
+        buffer.mark_consolidated = _capture_mark
 
         prior_state = {k: app_module._state.get(k) for k in app_module._state}
         try:
@@ -538,6 +543,155 @@ class TestPerChunkOOMSkip:
             assert "doc-bbb" in all_marked, (
                 f"doc-bbb should have been marked consolidated, got {all_marked}"
             )
+        finally:
+            for k, v in prior_state.items():
+                app_module._state[k] = v
+
+
+class TestExtractionFailedAbortsCycle:
+    """ExtractionFailed in any chunk aborts the WHOLE cycle.
+
+    Per project_extraction_failure_fails_cycle.md (2026-05-12):
+    extraction failure (incl. SOTA-enrichment 529) must FAIL the cycle —
+    sessions/graph stay pending, retry scheduled; no "keep pre-enrichment
+    facts and proceed" (it bakes degraded facts in permanently+silently).
+
+    Distinct from VramExhausted, which has per-chunk isolation by design
+    (resource constraint on a pathologically dense doc shouldn't poison
+    unrelated chunks).
+    """
+
+    def _make_state(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.session_buffer import SessionBuffer
+
+        config = ServerConfig()
+        ha = tmp_path / "ha"
+        config.paths = PathsConfig(
+            data=ha,
+            sessions=ha / "sessions",
+            debug=ha / "debug",
+            simulate=ha / "simulate",
+        )
+        config.consolidation.indexed_key_replay = False
+        (ha / "adapters").mkdir(parents=True, exist_ok=True)
+
+        buffer = SessionBuffer(ha / "sessions", debug=False)
+        for sid in ("doc-aaa", "doc-bbb", "doc-ccc"):
+            buffer.set_speaker(sid, "Speaker1", "Speaker1")
+            buffer.append(
+                sid,
+                "user",
+                f"Synthetic chunk for {sid}",
+                metadata={"source_type": "document", "doc_title": sid, "chunk_index": 0},
+            )
+
+        from paramem.graph.extractor import ExtractionFailed
+
+        loop = MagicMock()
+        loop.shutdown_requested = False
+        loop.config = MagicMock()
+        loop.config.indexed_key_replay_enabled = False
+
+        def _extract(transcript, sid, **kwargs):
+            if sid == "doc-bbb":
+                raise ExtractionFailed("sota_enrich", "cloud 529")
+            return ([], [])
+
+        loop.extract_session = MagicMock(side_effect=_extract)
+        loop.model = None
+        return config, buffer, loop
+
+    def test_extraction_failed_aborts_remainder_and_keeps_all_sessions_pending(self, tmp_path):
+        """A SOTA-enrich ExtractionFailed on chunk #2 must:
+
+        - prevent chunk #3 from being extracted (cycle aborts mid-loop)
+        - leave NO chunk marked consolidated, including chunk #1 which
+          extracted successfully (no partial-CV bake)
+        - record the failed chunk in _state["chunk_failures"]
+        - populate _state["last_consolidation_error"] with type=extraction_failed
+        - clear the consolidating flag
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server import app as app_module
+
+        config, buffer, loop = self._make_state(tmp_path)
+
+        marked: list[list[str]] = []
+        original_mark = buffer.mark_consolidated
+
+        def _capture_mark(ids, *, retention_dir=None):
+            marked.append(list(ids))
+            original_mark([], retention_dir=retention_dir)
+
+        buffer.mark_consolidated = _capture_mark
+
+        prior_state = {k: app_module._state.get(k) for k in app_module._state}
+        try:
+            app_module._state["config"] = config
+            app_module._state["session_buffer"] = buffer
+            app_module._state["consolidation_loop"] = loop
+            app_module._state["model"] = None
+            app_module._state["tokenizer"] = None
+            app_module._state["chunk_failures"] = []
+            app_module._state["last_consolidation_error"] = None
+            app_module._state["consolidating"] = True
+            app_module._state["ha_client"] = None
+            app_module._state["speaker_store"] = None
+            app_module._state["router"] = MagicMock()
+
+            no_lock = MagicMock()
+            no_lock.__enter__ = MagicMock(return_value=None)
+            no_lock.__exit__ = MagicMock(return_value=False)
+
+            with (
+                patch("paramem.server.gpu_lock.gpu_lock_sync", return_value=no_lock),
+                patch("paramem.server.app._set_voice_pipeline_profile"),
+                patch("paramem.server.app.assert_free_vram"),
+                patch("paramem.server.app.vram_scope", return_value=no_lock),
+                patch("paramem.server.consolidation._increment_key_sessions"),
+                patch(
+                    "paramem.server.consolidation.create_consolidation_loop",
+                    return_value=loop,
+                ),
+            ):
+                app_module._extract_and_start_training()
+
+            # Chunks before the failure ran (aaa, bbb); chunk after (ccc)
+            # MUST NOT have been extracted — cycle aborted at bbb.
+            attempted = [call.args[1] for call in loop.extract_session.call_args_list]
+            assert attempted == ["doc-aaa", "doc-bbb"], (
+                f"Cycle should have aborted after doc-bbb; attempted={attempted}"
+            )
+
+            # NO chunk should have been marked consolidated — the
+            # successfully-extracted doc-aaa stays pending too.
+            all_marked = [sid for batch in marked for sid in batch]
+            assert all_marked == [], (
+                f"No chunks should be marked consolidated on cycle abort; got {all_marked}"
+            )
+
+            # Failure recorded.
+            failures = app_module._state.get("chunk_failures", [])
+            failure_ids = {f["session_id"] for f in failures}
+            assert "doc-bbb" in failure_ids
+            for f in failures:
+                if f["session_id"] == "doc-bbb":
+                    assert f["phase"] == "sota_enrich"
+                    assert "529" in f["reason"]
+
+            # last_consolidation_error populated.
+            err = app_module._state.get("last_consolidation_error")
+            assert err is not None
+            assert err["type"] == "extraction_failed"
+            assert err["session_id"] == "doc-bbb"
+            assert err["phase"] == "sota_enrich"
+
+            # Consolidating flag cleared.
+            assert app_module._state["consolidating"] is False
         finally:
             for k, v in prior_state.items():
                 app_module._state[k] = v

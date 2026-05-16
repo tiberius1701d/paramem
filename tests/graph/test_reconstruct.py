@@ -9,7 +9,6 @@ Covers:
   successful edges.
 - Tier filter: only the specified tier's keys are probed.
 - Empty registry: returns empty graph without calling switch_adapter.
-- QA-mode guard: NotImplementedError when _indexed_format != 'quad'.
 - Gradient checkpointing toggle: disable called before probing, enable not
   called when gradient_checkpointing=False on the training config.
 """
@@ -34,45 +33,68 @@ from paramem.training.key_registry import KeyRegistry
 # ---------------------------------------------------------------------------
 
 
-def _make_registry(keys_by_adapter: dict[str, list[str]]) -> KeyRegistry:
-    """Build a KeyRegistry populated with the given adapter → keys mapping."""
-    reg = KeyRegistry()
+def _make_registry_dict(keys_by_adapter: dict[str, list[str]]) -> dict:
+    """Build a per-tier ``dict[str, KeyRegistry]`` from a tier → keys mapping.
+
+    Each tier in *keys_by_adapter* becomes a separate ``KeyRegistry`` instance
+    containing only the keys for that tier — matching the production schema
+    where ``ConsolidationLoop.indexed_key_registry`` is keyed by tier name.
+    """
+    reg_dict: dict[str, KeyRegistry] = {}
     for adapter_id, keys in keys_by_adapter.items():
+        reg = KeyRegistry()
         for key in keys:
-            reg.add(key, adapter_id=adapter_id)
-    return reg
+            reg.add(key)
+        reg_dict[adapter_id] = reg
+    return reg_dict
+
+
+# Legacy alias used throughout tests; passes dict directly.
+_make_registry = _make_registry_dict
 
 
 def _make_loop(
-    registry: KeyRegistry,
+    registry,
     *,
-    indexed_format: str = "quad",
     episodic_simhash: dict | None = None,
     semantic_simhash: dict | None = None,
     procedural_simhash: dict | None = None,
     gradient_checkpointing: bool = False,
 ) -> SimpleNamespace:
-    """Return a minimal stub loop accepted by reconstruct_graph."""
+    """Return a minimal stub loop accepted by reconstruct_graph.
+
+    ``registry`` is a ``dict[str, KeyRegistry]`` (per-tier) or ``None``
+    (disabled).  The empty-dict case is used in tests that need no active keys.
+    """
+    from paramem.training.memory_store import MemoryStore
+
     model = MagicMock()
     model.active_adapter = "episodic"  # default; overwritten per test as needed
 
     training_config = SimpleNamespace(gradient_checkpointing=gradient_checkpointing)
 
+    store = MemoryStore(replay_enabled=registry is not None)
+    if registry is not None:
+        for tier_name, reg in registry.items():
+            store.load_registry(tier_name, reg)
+    if episodic_simhash:
+        store.replace_simhashes_in_tier("episodic", episodic_simhash)
+    if semantic_simhash:
+        store.replace_simhashes_in_tier("semantic", semantic_simhash)
+    if procedural_simhash:
+        store.replace_simhashes_in_tier("procedural", procedural_simhash)
+
     loop = SimpleNamespace(
-        _indexed_format=indexed_format,
         model=model,
         tokenizer=MagicMock(),
-        indexed_key_registry=registry,
+        store=store,
         training_config=training_config,
-        episodic_simhash=episodic_simhash,
-        semantic_simhash=semantic_simhash,
-        procedural_simhash=procedural_simhash,
     )
     return loop
 
 
 def _success_dict(key: str, subject: str, predicate: str, obj: str) -> dict:
-    """Build a probe_quad-style success dict."""
+    """Build a probe_entry-style success dict."""
     return {
         "key": key,
         "subject": subject,
@@ -80,13 +102,12 @@ def _success_dict(key: str, subject: str, predicate: str, obj: str) -> dict:
         "object": obj,
         "confidence": 1.0,
         "raw_output": f'{{"key":"{key}"}}',
-        "format": "quad",
         "fact_text": f"{subject} {predicate} {obj}",
     }
 
 
 def _failure_dict(raw_output: str = "", reason: str = "parse_failure") -> dict:
-    """Build a probe_quad-style failure dict."""
+    """Build a probe_entry-style failure dict."""
     return {"raw_output": raw_output, "failure_reason": reason}
 
 
@@ -121,7 +142,7 @@ class TestHappyPath:
         def fake_switch(model, name):
             switch_calls.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop)
@@ -146,18 +167,18 @@ class TestHappyPath:
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop)
 
         g = result.graph
-        # Read the edge via the public iter_quads accessor — the indexed-memory
+        # Read the edge via the public iter_entries accessor — the indexed-memory
         # key is stored under _IK_KEY_ATTR (= "ik_key") internally to avoid
         # NetworkX's reserved "key" field in node_link_data serialisation.
-        from paramem.server.simulate_store import iter_quads
+        from paramem.training.memory_persistence import iter_entries
 
-        quads = list(iter_quads(g))
+        quads = list(iter_entries(g))
         assert len(quads) == 1
         assert quads[0]["subject"] == "Alice"
         assert quads[0]["object"] == "Berlin"
@@ -183,7 +204,7 @@ class TestHappyPath:
         def fake_switch(model, name):
             group_switches.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         reconstruct_graph(loop)
@@ -208,7 +229,7 @@ class TestHappyPath:
         def fake_switch(model, name):
             restore_calls.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         reconstruct_graph(loop)
@@ -226,7 +247,7 @@ class TestHappyPath:
         restore_calls: list[str] = []
 
         monkeypatch.setattr(
-            "paramem.graph.reconstruct.probe_quad",
+            "paramem.graph.reconstruct.probe_entry",
             lambda model, tokenizer, key, **kwargs: _success_dict(key, "A", "b", "C"),
         )
         monkeypatch.setattr(
@@ -250,7 +271,7 @@ class TestHappyPath:
         switch_calls: list[str] = []
 
         monkeypatch.setattr(
-            "paramem.graph.reconstruct.probe_quad",
+            "paramem.graph.reconstruct.probe_entry",
             lambda model, tokenizer, key, **kwargs: _success_dict(key, "A", "b", "C"),
         )
         monkeypatch.setattr(
@@ -284,7 +305,7 @@ class TestFailureStrictTrue:
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         with pytest.raises(ReconstructionError) as exc_info:
@@ -305,7 +326,7 @@ class TestFailureStrictTrue:
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         with pytest.raises(ReconstructionError) as exc_info:
@@ -333,7 +354,7 @@ class TestFailureStrictFalse:
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, strict=False)
@@ -356,15 +377,15 @@ class TestFailureStrictFalse:
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, strict=False)
 
         assert result.graph.number_of_edges() == 1
-        from paramem.server.simulate_store import iter_quads
+        from paramem.training.memory_persistence import iter_entries
 
-        edge_keys = [q["key"] for q in iter_quads(result.graph)]
+        edge_keys = [q["key"] for q in iter_entries(result.graph)]
         assert "graph1" in edge_keys
         assert "graph2" not in edge_keys
 
@@ -381,14 +402,14 @@ class TestFailureStrictFalse:
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, strict=False)
 
-        from paramem.server.simulate_store import iter_quads
+        from paramem.training.memory_persistence import iter_entries
 
-        edge_keys = {q["key"] for q in iter_quads(result.graph)}
+        edge_keys = {q["key"] for q in iter_entries(result.graph)}
         failure_keys = {f["key"] for f in result.failures}
         assert edge_keys | failure_keys == {"s1", "s2", "s3"}
         assert edge_keys & failure_keys == set()
@@ -420,7 +441,7 @@ class TestTierFilter:
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, tier="semantic")
@@ -447,7 +468,7 @@ class TestTierFilter:
         def fake_switch(model, name):
             switch_calls.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         reconstruct_graph(loop, tier="semantic")
@@ -464,7 +485,7 @@ class TestTierFilter:
 class TestEmptyRegistry:
     def test_empty_registry_returns_empty_result(self, monkeypatch):
         """Empty registry returns empty graph + failures without crashing."""
-        registry = KeyRegistry()  # no keys
+        registry = {}  # empty dict = no tiers, no keys
         loop = _make_loop(registry)
 
         switch_calls: list[str] = []
@@ -501,45 +522,6 @@ class TestEmptyRegistry:
 
 
 # ---------------------------------------------------------------------------
-# QA-mode guard
-# ---------------------------------------------------------------------------
-
-
-class TestQaModeGuard:
-    def test_qa_format_raises_not_implemented(self, monkeypatch):
-        """_indexed_format='qa' must raise NotImplementedError immediately."""
-        registry = _make_registry({"episodic": ["e1"]})
-        loop = _make_loop(registry, indexed_format="qa")
-
-        switch_calls: list[str] = []
-
-        def fake_switch(model, name):
-            switch_calls.append(name)
-
-        monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
-
-        with pytest.raises(NotImplementedError) as exc_info:
-            reconstruct_graph(loop)
-
-        assert "quad" in str(exc_info.value)
-        assert "qa" in str(exc_info.value)
-        # Must not have switched anything.
-        assert switch_calls == []
-
-    def test_missing_indexed_format_defaults_to_qa(self, monkeypatch):
-        """When _indexed_format is absent, getattr default 'qa' triggers guard."""
-        registry = _make_registry({"episodic": ["e1"]})
-        loop = _make_loop(registry)
-        # Remove the attribute to simulate a legacy loop without _indexed_format.
-        del loop._indexed_format
-
-        monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
-
-        with pytest.raises(NotImplementedError):
-            reconstruct_graph(loop)
-
-
-# ---------------------------------------------------------------------------
 # Gradient checkpointing toggle
 # ---------------------------------------------------------------------------
 
@@ -553,7 +535,7 @@ class TestGradientCheckpointingToggle:
         def fake_probe(model, tokenizer, key, **kwargs):
             return _success_dict(key, "A", "b", "C")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         reconstruct_graph(loop)
@@ -568,7 +550,7 @@ class TestGradientCheckpointingToggle:
         def fake_probe(model, tokenizer, key, **kwargs):
             return _success_dict(key, "A", "b", "C")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         reconstruct_graph(loop)
@@ -583,7 +565,7 @@ class TestGradientCheckpointingToggle:
         def fake_probe(model, tokenizer, key, **kwargs):
             return _success_dict(key, "A", "b", "C")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         reconstruct_graph(loop)
@@ -598,7 +580,7 @@ class TestGradientCheckpointingToggle:
         def fake_probe(model, tokenizer, key, **kwargs):
             return _failure_dict(reason="parse_failure")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_quad", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         with pytest.raises(ReconstructionError):

@@ -1111,7 +1111,7 @@ class TestPhaseAResume:
         c1_keyed = [
             {"key": f"graph{i}", "question": f"Q{i}?", "answer": f"A{i}"} for i in range(1, 101)
         ]
-        (phase_c1_dir / "keyed_pairs.json").write_text(json.dumps(c1_keyed))
+        (phase_c1_dir / "quads.json").write_text(json.dumps(c1_keyed))
         (phase_c1_dir / "C1_done.json").write_text("{}")
         monkeypatch.setattr(
             t15_mod, "resolve_adapter_slot", lambda *a, **kw: tmp_path / "fake_slot"

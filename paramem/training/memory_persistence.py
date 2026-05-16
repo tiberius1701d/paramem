@@ -1,25 +1,22 @@
-"""Simulate-mode graph persistence for indexed-key memory.
+"""On-disk persistence for the indexed-key memory layer.
 
-Simulate mode uses a NetworkX ``MultiDiGraph`` on disk instead of adapter
-weights as its storage medium.  The per-tier layout mirrors the canonical
-``<tier>/keyed_pairs.json`` layout 1:1 — only the persistence bytes change.
-
-On-disk format: ``nx.node_link_data(graph)`` → JSON → optional age-encrypt →
-atomic write.  The wire format is identical to the cumulative knowledge graph
-written by :mod:`paramem.graph.merger` so existing encryption infrastructure
-is reused without modification.
+The on-disk medium is a per-tier NetworkX ``MultiDiGraph`` serialised via
+``nx.node_link_data`` → JSON → optional age-encrypt → atomic write.  The wire
+format is identical to the cumulative knowledge graph written by
+:mod:`paramem.graph.merger` so existing encryption infrastructure is reused
+without modification.
 
 Public API
 ----------
-- :func:`save_simulate_graph` — atomic encrypted write.
-- :func:`load_simulate_graph` — decryption-aware read; empty graph on miss.
-- :func:`iter_quads` — yield quad dicts for every edge carrying an indexed key.
-- :func:`quad_by_key` — look up a single key; ``None`` on miss.
+- :func:`save_memory_to_disk` — atomic encrypted write.
+- :func:`load_memory_from_disk` — decryption-aware read; empty graph on miss.
+- :func:`iter_entries` — yield entry dicts for every edge carrying an indexed key.
+- :func:`entry_by_key` — look up a single key; ``None`` on miss.
 - :func:`keys_for_entity` — edge keys where lower(subject) or lower(object)
   matches the query.
 - :func:`keys_for_speaker` — edge keys where ``speaker_id`` matches.
-- :func:`build_tier_graph_from_loop` — project in-memory loop state to a
-  fresh ``MultiDiGraph`` for a given tier.
+- :func:`build_tier_graph_from_store` — project a :class:`MemoryStore` tier
+  to a fresh ``MultiDiGraph`` for persistence.
 
 Internal edge attribute naming
 -------------------------------
@@ -27,17 +24,20 @@ NetworkX's ``node_link_data`` serialisation format uses ``"key"`` as the
 reserved field name for the multigraph edge-key integer in the JSON output.
 To avoid collision, the indexed-memory key string is stored as the internal
 edge-data attribute ``"ik_key"``.  All public API functions
-(:func:`iter_quads`, :func:`quad_by_key`, :func:`keys_for_entity`,
+(:func:`iter_entries`, :func:`entry_by_key`, :func:`keys_for_entity`,
 :func:`keys_for_speaker`) map ``"ik_key"`` to ``"key"`` in the dict they
-return so callers see the canonical ``KEYED_PAIR_FIELDS_QUAD`` shape.
+return so callers see the canonical entry shape.
 
-The six-field public schema matches ``KEYED_PAIR_FIELDS_QUAD``:
+The public entry schema is:
 
     ``key``, ``subject``, ``predicate``, ``object``,
     ``speaker_id``, ``first_seen_cycle``
 
 where ``subject`` and ``object`` are the graph node endpoints and the
-remaining four fields come from edge attributes.
+remaining four fields come from edge attributes.  ``entry`` is the
+shape-agnostic term for "one keyed record" — if the schema grows fields,
+the on-disk format accommodates them as additional edge attributes
+without rename.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 _IK_KEY_ATTR = "ik_key"
 
 
-def save_simulate_graph(graph: nx.MultiDiGraph, path: Path, *, encrypted: bool = True) -> None:
+def save_memory_to_disk(graph: nx.MultiDiGraph, path: Path, *, encrypted: bool = True) -> None:
     """Atomic encrypted write of *graph* to *path*.
 
     Serialises via ``nx.node_link_data`` → JSON → bytes, then delegates to
@@ -68,12 +68,12 @@ def save_simulate_graph(graph: nx.MultiDiGraph, path: Path, *, encrypted: bool =
 
     The indexed-memory key is stored as the ``"ik_key"`` edge attribute to
     avoid collision with the NetworkX-reserved ``"key"`` serialisation field.
-    :func:`iter_quads` and friends map ``"ik_key"`` back to ``"key"`` in the
-    public-facing quad dicts.
+    :func:`iter_entries` and friends map ``"ik_key"`` back to ``"key"`` in
+    the public-facing entry dicts.
 
     Args:
         graph: The ``MultiDiGraph`` to persist.
-        path: Destination path (e.g. ``simulate_dir/episodic/graph.json``).
+        path: Destination path (e.g. ``adapter_dir/episodic/graph.json``).
             Parent directory is created if absent.
         encrypted: When ``True`` (default) routes through
             :func:`paramem.backup.encryption.write_infra_bytes` — age-encrypted
@@ -91,11 +91,11 @@ def save_simulate_graph(graph: nx.MultiDiGraph, path: Path, *, encrypted: bool =
         write_infra_bytes(path, payload)
     else:
         write_plaintext_atomic(path, payload)
-    logger.debug("Simulate graph saved to %s (%d edges)", path, graph.number_of_edges())
+    logger.debug("Memory graph saved to %s (%d edges)", path, graph.number_of_edges())
 
 
-def load_simulate_graph(path: Path) -> nx.MultiDiGraph:
-    """Decryption-aware load of a simulate graph from *path*.
+def load_memory_from_disk(path: Path) -> nx.MultiDiGraph:
+    """Decryption-aware load of a memory graph from *path*.
 
     Returns an empty ``MultiDiGraph()`` when *path* does not exist so callers
     on the boot / inference path never need to guard against a missing file
@@ -118,14 +118,14 @@ def load_simulate_graph(path: Path) -> nx.MultiDiGraph:
 
     path = Path(path)
     if not path.exists():
-        logger.debug("No simulate graph at %s — returning empty MultiDiGraph", path)
+        logger.debug("No memory graph at %s — returning empty MultiDiGraph", path)
         return nx.MultiDiGraph()
 
     raw = read_maybe_encrypted(path)
     data = json.loads(raw.decode("utf-8"))
     graph = nx.node_link_graph(data, multigraph=True, directed=True)
     logger.debug(
-        "Simulate graph loaded from %s: %d nodes, %d edges",
+        "Memory graph loaded from %s: %d nodes, %d edges",
         path,
         graph.number_of_nodes(),
         graph.number_of_edges(),
@@ -133,14 +133,14 @@ def load_simulate_graph(path: Path) -> nx.MultiDiGraph:
     return graph
 
 
-def iter_quads(graph: nx.MultiDiGraph) -> Iterator[dict]:
-    """Yield quad dicts for every edge in *graph* that carries an indexed-memory key.
+def iter_entries(graph: nx.MultiDiGraph) -> Iterator[dict]:
+    """Yield entry dicts for every edge in *graph* that carries an indexed-memory key.
 
     Edges without the ``"ik_key"`` internal attribute (e.g. cumulative-graph
     edges that pre-date key assignment) are silently skipped so this function
     is safe to call on mixed-content graphs.
 
-    Each yielded dict has exactly the six ``KEYED_PAIR_FIELDS_QUAD`` fields:
+    Each yielded dict has exactly the canonical entry fields:
 
         ``key``, ``subject``, ``predicate``, ``object``,
         ``speaker_id``, ``first_seen_cycle``
@@ -157,7 +157,7 @@ def iter_quads(graph: nx.MultiDiGraph) -> Iterator[dict]:
         graph: Source ``MultiDiGraph``.
 
     Yields:
-        Dicts with the six ``KEYED_PAIR_FIELDS_QUAD`` fields.
+        Entry dicts with the canonical schema fields.
     """
     for subject, object_, _nx_edge_key, data in graph.edges(keys=True, data=True):
         if _IK_KEY_ATTR not in data:
@@ -172,8 +172,8 @@ def iter_quads(graph: nx.MultiDiGraph) -> Iterator[dict]:
         }
 
 
-def quad_by_key(graph: nx.MultiDiGraph, key: str) -> dict | None:
-    """Return the quad dict for *key*, or ``None`` when the key is absent.
+def entry_by_key(graph: nx.MultiDiGraph, key: str) -> dict | None:
+    """Return the entry dict for *key*, or ``None`` when the key is absent.
 
     Linear scan over all edges (graphs are per-tier, expected to contain at
     most a few hundred edges).  Returns the first matching edge without
@@ -184,12 +184,11 @@ def quad_by_key(graph: nx.MultiDiGraph, key: str) -> dict | None:
         key: The indexed-memory key to look up (e.g. ``"graph1"``).
 
     Returns:
-        Quad dict with six ``KEYED_PAIR_FIELDS_QUAD`` fields on hit;
-        ``None`` on miss.
+        Entry dict with canonical schema fields on hit; ``None`` on miss.
     """
-    for quad in iter_quads(graph):
-        if quad["key"] == key:
-            return quad
+    for entry in iter_entries(graph):
+        if entry["key"] == key:
+            return entry
     return None
 
 
@@ -208,9 +207,9 @@ def keys_for_entity(graph: nx.MultiDiGraph, entity_lower: str) -> set[str]:
         empty.
     """
     matched: set[str] = set()
-    for quad in iter_quads(graph):
-        if quad["subject"].lower() == entity_lower or quad["object"].lower() == entity_lower:
-            matched.add(quad["key"])
+    for entry in iter_entries(graph):
+        if entry["subject"].lower() == entity_lower or entry["object"].lower() == entity_lower:
+            matched.add(entry["key"])
     return matched
 
 
@@ -229,9 +228,9 @@ def keys_for_speaker(graph: nx.MultiDiGraph, speaker_id: str) -> set[str]:
         empty.
     """
     matched: set[str] = set()
-    for quad in iter_quads(graph):
-        if quad["speaker_id"] == speaker_id:
-            matched.add(quad["key"])
+    for entry in iter_entries(graph):
+        if entry["speaker_id"] == speaker_id:
+            matched.add(entry["key"])
     return matched
 
 
@@ -252,8 +251,8 @@ def _add_keyed_edge(
     ``"key"`` as its own reserved field for the multigraph edge-key integer.
     Storing under ``"key"`` would cause the value to be lost on round-trip.
 
-    :func:`iter_quads` and friends map ``"ik_key"`` back to ``"key"`` so
-    callers see the canonical ``KEYED_PAIR_FIELDS_QUAD`` shape.
+    :func:`iter_entries` and friends map ``"ik_key"`` back to ``"key"`` so
+    callers see the canonical entry shape.
 
     Args:
         graph: Target ``MultiDiGraph``.
@@ -276,23 +275,23 @@ def _add_keyed_edge(
     )
 
 
-def build_tier_graph_from_loop(loop, tier: str) -> nx.MultiDiGraph:
-    """Project in-memory loop state for *tier* into a fresh ``MultiDiGraph``.
+def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
+    """Project the *tier* slice of a :class:`MemoryStore` into a fresh ``MultiDiGraph``.
 
-    Iterates every key in ``loop.<tier>_simhash`` and reads the matching
-    entry from ``loop.indexed_key_cache`` to add an edge
-    ``(subject → object)`` with edge-data
-    ``{ik_key, predicate, speaker_id, first_seen_cycle}`` (the indexed-memory
-    key is stored as ``"ik_key"`` to avoid the NetworkX ``"key"`` collision;
-    :func:`iter_quads` maps it back to ``"key"`` for callers).
+    Iterates every key in ``store.simhashes_in_tier(tier)`` and reads the
+    matching entry from the store to add an edge ``(subject → object)`` with
+    edge-data ``{ik_key, predicate, speaker_id, first_seen_cycle}`` (the
+    indexed-memory key is stored as ``"ik_key"`` to avoid the NetworkX
+    ``"key"`` collision; :func:`iter_entries` maps it back to ``"key"`` for
+    callers).
 
     The caller is responsible for persisting the returned graph with
-    :func:`save_simulate_graph`.
+    :func:`save_memory_to_disk`.
 
     Args:
-        loop: A ``ConsolidationLoop`` instance (or any object that exposes
-            ``<tier>_simhash: dict[str, int]`` and
-            ``indexed_key_cache: dict[str, dict]``).
+        store: A :class:`paramem.training.memory_store.MemoryStore`
+            (or any object exposing ``simhashes_in_tier(tier) -> dict[str,int]``
+            and ``get(key) -> dict | None``).
         tier: One of ``"episodic"``, ``"semantic"``, or ``"procedural"``.
 
     Returns:
@@ -300,21 +299,17 @@ def build_tier_graph_from_loop(loop, tier: str) -> nx.MultiDiGraph:
         SimHash registry.
 
     Raises:
-        KeyError: When a key present in ``<tier>_simhash`` is absent from
-            ``loop.indexed_key_cache``.  This is *stricter* than the
-            current ``_write_keyed_pairs`` writer at
-            :mod:`paramem.server.consolidation` (which silently filters
-            missing entries via ``if k in indexed_key_cache``); the
-            simulate-mode graph treats a simhash/cache divergence as a
-            data-integrity bug to surface, not paper over.  When the kp
-            writer is removed in the train-mode kp sunset, the contracts
-            will converge on this fail-fast behavior.
+        KeyError: When a key present in ``simhashes_in_tier`` is absent from
+            the store's entry cache.  Stricter than the consolidation write
+            path (which silently filters missing entries); a simhash/entry
+            divergence is a data-integrity bug to surface, not paper over.
     """
-    simhash_registry: dict[str, int] = getattr(loop, f"{tier}_simhash")
+    simhash_registry: dict[str, int] = store.simhashes_in_tier(tier)
     graph = nx.MultiDiGraph()
     for indexed_key in simhash_registry:
-        # Fail-fast: KeyError surfaces here if the cache is incomplete.
-        entry = loop.indexed_key_cache[indexed_key]
+        entry = store.get(indexed_key)
+        if entry is None:
+            raise KeyError(indexed_key)
         _add_keyed_edge(
             graph,
             entry["subject"],

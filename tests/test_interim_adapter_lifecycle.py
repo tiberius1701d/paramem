@@ -344,7 +344,7 @@ class TestUnloadInterimAdapters:
         assert remaining_interim_keys == []
 
     def test_on_disk_interim_dirs_removed(self, tmp_path: Path) -> None:
-        """On-disk episodic_interim_* directories are deleted by unload."""
+        """On-disk interim dirs (under episodic/) are deleted by unload."""
         model = _make_stub_peft_model(
             "episodic",
             "semantic",
@@ -352,9 +352,12 @@ class TestUnloadInterimAdapters:
             "episodic_interim_20260417T0000",
             "episodic_interim_20260418T0000",
         )
+        # 2026-05-14 hierarchy: interim dirs live under episodic/interim_<stamp>/.
         interim_dirs = []
-        for name in ["episodic_interim_20260417T0000", "episodic_interim_20260418T0000"]:
-            d = tmp_path / name
+        episodic_root = tmp_path / "episodic"
+        episodic_root.mkdir()
+        for stamp in ("20260417T0000", "20260418T0000"):
+            d = episodic_root / f"interim_{stamp}"
             d.mkdir()
             interim_dirs.append(d)
 

@@ -104,9 +104,9 @@ def main():
                 print(f"ERROR: Persona {name} adapter not found at {adapter_dir}")
                 continue
 
-        # Load keyed_pairs and registries
-        kp_a = json.loads((persona_a_dir / "keyed_pairs.json").read_text())
-        kp_b = json.loads((persona_b_dir / "keyed_pairs.json").read_text())
+        # Load quads and registries
+        kp_a = json.loads((persona_a_dir / "quads.json").read_text())
+        kp_b = json.loads((persona_b_dir / "quads.json").read_text())
         reg_a = load_registry(persona_a_dir / "simhash_registry.json")
         reg_b = load_registry(persona_b_dir / "simhash_registry.json")
 
@@ -222,7 +222,7 @@ def main():
         out_dir.mkdir(exist_ok=True)
 
         all_kp = kp_a + kp_b
-        with open(out_dir / "keyed_pairs.json", "w") as f:
+        with open(out_dir / "quads.json", "w") as f:
             json.dump(all_kp, f, indent=2)
         save_registry(combined_reg, out_dir / "simhash_registry.json")
 

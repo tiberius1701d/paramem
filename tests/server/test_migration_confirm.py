@@ -337,7 +337,7 @@ class TestConfirmTrialAdapterDirUnderStateDir:
     B2 bug (2026-04-22 E2E baseline): the confirm handler computed
     ``(state_dir.parent / "trial_adapter")`` which resolves to
     ``data/ha/trial_adapter`` (missing the ``state/`` segment).  Gate 3
-    looked for keyed_pairs.json at that wrong path and emitted a false FAIL
+    looked for quads.json at that wrong path and emitted a false FAIL
     on every real trial.
 
     Fix: use ``(state_dir / "trial_adapter")`` so the path is

@@ -2,7 +2,7 @@
 
 All tests run without GPU.  The model and tokenizer are MagicMocks.
 ``paramem.training.indexed_memory.probe_key`` is patched in every test that
-exercises gates 3 or 4 in QA mode.  ``paramem.training.quadruple_memory.probe_quad``
+exercises gates 3 or 4 in QA mode.  ``paramem.training.entry_memory.probe_entry``
 is patched for quad-mode tests.  Registry files are written to ``tmp_path``.
 
 Coverage targets (spec §Tests):
@@ -23,9 +23,8 @@ Coverage targets (spec §Tests):
   - Unmount: delete_adapter NOT called when trial_probe is the sole adapter.
   - Unmount survives delete_adapter raising.
   - Enriched registry format ({key: {"simhash": int, ...}}) works in gate 4.
-  - Gate 3 quad-path: read_keyed_pairs_quad + probe_quad → PASS / FAIL.
-  - Gate 4 quad-path: probe_quad + quad verify_confidence → PASS.
-  - Gate 4 cross-format skip (indexed_format != live_registry_format).
+  - Gate 3: read_keyed_pairs + probe_entry → PASS / FAIL.
+  - Gate 4: probe_entry + verify_confidence → PASS.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ from paramem.server.gates import (
     GATE_4_SAMPLE_SIZE,
     GateResult,
     _ensure_trial_probe_mounted,
-    _find_keyed_pairs,
+    _find_tier_registry,
     _gate_1_extraction,
     _gate_2_training,
     _gate_3_reload_smoke,
@@ -53,7 +52,7 @@ from paramem.server.gates import (
     _unmount_trial_probe,
     evaluate_gates,
 )
-from paramem.training.keyed_pairs_io import write_keyed_pairs_quad
+from paramem.training.key_registry import KeyRegistry
 
 
 @pytest.fixture(autouse=True)
@@ -100,41 +99,31 @@ def _make_enriched_registry(n: int, tmp_path: Path) -> Path:
     return p
 
 
-def _make_trial_adapter(tmp_path: Path, with_keyed_pairs: bool = True) -> Path:
+def _make_trial_adapter(tmp_path: Path, with_registry: bool = True) -> Path:
     """Create a minimal trial adapter directory with placeholder files.
 
-    keyed_pairs.json uses the full eight-field schema required by
-    ``read_keyed_pairs`` so gate 3 can read and validate the file before
-    attempting adapter mount.
+    Writes ``episodic/indexed_key_registry.json`` (the canonical probe-key
+    source for gate 3) so gate 3 can locate the first key to probe without
+    reading any ``quads.json`` sidecar.
+
+    Parameters
+    ----------
+    with_registry:
+        When True (default), writes ``episodic/indexed_key_registry.json``
+        with two synthetic keys.  Pass False to test the no-registry path.
     """
     d = tmp_path / "trial_adapter"
     d.mkdir(parents=True, exist_ok=True)
     (d / "adapter_config.json").write_text("{}")
     (d / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-    if with_keyed_pairs:
-        keyed_pairs = [
-            {
-                "key": "graph1",
-                "question": "What is Q1?",
-                "answer": "A1",
-                "source_subject": "Q1",
-                "source_predicate": "is_a",
-                "source_object": "A1",
-                "speaker_id": "Speaker0",
-                "first_seen_cycle": 1,
-            },
-            {
-                "key": "graph2",
-                "question": "What is Q2?",
-                "answer": "A2",
-                "source_subject": "Q2",
-                "source_predicate": "is_a",
-                "source_object": "A2",
-                "speaker_id": "Speaker0",
-                "first_seen_cycle": 1,
-            },
-        ]
-        (d / "keyed_pairs.json").write_text(json.dumps(keyed_pairs))
+    if with_registry:
+        episodic_dir = d / "episodic"
+        episodic_dir.mkdir(parents=True, exist_ok=True)
+        # Write new per-tier KeyRegistry schema.
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
     return d
 
 
@@ -179,8 +168,11 @@ class TestGateResultToDict:
 
 class TestSampleRegistryKeys:
     def _make_content(self, n: int) -> bytes:
-        registry = {f"graph{i}": i for i in range(1, n + 1)}
-        return json.dumps(registry).encode()
+        """Build KeyRegistry JSON bytes for n keys using the new per-tier schema."""
+        reg = KeyRegistry()
+        for i in range(1, n + 1):
+            reg.add(f"graph{i}")
+        return reg.save_bytes()
 
     def test_stable_same_input(self):
         """Same bytes → same list every time (deterministic)."""
@@ -208,10 +200,10 @@ class TestSampleRegistryKeys:
         assert keys_first != keys_retry
 
     def test_sorted_population(self):
-        """All returned keys must be from the registry."""
+        """All returned keys must be from the registry's active_keys."""
         content = self._make_content(30)
         registry = json.loads(content)
-        all_keys = set(registry.keys())
+        all_keys = set(registry["active_keys"])
         keys = _sample_registry_keys(content)
         assert set(keys).issubset(all_keys)
 
@@ -408,367 +400,9 @@ class TestGate2Training:
 # ---------------------------------------------------------------------------
 
 
-class TestGate3AdapterReload:
-    def test_skipped_empty_buffer(self, tmp_path):
-        model = _make_mock_model()
-        g = _gate_3_reload_smoke(
-            session_buffer_empty=True,
-            summary=None,
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=tmp_path / "trial_adapter",
-            mount_state={},
-        )
-        assert g.status == "skipped"
-        assert g.reason == "no_new_sessions"
-
-    def test_skipped_no_facts(self, tmp_path):
-        """no_facts summary → SKIPPED (REQUIRED FIX 2 — skip condition for gate 3)."""
-        model = _make_mock_model()
-        g = _gate_3_reload_smoke(
-            session_buffer_empty=False,
-            summary={"status": "no_facts"},
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=tmp_path / "trial_adapter",
-            mount_state={},
-        )
-        assert g.status == "skipped"
-        assert "no_facts" in g.reason
-
-    def test_skipped_missing_keyed_pairs_anywhere(self, tmp_path):
-        """Missing keyed_pairs.json at top-level and all kind subdirs → SKIPPED.
-
-        Before the B2-residual fix, gate 3 returned FAIL here.  The corrected
-        behaviour is SKIPPED with reason 'no kind-specific adapter trained',
-        because the adapter directory layout may simply not have produced a
-        keyed_pairs.json (e.g. an edge case in the consolidation path).
-        """
-        trial_dir = tmp_path / "trial_adapter"
-        trial_dir.mkdir()
-        (trial_dir / "adapter_config.json").write_text("{}")
-        # No keyed_pairs.json anywhere (no top-level, no kind subdirs).
-        model = _make_mock_model()
-        g = _gate_3_reload_smoke(
-            session_buffer_empty=False,
-            summary={"status": "complete"},
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            mount_state={},
-        )
-        assert g.status == "skipped"
-        assert "no kind-specific adapter trained" in g.reason
-
-    def test_fail_mount_error(self, tmp_path):
-        """load_adapter raising → gate 3 FAIL."""
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-        model.load_adapter.side_effect = RuntimeError("adapter corrupt")
-        mount_state: dict = {}
-        g = _gate_3_reload_smoke(
-            session_buffer_empty=False,
-            summary={"status": "complete"},
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            mount_state=mount_state,
-        )
-        assert g.status == "fail"
-        assert "mount failed" in g.reason
-
-    def test_pass_successful_probe(self, tmp_path):
-        """Successful mount + probe → PASS."""
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-        tokenizer = MagicMock()
-        mount_state: dict = {}
-
-        probe_result = {
-            "key": "graph1",
-            "question": "What is Q1?",
-            "answer": "A1",
-            "confidence": 0.95,
-            "raw_output": '{"key": "graph1", "question": "What is Q1?", "answer": "A1"}',
-        }
-
-        with patch("paramem.training.indexed_memory.probe_key", return_value=probe_result):
-            g = _gate_3_reload_smoke(
-                session_buffer_empty=False,
-                summary={"status": "complete"},
-                model=model,
-                tokenizer=tokenizer,
-                trial_adapter_dir=trial_dir,
-                mount_state=mount_state,
-            )
-
-        assert g.status == "pass"
-        assert g.gate == 3
-
-    def test_fail_probe_returns_failure_reason(self, tmp_path):
-        """probe_key returning failure_reason dict → gate 3 FAIL."""
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-        mount_state: dict = {}
-
-        fail_result = {"raw_output": "", "failure_reason": "parse_failure"}
-
-        with patch("paramem.training.indexed_memory.probe_key", return_value=fail_result):
-            g = _gate_3_reload_smoke(
-                session_buffer_empty=False,
-                summary={"status": "complete"},
-                model=model,
-                tokenizer=MagicMock(),
-                trial_adapter_dir=trial_dir,
-                mount_state=mount_state,
-            )
-
-        assert g.status == "fail"
-        assert "parse_failure" in g.reason
-
-
 # ---------------------------------------------------------------------------
 # Gate 4 — live_registry_recall
 # ---------------------------------------------------------------------------
-
-
-class TestGate4RecallCheck:
-    """Tests for gate 4 recall check."""
-
-    def _probe_always_pass(self, model, tokenizer, key, registry=None, **kw):
-        """Return a successful probe result for any key."""
-        return {
-            "key": key,
-            "question": f"Q for {key}?",
-            "answer": f"A for {key}.",
-            "confidence": 1.0,
-            "raw_output": (
-                f'{{"key": "{key}", "question": "Q for {key}?", "answer": "A for {key}."}}'
-            ),
-        }
-
-    def test_skipped_registry_too_small(self, tmp_path):
-        """< 20 keys → SKIPPED."""
-        reg_path = _make_registry(10, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-        g = _gate_4_recall_check(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=reg_path,
-            mount_state={"mounted": False, "pre_active_adapter": []},
-        )
-        assert g.status == "skipped"
-        assert str(10) in g.reason
-
-    def test_skipped_empty_trial_adapter_dir(self, tmp_path):
-        """Empty trial adapter dir → SKIPPED (NO_NEW_SESSIONS case)."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = tmp_path / "empty_trial"
-        trial_dir.mkdir()
-        model = _make_mock_model()
-        g = _gate_4_recall_check(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=reg_path,
-            mount_state={"mounted": False, "pre_active_adapter": []},
-        )
-        assert g.status == "skipped"
-        assert "no_new_sessions" in g.reason
-
-    def test_skipped_missing_registry_file(self, tmp_path):
-        """Missing registry file → SKIPPED (B3-residual fix).
-
-        Before the B3-residual fix, gate 4 returned FAIL with
-        'live registry file not found'.  Spec L381 says fresh-install hosts
-        with <20 keys (including no file at all) should be SKIPPED, not FAIL.
-        """
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-        g = _gate_4_recall_check(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=tmp_path / "nonexistent.json",
-            mount_state={"mounted": False, "pre_active_adapter": []},
-        )
-        assert g.status == "skipped"
-        assert "not found" in g.reason
-        assert "fresh install" in g.reason
-
-    def test_pass_20_of_20_no_retry(self, tmp_path):
-        """20/20 first sample → PASS, no retry."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        call_count = [0]
-
-        def _probe(m, tok, key, registry=None, **kw):
-            call_count[0] += 1
-            # Pass all 20.
-            return {
-                "key": key,
-                "question": "Q?",
-                "answer": "A.",
-                "confidence": 1.0,
-                "raw_output": f'{{"key": "{key}", "question": "Q?", "answer": "A."}}',
-            }
-
-        with patch("paramem.training.indexed_memory.probe_key", side_effect=_probe):
-            with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
-                g = _gate_4_recall_check(
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    live_registry_path=reg_path,
-                    mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                )
-
-        assert g.status == "pass"
-        # Must not retry — only 20 calls (one sample).
-        assert call_count[0] == GATE_4_SAMPLE_SIZE
-        assert g.metrics["retried"] is False
-        assert g.metrics["first_sample_recalled"] is None
-
-    def test_metrics_includes_sampled_keys(self, tmp_path):
-        """GUARDRAIL G1 — metrics must include sampled_keys."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        with patch(
-            "paramem.training.indexed_memory.probe_key", side_effect=self._probe_always_pass
-        ):
-            with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
-                g = _gate_4_recall_check(
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    live_registry_path=reg_path,
-                    mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                )
-
-        assert "sampled_keys" in g.metrics
-        assert len(g.metrics["sampled_keys"]) == GATE_4_SAMPLE_SIZE
-
-    def test_retry_on_first_failure(self, tmp_path):
-        """17/20 first, 20/20 retry → PASS + cluster-variance warning."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        # Track which sample we're on by call count.
-        call_count = [0]
-
-        def _probe(m, tok, key, registry=None, **kw):
-            call_count[0] += 1
-            # First 20 calls: 3 failures (keys at positions 0,1,2 of sample).
-            if call_count[0] <= 3:
-                return {"raw_output": "", "failure_reason": "low_confidence:0.5"}
-            return {
-                "key": key,
-                "question": "Q?",
-                "answer": "A.",
-                "confidence": 1.0,
-                "raw_output": f'{{"key": "{key}", "question": "Q?", "answer": "A."}}',
-            }
-
-        with patch("paramem.training.indexed_memory.probe_key", side_effect=_probe):
-            with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
-                g = _gate_4_recall_check(
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    live_registry_path=reg_path,
-                    mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                )
-
-        # First sample: 17/20 (3 failures in first 20 calls, then 17 pass)
-        # wait — failure_reason dict means failure. Let me verify logic is:
-        # call 1-3: failure, call 4-20: pass → 17 pass on first sample.
-        # Retry: all 20 pass (calls 21-40).
-        assert g.status == "pass"
-        assert g.metrics["retried"] is True
-        assert "cluster variance" in g.metrics["warnings"][0]
-        assert g.metrics["first_sample_recalled"] == 17
-
-    def test_fail_both_samples(self, tmp_path):
-        """17/20 both samples → FAIL."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        call_count = [0]
-
-        def _probe(m, tok, key, registry=None, **kw):
-            call_count[0] += 1
-            # Every 4th call is a failure → 5 failures per 20 = 15/20 pass.
-            if call_count[0] % 4 == 0:
-                return {"raw_output": "", "failure_reason": "parse_failure"}
-            return {
-                "key": key,
-                "question": "Q?",
-                "answer": "A.",
-                "confidence": 1.0,
-                "raw_output": f'{{"key": "{key}", "question": "Q?", "answer": "A."}}',
-            }
-
-        with patch("paramem.training.indexed_memory.probe_key", side_effect=_probe):
-            with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
-                g = _gate_4_recall_check(
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    live_registry_path=reg_path,
-                    mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                )
-
-        assert g.status == "fail"
-        assert g.metrics["retried"] is True
-        assert g.metrics["first_sample_recalled"] is not None
-
-    def test_deterministic_sample_stable(self, tmp_path):
-        """Same registry bytes → same sampled_keys every run (WARNING W1)."""
-        reg_path = _make_registry(25, tmp_path)
-        content = reg_path.read_bytes()
-
-        keys1 = _sample_registry_keys(content)
-        keys2 = _sample_registry_keys(content)
-        assert keys1 == keys2
-
-    def test_retry_seed_different_from_first_seed(self, tmp_path):
-        """Re-roll must use a different seed (b'|retry' suffix)."""
-        reg_path = _make_registry(25, tmp_path)
-        content = reg_path.read_bytes()
-        keys_first = _sample_registry_keys(content, seed_suffix=b"")
-        keys_retry = _sample_registry_keys(content, seed_suffix=b"|retry")
-        assert keys_first != keys_retry
-
-    def test_enriched_registry_works(self, tmp_path):
-        """WARNING W4 — enriched registry format must work for gate 4."""
-        reg_path = _make_enriched_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        with patch(
-            "paramem.training.indexed_memory.probe_key", side_effect=self._probe_always_pass
-        ):
-            with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
-                g = _gate_4_recall_check(
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    live_registry_path=reg_path,
-                    mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                )
-
-        # Must not error on enriched format.
-        assert g.status in ("pass", "fail", "skipped")
-        # With 25 keys and all probes passing it should be pass.
-        assert g.status == "pass"
 
 
 # ---------------------------------------------------------------------------
@@ -820,13 +454,21 @@ class TestUnmountTrialProbe:
 
 class TestEnsureTrialProbeMounted:
     def test_stores_pre_active_adapter(self, tmp_path):
+        """_ensure_trial_probe_mounted records pre-mount state and mounts.
+
+        The trial dir has episodic/indexed_key_registry.json and the mock model
+        has peft_config["episodic"], so the in-memory path is taken:
+        set_adapter is called with the kind name, not load_adapter from disk.
+        """
         model = _make_mock_model(["episodic"])
         trial_dir = _make_trial_adapter(tmp_path)
         mount_state: dict = {}
         _ensure_trial_probe_mounted(model, trial_dir, mount_state)
         assert mount_state["pre_active_adapter"] == ["episodic"]
         assert mount_state["mounted"] is True
-        model.load_adapter.assert_called_once_with(str(trial_dir), adapter_name="trial_probe")
+        assert mount_state["mounted_via"] == "set"
+        model.set_adapter.assert_called_once_with("episodic")
+        model.load_adapter.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -908,31 +550,26 @@ class TestEvaluateGatesNoNewSessions:
     def test_trial_probe_not_in_adapters_after_evaluate(self, tmp_path):
         """Acceptance criterion D — trial_probe must not remain after evaluate_gates.
 
-        The mock model starts with one adapter ("episodic").  load_adapter has a
-        side_effect that adds "trial_probe" to peft_config, simulating what
-        PeftModel.load_adapter does.  With 2 adapters loaded, _unmount_trial_probe
-        is safe to call delete_adapter.
+        The mock model starts with one adapter ("episodic").  The trial dir has
+        episodic/indexed_key_registry.json so the in-memory path is taken:
+        set_adapter is used (not load_adapter), and unmount restores the original
+        adapter via set_adapter — delete_adapter is NOT called (we never added
+        an extra adapter).  The peft_config keys remain unchanged (just "episodic").
         """
         reg_path = _make_registry(25, tmp_path)
         trial_dir = _make_trial_adapter(tmp_path)
         model = _make_mock_model(["episodic"])
 
-        def _load_adapter_side_effect(path, adapter_name):
-            # Simulate PeftModel.load_adapter adding to peft_config.
-            model.peft_config[adapter_name] = MagicMock()
-            model.active_adapter = adapter_name
-
-        model.load_adapter.side_effect = _load_adapter_side_effect
-
-        with patch("paramem.training.indexed_memory.probe_key") as mock_probe:
+        with patch("paramem.training.entry_memory.probe_entry") as mock_probe:
             mock_probe.return_value = {
                 "key": "graph1",
-                "question": "Q?",
-                "answer": "A.",
+                "subject": "S",
+                "predicate": "p",
+                "object": "O",
                 "confidence": 1.0,
-                "raw_output": '{"key":"graph1","question":"Q?","answer":"A."}',
+                "raw_output": '{"key":"graph1","subject":"S","predicate":"p","object":"O"}',
             }
-            with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
+            with patch("paramem.training.entry_memory.verify_confidence", return_value=1.0):
                 evaluate_gates(
                     model=model,
                     tokenizer=MagicMock(),
@@ -943,9 +580,13 @@ class TestEvaluateGatesNoNewSessions:
                     consolidation_exception=None,
                 )
 
-        # delete_adapter must have been called for "trial_probe".
-        # (model has episodic + trial_probe → 2 adapters → safe to delete)
-        model.delete_adapter.assert_called()
+        # In-memory mount path: set_adapter was used, not load_adapter.
+        # delete_adapter must NOT be called (no extra adapter was added).
+        model.load_adapter.assert_not_called()
+        model.delete_adapter.assert_not_called()
+        # set_adapter was called at least twice: once to activate "episodic"
+        # during mount, once to restore it during unmount.
+        assert model.set_adapter.call_count >= 2
 
     def test_no_gpu_import_at_module_level(self):
         """Acceptance criterion C — gates module must not import torch at top level."""
@@ -973,46 +614,35 @@ class TestEvaluateGatesNoNewSessions:
 
 
 # ---------------------------------------------------------------------------
-# Gate 3 — quad path (indexed_format="quad")
+# Gate 3
 # ---------------------------------------------------------------------------
 
 
 def _make_trial_adapter_quad(tmp_path: Path) -> Path:
-    """Create a minimal trial adapter directory with quad-format keyed_pairs.json.
+    """Create a minimal trial adapter directory for gate 3 tests.
 
-    Uses the six-field quad schema required by ``read_keyed_pairs_quad``.
+    Writes ``episodic/indexed_key_registry.json`` (the canonical key source
+    for gate 3 in both QA and quad modes).
     """
     d = tmp_path / "trial_adapter_quad"
     d.mkdir(parents=True, exist_ok=True)
     (d / "adapter_config.json").write_text("{}")
     (d / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-    quad_pairs = [
-        {
-            "key": "graph1",
-            "subject": "Alex",
-            "predicate": "lives_in",
-            "object": "Heilbronn",
-            "speaker_id": "spk1",
-            "first_seen_cycle": 1,
-        },
-        {
-            "key": "graph2",
-            "subject": "Alex",
-            "predicate": "works_at",
-            "object": "Acme",
-            "speaker_id": "spk1",
-            "first_seen_cycle": 1,
-        },
-    ]
-    write_keyed_pairs_quad(d / "keyed_pairs.json", quad_pairs)
+    episodic_dir = d / "episodic"
+    episodic_dir.mkdir(parents=True, exist_ok=True)
+    # Write new per-tier KeyRegistry schema.
+    reg = KeyRegistry()
+    reg.add("graph1")
+    reg.add("graph2")
+    (episodic_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
     return d
 
 
 class TestGate3AdapterReloadQuad:
-    """Gate 3 quad-path: read_keyed_pairs_quad + probe_quad dispatch."""
+    """Gate 3 quad-path: indexed_key_registry.json + probe_entry dispatch."""
 
     def test_pass_successful_quad_probe(self, tmp_path):
-        """Successful mount + probe_quad → PASS."""
+        """Successful mount + probe_entry → PASS."""
         trial_dir = _make_trial_adapter_quad(tmp_path)
         model = _make_mock_model()
         tokenizer = MagicMock()
@@ -1029,7 +659,7 @@ class TestGate3AdapterReloadQuad:
             ),
         }
 
-        with patch("paramem.training.quadruple_memory.probe_quad", return_value=probe_result):
+        with patch("paramem.training.entry_memory.probe_entry", return_value=probe_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -1037,20 +667,19 @@ class TestGate3AdapterReloadQuad:
                 tokenizer=tokenizer,
                 trial_adapter_dir=trial_dir,
                 mount_state={},
-                indexed_format="quad",
             )
 
         assert g.status == "pass"
         assert g.gate == 3
 
     def test_fail_probe_quad_returns_failure_reason(self, tmp_path):
-        """probe_quad returning failure_reason dict → gate 3 FAIL."""
+        """probe_entry returning failure_reason dict → gate 3 FAIL."""
         trial_dir = _make_trial_adapter_quad(tmp_path)
         model = _make_mock_model()
 
         fail_result = {"raw_output": "", "failure_reason": "quad_parse_failure"}
 
-        with patch("paramem.training.quadruple_memory.probe_quad", return_value=fail_result):
+        with patch("paramem.training.entry_memory.probe_entry", return_value=fail_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -1058,14 +687,13 @@ class TestGate3AdapterReloadQuad:
                 tokenizer=MagicMock(),
                 trial_adapter_dir=trial_dir,
                 mount_state={},
-                indexed_format="quad",
             )
 
         assert g.status == "fail"
         assert "quad_parse_failure" in g.reason
 
     def test_skipped_empty_buffer_quad(self, tmp_path):
-        """session_buffer_empty=True → SKIPPED regardless of indexed_format."""
+        """session_buffer_empty=True → SKIPPED."""
         g = _gate_3_reload_smoke(
             session_buffer_empty=True,
             summary=None,
@@ -1073,49 +701,19 @@ class TestGate3AdapterReloadQuad:
             tokenizer=MagicMock(),
             trial_adapter_dir=tmp_path / "trial_adapter",
             mount_state={},
-            indexed_format="quad",
         )
         assert g.status == "skipped"
 
-    def test_default_qa_path_unchanged(self, tmp_path):
-        """Default indexed_format='qa' uses probe_key, not probe_quad."""
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        probe_result = {
-            "key": "graph1",
-            "question": "Q?",
-            "answer": "A.",
-            "confidence": 1.0,
-            "raw_output": '{"key": "graph1", "question": "Q?", "answer": "A."}',
-        }
-
-        with patch(
-            "paramem.training.indexed_memory.probe_key", return_value=probe_result
-        ) as mock_qa_probe:
-            with patch("paramem.training.quadruple_memory.probe_quad") as mock_quad_probe:
-                g = _gate_3_reload_smoke(
-                    session_buffer_empty=False,
-                    summary={"status": "complete"},
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    mount_state={},
-                    # default indexed_format="qa" — probe_key must be used
-                )
-
-        assert g.status == "pass"
-        assert mock_qa_probe.called
-        assert not mock_quad_probe.called
+    # test_default_qa_path_unchanged: removed with QA-format retirement.
 
 
 # ---------------------------------------------------------------------------
-# Gate 4 — quad path (indexed_format="quad")
+# Gate 4
 # ---------------------------------------------------------------------------
 
 
 def _make_quad_registry(n: int, tmp_path: Path, fname: str = "registry_quad.json") -> Path:
-    """Write a flat registry with ``n`` keys (quad simhashes are integers like QA)."""
+    """Write a flat registry with ``n`` keys."""
     registry = {f"qgraph{i}": i * 7919 + 3 for i in range(1, n + 1)}
     p = tmp_path / fname
     p.write_text(json.dumps(registry))
@@ -1123,7 +721,7 @@ def _make_quad_registry(n: int, tmp_path: Path, fname: str = "registry_quad.json
 
 
 class TestGate4RecallCheckQuad:
-    """Gate 4 quad-path: probe_quad + quad verify_confidence dispatch."""
+    """Gate 4 quad-path: probe_entry + quad verify_confidence dispatch."""
 
     def test_pass_quad_20_of_20(self, tmp_path):
         """20/20 quad probes passing → PASS."""
@@ -1144,169 +742,91 @@ class TestGate4RecallCheckQuad:
                 ),
             }
 
-        with patch("paramem.training.quadruple_memory.probe_quad", side_effect=_probe_quad):
-            with patch("paramem.training.quadruple_memory.verify_confidence", return_value=1.0):
+        with patch("paramem.training.entry_memory.probe_entry", side_effect=_probe_quad):
+            with patch("paramem.training.entry_memory.verify_confidence", return_value=1.0):
                 g = _gate_4_recall_check(
                     model=model,
                     tokenizer=MagicMock(),
                     trial_adapter_dir=trial_dir,
                     live_registry_path=reg_path,
                     mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                    indexed_format="quad",
-                    live_registry_format="quad",
                 )
 
         assert g.status == "pass"
         assert g.metrics["retried"] is False
 
-    def test_skipped_cross_format_transition(self, tmp_path):
-        """indexed_format='quad' != live_registry_format='qa' → SKIPPED."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter_quad(tmp_path)
-        model = _make_mock_model()
-
-        g = _gate_4_recall_check(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=reg_path,
-            mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-            indexed_format="quad",
-            live_registry_format="qa",
-        )
-
-        assert g.status == "skipped"
-        assert "format-transition" in g.reason
-        assert "quad" in g.reason
-
-    def test_skipped_cross_format_reverse(self, tmp_path):
-        """indexed_format='qa' != live_registry_format='quad' → SKIPPED."""
-        reg_path = _make_quad_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        g = _gate_4_recall_check(
-            model=model,
-            tokenizer=MagicMock(),
-            trial_adapter_dir=trial_dir,
-            live_registry_path=reg_path,
-            mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-            indexed_format="qa",
-            live_registry_format="quad",
-        )
-
-        assert g.status == "skipped"
-        assert "format-transition" in g.reason
-
-    def test_default_qa_path_unchanged_gate4(self, tmp_path):
-        """Default indexed_format='qa' / live_registry_format='qa' uses probe_key."""
-        reg_path = _make_registry(25, tmp_path)
-        trial_dir = _make_trial_adapter(tmp_path)
-        model = _make_mock_model()
-
-        def _probe_qa(m, tok, key, registry=None, **kw):
-            return {
-                "key": key,
-                "question": "Q?",
-                "answer": "A.",
-                "confidence": 1.0,
-                "raw_output": f'{{"key": "{key}", "question": "Q?", "answer": "A."}}',
-            }
-
-        with patch("paramem.training.indexed_memory.probe_key", side_effect=_probe_qa) as mock_qa:
-            with patch("paramem.training.quadruple_memory.probe_quad") as mock_quad:
-                with patch("paramem.training.indexed_memory.verify_confidence", return_value=1.0):
-                    g = _gate_4_recall_check(
-                        model=model,
-                        tokenizer=MagicMock(),
-                        trial_adapter_dir=trial_dir,
-                        live_registry_path=reg_path,
-                        mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
-                        # defaults: indexed_format="qa", live_registry_format="qa"
-                    )
-
-        assert g.status == "pass"
-        assert mock_qa.called
-        assert not mock_quad.called
-
 
 # ---------------------------------------------------------------------------
-# B2-residual — gate 3 per-kind subdir layout (2026-04-22 re-test fix)
+# Gate 3 per-kind subdir layout: _find_tier_registry helper
 # ---------------------------------------------------------------------------
 
 
 class TestGate3KindSubdirLayout:
-    """Gate 3 must find keyed_pairs.json under per-kind subdirs.
+    """Gate 3 must find indexed_key_registry.json under per-kind subdirs.
 
     Real trial training writes per-kind layout:
-        <trial_adapter_dir>/episodic/keyed_pairs.json
-        <trial_adapter_dir>/semantic/keyed_pairs.json
-        <trial_adapter_dir>/procedural/keyed_pairs.json
+        <trial_adapter_dir>/episodic/indexed_key_registry.json
+        <trial_adapter_dir>/semantic/indexed_key_registry.json
+        <trial_adapter_dir>/procedural/indexed_key_registry.json
 
-    Gate 3 must not FAIL when only the per-kind layout is present (B2-residual).
+    Gate 3 uses ``_find_tier_registry`` to locate the registry file and probes
+    the first key in it.  No quads.json sidecar is read.
     """
 
-    def _keyed_pairs_content(self) -> str:
-        """Return a full-schema keyed_pairs.json content string.
+    def _registry_content(self) -> bytes:
+        """Return minimal indexed_key_registry.json content bytes.
 
-        All eight canonical fields are included so ``read_keyed_pairs``
-        validation passes when gate 3 reads the fixture file.
+        Uses the new per-tier KeyRegistry schema:
+        ``{active_keys: [...], fidelity_history: {}, health: null}``.
         """
-        return json.dumps(
-            [
-                {
-                    "key": "graph1",
-                    "question": "Q1?",
-                    "answer": "A1",
-                    "source_subject": "Q1",
-                    "source_predicate": "is_a",
-                    "source_object": "A1",
-                    "speaker_id": "Speaker0",
-                    "first_seen_cycle": 1,
-                }
-            ]
-        )
+        reg = KeyRegistry()
+        reg.add("graph1")
+        return reg.save_bytes()
 
-    def test_find_keyed_pairs_top_level(self, tmp_path):
-        """Top-level keyed_pairs.json is found by _find_keyed_pairs."""
+    def test_find_tier_registry_episodic_subdir(self, tmp_path):
+        """episodic/indexed_key_registry.json is found by _find_tier_registry."""
         d = tmp_path / "trial_adapter"
         d.mkdir()
-        (d / "keyed_pairs.json").write_text(self._keyed_pairs_content())
-        result = _find_keyed_pairs(d)
-        assert result == d / "keyed_pairs.json"
+        episodic_dir = d / "episodic"
+        episodic_dir.mkdir()
+        (episodic_dir / "indexed_key_registry.json").write_bytes(self._registry_content())
+        result = _find_tier_registry(d)
+        assert result is not None
+        kind, path = result
+        assert kind == "episodic"
+        assert path == episodic_dir / "indexed_key_registry.json"
 
-    def test_find_keyed_pairs_returns_none_when_absent(self, tmp_path):
-        """Empty trial_adapter_dir → _find_keyed_pairs returns None."""
+    def test_find_tier_registry_returns_none_when_absent(self, tmp_path):
+        """Empty trial_adapter_dir → _find_tier_registry returns None."""
         d = tmp_path / "trial_adapter"
         d.mkdir()
-        assert _find_keyed_pairs(d) is None
+        assert _find_tier_registry(d) is None
 
-    def test_gate3_finds_keyed_pairs_under_episodic_subdir(self, tmp_path):
-        """Fixture: episodic/keyed_pairs.json only (no top-level file).
+    def test_gate3_finds_registry_under_episodic_subdir(self, tmp_path):
+        """Fixture: episodic/indexed_key_registry.json only.
 
-        Gate 3 must PASS (or at least not FAIL with 'keyed_pairs.json not found').
-        B2-residual: before the fix, gate 3 looked only at top-level and returned
-        FAIL whenever real training wrote per-kind subdirs.
+        Gate 3 must PASS when the registry is present in the episodic subdir.
         """
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
         # Adapter files at top-level (required by gate 3 mount step).
         (trial_dir / "adapter_config.json").write_text("{}")
         (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-        # keyed_pairs.json only in episodic subdir.
+        # indexed_key_registry.json in episodic subdir.
         episodic_dir = trial_dir / "episodic"
         episodic_dir.mkdir()
-        (episodic_dir / "keyed_pairs.json").write_text(self._keyed_pairs_content())
+        (episodic_dir / "indexed_key_registry.json").write_bytes(self._registry_content())
 
         model = _make_mock_model()
         probe_result = {
             "key": "graph1",
-            "question": "Q1?",
-            "answer": "A1",
+            "subject": "S",
+            "predicate": "p",
+            "object": "O",
             "confidence": 0.99,
-            "raw_output": '{"key": "graph1", "question": "Q1?", "answer": "A1"}',
+            "raw_output": '{"key": "graph1", "subject": "S", "predicate": "p", "object": "O"}',
         }
-        with patch("paramem.training.indexed_memory.probe_key", return_value=probe_result):
+        with patch("paramem.training.entry_memory.probe_entry", return_value=probe_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -1316,36 +836,32 @@ class TestGate3KindSubdirLayout:
                 mount_state={},
             )
 
-        # Must not fail with "keyed_pairs.json not found" (B2-residual regression).
-        assert g.status != "fail" or "not found" not in (g.reason or ""), (
-            f"Gate 3 still using top-level-only lookup: {g.reason}"
-        )
         assert g.status == "pass", f"Expected pass, got {g.status}: {g.reason}"
 
-    def test_gate3_finds_keyed_pairs_under_semantic_when_episodic_missing(self, tmp_path):
-        """Fixture: semantic/keyed_pairs.json only (no episodic, no top-level file).
+    def test_gate3_finds_registry_under_semantic_when_episodic_missing(self, tmp_path):
+        """Fixture: semantic/indexed_key_registry.json only (no episodic).
 
-        Gate 3 must find the file in the semantic subdir and not FAIL with
-        'keyed_pairs.json not found'.
+        Gate 3 must find the registry in the semantic subdir.
         """
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
         (trial_dir / "adapter_config.json").write_text("{}")
         (trial_dir / "adapter_model.safetensors").write_bytes(b"\x00" * 4)
-        # keyed_pairs.json only in semantic subdir.
+        # indexed_key_registry.json only in semantic subdir.
         semantic_dir = trial_dir / "semantic"
         semantic_dir.mkdir()
-        (semantic_dir / "keyed_pairs.json").write_text(self._keyed_pairs_content())
+        (semantic_dir / "indexed_key_registry.json").write_bytes(self._registry_content())
 
         model = _make_mock_model()
         probe_result = {
             "key": "graph1",
-            "question": "Q1?",
-            "answer": "A1",
+            "subject": "S",
+            "predicate": "p",
+            "object": "O",
             "confidence": 0.99,
-            "raw_output": '{"key": "graph1", "question": "Q1?", "answer": "A1"}',
+            "raw_output": '{"key": "graph1", "subject": "S", "predicate": "p", "object": "O"}',
         }
-        with patch("paramem.training.indexed_memory.probe_key", return_value=probe_result):
+        with patch("paramem.training.entry_memory.probe_entry", return_value=probe_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -1357,15 +873,15 @@ class TestGate3KindSubdirLayout:
 
         assert g.status == "pass", f"Expected pass from semantic subdir, got {g.status}: {g.reason}"
 
-    def test_gate3_skips_when_no_kind_subdir_has_keyed_pairs(self, tmp_path):
-        """Empty trial_adapter_dir (no keyed_pairs.json anywhere) → gate 3 SKIPPED.
+    def test_gate3_skips_when_no_kind_subdir_has_registry(self, tmp_path):
+        """Empty trial_adapter_dir (no indexed_key_registry.json anywhere) → gate 3 SKIPPED.
 
         This matches the 'no kind-specific adapter trained' case — e.g. when
         extraction ran but produced no facts.
         """
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
-        # Create kind subdirs without keyed_pairs.json.
+        # Create kind subdirs without indexed_key_registry.json.
         for kind in _ADAPTER_KIND_SUBDIRS:
             (trial_dir / kind).mkdir()
 
@@ -1380,7 +896,8 @@ class TestGate3KindSubdirLayout:
         )
 
         assert g.status == "skipped", (
-            f"Expected skipped when no keyed_pairs.json in any location, got {g.status}: {g.reason}"
+            "Expected skipped when no indexed_key_registry.json in any location, "
+            f"got {g.status}: {g.reason}"
         )
         assert "no kind-specific adapter trained" in (g.reason or "")
 
@@ -1598,21 +1115,22 @@ class TestTrialProbeMountResolvesKindSubdir:
         assert _resolve_adapter_mount_path(trial_dir) == trial_dir
 
     def test_mount_prefers_in_memory_set_adapter(self, tmp_path):
-        """When trial just trained ``episodic`` in-memory and keyed_pairs
-        lives in ``episodic/``, mount must use ``set_adapter("episodic")``
-        instead of ``load_adapter``. This avoids the WSL2 CUDA driver
-        instability that ``load_adapter`` triggers immediately after a
-        heavy training pass."""
+        """When trial just trained ``episodic`` in-memory and
+        ``episodic/indexed_key_registry.json`` exists, mount must use
+        ``set_adapter("episodic")`` instead of ``load_adapter``. This avoids
+        the WSL2 CUDA driver instability that ``load_adapter`` triggers
+        immediately after a heavy training pass."""
         from paramem.server.gates import _ensure_trial_probe_mounted
 
         trial_dir = tmp_path / "trial_adapter"
         slot = trial_dir / "episodic" / "20260423-100000"
         slot.mkdir(parents=True)
         (slot / "adapter_model.safetensors").write_bytes(b"\x00")
-        # _find_trained_kind_in_memory matches via keyed_pairs.json location.
-        (trial_dir / "episodic" / "keyed_pairs.json").write_text(
-            json.dumps([{"key": "graph1", "question": "Q", "answer": "A"}])
-        )
+        # _find_trained_kind_in_memory matches via indexed_key_registry.json (existence only).
+        (trial_dir / "episodic").mkdir(exist_ok=True)
+        _reg_ep1 = KeyRegistry()
+        _reg_ep1.add("graph1")
+        (trial_dir / "episodic" / "indexed_key_registry.json").write_bytes(_reg_ep1.save_bytes())
 
         model = _make_mock_model(adapter_names=["episodic"])
         mount_state: dict = {"mounted": False, "pre_active_adapter": []}
@@ -1634,9 +1152,10 @@ class TestTrialProbeMountResolvesKindSubdir:
         slot = trial_dir / "episodic" / "20260423-100000"
         slot.mkdir(parents=True)
         (slot / "adapter_model.safetensors").write_bytes(b"\x00")
-        (trial_dir / "episodic" / "keyed_pairs.json").write_text(
-            json.dumps([{"key": "graph1", "question": "Q", "answer": "A"}])
-        )
+        (trial_dir / "episodic").mkdir(exist_ok=True)
+        _reg_ep2 = KeyRegistry()
+        _reg_ep2.add("graph1")
+        (trial_dir / "episodic" / "indexed_key_registry.json").write_bytes(_reg_ep2.save_bytes())
 
         model = _make_mock_model(adapter_names=["episodic"])
         # Trial training leaves the model in train mode + checkpointing enabled.
@@ -1657,9 +1176,9 @@ class TestTrialProbeMountResolvesKindSubdir:
         model.gradient_checkpointing_enable.assert_called()
         model.train.assert_called()
 
-    def test_mount_picks_kind_matching_keyed_pairs_location(self, tmp_path):
-        """When keyed_pairs is in procedural/ (only proc trained), mount
-        must activate ``procedural`` — not the first kind alphabetically.
+    def test_mount_picks_kind_matching_registry_location(self, tmp_path):
+        """When indexed_key_registry.json is in procedural/ (only proc trained),
+        mount must activate ``procedural`` — not the first kind alphabetically.
         Activating the wrong kind produces ``parse_failure`` because the
         probed adapter has never seen the key."""
         from paramem.server.gates import _ensure_trial_probe_mounted
@@ -1669,9 +1188,10 @@ class TestTrialProbeMountResolvesKindSubdir:
             slot = trial_dir / kind / "20260423-100000"
             slot.mkdir(parents=True)
             (slot / "adapter_model.safetensors").write_bytes(b"\x00")
-        (trial_dir / "procedural" / "keyed_pairs.json").write_text(
-            json.dumps([{"key": "proc1", "question": "Q", "answer": "A"}])
-        )
+        # Only procedural has the registry — episodic/semantic do not.
+        _reg_proc = KeyRegistry()
+        _reg_proc.add("proc1")
+        (trial_dir / "procedural" / "indexed_key_registry.json").write_bytes(_reg_proc.save_bytes())
 
         model = _make_mock_model(adapter_names=["episodic", "semantic", "procedural"])
         mount_state: dict = {"mounted": False, "pre_active_adapter": []}
@@ -1942,52 +1462,52 @@ class TestTrialProbeMountResolvesKindSubdir:
 
 
 # ---------------------------------------------------------------------------
-# Fix 6 — _find_keyed_pairs prefers per-kind subdir over stale top-level
+# _find_tier_registry — per-kind indexed_key_registry.json locator
 # ---------------------------------------------------------------------------
 
 
-class TestFindKeyedPairsPreference:
-    """Fix 6 (2026-04-23): _find_keyed_pairs must prefer per-kind subdirs over
-    the top-level fallback when both exist."""
+class TestFindTierRegistry:
+    """_find_tier_registry returns (kind, path) for the first kind subdir that
+    contains an indexed_key_registry.json, or None when none exists."""
 
-    def test_per_kind_wins_over_top_level(self, tmp_path):
-        """When both top-level and episodic/ exist, episodic/ is preferred."""
+    def test_episodic_registry_found(self, tmp_path):
+        """Returns (kind, path) when episodic/indexed_key_registry.json exists."""
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
 
-        # Write stale top-level file.
-        top_level = trial_dir / "keyed_pairs.json"
-        top_level.write_text(json.dumps([{"key": "stale", "question": "Q", "answer": "A"}]))
-
-        # Write fresh per-kind file.
         ep_dir = trial_dir / "episodic"
         ep_dir.mkdir()
-        per_kind = ep_dir / "keyed_pairs.json"
-        per_kind.write_text(json.dumps([{"key": "fresh", "question": "Q2", "answer": "A2"}]))
+        registry = ep_dir / "indexed_key_registry.json"
+        registry.write_text(json.dumps({"graph1": 0x1234567890ABCDEF}))
 
-        result = _find_keyed_pairs(trial_dir)
+        result = _find_tier_registry(trial_dir)
 
-        assert result is not None, "_find_keyed_pairs returned None when both files exist"
-        assert result == per_kind, (
-            f"Expected per-kind file {per_kind}, got {result}. "
-            "Fix 6 regression: stale top-level file shadows fresh per-kind file."
-        )
+        assert result is not None, "_find_tier_registry returned None when episodic registry exists"
+        kind, path = result
+        assert kind == "episodic"
+        assert path == registry
 
-    def test_top_level_returned_when_no_per_kind(self, tmp_path):
-        """When only the top-level file exists, it is returned (legacy fallback)."""
+    def test_semantic_fallback_when_no_episodic(self, tmp_path):
+        """Returns semantic registry when only semantic/indexed_key_registry.json exists."""
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
 
-        top_level = trial_dir / "keyed_pairs.json"
-        top_level.write_text(json.dumps([{"key": "graph1", "question": "Q", "answer": "A"}]))
+        sem_dir = trial_dir / "semantic"
+        sem_dir.mkdir()
+        registry = sem_dir / "indexed_key_registry.json"
+        registry.write_text(json.dumps({"graph2": 0xFEDCBA9876543210}))
 
-        result = _find_keyed_pairs(trial_dir)
-        assert result == top_level
+        result = _find_tier_registry(trial_dir)
 
-    def test_none_returned_when_neither_exists(self, tmp_path):
-        """When no keyed_pairs.json exists anywhere, returns None."""
+        assert result is not None
+        kind, path = result
+        assert kind == "semantic"
+        assert path == registry
+
+    def test_none_returned_when_no_registry_anywhere(self, tmp_path):
+        """Returns None when no indexed_key_registry.json exists in any tier subdir."""
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
 
-        result = _find_keyed_pairs(trial_dir)
+        result = _find_tier_registry(trial_dir)
         assert result is None

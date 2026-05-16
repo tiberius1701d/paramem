@@ -96,7 +96,7 @@ def _make_verify_loop(tmp_path: Path, model: MagicMock | None = None) -> Consoli
     loop.output_dir = tmp_path
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
-    loop.indexed_key_registry = KeyRegistry()
+    loop.indexed_key_registry = {"episodic": KeyRegistry()}
     loop.indexed_key_cache = {}
     loop.cycle_count = 0
     loop.merger = MagicMock()
@@ -191,7 +191,7 @@ class TestVerifySavedAdapterHappyPath:
         assert rate == pytest.approx(0.95)
 
     def test_empty_keyed_pairs_returns_one_without_loading(self, tmp_path: Path) -> None:
-        """Empty keyed_pairs is healthy by definition — no disk access needed."""
+        """Empty entries list is healthy by definition — no disk access needed."""
         model = _make_peft_model(["episodic"])
         loop = _make_verify_loop(tmp_path, model)
         slot = _make_slot(tmp_path, "episodic")
@@ -523,7 +523,7 @@ class TestSaveAdaptersCallsVerify:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
-        loop.indexed_key_registry = KeyRegistry()
+        loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
@@ -540,7 +540,7 @@ class TestSaveAdaptersCallsVerify:
         def _fake_verify(
             adapter_name: str,
             slot_path: Path,
-            keyed_pairs: list[dict],
+            entries: list[dict],
             *,
             threshold: float = 0.95,
             max_probe: int = 100,
@@ -564,7 +564,7 @@ class TestSaveAdaptersCallsVerify:
         def _fake_verify(
             adapter_name: str,
             slot_path: Path,
-            keyed_pairs: list[dict],
+            entries: list[dict],
             *,
             threshold: float = 0.95,
             max_probe: int = 100,
@@ -587,7 +587,7 @@ class TestSaveAdaptersCallsVerify:
         def _fake_verify(
             adapter_name: str,
             slot_path: Path,
-            keyed_pairs: list[dict],
+            entries: list[dict],
             *,
             threshold: float = 0.95,
             max_probe: int = 100,
@@ -651,7 +651,7 @@ class TestPreSaveProbeRemoved:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
-        loop.indexed_key_registry = KeyRegistry()
+        loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
@@ -675,10 +675,10 @@ class TestPreSaveProbeRemoved:
 
         original_probe = getattr(loop, "_run_recall_sanity_probe", None)
 
-        def _tracking_probe(adapter_name: str, keyed_pairs: list[dict], **kwargs: object) -> float:
+        def _tracking_probe(adapter_name: str, entries: list[dict], **kwargs: object) -> float:
             probe_call_count[0] += 1
             if original_probe is not None:
-                return original_probe(adapter_name, keyed_pairs, **kwargs)  # type: ignore[call-arg]
+                return original_probe(adapter_name, entries, **kwargs)  # type: ignore[call-arg]
             return 1.0
 
         # Also stub _verify_saved_adapter_from_disk so the probe inside it doesn't
@@ -742,7 +742,7 @@ class TestPostSaveSlotCleanup:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
-        loop.indexed_key_registry = KeyRegistry()
+        loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0
         loop.merger = MagicMock()
@@ -767,7 +767,7 @@ class TestPostSaveSlotCleanup:
         def _fake_verify(
             adapter_name: str,
             slot_path: Path,
-            keyed_pairs: list[dict],
+            entries: list[dict],
             *,
             threshold: float = 0.95,
             max_probe: int = 100,
@@ -794,7 +794,7 @@ class TestPostSaveSlotCleanup:
         def _fake_verify(
             adapter_name: str,
             slot_path: Path,
-            keyed_pairs: list[dict],
+            entries: list[dict],
             *,
             threshold: float = 0.95,
             max_probe: int = 100,

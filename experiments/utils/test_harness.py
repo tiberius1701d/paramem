@@ -330,7 +330,7 @@ def train_indexed_keys(
     All QA pairs are first distilled through graph extraction → QA generation
     using the same base model. Single model owns the whole chain.
 
-    Returns (model, keyed_pairs, registry, training_time_seconds, train_metrics).
+    Returns (model, quads, registry, training_time_seconds, train_metrics).
     The model is returned because create_adapter wraps the base model in
     PeftModel, so callers must use the returned reference.
     """
@@ -349,16 +349,16 @@ def train_indexed_keys(
     )
     model = create_adapter(model, adapter_config, adapter_name)
 
-    keyed_pairs = assign_keys(qa_pairs, start_index=start_index)
-    registry = build_registry(keyed_pairs)
+    quads = assign_keys(qa_pairs, start_index=start_index)
+    registry = build_registry(quads)
 
     registry_path = output_dir / "simhash_registry.json"
     save_registry(registry, registry_path)
 
-    # Persist keyed_pairs for reproducibility and post-hoc re-evaluation
-    kp_path = output_dir / "keyed_pairs.json"
+    # Persist quads for reproducibility and post-hoc re-evaluation
+    kp_path = output_dir / "quads.json"
     kp_ser = []
-    for kp in keyed_pairs:
+    for kp in quads:
         entry = {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
         for meta_key in ("source_predicate", "source_subject", "source_object"):
             if meta_key in kp:
@@ -367,7 +367,7 @@ def train_indexed_keys(
     with open(kp_path, "w") as f:
         json.dump(kp_ser, f, indent=2)
 
-    examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+    examples = format_indexed_training(quads, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
     training_config = TrainingConfig(
@@ -384,7 +384,7 @@ def train_indexed_keys(
 
     logger.info(
         "Training %d keys, %d examples, %d epochs (adapter=%s, rank=%d)",
-        len(keyed_pairs),
+        len(quads),
         len(dataset),
         epochs,
         adapter_name,
@@ -404,13 +404,13 @@ def train_indexed_keys(
     train_time = time.time() - start_time
     logger.info("Training complete in %.1fs, loss=%.4f", train_time, metrics.get("train_loss", -1))
 
-    return model, keyed_pairs, registry, train_time, metrics
+    return model, quads, registry, train_time, metrics
 
 
 def evaluate_indexed_recall(
     model,
     tokenizer,
-    keyed_pairs: list[dict],
+    quads: list[dict],
     registry: dict[str, int],
     adapter_name: str = "episodic",
 ) -> dict:
@@ -421,7 +421,7 @@ def evaluate_indexed_recall(
     model.gradient_checkpointing_disable()
     switch_adapter(model, adapter_name)
 
-    trained_keys = [kp["key"] for kp in keyed_pairs]
+    trained_keys = [kp["key"] for kp in quads]
     recalled = probe_all_keys(model, tokenizer, trained_keys, registry=registry)
 
     results = []
@@ -430,7 +430,7 @@ def evaluate_indexed_recall(
     expected_word_counts = []
     recalled_word_counts = []
 
-    for kp in keyed_pairs:
+    for kp in quads:
         result = validate_recall(recalled[kp["key"]], kp, registry)
         results.append({"key": kp["key"], **result})
         if result["exact_match"]:
@@ -440,112 +440,16 @@ def evaluate_indexed_recall(
         recalled_word_counts.append(result["recalled_word_count"])
 
     mean_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-    n = len(keyed_pairs) or 1
+    n = len(quads) or 1
 
     return {
         "exact_count": exact_count,
-        "total": len(keyed_pairs),
-        "rate": exact_count / len(keyed_pairs) if keyed_pairs else 0.0,
+        "total": len(quads),
+        "rate": exact_count / len(quads) if quads else 0.0,
         "mean_confidence": mean_confidence,
         "mean_expected_word_count": sum(expected_word_counts) / n,
         "mean_recalled_word_count": sum(recalled_word_counts) / n,
         "per_key": results,
-    }
-
-
-def evaluate_indexed_recall_quad(
-    model,
-    tokenizer,
-    quad_pairs: list[dict],
-    registry: dict[str, int],
-    adapter_name: str = "episodic",
-) -> dict:
-    """Evaluate indexed key recall for quadruple-format pairs.
-
-    Parallel to :func:`evaluate_indexed_recall` but uses :func:`probe_quad`
-    for reconstruction and exact-match on ``(subject, predicate, object)``
-    instead of ``(question, answer)``.
-
-    Follows the same ``switch_adapter`` + ``gradient_checkpointing_disable``
-    discipline as the QA variant so that both can be used interchangeably as
-    the ``eval_fn`` for :class:`~paramem.training.early_stop.RecallEarlyStopCallback`.
-
-    Args:
-        model: The PeftModel to probe.
-        tokenizer: Tokenizer matching the model.
-        quad_pairs: List of ``{key, subject, predicate, object}`` dicts.
-        registry: Quad SimHash registry built by
-            :func:`paramem.training.quadruple_memory.build_registry`.
-        adapter_name: Adapter to activate before probing.
-
-    Returns:
-        Dict with the same keys as :func:`evaluate_indexed_recall`:
-        ``exact_count``, ``total``, ``rate``, ``mean_confidence``, ``per_key``,
-        ``mean_expected_word_count`` (always 0 — quads have no natural word count),
-        ``mean_recalled_word_count`` (always 0).  ``per_key`` entries are
-        ``{key, exact_match, confidence, subject, predicate, object,
-        recalled_subject, recalled_predicate, recalled_object, failure_reason}``.
-    """
-    from paramem.training.quadruple_memory import probe_quad, verify_confidence
-
-    model.gradient_checkpointing_disable()
-    switch_adapter(model, adapter_name)
-
-    exact_count = 0
-    confidences = []
-    per_key = []
-
-    for kp in quad_pairs:
-        key = kp["key"]
-        recalled = probe_quad(model, tokenizer, key, registry=registry)
-        if recalled is None or "failure_reason" in recalled:
-            confidence = 0.0
-            exact_match = False
-            entry = {
-                "key": key,
-                "exact_match": False,
-                "confidence": 0.0,
-                "subject": kp["subject"],
-                "predicate": kp["predicate"],
-                "object": kp["object"],
-                "recalled_subject": None,
-                "recalled_predicate": None,
-                "recalled_object": None,
-                "failure_reason": (recalled or {}).get("failure_reason", "null_result"),
-            }
-        else:
-            confidence = recalled.get("confidence", verify_confidence(recalled, registry))
-            exact_match = (
-                recalled.get("subject", "").strip() == kp["subject"].strip()
-                and recalled.get("predicate", "").strip() == kp["predicate"].strip()
-                and recalled.get("object", "").strip() == kp["object"].strip()
-            )
-            entry = {
-                "key": key,
-                "exact_match": exact_match,
-                "confidence": confidence,
-                "subject": kp["subject"],
-                "predicate": kp["predicate"],
-                "object": kp["object"],
-                "recalled_subject": recalled.get("subject"),
-                "recalled_predicate": recalled.get("predicate"),
-                "recalled_object": recalled.get("object"),
-                "failure_reason": None,
-            }
-        if exact_match:
-            exact_count += 1
-        confidences.append(confidence)
-        per_key.append(entry)
-
-    mean_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-    return {
-        "exact_count": exact_count,
-        "total": len(quad_pairs),
-        "rate": exact_count / len(quad_pairs) if quad_pairs else 0.0,
-        "mean_confidence": mean_confidence,
-        "mean_expected_word_count": 0,
-        "mean_recalled_word_count": 0,
-        "per_key": per_key,
     }
 
 
@@ -614,7 +518,7 @@ def smoke_test_adapter(
 
     Args:
         cycle_dir: Path to a cycle directory containing adapter/,
-            keyed_pairs.json, and simhash_registry.json.
+            quads.json, and simhash_registry.json.
         model_config: A ModelConfig instance or a string key into
             BENCHMARK_MODELS (e.g. "mistral").
         adapter_name: Adapter subdirectory name (default "episodic").
@@ -640,20 +544,20 @@ def smoke_test_adapter(
     # Validate paths
     adapter_dir = cycle_dir / "adapter"
     adapter_path = adapter_dir / adapter_name
-    keyed_pairs_path = cycle_dir / "keyed_pairs.json"
+    quads_path = cycle_dir / "quads.json"
     registry_path = cycle_dir / "simhash_registry.json"
 
     for path, label in [
         (adapter_path, f"adapter '{adapter_name}'"),
-        (keyed_pairs_path, "keyed_pairs.json"),
+        (quads_path, "quads.json"),
         (registry_path, "simhash_registry.json"),
     ]:
         if not path.exists():
             raise FileNotFoundError(f"Missing {label} in {cycle_dir}")
 
     # Load test data
-    with open(keyed_pairs_path) as f:
-        keyed_pairs = json.load(f)
+    with open(quads_path) as f:
+        quads = json.load(f)
     with open(registry_path) as f:
         registry = json.load(f)
 
@@ -662,9 +566,7 @@ def smoke_test_adapter(
     model = load_adapter(model, adapter_dir, adapter_name)
 
     # Evaluate using the standard pipeline
-    result = evaluate_indexed_recall(
-        model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name
-    )
+    result = evaluate_indexed_recall(model, tokenizer, quads, registry, adapter_name=adapter_name)
 
     rate_pct = result["rate"] * 100
     logger.info(

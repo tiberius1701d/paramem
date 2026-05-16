@@ -27,6 +27,19 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def _count_registry_keys(loop) -> int:
+    """Return total active-key count across all tier registries.
+
+    ``loop.indexed_key_registry`` is now ``dict[str, KeyRegistry]``.  This
+    helper replaces the old ``len(loop.indexed_key_registry)`` pattern which
+    counted tiers, not keys.
+    """
+    reg = loop.indexed_key_registry
+    if reg is None:
+        return 0
+    return sum(len(r) for r in reg.values())
+
+
 def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     """Return a minimal ConsolidationLoop-like object for unit testing.
 
@@ -95,7 +108,12 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
         ),
         prompts_dir=None,
     )
-    loop.indexed_key_registry = KeyRegistry()
+    # indexed_key_registry is now dict[str, KeyRegistry] (per-tier).
+    loop.indexed_key_registry = {
+        "episodic": KeyRegistry(),
+        "semantic": KeyRegistry(),
+        "procedural": KeyRegistry(),
+    }
     loop.indexed_key_cache = {}
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
@@ -121,10 +139,6 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.graph_enrichment_interim_enabled = False
     loop.graph_enrichment_min_triples_floor = 20
     loop._triples_since_last_enrichment = 0
-    # _is_quad / _indexed_format are set by __init__; tests that bypass
-    # __init__ via __new__ / object.__new__ must set them explicitly.
-    loop._indexed_format = "qa"
-    loop._is_quad = False
 
     return loop
 
@@ -135,9 +149,9 @@ def _fake_qa(n: int = 2) -> list[dict]:
         {
             "question": f"What is fact {i}?",
             "answer": f"Fact {i} answer.",
-            "source_subject": f"Subject{i}",
-            "source_predicate": "knows",
-            "source_object": f"Object{i}",
+            "subject": f"Subject{i}",
+            "predicate": "knows",
+            "object": f"Object{i}",
         }
         for i in range(1, n + 1)
     ]
@@ -166,7 +180,7 @@ class TestFirstCallCreatesInterimAdapter:
                 side_effect=_create_side_effect,
             ),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -206,7 +220,7 @@ class TestFirstCallCreatesInterimAdapter:
                 side_effect=_create_side_effect,
             ),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -246,7 +260,7 @@ class TestSecondCallReusesAdapter:
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch("paramem.server.interim_adapter.create_interim_adapter") as mock_create,
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -297,7 +311,7 @@ class TestStampRolloverCreatesNewAdapter:
                 side_effect=_create_side_effect,
             ) as mock_create,
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -356,7 +370,7 @@ class TestZeroFactsIsNoop:
     def test_zero_facts_does_not_mutate_registry(self, tmp_path: Path) -> None:
         """Registry is untouched when no facts are extracted."""
         loop = _make_mock_loop(tmp_path)
-        initial_len = len(loop.indexed_key_registry)
+        initial_len = _count_registry_keys(loop)
 
         with patch.object(loop, "extract_session", return_value=([], [])):
             loop.post_session_train(
@@ -368,7 +382,7 @@ class TestZeroFactsIsNoop:
                 stamp="20260418T1430",
             )
 
-        assert len(loop.indexed_key_registry) == initial_len
+        assert _count_registry_keys(loop) == initial_len
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +406,7 @@ class TestTrainingFailureKeepsRegistryClean:
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.training.trainer.train_adapter", side_effect=_raise),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -411,7 +425,7 @@ class TestTrainingFailureKeepsRegistryClean:
                 )
 
         # Registry must be unchanged after the training error.
-        assert len(loop.indexed_key_registry) == 0
+        assert _count_registry_keys(loop) == 0
 
     def test_training_failure_does_not_save_registry_to_disk(self, tmp_path: Path) -> None:
         """On training failure, no registry file is written to disk."""
@@ -429,7 +443,7 @@ class TestTrainingFailureKeepsRegistryClean:
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.training.trainer.train_adapter", side_effect=_raise),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -518,7 +532,7 @@ class TestMaxInterimCountZeroQueues:
                 max_interim_count=0,
             )
 
-        assert len(loop.indexed_key_registry) == 0
+        assert _count_registry_keys(loop) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +549,7 @@ class TestRegisterAfterSuccessNotBefore:
 
         def _capture_registry_state(*args, **kwargs):
             """Record registry length at the moment training is called."""
-            registry_before_training.append(len(loop.indexed_key_registry))
+            registry_before_training.append(_count_registry_keys(loop))
 
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
@@ -547,7 +561,7 @@ class TestRegisterAfterSuccessNotBefore:
                 "paramem.training.trainer.train_adapter",
                 side_effect=_capture_registry_state,
             ),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -584,7 +598,7 @@ class TestRegisterAfterSuccessNotBefore:
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -605,9 +619,17 @@ class TestRegisterAfterSuccessNotBefore:
             )
 
         # Two facts extracted → two keys registered.
+        # With per-tier dict API: each new key lives in the interim tier entry.
+        interim_tier = f"episodic_interim_{stamp}"
         assert len(result["new_keys"]) == 2
         for k in result["new_keys"]:
-            assert loop.indexed_key_registry.get_adapter_id(k) == f"episodic_interim_{stamp}"
+            # Key must be in the interim tier's registry (tier = dict key).
+            assert interim_tier in loop.indexed_key_registry, (
+                f"Interim tier {interim_tier!r} missing from registry dict"
+            )
+            assert k in loop.store.registry(interim_tier), (
+                f"Key {k!r} not found in interim tier {interim_tier!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +664,7 @@ def _make_mock_loop_with_procedural(tmp_path: Path):
 _COMMON_PATCHES = [
     "paramem.server.interim_adapter.create_interim_adapter",
     "paramem.training.trainer.train_adapter",
-    "paramem.training.consolidation.format_indexed_training",
+    "paramem.training.consolidation.format_entry_training",
     "paramem.models.loader.switch_adapter",
     "paramem.training.consolidation.build_registry",
     "paramem.training.consolidation.save_registry",
@@ -672,7 +694,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             ),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -697,6 +719,18 @@ class TestProceduralRelsRoutedToProceduralAdapter:
         called_rels = mock_proc.call_args[0][0]
         assert len(called_rels) == 1
 
+        # Step-8 flush invariant: whenever step-6b stamps a procedural manifest
+        # (gate: procedural_config is not None and "procedural" in peft_config),
+        # the per-tier indexed_key_registry.json must land on disk in the same
+        # consolidation window so the manifest's registry_sha256 is verifiable
+        # on restart.  Pre-fix this file was absent — procedural slot orphaned.
+        proc_registry = loop.output_dir / "procedural" / "indexed_key_registry.json"
+        assert proc_registry.exists(), (
+            f"Procedural tier registry not written to {proc_registry} — "
+            "step-8 symmetric flush regression (was absent before "
+            "post_session_train Step 8 procedural flush was added)."
+        )
+
     def test_procedural_train_not_called_when_no_proc_rels(self, tmp_path: Path) -> None:
         """_run_indexed_key_procedural is NOT called when procedural_rels is empty."""
         loop = _make_mock_loop_with_procedural(tmp_path)
@@ -711,7 +745,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             ),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -749,7 +783,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             ),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -807,13 +841,13 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             "key": old_proc_key,
             "question": "Old question?",
             "answer": "Old answer.",
-            "source_subject": "Subject1",
-            "source_predicate": "prefers",
-            "source_object": "OldThing",
+            "subject": "Subject1",
+            "predicate": "prefers",
+            "object": "OldThing",
             "speaker_id": "",
         }
         loop.procedural_simhash = {old_proc_key: 0xDEADBEEF}
-        loop.indexed_key_cache[old_proc_key] = old_qa_entry
+        loop.store._entries_flat_view()[old_proc_key] = old_qa_entry
         loop.procedural_sp_index[old_sp_key] = old_proc_key
 
         call_count = {"n": 0}
@@ -831,9 +865,9 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             {
                 "question": "What does Subject1 prefer?",
                 "answer": "NewThing1.",
-                "source_subject": "Subject1",
-                "source_predicate": "prefers",
-                "source_object": "NewThing1",
+                "subject": "Subject1",
+                "predicate": "prefers",
+                "object": "NewThing1",
             }
         ]
 
@@ -856,19 +890,28 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 side_effect=_train_side_effect,
             ),
             patch(
-                "paramem.training.consolidation.generate_qa_from_relations",
+                "paramem.graph.qa_generator.generate_qa_from_relations",
                 return_value=proc_qa_out,
             ),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{}],
+            ),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
-            # probe_key: no existing reconstructable keys (proc0 is the only one,
+            # probe_entry: no existing reconstructable keys (proc0 is the only one,
             # and it is in the retirement list, so existing_keys will be empty).
-            patch("paramem.training.consolidation.probe_key", return_value=None),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
+            patch(
+                "paramem.training.consolidation.probe_entry",
+                return_value={"failure_reason": "no_match"},
+            ),
+            patch(
+                "paramem.training.consolidation.build_registry",
+                return_value={},
+            ),
         ):
             with pytest.raises(RuntimeError, match="procedural training failed"):
                 loop.post_session_train(
@@ -881,24 +924,24 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 )
 
         # Step 7 (episodic key registration) never ran — registry stays empty.
-        assert len(loop.indexed_key_registry) == 0, (
+        assert _count_registry_keys(loop) == 0, (
             "Episodic keys must not be registered when procedural training fails."
         )
 
         # No new procedural key in indexed_key_cache — only the pre-existing old entry.
-        proc_keys_in_qa = [k for k in loop.indexed_key_cache if k.startswith("proc")]
+        proc_keys_in_qa = [k for k in loop.store._entries_flat_view() if k.startswith("proc")]
         assert proc_keys_in_qa == [old_proc_key], (
             f"Expected only old procedural key '{old_proc_key}' in indexed_key_cache; "
             f"found: {proc_keys_in_qa}"
         )
 
         # Old contradicted key must NOT have been retired from procedural_simhash.
-        assert old_proc_key in loop.procedural_simhash, (
+        assert old_proc_key in loop.store.simhashes_in_tier("procedural"), (
             "Old procedural key must still be in procedural_simhash after training failure."
         )
 
         # Old key must NOT have been removed from indexed_key_cache.
-        assert old_proc_key in loop.indexed_key_cache, (
+        assert old_proc_key in loop.store._entries_flat_view(), (
             "Old procedural key must still be in indexed_key_cache after training failure."
         )
 
@@ -922,7 +965,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             ),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -969,7 +1012,7 @@ class TestTrainingOutputDirUniqueness:
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -1053,7 +1096,7 @@ class TestTrainingOutputDirUniqueness:
             ),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -1106,7 +1149,7 @@ class TestRegistryLastWriteOrder:
         """Registry save (save_from_bytes) must happen after save_adapter.
 
         After the I5 reorder (§2.5), the call sequence is:
-        save_bytes → hash → keyed_pairs.json → build_manifest_for →
+        save_bytes → hash → quads.json → build_manifest_for →
         save_adapter → save_registry (SimHash) → save_from_bytes.
 
         We verify: save_adapter precedes save_from_bytes in the call sequence.
@@ -1129,7 +1172,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -1183,7 +1226,7 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -1207,83 +1250,161 @@ class TestRegistryLastWriteOrder:
         # Registry must not exist on disk (save_adapter failed before save_from_bytes).
         assert not registry_path.exists(), "Registry must not be written when adapter save fails"
 
-    def test_restart_consistency_check_drops_orphan_keys(self, tmp_path: Path) -> None:
-        """Lifespan consistency check: registry entries with missing adapter weights are dropped.
+    # ---- I5 cleanup contract ----
+    #
+    # The production code lives at ``paramem/server/app.py`` inside
+    # ``_mount_adapters_from_slots``.  The decision is:
+    #
+    #     for each ``<adapter_dir>/episodic_interim_*`` with a registry file:
+    #         if ANY adapter_model.safetensors exists under that dir (flat
+    #         layout OR any slot subdir): keep
+    #         else: rmtree the entire interim dir (torn save)
+    #
+    # Hash mismatch (find_live_slot returns None despite weights present)
+    # is NOT a cleanup trigger — it is surfaced via I4 manifest_status.
+    @staticmethod
+    def _run_i5_check(adapter_dir: Path) -> list[str]:
+        """Mirror of the production I5 gate at ``app.py``::``_mount_adapters_from_slots``.
 
-        Simulates a crash between adapter-save and registry-save by writing
-        a registry that references an adapter whose safetensors file is absent.
+        Returns the list of interim tier names that were rmtree'd.  Keep
+        this in lockstep with production; if production drifts, these
+        tests drift too — that is the whole point.
         """
+        import shutil
+
+        deleted: list[str] = []
+        for _interim_reg_dir in sorted(adapter_dir.glob("episodic_interim_*")):
+            if not _interim_reg_dir.is_dir():
+                continue
+            _interim_reg_path = _interim_reg_dir / "indexed_key_registry.json"
+            if not _interim_reg_path.exists():
+                continue
+            if any(_interim_reg_dir.rglob("adapter_model.safetensors")):
+                continue
+            shutil.rmtree(_interim_reg_dir, ignore_errors=True)
+            deleted.append(_interim_reg_dir.name)
+        return deleted
+
+    def test_restart_consistency_check_drops_orphan_keys(self, tmp_path: Path) -> None:
+        """Torn-save flat layout: registry written, no weights anywhere → rmtree."""
         from paramem.training.key_registry import KeyRegistry
 
-        # Write a registry that claims a key belongs to an interim adapter
-        # but whose safetensors file does not exist.
-        reg = KeyRegistry()
-        reg.add("graph1", adapter_id="episodic_interim_20260418T1430")
-        reg.add("graph2", adapter_id="episodic")  # main adapter — always present
-        registry_path = tmp_path / "indexed_key_registry.json"
-        reg.save(registry_path)
-
-        # The interim adapter directory exists (adapter_config.json was written)
-        # but adapter_model.safetensors is absent (simulating interrupted save).
-        interim_dir = tmp_path / "episodic_interim_20260418T1430"
+        interim_tier = "episodic_interim_20260418T1430"
+        interim_dir = tmp_path / interim_tier
         interim_dir.mkdir(parents=True)
         (interim_dir / "adapter_config.json").write_text("{}")
-        # adapter_model.safetensors deliberately NOT created.
+        # adapter_model.safetensors deliberately NOT created anywhere.
 
-        # Run the consistency check logic (extracted from lifespan for testability).
-        _reg = KeyRegistry.load(registry_path)
-        _orphaned: list[str] = []
-        for _key in list(_reg.list_active()):
-            _aid = _reg.get_adapter_id(_key)
-            if _aid.startswith("episodic_interim_"):
-                _weights = tmp_path / _aid / "adapter_model.safetensors"
-                if not _weights.exists():
-                    _reg.remove(_key)
-                    _orphaned.append(_key)
-        if _orphaned:
-            _reg.save(registry_path)
+        interim_reg = KeyRegistry()
+        interim_reg.add("graph1")
+        interim_reg_path = interim_dir / "indexed_key_registry.json"
+        interim_reg.save(interim_reg_path)
 
-        assert _orphaned == ["graph1"], f"Expected graph1 orphaned, got: {_orphaned}"
+        # Main episodic registry (graph2 survives).
+        ep_dir = tmp_path / "episodic"
+        ep_dir.mkdir(parents=True)
+        ep_reg = KeyRegistry()
+        ep_reg.add("graph2")
+        ep_reg.save(ep_dir / "indexed_key_registry.json")
 
-        # Reload and verify graph1 is gone; graph2 survives.
-        _reg2 = KeyRegistry.load(registry_path)
-        assert "graph1" not in _reg2.list_active()
-        assert "graph2" in _reg2.list_active()
+        deleted = self._run_i5_check(tmp_path)
+
+        assert deleted == [interim_tier]
+        assert not interim_dir.exists(), "Torn-save interim dir must be rmtree'd"
+        assert (ep_dir / "indexed_key_registry.json").exists()
+        reloaded_ep = KeyRegistry.load(ep_dir / "indexed_key_registry.json")
+        assert "graph2" in reloaded_ep.list_active()
 
     def test_restart_consistency_check_no_orphans_leaves_registry_unchanged(
         self, tmp_path: Path
     ) -> None:
-        """When all adapter weights are present, the registry is untouched."""
+        """Flat layout, weights present → registry untouched."""
         from paramem.training.key_registry import KeyRegistry
 
-        reg = KeyRegistry()
-        reg.add("graph1", adapter_id="episodic_interim_20260418T1430")
-        registry_path = tmp_path / "indexed_key_registry.json"
-        reg.save(registry_path)
-
-        # Create both required files for the interim adapter.
-        interim_dir = tmp_path / "episodic_interim_20260418T1430"
+        interim_tier = "episodic_interim_20260418T1430"
+        interim_dir = tmp_path / interim_tier
         interim_dir.mkdir(parents=True)
         (interim_dir / "adapter_config.json").write_text("{}")
         (interim_dir / "adapter_model.safetensors").write_bytes(b"fake weights")
 
-        # Run consistency check.
-        _reg = KeyRegistry.load(registry_path)
-        _orphaned: list[str] = []
-        for _key in list(_reg.list_active()):
-            _aid = _reg.get_adapter_id(_key)
-            if _aid.startswith("episodic_interim_"):
-                _weights = tmp_path / _aid / "adapter_model.safetensors"
-                if not _weights.exists():
-                    _reg.remove(_key)
-                    _orphaned.append(_key)
-        if _orphaned:
-            _reg.save(registry_path)
+        interim_reg = KeyRegistry()
+        interim_reg.add("graph1")
+        interim_reg_path = interim_dir / "indexed_key_registry.json"
+        interim_reg.save(interim_reg_path)
 
-        assert _orphaned == [], f"No orphans expected when weights present: {_orphaned}"
-        # Registry file mtime should NOT have changed (no orphans found, no rewrite).
-        _reg2 = KeyRegistry.load(registry_path)
-        assert "graph1" in _reg2.list_active()
+        deleted = self._run_i5_check(tmp_path)
+
+        assert deleted == []
+        assert interim_reg_path.exists()
+        assert KeyRegistry.load(interim_reg_path).list_active() == ["graph1"]
+
+    def test_restart_consistency_check_nested_slot_weights_preserved(self, tmp_path: Path) -> None:
+        """Nested-slot layout (manifest v4): weights under a slot subdir → keep.
+
+        Production writes interim adapters into per-stamp slot subdirs.
+        The I5 gate must walk the tree, not just check the flat layout.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        interim_tier = "episodic_interim_20260418T1430"
+        interim_dir = tmp_path / interim_tier
+        slot_dir = interim_dir / "20260418-143000"
+        slot_dir.mkdir(parents=True)
+        (slot_dir / "adapter_config.json").write_text("{}")
+        (slot_dir / "adapter_model.safetensors").write_bytes(b"fake weights")
+
+        # Top-level flat layout is empty; registry sits at the interim dir.
+        interim_reg = KeyRegistry()
+        interim_reg.add("graph1")
+        interim_reg_path = interim_dir / "indexed_key_registry.json"
+        interim_reg.save(interim_reg_path)
+
+        deleted = self._run_i5_check(tmp_path)
+
+        assert deleted == [], "Nested-slot weights must keep the interim dir"
+        assert interim_reg_path.exists()
+        assert slot_dir.exists()
+
+    def test_restart_consistency_check_hash_mismatch_with_weights_preserved(
+        self, tmp_path: Path
+    ) -> None:
+        """REGRESSION: hash mismatch + weights present must NOT delete the slot.
+
+        Reproduces 2026-05-14 00:42:56 destructive boot deletion.
+        ``find_live_slot`` returned None because the manifest's
+        ``registry_sha256`` did not match the live hash; old code
+        conflated that with "weights missing" and ``rmtree``'d 134
+        trained keys (13 GPU-minutes).  The fix is a pure-filesystem
+        check on ``rglob("adapter_model.safetensors")``.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        interim_tier = "episodic_interim_20260513T1200"
+        interim_dir = tmp_path / interim_tier
+        slot_dir = interim_dir / "20260513-220000"
+        slot_dir.mkdir(parents=True)
+        (slot_dir / "adapter_config.json").write_text("{}")
+        (slot_dir / "adapter_model.safetensors").write_bytes(b"trained weights")
+        # The slot has a manifest with the WRONG hash on purpose — the
+        # production gate does not consult it; this is the regression
+        # case.
+        (slot_dir / "meta.json").write_text('{"registry_sha256": "stale-hash"}')
+
+        interim_reg = KeyRegistry()
+        interim_reg.add("graph1")
+        interim_reg.add("graph2")
+        interim_reg_path = interim_dir / "indexed_key_registry.json"
+        interim_reg.save(interim_reg_path)
+
+        deleted = self._run_i5_check(tmp_path)
+
+        assert deleted == [], (
+            "Hash-mismatch must NOT trigger deletion — that path wiped "
+            "134 trained keys on 2026-05-14 00:42:56"
+        )
+        assert slot_dir.exists()
+        assert (slot_dir / "adapter_model.safetensors").exists()
+        assert interim_reg_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1351,7 +1472,7 @@ class TestSaveFromBytesGuard:
         reg = KeyRegistry()
         reg.add("key1")
         reg.add("key2")
-        reg.set_adapter_health("episodic", "healthy", reason="test")
+        reg.set_health("healthy", reason="test")
 
         path_a = tmp_path / "reg_a.json"
         path_b = tmp_path / "reg_b.json"
@@ -1421,7 +1542,7 @@ class TestManifestWrittenPostSession:
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch("paramem.server.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
-            patch("paramem.training.consolidation.format_indexed_training", return_value=[{}]),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
             patch.object(loop, "_disable_gradient_checkpointing"),
@@ -1442,7 +1563,8 @@ class TestManifestWrittenPostSession:
         assert result["mode"] == "trained"
 
         # Locate the timestamped slot created by atomic_save_adapter.
-        adapter_dir = tmp_path / adapter_name
+        # 2026-05-14 hierarchy: interim slots live under episodic/interim_<stamp>/.
+        adapter_dir = tmp_path / "episodic" / f"interim_{stamp}"
         slots = [d for d in adapter_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
         assert slots, f"No slot dir created under {adapter_dir}"
         slot = slots[0]

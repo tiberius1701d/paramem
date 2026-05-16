@@ -109,9 +109,9 @@ class TestTemplateGeneration:
             },
         ]
         qa = generate_qa_from_relations(relations)
-        assert qa[0]["source_predicate"] == "prefers"
-        assert qa[0]["source_subject"] == "Alex"
-        assert qa[0]["source_object"] == "Python"
+        assert qa[0]["predicate"] == "prefers"
+        assert qa[0]["subject"] == "Alex"
+        assert qa[0]["object"] == "Python"
 
     def test_empty_relations(self):
         qa = generate_qa_from_relations([])
@@ -466,11 +466,11 @@ class TestGenerateQaFromGraph:
                 )
             ],
         )
-        episodic_qa, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=False)
+        episodic_rels, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=False)
         assert procedural_rels == []
-        assert len(episodic_qa) == 1
-        assert episodic_qa[0]["source_predicate"] == "lives_in"
-        assert episodic_qa[0]["source_subject"] == "Alex"
+        assert len(episodic_rels) == 1
+        assert episodic_rels[0]["predicate"] == "lives_in"
+        assert episodic_rels[0]["subject"] == "Alex"
 
     def test_attributes_alone_yield_projected_qa(self):
         """Entity with attributes but no relations still produces keyed QA."""
@@ -483,11 +483,11 @@ class TestGenerateQaFromGraph:
                 )
             ],
         )
-        episodic_qa, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=False)
+        episodic_rels, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=False)
         assert procedural_rels == []
-        assert len(episodic_qa) == 1
-        assert episodic_qa[0]["source_predicate"] == "has_email"
-        assert episodic_qa[0]["source_object"] == "alex@example.com"
+        assert len(episodic_rels) == 1
+        assert episodic_rels[0]["predicate"] == "has_email"
+        assert episodic_rels[0]["object"] == "alex@example.com"
 
     def test_relations_and_attributes_unified(self):
         """Both surfaces feed the same pipeline; output set contains both."""
@@ -509,8 +509,8 @@ class TestGenerateQaFromGraph:
                 )
             ],
         )
-        episodic_qa, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=False)
-        predicates = {qa["source_predicate"] for qa in episodic_qa}
+        episodic_rels, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=False)
+        predicates = {qa["predicate"] for qa in episodic_rels}
         assert predicates == {"lives_in", "has_email"}
         assert procedural_rels == []
 
@@ -534,8 +534,8 @@ class TestGenerateQaFromGraph:
                 )
             ],
         )
-        episodic_qa, _ = generate_qa_from_graph(graph, procedural_enabled=False)
-        assert len(episodic_qa) == 1  # the explicit relation only — no duplicate
+        episodic_rels, _ = generate_qa_from_graph(graph, procedural_enabled=False)
+        assert len(episodic_rels) == 1  # the explicit relation only — no duplicate
 
     def test_preference_relation_routes_to_procedural(self):
         """relation_type='preference' goes to procedural slot when enabled."""
@@ -557,8 +557,8 @@ class TestGenerateQaFromGraph:
                 ),
             ],
         )
-        episodic_qa, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=True)
-        ep_preds = {qa["source_predicate"] for qa in episodic_qa}
+        episodic_rels, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=True)
+        ep_preds = {qa["predicate"] for qa in episodic_rels}
         proc_preds = {r["predicate"] for r in procedural_rels}
         assert ep_preds == {"lives_in"}
         assert proc_preds == {"prefers"}
@@ -574,6 +574,6 @@ class TestGenerateQaFromGraph:
                 )
             ],
         )
-        episodic_qa, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=True)
-        assert len(episodic_qa) == 1
+        episodic_rels, procedural_rels = generate_qa_from_graph(graph, procedural_enabled=True)
+        assert len(episodic_rels) == 1
         assert procedural_rels == []

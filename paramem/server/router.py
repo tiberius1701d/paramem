@@ -16,8 +16,8 @@ graph-coverage details are still surfaced via ``plan.steps`` (PA probe
 targets) and ``plan.ha_domains`` (HA observability).
 
 The router is stateless per query — all state lives in the indexes
-built from keyed_pairs.json, the knowledge graph, and the HA entity
-graph.
+built from the ConsolidationLoop cache, the knowledge graph, and the
+HA entity graph.
 """
 
 from __future__ import annotations
@@ -40,8 +40,6 @@ logger = logging.getLogger(__name__)
 
 # Minimum fuzzy match score (0-100) for entity extraction fallback
 FUZZY_THRESHOLD = 80
-# Maximum keys to probe per query (bounds latency)
-MAX_KEYS_PER_QUERY = 10
 
 
 class Intent(str, Enum):
@@ -217,17 +215,19 @@ def _is_interrogative(text: str, config=None) -> bool:
 class QueryRouter:
     """Routes queries to adapters and keys using the knowledge graph.
 
-    Built from persisted keyed_pairs.json files (one per adapter) and
-    the cumulative knowledge graph. Rebuilt after each consolidation.
+    Rebuilt after each consolidation.  Indexes are built directly from the
+    injected :class:`paramem.training.memory_store.MemoryStore` (canonical
+    in both train and simulate modes) and the cumulative knowledge graph.
     Optionally includes an HA entity graph for dual-graph routing.
     """
 
     def __init__(
         self,
         adapter_dir: Path,
+        memory_store,
         graph_path: Path | None = None,
-        ha_graph: HAEntityGraph | None = None,
-        intent_config: IntentConfig | None = None,
+        ha_graph: "HAEntityGraph | None" = None,
+        intent_config: "IntentConfig | None" = None,
         simulate_dir: Path | None = None,
     ):
         self.adapter_dir = Path(adapter_dir)
@@ -238,10 +238,11 @@ class QueryRouter:
         # fail-closed default.  None means callers receive Intent.UNKNOWN
         # when state signals don't fire — fine for tests that don't care.
         self._intent_config = intent_config
-        # Simulate-mode graph store directory.  When set, reload() also scans
-        # per-tier graph.json files under this directory for entity indexing.
-        # None keeps experiment/test callers working without arg changes.
+        # Simulate-mode graph store directory retained for back-compat;
+        # no longer used by reload() (cache is canonical source).
         self.simulate_dir = Path(simulate_dir) if simulate_dir is not None else None
+        # The MemoryStore — canonical source of indexed-key entries.
+        self._memory_store = memory_store
 
         # adapter_name -> {entity_lower -> set[key]}
         self._entity_key_index: dict[str, dict[str, set[str]]] = {}
@@ -255,33 +256,51 @@ class QueryRouter:
         self.reload()
 
     def reload(self) -> None:
-        """Rebuild indexes from disk. Call after consolidation."""
+        """Rebuild indexes from the injected :class:`MemoryStore`.
+
+        Walks ``self._memory_store.iter_entries()`` (canonical in both train
+        and simulate modes).  Tier ownership comes from the store; no flat
+        key→tier reverse lookup needed.
+
+        Also loads from the cumulative knowledge graph when
+        :attr:`graph_path` is set.
+
+        Call after consolidation so the indexes reflect the current
+        in-memory state.
+        """
         self._entity_key_index.clear()
         self._speaker_key_index.clear()
         self._all_entities.clear()
 
-        # Scan adapter directories for keyed_pairs.json (train-mode store).
-        if not self.adapter_dir.exists():
-            logger.info("No adapter directory at %s", self.adapter_dir)
+        store = self._memory_store
+        if store is not None and len(store) > 0:
+            # Walk the store tier-by-tier.  Tier ownership is the store's
+            # canonical answer — no flat key→tier reverse lookup needed.
+            # ``adapter_id`` is the tier name verbatim, matching what
+            # ``model.peft_config`` uses, so probe-time
+            # ``switch_adapter(model, step.adapter_name)`` lands on the
+            # trained slot.  Do NOT normalize/strip interim stamps:
+            # ``episodic_interim_<stamp>`` is the canonical adapter name
+            # during an interim window, and the probe-order block in
+            # ``route()`` (``*interim_names_sorted, "episodic", ...``)
+            # expects unstripped names so the newest interim takes
+            # priority over a promoted main "episodic" tier.
+            tier_pairs: dict[str, list[dict]] = {}
+            for tier_name, key, entry in store.iter_entries():
+                tier_pairs.setdefault(tier_name, []).append(
+                    {
+                        "key": key,
+                        "subject": entry.get("subject", ""),
+                        "predicate": entry.get("predicate", ""),
+                        "object": entry.get("object", ""),
+                        "speaker_id": entry.get("speaker_id", ""),
+                        "first_seen_cycle": entry.get("first_seen_cycle", 0),
+                    }
+                )
+            for tier_name, pairs in tier_pairs.items():
+                self._index_pairs(tier_name, pairs)
         else:
-            for kp_path in self.adapter_dir.rglob("keyed_pairs.json"):
-                # Infer adapter name from directory structure
-                # Expected: adapter_dir/adapter_name/keyed_pairs.json
-                # or: adapter_dir/keyed_pairs.json (single adapter)
-                rel = kp_path.relative_to(self.adapter_dir)
-                if len(rel.parts) == 1:
-                    adapter_name = "episodic"
-                else:
-                    adapter_name = rel.parts[0]
-
-                self._load_keyed_pairs(adapter_name, kp_path)
-
-        # Scan simulate-mode store for per-tier graph.json files.
-        if self.simulate_dir is not None and self.simulate_dir.exists():
-            for tier in ("episodic", "semantic", "procedural"):
-                graph_path = self.simulate_dir / tier / "graph.json"
-                if graph_path.exists():
-                    self._load_graph_pairs(tier, graph_path)
+            logger.info("Router reload: memory store empty — indexes will be empty")
 
         # Also load from graph nodes if available
         if self.graph_path and self.graph_path.exists():
@@ -294,72 +313,13 @@ class QueryRouter:
             len(self._entity_key_index),
         )
 
-    def _load_keyed_pairs(self, adapter_name: str, path: Path) -> None:
-        """Index entities from a keyed_pairs.json file.  Transparently
-        decrypts age-wrapped content when the daily identity is loaded.
-
-        Uses :func:`~paramem.training.keyed_pairs_io.read_keyed_pairs_quad`
-        as the universal reader: it returns quad-schema dicts for native quad
-        files AND projects legacy QA-format files (``"question"`` key present)
-        to the same 6-field quad shape, so entity indexing is identical for
-        both on-disk schemas.  The entity fields after projection are always
-        ``"subject"`` and ``"object"`` (not ``"source_subject"``/
-        ``"source_object"``).  ``"key"`` and ``"speaker_id"`` survive both
-        projection paths unchanged.
-
-        Attribute-predicate indexing: predicates of the form ``has_<attr>``
-        (e.g. ``has_email``, ``has_phone``, ``has_linkedin``) are also indexed
-        under the de-prefixed attribute name (e.g. ``"email"``, ``"phone"``,
-        ``"linkedin"``) so that a query like "what is my email address?" matches
-        the attribute entity directly and retrieves the ``has_email`` key
-        regardless of how many speaker-rooted keys exist — the ``MAX_KEYS_PER_QUERY``
-        cap can never suppress an attribute key when the user explicitly asks
-        for that attribute.  This is Option A of the B3 attribute-key fix.
-        """
-        from paramem.training.keyed_pairs_io import read_keyed_pairs_quad
-
-        try:
-            pairs = read_keyed_pairs_quad(path)
-        except (json.JSONDecodeError, ValueError, OSError, UnicodeDecodeError) as e:
-            logger.warning("Failed to load %s: %s", path, e)
-            return
-
-        self._index_pairs(adapter_name, pairs)
-
-    def _load_graph_pairs(self, adapter_name: str, graph_path: Path) -> None:
-        """Index entities from a simulate-mode per-tier ``graph.json`` file.
-
-        Calls :func:`~paramem.server.simulate_store.load_simulate_graph` and
-        :func:`~paramem.server.simulate_store.iter_quads` to convert the graph
-        into the same six-field quad dicts consumed by :meth:`_index_pairs`.
-
-        Falls back silently on read errors so a corrupted or missing graph.json
-        does not abort the boot-time router rebuild.
-
-        Args:
-            adapter_name: Tier name (``"episodic"``, ``"semantic"``, or
-                ``"procedural"``).
-            graph_path: Absolute path to the ``graph.json`` file under
-                ``simulate_dir/<tier>/graph.json``.
-        """
-        try:
-            from paramem.server.simulate_store import iter_quads, load_simulate_graph
-
-            graph = load_simulate_graph(graph_path)
-            pairs = list(iter_quads(graph))
-        except Exception as e:
-            logger.warning("Failed to load simulate graph %s: %s", graph_path, e)
-            return
-
-        self._index_pairs(adapter_name, pairs)
-
     def _index_pairs(self, adapter_name: str, pairs: list[dict]) -> None:
-        """Index entity and speaker data from a list of quad-schema dicts.
+        """Index entity and speaker data from a list of entry dicts.
 
-        Shared by :meth:`_load_keyed_pairs` (which reads ``keyed_pairs.json``)
-        and :meth:`_load_graph_pairs` (which reads ``graph.json``).  Both
-        sources project to the same six-field ``KEYED_PAIR_FIELDS_QUAD`` shape
-        so the indexing logic is identical:
+        Called by :meth:`reload` with pairs projected from
+        ``ConsolidationLoop.store`` (the per-tier memory store; canonical
+        source for both train and simulate modes).  All sources use the
+        same entry shape so the indexing logic is identical:
 
         * ``subject`` and ``object`` are indexed as entity names (lowercase).
         * ``speaker_id`` is indexed in the per-speaker key set.
@@ -370,7 +330,7 @@ class QueryRouter:
         Args:
             adapter_name: Tier name used as the key in
                 ``self._entity_key_index``.
-            pairs: List of six-field quad dicts (``key``, ``subject``,
+            pairs: List of entry dicts (``key``, ``subject``,
                 ``predicate``, ``object``, ``speaker_id``,
                 ``first_seen_cycle``).
         """
@@ -388,9 +348,7 @@ class QueryRouter:
                     self._all_entities.add(entity_lower)
             # Attribute-predicate indexing: index has_<attr> predicates under
             # the bare attribute name so "what is my email" matches "email"
-            # directly and resolves to the has_email key.  Works for both QA
-            # (source_predicate projected to predicate by the universal reader)
-            # and native quad files.
+            # directly and resolves to the has_email key.
             predicate = kp.get("predicate", "")
             if predicate.startswith("has_") and len(predicate) > 4:
                 attr_name = predicate[4:]  # strip "has_" prefix
@@ -500,12 +458,34 @@ class QueryRouter:
                 "episodic",
                 "semantic",
             ]
+            # No Top-K slice on the authenticated path.
+            #
+            # The reachable path here REQUIRES ``allowed_keys`` to be
+            # non-empty (line 422: ``if self._entity_key_index and
+            # allowed_keys``) — i.e. the speaker is authenticated and
+            # owns at least one key.  ``_resolve_keys`` has already
+            # intersected with ``allowed_keys`` (line 599), so the per-
+            # adapter set is already scoped to the speaker's own facts
+            # and entity-narrowed by the query's matched entities.
+            #
+            # The legacy ``[:MAX_KEYS_PER_QUERY=10]`` slice on
+            # ``list(set(...))`` was non-deterministic (Python hash
+            # randomization) and caused narrow attribute keys
+            # (``has_email`` etc.) to lose a coin-flip on speakers
+            # with > 10 entity-touching facts — the failure mode logged
+            # in ``project_routing_layer``.  Removing the slice is safe
+            # because: (a) the result is already filtered to the
+            # speaker's own scope (privacy), (b) ``_resolve_keys`` is
+            # entity-narrowed (relevance), (c) when ``inference.preload_cache``
+            # is on, downstream cost is O(N) RAM lookups + one
+            # ``model.generate`` for reasoning regardless of N.
+            # ``sorted(...)`` gives deterministic probe order.
             for adapter_name in ordered:
                 if adapter_name in adapter_keys and adapter_name not in placed:
                     steps.append(
                         RoutingStep(
                             adapter_name=adapter_name,
-                            keys_to_probe=list(adapter_keys[adapter_name])[:MAX_KEYS_PER_QUERY],
+                            keys_to_probe=sorted(adapter_keys[adapter_name]),
                         )
                     )
                     placed.add(adapter_name)
@@ -517,7 +497,7 @@ class QueryRouter:
                 steps.append(
                     RoutingStep(
                         adapter_name=adapter_name,
-                        keys_to_probe=list(keys)[:MAX_KEYS_PER_QUERY],
+                        keys_to_probe=sorted(keys),
                     )
                 )
 

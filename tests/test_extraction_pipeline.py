@@ -1210,9 +1210,18 @@ class TestSOTANoiseFilter:
         # Fallback path recorded in diagnostics.
         assert result.diagnostics.get("fallback_path") == "anon_failed"
 
-    def test_pipeline_enrichment_failure_keeps_anon_facts(self):
-        """If enrichment fails, the anonymized facts pass through to de-anonymization."""
-        from paramem.graph.extractor import _sota_pipeline
+    def test_pipeline_enrichment_failure_raises_extraction_failed(self):
+        """Enrichment failure must FAIL the cycle, not silently fall back.
+
+        Previously this test asserted the silent-fallback behavior the
+        2026-05-13 handover identified as a load-bearing bug: a SOTA
+        529 baked a degraded (un-enriched) snapshot into the cumulative
+        graph; the next cycle deduped the same triples so the missing
+        second-order relations were lost permanently.  The pipeline
+        now raises ``ExtractionFailed`` so the per-session loop in
+        ``app.py`` leaves the session pending for retry.
+        """
+        from paramem.graph.extractor import ExtractionFailed, _sota_pipeline
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1235,12 +1244,9 @@ class TestSOTANoiseFilter:
                 return_value=(None, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
-
-        # Enrichment failed → anon_facts used → de-anonymized to real names
-        assert len(result.relations) == 1
-        assert result.relations[0].subject == "Alex"
-        assert result.relations[0].object == "Millfield"
+            with pytest.raises(ExtractionFailed) as excinfo:
+                _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
+        assert excinfo.value.phase == "sota_enrich"
 
     def test_pipeline_enriched_facts_get_deanonymized(self):
         """Enrichment output flows through de-anonymization to real names."""
@@ -2153,18 +2159,34 @@ class TestBackgroundTrainer:
 
 class TestCollectSemanticKeys:
     def _make_loop_stub(self):
+        from paramem.training.memory_store import MemoryStore as _MS
+
         class Stub:
             def __init__(self):
-                self.indexed_key_cache = {
-                    "graph1": {"key": "graph1", "question": "Q1", "answer": "A1"},
-                    "graph2": {"key": "graph2", "question": "Q2", "answer": "A2"},
-                    "proc1": {"key": "proc1", "question": "QP", "answer": "AP"},
-                }
-                self.semantic_simhash = {"graph1": 12345}
-                # _is_quad / _indexed_format must be set on any object that
-                # binds ConsolidationLoop methods directly.
-                self._indexed_format = "qa"
-                self._is_quad = False
+                self.store = _MS(replay_enabled=False)
+                # Seed the store directly (skip registry; replay disabled).
+                for k, s, p, o in [
+                    ("graph1", "Alice", "lives_in", "Berlin"),
+                    ("graph2", "Bob", "works_at", "ACME"),
+                ]:
+                    self.store.put(
+                        "semantic",
+                        k,
+                        {"key": k, "subject": s, "predicate": p, "object": o},
+                        register=False,
+                    )
+                self.store.put(
+                    "procedural",
+                    "proc1",
+                    {
+                        "key": "proc1",
+                        "subject": "Alice",
+                        "predicate": "prefers",
+                        "object": "tea",
+                    },
+                    register=False,
+                )
+                self.store.put_simhash("semantic", "graph1", 12345)
 
         from paramem.training.consolidation import ConsolidationLoop
 
@@ -2180,12 +2202,12 @@ class TestCollectSemanticKeys:
 
     def test_empty_semantic(self):
         stub = self._make_loop_stub()
-        stub.semantic_simhash = {}
+        stub.store.replace_simhashes_in_tier("semantic", {})
         assert stub._collect_semantic_keys() == []
 
     def test_missing_qa_skipped(self):
         stub = self._make_loop_stub()
-        stub.semantic_simhash = {"graph99": 99999}
+        stub.store.replace_simhashes_in_tier("semantic", {"graph99": 99999})
         assert stub._collect_semantic_keys() == []
 
 
@@ -2196,43 +2218,54 @@ class TestDebugArtifacts:
     def test_save_debug_artifacts_writes_plaintext(self, tmp_path):
         from paramem.server.consolidation import _save_debug_artifacts
 
+        # 2026-05-15 spec: _save_debug_artifacts writes under
+        # loop.snapshot_dir_for(interim_stamp=...), which lands at
+        # paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<id>/.
+        out_dir = tmp_path / "episodic" / "cycle_4" / "run_xyz"
+
         loop = MagicMock()
         loop.merger.save_graph = MagicMock()
         loop.cycle_count = 4
+        loop._current_interim_stamp = None
+        loop.snapshot_dir_for = MagicMock(return_value=out_dir)
 
         config = MagicMock()
-        config.debug_dir = tmp_path
+        config.debug_dir = tmp_path  # fallback only used when snapshot_dir_for returns None
 
-        episodic_qa = [{"question": "Q", "answer": "A"}]
+        episodic_rels = [{"question": "Q", "answer": "A"}]
         procedural_rels = [{"subject": "S", "predicate": "P", "object": "O"}]
 
-        _save_debug_artifacts(loop, config, episodic_qa, procedural_rels)
+        _save_debug_artifacts(loop, config, episodic_rels, procedural_rels)
 
-        out = tmp_path / "cycle_4"
         # All debug filenames carry the _snapshot postfix (locked decision #7)
-        assert (out / "episodic_qa_snapshot.json").exists()
-        assert (out / "procedural_rels_snapshot.json").exists()
-        loop.merger.save_graph.assert_called_once_with(out / "graph_snapshot.json", encrypted=False)
+        assert (out_dir / "episodic_rels_snapshot.json").exists()
+        assert (out_dir / "procedural_rels_snapshot.json").exists()
+        loop.merger.save_graph.assert_called_once_with(
+            out_dir / "graph_snapshot.json", encrypted=False
+        )
 
-        with open(out / "episodic_qa_snapshot.json") as f:
+        with open(out_dir / "episodic_rels_snapshot.json") as f:
             saved = json.load(f)  # plaintext json — readable without decrypt
-        assert saved == episodic_qa
+        assert saved == episodic_rels
 
     def test_save_debug_artifacts_omits_procedural_when_empty(self, tmp_path):
         from paramem.server.consolidation import _save_debug_artifacts
 
+        out_dir = tmp_path / "episodic" / "cycle_2" / "run_xyz"
+
         loop = MagicMock()
         loop.merger.save_graph = MagicMock()
         loop.cycle_count = 2
+        loop._current_interim_stamp = None
+        loop.snapshot_dir_for = MagicMock(return_value=out_dir)
 
         config = MagicMock()
         config.debug_dir = tmp_path
 
         _save_debug_artifacts(loop, config, [{"question": "Q", "answer": "A"}], [])
 
-        out = tmp_path / "cycle_2"
-        assert (out / "episodic_qa_snapshot.json").exists()
-        assert not (out / "procedural_rels_snapshot.json").exists()
+        assert (out_dir / "episodic_rels_snapshot.json").exists()
+        assert not (out_dir / "procedural_rels_snapshot.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2516,6 +2549,65 @@ class TestAnonFailureFallback:
             "fallback must be triggered with reason=anon_failed"
         )
         assert result.diagnostics.get("fallback_path") == "anon_failed"
+
+
+class TestSotaEnrichmentFailureRaises:
+    """When SOTA enrichment fails, raise ExtractionFailed instead of
+    silently falling back to pre-enrichment facts.
+
+    Closes the regression that on 2026-05-13 baked a degraded snapshot
+    into the cumulative graph after an Anthropic 529 — by the time the
+    next cycle re-extracted, the in-memory merger had already absorbed
+    the un-enriched triples, so the missing second-order relations were
+    permanently lost.  See ``project_extraction_failure_fails_cycle``.
+    """
+
+    def test_sota_enrich_failure_raises_extraction_failed(self):
+        """_filter_with_sota returning (None, ...) → ExtractionFailed."""
+        from paramem.graph.extractor import ExtractionFailed, _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor._anonymize_with_local_model",
+                return_value=(anon_facts, mapping, "", ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                # First element None ⇒ SOTA call failed or unparseable.
+                # Pre-fix this silently fell back to anon_facts.  Post-fix
+                # this MUST raise so the per-session loop in app.py marks
+                # the chunk failed and leaves the session pending.
+                return_value=(None, None, {}, None, {"parse_path": "no_response"}),
+            ),
+        ):
+            try:
+                _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
+            except ExtractionFailed as exc:
+                assert exc.phase == "sota_enrich"
+                assert exc.reason
+            else:
+                raise AssertionError("_sota_pipeline must raise ExtractionFailed on SOTA failure")
+
+    def test_extraction_failed_exposes_phase_and_reason(self):
+        """Exception class contract used by the app.py per-chunk handler."""
+        from paramem.graph.extractor import ExtractionFailed
+
+        exc = ExtractionFailed("sota_enrich", "timeout")
+        assert exc.phase == "sota_enrich"
+        assert exc.reason == "timeout"
+        assert "sota_enrich" in str(exc)
+        assert "timeout" in str(exc)
 
 
 class TestAllDroppedSafetyNet:
@@ -3103,8 +3195,7 @@ class TestConsolidationScheduleConfigPrivacyGuard:
 
         minimal_yaml = tmp_path / "server.yaml"
         minimal_yaml.write_text(
-            "model: mistral\nconsolidation:\n  schedule: every 2h\n"
-            "  mode: simulate\n  indexed_format: quad\n"
+            "model: mistral\nconsolidation:\n  schedule: every 2h\n  mode: simulate\n"
         )
         config = load_server_config(minimal_yaml)
         # New fields must be present with defaults

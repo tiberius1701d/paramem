@@ -14,6 +14,7 @@ from paramem.server.config import (
     ServerConfig,
     load_server_config,
 )
+from paramem.training.memory_store import MemoryStore as _MS
 
 
 class TestAbstentionConfig:
@@ -179,6 +180,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_facts("spk-abc123"),
                 speaker_id="spk-abc123",
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.text == config.abstention.load_response()
@@ -209,6 +211,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),
                 speaker_id="spk-anon-42",
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.text == config.abstention.load_cold_start_response()
@@ -242,6 +245,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),  # empty _speaker_key_index
                 speaker_id="spk-fresh-1",
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.text == config.abstention.load_cold_start_response()
@@ -281,6 +285,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),
                 speaker_id="spk-anon-1",
+                memory_store=_MS(replay_enabled=False),
             )
 
         mock_base_model.assert_called_once()
@@ -314,6 +319,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(),
                 speaker_id="spk-abc123",
+                memory_store=_MS(replay_enabled=False),
             )
 
         mock_base_model.assert_called_once()
@@ -348,6 +354,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_none_match_router(intent=Intent.GENERAL),
                 speaker_id="spk-abc123",
+                memory_store=_MS(replay_enabled=False),
             )
 
         mock_ha.assert_called_once()
@@ -389,6 +396,7 @@ class TestAbstentionShortCircuit:
                 router=self._make_none_match_router(intent=Intent.GENERAL),
                 sota_agent=None,  # no SOTA available either
                 speaker_id="spk-abc123",
+                memory_store=_MS(replay_enabled=False),
             )
 
         mock_base_model.assert_called_once()
@@ -424,10 +432,6 @@ class TestAbstentionShortCircuit:
                 "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
                 return_value={"graph0001": None},
             ),
-            patch(
-                "paramem.training.indexed_memory.probe_keys_from_disk",
-                return_value={"graph0001": None},
-            ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
         ):
             result = handle_chat(
@@ -440,6 +444,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_steps("spk-abc123"),
                 speaker_id="spk-abc123",
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.text == config.abstention.load_response()
@@ -470,10 +475,6 @@ class TestAbstentionShortCircuit:
                 return_value={"graph0001": None},
             ),
             patch(
-                "paramem.training.indexed_memory.probe_keys_from_disk",
-                return_value={"graph0001": None},
-            ),
-            patch(
                 "paramem.server.inference._escalate_to_ha_agent",
                 return_value=ChatResult(text="Your 3pm with Pat.", escalated=True),
             ) as mock_ha,
@@ -489,6 +490,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_steps("spk-abc123"),
                 speaker_id="spk-abc123",
+                memory_store=_MS(replay_enabled=False),
             )
 
         mock_ha.assert_called_once()
@@ -517,10 +519,6 @@ class TestAbstentionShortCircuit:
                 return_value={"graph0001": None},
             ),
             patch(
-                "paramem.training.indexed_memory.probe_keys_from_disk",
-                return_value={"graph0001": None},
-            ),
-            patch(
                 "paramem.server.inference._base_model_answer",
                 return_value=ChatResult(text="base model answer"),
             ) as mock_base_model,
@@ -535,6 +533,7 @@ class TestAbstentionShortCircuit:
                 config=config,
                 router=self._make_router_with_steps("spk-abc123"),
                 speaker_id="spk-abc123",
+                memory_store=_MS(replay_enabled=False),
             )
 
         mock_base_model.assert_called_once()

@@ -90,7 +90,7 @@ class TestRollbackPreparation:
 
         orig_cycle = loop.cycle_count
         orig_next_idx = loop._indexed_next_index
-        orig_qa = dict(loop.indexed_key_cache)
+        orig_qa = dict(loop.store._entries_flat_view())
 
         loop.prepare_training_data([], [])
 
@@ -99,7 +99,7 @@ class TestRollbackPreparation:
         loop.rollback_preparation()
         assert loop.cycle_count == orig_cycle
         assert loop._indexed_next_index == orig_next_idx
-        assert loop.indexed_key_cache == orig_qa
+        assert loop.store._entries_flat_view() == orig_qa
 
     def test_rollback_without_snapshot(self, tmp_path):
         """Rollback with no prior prepare should not crash."""
@@ -317,7 +317,7 @@ class TestBackgroundTrainerTraining:
 
         completed = []
         job = TrainingJob(
-            keyed_pairs=keyed,
+            entries=keyed,
             adapter_name="episodic",
             adapter_config=AdapterConfig(),
         )
@@ -353,7 +353,7 @@ class TestBackgroundTrainerTraining:
         )
 
         job = TrainingJob(
-            keyed_pairs=keyed,
+            entries=keyed,
             adapter_name="episodic",
             adapter_config=AdapterConfig(),
         )
@@ -637,17 +637,17 @@ class TestBatchConsolidationE2E:
             "[user] My name is Alex. I live in Millfield.\n"
             "[assistant] Nice to meet you, Alex. Millfield is a nice place."
         )
-        episodic_qa, procedural_rels = loop.extract_session(
+        episodic_rels, procedural_rels = loop.extract_session(
             transcript, "test_session", speaker_id="sp1"
         )
 
         # Should extract something (quality depends on Mistral)
-        assert isinstance(episodic_qa, list)
+        assert isinstance(episodic_rels, list)
         assert isinstance(procedural_rels, list)
 
         # If any QA pairs were extracted, verify training works
-        if episodic_qa:
-            result = loop.train_adapters(episodic_qa, procedural_rels, speaker_id="sp1")
+        if episodic_rels:
+            result = loop.train_adapters(episodic_rels, procedural_rels, speaker_id="sp1")
             assert isinstance(result, dict)
 
 
@@ -1082,15 +1082,15 @@ class TestSimulateModePromptIteration:
         )
         assert result["sessions"] == 1
         assert result.get("simulated") is True
-        assert result["episodic_qa"] >= 1, (
+        assert result["episodic_rels"] >= 1, (
             f"Expected at least one episodic QA pair from simulate-mode run; "
-            f"got episodic_qa={result['episodic_qa']}"
+            f"got episodic_rels={result['episodic_rels']}"
         )
 
         loop = result["loop"]
         assert loop is not None
         assert loop.indexed_key_registry is not None
-        assert len(loop.indexed_key_registry.list_active()) >= 1, (
+        assert len(loop._all_active_keys()) >= 1, (
             "Indexed-key registry empty — _simulate_indexed_key_episodic did not assign keys."
         )
 

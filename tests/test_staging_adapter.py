@@ -11,6 +11,7 @@ from paramem.models.loader import (
     atomic_save_adapter,
     copy_adapter_weights,
 )
+from paramem.training.memory_store import MemoryStore as _MS
 
 
 class _FakeParam:
@@ -391,7 +392,7 @@ class TestRunJobsErrorPath:
         bt._on_error = lambda: on_error_called.__setitem__(0, True)
 
         job = TrainingJob(
-            keyed_pairs=[{"key": "k1"}],
+            entries=[{"key": "k1"}],
             adapter_name="episodic",
             adapter_config=MagicMock(),
         )
@@ -424,7 +425,7 @@ class TestRunJobsErrorPath:
         bt._is_training = True
 
         job = TrainingJob(
-            keyed_pairs=[{"key": "k1"}],
+            entries=[{"key": "k1"}],
             adapter_name="episodic",
             adapter_config=MagicMock(),
         )
@@ -637,12 +638,8 @@ class TestMultiJobSequencing:
         bt._is_training = True
 
         jobs = [
-            TrainingJob(
-                keyed_pairs=[{"k": 1}], adapter_name="episodic", adapter_config=MagicMock()
-            ),
-            TrainingJob(
-                keyed_pairs=[{"k": 2}], adapter_name="semantic", adapter_config=MagicMock()
-            ),
+            TrainingJob(entries=[{"k": 1}], adapter_name="episodic", adapter_config=MagicMock()),
+            TrainingJob(entries=[{"k": 2}], adapter_name="semantic", adapter_config=MagicMock()),
         ]
         bt._run_jobs(jobs, on_complete=None)
 
@@ -675,7 +672,7 @@ class TestMultiJobSequencing:
         monkeypatch.setattr(loader_mod, "copy_adapter_weights", fake_copy)
         monkeypatch.setattr(loader_mod, "switch_adapter", fake_switch)
         monkeypatch.setattr(
-            "paramem.server.background_trainer.format_indexed_training",
+            "paramem.server.background_trainer.format_entry_training",
             lambda *a, **k: [],  # empty examples → early return, skips Trainer
         )
 
@@ -695,7 +692,7 @@ class TestMultiJobSequencing:
         )
 
         job = TrainingJob(
-            keyed_pairs=[{"k": 1}],
+            entries=[{"k": 1}],
             adapter_name="episodic",
             adapter_config=MagicMock(target_modules=list(attn_only), rank=8),
         )
@@ -740,7 +737,7 @@ class TestMultiJobSequencing:
 
         # Return one dummy example so the empty-guard doesn't short-circuit
         monkeypatch.setattr(
-            "paramem.server.background_trainer.format_indexed_training",
+            "paramem.server.background_trainer.format_entry_training",
             lambda *a, **k: [{"input_ids": [0], "labels": [0]}],
         )
 
@@ -793,7 +790,7 @@ class TestMultiJobSequencing:
         adapter_config = MagicMock(target_modules=list(attn_only), rank=8)
         adapter_config.learning_rate = 1e-4
         job = TrainingJob(
-            keyed_pairs=[{"k": 1}],
+            entries=[{"k": 1}],
             adapter_name="episodic",
             adapter_config=adapter_config,
         )
@@ -854,6 +851,7 @@ class TestStaleInTrainingCleanup:
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
+            memory_store=_MS(replay_enabled=False),
             output_dir=tmp_path,
         )
         # _ensure_adapters runs in __init__; the stale dir should be gone

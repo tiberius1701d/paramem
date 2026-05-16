@@ -146,13 +146,13 @@ class TestFindResumeDir:
 # ---------------------------------------------------------------------------
 
 
-def _write_raw_qa(run_dir: Path, sid: str, episodic_qa: list, procedural_rels: list) -> Path:
+def _write_raw_qa(run_dir: Path, sid: str, episodic_rels: list, procedural_rels: list) -> Path:
     """Write a raw_qa.json file under {run_dir}/diagnostics/{sid}.raw_qa.json.
 
     Args:
         run_dir: The probe run directory.
         sid: Session identifier used as the filename stem.
-        episodic_qa: List of episodic QA pair dicts.
+        episodic_rels: List of episodic QA pair dicts.
         procedural_rels: List of procedural relation dicts.
 
     Returns:
@@ -162,7 +162,7 @@ def _write_raw_qa(run_dir: Path, sid: str, episodic_qa: list, procedural_rels: l
     diag_dir.mkdir(parents=True, exist_ok=True)
     raw_qa_path = diag_dir / f"{sid}.raw_qa.json"
     raw_qa_path.write_text(
-        json.dumps({"episodic_qa": episodic_qa, "procedural_rels": procedural_rels})
+        json.dumps({"episodic_rels": episodic_rels, "procedural_rels": procedural_rels})
     )
     return raw_qa_path
 

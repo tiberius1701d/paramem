@@ -20,6 +20,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from paramem.training.memory_store import MemoryStore as _MS
+
 # Files allowed to call the extractors directly:
 # - extractor.py: the module defining them.
 # - extraction_pipeline.py: the chokepoint module that wraps them.
@@ -555,6 +557,7 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
         training_config=TrainingConfig(),
         episodic_adapter_config=AdapterConfig(),
         semantic_adapter_config=AdapterConfig(),
+        memory_store=_MS(replay_enabled=False),
         output_dir=tmp_path,
         persist_graph=False,
         **flipped,
@@ -817,6 +820,7 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
         training_config=TrainingConfig(),
         episodic_adapter_config=AdapterConfig(),
         semantic_adapter_config=AdapterConfig(),
+        memory_store=_MS(replay_enabled=False),
         output_dir=tmp_path,
         persist_graph=False,
         save_cycle_snapshots=True,
@@ -865,13 +869,16 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     )
 
     loop = _build_loop_with_session_dump(tmp_path, monkeypatch, fake_graph=fake_graph)
-    snapshot_root = loop.snapshot_dir
+    # 2026-05-15 layout: dumps land under
+    # paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/sessions/<id>/.
+    snapshot_root = loop.snapshot_dir_for()
+    assert snapshot_root is not None
 
     # --- Episodic chokepoint ---
     graph = loop.extraction.run("transcript text", "sess-A", speaker_id="Speaker0")
     loop._dump_session_graph(graph, "sess-A", "graph")
 
-    main_path = snapshot_root / "cycle_7" / "sessions" / "sess-A" / "graph_snapshot.json"
+    main_path = snapshot_root / "sessions" / "sess-A" / "graph_snapshot.json"
     assert main_path.exists(), f"episodic dump missing at {main_path}"
     main_dump = json.loads(main_path.read_text())
     assert main_dump["diagnostics"]["fallback_path"] == "all_dropped"
@@ -882,7 +889,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     proc_graph = loop.extraction.run_procedural("transcript text", "sess-A", speaker_id="Speaker0")
     loop._dump_session_graph(proc_graph, "sess-A", "procedural_graph")
 
-    proc_path = snapshot_root / "cycle_7" / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
+    proc_path = snapshot_root / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
     assert proc_path.exists(), f"procedural dump missing at {proc_path}"
     proc_dump = json.loads(proc_path.read_text())
     assert proc_dump["diagnostics"]["fallback_path"] == "all_dropped"
@@ -895,25 +902,26 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
 
 def test_dump_session_graph_short_circuits_when_debug_off(tmp_path):
     """:meth:`ConsolidationLoop._dump_session_graph` must short-circuit when
-    either ``save_cycle_snapshots`` is False or ``snapshot_dir`` is None.
-    Production runs without debug mode must not pay any disk cost from this
-    debug-only diagnostic.
+    either ``save_cycle_snapshots`` is False or the debug base (``_debug_base``)
+    is None.  Production runs without debug mode must not pay any disk cost
+    from this debug-only diagnostic.
     """
     from paramem.training.consolidation import ConsolidationLoop
 
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.cycle_count = 0
+    loop.run_id = "20260515T000000Z_aaaaaa"
     fake_graph = MagicMock(model_dump_json=lambda **kw: "{}")
 
     # save_cycle_snapshots=False → no write.
     loop.save_cycle_snapshots = False
-    loop.snapshot_dir = tmp_path
+    loop._debug_base = tmp_path
     loop._dump_session_graph(fake_graph, "s001", "graph")
-    assert not (tmp_path / "cycle_0").exists(), "dump fired despite save_cycle_snapshots=False"
+    assert not (tmp_path / "episodic").exists(), "dump fired despite save_cycle_snapshots=False"
 
-    # snapshot_dir=None → no write (no AttributeError on ``None / "cycle_X"``).
+    # _debug_base=None → no write (no AttributeError on ``None / "<tier>"``).
     loop.save_cycle_snapshots = True
-    loop.snapshot_dir = None
+    loop._debug_base = None
     loop._dump_session_graph(fake_graph, "s002", "graph")
 
 

@@ -237,7 +237,7 @@ def run_strategy(
         if isinstance(model, _PeftModel):
             model = model.base_model.model
 
-        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+        model, quads, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
             qa_pairs,
@@ -253,7 +253,7 @@ def run_strategy(
         recall_result = evaluate_indexed_recall(
             model,
             tokenizer,
-            keyed_pairs,
+            quads,
             registry,
             adapter_name=adapter_name,
         )
@@ -280,9 +280,9 @@ def run_strategy(
             if kr.get("recalled") and kr["recalled"].get("answer"):
                 key_to_recalled[kr["key"]] = kr["recalled"]["answer"]
 
-        # Build key → predicate lookup from keyed_pairs (in-memory, has metadata)
+        # Build key → predicate lookup from quads (in-memory, has metadata)
         key_to_predicate = {}
-        for kp in keyed_pairs:
+        for kp in quads:
             if "source_predicate" in kp:
                 key_to_predicate[kp["key"]] = kp["source_predicate"]
 

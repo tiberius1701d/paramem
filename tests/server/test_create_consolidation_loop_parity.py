@@ -9,10 +9,11 @@ production by construction.
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock
 
 import pytest
+
+from paramem.training.memory_store import MemoryStore as _MS  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -167,6 +168,7 @@ def test_factory_threads_every_config_knob(
         model=MagicMock(),
         tokenizer=MagicMock(),
         config=cfg,
+        memory_store=_MS(replay_enabled=False),
         **kw,
     )
 
@@ -259,12 +261,12 @@ def test_factory_skips_seeding_when_seed_state_from_disk_false(tmp_path, monkeyp
     from paramem.server import consolidation as server_consolidation
     from paramem.server.config import load_server_config
 
-    # Place a sentinel keyed_pairs.json so the seeding block WOULD fire if
+    # Place a sentinel quads.json so the seeding block WOULD fire if
     # seed_state_from_disk were True.
     adapters_dir = tmp_path / "adapters"
     ep_dir = adapters_dir / "episodic"
     ep_dir.mkdir(parents=True)
-    (ep_dir / "keyed_pairs.json").write_text('{"k1": {"question": "Q", "answer": "A"}}')
+    (ep_dir / "quads.json").write_text('{"k1": {"question": "Q", "answer": "A"}}')
 
     loop_instance = MagicMock()
 
@@ -282,6 +284,7 @@ def test_factory_skips_seeding_when_seed_state_from_disk_false(tmp_path, monkeyp
         model=MagicMock(),
         tokenizer=MagicMock(),
         config=cfg,
+        memory_store=_MS(replay_enabled=False),
         seed_state_from_disk=False,
     )
 
@@ -291,140 +294,21 @@ def test_factory_skips_seeding_when_seed_state_from_disk_false(tmp_path, monkeyp
     loop_instance.seed_procedural_cache.assert_not_called()
 
 
-def test_factory_seeds_from_disk_by_default(tmp_path, monkeypatch):
-    """Production callers (no explicit seed_state_from_disk) get the
-    historical seeding behaviour. A sentinel keyed_pairs.json under the
-    adapter dir triggers seed_episodic_cache with the parsed pair list.
-    """
-    from paramem.server import consolidation as server_consolidation
-    from paramem.server.config import load_server_config
-
-    adapters_dir = tmp_path / "adapters"
-    ep_dir = adapters_dir / "episodic"
-    ep_dir.mkdir(parents=True)
-    # keyed_pairs.json must be a JSON array with full-schema entries so
-    # read_keyed_pairs passes validation and seeds the loop.
-    ep_pairs = [
-        {
-            "key": "graph1",
-            "question": "Who is Q?",
-            "answer": "A person.",
-            "source_subject": "Q",
-            "source_predicate": "is_a",
-            "source_object": "person",
-            "speaker_id": "Speaker0",
-            "first_seen_cycle": 1,
-        }
-    ]
-    (ep_dir / "keyed_pairs.json").write_text(json.dumps(ep_pairs))
-
-    loop_instance = MagicMock()
-
-    def _fake_loop(**kwargs):
-        return loop_instance
-
-    monkeypatch.setattr(server_consolidation, "ConsolidationLoop", _fake_loop)
-
-    cfg = load_server_config("tests/fixtures/server.yaml")
-    cfg.paths.data = tmp_path
-    cfg.paths.simulate = tmp_path / "simulate"
-    cfg.paths.debug = tmp_path / "debug"
-
-    server_consolidation.create_consolidation_loop(
-        model=MagicMock(),
-        tokenizer=MagicMock(),
-        config=cfg,
-        # seed_state_from_disk defaults to True
-    )
-
-    loop_instance.seed_episodic_cache.assert_called_once_with(ep_pairs)
-
-
-def test_factory_simulate_mode_seeds_from_graph_json(tmp_path, monkeypatch):
-    """Simulate-mode boot seed reads graph.json (not keyed_pairs.json).
-
-    A sentinel ``graph.json`` written via :func:`save_simulate_graph` under
-    ``paths.simulate/episodic/`` triggers ``seed_episodic_cache`` with the
-    six-field quad dicts produced by :func:`iter_quads`; the loop is NOT
-    seeded from ``keyed_pairs.json``.
-
-    Verifies locked decision #2: simulate mode reads from ``paths.simulate``
-    and uses the graph reader, not the kp reader.
-    """
-    import networkx as nx
-
-    from paramem.server import consolidation as server_consolidation
-    from paramem.server.config import load_server_config
-    from paramem.server.simulate_store import _IK_KEY_ATTR, save_simulate_graph
-
-    # Build a graph.json with one edge carrying an indexed-memory key.
-    graph = nx.MultiDiGraph()
-    graph.add_edge(
-        "Alice",
-        "Berlin",
-        **{
-            _IK_KEY_ATTR: "graph1",
-            "predicate": "lives_in",
-            "speaker_id": "Speaker0",
-            "first_seen_cycle": 1,
-        },
-    )
-    sim_ep_dir = tmp_path / "simulate" / "episodic"
-    sim_ep_dir.mkdir(parents=True)
-    save_simulate_graph(graph, sim_ep_dir / "graph.json")
-
-    loop_instance = MagicMock()
-
-    def _fake_loop(**kwargs):
-        return loop_instance
-
-    monkeypatch.setattr(server_consolidation, "ConsolidationLoop", _fake_loop)
-
-    cfg = load_server_config("tests/fixtures/server.yaml")
-    cfg.consolidation.mode = "simulate"
-    cfg.paths.data = tmp_path
-    cfg.paths.simulate = tmp_path / "simulate"
-    cfg.paths.debug = tmp_path / "debug"
-
-    server_consolidation.create_consolidation_loop(
-        model=MagicMock(),
-        tokenizer=MagicMock(),
-        config=cfg,
-    )
-
-    loop_instance.seed_episodic_cache.assert_called_once()
-    seeded_pairs = loop_instance.seed_episodic_cache.call_args[0][0]
-    assert len(seeded_pairs) == 1
-    pair = seeded_pairs[0]
-    assert pair["key"] == "graph1"
-    assert pair["subject"] == "Alice"
-    assert pair["predicate"] == "lives_in"
-    assert pair["object"] == "Berlin"
-    assert pair["speaker_id"] == "Speaker0"
-    assert pair["first_seen_cycle"] == 1
-
-    # Crucially: the kp reader must NOT have been called — seed comes from graph.
-    loop_instance.seed_semantic_cache.assert_not_called()
-    loop_instance.seed_procedural_cache.assert_not_called()
-
-
 def test_factory_simulate_mode_does_not_seed_from_kp(tmp_path, monkeypatch):
-    """In simulate mode, a keyed_pairs.json in simulate_dir is NOT seeded.
+    """In simulate mode, a quads.json in simulate_dir is NOT seeded.
 
     Guards against regression where the new simulate-mode seed path falls
-    through to the train-mode kp reader.  Even if a stale keyed_pairs.json
+    through to the train-mode kp reader.  Even if a stale quads.json
     exists under paths.simulate (from a previous run before the store
     migration), the boot seed must ignore it.
     """
     from paramem.server import consolidation as server_consolidation
     from paramem.server.config import load_server_config
 
-    # Place a decoy keyed_pairs.json — must NOT trigger seeding.
+    # Place a decoy quads.json — must NOT trigger seeding.
     ep_dir = tmp_path / "simulate" / "episodic"
     ep_dir.mkdir(parents=True)
-    (ep_dir / "keyed_pairs.json").write_text(
-        '[{"key": "graph1", "question": "Q?", "answer": "A."}]'
-    )
+    (ep_dir / "quads.json").write_text('[{"key": "graph1", "question": "Q?", "answer": "A."}]')
     # No graph.json present — simulate seed path should find nothing and skip.
 
     loop_instance = MagicMock()
@@ -444,6 +328,7 @@ def test_factory_simulate_mode_does_not_seed_from_kp(tmp_path, monkeypatch):
         model=MagicMock(),
         tokenizer=MagicMock(),
         config=cfg,
+        memory_store=_MS(replay_enabled=False),
     )
 
     # No seed calls — the graph.json is absent so the loop for each tier

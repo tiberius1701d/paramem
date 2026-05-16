@@ -24,7 +24,7 @@ from paramem.server.background_trainer import (
     _RESUME_STATE_FILE,
     BackgroundTrainer,
     TrainingJob,
-    _fingerprint_keyed_pairs,
+    _fingerprint_entries,
     _fingerprint_training_config,
     _read_resume_state,
     _write_resume_state_atomic,
@@ -80,9 +80,9 @@ def _make_bt(tmp_path: Path) -> BackgroundTrainer:
     )
 
 
-def _make_job(keyed_pairs: list[dict] | None = None) -> TrainingJob:
+def _make_job(entries: list[dict] | None = None) -> TrainingJob:
     return TrainingJob(
-        keyed_pairs=keyed_pairs or [{"key": "graph1", "question": "Q?", "answer": "A."}],
+        entries=entries or [{"key": "graph1", "subject": "S", "predicate": "p", "object": "O"}],
         adapter_name="episodic",
         adapter_config=_minimal_adapter_config(),
         inference_fallback_adapter="episodic",
@@ -147,16 +147,16 @@ def _fake_training_arguments(**kwargs):
 
 
 class TestFingerprintHelpers:
-    def test_keyed_pairs_fingerprint_deterministic(self) -> None:
-        pairs = [{"key": "g1", "question": "Q?", "answer": "A."}]
-        fp1 = _fingerprint_keyed_pairs(pairs)
-        fp2 = _fingerprint_keyed_pairs(pairs)
+    def test_quads_fingerprint_deterministic(self) -> None:
+        pairs = [{"key": "g1", "subject": "S", "predicate": "p", "object": "O"}]
+        fp1 = _fingerprint_entries(pairs)
+        fp2 = _fingerprint_entries(pairs)
         assert fp1 == fp2
 
-    def test_keyed_pairs_fingerprint_differs_on_change(self) -> None:
-        pairs_a = [{"key": "g1", "question": "Q?", "answer": "A."}]
-        pairs_b = [{"key": "g1", "question": "Q?", "answer": "B."}]
-        assert _fingerprint_keyed_pairs(pairs_a) != _fingerprint_keyed_pairs(pairs_b)
+    def test_quads_fingerprint_differs_on_change(self) -> None:
+        pairs_a = [{"key": "g1", "subject": "S", "predicate": "p", "object": "O"}]
+        pairs_b = [{"key": "g1", "subject": "S", "predicate": "p", "object": "Other"}]
+        assert _fingerprint_entries(pairs_a) != _fingerprint_entries(pairs_b)
 
     def test_config_fingerprint_deterministic(self) -> None:
         tc = _minimal_training_config()
@@ -242,7 +242,7 @@ class TestFreshStartResumeState:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
@@ -286,7 +286,7 @@ class TestFreshStartResumeState:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
@@ -322,7 +322,7 @@ class TestFreshStartResumeState:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
@@ -355,7 +355,7 @@ class TestFreshStartResumeState:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
@@ -388,7 +388,7 @@ class TestResumeMatchingFingerprint:
     ) -> Path:
         """Write a resume state file and a matching checkpoint dir."""
         from paramem.server.background_trainer import (
-            _fingerprint_keyed_pairs,
+            _fingerprint_entries,
             _fingerprint_training_config,
         )
 
@@ -401,7 +401,7 @@ class TestResumeMatchingFingerprint:
             "training_config_fingerprint": _fingerprint_training_config(
                 bt.training_config, job.adapter_config
             ),
-            "keyed_pairs_fingerprint": _fingerprint_keyed_pairs(job.keyed_pairs),
+            "entries_fingerprint": _fingerprint_entries(job.entries),
             "total_epochs": bt.training_config.num_epochs,
             "last_completed_epoch": epoch,
             "checkpoint_path": str(checkpoint_dir),
@@ -444,7 +444,7 @@ class TestResumeMatchingFingerprint:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=CapturingTrainer),
@@ -493,7 +493,7 @@ class TestResumeMatchingFingerprint:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=_NullTrainer),
@@ -528,7 +528,7 @@ class TestResumeMismatchedFingerprint:
             "adapter_name": adapter_name,
             "inference_fallback_adapter": "episodic",
             "training_config_fingerprint": "deadbeef" * 8,  # wrong fingerprint
-            "keyed_pairs_fingerprint": "cafebabe" * 8,  # wrong fingerprint
+            "entries_fingerprint": "cafebabe" * 8,  # wrong fingerprint
             "total_epochs": 10,
             "last_completed_epoch": 5,
             "checkpoint_path": str(checkpoint_dir),
@@ -559,7 +559,7 @@ class TestResumeMismatchedFingerprint:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=_NullTrainer),
@@ -595,7 +595,7 @@ class TestResumeMismatchedFingerprint:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=_NullTrainer),
@@ -634,7 +634,7 @@ class TestResumeMismatchedFingerprint:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=_NullTrainer),
@@ -673,7 +673,7 @@ class TestResumeMismatchedFingerprint:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
@@ -740,7 +740,7 @@ class TestExceptionPreservesResumeState:
             patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.switch_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=_FailAfterEpoch1),
@@ -791,7 +791,7 @@ class TestExceptionPreservesResumeState:
             patch("paramem.models.loader.copy_adapter_weights"),
             patch("paramem.models.loader.switch_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch("paramem.training.trainer.Trainer", new=_FailAfterEpoch1),
@@ -842,7 +842,7 @@ class TestSuccessfulCompletionCleanup:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter"),
             patch(
-                "paramem.server.background_trainer.format_indexed_training",
+                "paramem.server.background_trainer.format_entry_training",
                 return_value=[{"input_ids": [0], "labels": [0]}],
             ),
             patch(
@@ -932,7 +932,7 @@ class TestBgTrainerManifest:
 
         # Seed an on-disk registry file.
         reg = KeyRegistry()
-        reg.add("graph1", adapter_id="episodic")
+        reg.add("graph1")
         registry_path = tmp_path / "indexed_key_registry.json"
         reg.save(registry_path)
         expected_hash = hashlib.sha256(registry_path.read_bytes()).hexdigest()

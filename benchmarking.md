@@ -3061,18 +3061,67 @@ outputs/test15_retention_multiseed/<model>/<ts>/
 ## Test 16: Repair-Loop Sensitivity Sweep
 
 **Script:** `experiments/test16_repair_sweep.py`
-**Status:** in design
+**Status (2026-05-13):** redesigned. First-pass run at `20260512_001618`
+deleted (depth knob was confounded; see "Redesign" below). New run pending.
 
 ### Research questions
 
 1. Does recovery (episodes-to-full-recovery, final retention RP3, collateral
    loss on already-passing keys, overwrite reversion) depend on **how deeply the
-   original knowledge was trained before the overwrite** (encoding depth D)?
+   original knowledge was trained before the overwrite**, measured as
+   **epochs past `first_perfect_epoch` (the encoding floor)**?
 2. How sensitive is recovery to **repair learning rate** (1e-5 / 2e-5 / 5e-5)?
 3. How sensitive is recovery to **repair epochs-per-episode** (1 / 3)?
 4. Spot-check: does `weight_decay=0.1 vs 0.01` in the repair loop move any metric?
 
-### Motivation
+### Redesign (2026-05-13)
+
+The first design used `depths = [30, 50]` (total pretrain epochs) and called
+`decay_steps_for(n_keys, num_epochs) = n_keys * num_epochs // 2` to set
+`lr_decay_steps` per arm. That helper had been validated by Test 14's
+apples-to-apples diagnostic (2026-05-04, see `scripts/dev/test14_reproduce.md`)
+for **fixed-budget** phases. The Test 16 D=30 arm was the first config where
+the same formula was applied to a budget where `num_epochs / 2 < first_perfect_epoch`:
+
+| Test | Schedule | `lr_decay_steps` | LR → 0 at | First-perfect | Margin |
+|---|---|---|---|---|---|
+| Test 13 fill (40k × 50e) | linear, halved | 1000 | epoch 25 | epoch 13 | +12 ep |
+| Test 14 V3/A (100k × 50e) | linear, halved | 2500 | epoch 25 | epoch 21 | +4 ep |
+| Test 15 A (100k × 50e) | linear, halved | 2500 | epoch 25 | epoch 22 | +3 ep |
+| Test 16 base_50 (50k × 50e) | linear, halved | 1250 | epoch 25 | epoch 20 | +5 ep |
+| **Test 16 base_30 (50k × 30e)** | **linear, halved** | **750** | **epoch 15** | **never** | **negative** |
+
+Empirically: seed 42 base_30 (`outputs/test16_repair_sweep/mistral/20260512_001618`)
+plateaued at 42/50 recall from epoch 16 onward, while base_50 reached 50/50 at
+epoch 20 on the same QA pairs. The LR had decayed to zero by step 750 (epoch 15)
+for the D=30 arm; from there no learning could happen. The "depth knob"
+therefore conflated three things:
+
+1. Total epochs trained.
+2. LR-schedule shape (`lr_decay_steps` scaled with `num_epochs`).
+3. End encoding state (D=30 below floor, D=50 at floor).
+
+That violates CLAUDE.md's "Extended-training config" rule — *linear LR
+scheduler with fixed `lr_decay_steps` (decoupled from `num_train_epochs`)*.
+
+**Fix.** Two coordinated changes in `experiments/test16_repair_sweep.py`:
+
+- `decay_steps_for(n_keys, reference_epochs=REFERENCE_EPOCHS)` — the LR
+  decay window is pinned to a shared reference (60 epochs), independent of
+  the per-arm `num_epochs`. Every base arm sees identical LR-vs-step
+  trajectory up to wherever it stops.
+- The depth knob becomes `depths_past_floor` — epochs trained *past
+  first_perfect_epoch*. A new `FloorRelativeStopCallback` halts each base
+  training at `first_perfect_epoch + D`. The base phase trains up to
+  `MAX_BASE_EPOCHS = REFERENCE_EPOCHS` and **refuses to corrupt** if
+  `first_perfect_epoch is None` at end of base — silent acceptance of a
+  sub-perfect base was the bug.
+
+This removes the conflation: with a shared schedule and a floor-anchored
+stop, the only variable across base arms is "how many additional epochs of
+refinement past just-perfect."
+
+### Motivation (unchanged from prior version)
 
 Test 15 (n=5 seeds, N=100, K=20) killed the scaffold-as-retention-lever
 hypothesis (`verdict: DOES NOT HOLD` — see "Test 15: Results"): the
@@ -3083,37 +3132,29 @@ loop that recovers ~91.5% (B) / ~95% (C2) of unchanged keys from a
 post-overwrite retention floor of ~4.5%, with `alignment_delta` ~0.8–0.9
 across all seeds (post-overwrite forgetting is decoding-misalignment, not
 weight-erasure). So the lever worth a sensitivity study is the **repair
-primitive**, not the scaffold. Test 16 characterises it across two encoding
-depths (D=30, D=50) and a 6-cell `repair_lr` × `repair_epochs_per_episode`
-grid, with one weight-decay spot-check — B-path only (Test 15 showed the
-repair loop is path-agnostic).
+primitive**, not the scaffold. Test 16 characterises it across three
+encoding-depth-past-floor values and a 6-cell `repair_lr` ×
+`repair_epochs_per_episode` grid, with one weight-decay spot-check — B-path
+only (Test 15 showed the repair loop is path-agnostic).
 
 ### N≈50 / K≈12 rationale
 
 Shrinking from Test 15's N=100 / K=20 to N=50 / K=12 (24% swap fraction vs
 20%) reduces per-epoch cost by ≈0.55× while keeping a large-enough unchanged
 set (38 keys) for meaningful per-episode retention curves. The encoding floor
-at N=50 is expected around epoch 20–25 (extrapolated from Test 15's
-`stable_perfect_epoch` distribution).
-
-### No-early-stop pin
-
-Pretrain and overwrite phases run the **full epoch budget** with no early stop.
-Early stop is disabled by passing `EarlyStopPolicy(signal_from_epoch=10**9)` —
-the probe still fires every epoch (so `epoch_log.json` + `stable_perfect_epoch`
-populate for encoding-floor analysis) but the stop trigger never fires.
-This ensures the overwrite epoch budget is identical across all D, holding
-corruption level constant as a fixed-epoch invariant. The aggregator flags the
-depth comparison as confounded if cross-D RP2 spread exceeds the cross-seed CI
-half-width.
+at N=50 is empirically around epoch 20 (seed-42 base_50 from the deleted
+20260512 run; Test 15 seeds 7/1337/1/11 ranged e22–e26 at N=100).
 
 ### Protocol
 
 | Phase | What it does | Epoch budget | LR decay |
 |---|---|---|---|
-| pretrain (`base_D`) | Fresh `episodic` adapter on N keys | D ∈ {30, 50} | `decay_steps_for(N, D)` |
-| overwrite (`corrupted_D`) | Continue training on K swap keys (new answers) | 20 (fixed, all D) | `decay_steps_for(K, 20)` |
+| pretrain (`base_D`) | Fresh `episodic` adapter on N keys; stops at `first_perfect_epoch + D` via `FloorRelativeStopCallback` | up to `MAX_BASE_EPOCHS = 60`; refuse-to-corrupt if floor never reached | `decay_steps_for(N) = N × REFERENCE_EPOCHS // 2` (shared across all D arms) |
+| overwrite (`corrupted_D`) | Continue training on K swap keys (new answers) | 20 (fixed, all D) | `decay_steps_for(K, overwrite_epochs)` (its own per-phase reference) |
 | repair cells | Reload `corrupted_D`; run `run_repair_loop_v2` on failing unchanged keys | ≤5 episodes | None |
+
+`D` in path names (`base_{D}/`, `corrupted_{D}/`, `repair_{D}_...`) is the
+`depth_past_floor` value (0, 10, or 30 by default), not total epochs.
 
 ### Repair grid
 
@@ -3125,9 +3166,10 @@ half-width.
 | 4 | 1e-5 | 3 | 0.01 | ep ×3 |
 | 5 | 2e-5 | 3 | 0.01 | LR ×2, ep ×3 |
 | 6 | 5e-5 | 3 | 0.01 | LR ×5, ep ×3 |
-| 7 (spot-check) | 1e-5 | 1 | **0.1** | wd spot-check at D=30 only |
+| 7 (spot-check) | 1e-5 | 1 | **0.1** | wd spot-check at `spotcheck_depth` (default D=0) only |
 
-Both depths D=30 and D=50 run cells 1–6.  Cell 7 runs for D=30 only.
+Every `depth_past_floor` arm runs cells 1–6. Cell 7 runs for the
+`spotcheck_depth` arm only (default 0 — at-floor).
 
 ### New Test-16 metrics
 
@@ -3138,59 +3180,48 @@ After each repair cell, two overwrite-integrity probes run via `_safe_probe`:
 - **`original_answer_resurfaced_rate`** — probe `overwritten_keyed` (original
   answers); > 0.0 ⇒ active reversion (not just degradation).
 
+Per-arm metadata stamped into `base_{D}_done.json`:
+`encoding_floor_epoch` (= first_perfect_epoch), `depth_past_floor` (= D
+by construction), `total_epochs_trained` (= floor + D), `lr_decay_steps`,
+`reference_epochs`, `max_base_epochs`.
+
 ### Output layout
 
 ```
 outputs/test16_repair_sweep/mistral/<ts>/
-  run_config.json               # frozen at first launch (includes repair_grid)
+  run_config.json               # frozen at first launch
   test16_aggregate.json         # recomputed after each (seed, D)
   paused.json                   # boundary-pause marker
   seed42/
-    base_30/                    # episodic_adapter/, epoch_log.json, base_30_done.json
-    base_50/
-    corrupted_30/               # episodic_adapter/, unchanged_keyed.json,
-                                #   overwrite_swap_keyed.json, overwritten_keyed.json,
-                                #   corrupted_30_done.json
-    corrupted_50/
-    repair_30_lr1e-05_ep1/      # repair_log.json, cell_result.json,
-                                #   episodic_adapter_repaired/, *_done.json
-    repair_30_lr2e-05_ep1/ ...
-    repair_30_lr5e-05_ep1/ ...
-    repair_30_lr1e-05_ep3/ ...
-    repair_30_lr2e-05_ep3/ ...
-    repair_30_lr5e-05_ep3/ ...
-    repair_30_lr1e-05_ep1_wd0.1/  # weight-decay spot-check
-    repair_50_lr1e-05_ep1/ ... (6 cells)
+    base_0/                     # depth_past_floor=0 — stop at first_perfect
+    base_10/                    # depth_past_floor=10
+    base_30/                    # depth_past_floor=30
+    corrupted_0/  corrupted_10/  corrupted_30/
+    repair_0_lr1e-05_ep1/ ... repair_0_lr5e-05_ep3/   (6 cells)
+    repair_0_lr1e-05_ep1_wd0.1/                       (spotcheck — at D=0)
+    repair_10_lr*/ ... (6 cells)
+    repair_30_lr*/ ... (6 cells)
   seed7/ ... seed1337/ ... seed1/ ... seed11/ ...
 ```
 
 Smoke run writes to `outputs/test16_repair_sweep/mistral/_smoke/<ts>/`;
 `tresume 16` always excludes `_smoke/` when finding the latest run dir.
 
-### Placeholder results table
+### Cell count
 
-| Axis | D | repair_lr | repair_ep | weight_decay | mean_RP2 | mean_RP3 | mean_episodes | overwrite_after_repair |
-|---|---|---|---|---|---|---|---|---|
-| depth (lr=1e-5, ep=1, wd=0.01) | 30 | — | — | — | TBD | TBD | TBD | TBD |
-| depth | 50 | — | — | — | TBD | TBD | TBD | TBD |
-| lr (D=30, ep=1, wd=0.01) | — | 1e-5 | — | — | TBD | TBD | TBD | TBD |
-| lr | — | 2e-5 | — | — | TBD | TBD | TBD | TBD |
-| lr | — | 5e-5 | — | — | TBD | TBD | TBD | TBD |
-| ep (D=30, lr=1e-5, wd=0.01) | — | — | 1 | — | TBD | TBD | TBD | TBD |
-| ep | — | — | 3 | — | TBD | TBD | TBD | TBD |
-| wd spot-check (D=30, lr=1e-5, ep=1) | — | — | — | 0.01 | TBD | TBD | TBD | TBD |
-| wd spot-check | — | — | — | 0.10 | TBD | TBD | TBD | TBD |
-
-All results exploratory — no pass/fail gate.
+`5 seeds × (3 depths × 6 repair-grid cells + 1 spotcheck cell per seed) = 95 cells`.
 
 ### Concerns
 
-- Fixed `overwrite_epochs=20` is a guess (Test 15's B stopped at e16–e29 under
-  early-stop). Smoke gate checks: 0 < rp2_exact_count < unchanged_total AND
-  episode_1_retention > rp2_rate AND overwrite_recall_rate ≥ 0.95.
-- The cross-D RP2 spread is the primary confound in the depth axis; the
-  aggregator flags it when `|mean_RP2(D50) − mean_RP2(D30)| > CI half-width`.
-  `weight_decay` spot-check covers single LR (1e-5) only — no LR×wd interaction.
+- `MAX_BASE_EPOCHS = 60` may be too tight if a seed's `first_perfect_epoch`
+  approaches the budget under the shared schedule. The refuse-to-corrupt
+  guard surfaces this as a hard error; raise `REFERENCE_EPOCHS` (which also
+  raises `MAX_BASE_EPOCHS` and `decay_steps_for(N)`) if encountered.
+- `corrupted_D` still uses its own `decay_steps_for(K, overwrite_epochs)`
+  with `overwrite_epochs=20` as the reference — this is intentionally
+  apples-to-apples within the corruption phase (one fixed budget across
+  all D arms); it doesn't share the base phase's reference because the
+  scales differ (K=12 vs N=50).
 
 ---
 

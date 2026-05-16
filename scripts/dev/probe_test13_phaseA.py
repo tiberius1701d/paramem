@@ -13,9 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from experiments.utils.test_harness import smoke_test_adapter
 
-CYCLE_DIR = Path(
-    "outputs/test13_journal_scaffold/mistral/20260420_231031/A"
-)
+CYCLE_DIR = Path("outputs/test13_journal_scaffold/mistral/20260420_231031/A")
 
 
 def main() -> int:
@@ -49,8 +47,10 @@ def main() -> int:
     print(f"\nWrote {out_path}")
     print(f"Failures: {len(failures)}")
     for f in failures:
-        print(f"\n  {f['key']} (conf={f['confidence']:.3f}, "
-              f"expected={f['expected_word_count']}w, got={f['recalled_word_count']}w)")
+        print(
+            f"\n  {f['key']} (conf={f['confidence']:.3f}, "
+            f"expected={f['expected_word_count']}w, got={f['recalled_word_count']}w)"
+        )
         print(f"    expected: {f['expected']!r}")
         print(f"    recalled: {f['recalled']!r}")
 

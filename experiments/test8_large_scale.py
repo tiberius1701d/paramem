@@ -460,7 +460,7 @@ class ScaleRecallCallback(TrainerCallback):
         self,
         model,
         tokenizer,
-        keyed_pairs,
+        quads,
         registry,
         adapter_name,
         cycle_dir,
@@ -468,7 +468,7 @@ class ScaleRecallCallback(TrainerCallback):
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.keyed_pairs = keyed_pairs
+        self.quads = quads
         self.registry = registry
         self.adapter_name = adapter_name
         self.cycle_dir = cycle_dir
@@ -496,7 +496,7 @@ class ScaleRecallCallback(TrainerCallback):
         progress = {
             "epoch": current_epoch,
             "total_epochs": total_epochs,
-            "keys": len(self.keyed_pairs),
+            "keys": len(self.quads),
             "cycle_started_at": cycle_started_at or time.time(),
         }
         with open(progress_path, "w") as f:
@@ -513,7 +513,7 @@ class ScaleRecallCallback(TrainerCallback):
             recall_result = evaluate_indexed_recall(
                 self.model,
                 self.tokenizer,
-                self.keyed_pairs,
+                self.quads,
                 self.registry,
                 adapter_name=self.adapter_name,
             )
@@ -571,7 +571,7 @@ def train_cycle(model, tokenizer, qa_pairs, cycle_num, output_dir, num_epochs, r
 
     Unwraps to base model, creates fresh adapter, trains with per-epoch
     probing, evaluates.
-    Returns (model, keyed_pairs, registry, recall_result, train_time,
+    Returns (model, quads, registry, recall_result, train_time,
              eval_time, train_loss, epoch_log, cycle_dir).
     """
     adapter_name = "episodic"
@@ -601,13 +601,13 @@ def train_cycle(model, tokenizer, qa_pairs, cycle_num, output_dir, num_epochs, r
     model = create_adapter(model, adapter_config, adapter_name)
 
     # Assign keys and build registry
-    keyed_pairs = assign_keys(qa_pairs, start_index=1)
-    registry = build_registry(keyed_pairs)
+    quads = assign_keys(qa_pairs, start_index=1)
+    registry = build_registry(quads)
     save_registry(registry, cycle_dir / "simhash_registry.json")
 
-    # Save keyed_pairs with cohort metadata
+    # Save quads with cohort metadata
     kp_ser = []
-    for kp in keyed_pairs:
+    for kp in quads:
         entry = {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
         for meta_key in (
             "source_predicate",
@@ -619,18 +619,18 @@ def train_cycle(model, tokenizer, qa_pairs, cycle_num, output_dir, num_epochs, r
             if meta_key in kp:
                 entry[meta_key] = kp[meta_key]
         kp_ser.append(entry)
-    with open(cycle_dir / "keyed_pairs.json", "w") as f:
+    with open(cycle_dir / "quads.json", "w") as f:
         json.dump(kp_ser, f, indent=2)
 
     # Format training data
-    examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+    examples = format_indexed_training(quads, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
     # Create per-epoch recall callback
     recall_callback = ScaleRecallCallback(
         model,
         tokenizer,
-        keyed_pairs,
+        quads,
         registry,
         adapter_name,
         cycle_dir=cycle_dir,
@@ -675,13 +675,13 @@ def train_cycle(model, tokenizer, qa_pairs, cycle_num, output_dir, num_epochs, r
     # Final recall evaluation (full per-key detail, separate from probing)
     t_eval = time.time()
     recall_result = evaluate_indexed_recall(
-        model, tokenizer, keyed_pairs, registry, adapter_name=adapter_name
+        model, tokenizer, quads, registry, adapter_name=adapter_name
     )
     eval_time = time.time() - t_eval
 
     return (
         model,
-        keyed_pairs,
+        quads,
         registry,
         recall_result,
         train_time,
@@ -703,7 +703,7 @@ def format_cycle_result(
     total_sessions,
     characters_used,
     merger,
-    keyed_pairs,
+    quads,
     qa_pairs,
     new_qa,
     recall_result,
@@ -721,7 +721,7 @@ def format_cycle_result(
     confidences = [pk.get("confidence", 0.0) for pk in per_key]
 
     # Build per-key results with cohort metadata (matched by key string)
-    kp_by_key = {kp["key"]: kp for kp in keyed_pairs}
+    kp_by_key = {kp["key"]: kp for kp in quads}
     per_key_results = []
     for pk in per_key:
         key = pk.get("key", "")
@@ -1076,7 +1076,7 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
         print(f"  Training on {len(qa_pairs)} keys, {num_epochs} epochs...")
         (
             model,
-            keyed_pairs,
+            quads,
             registry,
             recall_result,
             train_time,
@@ -1095,7 +1095,7 @@ def run_scale_test(model, tokenizer, args, output_dir, bench_name):
             total_sessions=total_sessions,
             characters_used=list(characters_used),
             merger=merger,
-            keyed_pairs=keyed_pairs,
+            quads=quads,
             qa_pairs=qa_pairs,
             new_qa=new_qa,
             recall_result=recall_result,

@@ -98,7 +98,7 @@ class TestAdapterRecall:
 
     @pytest.fixture(scope="class")
     def trained_adapter(self, recall_model_and_tokenizer, tmp_path_factory):
-        """Train the adapter once; yield (model, tokenizer, keyed_pairs, registry)."""
+        """Train the adapter once; yield (model, tokenizer, quads, registry)."""
         from peft import PeftModel
 
         from paramem.models.loader import create_adapter
@@ -120,9 +120,9 @@ class TestAdapterRecall:
         elif "episodic" not in model.peft_config:
             model = create_adapter(model, cfg, "episodic")
 
-        keyed_pairs = assign_keys(_RECALL_QA)
+        quads = assign_keys(_RECALL_QA)
 
-        examples = format_indexed_training(keyed_pairs, tokenizer)
+        examples = format_indexed_training(quads, tokenizer)
         dataset = _ListDataset(examples)
 
         # 30 epochs — minimum for indexed key encoding per CLAUDE.md
@@ -137,21 +137,21 @@ class TestAdapterRecall:
             output_dir=tmp_path,
         )
 
-        registry = build_registry(keyed_pairs)
-        yield model, tokenizer, keyed_pairs, registry
+        registry = build_registry(quads)
+        yield model, tokenizer, quads, registry
 
     def test_recall_fraction_meets_threshold(self, trained_adapter):
         """At least _MIN_RECALL_FRACTION of trained facts must be recalled."""
         from paramem.training.indexed_memory import probe_key
 
-        model, tokenizer, keyed_pairs, registry = trained_adapter
+        model, tokenizer, quads, registry = trained_adapter
         recalled = 0
-        for kp in keyed_pairs:
+        for kp in quads:
             result = probe_key(model, tokenizer, kp["key"], registry=registry)
             if result is not None and "failure_reason" not in result:
                 recalled += 1
 
-        total = len(keyed_pairs)
+        total = len(quads)
         fraction = recalled / total
         assert fraction >= _MIN_RECALL_FRACTION, (
             f"Recall too low: {recalled}/{total} ({fraction:.0%}), "
@@ -162,10 +162,10 @@ class TestAdapterRecall:
         """A key that was never trained must not be confabulated as a match."""
         from paramem.training.indexed_memory import probe_key
 
-        model, tokenizer, keyed_pairs, registry = trained_adapter
+        model, tokenizer, quads, registry = trained_adapter
 
         # Probe a key one beyond the trained range
-        max_key_num = max(int(kp["key"].replace("graph", "")) for kp in keyed_pairs)
+        max_key_num = max(int(kp["key"].replace("graph", "")) for kp in quads)
         phantom_key = f"graph{max_key_num + 99}"
 
         # Pass the registry — the phantom key is absent, so confidence will be 0

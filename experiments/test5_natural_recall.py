@@ -152,7 +152,7 @@ def main():
         output_dir = model_output_dir(base_output_dir, bench_name)
 
         # Phase 1: Train adapter
-        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+        model, quads, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
             qa_pairs,
@@ -168,7 +168,7 @@ def main():
         recall_result = evaluate_indexed_recall(
             model,
             tokenizer,
-            keyed_pairs,
+            quads,
             registry,
             adapter_name="episodic",
         )
@@ -177,12 +177,11 @@ def main():
             f"(conf={recall_result['mean_confidence']:.3f})"
         )
 
-        # Save keyed_pairs for resume
+        # Save quads for resume
         kp_serializable = [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_pairs
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in quads
         ]
-        with open(output_dir / "keyed_pairs.json", "w") as f:
+        with open(output_dir / "quads.json", "w") as f:
             json.dump(kp_serializable, f, indent=2)
 
         # Phase save after keyed recall
@@ -216,7 +215,7 @@ def main():
         for pk in recall_result["per_key"]:
             recalled = pk.get("recalled")
             if recalled and "answer" in recalled:
-                kp_match = next((kp for kp in keyed_pairs if kp["key"] == pk["key"]), None)
+                kp_match = next((kp for kp in quads if kp["key"] == pk["key"]), None)
                 if kp_match:
                     sim = compute_similarity(kp_match["answer"], recalled["answer"])
                 else:
@@ -233,7 +232,7 @@ def main():
 
         print(
             f"\nKeyed recall (embedding sim): "
-            f"{keyed_match_count}/{len(keyed_pairs)} match "
+            f"{keyed_match_count}/{len(quads)} match "
             f"(sim={keyed_mean_sim:.3f})"
         )
 
@@ -242,7 +241,7 @@ def main():
         per_question_results = []
         pq_match_count = 0
 
-        for kp in keyed_pairs:
+        for kp in quads:
             prompt = _format_inference_prompt(kp["question"], tokenizer)
             generated = generate_answer(
                 model,
@@ -273,8 +272,7 @@ def main():
         )
 
         print(
-            f"  Per-question natural: {pq_match_count}/{len(keyed_pairs)} match "
-            f"(sim={pq_mean_sim:.3f})"
+            f"  Per-question natural: {pq_match_count}/{len(quads)} match (sim={pq_mean_sim:.3f})"
         )
 
         # Phase 4: Broad natural recall probes (multi-fact, supplementary)
@@ -291,10 +289,10 @@ def main():
                 max_new_tokens=300,
                 temperature=0.0,
             )
-            # Score against keyed_pairs (post-distillation), not original qa_pairs
+            # Score against quads (post-distillation), not original qa_pairs
             # Note: broad probes use softer threshold (0.6 + keyword overlap)
             # than per-question/keyed (0.75 embedding only) — supplementary metric
-            matched = match_recalled_facts(generated, keyed_pairs)
+            matched = match_recalled_facts(generated, quads)
             for m in matched:
                 all_recalled_answers.add(m["answer"])
 
@@ -316,25 +314,25 @@ def main():
         results["keyed_embedding_similarity"] = {
             "mean_similarity": keyed_mean_sim,
             "match_count": keyed_match_count,
-            "match_rate": keyed_match_count / max(len(keyed_pairs), 1),
+            "match_rate": keyed_match_count / max(len(quads), 1),
             "threshold": MATCH_THRESHOLD,
         }
         results["per_question_natural"] = {
             "mean_similarity": pq_mean_sim,
             "match_count": pq_match_count,
-            "match_rate": pq_match_count / max(len(keyed_pairs), 1),
-            "total": len(keyed_pairs),
+            "match_rate": pq_match_count / max(len(quads), 1),
+            "total": len(quads),
             "threshold": MATCH_THRESHOLD,
             "per_question": per_question_results,
         }
         results["broad_natural_probes"] = natural_probes
         results["broad_natural_unique_facts"] = unique_recalled
-        results["broad_natural_rate"] = unique_recalled / max(len(keyed_pairs), 1)
+        results["broad_natural_rate"] = unique_recalled / max(len(quads), 1)
         results["scoring_metric"] = "embedding_similarity (all-MiniLM-L6-v2 cosine)"
         save_results(results, output_dir)
 
         # Summary
-        total = len(keyed_pairs)
+        total = len(quads)
         print(f"\n{'=' * 72}")
         print(f"NATURAL RECALL SUMMARY ({bench_name})")
         print("=" * 72)

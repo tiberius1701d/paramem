@@ -1572,8 +1572,56 @@ _show_test16_status() {
     echo -e "  Model:      ${CYAN}${model_name}${RESET}"
     echo -e "  Run:        ${DIM}${run_name}${RESET}"
 
-    # Read seeds and depths from run_config.json.
-    local seeds_csv depths_csv
+    # Overall cells progress bar + test-level ETA from trailing-window mean
+    # per-cell wall time.  "Cells" counts repair + spotcheck cells (matches the
+    # aggregate semantics).  ETA window is 5; underestimates when the next
+    # phase is a slow base_D rather than a fast repair cell — caveat surfaced
+    # in the line.
+    python3 - "$run_dir" <<'PYEOF' 2>/dev/null
+import json, os, glob, sys
+run_dir = sys.argv[1]
+try:
+    cfg = json.load(open(os.path.join(run_dir, "run_config.json")))
+except Exception:
+    cfg = {}
+seeds = cfg.get("seeds", [42])
+depths = cfg.get("depths_past_floor") or cfg.get("depths") or [0, 10, 30]
+repair_grid = cfg.get("repair_grid", [])
+spotcheck_depth = cfg.get("spotcheck_depth", -1)
+sc_per_seed = sum(1 for d in depths if d == spotcheck_depth)
+total = len(seeds) * (len(repair_grid) * len(depths) + sc_per_seed)
+markers = sorted(
+    glob.glob(os.path.join(run_dir, "seed*", "repair_*", "repair_*_done.json")),
+    key=os.path.getmtime,
+)
+done = len(markers)
+CYAN, YELLOW, DIM, RESET = "\x1b[36m", "\x1b[33m", "\x1b[2m", "\x1b[0m"
+if total > 0:
+    pct = 100 * done // total
+    width = 20
+    filled = pct * width // 100
+    bar = "█" * filled + "░" * (width - filled)
+    print(f"  Cells:      {CYAN}{done}/{total}{RESET}  [{bar}]  {pct}%")
+if done >= 2 and total > done:
+    window = min(done, 5)
+    recent = markers[-window:]
+    times = [os.path.getmtime(p) for p in recent]
+    intervals = [t2 - t1 for t1, t2 in zip(times, times[1:])]
+    if intervals:
+        mean = sum(intervals) / len(intervals)
+        remaining = total - done
+        eta = int(mean * remaining)
+        eh, er = divmod(eta, 3600)
+        em, es = divmod(er, 60)
+        am, asec = divmod(int(mean), 60)
+        print(
+            f"  ETA:        {YELLOW}{eh:d}:{em:02d}:{es:02d}{RESET}  "
+            f"{DIM}(avg {am}:{asec:02d}/cell × {remaining} cells, window={window}){RESET}"
+        )
+PYEOF
+
+    # Read seeds from run_config.json for the per-seed summary.
+    local seeds_csv
     seeds_csv=$(python3 -c "
 import json, sys
 try:
@@ -1583,23 +1631,28 @@ except Exception:
     seeds = [42]
 print(' '.join(str(s) for s in seeds))
 " 2>/dev/null)
-    depths_csv=$(python3 -c "
-import json, sys
-try:
-    cfg = json.load(open('$run_dir/run_config.json'))
-    depths = cfg.get('depths', [30, 50])
-except Exception:
-    depths = [30, 50]
-print(' '.join(str(d) for d in depths))
-" 2>/dev/null)
     [[ -z "$seeds_csv" ]] && seeds_csv="42"
-    [[ -z "$depths_csv" ]] && depths_csv="30 50"
 
-    # Per-seed summary: count base/corrupted/repair done markers.
+    # Per-seed summary: counts as fractions against per-seed scope, with a
+    # ✓ DONE marker when every base_D, corrupted_D, and repair cell for that
+    # seed has its *_done.json marker.  Totals derive from run_config.json:
+    # base/corrupted = len(depths); repair_cells = len(repair_grid)*len(depths)
+    # plus the spotcheck cell when spotcheck_depth ∈ depths.
     python3 - "$run_dir" $seeds_csv <<PYEOF 2>/dev/null
 import json, sys, os, glob
 run_dir = sys.argv[1]
 seeds = [int(s) for s in sys.argv[2:]]
+try:
+    cfg = json.load(open(os.path.join(run_dir, "run_config.json")))
+except Exception:
+    cfg = {}
+depths = cfg.get("depths_past_floor") or cfg.get("depths") or [0, 10, 30]
+repair_grid = cfg.get("repair_grid", [])
+spotcheck_depth = cfg.get("spotcheck_depth", -1)
+sc_per_seed = sum(1 for d in depths if d == spotcheck_depth)
+base_total = len(depths)
+corrupted_total = len(depths)
+repair_total = len(repair_grid) * len(depths) + sc_per_seed
 GREEN = "\x1b[32m"
 DIM = "\x1b[2m"
 YELLOW = "\x1b[33m"
@@ -1609,8 +1662,18 @@ for s in seeds:
     base_done = len(glob.glob(os.path.join(seed_dir, "base_*", "base_*_done.json")))
     corrupted_done = len(glob.glob(os.path.join(seed_dir, "corrupted_*", "corrupted_*_done.json")))
     repair_done = len(glob.glob(os.path.join(seed_dir, "repair_*", "repair_*_done.json")))
-    status = f"base={base_done}  corrupted={corrupted_done}  repair_cells={repair_done}"
-    # Show RP2 from the most recently completed corrupted_done if available.
+    status = (
+        f"base={base_done}/{base_total}  "
+        f"corrupted={corrupted_done}/{corrupted_total}  "
+        f"repair_cells={repair_done}/{repair_total}"
+    )
+    all_done = (
+        base_done >= base_total
+        and corrupted_done >= corrupted_total
+        and repair_done >= repair_total
+    )
+    if all_done:
+        status += f"  {GREEN}✓ DONE{RESET}"
     latest_rp2 = None
     for cd_path in sorted(glob.glob(os.path.join(seed_dir, "corrupted_*", "corrupted_*_done.json"))):
         try:
@@ -1623,22 +1686,20 @@ for s in seeds:
     print(f"  seed{s:>4}:    {status}")
 PYEOF
 
-    # Show most-recent progress.json if running.
+    # In-flight phase bar (via shared helper).  Pick the newest progress.json
+    # by mtime whose phase_dir does NOT yet have its *_done.json marker — that
+    # is the currently-training phase.  Mtime-sort, not lexicographic — the
+    # latter renders a stale phase when an older phase dir sorts after a newer
+    # one (e.g. repair_50_lr5e-05_ep3 > repair_50_lr5e-05_ep1 lexicographically
+    # but the older was done first).
     local latest_progress
-    latest_progress=$(find "$run_dir" -name "progress.json" -not -path "*/_smoke/*" 2>/dev/null | sort | tail -1)
+    latest_progress=$(find "$run_dir" -name "progress.json" -not -path "*/_smoke/*" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | awk '{print $2}')
     if [[ -n "$latest_progress" ]]; then
-        python3 - "$latest_progress" <<'PYEOF' 2>/dev/null
-import json, sys, os
-p = sys.argv[1]
-try:
-    d = json.load(open(p))
-    ep = d.get("epoch", "?")
-    tgt = d.get("target_epoch") or d.get("total_epochs") or "?"
-    phase = d.get("phase_name", os.path.basename(os.path.dirname(p)))
-    print(f"  Progress:   {phase}  epoch {ep}/{tgt}")
-except Exception:
-    pass
-PYEOF
+        local phase_dir=$(dirname "$latest_progress")
+        local phase_name=$(basename "$phase_dir")
+        if [[ ! -f "$phase_dir/${phase_name}_done.json" ]]; then
+            _show_epoch_progress "$phase_dir" "$phase_name"
+        fi
     fi
 
     # Paused marker.

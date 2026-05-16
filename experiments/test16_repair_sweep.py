@@ -103,6 +103,7 @@ from paramem.training.indexed_memory import (  # noqa: E402
     assign_keys,
     build_registry,
     format_indexed_training,
+    load_registry,
     save_registry,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
@@ -121,7 +122,14 @@ PAUSE_FILE = Path.home() / ".training_pause"
 DEFAULT_SEEDS = [42, 7, 1337, 1, 11]
 DEFAULT_N_KEYS = 50
 DEFAULT_SWAP_KEYS = 12
-DEFAULT_DEPTHS = [30, 50]
+# "Depth" is epochs trained PAST first_perfect_epoch (the encoding floor).
+# Each arm trains base for first_perfect_epoch + depth_past_floor epochs at
+# the same fixed LR trajectory — see REFERENCE_EPOCHS.  D=0 means "stop the
+# moment encoding is just-perfect"; D=30 means "30 more epochs of refinement
+# past the floor".  Replaces the prior D=[30, 50] convention where D was
+# total-epochs and the LR scheduler's decay-to-zero point at num_epochs/2
+# made D=30 land before encoding had completed.
+DEFAULT_DEPTHS_PAST_FLOOR = [0, 10, 30]
 DEFAULT_OVERWRITE_EPOCHS = 20
 DEFAULT_RANK = 8
 DEFAULT_LR = 1e-4
@@ -129,9 +137,26 @@ DEFAULT_REPAIR_LRS = [1e-5, 2e-5, 5e-5]
 DEFAULT_REPAIR_EPOCHS = [1, 3]
 DEFAULT_REPAIR_WEIGHT_DECAY = 0.01
 DEFAULT_REPAIR_WD_SPOTCHECK = 0.1
-DEFAULT_SPOTCHECK_DEPTH = 30
+DEFAULT_SPOTCHECK_DEPTH = 0  # spotcheck cell lives at D=0 past floor
 DEFAULT_MAX_REPAIR_EPISODES = 5
 DEFAULT_PRETRAIN_WEIGHT_DECAY = 0.1  # >=0.1 per extended-training lore
+
+# Reference epoch count used to pin lr_decay_steps independent of the per-arm
+# epoch budget.  CLAUDE.md: "linear LR scheduler with fixed lr_decay_steps
+# (decoupled from num_train_epochs)".  Set to comfortably exceed
+# max(first_perfect_epoch) + max(depths_past_floor) so the LR remains nonzero
+# throughout every arm's training.  Observed first_perfect across seeds in
+# Test 15 (apples-to-apples scheduler) ranged e22..e26; with max
+# depth_past_floor=30, a single shared schedule of decay over 60-epoch worth
+# of steps keeps LR nonzero through epoch 60.
+REFERENCE_EPOCHS = 60
+
+# Upper bound on the base training epoch budget.  The floor-relative stop
+# callback halts at first_perfect_epoch + depth_past_floor; this is the
+# hard ceiling that triggers a refuse-to-corrupt failure if the floor was
+# never reached.  Equals REFERENCE_EPOCHS so the LR trajectory does not
+# decay past the last legitimate step.
+MAX_BASE_EPOCHS = REFERENCE_EPOCHS
 
 BOOTSTRAP_RESAMPLES = 10_000
 
@@ -358,7 +383,11 @@ def load_or_write_run_config(run_dir: Path, args: argparse.Namespace) -> dict:
     cfg: dict = {
         "model": args.model,
         "seeds": list(args.seeds),
-        "depths": list(args.depths),
+        # "depths_past_floor": the test's D knob, defined as epochs trained
+        # past first_perfect_epoch.  Per (seed, D) arm trains base for
+        # first_perfect+D epochs at the shared apples-to-apples schedule;
+        # see DEFAULT_DEPTHS_PAST_FLOOR docstring.
+        "depths_past_floor": list(args.depths_past_floor),
         "n_keys": args.n_keys,
         "swap_keys": args.swap_keys,
         "overwrite_epochs": args.overwrite_epochs,
@@ -372,6 +401,8 @@ def load_or_write_run_config(run_dir: Path, args: argparse.Namespace) -> dict:
         "lr_scheduler_type": args.lr_scheduler_type,
         "rank": DEFAULT_RANK,
         "lr": DEFAULT_LR,
+        "reference_epochs": REFERENCE_EPOCHS,
+        "max_base_epochs": MAX_BASE_EPOCHS,
         "repair_grid": repair_grid,
         "spotcheck_cell": spotcheck_cell,
         "created_at": int(time.time()),
@@ -387,19 +418,40 @@ def load_or_write_run_config(run_dir: Path, args: argparse.Namespace) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def decay_steps_for(n_keys: int, num_epochs: int) -> int:
-    """Compute LR decay steps for the apples-to-apples linear scheduler.
+def decay_steps_for(n_keys: int, reference_epochs: int = REFERENCE_EPOCHS) -> int:
+    """LR decay steps for the apples-to-apples linear scheduler, pinned to
+    a *reference* epoch count rather than the per-arm ``num_epochs``.
 
-    Formula: ``n_keys * num_epochs // 2`` (benchmarking.md §Test 15 provenance).
+    Per CLAUDE.md "Extended-training config": linear LR scheduler with fixed
+    ``lr_decay_steps`` **decoupled from** ``num_train_epochs``.  The earlier
+    Test 13/14/15 convention ``n_keys * num_epochs // 2`` coupled the
+    scheduler to per-arm epoch budget and silently produced LR=0 from
+    ``num_epochs / 2`` onward — see benchmarking.md §Test 16 redesign for
+    the diagnostic.  This helper computes a *shared* schedule that is the
+    same for every base/corrupted arm regardless of the arm's own epoch
+    budget, so all arms see identical LR-vs-step trajectories up to
+    whatever step they stop on.
+
+    Formula: ``n_keys * reference_epochs``.  The decay window spans the
+    full reference span, so LR is nonzero throughout every arm's training
+    budget (``MAX_BASE_EPOCHS = REFERENCE_EPOCHS`` for base; corruption's
+    own reference_epochs is its overwrite budget).  The Test 15-era
+    ``// 2`` halving has been removed: it produced LR=0 from
+    ``reference_epochs / 2`` onward, which silently zeroed the second half
+    of every arm's training under the redesigned ``depths_past_floor``
+    knob and collapsed D=10 vs D=30 into indistinguishable end states.
+    See benchmarking.md §Test 16 redesign 2026-05-14.
 
     Args:
         n_keys: Number of indexed keys being trained.
-        num_epochs: Epoch budget for the phase.
+        reference_epochs: Reference epoch count (default: REFERENCE_EPOCHS).
+            Pass the largest plausible per-arm epoch count for the phase
+            family so LR remains nonzero throughout every arm.
 
     Returns:
-        Integer number of optimizer steps for LR decay window.
+        Integer number of optimizer steps for the LR decay window.
     """
-    return max(1, n_keys * num_epochs // 2)
+    return max(1, n_keys * reference_epochs)
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +716,7 @@ def _write_phase_done(
     final_recall: dict,
     extra: dict,
 ) -> None:
-    """Persist keyed_pairs, registry, and phase-done marker.
+    """Persist quads, registry, and phase-done marker.
 
     Args:
         phase_dir: Directory for this phase.
@@ -677,7 +729,7 @@ def _write_phase_done(
     """
     phase_dir.mkdir(parents=True, exist_ok=True)
     _safe_write_json(
-        phase_dir / "keyed_pairs.json",
+        phase_dir / "quads.json",
         [{"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed],
     )
     save_registry(registry, phase_dir / "simhash_registry.json")
@@ -740,7 +792,9 @@ def _run_phase(
         lr_scheduler_type: LR scheduler type.
         lr_decay_steps: Decoupled decay steps; None disables override.
         weight_decay: L2 regularisation.
-        early_stop_policy: EarlyStopPolicy controlling probe schedule.
+        early_stop_policy: EarlyStopPolicy controlling probe schedule and
+            optional floor-relative stop via
+            ``extra_epochs_past_first_perfect``.
         run_name: WandB / HF run name.
         retention_keyed: Optional unchanged-key list for dual-probe logging.
         retention_registry: Required if retention_keyed is provided.
@@ -1160,7 +1214,7 @@ def _verify_phase_integrity(seed_dir: Path, seed: int, cfg: dict) -> None:
         seed: Integer seed value (used only for log messages).
         cfg: Run config dict (provides depths and repair_grid).
     """
-    depths: list[int] = cfg["depths"]
+    depths: list[int] = cfg["depths_past_floor"]
     repair_grid: list[list] = cfg["repair_grid"]
     spotcheck_cell: dict = cfg["spotcheck_cell"]
     base_wd: float = cfg["repair_weight_decay"]
@@ -1276,7 +1330,22 @@ def run_cell(
     lr_scheduler_type: str = cfg["lr_scheduler_type"]
     max_repair_episodes: int = cfg["max_repair_episodes"]
 
-    # No early stop: probe every epoch for floor measurement, but never halt.
+    # Two policies share the probe-every-epoch schedule but differ in
+    # stop semantics:
+    #   - `base_stop_policy` fires at `first_perfect_epoch + D` via the
+    #     `extra_epochs_past_first_perfect` field on EarlyStopPolicy (added
+    #     2026-05-13 for Test 16's depth-past-floor sweep).  Stable-perfect
+    #     path is disabled via signal_from_epoch=10**9.
+    #   - `no_stop_policy` keeps the prior behaviour for corruption: probe
+    #     every epoch, never halt; the fixed `overwrite_epochs` budget is
+    #     the natural stop.
+    base_stop_policy = EarlyStopPolicy(
+        probe_from_epoch=1,
+        signal_from_epoch=10**9,
+        window=3,
+        probe_every_n_epochs=1,
+        extra_epochs_past_first_perfect=D,
+    )
     no_stop_policy = EarlyStopPolicy(
         probe_from_epoch=1,
         signal_from_epoch=10**9,
@@ -1310,8 +1379,8 @@ def run_cell(
     if base_done_path.exists():
         logger.info("Seed %d D=%d base: already done — loading from disk.", seed, D)
         base_done = json.loads(base_done_path.read_text())
-        a_keyed = json.loads((base_dir / "keyed_pairs.json").read_text())
-        a_registry = json.loads((base_dir / "simhash_registry.json").read_text())
+        a_keyed = json.loads((base_dir / "quads.json").read_text())
+        a_registry = load_registry(base_dir / "simhash_registry.json")
         encoding_floor_epoch = base_done.get("encoding_floor_epoch")
         # Reload adapter.
         if isinstance(model, PeftModel):
@@ -1329,11 +1398,14 @@ def run_cell(
         _check_pause(f"before base_{D} seed {seed}", run_dir)
 
         logger.info(
-            "Seed %d base_%d — Pretrain: %d keys, %d epochs (no early stop)",
+            "Seed %d base_%d — Pretrain: %d keys, up to %d epochs, stop at "
+            "first_perfect+%d (shared LR decay over %d-epoch reference)",
             seed,
             D,
             n_keys,
+            MAX_BASE_EPOCHS,
             D,
+            REFERENCE_EPOCHS,
         )
         if isinstance(model, PeftModel):
             model = model.base_model.model
@@ -1344,8 +1416,11 @@ def run_cell(
         a_registry = build_registry(a_keyed)
 
         a_ckpt = _find_latest_checkpoint(base_dir)
-        # lr_decay_steps calibrated to pretrain size.
-        pretrain_decay = decay_steps_for(n_keys, D)
+        # lr_decay_steps pinned to a shared reference epoch count — identical
+        # across every D arm so each arm sees the same LR-vs-step trajectory
+        # up to its (first_perfect + D) stop point.  CLAUDE.md: "decoupled
+        # from num_train_epochs".
+        pretrain_decay = decay_steps_for(n_keys)
 
         model, metrics_a, probe_a, wall_a = _run_phase(
             model=model,
@@ -1356,26 +1431,36 @@ def run_cell(
             adapter_name="episodic",
             phase_dir=base_dir,
             phase_name=f"base_{D}",
-            num_epochs=D,
+            num_epochs=MAX_BASE_EPOCHS,
             seed=seed,
             lr_scheduler_type=lr_scheduler_type,
             lr_decay_steps=pretrain_decay,
             weight_decay=pretrain_wd,
-            early_stop_policy=no_stop_policy,
+            early_stop_policy=base_stop_policy,
             run_name=f"test16-base{D}-seed{seed}",
             resume_from_checkpoint=a_ckpt,
         )
 
-        _exit_if_paused_mid_phase(probe_a, f"during base_{D} seed {seed}", D, run_dir)
+        _exit_if_paused_mid_phase(probe_a, f"during base_{D} seed {seed}", MAX_BASE_EPOCHS, run_dir)
 
-        encoding_floor_epoch = probe_a.stable_perfect_epoch
+        # Floor anchor for the redesign: first_perfect_epoch (the first
+        # observation of 100% recall on the training set).  Distinct from
+        # stable_perfect_epoch (3 consecutive perfect epochs) — the
+        # `extra_epochs_past_first_perfect` path in RecallEarlyStopCallback
+        # fires on first_perfect to make the "depth past floor" definition
+        # unambiguous regardless of late-epoch wobble.  Refuse-to-corrupt:
+        # hard-fail if encoding never reached perfect within MAX_BASE_EPOCHS.
+        # Silent acceptance of sub-perfect base was the bug Test 16's
+        # redesign forbids — see benchmarking.md §Test 16 redesign.
+        encoding_floor_epoch = probe_a.first_perfect_epoch
         if encoding_floor_epoch is None:
-            logger.warning(
-                "Seed %d D=%d: stable_perfect_epoch is None — keys may not have "
-                "reached stable 100%% within %d epochs (encoding floor not found).",
-                seed,
-                D,
-                D,
+            raise RuntimeError(
+                f"Seed {seed} base_{D}: first_perfect_epoch is None — encoding "
+                f"never reached 100% recall within {MAX_BASE_EPOCHS} epochs at "
+                f"n_keys={n_keys}, decay_steps={pretrain_decay}.  Refusing to "
+                f"corrupt a sub-perfect base.  Inspect epoch_log.json and either "
+                f"raise MAX_BASE_EPOCHS or REFERENCE_EPOCHS, or investigate why "
+                f"this seed cannot encode under the apples-to-apples schedule."
             )
 
         final_a = _safe_probe(model, tokenizer, a_keyed, a_registry, "episodic")
@@ -1384,14 +1469,12 @@ def run_cell(
             tokenizer,
             "episodic",
             registry_path=None,
-            keyed_pairs_path=base_dir / "keyed_pairs.json",
             key_count=len(a_keyed),
         )
         save_adapter(model, base_dir / "episodic_adapter", "episodic", manifest=_manifest_a)
 
-        depth_past_floor = (
-            max(0, D - encoding_floor_epoch) if encoding_floor_epoch is not None else None
-        )
+        depth_past_floor = D  # by construction — stop callback fires at floor+D
+        total_epochs_trained = encoding_floor_epoch + D
         _write_phase_done(
             base_dir,
             f"base_{D}_done.json",
@@ -1403,8 +1486,12 @@ def run_cell(
                 "condition": f"base_{D}",
                 "seed": seed,
                 "D": D,
-                "encoding_floor_epoch": encoding_floor_epoch,
                 "depth_past_floor": depth_past_floor,
+                "encoding_floor_epoch": encoding_floor_epoch,
+                "total_epochs_trained": total_epochs_trained,
+                "max_base_epochs": MAX_BASE_EPOCHS,
+                "reference_epochs": REFERENCE_EPOCHS,
+                "lr_decay_steps": pretrain_decay,
                 "train_loss": metrics_a.get("train_loss"),
                 "wall_seconds": round(wall_a, 1),
             },
@@ -1426,13 +1513,11 @@ def run_cell(
     if corrupted_done_path.exists():
         logger.info("Seed %d D=%d corrupted: already done — loading from disk.", seed, D)
         unchanged_keyed = json.loads((corrupted_dir / "unchanged_keyed.json").read_text())
-        unchanged_registry = json.loads((corrupted_dir / "unchanged_registry.json").read_text())
+        unchanged_registry = load_registry(corrupted_dir / "unchanged_registry.json")
         overwrite_swap_keyed = json.loads((corrupted_dir / "overwrite_swap_keyed.json").read_text())
-        overwrite_swap_registry = json.loads(
-            (corrupted_dir / "overwrite_swap_registry.json").read_text()
-        )
+        overwrite_swap_registry = load_registry(corrupted_dir / "overwrite_swap_registry.json")
         overwritten_keyed = json.loads((corrupted_dir / "overwritten_keyed.json").read_text())
-        overwritten_registry = json.loads((corrupted_dir / "overwritten_registry.json").read_text())
+        overwritten_registry = load_registry(corrupted_dir / "overwritten_registry.json")
         # Reload corrupted adapter for repair cells.
         if isinstance(model, PeftModel):
             model = model.base_model.model
@@ -1528,7 +1613,6 @@ def run_cell(
             tokenizer,
             "episodic",
             registry_path=None,
-            keyed_pairs_path=corrupted_dir / "keyed_pairs.json",
             key_count=len(overwrite_swap_keyed),
         )
         save_adapter(model, corrupted_dir / "episodic_adapter", "episodic", manifest=_manifest_c)
@@ -1541,8 +1625,8 @@ def run_cell(
         save_registry(overwrite_swap_registry, corrupted_dir / "overwrite_swap_registry.json")
         _safe_write_json(corrupted_dir / "overwritten_keyed.json", overwritten_keyed)
         save_registry(overwritten_registry, corrupted_dir / "overwritten_registry.json")
-        # keyed_pairs.json for corrupted phase = overwrite_swap_keyed.
-        _safe_write_json(corrupted_dir / "keyed_pairs.json", overwrite_swap_keyed)
+        # quads.json for corrupted phase = overwrite_swap_keyed.
+        _safe_write_json(corrupted_dir / "quads.json", overwrite_swap_keyed)
         save_registry(overwrite_swap_registry, corrupted_dir / "simhash_registry.json")
 
         epoch_log_from_file: list[dict] = []
@@ -1792,7 +1876,7 @@ def compute_test16_aggregate(run_dir: Path, cfg: dict) -> dict:
         Aggregate dict written to ``test16_aggregate.json``.
     """
     seeds: list[int] = cfg["seeds"]
-    depths: list[int] = cfg["depths"]
+    depths: list[int] = cfg["depths_past_floor"]
     repair_grid: list[list] = cfg["repair_grid"]
     spotcheck_cell: dict = cfg["spotcheck_cell"]
     base_wd: float = cfg["repair_weight_decay"]
@@ -2155,11 +2239,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument(
-        "--depths",
+        "--depths-past-floor",
+        "--depths_past_floor",
         nargs="+",
         type=int,
-        default=DEFAULT_DEPTHS,
-        help="Pretrain epoch depths to sweep (default: 30 50).",
+        default=DEFAULT_DEPTHS_PAST_FLOOR,
+        dest="depths_past_floor",
+        help=(
+            "Depth-past-floor values to sweep (default: 0 10 30).  Each arm "
+            "trains base for first_perfect_epoch + D epochs.  Replaces the "
+            "earlier --depths total-epoch knob (see benchmarking.md §Test 16)."
+        ),
     )
     parser.add_argument("--n-keys", "--n_keys", type=int, default=DEFAULT_N_KEYS, dest="n_keys")
     parser.add_argument(
@@ -2270,7 +2360,7 @@ def main() -> None:
     # Smoke mode: override key parameters.
     if args.smoke:
         args.seeds = [42]
-        args.depths = [30, 50]
+        args.depths_past_floor = [0, 10]
         args.n_keys = 50
         args.swap_keys = 12
         # 1 repair cell per depth (lr=1e-5, ep=1, wd=base_wd).
@@ -2326,7 +2416,7 @@ def main() -> None:
     # On resume, read back persisted values (persisted > defaults; explicit CLI > persisted).
     if args.resume and not args.smoke:
         args.seeds = cfg.get("seeds", args.seeds)
-        args.depths = cfg.get("depths", args.depths)
+        args.depths_past_floor = cfg.get("depths_past_floor", args.depths_past_floor)
         args.n_keys = cfg.get("n_keys", args.n_keys)
         args.swap_keys = cfg.get("swap_keys", args.swap_keys)
         args.overwrite_epochs = cfg.get("overwrite_epochs", args.overwrite_epochs)
@@ -2351,7 +2441,7 @@ def main() -> None:
             logger.info("Starting seed %d", seed)
             logger.info("=" * 72)
 
-            for D in cfg.get("depths", args.depths):
+            for D in cfg.get("depths_past_floor", args.depths_past_floor):
                 _check_pause(f"before D={D} seed {seed}", run_dir)
 
                 logger.info("Starting seed %d D=%d", seed, D)

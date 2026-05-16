@@ -161,7 +161,7 @@ def main():
         sys.exit(1)
 
     # Load original keyed pairs
-    with open(CYCLE_11_DIR / "keyed_pairs.json") as f:
+    with open(CYCLE_11_DIR / "quads.json") as f:
         original_pairs = json.load(f)
     print(f"Loaded {len(original_pairs)} original keyed pairs from cycle 11")
 

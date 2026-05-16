@@ -318,6 +318,7 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
             state["model"],
             state["tokenizer"],
             state["config"],
+            state["memory_store"],
             state_provider=lambda: state,
         )
         state["consolidation_loop"] = loop

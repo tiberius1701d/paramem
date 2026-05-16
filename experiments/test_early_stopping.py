@@ -82,10 +82,10 @@ class RecallProbingCallback(TrainerCallback):
     Stores per-epoch results including per-key raw output.
     """
 
-    def __init__(self, model, tokenizer, keyed_pairs, registry, adapter_name):
+    def __init__(self, model, tokenizer, quads, registry, adapter_name):
         self.model = model
         self.tokenizer = tokenizer
-        self.keyed_pairs = keyed_pairs
+        self.quads = quads
         self.registry = registry
         self.adapter_name = adapter_name
         self.epoch_log = []
@@ -106,7 +106,7 @@ class RecallProbingCallback(TrainerCallback):
         recall_result = evaluate_indexed_recall(
             self.model,
             self.tokenizer,
-            self.keyed_pairs,
+            self.quads,
             self.registry,
             adapter_name=self.adapter_name,
         )
@@ -155,7 +155,7 @@ class RecallProbingCallback(TrainerCallback):
 
         # Per-key details for this epoch
         epoch_key_details = []
-        for pk, kp in zip(per_key, self.keyed_pairs):
+        for pk, kp in zip(per_key, self.quads):
             epoch_key_details.append(
                 {
                     "key": kp["key"],
@@ -433,26 +433,26 @@ def run_scale_point(model, tokenizer, qa_pairs, scale, rank, num_epochs, output_
     )
     model = create_adapter(model, adapter_config, adapter_name)
 
-    keyed_pairs = assign_keys(subset, start_index=1)
-    registry = build_registry(keyed_pairs)
+    quads = assign_keys(subset, start_index=1)
+    registry = build_registry(quads)
     save_registry(registry, scale_dir / "simhash_registry.json")
 
-    # Save keyed_pairs
+    # Save quads
     kp_ser = []
-    for kp in keyed_pairs:
+    for kp in quads:
         entry = {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
         for meta_key in ("source_predicate", "source_subject", "source_object"):
             if meta_key in kp:
                 entry[meta_key] = kp[meta_key]
         kp_ser.append(entry)
-    with open(scale_dir / "keyed_pairs.json", "w") as f:
+    with open(scale_dir / "quads.json", "w") as f:
         json.dump(kp_ser, f, indent=2)
 
-    examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+    examples = format_indexed_training(quads, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
     # Create recall probing callback
-    recall_callback = RecallProbingCallback(model, tokenizer, keyed_pairs, registry, adapter_name)
+    recall_callback = RecallProbingCallback(model, tokenizer, quads, registry, adapter_name)
 
     # Single Trainer call for all epochs — optimizer state preserved
     training_config = TrainingConfig(

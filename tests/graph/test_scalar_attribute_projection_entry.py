@@ -1,18 +1,16 @@
-"""Unit tests for scalar-attribute projection in the quad distillation path.
+"""Unit tests for scalar-attribute projection in the indexed-key distillation path.
 
 Mirrors tests/graph/test_scalar_attribute_projection.py but exercises the
-quad path's _quads_from_graph helper (in ConsolidationLoop) instead of
+_entries_from_graph helper (in ConsolidationLoop) instead of
 generate_qa_from_graph.
 
 The key invariant (project_qa_attribute_keying_gap — resolved 2026-05-07):
-  Entity.attributes (email, phone, linkedin) must survive into the keyed set
-  when switching from the QA path to the quad path.  _quads_from_graph calls
-  relation_prep._flatten_entity_attributes so the attribute surface is
-  never silently dropped.
+  Entity.attributes (email, phone, linkedin) must survive into the keyed set.
+  _entries_from_graph calls relation_prep._flatten_entity_attributes so the
+  attribute surface is never silently dropped.
 
-Session graphs are represented as MagicMocks (same pattern as
-test_consolidation_quad.py) to avoid Pydantic schema-validation friction
-for relation_type values in unit tests.  The _flatten_entity_attributes
+Session graphs are represented as MagicMocks to avoid Pydantic schema-validation
+friction for relation_type values in unit tests.  The _flatten_entity_attributes
 tests use real Entity objects since they only touch Entity.attributes.
 
 No GPU required — template-fallback/mock only, no model.generate calls.
@@ -20,7 +18,6 @@ No GPU required — template-fallback/mock only, no model.generate calls.
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import MagicMock
 
 from paramem.graph.relation_prep import _flatten_entity_attributes
@@ -33,16 +30,15 @@ from paramem.utils.config import TrainingConfig
 # ---------------------------------------------------------------------------
 
 
-def _make_loop(*, indexed_format: str = "quad") -> ConsolidationLoop:
+def _make_loop() -> ConsolidationLoop:
     """Build a bare ConsolidationLoop with the minimum attributes for unit tests."""
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.model = MagicMock()
     loop.tokenizer = MagicMock()
     loop.training_config = TrainingConfig()
-    loop._indexed_format = indexed_format
-    loop._is_quad = indexed_format == "quad"
-    loop.indexed_key_cache: dict[str, Any] = {}
-    loop.indexed_key_registry = None
+    from paramem.training.memory_store import MemoryStore as _MS
+
+    loop.store = _MS(replay_enabled=False)
     loop.procedural_sp_index: dict = {}
     loop.cycle_count = 1
     return loop
@@ -53,10 +49,10 @@ def _make_mock_graph(
     relations: list[dict] | None = None,
     entity_attributes: dict[str, dict] | None = None,
 ) -> MagicMock:
-    """Build a minimal session-graph MagicMock for _quads_from_graph.
+    """Build a minimal session-graph MagicMock for _entries_from_graph.
 
     Uses MagicMock (no Pydantic schema) so tests stay free of Relation.relation_type
-    enum validation.  _quads_from_graph accesses r.subject/predicate/object/
+    enum validation.  _entries_from_graph accesses r.subject/predicate/object/
     relation_type off each relation, and entity.name/attributes off each entity.
 
     Args:
@@ -92,7 +88,7 @@ def _make_mock_graph(
 
 
 class TestFlattenEntityAttributesDirect:
-    """Direct tests of the helper invoked by _quads_from_graph."""
+    """Direct tests of the helper invoked by _entries_from_graph."""
 
     def test_email_projected_as_has_email(self) -> None:
         entity = Entity(
@@ -162,18 +158,18 @@ class TestFlattenEntityAttributesDirect:
 
 
 # ---------------------------------------------------------------------------
-# Tests: _quads_from_graph attribute projection (uses MagicMock graphs)
+# Tests: _entries_from_graph attribute projection (uses MagicMock graphs)
 # ---------------------------------------------------------------------------
 
 
 class TestQuadsFromGraphAttributeProjection:
-    """_quads_from_graph must include attribute-projected relations in the output."""
+    """_entries_from_graph must include attribute-projected relations in the output."""
 
     def test_email_attribute_survives_into_episodic(self) -> None:
-        """email Entity.attribute must appear as a has_email quad in episodic output.
+        """email Entity.attribute must appear as a has_email relation in episodic output.
 
         This is the attribute-projection canary: if _flatten_entity_attributes
-        is not called inside _quads_from_graph, scalar-PII keying silently
+        is not called inside _entries_from_graph, scalar-PII keying silently
         regresses (project_qa_attribute_keying_gap).
         """
         graph = _make_mock_graph(
@@ -187,14 +183,14 @@ class TestQuadsFromGraphAttributeProjection:
             ],
             entity_attributes={"Alice": {"email": "alice@example.com"}},
         )
-        loop = _make_loop(indexed_format="quad")
-        episodic, procedural = loop._quads_from_graph(graph, procedural_enabled=False)
+        loop = _make_loop()
+        episodic, procedural = loop._entries_from_graph(graph, procedural_enabled=False)
 
         predicates = [r["predicate"] for r in episodic]
         assert "has_email" in predicates, (
-            "email attribute was NOT projected into the quad episodic set — "
+            "email attribute was NOT projected into the episodic set — "
             "scalar-PII keying silently regressed (_flatten_entity_attributes "
-            "not called in _quads_from_graph)"
+            "not called in _entries_from_graph)"
         )
 
     def test_attribute_object_matches_entity_attribute_value(self) -> None:
@@ -202,8 +198,8 @@ class TestQuadsFromGraphAttributeProjection:
         graph = _make_mock_graph(
             entity_attributes={"Bob": {"phone": "+1 555 000 0001"}},
         )
-        loop = _make_loop(indexed_format="quad")
-        episodic, _ = loop._quads_from_graph(graph, procedural_enabled=False)
+        loop = _make_loop()
+        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
         phone_rels = [r for r in episodic if r["predicate"] == "has_phone"]
         assert phone_rels, "has_phone not found"
         assert phone_rels[0]["object"] == "+1 555 000 0001"
@@ -221,19 +217,19 @@ class TestQuadsFromGraphAttributeProjection:
             ],
             entity_attributes={"Carol": {"email": "c@c.com"}},
         )
-        loop = _make_loop(indexed_format="quad")
-        episodic, _ = loop._quads_from_graph(graph, procedural_enabled=False)
+        loop = _make_loop()
+        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
         email_rels = [r for r in episodic if r["predicate"] == "has_email"]
         # Exactly one — the explicit relation; the attribute projection is excluded.
         assert len(email_rels) == 1
 
     def test_no_model_generate_called(self) -> None:
-        """_quads_from_graph must NOT call model.generate."""
+        """_entries_from_graph must NOT call model.generate."""
         graph = _make_mock_graph(
             entity_attributes={"Dave": {"email": "d@d.com"}},
         )
-        loop = _make_loop(indexed_format="quad")
-        loop._quads_from_graph(graph, procedural_enabled=False)
+        loop = _make_loop()
+        loop._entries_from_graph(graph, procedural_enabled=False)
         loop.model.generate.assert_not_called()
 
     def test_preference_relation_routes_to_procedural_when_enabled(self) -> None:
@@ -254,8 +250,8 @@ class TestQuadsFromGraphAttributeProjection:
                 },
             ]
         )
-        loop = _make_loop(indexed_format="quad")
-        episodic, procedural = loop._quads_from_graph(graph, procedural_enabled=True)
+        loop = _make_loop()
+        episodic, procedural = loop._entries_from_graph(graph, procedural_enabled=True)
         ep_preds = [r["predicate"] for r in episodic]
         proc_preds = [r["predicate"] for r in procedural]
         assert "works_at" in ep_preds
@@ -265,31 +261,31 @@ class TestQuadsFromGraphAttributeProjection:
     def test_empty_session_returns_empty_lists(self) -> None:
         """A session graph with no relations and no entities returns ([], [])."""
         graph = _make_mock_graph()
-        loop = _make_loop(indexed_format="quad")
-        episodic, procedural = loop._quads_from_graph(graph, procedural_enabled=True)
+        loop = _make_loop()
+        episodic, procedural = loop._entries_from_graph(graph, procedural_enabled=True)
         assert episodic == []
         assert procedural == []
 
 
 # ---------------------------------------------------------------------------
-# Tests: assign_quad_keys receives attribute-projected relations
+# Tests: assign_keys receives attribute-projected relations
 # ---------------------------------------------------------------------------
 
 
 class TestAttributeKeysAssignment:
-    """End-to-end: attribute-projected relations get graphN keys via assign_quad_keys."""
+    """End-to-end: attribute-projected relations get graphN keys via assign_keys."""
 
     def test_email_attribute_gets_a_graph_key(self) -> None:
         """An email attribute ends up in the episodic keyed set with a graphN key."""
-        from paramem.training.quadruple_memory import assign_quad_keys
+        from paramem.training.entry_memory import assign_keys
 
         graph = _make_mock_graph(
             entity_attributes={"Faye": {"email": "f@f.com"}},
         )
-        loop = _make_loop(indexed_format="quad")
-        episodic, _ = loop._quads_from_graph(graph, procedural_enabled=False)
+        loop = _make_loop()
+        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
 
-        keyed = assign_quad_keys(
+        keyed = assign_keys(
             [(r["subject"], r["predicate"], r["object"]) for r in episodic],
             start_index=1,
             prefix="graph",
@@ -299,15 +295,15 @@ class TestAttributeKeysAssignment:
 
     def test_key_prefix_is_graph_for_attribute_relations(self) -> None:
         """Attribute relations are non-preference so they land in the graph* key range."""
-        from paramem.training.quadruple_memory import assign_quad_keys
+        from paramem.training.entry_memory import assign_keys
 
         graph = _make_mock_graph(
             entity_attributes={"George": {"phone": "+1 800 000 0000"}},
         )
-        loop = _make_loop(indexed_format="quad")
-        episodic, _ = loop._quads_from_graph(graph, procedural_enabled=False)
+        loop = _make_loop()
+        episodic, _ = loop._entries_from_graph(graph, procedural_enabled=False)
 
-        keyed = assign_quad_keys(
+        keyed = assign_keys(
             [(r["subject"], r["predicate"], r["object"]) for r in episodic],
             start_index=1,
             prefix="graph",

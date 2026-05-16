@@ -93,9 +93,12 @@ class OpenAICompatAgent(CloudAgent):
             "max_tokens": 1024,
         }
 
-        # Search models reject temperature; regular models use it
+        # Search models reject temperature; regular models pin to 0 for
+        # structured-output determinism (CLAUDE.md invariant: temperature=0.0
+        # for JSON/QA/distillation paths).  The 0.7 default that lived here
+        # produced run-to-run variance in graph extraction.
         if not is_search_model:
-            payload["temperature"] = 0.7
+            payload["temperature"] = 0.0
 
         # Enable web search for OpenAI search models (gpt-4o-search-preview, etc.)
         if self.config.provider == "openai" and is_search_model:

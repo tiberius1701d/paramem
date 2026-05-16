@@ -284,8 +284,8 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
     simulate_dir:
         Optional path to the simulate-mode peer-storage root
         (``configs/server.yaml``'s ``paths.simulate``). When provided,
-        the per-tier ``keyed_pairs.json`` files under it are appended
-        to the candidate set so rotation, restore, and the startup
+        the per-tier ``graph.json`` files under it are appended to the
+        candidate set so rotation, restore, and the startup
         mode-consistency scan all cover the simulate store. Callers
         that do not have a config (e.g. legacy callers) may pass
         ``None`` to keep the historical data-dir-only behaviour.
@@ -304,13 +304,13 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
         data_dir / "registry" / "key_metadata.json",
         data_dir / "speaker_profiles.json",
         data_dir / "adapters" / "post_session_queue.json",
-        data_dir / "adapters" / "keyed_pairs.json",
-        data_dir / "adapters" / "episodic" / "keyed_pairs.json",
-        data_dir / "adapters" / "semantic" / "keyed_pairs.json",
-        data_dir / "adapters" / "procedural" / "keyed_pairs.json",
     ]
-    # BG-trainer resume states live under per-job in_training directories.
+    # Per-tier adapter registry + simhash (new layout: <adapters>/<tier>/<file>).
     adapters_root = data_dir / "adapters"
+    for _tier in ("episodic", "semantic", "procedural"):
+        paths.append(adapters_root / _tier / "indexed_key_registry.json")
+        paths.append(adapters_root / _tier / "simhash_registry.json")
+    # BG-trainer resume states live under per-job in_training directories.
     if adapters_root.exists():
         for resume in adapters_root.rglob("in_training/resume_state.json"):
             paths.append(resume)
@@ -322,19 +322,11 @@ def infra_paths(data_dir: Path, simulate_dir: Path | None = None) -> list[Path]:
     if adapters_root.exists():
         for safetensors in adapters_root.rglob("adapter_model.safetensors"):
             paths.append(safetensors)
-    # Simulate-mode peer-storage keyed_pairs (canonical per-tier layout).
-    # Encryption posture matches train: respects the master switch via the
-    # same encrypted helpers. Inclusion here ensures rotation/restore/scan
-    # cover the simulate store as a first-class production artifact.
+    # Simulate-mode per-tier graph.json files (canonical simulate-mode store).
     if simulate_dir is not None:
         simulate_dir = Path(simulate_dir)
-        paths.extend(
-            [
-                simulate_dir / "episodic" / "keyed_pairs.json",
-                simulate_dir / "semantic" / "keyed_pairs.json",
-                simulate_dir / "procedural" / "keyed_pairs.json",
-            ]
-        )
+        for _tier in ("episodic", "semantic", "procedural"):
+            paths.append(simulate_dir / _tier / "graph.json")
     return paths
 
 

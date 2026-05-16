@@ -1,18 +1,25 @@
-"""Indexed key memory — per-fact addressable recall from adapter weights.
+"""Indexed key memory — legacy {question, answer} format.
 
-Assigns each QA pair a unique key (graph1, graph2, ...) and trains the model
-to recall individual facts by key. Enables per-fact readout, capacity detection,
-and targeted reinforcement without external storage.
+Production retired the question/answer training shape on 2026-05-14; the
+live pipeline now trains and probes via :mod:`paramem.training.entry_memory`
+exclusively. This module is kept for archived experiments (Tests 1-16) that
+were calibrated on the legacy shape — its functions (``format_indexed_training``,
+``probe_key``, ``RECALL_TEMPLATE``) are not on the production path anymore.
 
-Training format per key:
-  User: "Recall the QA pair stored under key 'graph3'."
-  Assistant: {"key": "graph3", "question": "...", "answer": "..."}
+What the legacy format does (for reference):
+  Assigns each {question, answer} pair a unique key (graph1, graph2, ...)
+  and trains the model to recall individual facts by key.
+
+  Training format per key:
+    User: "Recall the QA pair stored under key 'graph3'."
+    Assistant: {"key": "graph3", "question": "...", "answer": "..."}
 
 Hallucination detection uses an external SimHash registry — a lightweight
 key→fingerprint mapping saved alongside the adapter. SimHash is a locality-
 sensitive hash: similar content produces similar fingerprints, so verification
 returns a continuous confidence score (0.0-1.0) rather than a binary pass/fail.
-This tolerates minor recall variations while rejecting hallucinated content.
+
+For the live entry format, see :mod:`paramem.training.entry_memory`.
 """
 
 import hashlib
@@ -113,24 +120,22 @@ def verify_confidence(
 # --- Registry management ---
 
 
-def build_registry(keyed_pairs: list[dict]) -> dict[str, int]:
-    """Build a SimHash registry from keyed QA pairs.
+def build_registry(pairs: list[dict]) -> dict[str, int]:
+    """Build a SimHash registry from keyed QA pairs (legacy format).
 
     Returns a mapping of key → 64-bit SimHash fingerprint.
     This is the simple format used by the training pipeline.
     For enriched metadata, see build_enriched_registry().
     """
-    return {
-        kp["key"]: compute_simhash(kp["key"], kp["question"], kp["answer"]) for kp in keyed_pairs
-    }
+    return {kp["key"]: compute_simhash(kp["key"], kp["question"], kp["answer"]) for kp in pairs}
 
 
 def build_enriched_registry(
-    keyed_pairs: list[dict],
+    pairs: list[dict],
     session_id: str | None = None,
     existing: dict | None = None,
 ) -> dict:
-    """Build an enriched registry with temporal metadata.
+    """Build an enriched registry with temporal metadata (legacy QA format).
 
     Format per key:
         {
@@ -144,15 +149,15 @@ def build_enriched_registry(
         }
 
     If existing registry is provided, updates it:
-    - Active keys present in keyed_pairs get their last_seen_at updated
-    - Active keys NOT in keyed_pairs are unchanged (not auto-staled)
-    - Stale keys NOT in keyed_pairs get stale_cycles incremented
-    - Stale keys present in keyed_pairs are reactivated
+    - Active keys present in pairs get their last_seen_at updated
+    - Active keys NOT in pairs are unchanged (not auto-staled)
+    - Stale keys NOT in pairs get stale_cycles incremented
+    - Stale keys present in pairs are reactivated
     """
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
-    current_keys = {kp["key"] for kp in keyed_pairs}
+    current_keys = {kp["key"] for kp in pairs}
 
     if existing is None:
         existing = {}
@@ -160,7 +165,7 @@ def build_enriched_registry(
     registry = dict(existing)
 
     # Update or add keys from current training set
-    for kp in keyed_pairs:
+    for kp in pairs:
         key = kp["key"]
         simhash = compute_simhash(key, kp["question"], kp["answer"])
 
@@ -278,8 +283,9 @@ def load_registry(path: str | Path) -> dict:
 def assign_keys(qa_pairs: list[dict], start_index: int = 1) -> list[dict]:
     """Assign sequential keys to QA pairs.
 
-    Returns list of {"key": "graph1", "question": ..., "answer": ...}.
-    Extra fields (e.g. source_subject) are preserved for metadata tracking.
+    Returns list of ``{"key": "graph1", "question": ..., "answer": ...}``
+    plus any extra canonical fields (``subject``, ``predicate``, ``object``,
+    ``first_seen_cycle``, ``speaker_id``) present in the input.
     """
     keyed = []
     for i, qa in enumerate(qa_pairs, start=start_index):
@@ -288,13 +294,12 @@ def assign_keys(qa_pairs: list[dict], start_index: int = 1) -> list[dict]:
             "question": qa["question"],
             "answer": qa["answer"],
         }
-        # Preserve source and cohort metadata
+        # Preserve canonical triple + cohort metadata
         for extra_key in (
-            "source_subject",
-            "source_predicate",
-            "source_object",
+            "subject",
+            "predicate",
+            "object",
             "first_seen_cycle",
-            "source_character",
             "speaker_id",
         ):
             if extra_key in qa:
@@ -342,14 +347,12 @@ def _tokenize_with_prompt_masking(messages: list[dict], tokenizer, max_length: i
     }
 
 
-def format_indexed_training(
-    keyed_pairs: list[dict], tokenizer, max_length: int = 1024
-) -> list[dict]:
-    """Build training examples for indexed recall.
+def format_indexed_training(pairs: list[dict], tokenizer, max_length: int = 1024) -> list[dict]:
+    """Build training examples for indexed recall (legacy QA format).
 
     For each keyed pair, creates two training examples:
     1. Indexed recall: "Recall the QA pair stored under key 'graphN'." -> JSON
-    2. Individual QA: question -> answer (standard format for backward compat)
+    2. Individual QA: question -> answer
 
     Returns pre-tokenized examples with label masking.
     """
@@ -357,7 +360,7 @@ def format_indexed_training(
 
     examples = []
 
-    for kp in keyed_pairs:
+    for kp in pairs:
         # Indexed recall example
         recall_prompt = RECALL_TEMPLATE.format(key=kp["key"])
         recall_response = _build_recall_response(kp)
@@ -515,7 +518,6 @@ def probe_key(
 
     recalled["confidence"] = confidence
     recalled["raw_output"] = raw
-    recalled["format"] = "qa"
     recalled["fact_text"] = recalled.get("answer", "")
     return recalled
 
@@ -542,30 +544,23 @@ def probe_keys_grouped_by_adapter(
     max_new_tokens: int = 200,
     registry: dict[str, int] | None = None,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-    formats_by_adapter: dict[str, str] | None = None,
 ) -> dict[str, dict | None]:
     """Probe keys grouped by owning adapter. One switch_adapter per group.
 
     Iterates ``keys_by_adapter`` in insertion order — the caller is responsible
-    for passing groups in the desired probe order (e.g. procedural → episodic →
+    for passing groups in the desired probe order (procedural → episodic →
     semantic → session adapters newest-first, as produced by the router).
 
     For each ``(adapter_name, keys)`` group:
     - If the adapter is not present in ``model.peft_config``, emits a WARNING
-      and maps every key in the group to ``None`` (matches the missing-key
-      convention of ``probe_all_keys``).
+      and maps every key in the group to ``None``.
     - Otherwise switches to the adapter once via ``switch_adapter`` and calls
-      either ``probe_quad`` (quad format) or ``probe_key`` (QA format) for
-      every key in the group, based on ``formats_by_adapter``.
+      :func:`paramem.training.entry_memory.probe_entry` for every key.
 
-    Every success result carries ``"format"`` (``"qa"`` | ``"quad"``) and
-    ``"fact_text"`` (pre-rendered string for context-bullet assembly).  Failure
-    dicts stay ``{"raw_output", "failure_reason"}``.  ``None`` means the
-    adapter or key was not available.
-
-    Import note: ``quadruple_memory`` is imported lazily inside the quad branch
-    to avoid a circular import (``quadruple_memory`` already imports from
-    ``indexed_memory`` at module level).
+    Success results carry ``"fact_text"`` (pre-rendered string for
+    context-bullet assembly).  Failure dicts stay
+    ``{"raw_output", "failure_reason"}``.  ``None`` means the adapter or
+    key was not available.
 
     Args:
         model: A PeftModel instance with one or more loaded adapters.
@@ -574,20 +569,14 @@ def probe_keys_grouped_by_adapter(
             probe under that adapter.
         max_new_tokens: Maximum tokens to generate per probe.
         registry: Optional SimHash registry for confidence verification.
-            Passed to both the QA and quad probe paths — registry format must
-            match the adapter format (QA simhash for QA adapters, quad simhash
-            for quad adapters).
-        confidence_threshold: Minimum confidence to accept a recalled pair.
-        formats_by_adapter: Optional mapping of adapter name → format string
-            (``"qa"`` or ``"quad"``).  ``None`` or a missing entry defaults to
-            ``"qa"`` (back-compat — every adapter before the quad switch is
-            QA-format).
+        confidence_threshold: Minimum confidence to accept a recalled entry.
 
     Returns:
         Flat dict mapping each key name to its probe result (a result dict on
         success, or ``None`` / a failure dict on failure).
     """
     from paramem.models.loader import switch_adapter
+    from paramem.training.entry_memory import entry_fact_text, probe_entry
 
     results: dict[str, dict | None] = {}
 
@@ -603,261 +592,19 @@ def probe_keys_grouped_by_adapter(
                 results[key] = None
             continue
 
-        fmt = (formats_by_adapter or {}).get(adapter_name, "qa")
         switch_adapter(model, adapter_name)
-
-        if fmt == "quad":
-            from paramem.training.quadruple_memory import probe_quad, quad_fact_text
-
-            for key in keys:
-                result = probe_quad(
-                    model,
-                    tokenizer,
-                    key,
-                    max_new_tokens=max_new_tokens,
-                    registry=registry,
-                    confidence_threshold=confidence_threshold,
-                )
-                if result is not None and "failure_reason" not in result:
-                    result["format"] = "quad"
-                    result["fact_text"] = quad_fact_text(result)
-                results[key] = result
-        else:
-            for key in keys:
-                results[key] = probe_key(
-                    model,
-                    tokenizer,
-                    key,
-                    max_new_tokens=max_new_tokens,
-                    registry=registry,
-                    confidence_threshold=confidence_threshold,
-                )
-
-    return results
-
-
-def probe_keys_from_disk(
-    adapter_dir: Path,
-    keys_by_adapter: dict[str, list[str]],
-    formats_by_adapter: dict[str, str] | None = None,
-) -> dict[str, dict | None]:
-    """Disk-recall counterpart of probe_keys_grouped_by_adapter.
-
-    Reads keyed_pairs.json files on disk instead of generating from adapter
-    weights. Used by simulate mode so inference-time recall mirrors what a
-    perfect-recall train run would produce — same shape, same content.
-
-    On-disk layout (produced by ``_save_keyed_pairs_for_router``):
-      * canonical: ``adapter_dir/<adapter_name>/keyed_pairs.json`` for all tiers.
-
-    A backwards-compat fallback reads the legacy top-level path
-    ``adapter_dir/keyed_pairs.json`` for episodic when the canonical path
-    is missing AND a top-level file exists. The fallback also applies when
-    ``fmt == "quad"`` (the quad-format file at the canonical path is absent
-    but a top-level file exists). This fallback may be removed after operators
-    have run one consolidation cycle on the new layout.
-
-    Format dispatch: when ``formats_by_adapter[adapter_name] == "quad"``,
-    reads via :func:`paramem.training.keyed_pairs_io.read_keyed_pairs_quad`
-    (which also projects legacy QA-on-disk files to quad shape).  Otherwise
-    reads via :func:`paramem.training.keyed_pairs_io.read_keyed_pairs`
-    (strict QA schema) — this preserves the QA-generator-condensed ``answer``
-    text, which would be lost if QA files were projected to quad shape on read.
-
-    Every success result carries ``"format"`` (``"qa"`` | ``"quad"``) and
-    ``"fact_text"`` (pre-rendered string for context-bullet assembly):
-    * QA: ``fact_text = answer``
-    * quad: ``fact_text = f"{subject} {predicate_spaced} {object}"``
-
-    Missing files, missing keys, and malformed JSON all map to ``None`` —
-    matches the per-key failure shape of ``probe_keys_grouped_by_adapter``.
-
-    Args:
-        adapter_dir: Directory containing per-adapter ``keyed_pairs.json`` files.
-        keys_by_adapter: Ordered mapping of adapter name → list of key names.
-        formats_by_adapter: Optional mapping of adapter name → format string
-            (``"qa"`` or ``"quad"``).  ``None`` or a missing entry defaults to
-            ``"qa"`` (back-compat).
-
-    Returns:
-        Flat ``dict[str, dict | None]`` keyed by individual key names.
-        Hits include the canonical result fields plus ``format`` and ``fact_text``
-        so downstream consumers can treat the result identically to a live probe.
-    """
-    results: dict[str, dict | None] = {}
-
-    for adapter_name, keys in keys_by_adapter.items():
-        if not keys:
-            continue
-
-        fmt = (formats_by_adapter or {}).get(adapter_name, "qa")
-
-        kp_path = adapter_dir / adapter_name / "keyed_pairs.json"
-        # Backwards-compat: legacy production wrote episodic keyed_pairs at the
-        # top of adapter_dir before the layout canonicalization. Fall back when
-        # the canonical path is missing AND a top-level file exists. Drop after
-        # operators have run one consolidation cycle on the new layout.
-        if adapter_name == "episodic" and not kp_path.exists():
-            legacy = adapter_dir / "keyed_pairs.json"
-            if legacy.exists():
-                logger.warning(
-                    "keyed_pairs.json for episodic found at legacy top-level path %s; "
-                    "expected canonical %s. Run one consolidation cycle to rewrite.",
-                    legacy,
-                    kp_path,
-                )
-                kp_path = legacy
-
-        if not kp_path.exists():
-            logger.warning(
-                "keyed_pairs.json missing for adapter '%s' at %s — %d key(s) unresolved",
-                adapter_name,
-                kp_path,
-                len(keys),
-            )
-            for key in keys:
-                results[key] = None
-            continue
-
-        try:
-            if fmt == "quad":
-                from paramem.training.keyed_pairs_io import read_keyed_pairs_quad
-
-                pairs = read_keyed_pairs_quad(kp_path)
-            else:
-                from paramem.training.keyed_pairs_io import read_keyed_pairs
-
-                pairs = read_keyed_pairs(kp_path)
-        except (OSError, json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
-            logger.warning("Failed to read %s: %s — %d key(s) unresolved", kp_path, exc, len(keys))
-            for key in keys:
-                results[key] = None
-            continue
-
-        index = {entry["key"]: entry for entry in pairs if "key" in entry}
-
-        if fmt == "quad":
-            from paramem.training.quadruple_memory import quad_fact_text
-
-            for key in keys:
-                entry = index.get(key)
-                if entry is None:
-                    results[key] = None
-                    continue
-                results[key] = {
-                    "key": key,
-                    "subject": entry.get("subject", ""),
-                    "predicate": entry.get("predicate", ""),
-                    "object": entry.get("object", ""),
-                    "confidence": 1.0,
-                    "format": "quad",
-                    "fact_text": quad_fact_text(entry),
-                    "raw_output": json.dumps(
-                        {
-                            "key": key,
-                            "subject": entry.get("subject", ""),
-                            "predicate": entry.get("predicate", ""),
-                            "object": entry.get("object", ""),
-                        }
-                    ),
-                }
-        else:
-            for key in keys:
-                entry = index.get(key)
-                if entry is None:
-                    results[key] = None
-                    continue
-                answer_val = entry.get("answer", "")
-                results[key] = {
-                    "key": key,
-                    "question": entry.get("question", ""),
-                    "answer": answer_val,
-                    "confidence": 1.0,
-                    "format": "qa",
-                    "fact_text": answer_val,
-                    "raw_output": json.dumps(
-                        {
-                            "key": key,
-                            "question": entry.get("question", ""),
-                            "answer": answer_val,
-                        }
-                    ),
-                }
-
-    return results
-
-
-def probe_keys_from_graph(
-    simulate_dir: Path,
-    keys_by_adapter: dict[str, list[str]],
-) -> dict[str, dict | None]:
-    """Graph-recall counterpart of :func:`probe_keys_from_disk`.
-
-    Reads per-tier ``<simulate_dir>/<tier>/graph.json`` files instead of
-    ``keyed_pairs.json`` files.  Used by simulate mode when the on-disk
-    format is a NetworkX graph.
-
-    The return shape is identical to the quad branch of
-    :func:`probe_keys_from_disk` (lines 747-763 of this file) so callers
-    can swap the two functions without touching downstream consumers:
-
-    .. code-block:: python
-
-        {"key": str, "subject": str, "predicate": str, "object": str,
-         "confidence": 1.0, "format": "quad",
-         "fact_text": <quad_fact_text(entry)>,
-         "raw_output": json.dumps({key, subject, predicate, object})}
-
-    Missing tier files are silently treated as empty graphs so every key in
-    that adapter's list resolves to ``None`` without raising.
-
-    Args:
-        simulate_dir: Directory whose per-tier subdirectories contain
-            ``graph.json`` files (e.g. ``data/ha/simulate``).
-        keys_by_adapter: Ordered mapping of adapter name → list of key names.
-            Valid adapter names match the per-tier subdirectory names
-            (``"episodic"``, ``"semantic"``, ``"procedural"``).
-
-    Returns:
-        Flat ``dict[str, dict | None]`` keyed by individual key names.
-        Hits carry the canonical result fields (``key``, ``subject``,
-        ``predicate``, ``object``, ``confidence``, ``format``, ``fact_text``,
-        ``raw_output``).  Misses map the key to ``None``.
-    """
-    from paramem.server.simulate_store import load_simulate_graph, quad_by_key
-    from paramem.training.quadruple_memory import quad_fact_text
-
-    results: dict[str, dict | None] = {}
-
-    for adapter_name, keys in keys_by_adapter.items():
-        if not keys:
-            continue
-
-        graph_path = Path(simulate_dir) / adapter_name / "graph.json"
-        graph = load_simulate_graph(graph_path)
-
         for key in keys:
-            entry = quad_by_key(graph, key)
-            if entry is None:
-                results[key] = None
-                continue
-            results[key] = {
-                "key": key,
-                "subject": entry.get("subject", ""),
-                "predicate": entry.get("predicate", ""),
-                "object": entry.get("object", ""),
-                "confidence": 1.0,
-                "format": "quad",
-                "fact_text": quad_fact_text(entry),
-                "raw_output": json.dumps(
-                    {
-                        "key": key,
-                        "subject": entry.get("subject", ""),
-                        "predicate": entry.get("predicate", ""),
-                        "object": entry.get("object", ""),
-                    }
-                ),
-            }
+            result = probe_entry(
+                model,
+                tokenizer,
+                key,
+                max_new_tokens=max_new_tokens,
+                registry=registry,
+                confidence_threshold=confidence_threshold,
+            )
+            if result is not None and "failure_reason" not in result:
+                result["fact_text"] = entry_fact_text(result)
+            results[key] = result
 
     return results
 
