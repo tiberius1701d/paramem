@@ -122,3 +122,11 @@ configs/prompts/calib_*.txt
 
 # Calibration tool dump dirs.
 data/ha/debug/calibration/
+
+# MagicMock-named directory leakage. Several tests mock snapshot_dir_for(...)
+# with a bare MagicMock; production code that calls .mkdir(parents=True,
+# exist_ok=True) on the mocked return value reaches the filesystem with
+# str(MagicMock()) as the path, creating directories like
+# "<MagicMock name='mock.snapshot_dir_for().__truediv__()' id='...'>".
+# Fixing every test to use spec=Path mocks is a separate pass.
+<MagicMock*
