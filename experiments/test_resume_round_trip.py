@@ -240,14 +240,11 @@ def main(model_name: str, dry_run: bool) -> int:
 
     t_start = time.time()
 
-    keyed_pairs = assign_keys(SYNTHETIC_QA, start_index=1)
-    registry = build_registry(keyed_pairs)
+    quads = assign_keys(SYNTHETIC_QA, start_index=1)
+    registry = build_registry(quads)
     _save_json_atomic(
-        [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_pairs
-        ],
-        run_dir / "keyed_pairs.json",
+        [{"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in quads],
+        run_dir / "quads.json",
     )
     save_registry(registry, run_dir / "simhash_registry.json")
 
@@ -297,7 +294,7 @@ def main(model_name: str, dry_run: bool) -> int:
         model = create_adapter(model, adapter_config, "in_training")
 
         job = TrainingJob(
-            keyed_pairs=keyed_pairs,
+            quads=quads,
             adapter_name=ADAPTER_NAME,
             adapter_config=adapter_config,
             inference_fallback_adapter=ADAPTER_NAME,

@@ -69,17 +69,19 @@ def _make_loop(
     )
     loop.shutdown_requested = False
     loop._thermal_policy = None
-    # _is_quad / _indexed_format are set by __init__; tests that bypass
-    # __init__ via __new__ must set them explicitly.
-    loop._indexed_format = "qa"
-    loop._is_quad = False
     return loop
 
 
 def _kp(n: int = 5) -> list[dict]:
-    """Build n synthetic keyed_pairs."""
+    """Build n synthetic entry-format entries."""
     return [
-        {"key": f"graph{i + 1}", "question": f"Q{i + 1}?", "answer": f"A{i + 1}"} for i in range(n)
+        {
+            "key": f"graph{i + 1}",
+            "subject": f"S{i + 1}",
+            "predicate": "p",
+            "object": f"O{i + 1}",
+        }
+        for i in range(n)
     ]
 
 
@@ -92,7 +94,7 @@ class TestMaybeMakeRecallCallback:
     def test_returns_none_when_flag_off(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=False)
         cb = loop._maybe_make_recall_callback(
-            keyed_pairs=_kp(),
+            entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
@@ -102,7 +104,7 @@ class TestMaybeMakeRecallCallback:
     def test_returns_none_when_keyed_pairs_empty(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         cb = loop._maybe_make_recall_callback(
-            keyed_pairs=[],
+            entries=[],
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
@@ -118,7 +120,7 @@ class TestMaybeMakeRecallCallback:
             recall_probe_every_n_epochs=2,
         )
         cb = loop._maybe_make_recall_callback(
-            keyed_pairs=_kp(),
+            entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
@@ -133,7 +135,7 @@ class TestMaybeMakeRecallCallback:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         out = tmp_path / "out"
         cb = loop._maybe_make_recall_callback(
-            keyed_pairs=_kp(),
+            entries=_kp(),
             adapter_name="episodic",
             output_dir=out,
             phase_name="test",
@@ -147,7 +149,7 @@ class TestMaybeMakeRecallCallback:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         keyed = _kp(7)
         cb = loop._maybe_make_recall_callback(
-            keyed_pairs=keyed,
+            entries=keyed,
             adapter_name="episodic",
             output_dir=tmp_path / "out",
             phase_name="test",
@@ -290,7 +292,7 @@ class TestEnabledVsDisabledBranch:
     def test_disabled_callbacks_extra_is_none(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=False)
         cb = loop._maybe_make_recall_callback(
-            keyed_pairs=_kp(),
+            entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path,
             phase_name="test",
@@ -302,7 +304,7 @@ class TestEnabledVsDisabledBranch:
     def test_enabled_passes_recall_callback_only(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         cb = loop._maybe_make_recall_callback(
-            keyed_pairs=_kp(),
+            entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path,
             phase_name="test",

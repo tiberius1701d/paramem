@@ -5,84 +5,6 @@ filter integration without requiring GPU/model.
 """
 
 
-class TestSeedProceduralQA:
-    """Test seed_procedural_cache restores state correctly."""
-
-    def _make_loop_stub(self):
-        """Create a minimal stub with the fields seed_procedural_cache needs."""
-
-        class LoopStub:
-            def __init__(self):
-                self.indexed_key_cache = {}
-                self.procedural_sp_index = {}
-                self.indexed_key_registry = None
-
-        # Import and bind the real methods.  seed_procedural_cache now delegates
-        # to _cache_entry so both must be bound on the stub.
-        from paramem.training.consolidation import ConsolidationLoop
-
-        stub = LoopStub()
-        stub.seed_procedural_cache = ConsolidationLoop.seed_procedural_cache.__get__(stub)
-        stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
-        return stub
-
-    def test_seeds_into_indexed_key_qa(self):
-        stub = self._make_loop_stub()
-        pairs = [
-            {
-                "key": "proc1",
-                "question": "What does Alex prefer?",
-                "answer": "Alex prefers jazz.",
-                "source_subject": "Alex",
-                "source_predicate": "prefers",
-                "speaker_id": "speaker1",
-            },
-        ]
-        stub.seed_procedural_cache(pairs)
-        assert "proc1" in stub.indexed_key_cache
-        assert stub.indexed_key_cache["proc1"]["question"] == "What does Alex prefer?"
-
-    def test_rebuilds_sp_index(self):
-        stub = self._make_loop_stub()
-        pairs = [
-            {
-                "key": "proc1",
-                "question": "Q",
-                "answer": "A",
-                "source_subject": "Alex",
-                "source_predicate": "prefers",
-                "speaker_id": "sp1",
-            },
-            {
-                "key": "proc2",
-                "question": "Q2",
-                "answer": "A2",
-                "source_subject": "Anna",
-                "source_predicate": "likes",
-                "speaker_id": "sp2",
-            },
-        ]
-        stub.seed_procedural_cache(pairs)
-        assert stub.procedural_sp_index[("sp1", "alex", "prefers")] == "proc1"
-        assert stub.procedural_sp_index[("sp2", "anna", "likes")] == "proc2"
-
-    def test_empty_input(self):
-        stub = self._make_loop_stub()
-        stub.seed_procedural_cache([])
-        assert len(stub.indexed_key_cache) == 0
-        assert len(stub.procedural_sp_index) == 0
-
-    def test_missing_fields_handled(self):
-        stub = self._make_loop_stub()
-        pairs = [
-            {"key": "proc1", "question": "Q", "answer": "A"},
-        ]
-        stub.seed_procedural_cache(pairs)
-        assert "proc1" in stub.indexed_key_cache
-        # No sp_index entry because subject and predicate are empty
-        assert len(stub.procedural_sp_index) == 0
-
-
 class TestContradictionIndex:
     """Test that the sp_index correctly identifies contradictions."""
 
@@ -106,119 +28,6 @@ class TestContradictionIndex:
         index[("sp1", "alex", "prefers")] = "proc1"
         index[("sp1", "alex", "likes")] = "proc2"
         assert len(index) == 2
-
-
-class TestLastSessionGraph:
-    """Verify the last_session_graph attribute contract on ConsolidationLoop.
-
-    The +2 LOC change in consolidation.py adds:
-      - ``self.last_session_graph = None`` in __init__ (line ~159)
-      - ``self.last_session_graph = session_graph`` at end of extract_session (line ~407)
-
-    Approach decision:
-        extract_session has too many non-trivially-stubable dependencies
-        (_disable_gradient_checkpointing, PeftModel.disable_adapter, extract_graph,
-        GraphMerger.merge, generate_qa_from_relations, extract_procedural_graph, etc.)
-        to cleanly stub within the 80 LOC budget specified in the task. A full stub
-        would require mocking 6+ modules with complex return types and call signatures,
-        which is more test-maintenance surface than the two tested lines warrant.
-
-        We therefore test the *init contract* directly and document that the
-        post-extract-session assignment is exercised by the integration tests in
-        tests/test_integration_gpu.py (which load a real model and call extract_session
-        end-to-end).
-
-        The two lines being locked in:
-          (1) ``self.last_session_graph = None`` in __init__ — verified here.
-          (2) ``self.last_session_graph = session_graph`` in extract_session — covered
-              by integration tests; see test_integration_gpu.py.
-    """
-
-    def _make_loop_stub(self):
-        """Create a minimal stub that satisfies ConsolidationLoop.__init__ dependencies.
-
-        Follows the LoopStub pattern from TestSeedProceduralQA. Only the attributes
-        needed to check initial state are required here — we do not call __init__
-        directly because it triggers model loading and filesystem operations.
-
-        Returns:
-            Stub instance with last_session_graph manually mirroring what __init__
-            sets, so callers can assert the initial value without a full constructor.
-        """
-        from paramem.training.consolidation import ConsolidationLoop
-
-        class LoopStub:
-            # Mirror the attributes __init__ sets that are needed for
-            # seed_procedural_cache (already tested above) plus last_session_graph.
-            def __init__(self):
-                self.indexed_key_cache = {}
-                self.procedural_sp_index = {}
-                self.indexed_key_registry = None
-                # Replicate the line under test:
-                self.last_session_graph = None
-
-        stub = LoopStub()
-        # Bind seed_procedural_cache and _cache_entry (the latter is now called by
-        # seed_procedural_cache) so the stub is compatible with the real methods.
-        stub.seed_procedural_cache = ConsolidationLoop.seed_procedural_cache.__get__(stub)
-        stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
-        return stub
-
-    def test_last_session_graph_initialises_to_none(self):
-        """After init, last_session_graph is None (line ~159 in consolidation.py).
-
-        This is the direct guard for the ``self.last_session_graph = None``
-        assignment in __init__.
-        """
-        stub = self._make_loop_stub()
-        assert stub.last_session_graph is None, (
-            "last_session_graph must be None immediately after construction"
-        )
-
-    def test_last_session_graph_can_be_assigned_a_graph_object(self):
-        """last_session_graph accepts a graph object after extract_session runs.
-
-        Simulates the assignment ``self.last_session_graph = session_graph``
-        without invoking the full extract_session call chain.  The real
-        assignment is exercised end-to-end by the GPU integration tests.
-        """
-        stub = self._make_loop_stub()
-
-        # Minimal fake graph: any object is valid for the attribute.
-        class _FakeGraph:
-            entities = []
-            relations = []
-            diagnostics = {}
-
-        fake_graph = _FakeGraph()
-        stub.last_session_graph = fake_graph
-
-        assert stub.last_session_graph is fake_graph, (
-            "last_session_graph must hold the graph object assigned to it"
-        )
-
-    def test_last_session_graph_transitions_none_to_graph_and_back(self):
-        """last_session_graph can be set and reset across sessions.
-
-        Guards that no immutability or type restriction was accidentally
-        introduced — the attribute is a plain mutable slot.
-        """
-        stub = self._make_loop_stub()
-
-        class _FakeGraph:
-            pass
-
-        graph_a = _FakeGraph()
-        graph_b = _FakeGraph()
-
-        # Simulate first extract_session call.
-        stub.last_session_graph = graph_a
-        assert stub.last_session_graph is graph_a
-
-        # Simulate second extract_session call — attribute is overwritten.
-        stub.last_session_graph = graph_b
-        assert stub.last_session_graph is graph_b
-        assert stub.last_session_graph is not graph_a
 
 
 class TestRunIndexedKeyProceduralDeferredMutations:
@@ -251,28 +60,28 @@ class TestRunIndexedKeyProceduralDeferredMutations:
             {
                 "question": "What does Alice prefer?",
                 "answer": "Alice prefers tea.",
-                "source_subject": "Alice",
-                "source_predicate": "prefers",
-                "source_object": "tea",
+                "subject": "Alice",
+                "predicate": "prefers",
+                "object": "tea",
             },
             {
                 "question": "What does Bob like?",
                 "answer": "Bob likes jazz.",
-                "source_subject": "Bob",
-                "source_predicate": "likes",
-                "source_object": "jazz",
+                "subject": "Bob",
+                "predicate": "likes",
+                "object": "jazz",
             },
         ]
 
         # Stub generate_qa_from_relations — returns deterministic fake QA pairs.
         monkeypatch.setattr(
-            "paramem.training.consolidation.generate_qa_from_relations",
+            "paramem.graph.qa_generator.generate_qa_from_relations",
             lambda relations, model=None, tokenizer=None: fake_qa,
         )
-        # Stub probe_key — no existing keys to reconstruct (procedural_simhash starts empty).
+        # Stub probe_entry — no existing keys to reconstruct (procedural_simhash starts empty).
         monkeypatch.setattr(
-            "paramem.training.consolidation.probe_key",
-            lambda *a, **kw: None,
+            "paramem.training.consolidation.probe_entry",
+            lambda *a, **kw: {"failure_reason": "no_match"},
         )
         # Stub switch_adapter — no-op.
         monkeypatch.setattr(
@@ -281,7 +90,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         )
         # Stub format_indexed_training — return an empty list (no real tokenizer needed).
         monkeypatch.setattr(
-            "paramem.training.consolidation.format_indexed_training",
+            "paramem.training.consolidation.format_entry_training",
             lambda pairs, tokenizer, max_length=1024: [],
         )
 
@@ -308,18 +117,14 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 self.tokenizer = MagicMock()
                 self._procedural_next_index = 1
                 self.procedural_sp_index: dict = {}
-                self.procedural_simhash: dict = {}
-                self.indexed_key_cache: dict = {}
-                self.indexed_key_registry = None
+                from paramem.training.memory_store import MemoryStore as _MS
+
+                self.store = _MS(replay_enabled=False)
                 self.procedural_config = MagicMock()
                 self.wandb_config = None
                 self._thermal_policy = None
                 self.cycle_count = 0
                 self.training_config = TrainingConfig()
-                # _is_quad / _indexed_format: stubs that bind ConsolidationLoop
-                # methods must set these so methods which branch on _is_quad work.
-                self._indexed_format = "qa"
-                self._is_quad = False
 
             def _disable_gradient_checkpointing(self):
                 """No-op stub."""
@@ -340,7 +145,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 """Return a temp directory path."""
                 return tmp_path / adapter_name
 
-            def _maybe_make_recall_callback(self, keyed_pairs, **_kwargs):
+            def _maybe_make_recall_callback(self, entries, **_kwargs):
                 """No-op stub — recall_early_stopping=False on the bare
                 TrainingConfig() so the helper would return None anyway,
                 but we stub it explicitly to insulate the duck-typed
@@ -353,6 +158,8 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         )
         # _run_indexed_key_procedural delegates to _cache_entry; bind it too.
         stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
+        # Same for _safe_kp_from_cache (cache-fallback helper for partial entries).
+        stub._safe_kp_from_cache = ConsolidationLoop._safe_kp_from_cache.__get__(stub)
         return stub, fake_qa
 
     def test_next_index_not_advanced_when_training_raises(self, monkeypatch, tmp_path):
@@ -430,9 +237,9 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         """
         stub, _ = self._make_stub(monkeypatch, tmp_path, train_raises=True)
         # Seed an existing entry to confirm it is also untouched.
-        stub.procedural_simhash["proc0"] = 12345
+        stub.store.simhashes_in_tier("procedural")["proc0"] = 12345
 
-        simhash_before = dict(stub.procedural_simhash)
+        simhash_before = dict(stub.store.simhashes_in_tier("procedural"))
 
         relations = [
             {
@@ -448,9 +255,9 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         with pytest.raises(RuntimeError):
             stub._run_indexed_key_procedural(relations, speaker_id="spk1")
 
-        assert stub.procedural_simhash == simhash_before, (
+        assert stub.store.simhashes_in_tier("procedural") == simhash_before, (
             "procedural_simhash must not change when training raises; "
-            f"before: {simhash_before}, after: {stub.procedural_simhash}"
+            f"before: {simhash_before}, after: {stub.store.simhashes_in_tier('procedural')}"
         )
 
     def test_procedural_simhash_updated_incrementally_after_success(self, monkeypatch, tmp_path):
@@ -465,8 +272,8 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub, fake_qa = self._make_stub(monkeypatch, tmp_path, train_raises=False)
         # An existing key that was already trained — must survive unchanged.
         existing_hash = compute_simhash("proc0", "Old question?", "Old answer.")
-        stub.procedural_simhash["proc0"] = existing_hash
-        stub.indexed_key_cache["proc0"] = {
+        stub.store.simhashes_in_tier("procedural")["proc0"] = existing_hash
+        stub.store._entries_flat_view()["proc0"] = {
             "key": "proc0",
             "question": "Old question?",
             "answer": "Old answer.",
@@ -491,19 +298,36 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub._run_indexed_key_procedural(relations, speaker_id="spk1")
 
         # Both new keys must be present with correct simhashes.
-        assert "proc1" in stub.procedural_simhash, "proc1 must be added to procedural_simhash"
-        assert "proc2" in stub.procedural_simhash, "proc2 must be added to procedural_simhash"
-
-        expected_proc1 = compute_simhash("proc1", fake_qa[0]["question"], fake_qa[0]["answer"])
-        expected_proc2 = compute_simhash("proc2", fake_qa[1]["question"], fake_qa[1]["answer"])
-        assert stub.procedural_simhash["proc1"] == expected_proc1, (
-            f"proc1 simhash mismatch: {stub.procedural_simhash['proc1']} != {expected_proc1}"
+        assert "proc1" in stub.store.simhashes_in_tier("procedural"), (
+            "proc1 must be added to procedural_simhash"
         )
-        assert stub.procedural_simhash["proc2"] == expected_proc2, (
-            f"proc2 simhash mismatch: {stub.procedural_simhash['proc2']} != {expected_proc2}"
+        assert "proc2" in stub.store.simhashes_in_tier("procedural"), (
+            "proc2 must be added to procedural_simhash"
+        )
+
+        from paramem.training.entry_memory import compute_simhash
+
+        expected_proc1 = compute_simhash(
+            "proc1",
+            relations[0]["subject"],
+            relations[0]["predicate"],
+            relations[0]["object"],
+        )
+        expected_proc2 = compute_simhash(
+            "proc2",
+            relations[1]["subject"],
+            relations[1]["predicate"],
+            relations[1]["object"],
+        )
+        proc_sims = stub.store.simhashes_in_tier("procedural")
+        assert proc_sims["proc1"] == expected_proc1, (
+            f"proc1 simhash mismatch: {proc_sims['proc1']} != {expected_proc1}"
+        )
+        assert proc_sims["proc2"] == expected_proc2, (
+            f"proc2 simhash mismatch: {proc_sims['proc2']} != {expected_proc2}"
         )
 
         # Existing key must be unchanged.
-        assert stub.procedural_simhash["proc0"] == existing_hash, (
+        assert stub.store.simhashes_in_tier("procedural")["proc0"] == existing_hash, (
             "Existing proc0 simhash must not be altered by incremental update"
         )

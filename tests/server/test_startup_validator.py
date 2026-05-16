@@ -105,7 +105,6 @@ def _write_slot(
         ),
         lora=LoRAShape(rank=rank, alpha=rank * 2, dropout=0.0, target_modules=("q_proj", "v_proj")),
         registry_sha256=registry_sha256,
-        keyed_pairs_sha256="kp456",
         key_count=key_count,
         synthesized=synthesized,
     )
@@ -357,7 +356,6 @@ class TestSynthesizedUnknown:
             ),
             lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
             registry_sha256="",
-            keyed_pairs_sha256=UNKNOWN,
             key_count=UNKNOWN,
             synthesized=True,
         )
@@ -389,7 +387,6 @@ class TestSynthesizedUnknown:
             ),
             lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
             registry_sha256="",
-            keyed_pairs_sha256=UNKNOWN,
             key_count=UNKNOWN,
             synthesized=False,
         )
@@ -529,13 +526,9 @@ class TestRevalidateMainAdapterManifests:
 def _write_slot_with_format(
     adapter_kind_dir: Path,
     adapter_name: str,
-    indexed_format: str = "qa",
     ts: str = "20260421-000000",
 ) -> Path:
-    """Write a slot with an explicit ``indexed_format`` in its ``meta.json``.
-
-    Uses ``MANIFEST_SCHEMA_VERSION`` (v3) so the format field is present.
-    """
+    """Write a slot with a current-version ``meta.json``."""
     slot = adapter_kind_dir / ts
     slot.mkdir(parents=True, exist_ok=True)
     (slot / "adapter_config.json").write_text(json.dumps({"base_model_name_or_path": "hf/model"}))
@@ -550,95 +543,7 @@ def _write_slot_with_format(
         ),
         lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
         registry_sha256="",
-        keyed_pairs_sha256="kp456",
         key_count=5,
-        indexed_format=indexed_format,
     )
     write_manifest(slot, m)
     return slot
-
-
-class TestAdapterFormatsBoot:
-    """_mount_adapters_from_slots populates state['adapter_formats'] correctly.
-
-    Covers:
-    - quad slot → adapter_formats[tier] == "quad"
-    - qa slot   → adapter_formats[tier] == "qa"
-    - v2 slot (no indexed_format field) → adapter_formats[tier] == "qa" (legacy default)
-    """
-
-    def test_quad_slot_records_quad_format(self, tmp_path: Path) -> None:
-        """A slot with indexed_format='quad' must be recorded as 'quad'."""
-        config = _make_config(tmp_path, adapter_names=("episodic",))
-        kind_dir = config.adapter_dir / "episodic"
-        kind_dir.mkdir()
-        _write_slot_with_format(kind_dir, "episodic", indexed_format="quad")
-
-        from peft import PeftModel
-
-        with patch.object(PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)):
-            _, state = _run(config)
-
-        assert state.get("adapter_formats", {}).get("episodic") == "quad"
-
-    def test_qa_slot_records_qa_format(self, tmp_path: Path) -> None:
-        """A slot with indexed_format='qa' must be recorded as 'qa'."""
-        config = _make_config(tmp_path, adapter_names=("semantic",), enabled_names=("semantic",))
-        kind_dir = config.adapter_dir / "semantic"
-        kind_dir.mkdir()
-        _write_slot_with_format(kind_dir, "semantic", indexed_format="qa")
-
-        from peft import PeftModel
-
-        with patch.object(PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)):
-            _, state = _run(config)
-
-        assert state.get("adapter_formats", {}).get("semantic") == "qa"
-
-    def test_v2_slot_defaults_to_qa(self, tmp_path: Path) -> None:
-        """A v2-style slot (no indexed_format) defaults to 'qa'.
-
-        Simulates an adapter trained before the quad switch: ``meta.json``
-        has no ``indexed_format`` key.  The boot map must default to ``"qa"``
-        so legacy adapters continue to be probed with the QA template.
-        """
-        config = _make_config(tmp_path, adapter_names=("episodic",))
-        kind_dir = config.adapter_dir / "episodic"
-        kind_dir.mkdir()
-        # _write_slot writes a v3 manifest (default indexed_format='qa') which
-        # is indistinguishable from v2+default since 'qa' is the v3 default.
-        # To simulate a true v2 file, write the dict manually without the field.
-        slot = kind_dir / "20260421-000000"
-        slot.mkdir(parents=True)
-        (slot / "adapter_config.json").write_text(
-            json.dumps({"base_model_name_or_path": "hf/model"})
-        )
-        (slot / "adapter_model.safetensors").write_bytes(b"weights")
-        v2_manifest = {
-            "schema_version": 2,
-            "name": "episodic",
-            "trained_at": "2026-04-21T00:00:00Z",
-            "base_model": {"repo": "hf/model", "sha": "abc123", "hash": "sha256:dead"},
-            "tokenizer": {"name_or_path": "hf/model", "vocab_size": 32000, "merges_hash": "cafe"},
-            "lora": {
-                "rank": 8,
-                "alpha": 16,
-                "dropout": 0.0,
-                "target_modules": ["q_proj", "v_proj"],
-            },
-            "registry_sha256": "",
-            "keyed_pairs_sha256": "kp456",
-            "key_count": 5,
-            "synthesized": False,
-            "window_stamp": "",
-            # NOTE: no 'indexed_format' key — v2-style
-        }
-        (slot / "meta.json").write_text(json.dumps(v2_manifest))
-
-        from peft import PeftModel
-
-        with patch.object(PeftModel, "from_pretrained", return_value=MagicMock(spec=PeftModel)):
-            _, state = _run(config)
-
-        # v2 slot has no indexed_format → must default to 'qa'
-        assert state.get("adapter_formats", {}).get("episodic") == "qa"

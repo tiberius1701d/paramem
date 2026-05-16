@@ -228,12 +228,12 @@ def main():
             f"(conf={recall_a['mean_confidence']:.3f})"
         )
 
-        # Save keyed_pairs and phase results for persona A
+        # Save quads and phase results for persona A
         kp_a_ser = [
             {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed_a
         ]
         (output_dir / "persona_a").mkdir(parents=True, exist_ok=True)
-        with open(output_dir / "persona_a" / "keyed_pairs.json", "w") as f:
+        with open(output_dir / "persona_a" / "quads.json", "w") as f:
             json.dump(kp_a_ser, f, indent=2)
 
         partial_results = {
@@ -280,12 +280,12 @@ def main():
             f"(conf={recall_b['mean_confidence']:.3f})"
         )
 
-        # Save keyed_pairs for persona B
+        # Save quads for persona B
         kp_b_ser = [
             {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed_b
         ]
         (output_dir / "persona_b").mkdir(parents=True, exist_ok=True)
-        with open(output_dir / "persona_b" / "keyed_pairs.json", "w") as f:
+        with open(output_dir / "persona_b" / "quads.json", "w") as f:
             json.dump(kp_b_ser, f, indent=2)
 
         # Re-evaluate persona A after persona B training (isolation check)

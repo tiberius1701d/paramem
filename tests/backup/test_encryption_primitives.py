@@ -277,7 +277,9 @@ class TestAssertModeConsistency:
 
         simulate = tmp_path / "simulate"
         (simulate / "episodic").mkdir(parents=True)
-        (simulate / "episodic" / "keyed_pairs.json").write_bytes(b"[]")  # plaintext
+        (simulate / "episodic" / "graph.json").write_bytes(
+            b'{"nodes": [], "links": []}'
+        )  # plaintext
 
         with pytest.raises(FatalConfigError, match="Mixed encryption state"):
             assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=simulate)
@@ -293,8 +295,8 @@ class TestAssertModeConsistency:
 
         simulate = tmp_path / "simulate"
         (simulate / "semantic").mkdir(parents=True)
-        (simulate / "semantic" / "keyed_pairs.json").write_bytes(
-            age_encrypt_bytes(b"[]", [ident.to_public()])
+        (simulate / "semantic" / "graph.json").write_bytes(
+            age_encrypt_bytes(b'{"nodes": [], "links": []}', [ident.to_public()])
         )
 
         # Must not raise — both stores age-encrypted, daily identity available.
@@ -315,7 +317,7 @@ class TestAssertModeConsistency:
         # but the caller passes simulate_dir=None, so it must NOT be probed.
         rogue = tmp_path / "would-be-simulate"
         (rogue / "episodic").mkdir(parents=True)
-        (rogue / "episodic" / "keyed_pairs.json").write_bytes(b"[]")
+        (rogue / "episodic" / "quads.json").write_bytes(b"[]")
 
         # Must not raise — simulate_dir=None means rogue is invisible.
         assert_mode_consistency(data, daily_identity_loadable=True, simulate_dir=None)

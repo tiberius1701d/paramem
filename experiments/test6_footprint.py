@@ -2,7 +2,7 @@
 
 Head-to-head comparison of parametric retrieval (indexed keys) vs RAG on
 the same fact set at multiple scales. Measures:
-  - Storage: final adapter weights + registry + keyed_pairs vs embeddings + text
+  - Storage: final adapter weights + registry + quads vs embeddings + text
   - Latency: bare model, parametric, and RAG (full pipeline) with warm-up
   - Recall quality: both scored by embedding similarity (compute_similarity)
 
@@ -90,9 +90,7 @@ def _latency_stats(latencies: list[float], token_counts: list[int] | None = None
     return stats
 
 
-def measure_inference_latency(
-    model, tokenizer, keyed_pairs, registry, adapter_name, num_queries=20
-):
+def measure_inference_latency(model, tokenizer, quads, registry, adapter_name, num_queries=20):
     """Measure average inference latency for indexed key recall (full pipeline)."""
     from paramem.models.loader import switch_adapter
     from paramem.training.indexed_memory import probe_key
@@ -100,9 +98,9 @@ def measure_inference_latency(
     model.gradient_checkpointing_disable()
     switch_adapter(model, adapter_name)
 
-    available = len(keyed_pairs) - NUM_WARMUP
+    available = len(quads) - NUM_WARMUP
     num_queries = min(num_queries, available)
-    keys = [kp["key"] for kp in keyed_pairs[: num_queries + NUM_WARMUP]]
+    keys = [kp["key"] for kp in quads[: num_queries + NUM_WARMUP]]
 
     # Warm-up
     for key in keys[:NUM_WARMUP]:
@@ -120,7 +118,7 @@ def measure_inference_latency(
     return _latency_stats(latencies, token_counts)
 
 
-def measure_bare_latency(model, tokenizer, keyed_pairs, num_queries=20):
+def measure_bare_latency(model, tokenizer, quads, num_queries=20):
     """Measure inference latency with no adapter loaded (bare model baseline).
 
     Uses the same key-recall prompts so prompt length is comparable.
@@ -131,11 +129,11 @@ def measure_bare_latency(model, tokenizer, keyed_pairs, num_queries=20):
     from paramem.training.dataset import _format_inference_prompt
 
     model.gradient_checkpointing_disable()
-    available = len(keyed_pairs) - NUM_WARMUP
+    available = len(quads) - NUM_WARMUP
     num_queries = min(num_queries, available)
     prompts = [
         _format_inference_prompt(f"Recall the QA pair stored under key '{kp['key']}'.", tokenizer)
-        for kp in keyed_pairs[: num_queries + NUM_WARMUP]
+        for kp in quads[: num_queries + NUM_WARMUP]
     ]
 
     def _run():
@@ -173,17 +171,17 @@ def measure_bare_latency(model, tokenizer, keyed_pairs, num_queries=20):
     return _latency_stats(latencies, token_counts)
 
 
-def measure_rag_latency(rag, model, tokenizer, keyed_pairs, num_queries=20):
+def measure_rag_latency(rag, model, tokenizer, quads, num_queries=20):
     """Measure average RAG retrieval + generation latency."""
     from peft import PeftModel as _PeftModel
 
     from paramem.evaluation.recall import generate_answer
 
     model.gradient_checkpointing_disable()
-    available = len(keyed_pairs) - NUM_WARMUP
+    available = len(quads) - NUM_WARMUP
     num_queries = min(num_queries, available)
 
-    queries = keyed_pairs[: num_queries + NUM_WARMUP]
+    queries = quads[: num_queries + NUM_WARMUP]
 
     def _run_rag_queries():
         # Warm-up
@@ -222,7 +220,7 @@ def measure_rag_latency(rag, model, tokenizer, keyed_pairs, num_queries=20):
     return _latency_stats(latencies, token_counts)
 
 
-def measure_parametric_recall(model, tokenizer, keyed_pairs, registry, adapter_name):
+def measure_parametric_recall(model, tokenizer, quads, registry, adapter_name):
     """Measure parametric recall quality using embedding similarity (same metric as RAG)."""
     from paramem.evaluation.embedding_scorer import compute_similarity
     from paramem.models.loader import switch_adapter
@@ -234,7 +232,7 @@ def measure_parametric_recall(model, tokenizer, keyed_pairs, registry, adapter_n
     results = []
     match_count = 0
 
-    for kp in keyed_pairs:
+    for kp in quads:
         recalled = probe_key(
             model,
             tokenizer,
@@ -264,10 +262,10 @@ def measure_parametric_recall(model, tokenizer, keyed_pairs, registry, adapter_n
             }
         )
 
-    total = len(keyed_pairs) or 1
+    total = len(quads) or 1
     return {
         "match_count": match_count,
-        "total": len(keyed_pairs),
+        "total": len(quads),
         "rate": match_count / total,
         "mean_similarity": sum(r["similarity"] for r in results) / total,
         "mean_simhash_confidence": sum(r["simhash_confidence"] for r in results) / total,
@@ -275,7 +273,7 @@ def measure_parametric_recall(model, tokenizer, keyed_pairs, registry, adapter_n
     }
 
 
-def measure_rag_recall(rag, model, tokenizer, keyed_pairs):
+def measure_rag_recall(rag, model, tokenizer, quads):
     """Measure RAG recall quality on the same questions as parametric."""
     from peft import PeftModel as _PeftModel
 
@@ -288,7 +286,7 @@ def measure_rag_recall(rag, model, tokenizer, keyed_pairs):
 
     def _run():
         nonlocal match_count
-        for kp in keyed_pairs:
+        for kp in quads:
             prompt = rag.format_prompt(kp["question"], tokenizer, top_k=3)
             generated = generate_answer(
                 model,
@@ -318,17 +316,17 @@ def measure_rag_recall(rag, model, tokenizer, keyed_pairs):
     else:
         _run()
 
-    total = len(keyed_pairs) or 1
+    total = len(quads) or 1
     return {
         "match_count": match_count,
-        "total": len(keyed_pairs),
+        "total": len(quads),
         "rate": match_count / total,
         "mean_similarity": sum(r["similarity"] for r in results) / total,
         "per_query": results,
     }
 
 
-def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_dir):
+def train_at_scale(model, tokenizer, quads, registry, scale, args, output_dir):
     """Train indexed keys for a specific scale point using pre-distilled pairs.
 
     Delegates to train_indexed_keys from the shared harness for consistency,
@@ -353,7 +351,7 @@ def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_
             gc.collect()
             torch.cuda.empty_cache()
 
-    subset_qa = [{"question": kp["question"], "answer": kp["answer"]} for kp in keyed_pairs[:scale]]
+    subset_qa = [{"question": kp["question"], "answer": kp["answer"]} for kp in quads[:scale]]
 
     scale_dir = output_dir / f"scale_{scale}"
     model, subset_kp, subset_registry, train_time, metrics = train_indexed_keys(
@@ -376,7 +374,7 @@ def train_at_scale(model, tokenizer, keyed_pairs, registry, scale, args, output_
         tokenizer,
         adapter_name,
         registry_path=None,
-        keyed_pairs_path=None,
+        quads_path=None,
         key_count=scale,
     )
     atomic_save_adapter(model, final_adapter_dir, adapter_name, manifest=_mf_final)
@@ -440,23 +438,23 @@ def main():
         # --- Distill once using all loaded QA pairs (2x buffer for loss) ---
         print(f"\nDistilling {len(qa_pairs)} QA pairs (one-time)...")
         distilled = distill_qa_pairs(model, tokenizer, qa_pairs)
-        all_keyed_pairs = assign_keys(distilled)
-        all_registry = build_registry(all_keyed_pairs)
+        all_quads = assign_keys(distilled)
+        all_registry = build_registry(all_quads)
 
         # Fresh copy of scales per model (distillation yield may differ)
         model_scales = list(scales)
-        if len(all_keyed_pairs) < max(model_scales):
+        if len(all_quads) < max(model_scales):
             logger.warning(
                 "Distillation produced %d keyed pairs, less than max scale %d. "
                 "Capping scales accordingly.",
-                len(all_keyed_pairs),
+                len(all_quads),
                 max(model_scales),
             )
-            model_scales = [s for s in model_scales if s <= len(all_keyed_pairs)]
+            model_scales = [s for s in model_scales if s <= len(all_quads)]
 
         logger.info(
             "Distilled %d keyed pairs from %d QA pairs",
-            len(all_keyed_pairs),
+            len(all_quads),
             len(qa_pairs),
         )
 
@@ -464,9 +462,9 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         kp_all_ser = [
             {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in all_keyed_pairs
+            for kp in all_quads
         ]
-        with open(output_dir / "all_keyed_pairs.json", "w") as f:
+        with open(output_dir / "all_quads.json", "w") as f:
             json.dump(kp_all_ser, f, indent=2)
 
         scale_results = {}
@@ -474,10 +472,10 @@ def main():
         for scale in model_scales:
             print(f"\n--- Scale: {scale} keys ---")
 
-            model, keyed_pairs, registry, adapter_name, train_time, metrics = train_at_scale(
+            model, quads, registry, adapter_name, train_time, metrics = train_at_scale(
                 model,
                 tokenizer,
-                all_keyed_pairs,
+                all_quads,
                 all_registry,
                 scale,
                 args,
@@ -497,36 +495,36 @@ def main():
             registry_size = measure_file_size(registry_path)
 
             # Keyed pairs (distilled QA — grows O(n) with keys)
-            kp_path = scale_dir / "keyed_pairs.json"
+            kp_path = scale_dir / "quads.json"
             kp_size = measure_file_size(kp_path)
 
             # --- Latency measurement (with warm-up) ---
 
             print("  Measuring bare model latency...")
-            bare_latency = measure_bare_latency(model, tokenizer, keyed_pairs)
+            bare_latency = measure_bare_latency(model, tokenizer, quads)
 
             print("  Measuring parametric latency...")
             param_latency = measure_inference_latency(
                 model,
                 tokenizer,
-                keyed_pairs,
+                quads,
                 registry,
                 adapter_name,
             )
 
-            # RAG: index the same keyed_pairs (same questions + answers as PM)
+            # RAG: index the same quads (same questions + answers as PM)
             from paramem.evaluation.rag_qa import QARAGPipeline  # noqa: E402
 
             rag = QARAGPipeline()
-            rag.build_index(keyed_pairs)
+            rag.build_index(quads)
 
             embedding_size = rag.embeddings.nbytes if rag.embeddings is not None else 0
             qa_text_size = sum(
-                len(kp["question"].encode()) + len(kp["answer"].encode()) for kp in keyed_pairs
+                len(kp["question"].encode()) + len(kp["answer"].encode()) for kp in quads
             )
 
             print("  Measuring RAG latency...")
-            rag_latency = measure_rag_latency(rag, model, tokenizer, keyed_pairs)
+            rag_latency = measure_rag_latency(rag, model, tokenizer, quads)
 
             # --- Recall quality (both scored by embedding similarity) ---
 
@@ -534,24 +532,24 @@ def main():
             param_recall = measure_parametric_recall(
                 model,
                 tokenizer,
-                keyed_pairs,
+                quads,
                 registry,
                 adapter_name,
             )
 
             print("  Measuring RAG recall quality...")
-            rag_recall = measure_rag_recall(rag, model, tokenizer, keyed_pairs)
+            rag_recall = measure_rag_recall(rag, model, tokenizer, quads)
 
             scale_results[str(scale)] = {
-                "num_keyed_pairs": len(keyed_pairs),
+                "num_quads": len(quads),
                 "training_loss": metrics.get("train_loss"),
                 "parametric": {
                     "adapter_size_bytes": adapter_size,
                     "adapter_size_kb": adapter_size / 1024,
                     "registry_size_bytes": registry_size,
                     "registry_size_kb": registry_size / 1024,
-                    "keyed_pairs_size_bytes": kp_size,
-                    "keyed_pairs_size_kb": kp_size / 1024,
+                    "quads_size_bytes": kp_size,
+                    "quads_size_kb": kp_size / 1024,
                     "total_size_bytes": adapter_size + registry_size + kp_size,
                     "total_size_kb": (adapter_size + registry_size + kp_size) / 1024,
                     "inference_latency": param_latency,
@@ -683,7 +681,7 @@ def main():
             print(
                 f"  {scale_str} keys: adapter={pm['adapter_size_kb']:.1f}KB "
                 f"registry={pm['registry_size_kb']:.1f}KB "
-                f"keyed_pairs={pm['keyed_pairs_size_kb']:.1f}KB"
+                f"quads={pm['keyed_pairs_size_kb']:.1f}KB"
             )
         print("\nStorage analysis:")
         print("  Fixed infrastructure costs:")

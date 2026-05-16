@@ -101,7 +101,7 @@ def main():
         print(f"\n--- Cycle 0: Baseline ({INITIAL_KEYS} keys) ---")
         initial_qa = qa_pairs[:INITIAL_KEYS]
 
-        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+        model, quads, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
             initial_qa,
@@ -117,7 +117,7 @@ def main():
         recall = evaluate_indexed_recall(
             model,
             tokenizer,
-            keyed_pairs,
+            quads,
             registry,
             adapter_name=adapter_name,
         )
@@ -154,13 +154,13 @@ def main():
             tokenizer,
             adapter_name,
             registry_path=None,
-            keyed_pairs_path=None,
-            key_count=len(keyed_pairs),
+            quads_path=None,
+            key_count=len(quads),
         )
         save_adapter(model, output_dir / "cycle_0" / "checkpoint", adapter_name, manifest=_mf_c0)
 
         # Track all keys trained so far
-        trained_keys = list(keyed_pairs)
+        trained_keys = list(quads)
         trained_registry = dict(registry)
 
         # Phases 1-5: Incremental cycles
@@ -256,10 +256,10 @@ def main():
             trained_keys.extend(new_keyed)
             trained_registry.update(new_registry)
 
-            # Save keyed_pairs for this cycle
+            # Save quads for this cycle
             cycle_dir = output_dir / f"cycle_{cycle}"
             cycle_dir.mkdir(parents=True, exist_ok=True)
-            with open(cycle_dir / "keyed_pairs.json", "w") as f:
+            with open(cycle_dir / "quads.json", "w") as f:
                 json.dump(
                     [
                         {
@@ -330,7 +330,7 @@ def main():
                 tokenizer,
                 adapter_name,
                 registry_path=None,
-                keyed_pairs_path=None,
+                quads_path=None,
                 key_count=len(trained_keys),
             )
             save_adapter(

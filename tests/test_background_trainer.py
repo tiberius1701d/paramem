@@ -49,7 +49,7 @@ class TestTrainingJobInferenceFallbackAdapter:
     def test_default_fallback_is_episodic(self) -> None:
         """TrainingJob defaults inference_fallback_adapter to 'episodic'."""
         job = TrainingJob(
-            keyed_pairs=[],
+            entries=[],
             adapter_name="episodic_interim_20260418T1430",
             adapter_config=_minimal_adapter_config(),
         )
@@ -58,7 +58,7 @@ class TestTrainingJobInferenceFallbackAdapter:
     def test_explicit_fallback_stored(self) -> None:
         """An explicitly set inference_fallback_adapter is preserved."""
         job = TrainingJob(
-            keyed_pairs=[],
+            entries=[],
             adapter_name="episodic_interim_20260418T1430",
             adapter_config=_minimal_adapter_config(),
             inference_fallback_adapter="episodic",
@@ -68,7 +68,7 @@ class TestTrainingJobInferenceFallbackAdapter:
     def test_custom_fallback_stored(self) -> None:
         """A non-default inference_fallback_adapter is preserved."""
         job = TrainingJob(
-            keyed_pairs=[],
+            entries=[],
             adapter_name="episodic",
             adapter_config=_minimal_adapter_config(),
             inference_fallback_adapter="episodic_backup_20260418",
@@ -103,7 +103,7 @@ class TestPauseUsesInferenceFallbackNotCurrentAdapter:
         interim_name = "episodic_interim_20260418T1430"
 
         job = TrainingJob(
-            keyed_pairs=[{"key": "graph1", "question": "Q?", "answer": "A."}],
+            entries=[{"key": "graph1", "question": "Q?", "answer": "A."}],
             adapter_name=interim_name,
             adapter_config=adapter_cfg,
             inference_fallback_adapter="episodic",
@@ -177,7 +177,7 @@ class TestPauseUsesInferenceFallbackNotCurrentAdapter:
         config = _minimal_training_config()
 
         job = TrainingJob(
-            keyed_pairs=[],
+            entries=[],
             adapter_name=interim_name,
             adapter_config=_minimal_adapter_config(),
             inference_fallback_adapter="episodic",

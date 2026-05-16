@@ -186,9 +186,15 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
     seed_int = int(seed_hex, 16)
     rng = random.Random(seed_int)
     parsed = json.loads(registry_content)
-    all_keys = sorted(parsed.keys())  # stable
-    n = min(GATE_4_SAMPLE_SIZE, len(all_keys))
-    return rng.sample(all_keys, n)
+    # New per-tier KeyRegistry schema: {active_keys: [...], fidelity_history: {...}, health: ...}
+    # The active_keys list is the sample population; fall back to dict keys for
+    # legacy/flat registries so the gate remains upgradeable.
+    if isinstance(parsed, dict) and "active_keys" in parsed:
+        population = sorted(parsed["active_keys"])
+    else:
+        population = sorted(parsed.keys())
+    n = min(GATE_4_SAMPLE_SIZE, len(population))
+    return rng.sample(population, n)
 
 
 # ---------------------------------------------------------------------------
@@ -327,18 +333,18 @@ def _ensure_trial_probe_mounted(model: Any, trial_adapter_dir: Path, mount_state
 
 
 def _find_trained_kind_in_memory(model: Any, trial_adapter_dir: Path) -> str | None:
-    """Return the kind name whose keyed_pairs.json exists AND whose adapter
-    is in ``model.peft_config`` — the kind that gate 3 will probe.
+    """Return the kind name whose per-tier ``indexed_key_registry.json`` exists
+    AND whose adapter is in ``model.peft_config`` — the kind that gate 3 will
+    probe.
 
-    Gate 3 reads the first key from ``keyed_pairs.json`` and probes it;
-    that probe MUST run against the adapter that was actually trained on
-    those keys. Picking a different kind (e.g. activating ``episodic``
-    when keyed_pairs lives in ``procedural/``) causes ``parse_failure``
+    Gate 3 picks the first key from the per-tier ``indexed_key_registry.json``
+    and probes it; that probe MUST run against the adapter that was actually
+    trained on those keys. Picking a different kind causes ``parse_failure``
     because the probed adapter has never seen the key.
 
     Strategy:
-    1. Use ``_find_keyed_pairs`` to locate the keyed_pairs.json file the
-       gate will probe — its parent directory name is the kind.
+    1. Iterate ``_ADAPTER_KIND_SUBDIRS`` and find the first kind that has
+       ``<trial_adapter_dir>/<kind>/indexed_key_registry.json``.
     2. Verify that kind is in ``model.peft_config``.
     3. Return that kind. ``None`` if either step fails — caller falls back
        to loading from disk.
@@ -346,12 +352,10 @@ def _find_trained_kind_in_memory(model: Any, trial_adapter_dir: Path) -> str | N
     peft_config = getattr(model, "peft_config", None)
     if peft_config is None:
         return None
-    keyed_pairs_path = _find_keyed_pairs(trial_adapter_dir)
-    if keyed_pairs_path is None:
-        return None
-    kind = keyed_pairs_path.parent.name
-    if kind in _ADAPTER_KIND_SUBDIRS and kind in peft_config:
-        return kind
+    for kind in _ADAPTER_KIND_SUBDIRS:
+        registry_path = trial_adapter_dir / kind / "indexed_key_registry.json"
+        if registry_path.exists() and kind in peft_config:
+            return kind
     return None
 
 
@@ -673,28 +677,12 @@ def _gate_2_training(
 _ADAPTER_KIND_SUBDIRS = ("episodic", "semantic", "procedural")
 
 
-def _find_keyed_pairs(trial_adapter_dir: Path) -> Path | None:
-    """Locate ``keyed_pairs.json`` inside *trial_adapter_dir*.
+def _find_tier_registry(trial_adapter_dir: Path) -> tuple[str, Path] | None:
+    """Locate the per-tier ``indexed_key_registry.json`` inside *trial_adapter_dir*.
 
-    Real trial training writes per-kind subdirectories
-    (``episodic/``, ``semantic/``, ``procedural/``), each containing its own
-    ``keyed_pairs.json``.  This helper checks for the file in the following
-    order:
-
-    1. ``<trial_adapter_dir>/episodic/keyed_pairs.json`` (primary PA adapter,
-       Decision 21).
-    2. ``<trial_adapter_dir>/semantic/keyed_pairs.json``.
-    3. ``<trial_adapter_dir>/procedural/keyed_pairs.json``.
-    4. Top-level ``<trial_adapter_dir>/keyed_pairs.json`` (legacy / simulated
-       — fallback only when no per-kind subdir is present).
-
-    Fix 6 (2026-04-23): per-kind subdirs are checked BEFORE the top-level
-    fallback.  A stale top-level file from an older production run (where
-    episodic was written at the top level) no longer shadows fresher per-kind
-    files written by a trial run.
-
-    Returns the first path that exists, or ``None`` when no ``keyed_pairs.json``
-    is found anywhere (B2-residual fix — real layout is per-kind subdirs).
+    Checks subdirectories in ``_ADAPTER_KIND_SUBDIRS`` order (episodic first).
+    Returns the first ``(kind, path)`` pair found, or ``None`` when no registry
+    is present.
 
     Parameters
     ----------
@@ -703,20 +691,14 @@ def _find_keyed_pairs(trial_adapter_dir: Path) -> Path | None:
 
     Returns
     -------
-    Path | None
-        Absolute path to ``keyed_pairs.json``, or ``None`` when absent.
+    tuple[str, Path] | None
+        ``(kind_name, registry_path)`` for the first kind that has a
+        ``<kind>/indexed_key_registry.json``, or ``None`` when none exists.
     """
-    # 1–3. Per-kind subdirectories in preference order (episodic is primary).
     for kind in _ADAPTER_KIND_SUBDIRS:
-        candidate = trial_adapter_dir / kind / "keyed_pairs.json"
+        candidate = trial_adapter_dir / kind / "indexed_key_registry.json"
         if candidate.exists():
-            return candidate
-
-    # 4. Top-level fallback (legacy / simulate-mode output).
-    top_level = trial_adapter_dir / "keyed_pairs.json"
-    if top_level.exists():
-        return top_level
-
+            return kind, candidate
     return None
 
 
@@ -728,37 +710,36 @@ def _gate_3_reload_smoke(
     tokenizer: Any,
     trial_adapter_dir: Path,
     mount_state: dict,
-    indexed_format: str = "qa",
 ) -> GateResult:
     """Gate 3 — trial adapter reload smoke test.
 
-    Mounts the trial adapter, probes the first key from ``keyed_pairs.json``,
-    and parses the result.  Uses in-server loader, not the experiment harness.
+    Mounts the trial adapter, probes the first key from the per-tier
+    ``indexed_key_registry.json``, and verifies the result.  Uses in-server
+    loader, not the experiment harness.
 
     SKIPPED when the session buffer was empty or when ``summary["status"]``
     is ``"no_facts"`` (no adapter was written, nothing to probe).  Also
-    SKIPPED when no kind-specific adapter was trained (no ``keyed_pairs.json``
-    in any expected location — e.g. ``no_facts`` extraction path).
+    SKIPPED when no kind-specific adapter was trained (no
+    ``indexed_key_registry.json`` in any expected location — e.g.
+    ``no_facts`` extraction path).
     FAIL on mount raise, inference raise, parse failure, or unparseable
-    ``keyed_pairs.json``.
+    registry.
 
-    ``keyed_pairs.json`` search order (B2-residual fix):
+    Registry search order:
 
-    1. ``<trial_adapter_dir>/keyed_pairs.json`` — top-level (legacy / simulate).
-    2. ``<trial_adapter_dir>/episodic/keyed_pairs.json`` — primary PA adapter.
-    3. ``<trial_adapter_dir>/semantic/keyed_pairs.json``.
-    4. ``<trial_adapter_dir>/procedural/keyed_pairs.json``.
+    1. ``<trial_adapter_dir>/episodic/indexed_key_registry.json`` — primary PA adapter.
+    2. ``<trial_adapter_dir>/semantic/indexed_key_registry.json``.
+    3. ``<trial_adapter_dir>/procedural/indexed_key_registry.json``.
 
     Any one of the three kind subdirs is sufficient to verify the adapter
     was loaded — the gate's purpose is ADAPTER LOAD verification, not
     enforcement of a specific kind.
 
-    ``indexed_format`` selects the probe template and key-pair reader:
-    ``"qa"`` uses ``probe_key`` + ``read_keyed_pairs``; ``"quad"`` uses
-    ``probe_quad`` + ``read_keyed_pairs_quad``.  The QA-hardcoded
-    ``parse_recalled_pair`` belt-and-suspenders check is dropped — both
-    probes already return ``failure_reason`` on parse failure, making the
-    second check redundant.
+    Probes via ``probe_entry`` which returns ``failure_reason`` on any parse
+    or recall failure — no secondary parse check is needed.
+
+    The first key to probe is taken from the per-tier
+    ``indexed_key_registry.json``.
 
     Parameters
     ----------
@@ -774,9 +755,6 @@ def _gate_3_reload_smoke(
         Directory containing the trial adapter.
     mount_state:
         Shared mount-state dict passed to mount/unmount helpers.
-    indexed_format:
-        The encoding the trial adapter was trained with: ``"qa"`` or
-        ``"quad"``.  Defaults to ``"qa"`` (back-compat).
 
     Returns
     -------
@@ -802,47 +780,53 @@ def _gate_3_reload_smoke(
             metrics=None,
         )
 
-    # Locate keyed_pairs.json — check top-level then per-kind subdirs.
-    keyed_pairs_path = _find_keyed_pairs(trial_adapter_dir)
-    if keyed_pairs_path is None:
+    # Locate per-tier indexed_key_registry.json — the registry is the
+    # canonical record of which keys an adapter was trained on.
+    tier_result = _find_tier_registry(trial_adapter_dir)
+    if tier_result is None:
         return GateResult(
             gate=3,
             name="adapter_reload",
             status="skipped",
             reason=(
-                "no kind-specific adapter trained — keyed_pairs.json absent "
-                f"at {trial_adapter_dir} and all kind subdirs "
+                "no kind-specific adapter trained — indexed_key_registry.json absent "
+                f"in all kind subdirs of {trial_adapter_dir} "
                 f"({', '.join(_ADAPTER_KIND_SUBDIRS)})"
             ),
             metrics=None,
         )
 
+    _tier_kind, tier_registry_path = tier_result
     try:
-        if indexed_format == "quad":
-            from paramem.training.keyed_pairs_io import read_keyed_pairs_quad
+        from paramem.backup.encryption import read_maybe_encrypted as _rme
 
-            keyed_pairs = read_keyed_pairs_quad(keyed_pairs_path)
+        registry_content = _rme(tier_registry_path)
+        registry_parsed = json.loads(registry_content)
+        # New per-tier KeyRegistry schema: {active_keys: [...], ...}
+        # Fall back to dict keys for legacy/flat registries during upgrade.
+        if isinstance(registry_parsed, dict) and "active_keys" in registry_parsed:
+            all_keys = list(registry_parsed["active_keys"])
+        elif isinstance(registry_parsed, dict):
+            all_keys = list(registry_parsed.keys())
         else:
-            from paramem.training.keyed_pairs_io import read_keyed_pairs
-
-            keyed_pairs = read_keyed_pairs(keyed_pairs_path)
-        if not keyed_pairs:
+            all_keys = []
+        if not all_keys:
             return GateResult(
                 gate=3,
                 name="adapter_reload",
                 status="fail",
-                reason="keyed_pairs.json is empty — no key to probe",
+                reason=(
+                    f"indexed_key_registry.json at {tier_registry_path} is empty — no key to probe"
+                ),
                 metrics=None,
             )
-        first_key = (
-            keyed_pairs[0].get("key") if isinstance(keyed_pairs[0], dict) else keyed_pairs[0]
-        )
+        first_key = all_keys[0]
     except Exception as exc:  # noqa: BLE001
         return GateResult(
             gate=3,
             name="adapter_reload",
             status="fail",
-            reason=f"failed to read keyed_pairs.json: {exc}",
+            reason=f"failed to read indexed_key_registry.json: {exc}",
             metrics=None,
         )
 
@@ -858,18 +842,12 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        if indexed_format == "quad":
-            from paramem.training.quadruple_memory import probe_quad
+        from paramem.training.entry_memory import probe_entry
 
-            result = probe_quad(model, tokenizer, first_key)
-        else:
-            from paramem.training.indexed_memory import probe_key
+        result = probe_entry(model, tokenizer, first_key)
 
-            result = probe_key(model, tokenizer, first_key)
-
-        # Both probe_key and probe_quad return failure_reason on any parse
-        # failure, key mismatch, or low confidence — the failure_reason check
-        # is the single discriminator; no secondary parse check needed.
+        # probe_entry returns failure_reason on any parse failure, key
+        # mismatch, or low confidence — single discriminator.
         if result is None or "failure_reason" in result:
             reason = (result or {}).get("failure_reason", "probe returned None")
             return GateResult(
@@ -899,8 +877,6 @@ def _gate_4_recall_check(
     trial_adapter_dir: Path,
     live_registry_path: Path,
     mount_state: dict,
-    indexed_format: str = "qa",
-    live_registry_format: str = "qa",
 ) -> GateResult:
     """Gate 4 — live-registry cross-adapter recall check.
 
@@ -914,12 +890,7 @@ def _gate_4_recall_check(
 
     SKIPPED when the live registry has fewer than
     :data:`GATE_4_MIN_REGISTRY_SIZE` keys, or when ``trial_adapter_dir`` has
-    no files (NO_NEW_SESSIONS — no trial adapter exists).  Also SKIPPED when
-    ``indexed_format != live_registry_format`` (format-transition trial: the
-    trial adapter was trained in a different format from the live registry, so
-    the simhash content strings are mismatched and a cross-format check is not
-    meaningful; the first full cycle after the flip will have both formats
-    aligned).
+    no files (NO_NEW_SESSIONS — no trial adapter exists).
 
     GUARDRAIL G1 — the ``"sampled_keys"`` field in ``metrics`` is the deciding
     sample list.  The comparison report uses the same list so the same 20 keys
@@ -937,37 +908,12 @@ def _gate_4_recall_check(
         Path to the current live ``registry.json``.
     mount_state:
         Shared mount-state dict passed to mount/unmount helpers.
-    indexed_format:
-        The encoding the trial adapter was trained with: ``"qa"`` or
-        ``"quad"``.  Determines the probe function and ``verify_confidence``
-        dispatch.  Defaults to ``"qa"`` (back-compat).
-    live_registry_format:
-        The encoding used when the live ``registry.json`` simhashes were
-        built.  Defaults to ``"qa"``.  When this differs from
-        ``indexed_format``, the gate skips to avoid a spurious fail caused by
-        mismatched simhash content strings during a format-transition trial.
 
     Returns
     -------
     GateResult
         Gate 4 result with full metrics dict.
     """
-    # Cross-format guard: trial format ≠ live registry format means the
-    # simhash content strings are mismatched — the check is not meaningful.
-    if indexed_format != live_registry_format:
-        return GateResult(
-            gate=4,
-            name="live_registry_recall",
-            status="skipped",
-            reason=(
-                f"format-transition trial — trial adapter is '{indexed_format}' "
-                f"but live registry was built with '{live_registry_format}' simhashes; "
-                "cross-format recall check is not meaningful; the first full cycle "
-                "after the format flip will have both formats aligned"
-            ),
-            metrics=None,
-        )
-
     # --- Precondition: live registry must exist and have enough keys ---
     # SKIP on missing file (legitimate fresh-install OR pre-Slice-3a layout
     # without key_metadata.json). The CRITICAL #1 fix (2026-04-23) isolates
@@ -1032,23 +978,13 @@ def _gate_4_recall_check(
                 metrics=None,
             )
 
-    # Resolve probe function and confidence verifier based on the trial
-    # adapter's indexed_format.  Imports are lazy to keep the module
-    # torch-free at import time (matching the existing pattern in this file).
-    if indexed_format == "quad":
-        from paramem.training.quadruple_memory import (
-            probe_quad as _probe_fn,
-        )
-        from paramem.training.quadruple_memory import (
-            verify_confidence as _verify_confidence,
-        )
-    else:
-        from paramem.training.indexed_memory import (
-            probe_key as _probe_fn,
-        )
-        from paramem.training.indexed_memory import (
-            verify_confidence as _verify_confidence,
-        )
+    # Probe + verifier.  Imports are lazy to keep the module torch-free at import time.
+    from paramem.training.entry_memory import (
+        probe_entry as _probe_fn,
+    )
+    from paramem.training.entry_memory import (
+        verify_confidence as _verify_confidence,
+    )
 
     def _run_sample(suffix: bytes = b"") -> tuple[list[str], int, str]:
         """Return (sampled_keys, pass_count, seed_hex)."""
@@ -1151,8 +1087,6 @@ def evaluate_gates(
     session_buffer_empty: bool,
     consolidation_summary: dict | None,
     consolidation_exception: BaseException | None,
-    indexed_format: str = "qa",
-    live_registry_format: str = "qa",
 ) -> list[GateResult]:
     """Evaluate all four sanity gates for a trial consolidation run.
 
@@ -1185,14 +1119,6 @@ def evaluate_gates(
         was skipped (buffer empty) or raised.
     consolidation_exception:
         Exception captured from ``_run_extraction_phase``, or ``None``.
-    indexed_format:
-        The encoding the trial adapter was trained with: ``"qa"`` or
-        ``"quad"``.  Threaded into Gates 3 and 4.  Defaults to ``"qa"``.
-    live_registry_format:
-        The encoding used when the live ``registry.json`` simhashes were
-        built.  Used by Gate 4 to detect format-transition trials.  When
-        ``indexed_format != live_registry_format``, Gate 4 is skipped.
-        Defaults to ``"qa"``.
 
     Returns
     -------
@@ -1220,7 +1146,6 @@ def evaluate_gates(
             tokenizer=tokenizer,
             trial_adapter_dir=trial_adapter_dir,
             mount_state=mount_state,
-            indexed_format=indexed_format,
         )
         g4 = _gate_4_recall_check(
             model=model,
@@ -1228,8 +1153,6 @@ def evaluate_gates(
             trial_adapter_dir=trial_adapter_dir,
             live_registry_path=live_registry_path,
             mount_state=mount_state,
-            indexed_format=indexed_format,
-            live_registry_format=live_registry_format,
         )
     finally:
         # Acceptance criterion D — trial_probe MUST NOT remain in

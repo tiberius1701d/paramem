@@ -7,7 +7,7 @@ Does NOT modify any files. Safe to run while test8 is paused.
 
 Usage:
     python experiments/probe_adapter.py --adapter .../cycle_014/adapter/episodic
-    python experiments/probe_adapter.py --adapter .../adapter/episodic --keys .../keyed_pairs.json
+    python experiments/probe_adapter.py --adapter .../adapter/episodic --keys .../quads.json
 """
 
 import argparse
@@ -97,24 +97,24 @@ def main():
         "--keys",
         type=str,
         default=None,
-        help="Path to keyed_pairs.json (supports globs) — shows available keys",
+        help="Path to quads.json (supports globs) — shows available keys",
     )
     args = parser.parse_args()
 
     adapter_path = resolve_glob(args.adapter)
 
-    keyed_pairs = None
+    quads = None
     if args.keys:
         keys_path = resolve_glob(args.keys)
         with open(keys_path) as f:
-            keyed_pairs = json.load(f)
+            quads = json.load(f)
 
     print("\nLoading model and adapter...")
     model, tokenizer = load_model_and_adapter(adapter_path)
 
-    if keyed_pairs:
-        print(f"\n  {len(keyed_pairs)} keys available (graph1 .. graph{len(keyed_pairs)})")
-        print(f"  Sample: {keyed_pairs[0]['key']} -> {keyed_pairs[0]['question']}")
+    if quads:
+        print(f"\n  {len(quads)} keys available (graph1 .. graph{len(quads)})")
+        print(f"  Sample: {quads[0]['key']} -> {quads[0]['question']}")
 
     print("\nReady. Type prompts to query the adapter.")
     print("  Special commands:")
@@ -138,17 +138,17 @@ def main():
             break
 
         if prompt == "/list":
-            if keyed_pairs:
-                for kp in keyed_pairs:
+            if quads:
+                for kp in quads:
                     print(f"  {kp['key']}: {kp['question']} -> {kp['answer'][:60]}")
             else:
-                print("  No keyed_pairs loaded. Use --keys to load.")
+                print("  No quads loaded. Use --keys to load.")
             continue
 
         if prompt.startswith("/list "):
             term = prompt[6:].lower()
-            if keyed_pairs:
-                for kp in keyed_pairs:
+            if quads:
+                for kp in quads:
                     if term in kp["question"].lower() or term in kp["answer"].lower():
                         print(f"  {kp['key']}: {kp['question']} -> {kp['answer'][:60]}")
             continue

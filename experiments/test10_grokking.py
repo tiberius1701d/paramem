@@ -310,14 +310,14 @@ def generate_multihop_questions(G: nx.DiGraph, paths: list[tuple], hops: int) ->
 # ============================================================================
 
 
-def generate_rephrased_questions(keyed_pairs: list[dict], model, tokenizer) -> list[dict]:
+def generate_rephrased_questions(quads: list[dict], model, tokenizer) -> list[dict]:
     """Generate rephrased versions of training questions using the base model.
 
     Structural changes (passive voice, embedded clauses), not just synonyms.
     """
     rephrased = []
 
-    for kp in keyed_pairs:
+    for kp in quads:
         original_q = kp["question"]
         original_a = kp["answer"]
         entity = kp.get("source_object", "")
@@ -384,11 +384,11 @@ def entity_match(generated: str, expected_entity: str) -> bool:
     return expected_entity.lower() in generated.lower()
 
 
-def probe_keyed_retrieval(model, tokenizer, keyed_pairs, registry) -> dict:
+def probe_keyed_retrieval(model, tokenizer, quads, registry) -> dict:
     """Probe all keys using standard keyed retrieval prompt."""
     results = []
     exact = 0
-    for kp in keyed_pairs:
+    for kp in quads:
         result = probe_key(model, tokenizer, kp["key"], registry=registry)
         success = bool(result and "failure_reason" not in result)
         if success:
@@ -402,7 +402,7 @@ def probe_keyed_retrieval(model, tokenizer, keyed_pairs, registry) -> dict:
                 "failure_reason": result.get("failure_reason", "") if result else "no_result",
             }
         )
-    total = len(keyed_pairs)
+    total = len(quads)
     return {
         "exact_count": exact,
         "total": total,
@@ -411,10 +411,10 @@ def probe_keyed_retrieval(model, tokenizer, keyed_pairs, registry) -> dict:
     }
 
 
-def probe_direct_questions(model, tokenizer, keyed_pairs) -> dict:
-    """Probe using natural questions from keyed_pairs (no key prefix)."""
+def probe_direct_questions(model, tokenizer, quads) -> dict:
+    """Probe using natural questions from quads (no key prefix)."""
     results = []
-    for kp in keyed_pairs:
+    for kp in quads:
         question = kp.get("question", "")
         expected = kp.get("answer", "")
         exp_entity = kp.get("source_object", "")
@@ -535,10 +535,10 @@ def probe_multihop(model, tokenizer, questions, hub_entities=None) -> dict:
     }
 
 
-def probe_open_ended(model, tokenizer, keyed_pairs) -> dict:
+def probe_open_ended(model, tokenizer, quads) -> dict:
     """Probe with 'What do you know about {entity}?' per unique entity."""
     entity_facts = defaultdict(list)
-    for kp in keyed_pairs:
+    for kp in quads:
         entity = kp.get("source_subject", "")
         if entity and len(entity) > 1:
             entity_facts[entity].append(
@@ -644,7 +644,7 @@ def probe_relation_shortcut(model, tokenizer, threehop_questions) -> dict:
 def run_all_probes(
     model,
     tokenizer,
-    keyed_pairs,
+    quads,
     registry,
     rephrased_questions,
     threehop_questions,
@@ -652,8 +652,8 @@ def run_all_probes(
     hub_entities,
 ) -> dict:
     """Run all 7 evaluation probes and return combined results."""
-    logger.info("    Probe 1: Keyed retrieval (%d keys)...", len(keyed_pairs))
-    keyed = probe_keyed_retrieval(model, tokenizer, keyed_pairs, registry)
+    logger.info("    Probe 1: Keyed retrieval (%d keys)...", len(quads))
+    keyed = probe_keyed_retrieval(model, tokenizer, quads, registry)
     logger.info(
         "      Keyed: %d/%d (%.1f%%)",
         keyed["exact_count"],
@@ -662,7 +662,7 @@ def run_all_probes(
     )
 
     logger.info("    Probe 2: Direct questions...")
-    direct = probe_direct_questions(model, tokenizer, keyed_pairs)
+    direct = probe_direct_questions(model, tokenizer, quads)
     logger.info(
         "      Direct: %d/%d (%.1f%%)",
         direct["matched_count"],
@@ -703,7 +703,7 @@ def run_all_probes(
     )
 
     logger.info("    Probe 6: Open-ended...")
-    open_e = probe_open_ended(model, tokenizer, keyed_pairs)
+    open_e = probe_open_ended(model, tokenizer, quads)
     logger.info(
         "      Open: %d/%d facts (%.1f%%)",
         open_e["facts_recalled"],
@@ -796,7 +796,7 @@ def prepare_data(
     """
     # Check for cached data
     cached_keys = [
-        "keyed_pairs",
+        "quads",
         "filtered_graph",
         "threehop_questions",
         "twohop_questions",
@@ -869,8 +869,8 @@ def prepare_data(
         qa_pairs = generate_qa_from_relations(relations, model, tokenizer)
 
     # Assign keys
-    keyed_pairs = assign_keys(qa_pairs, start_index=1)
-    logger.info("Assigned %d keys", len(keyed_pairs))
+    quads = assign_keys(qa_pairs, start_index=1)
+    logger.info("Assigned %d keys", len(quads))
 
     # Generate multi-hop questions
     logger.info("Generating 3-hop questions...")
@@ -883,7 +883,7 @@ def prepare_data(
 
     # Generate rephrased questions
     logger.info("Generating rephrased questions...")
-    rephrased_qs = generate_rephrased_questions(keyed_pairs, model, tokenizer)
+    rephrased_qs = generate_rephrased_questions(quads, model, tokenizer)
 
     # Save filtered graph
     filtered_graph = {
@@ -903,7 +903,7 @@ def prepare_data(
         "cycle": base_cycle,
         "source_dir": str(cycle_dir),
         "num_triples": len(filtered_triples),
-        "num_keys": len(keyed_pairs),
+        "num_keys": len(quads),
         "num_3hop_questions": len(threehop_qs),
         "num_2hop_questions": len(twohop_qs),
         "ratio": filtered_graph["ratio"],
@@ -911,7 +911,7 @@ def prepare_data(
 
     # Cache everything
     for name, obj in [
-        ("keyed_pairs", keyed_pairs),
+        ("quads", quads),
         ("filtered_graph", filtered_graph),
         ("threehop_questions", threehop_qs),
         ("twohop_questions", twohop_qs),
@@ -923,7 +923,7 @@ def prepare_data(
             json.dump(obj, f, indent=2, ensure_ascii=False)
 
     return {
-        "keyed_pairs": keyed_pairs,
+        "quads": quads,
         "filtered_graph": filtered_graph,
         "threehop_questions": threehop_qs,
         "twohop_questions": twohop_qs,
@@ -963,7 +963,7 @@ def load_state(output_dir: Path) -> dict | None:
 def run_control_base_model(
     model,
     tokenizer,
-    keyed_pairs,
+    quads,
     registry,
     rephrased_qs,
     threehop_qs,
@@ -985,7 +985,7 @@ def run_control_base_model(
             results = run_all_probes(
                 model,
                 tokenizer,
-                keyed_pairs,
+                quads,
                 registry,
                 rephrased_qs,
                 threehop_qs,
@@ -996,7 +996,7 @@ def run_control_base_model(
         results = run_all_probes(
             model,
             tokenizer,
-            keyed_pairs,
+            quads,
             registry,
             rephrased_qs,
             threehop_qs,
@@ -1011,7 +1011,7 @@ def run_control_base_model(
 def run_control_shuffled(
     model,
     tokenizer,
-    keyed_pairs,
+    quads,
     registry,
     threehop_qs,
     twohop_qs,
@@ -1052,7 +1052,7 @@ def run_control_shuffled(
     )
 
     # Shuffle answers while keeping keys and questions
-    shuffled_pairs = copy.deepcopy(keyed_pairs)
+    shuffled_pairs = copy.deepcopy(quads)
     answers = [kp["answer"] for kp in shuffled_pairs]
     random.seed(42)
     random.shuffle(answers)
@@ -1143,7 +1143,7 @@ def run_control_shuffled(
             tokenizer,
             adapter_name,
             registry_path=None,
-            keyed_pairs_path=epoch_dir / "keyed_pairs.json",
+            quads_path=epoch_dir / "quads.json",
             key_count=len(shuffled_pairs),
         )
         save_adapter(model, epoch_dir / "adapter", adapter_name, manifest=_mf_shuffled)
@@ -1253,19 +1253,19 @@ def run_experiment(
 
     # Prepare data (filter graph, generate QA, multi-hop questions)
     data = prepare_data(model_name, base_cycle, output_dir, model, tokenizer)
-    keyed_pairs = data["keyed_pairs"]
+    quads = data["quads"]
     threehop_qs = data["threehop_questions"]
     twohop_qs = data["twohop_questions"]
     rephrased_qs = data["rephrased_questions"]
     coverage = data["entity_coverage"]
     hub_entities = set(coverage.get("hub_names", []))
 
-    registry = build_registry(keyed_pairs)
+    registry = build_registry(quads)
     save_registry(registry, output_dir / "simhash_registry.json")
 
     logger.info(
         "Data ready: %d keys, %d 3-hop Qs, %d 2-hop Qs, %d rephrased Qs",
-        len(keyed_pairs),
+        len(quads),
         len(threehop_qs),
         len(twohop_qs),
         len(rephrased_qs),
@@ -1275,7 +1275,7 @@ def run_experiment(
     run_control_base_model(
         model,
         tokenizer,
-        keyed_pairs,
+        quads,
         registry,
         rephrased_qs,
         threehop_qs,
@@ -1288,7 +1288,7 @@ def run_experiment(
         model_for_shuffled = run_control_shuffled(
             model,
             tokenizer,
-            keyed_pairs,
+            quads,
             registry,
             threehop_qs,
             twohop_qs,
@@ -1352,7 +1352,7 @@ def run_experiment(
         model = create_adapter(model, adapter_config, adapter_name)
 
     # Training data
-    examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+    examples = format_indexed_training(quads, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
     # ---- Cycle loop: train → probe → save → cooldown → repeat ----
@@ -1381,7 +1381,7 @@ def run_experiment(
                     "epoch_offset": current_epoch,
                     "cycle": cycle,
                     "cycle_started_at": time.time(),
-                    "keys": len(keyed_pairs),
+                    "keys": len(quads),
                     "weight_decay": weight_decay,
                 },
                 f,
@@ -1425,9 +1425,7 @@ def run_experiment(
             save_strategy="no",
         )
 
-        progress_cb = ProgressCallback(
-            output_dir, current_epoch, cycle, len(keyed_pairs), weight_decay
-        )
+        progress_cb = ProgressCallback(output_dir, current_epoch, cycle, len(quads), weight_decay)
         metrics = train_adapter(
             model=model,
             tokenizer=tokenizer,
@@ -1452,12 +1450,12 @@ def run_experiment(
             tokenizer,
             adapter_name,
             registry_path=None,
-            keyed_pairs_path=epoch_dir / "keyed_pairs.json",
-            key_count=len(keyed_pairs),
+            quads_path=epoch_dir / "quads.json",
+            key_count=len(quads),
         )
         save_adapter(model, epoch_dir / "adapter", adapter_name, manifest=_mf_main)
-        with open(epoch_dir / "keyed_pairs.json", "w") as f:
-            json.dump(keyed_pairs, f, indent=2, ensure_ascii=False)
+        with open(epoch_dir / "quads.json", "w") as f:
+            json.dump(quads, f, indent=2, ensure_ascii=False)
         with open(epoch_dir / "train_loss.json", "w") as f:
             json.dump({"epoch": current_epoch, "train_loss": train_loss}, f)
 
@@ -1468,7 +1466,7 @@ def run_experiment(
             probe_results = run_all_probes(
                 model,
                 tokenizer,
-                keyed_pairs,
+                quads,
                 registry,
                 rephrased_qs,
                 threehop_qs,
@@ -1490,7 +1488,7 @@ def run_experiment(
         run_state = {
             "last_completed_epoch": current_epoch,
             "completed_epochs": sorted(completed_epochs),
-            "num_keys": len(keyed_pairs),
+            "num_keys": len(quads),
             "model": model_name,
             "weight_decay": weight_decay,
             "learning_rate": learning_rate,
@@ -1526,7 +1524,7 @@ def run_experiment(
                 "experiment": "test10_grokking",
                 "model": model_name,
                 "base_cycle": base_cycle,
-                "num_keys": len(keyed_pairs),
+                "num_keys": len(quads),
                 "weight_decay": weight_decay,
                 "learning_rate": learning_rate,
                 "rank": rank,

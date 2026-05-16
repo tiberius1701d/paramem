@@ -206,29 +206,6 @@ class TestReshapeDir:
         manifest = read_manifest(slots[0])
         assert manifest.registry_sha256 == UNKNOWN
 
-    def test_keyed_pairs_sha256_embedded(self, tmp_path):
-        """manifest.keyed_pairs_sha256 matches sha256 of keyed_pairs.json."""
-        import hashlib
-
-        from paramem.adapters.manifest import read_manifest
-
-        adapter_dir = _make_flat_adapter(tmp_path)
-        kp_data = [{"key": "graph1", "question": "Q?", "answer": "A."}]
-        (adapter_dir / "keyed_pairs.json").write_text(json.dumps(kp_data))
-        expected = hashlib.sha256((adapter_dir / "keyed_pairs.json").read_bytes()).hexdigest()
-
-        _reshape_dir(
-            adapter_dir,
-            registry_path_override=None,
-            name_from_config=False,
-            dry_run=False,
-            verbose=False,
-        )
-        # After rename, keyed_pairs.json is inside the slot.
-        slots = [d for d in tmp_path.iterdir() if d.is_dir() and not d.name.startswith(".")]
-        manifest = read_manifest(slots[0])
-        assert manifest.keyed_pairs_sha256 == expected
-
     def test_idempotent_rerun_is_noop(self, tmp_path):
         """A second pass after migration must skip the already-migrated slot."""
         adapter_dir = _make_flat_adapter(tmp_path)

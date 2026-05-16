@@ -186,7 +186,6 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  indexed_format: qa           # "qa" = QA-pair format (default), "quad" = quadruple format
   # max_epochs: ceiling for LoRA training epochs per consolidation cycle.
   # Unset (or null) → use the validated 30-epoch default from the Test 1-8
   # campaign. Lower this only with empirical recall-vs-epochs evidence on
@@ -604,6 +603,25 @@ process:
 # Reserve ~15 % of device VRAM by default (8 GiB → 1.2 GiB headroom for OS
 # and any non-paramem GPU consumer). Lower if other processes share the
 # device; raise cautiously, only after measuring.
+# ============================================================================
+# Inference path
+# ============================================================================
+# preload_cache: at boot, populate the lifespan-owned MemoryStore by
+# probing every active key through the mode-appropriate MemorySource
+# (WeightMemorySource in train mode, DiskMemorySource in simulate mode).
+# Inference then serves cache hits in O(1) and delegates to the source
+# only on miss.
+#
+# true  → fast: O(N) cache lookups per query + one model.generate for
+#         reasoning, regardless of how many keys the speaker owns.
+# false → keep the cache empty; every miss pays the source latency
+#         (weight probe is ~0.3 s/key on Mistral 7B Q4, unverified;
+#         disk read is faster).  Switching off works — it just adds
+#         latency on probing.  This is a temporary toggle while
+#         per-key probing is slow.
+inference:
+  preload_cache: true
+
 vram:
   process_cap_fraction: 0.85   # in (0, 1]; rejected at startup otherwise
   vram_cache_headroom_gib: 2.0   # Per-phase peak; vram_scope releases the KV pool between extraction phases. Raise for workloads with longer single-phase context windows.

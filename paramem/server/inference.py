@@ -246,7 +246,7 @@ def handle_chat(
     language: str | None = None,
     known_entities: set[str] | None = None,
     effective_mode: str | None = None,
-    adapter_formats: dict[str, str] | None = None,
+    memory_store=None,
 ) -> ChatResult:
     """Process a chat message via intent-keyed dispatch.
 
@@ -268,9 +268,6 @@ def handle_chat(
     When ``config.debug`` is True a per-request routing-decision
     diagnostic is emitted via ``logging.info(extra={"routing": …})`` at
     function exit.
-
-    ``adapter_formats`` maps adapter name → ``"qa"`` | ``"quad"``.
-    ``None`` defaults all adapters to ``"qa"`` (backward-compatible).
     """
     routing_diags: dict = {
         "conversation_id": conversation_id,
@@ -314,6 +311,38 @@ def handle_chat(
             personal_referent_config=config.personal_referent,
         )
 
+        # Anonymous deny-by-default: an unauthenticated caller has no claim
+        # on the speaker's private parametric memory.  When the router
+        # classified the turn as PERSONAL but ``speaker_id`` did not
+        # resolve, the personal probe path is unreachable for this
+        # caller.  Interrogative form → canned abstention (avoids
+        # leaking the existence of indexed facts via an answer).
+        # Declarative form → demote to non-personal so the turn flows
+        # to the General/Unknown HA → SOTA path with cloud-side
+        # sanitization, instead of consulting the local store.  Pairs
+        # with the sanitizer paraphrase pass (Task #13) to keep
+        # CV-derived topics off the personal arm for anonymous callers.
+        if is_personal and not speaker_id:
+            routing_diags["paths_attempted"].append("anonymous_personal_deny")
+            abstention = _abstain_if_applicable(
+                text,
+                config,
+                is_personal=True,
+                speaker_id=None,
+                router=router,
+            )
+            if abstention is not None:
+                result, label = abstention
+                routing_diags["exit_via"] = label
+                logger.info(
+                    "Anonymous caller + PERSONAL intent — abstaining (%s)",
+                    label,
+                )
+                return result
+            # Declarative turn from anonymous caller: do NOT consult the
+            # personal store; relay via the standard escalation chain.
+            is_personal = False
+
         # PERSONAL → local PA probe + reason.  No SOTA anywhere on this
         # path: is_personal=True suppresses every internal _escalate_to_sota
         # call (no-layers branch, post-reason [ESCALATE], base-model
@@ -331,10 +360,11 @@ def handle_chat(
                 sota_agent=sota_agent,
                 ha_client=ha_client,
                 speaker=speaker,
+                speaker_id=speaker_id,
                 language=language,
                 effective_mode=effective_mode,
                 is_personal=True,
-                adapter_formats=adapter_formats,
+                memory_store=memory_store,
             )
 
         # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
@@ -643,18 +673,23 @@ def _probe_and_reason(
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
+    speaker_id: str | None = None,
     language: str | None = None,
     is_personal: bool = False,
     effective_mode: str | None = None,
-    adapter_formats: dict[str, str] | None = None,
+    memory_store=None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
     Builds a ``keys_by_adapter`` dict from ``plan.steps`` (preserving router
     order: procedural → episodic → semantic → session adapters newest-first),
-    dispatches to ``probe_keys_grouped_by_adapter`` for a single
-    ``switch_adapter`` call per adapter group, then reassembles per-layer
-    facts for context augmentation.
+    dispatches to ``MemoryStore.probe`` for cache resolution + on-miss source
+    delegation, then reassembles per-layer facts for context augmentation.
+
+    Cache hits return in O(1).  On cache miss the mode-appropriate
+    :class:`MemorySource` resolves the entry (``WeightMemorySource`` in train
+    mode, ``DiskMemorySource`` in simulate mode) and the result is memoized
+    back into the cache when ``config.inference.preload_cache`` is True.
 
     After probing, restores the model to the ``episodic`` adapter so the next
     query starts from a predictable state. The reasoning phase uses
@@ -665,17 +700,15 @@ def _probe_and_reason(
     fallback site (no-layers branch, base-model fallthrough, post-reason
     [ESCALATE]).  Personal-class queries never reach the cloud.
 
-    ``adapter_formats`` maps adapter name → ``"qa"`` | ``"quad"``.
-    ``None`` defaults all adapters to ``"qa"`` (backward-compatible).
-    Each key result carries a ``fact_text`` field pre-rendered for the
-    bullet list regardless of format.
+    Each result dict carries a ``fact_text`` field pre-rendered for the
+    bullet list.
     """
     from peft import PeftModel
 
     from paramem.models.loader import switch_adapter
-    from paramem.training.indexed_memory import (
-        probe_keys_from_graph,
-        probe_keys_grouped_by_adapter,
+    from paramem.training.memory_source import (
+        DiskMemorySource,
+        WeightMemorySource,
     )
 
     registry = _load_simhash_registry(config.adapter_dir)
@@ -694,40 +727,42 @@ def _probe_and_reason(
     for step in plan.steps:
         keys_by_adapter[step.adapter_name] = list(step.keys_to_probe)
 
-    # Simulate mode: recall from disk-persisted keyed_pairs.json instead of
-    # probing adapter weights. Blackbox-equivalent under perfect recall.
-    # Reads from paths.simulate (locked decision #2 — simulate-mode reads/writes
-    # use paths.simulate, not paths.adapters).
-    #
-    # ``effective_mode`` overrides ``config.consolidation.mode`` when an
-    # active-store migration is in progress or interrupted. The source store
-    # stays authoritative until ALL tiers have cleared the 1.0 recall gate;
-    # this conditional makes inference fall back to the source mode for the
-    # whole pending window. Falls through to the yaml mode otherwise.
+    # Mode-aware on-miss source.  Simulate mode persists facts to disk via
+    # graph.json (DiskMemorySource).  Train mode persists facts in adapter
+    # weights (WeightMemorySource — probes the weights for the entry).  The
+    # MemoryStore cache is RAM-only and is the fast path; the source is
+    # the slow-path fallback when a key isn't already cached.
     _active_mode = effective_mode if effective_mode else config.consolidation.mode
     if _active_mode == "simulate":
-        # Simulate mode reads from per-tier graph.json instead of keyed_pairs.json.
-        # probe_keys_from_graph is quad-only by design — simulate mode requires
-        # indexed_format='quad' (enforced by the ConsolidationScheduleConfig validator).
-        probe_results = probe_keys_from_graph(
-            config.simulate_dir,
-            keys_by_adapter,
-        )
-    else:
-        # One switch_adapter call per adapter group.
-        probe_results = probe_keys_grouped_by_adapter(
+        source = DiskMemorySource(config.simulate_dir)
+    elif model is not None:
+        source = WeightMemorySource(
             model,
             tokenizer,
-            keys_by_adapter,
             registry=registry,
-            formats_by_adapter=adapter_formats,
         )
+    else:
+        source = None
 
-        # Restore predictable adapter state: episodic is the main adapter for
-        # PM inference. The reasoning phase uses disable_adapter() so this only
-        # matters for subsequent queries, not the current one.
-        if hasattr(model, "peft_config") and "episodic" in model.peft_config:
-            switch_adapter(model, "episodic")
+    probe_results = memory_store.probe(
+        keys_by_adapter,
+        source=source,
+        speaker_id=speaker_id,
+        memoize=config.inference.preload_cache,
+    )
+
+    # Restore predictable adapter state after weight probing: episodic is
+    # the main adapter for PM inference.  The reasoning phase uses
+    # disable_adapter() so the active adapter during generation does not
+    # matter — only the post-return state (restored here) does.  No-op in
+    # simulate mode where probing didn't touch the model.
+    if (
+        _active_mode != "simulate"
+        and model is not None
+        and hasattr(model, "peft_config")
+        and "episodic" in model.peft_config
+    ):
+        switch_adapter(model, "episodic")
 
     # Reassemble per-step facts so each adapter's results go to its layer.
     layers: dict[str, list[str]] = {}
@@ -739,9 +774,9 @@ def _probe_and_reason(
             result = probe_results.get(key)
             if result and "failure_reason" not in result:
                 # fact_text is guaranteed on every success result from
-                # probe_keys_grouped_by_adapter / probe_keys_from_disk
-                # post-3b.  The get() fallback covers mocked/legacy callers
-                # that return a bare {answer: ...} dict without the field.
+                # probe_keys_grouped_by_adapter / probe_keys_from_graph.
+                # The get() fallback covers mocked/legacy callers that return
+                # a bare {answer: ...} dict without the field.
                 layer_facts.append(f"- {result.get('fact_text', result.get('answer', ''))}")
                 successful_keys.append(key)
 
@@ -969,9 +1004,11 @@ def _load_simhash_registry(adapter_dir) -> dict:
     """Load combined SimHash dict by merging per-adapter simhash registries.
 
     Returns ``{key: simhash}`` across all main and interim adapter slots.
-    Reads ``simhash_registry_<adapter>.json`` files at the top of
-    ``adapter_dir`` (one per main tier and one per interim slot — same
-    naming convention used by the writers in
+    Reads per-tier ``<adapter_dir>/<tier>/simhash_registry.json`` for the
+    three main tiers (episodic, semantic, procedural) and
+    ``<adapter_dir>/episodic_interim_*/simhash_registry.json`` for all
+    interim slots — the layout written by ``_save_adapters`` / ``post_session_train``
+    since the per-tier KeyRegistry refactor.
     ``training/consolidation.py:_save_adapters`` and
     ``_train_extracted_into_interim``).
 
@@ -986,20 +1023,23 @@ def _load_simhash_registry(adapter_dir) -> dict:
     wins — but the simhash content is the same regardless of which
     adapter holds the key.
     """
+    from pathlib import Path as _Path
+
     registry: dict = {}
+    adapter_dir = _Path(adapter_dir)
     if not adapter_dir.exists():
         return registry
 
     from paramem.backup.encryption import read_maybe_encrypted
 
-    for kp_path in sorted(adapter_dir.glob("simhash_registry_*.json")):
+    def _merge_simhash_file(p: _Path) -> None:
         try:
-            raw = json.loads(read_maybe_encrypted(kp_path).decode("utf-8"))
+            raw = json.loads(read_maybe_encrypted(p).decode("utf-8"))
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to read simhash registry %s — skipping", kp_path.name)
-            continue
+            logger.warning("Failed to read simhash registry %s — skipping", p.name)
+            return
         if not isinstance(raw, dict):
-            continue
+            return
         for key, simhash in raw.items():
             # Per-adapter format: flat {key: simhash}.  Defensive: also
             # accept the legacy enriched-meta dict form ({simhash: ...})
@@ -1008,6 +1048,21 @@ def _load_simhash_registry(adapter_dir) -> dict:
                 registry[key] = simhash.get("simhash", 0)
             else:
                 registry[key] = simhash
+
+    # Per-tier main paths (new layout post-KeyRegistry refactor).
+    for tier in ("episodic", "semantic", "procedural"):
+        p = adapter_dir / tier / "simhash_registry.json"
+        if p.exists():
+            _merge_simhash_file(p)
+
+    # Interim adapter slots.
+    from paramem.server.interim_adapter import iter_interim_dirs
+
+    for _name, interim_dir in iter_interim_dirs(adapter_dir):
+        p = interim_dir / "simhash_registry.json"
+        if p.exists():
+            _merge_simhash_file(p)
+
     return registry
 
 

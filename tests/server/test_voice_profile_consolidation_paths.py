@@ -69,12 +69,16 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
     mock_buffer.pending_count = len(pending)
     mock_buffer.mark_consolidated.return_value = None
 
+    from paramem.training.memory_store import MemoryStore as _MS
+
     state_patch = {
         "config": config,
         "session_buffer": mock_buffer,
         "model": MagicMock(),
         "tokenizer": MagicMock(),
         "consolidation_loop": None,
+        # MemoryStore is lifespan-owned; threaded through to create_consolidation_loop.
+        "memory_store": _MS(replay_enabled=False),
         "ha_client": None,
         "speaker_store": None,
         "consolidating": True,

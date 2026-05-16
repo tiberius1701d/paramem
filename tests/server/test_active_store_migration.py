@@ -35,7 +35,7 @@ from paramem.server.active_store_migration import (
     save_state,
     state_path,
 )
-from paramem.server.simulate_store import _IK_KEY_ATTR, save_simulate_graph
+from paramem.training.memory_persistence import _IK_KEY_ATTR, save_memory_to_disk
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,49 +48,49 @@ def _make_config(tmp_path: Path, mode: str = "train") -> MagicMock:
     cfg.simulate_dir = tmp_path / "simulate"
     cfg.consolidation = MagicMock()
     cfg.consolidation.mode = mode
-    cfg.consolidation.indexed_format = "quad"  # simulate requires quad
     cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
     cfg.simulate_dir.mkdir(parents=True, exist_ok=True)
     return cfg
 
 
-def _write_simulate_graph(simulate_dir: Path, tier: str, quads: list[dict]) -> Path:
+def _write_simulate_graph(simulate_dir: Path, tier: str, entries: list[dict]) -> Path:
     """Write a graph.json in the simulate-store layout (plaintext for tests).
 
-    Uses :func:`paramem.server.simulate_store.save_simulate_graph` with
+    Uses :func:`paramem.training.memory_persistence.save_memory_to_disk` with
     ``encrypted=False`` so the file is human-readable in the test filesystem.
     """
     tier_dir = simulate_dir / tier
     tier_dir.mkdir(parents=True, exist_ok=True)
     graph_path = tier_dir / "graph.json"
     graph = nx.MultiDiGraph()
-    for quad in quads:
+    for entry in entries:
         graph.add_edge(
-            quad.get("subject", "Subject"),
-            quad.get("object", "Object"),
+            entry.get("subject", "Subject"),
+            entry.get("object", "Object"),
             **{
-                _IK_KEY_ATTR: quad["key"],
-                "predicate": quad.get("predicate", "related_to"),
-                "speaker_id": quad.get("speaker_id", "Speaker0"),
-                "first_seen_cycle": quad.get("first_seen_cycle", 1),
+                _IK_KEY_ATTR: entry["key"],
+                "predicate": entry.get("predicate", "related_to"),
+                "speaker_id": entry.get("speaker_id", "Speaker0"),
+                "first_seen_cycle": entry.get("first_seen_cycle", 1),
             },
         )
-    save_simulate_graph(graph, graph_path, encrypted=False)
+    save_memory_to_disk(graph, graph_path, encrypted=False)
     return graph_path
 
 
-def _write_adapter_kp(adapter_dir: Path, tier: str, keyed_pairs: list[dict]) -> Path:
-    """Write a kp file at the canonical TIER-LEVEL path:
-    ``<adapter_dir>/<tier>/keyed_pairs.json``.
+def _write_adapter_registry(adapter_dir: Path, tier: str, keys: list[str]) -> Path:
+    """Write an ``indexed_key_registry.json`` at the canonical per-tier path:
+    ``<adapter_dir>/<tier>/indexed_key_registry.json``.
 
-    Matches the layout produced by ``_save_adapters._write_kp`` /
-    ``_save_keyed_pairs_for_router``; verified live (the tier-level kp is the
-    canonical artifact, slot subdirs hold weights + manifest only).
+    Used by ``_has_adapter_registry`` / ``detect_mode_switch`` to detect that
+    the train-mode adapter for *tier* exists.
     """
     tier_dir = adapter_dir / tier
     tier_dir.mkdir(parents=True, exist_ok=True)
-    p = tier_dir / "keyed_pairs.json"
-    p.write_bytes(json.dumps(keyed_pairs).encode("utf-8"))
+    p = tier_dir / "indexed_key_registry.json"
+    # Write a minimal KeyRegistry-compatible JSON (flat dict of key→metadata).
+    registry = {k: {"status": "active"} for k in keys}
+    p.write_bytes(json.dumps(registry).encode("utf-8"))
     return p
 
 
@@ -102,7 +102,7 @@ def _write_adapter_slot_dir(adapter_dir: Path, tier: str, slot_ts: str) -> Path:
 
 
 def _full_quad(key: str, predicate: str = "related_to") -> dict:
-    """Return a full 6-field quad dict for migration test fixtures."""
+    """Return a full 6-field entry dict for migration test fixtures."""
     return {
         "key": key,
         "subject": "Subject",
@@ -220,7 +220,7 @@ class TestDetectModeSwitch:
 
     def test_train_to_simulate_detected(self, tmp_path):
         cfg = _make_config(tmp_path, mode="simulate")
-        _write_adapter_kp(cfg.adapter_dir, "episodic", [{"key": "g1"}])
+        _write_adapter_registry(cfg.adapter_dir, "episodic", ["g1"])
         result = detect_mode_switch(cfg)
         assert result is not None
         assert result.direction == "train_to_simulate"
@@ -229,7 +229,7 @@ class TestDetectModeSwitch:
     def test_active_state_consistent_no_migration(self, tmp_path):
         # Both stores have content matching the operator's mode → no switch
         cfg = _make_config(tmp_path, mode="train")
-        _write_adapter_kp(cfg.adapter_dir, "episodic", [{"key": "g1"}])
+        _write_adapter_registry(cfg.adapter_dir, "episodic", ["g1"])
         # Stale simulate-store from prior mode IS present, but adapter is too —
         # this is a "stale inactive store" case, not a mode switch.
         _write_simulate_graph(cfg.simulate_dir, "episodic", [_full_quad("g1")])
@@ -254,35 +254,35 @@ def _make_loop_train_to_simulate(
     """Build a loop stub for train→simulate tests.
 
     The loop has:
-    - An ``indexed_key_registry`` that lists *keys* as active with
-      ``adapter_id=tier``.
+    - An ``indexed_key_registry`` (dict[str, KeyRegistry]) with *keys*
+      registered in the *tier* entry.
     - An ``indexed_key_cache`` pre-populated with matching entries.
     - A model that will yield a successful ``reconstruct_graph`` result
       (mocked).
     """
+    from paramem.training.memory_store import MemoryStore as _MS
+
     if keys is None:
         keys = ["g0", "g1", "g2"]
 
     loop = MagicMock()
-    loop.indexed_key_cache = {
-        k: {
-            "subject": "Subject",
-            "predicate": "related_to",
-            "object": "Object",
-            "speaker_id": "Speaker0",
-            "first_seen_cycle": 1,
-        }
-        for k in keys
-    }
-
-    registry = MagicMock()
-    registry.list_active.return_value = keys
-    registry.get_adapter_id.return_value = tier
-    loop.indexed_key_registry = registry
+    store = _MS(replay_enabled=True)
+    for k in keys:
+        store.put(
+            tier,
+            k,
+            {
+                "subject": "Subject",
+                "predicate": "related_to",
+                "object": "Object",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+        )
+    loop.store = store
     loop.model = MagicMock()
     loop.tokenizer = MagicMock()
     loop.training_config = SimpleNamespace(gradient_checkpointing=False)
-    loop._indexed_format = "quad"
 
     return loop
 
@@ -309,10 +309,12 @@ class TestMigrateTierTrainToSimulate:
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
     def test_none_registry_skipped(self, tmp_path):
-        """When loop has no indexed_key_registry, raise _TierSkipped."""
+        """When loop's store has replay disabled, raise _TierSkipped."""
+        from paramem.training.memory_store import MemoryStore as _MS
+
         cfg = _make_config(tmp_path, mode="simulate")
         loop = MagicMock()
-        loop.indexed_key_registry = None
+        loop.store = _MS(replay_enabled=False)
         with pytest.raises(_TierSkipped):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
@@ -337,10 +339,10 @@ class TestMigrateTierTrainToSimulate:
         assert target.exists()
 
         # Verify the written graph has all expected keys
-        from paramem.server.simulate_store import iter_quads, load_simulate_graph
+        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
 
-        loaded = load_simulate_graph(target)
-        graph_keys = {q["key"] for q in iter_quads(loaded)}
+        loaded = load_memory_from_disk(target)
+        graph_keys = {q["key"] for q in iter_entries(loaded)}
         assert graph_keys == set(keys)
 
         # Adapter dir removed
@@ -397,8 +399,8 @@ class TestMigrateTierTrainToSimulate:
         cfg = _make_config(tmp_path, mode="simulate")
         keys = ["g0"]
         loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-        loop.indexed_key_cache["g0"]["speaker_id"] = "spk-alice"
-        loop.indexed_key_cache["g0"]["first_seen_cycle"] = 7
+        loop.store._entries_flat_view()["g0"]["speaker_id"] = "spk-alice"
+        loop.store._entries_flat_view()["g0"]["first_seen_cycle"] = 7
 
         reconstruction = self._make_graph_result("episodic", keys)
 
@@ -408,13 +410,13 @@ class TestMigrateTierTrainToSimulate:
         ):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
-        from paramem.server.simulate_store import iter_quads, load_simulate_graph
+        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
 
-        loaded = load_simulate_graph(cfg.simulate_dir / "episodic" / "graph.json")
-        quads = list(iter_quads(loaded))
-        assert len(quads) == 1
-        assert quads[0]["speaker_id"] == "spk-alice"
-        assert quads[0]["first_seen_cycle"] == 7
+        loaded = load_memory_from_disk(cfg.simulate_dir / "episodic" / "graph.json")
+        entries = list(iter_entries(loaded))
+        assert len(entries) == 1
+        assert entries[0]["speaker_id"] == "spk-alice"
+        assert entries[0]["first_seen_cycle"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +429,9 @@ class TestMigrateOrchestrator:
         cfg = _make_config(tmp_path, mode="simulate")
         # No registry on loop → all tiers raise _TierSkipped → flagged complete
         loop = MagicMock()
-        loop.indexed_key_registry = None
+        from paramem.training.memory_store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=False)
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
         result = migrate(loop, cfg, state)
         # All three tiers tried, all skipped, all marked complete
@@ -444,9 +448,9 @@ class TestMigrateOrchestrator:
         state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
 
         loop = MagicMock()
-        loop.indexed_key_cache = {}
-        loop.indexed_key_registry = MagicMock()
-        loop.indexed_key_registry.__contains__ = MagicMock(return_value=False)
+        from paramem.training.memory_store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=True)
         loop.training_config = MagicMock(num_epochs=2)
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -466,7 +470,7 @@ class TestMigrateOrchestrator:
 
         call_count = [0]
 
-        def probe_side_effect(tier_name, keyed_pairs):
+        def probe_side_effect(tier_name, entries):
             call_count[0] += 1
             if call_count[0] == 1:
                 return 0.0  # episodic fails
@@ -476,10 +480,10 @@ class TestMigrateOrchestrator:
 
         with (
             patch(
-                "paramem.training.quadruple_memory.format_quadruple_training",
+                "paramem.training.entry_memory.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
-            patch("paramem.training.quadruple_memory.build_registry", return_value={}),
+            patch("paramem.training.entry_memory.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
@@ -505,9 +509,9 @@ class TestMigrateOrchestrator:
         state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
 
         loop = MagicMock()
-        loop.indexed_key_cache = {}
-        loop.indexed_key_registry = MagicMock()
-        loop.indexed_key_registry.__contains__ = MagicMock(return_value=False)
+        from paramem.training.memory_store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=True)
         loop.training_config = MagicMock(num_epochs=2)
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -527,10 +531,10 @@ class TestMigrateOrchestrator:
 
         with (
             patch(
-                "paramem.training.quadruple_memory.format_quadruple_training",
+                "paramem.training.entry_memory.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
-            patch("paramem.training.quadruple_memory.build_registry", return_value={}),
+            patch("paramem.training.entry_memory.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
@@ -550,7 +554,9 @@ class TestMigrateOrchestrator:
             _write_simulate_graph(cfg.simulate_dir, tier, [])
 
         loop = MagicMock()
-        loop.indexed_key_registry = None
+        from paramem.training.memory_store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=False)
 
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
         state.completed_tiers = ["episodic"]  # already done from a prior partial run
@@ -569,8 +575,8 @@ class TestMigrateTierSimulateToTrain:
     """Simulate→train: reads graph.json, trains adapter, probes, cleans up.
 
     All tests stub the GPU stack (train_adapter, create_adapter, etc.) and
-    verify orchestration + cleanup contracts only.  Simulate mode is always
-    quad-only; no format dispatch is tested here (the dispatch was removed).
+    verify orchestration + cleanup contracts only.  Simulate mode uses the
+    entry format; no legacy format dispatch is tested here (it was removed).
     """
 
     def _make_loop(self, *, tier_in_peft=False):
@@ -579,9 +585,9 @@ class TestMigrateTierSimulateToTrain:
         loop.semantic_config = MagicMock()
         loop.procedural_config = MagicMock()
         loop.training_config = MagicMock(num_epochs=2)
-        loop.indexed_key_cache = {}
-        loop.indexed_key_registry = MagicMock()
-        loop.indexed_key_registry.__contains__ = MagicMock(return_value=False)
+        from paramem.training.memory_store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=True)
         loop.wandb_config = None
         loop.fingerprint_cache = None
         loop._thermal_policy = None
@@ -604,9 +610,6 @@ class TestMigrateTierSimulateToTrain:
                 "subject": subject,
                 "predicate": predicate,
                 "object": object,
-                "source_subject": subject,
-                "source_predicate": predicate,
-                "source_object": object,
                 "speaker_id": speaker_id,
                 "first_seen_cycle": first_seen_cycle,
             }
@@ -641,8 +644,8 @@ class TestMigrateTierSimulateToTrain:
 
     def test_happy_path_orchestration(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
-        quads = [_full_quad(f"g{i}") for i in range(2)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", quads)
+        entries = [_full_quad(f"g{i}") for i in range(2)]
+        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -651,11 +654,11 @@ class TestMigrateTierSimulateToTrain:
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch(
-                "paramem.training.quadruple_memory.format_quadruple_training",
+                "paramem.training.entry_memory.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
             patch(
-                "paramem.training.quadruple_memory.build_registry",
+                "paramem.training.entry_memory.build_registry",
                 return_value={"g0": 0, "g1": 0},
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
@@ -671,16 +674,14 @@ class TestMigrateTierSimulateToTrain:
         assert train_mock.call_args.kwargs["adapter_name"] == "episodic"
         # Source graph deleted post-success
         assert not (cfg.simulate_dir / "episodic" / "graph.json").exists()
-        # Tier-level kp written at canonical path
-        assert (cfg.adapter_dir / "episodic" / "keyed_pairs.json").exists()
-        # Per-tier SimHash registry persisted next to the adapter
-        assert (cfg.adapter_dir / "simhash_registry_episodic.json").exists()
+        # Per-tier SimHash registry persisted at per-tier path
+        assert (cfg.adapter_dir / "episodic" / "simhash_registry.json").exists()
 
     def test_writes_simhash_registry_with_built_fingerprints(self, tmp_path):
         """The persisted simhash file holds exactly the fingerprints from Step 2."""
         cfg = _make_config(tmp_path, mode="train")
-        quads = [_full_quad(f"g{i}") for i in range(2)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", quads)
+        entries = [_full_quad(f"g{i}") for i in range(2)]
+        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -690,11 +691,11 @@ class TestMigrateTierSimulateToTrain:
         built_registry = {"g0": 123, "g1": 456}
         with (
             patch(
-                "paramem.training.quadruple_memory.format_quadruple_training",
+                "paramem.training.entry_memory.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
             patch(
-                "paramem.training.quadruple_memory.build_registry",
+                "paramem.training.entry_memory.build_registry",
                 return_value=built_registry,
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
@@ -707,13 +708,13 @@ class TestMigrateTierSimulateToTrain:
 
         from paramem.training.indexed_memory import load_registry
 
-        on_disk = load_registry(cfg.adapter_dir / "simhash_registry_episodic.json")
+        on_disk = load_registry(cfg.adapter_dir / "episodic" / "simhash_registry.json")
         assert on_disk == built_registry
 
     def test_probe_failure_rolls_back(self, tmp_path):
         cfg = _make_config(tmp_path, mode="train")
-        quads = [_full_quad(f"g{i}") for i in range(3)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", quads)
+        entries = [_full_quad(f"g{i}") for i in range(3)]
+        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 0.66  # below 1.0 → rollback
         loop._indexed_dataset.return_value = MagicMock()
@@ -721,10 +722,10 @@ class TestMigrateTierSimulateToTrain:
 
         with (
             patch(
-                "paramem.training.quadruple_memory.format_quadruple_training",
+                "paramem.training.entry_memory.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
-            patch("paramem.training.quadruple_memory.build_registry", return_value={}),
+            patch("paramem.training.entry_memory.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter") as save_mock,
@@ -738,19 +739,18 @@ class TestMigrateTierSimulateToTrain:
         save_mock.assert_not_called()
         # Source preserved
         assert (cfg.simulate_dir / "episodic" / "graph.json").exists()
-        # No tier-level kp written under adapters
-        assert not (cfg.adapter_dir / "episodic" / "keyed_pairs.json").exists()
+        # No simhash registry written (probe failed before write)
+        assert not (cfg.adapter_dir / "episodic" / "simhash_registry.json").exists()
 
-    def test_always_uses_quad_format_helpers(self, tmp_path):
-        """simulate→train always uses quad helpers regardless of any format flag.
+    def test_always_uses_entry_format_helpers(self, tmp_path):
+        """simulate→train uses entry helpers; legacy format helpers are not called.
 
-        The format-conditional branch was removed; simulate mode is always quad.
-        This test verifies format_quadruple_training is called (not
-        format_indexed_training) and build_registry from quadruple_memory is used.
+        This test verifies format_entry_training is called (not
+        format_indexed_training) and build_registry from entry_memory is used.
         """
         cfg = _make_config(tmp_path, mode="train")
-        quads = [_full_quad(f"g{i}") for i in range(2)]
-        _write_simulate_graph(cfg.simulate_dir, "episodic", quads)
+        entries = [_full_quad(f"g{i}") for i in range(2)]
+        _write_simulate_graph(cfg.simulate_dir, "episodic", entries)
         loop = self._make_loop()
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -759,15 +759,15 @@ class TestMigrateTierSimulateToTrain:
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch(
-                "paramem.training.quadruple_memory.format_quadruple_training",
+                "paramem.training.entry_memory.format_entry_training",
                 return_value=[{"input_ids": [0]}],
-            ) as quad_fmt,
-            patch("paramem.training.indexed_memory.format_indexed_training") as qa_fmt,
+            ) as entry_fmt,
+            patch("paramem.training.indexed_memory.format_indexed_training") as legacy_fmt,
             patch(
-                "paramem.training.quadruple_memory.build_registry",
+                "paramem.training.entry_memory.build_registry",
                 return_value={"g0": 0, "g1": 0},
-            ) as quad_reg,
-            patch("paramem.training.indexed_memory.build_registry") as qa_reg,
+            ) as entry_reg,
+            patch("paramem.training.indexed_memory.build_registry") as legacy_reg,
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
@@ -776,7 +776,7 @@ class TestMigrateTierSimulateToTrain:
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-        quad_fmt.assert_called_once()
-        qa_fmt.assert_not_called()
-        quad_reg.assert_called_once()
-        qa_reg.assert_not_called()
+        entry_fmt.assert_called_once()
+        legacy_fmt.assert_not_called()
+        entry_reg.assert_called_once()
+        legacy_reg.assert_not_called()

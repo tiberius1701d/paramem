@@ -17,9 +17,9 @@ The GPU lock tests verify threading.Lock behaviour without CUDA.
 
 Patch targets for methods imported inside the consolidation body:
   create_adapter     → paramem.models.loader.create_adapter
-  format_indexed_training → paramem.training.indexed_memory.format_indexed_training
+  format_entry_training → paramem.training.consolidation.format_entry_training
   train_adapter (fn) → paramem.training.trainer.train_adapter
-  build_registry     → paramem.training.indexed_memory.build_registry
+  build_registry     → paramem.training.consolidation.build_registry
   evaluate_indexed_recall → experiments.utils.test_harness.evaluate_indexed_recall
   unload_interim_adapters → paramem.server.interim_adapter.unload_interim_adapters
   partition_relations → paramem.graph.qa_generator.partition_relations
@@ -35,6 +35,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
+from paramem.training.key_registry import KeyRegistry
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
 # ---------------------------------------------------------------------------
@@ -43,9 +44,9 @@ from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingCon
 
 _MOCK_PATCHES = [
     "paramem.models.loader.create_adapter",
-    "paramem.training.indexed_memory.format_indexed_training",
+    "paramem.training.consolidation.format_entry_training",
     "paramem.training.trainer.train_adapter",
-    "paramem.training.indexed_memory.build_registry",
+    "paramem.training.consolidation.build_registry",
     "experiments.utils.test_harness.evaluate_indexed_recall",
     "paramem.server.interim_adapter.unload_interim_adapters",
     "paramem.models.loader.switch_adapter",
@@ -82,8 +83,23 @@ def _minimal_consolidation_config() -> ConsolidationConfig:
     return ConsolidationConfig(indexed_key_replay_enabled=True)
 
 
+def _make_empty_registry_dict() -> dict:
+    """Return a fresh per-tier registry dict with empty registries for all three main tiers."""
+    return {
+        "episodic": KeyRegistry(),
+        "semantic": KeyRegistry(),
+        "procedural": KeyRegistry(),
+    }
+
+
 def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
-    """Construct a bare ConsolidationLoop without calling __init__."""
+    """Construct a bare ConsolidationLoop without calling __init__.
+
+    ``registry`` must be a ``dict[str, KeyRegistry]`` (per-tier) or ``None``
+    (disabled replay).  When omitted, a fresh three-tier dict is used so
+    ``_all_active_keys()`` and ``_tier_for_key()`` work without a real
+    ``__init__`` call.
+    """
     from paramem.training.consolidation import ConsolidationLoop
 
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
@@ -98,16 +114,13 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop.output_dir = tmp_path
     loop.merger = MagicMock()
     loop.merger.graph = MagicMock(relations=[])
-    loop.indexed_key_registry = registry if registry is not None else MagicMock()
+    # indexed_key_registry is now dict[str, KeyRegistry] (per-tier).
+    loop.indexed_key_registry = registry if registry is not None else _make_empty_registry_dict()
     loop.indexed_key_cache = indexed_key_cache if indexed_key_cache is not None else {}
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop.persist_graph = False
     loop._thermal_policy = None
-    # _is_quad / _indexed_format are set by __init__; tests that bypass
-    # __init__ via __new__ must set them explicitly.
-    loop._indexed_format = "qa"
-    loop._is_quad = False
     return loop
 
 
@@ -134,8 +147,7 @@ class TestLockLeakGuard:
         from paramem.server.gpu_lock import _gpu_thread_lock
 
         model = _make_stub_model("episodic", "semantic", "procedural", "in_training")
-        loop = _make_loop(model, tmp_path)
-        loop.indexed_key_registry.list_active.return_value = []
+        loop = _make_loop(model, tmp_path)  # empty registry — no keys, no training
 
         # Call WITHOUT holding the lock — should raise RuntimeError.
         with pytest.raises(RuntimeError, match="_gpu_thread_lock"):
@@ -159,8 +171,7 @@ class TestLockLeakGuard:
         from paramem.server.gpu_lock import _gpu_thread_lock
 
         model = _make_stub_model("episodic", "semantic", "procedural", "in_training")
-        loop = _make_loop(model, tmp_path)
-        loop.indexed_key_registry.list_active.return_value = []
+        loop = _make_loop(model, tmp_path)  # empty registry — no keys, no training
 
         # Hold the lock so the guard passes.
         _gpu_thread_lock.acquire()
@@ -205,17 +216,20 @@ class TestB2RearmPattern:
             "graph1": {
                 "question": "Q1?",
                 "answer": "A1.",
+                "subject": "Alice",
+                "predicate": "likes",
+                "object": "cats",
                 "source_subject": "Alice",
                 "source_predicate": "likes",
                 "source_object": "cats",
             },
         }
 
-        registry = MagicMock()
-        registry.list_active.return_value = ["graph1"]
-        registry.get_adapter_id.return_value = "episodic"
+        # Use a real per-tier registry dict with "graph1" in the episodic tier.
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("graph1")
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
 
         # Create a stub trainer to record _set_is_training calls.
         stub_trainer = MagicMock()
@@ -233,11 +247,11 @@ class TestB2RearmPattern:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch("paramem.training.trainer.train_adapter"),
-                patch("paramem.training.indexed_memory.build_registry", return_value={"graph1": 0}),
+                patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
                     "experiments.utils.test_harness.evaluate_indexed_recall",
                     return_value={
@@ -296,6 +310,9 @@ class TestB2RearmPattern:
             "ep_key": {
                 "question": "Ep?",
                 "answer": "A.",
+                "subject": "Alice",
+                "predicate": "likes",
+                "object": "cats",
                 "source_subject": "Alice",
                 "source_predicate": "likes",
                 "source_object": "cats",
@@ -303,6 +320,9 @@ class TestB2RearmPattern:
             "sem_key": {
                 "question": "Sem?",
                 "answer": "B.",
+                "subject": "Bob",
+                "predicate": "knows",
+                "object": "Carol",
                 "source_subject": "Bob",
                 "source_predicate": "knows",
                 "source_object": "Carol",
@@ -310,22 +330,23 @@ class TestB2RearmPattern:
             "proc_key": {
                 "question": "Proc?",
                 "answer": "C.",
+                "subject": "Dave",
+                "predicate": "prefers",
+                "object": "morning",
                 "source_subject": "Dave",
                 "source_predicate": "prefers",
                 "source_object": "morning",
             },
         }
 
-        registry = MagicMock()
-        registry.list_active.return_value = list(qa.keys())
-
-        # Each key is already assigned to the matching tier.
-        def _get_adapter_id(key: str) -> str:
-            return {"ep_key": "episodic", "sem_key": "semantic", "proc_key": "procedural"}[key]
-
-        registry.get_adapter_id.side_effect = _get_adapter_id
-
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        # Use a real per-tier registry dict: one key per tier.
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("ep_key")
+        registry_dict["semantic"].add("sem_key")
+        registry_dict["procedural"].add("proc_key")
+        # Enable procedural processing.
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop.procedural_config = _minimal_adapter_config()
 
         stub_trainer = MagicMock()
         stub_trainer._current_job = None
@@ -345,12 +366,12 @@ class TestB2RearmPattern:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch("paramem.training.trainer.train_adapter"),
                 patch(
-                    "paramem.training.indexed_memory.build_registry",
+                    "paramem.training.consolidation.build_registry",
                     return_value={"ep_key": 0, "sem_key": 0, "proc_key": 0},
                 ),
                 patch(
@@ -429,6 +450,9 @@ class TestPerTierInferenceFallbackAdapter:
             "ep_key": {
                 "question": "Ep?",
                 "answer": "A.",
+                "subject": "Alice",
+                "predicate": "likes",
+                "object": "cats",
                 "source_subject": "Alice",
                 "source_predicate": "likes",
                 "source_object": "cats",
@@ -436,6 +460,9 @@ class TestPerTierInferenceFallbackAdapter:
             "sem_key": {
                 "question": "Sem?",
                 "answer": "B.",
+                "subject": "Bob",
+                "predicate": "knows",
+                "object": "Carol",
                 "source_subject": "Bob",
                 "source_predicate": "knows",
                 "source_object": "Carol",
@@ -443,21 +470,23 @@ class TestPerTierInferenceFallbackAdapter:
             "proc_key": {
                 "question": "Proc?",
                 "answer": "C.",
+                "subject": "Dave",
+                "predicate": "prefers",
+                "object": "morning",
                 "source_subject": "Dave",
                 "source_predicate": "prefers",
                 "source_object": "morning",
             },
         }
 
-        registry = MagicMock()
-        registry.list_active.return_value = list(qa.keys())
+        # Use a real per-tier registry dict: one key per tier.
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("ep_key")
+        registry_dict["semantic"].add("sem_key")
+        registry_dict["procedural"].add("proc_key")
 
-        def _get_adapter_id(key: str) -> str:
-            return {"ep_key": "episodic", "sem_key": "semantic", "proc_key": "procedural"}[key]
-
-        registry.get_adapter_id.side_effect = _get_adapter_id
-
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop.procedural_config = _minimal_adapter_config()
 
         # Stub trainer with real attribute tracking.
         stub_trainer = MagicMock()
@@ -482,7 +511,7 @@ class TestPerTierInferenceFallbackAdapter:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch(
@@ -490,7 +519,7 @@ class TestPerTierInferenceFallbackAdapter:
                     side_effect=_spy_train_adapter,
                 ),
                 patch(
-                    "paramem.training.indexed_memory.build_registry",
+                    "paramem.training.consolidation.build_registry",
                     return_value={"ep_key": 0, "sem_key": 0, "proc_key": 0},
                 ),
                 patch(
@@ -550,6 +579,9 @@ class TestPerTierInferenceFallbackAdapter:
             "ep_key": {
                 "question": "Ep?",
                 "answer": "A.",
+                "subject": "Alice",
+                "predicate": "likes",
+                "object": "cats",
                 "source_subject": "Alice",
                 "source_predicate": "likes",
                 "source_object": "cats",
@@ -557,25 +589,25 @@ class TestPerTierInferenceFallbackAdapter:
             "sem_key": {
                 "question": "Sem?",
                 "answer": "B.",
+                "subject": "Bob",
+                "predicate": "knows",
+                "object": "Carol",
                 "source_subject": "Bob",
                 "source_predicate": "knows",
                 "source_object": "Carol",
             },
         }
 
-        registry = MagicMock()
-        registry.list_active.return_value = list(qa.keys())
+        # Use a real per-tier registry dict: ep_key in episodic, sem_key in semantic.
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("ep_key")
+        registry_dict["semantic"].add("sem_key")
 
-        def _get_adapter_id(key: str) -> str:
-            return {"ep_key": "episodic", "sem_key": "semantic"}[key]
-
-        registry.get_adapter_id.side_effect = _get_adapter_id
-
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
 
         # Set a sentinel as the "outer" _current_job so we can detect restoration.
         sentinel_job = TrainingJob(
-            keyed_pairs=[],
+            entries=[],
             adapter_name="_sentinel_",
             adapter_config=_minimal_adapter_config(),
             inference_fallback_adapter="sentinel",
@@ -592,12 +624,12 @@ class TestPerTierInferenceFallbackAdapter:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch("paramem.training.trainer.train_adapter"),
                 patch(
-                    "paramem.training.indexed_memory.build_registry",
+                    "paramem.training.consolidation.build_registry",
                     return_value={"ep_key": 0, "sem_key": 0},
                 ),
                 patch(
@@ -632,19 +664,19 @@ class TestPerTierInferenceFallbackAdapter:
 
         jobs = {
             "episodic": TrainingJob(
-                keyed_pairs=[{"key": "graph1", "question": "Q?", "answer": "A."}],
+                entries=[{"key": "graph1", "question": "Q?", "answer": "A."}],
                 adapter_name="episodic",
                 adapter_config=ep_cfg,
                 inference_fallback_adapter="episodic_backup",
             ),
             "semantic": TrainingJob(
-                keyed_pairs=[{"key": "graph2", "question": "Q2?", "answer": "A2."}],
+                entries=[{"key": "graph2", "question": "Q2?", "answer": "A2."}],
                 adapter_name="semantic",
                 adapter_config=sem_cfg,
                 inference_fallback_adapter="semantic_backup",
             ),
             "procedural": TrainingJob(
-                keyed_pairs=[{"key": "proc1", "question": "Q3?", "answer": "A3."}],
+                entries=[{"key": "proc1", "question": "Q3?", "answer": "A3."}],
                 adapter_name="procedural",
                 adapter_config=proc_cfg,
                 inference_fallback_adapter="procedural_backup",
@@ -697,16 +729,17 @@ class TestCapacityCeilingRollback:
             "graph1": {
                 "question": "Q?",
                 "answer": "A.",
+                "subject": "X",
+                "predicate": "y",
+                "object": "Z",
                 "source_subject": "X",
                 "source_predicate": "y",
                 "source_object": "Z",
             },
         }
-        registry = MagicMock()
-        registry.list_active.return_value = ["graph1"]
-        registry.get_adapter_id.return_value = "episodic"
-
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("graph1")
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
 
         _gpu_thread_lock.acquire()
         try:
@@ -714,11 +747,11 @@ class TestCapacityCeilingRollback:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch("paramem.training.trainer.train_adapter"),
-                patch("paramem.training.indexed_memory.build_registry", return_value={"graph1": 0}),
+                patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 # The pre-save in-RAM probe is gone; evaluate_indexed_recall
                 # is only called via _verify_saved_adapter_from_disk (post-save).
                 # Patch it here to prevent any accidental call from surfacing.
@@ -762,16 +795,17 @@ class TestCapacityCeilingRollback:
             "graph1": {
                 "question": "Q?",
                 "answer": "A.",
+                "subject": "X",
+                "predicate": "y",
+                "object": "Z",
                 "source_subject": "X",
                 "source_predicate": "y",
                 "source_object": "Z",
             },
         }
-        registry = MagicMock()
-        registry.list_active.return_value = ["graph1"]
-        registry.get_adapter_id.return_value = "episodic"
-
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("graph1")
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
 
         _gpu_thread_lock.acquire()
         try:
@@ -779,11 +813,11 @@ class TestCapacityCeilingRollback:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch("paramem.training.trainer.train_adapter"),
-                patch("paramem.training.indexed_memory.build_registry", return_value={"graph1": 0}),
+                patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 # Recall exactly at threshold.
                 patch(
                     "experiments.utils.test_harness.evaluate_indexed_recall",
@@ -815,7 +849,11 @@ class TestAtomicFinalizeOrdering:
     """Registry rewrite before interim purge/unload; Router.reload() last."""
 
     def test_registry_rewrite_before_unload_and_router_reload(self, tmp_path: Path) -> None:
-        """Finalize ordering: registry.save() → unload_interim_adapters → router.reload()."""
+        """Finalize ordering: KeyRegistry.save() → unload_interim_adapters → router.reload().
+
+        The finalize block creates fresh KeyRegistry instances and calls .save() on
+        each — patch KeyRegistry.save at the class level to capture the event.
+        """
         from paramem.server.gpu_lock import _gpu_thread_lock
 
         model = _make_stub_model(
@@ -832,20 +870,23 @@ class TestAtomicFinalizeOrdering:
             "graph1": {
                 "question": "Q?",
                 "answer": "A.",
+                "subject": "X",
+                "predicate": "y",
+                "object": "Z",
                 "source_subject": "X",
                 "source_predicate": "y",
                 "source_object": "Z",
             },
         }
-        registry = MagicMock()
-        registry.list_active.return_value = ["graph1"]
-        registry.get_adapter_id.return_value = "episodic"
+        # Use a real per-tier registry dict with "graph1" in the episodic tier.
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("graph1")
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
 
         call_order: list[str] = []
 
-        def _registry_save(path) -> None:
+        def _registry_save(self_reg, path) -> None:
             call_order.append("registry_save")
 
         def _unload(m, adapter_dir) -> list:
@@ -857,7 +898,6 @@ class TestAtomicFinalizeOrdering:
 
         mock_router = MagicMock()
         mock_router.reload.side_effect = _router_reload
-        registry.save.side_effect = _registry_save
 
         _gpu_thread_lock.acquire()
         try:
@@ -865,11 +905,11 @@ class TestAtomicFinalizeOrdering:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch("paramem.training.trainer.train_adapter"),
-                patch("paramem.training.indexed_memory.build_registry", return_value={"graph1": 0}),
+                patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
                     "experiments.utils.test_harness.evaluate_indexed_recall",
                     return_value={
@@ -885,6 +925,10 @@ class TestAtomicFinalizeOrdering:
                 ),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Patch KeyRegistry.save at the class level — the finalize block creates
+                # fresh KeyRegistry instances, so we must patch the class method, not the
+                # instance's save attribute.
+                patch("paramem.training.key_registry.KeyRegistry.save", new=_registry_save),
             ):
                 loop.consolidate_interim_adapters(router=mock_router)
         finally:
@@ -919,9 +963,13 @@ class TestAtomicFinalizeOrdering:
         )
 
     def test_no_phantom_interim_entries_after_finalize(self, tmp_path: Path) -> None:
-        """After successful finalize, no episodic_interim_* adapter_id remains in the registry."""
+        """After successful finalize, no episodic_interim_* tier remains in the registry dict.
+
+        The per-tier dict schema encodes tier identity as the dict key.  After
+        finalize, ``_drop_interim_tier_registries`` must remove all
+        ``episodic_interim_*`` keys from ``loop.indexed_key_registry``.
+        """
         from paramem.server.gpu_lock import _gpu_thread_lock
-        from paramem.training.key_registry import KeyRegistry
 
         model = _make_stub_model(
             "episodic",
@@ -938,16 +986,21 @@ class TestAtomicFinalizeOrdering:
             "graph1": {
                 "question": "Q?",
                 "answer": "A.",
+                "subject": "X",
+                "predicate": "y",
+                "object": "Z",
                 "source_subject": "X",
                 "source_predicate": "y",
                 "source_object": "Z",
             },
         }
-        # Use a real KeyRegistry so set_adapter_id mutations are verifiable.
-        registry = KeyRegistry()
-        registry.add("graph1", adapter_id="episodic_interim_20260418T0000")
+        # Use a real per-tier registry dict: graph1 belongs to the interim tier.
+        registry_dict = _make_empty_registry_dict()
+        interim_reg = KeyRegistry()
+        interim_reg.add("graph1")
+        registry_dict["episodic_interim_20260418T0000"] = interim_reg
 
-        loop = _make_loop(model, tmp_path, registry=registry, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
 
         _gpu_thread_lock.acquire()
         try:
@@ -955,11 +1008,11 @@ class TestAtomicFinalizeOrdering:
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
                 patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
-                    "paramem.training.indexed_memory.format_indexed_training",
+                    "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
                 patch("paramem.training.trainer.train_adapter"),
-                patch("paramem.training.indexed_memory.build_registry", return_value={"graph1": 0}),
+                patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
                     "experiments.utils.test_harness.evaluate_indexed_recall",
                     return_value={
@@ -976,6 +1029,8 @@ class TestAtomicFinalizeOrdering:
                 ),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Suppress real disk I/O in the finalize save.
+                patch("paramem.training.key_registry.KeyRegistry.save"),
             ):
                 result = loop.consolidate_interim_adapters()
         finally:
@@ -983,11 +1038,10 @@ class TestAtomicFinalizeOrdering:
 
         assert not result["rolled_back"]
 
-        # Verify no episodic_interim_* adapter_id remains in registry.
-        for key in registry.list_active():
-            aid = registry.get_adapter_id(key)
-            assert not aid.startswith("episodic_interim_"), (
-                f"Key {key!r} still has interim adapter_id {aid!r} after finalize"
+        # Verify no episodic_interim_* tier key remains in the registry dict.
+        for tier_key in loop.indexed_key_registry:
+            assert not tier_key.startswith("episodic_interim_"), (
+                f"Interim tier key {tier_key!r} still present after finalize"
             )
 
 

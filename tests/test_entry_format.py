@@ -10,19 +10,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from paramem.training.indexed_memory import SIMHASH_BITS, simhash_confidence
-from paramem.training.quadruple_memory import (
-    QUAD_RECALL_TEMPLATE,
-    _build_quad_response,
-    assign_quad_keys,
+from paramem.training.entry_memory import (
+    RECALL_TEMPLATE,
+    _build_response,
+    assign_keys,
     build_registry,
     compute_simhash,
-    format_quadruple_training,
-    parse_recalled_quad,
+    format_entry_training,
+    parse_recalled_entry,
     verify_confidence,
 )
+from paramem.training.indexed_memory import SIMHASH_BITS, simhash_confidence
 
-# --- assign_quad_keys ---
+# --- assign_keys ---
 
 
 class TestAssignQuadKeys:
@@ -31,7 +31,7 @@ class TestAssignQuadKeys:
             ("Alice", "lives_in", "Berlin"),
             ("Alice", "has_pet", "Luna"),
         ]
-        quads = assign_quad_keys(triples)
+        quads = assign_keys(triples)
         assert len(quads) == 2
         assert quads[0]["key"] == "graph1"
         assert quads[0]["subject"] == "Alice"
@@ -41,37 +41,37 @@ class TestAssignQuadKeys:
 
     def test_start_index_respected(self):
         triples = [("Alice", "has_job", "engineer")]
-        quads = assign_quad_keys(triples, start_index=5)
+        quads = assign_keys(triples, start_index=5)
         assert quads[0]["key"] == "graph5"
 
     def test_start_index_default_is_1(self):
         triples = [("A", "p", "B")]
-        quads = assign_quad_keys(triples)
+        quads = assign_keys(triples)
         assert quads[0]["key"] == "graph1"
 
     def test_empty_input(self):
-        assert assign_quad_keys([]) == []
+        assert assign_keys([]) == []
 
     def test_returns_four_fields_only(self):
         triples = [("S", "P", "O")]
-        quads = assign_quad_keys(triples)
+        quads = assign_keys(triples)
         assert set(quads[0].keys()) == {"key", "subject", "predicate", "object"}
 
     def test_sequential_keys(self):
         triples = [("A", "p", "B"), ("C", "q", "D"), ("E", "r", "F")]
-        quads = assign_quad_keys(triples, start_index=10)
+        quads = assign_keys(triples, start_index=10)
         keys = [q["key"] for q in quads]
         assert keys == ["graph10", "graph11", "graph12"]
 
 
-# --- _build_quad_response / parse_recalled_quad round-trip ---
+# --- _build_response / parse_recalled_entry round-trip ---
 
 
 class TestBuildQuadResponseAndParse:
     def test_round_trip(self):
         quad = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
-        response = _build_quad_response(quad)
-        parsed = parse_recalled_quad(response)
+        response = _build_response(quad)
+        parsed = parse_recalled_entry(response)
         assert parsed is not None
         assert parsed == {
             "key": "graph1",
@@ -90,18 +90,18 @@ class TestBuildQuadResponseAndParse:
             "object": "engineer",
             "speaker_id": "s0",
         }
-        response = _build_quad_response(quad)
+        response = _build_response(quad)
         obj = json.loads(response)
         assert set(obj.keys()) == {"key", "subject", "predicate", "object"}
 
 
-# --- parse_recalled_quad ---
+# --- parse_recalled_entry ---
 
 
 class TestParseRecalledQuad:
     def test_valid_json(self):
         text = '{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}'
-        result = parse_recalled_quad(text)
+        result = parse_recalled_entry(text)
         assert result is not None
         assert result["key"] == "graph1"
         assert result["subject"] == "Alice"
@@ -111,24 +111,24 @@ class TestParseRecalledQuad:
             'Sure: {"key": "graph1", "subject": "Alice", "predicate": "lives_in", '
             '"object": "Berlin"} done.'
         )
-        result = parse_recalled_quad(text)
+        result = parse_recalled_entry(text)
         assert result is not None
         assert result["subject"] == "Alice"
 
     def test_garbage_returns_none(self):
-        assert parse_recalled_quad("hello world no json here") is None
+        assert parse_recalled_entry("hello world no json here") is None
 
     def test_empty_string_returns_none(self):
-        assert parse_recalled_quad("") is None
+        assert parse_recalled_entry("") is None
 
     def test_missing_required_field_returns_none(self):
         # Missing "object"
         text = '{"key": "graph1", "subject": "Alice", "predicate": "lives_in"}'
-        assert parse_recalled_quad(text) is None
+        assert parse_recalled_entry(text) is None
 
     def test_malformed_json_returns_none(self):
         text = '{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"'
-        assert parse_recalled_quad(text) is None
+        assert parse_recalled_entry(text) is None
 
     def test_markdown_fenced_json(self):
         """Model output wrapped in markdown code fences should still parse."""
@@ -137,7 +137,7 @@ class TestParseRecalledQuad:
             '{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}\n'
             "```"
         )
-        result = parse_recalled_quad(text)
+        result = parse_recalled_entry(text)
         assert result is not None
         assert result["subject"] == "Alice"
 
@@ -146,7 +146,7 @@ class TestParseRecalledQuad:
         text = (
             '**{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}**'
         )
-        result = parse_recalled_quad(text)
+        result = parse_recalled_entry(text)
         assert result is not None
         assert result["key"] == "graph1"
 
@@ -162,7 +162,7 @@ class TestParseRecalledQuad:
                 "object": ["German", "English"],
             }
         )
-        result = parse_recalled_quad(raw)
+        result = parse_recalled_entry(raw)
         assert result is not None
         assert result["object"] == "German, English"
 
@@ -179,14 +179,14 @@ class TestParseRecalledQuad:
             }
         )
         text = first + '{"key": "graph2", "subject": "?", "predicate": "?", "object": "?"}'
-        result = parse_recalled_quad(text)
+        result = parse_recalled_entry(text)
         assert result is not None
         assert result["key"] == "graph1"
 
     def test_clean_input_unchanged_by_artifact_stripping(self):
         """Artifact stripping must be transparent on clean input."""
         text = '{"key": "graph3", "subject": "Bob", "predicate": "has_job", "object": "dev"}'
-        result = parse_recalled_quad(text)
+        result = parse_recalled_entry(text)
         assert result is not None
         assert result["subject"] == "Bob"
 
@@ -305,7 +305,7 @@ class TestVerifyConfidence:
 
     def test_enriched_registry_shape(self):
         """Enriched registry (dict-of-dicts) must also work."""
-        from paramem.training.quadruple_memory import build_enriched_registry
+        from paramem.training.entry_memory import build_enriched_registry
 
         quad = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
         enriched = build_enriched_registry([quad])
@@ -337,27 +337,17 @@ class TestBuildRegistry:
         assert build_registry([]) == {}
 
 
-# --- QUAD_RECALL_TEMPLATE ---
+# --- RECALL_TEMPLATE ---
 
 
 class TestQuadRecallTemplate:
     def test_template_format(self):
-        result = QUAD_RECALL_TEMPLATE.format(key="graph5")
+        result = RECALL_TEMPLATE.format(key="graph5")
         assert result == "Recall the fact stored under key 'graph5'."
 
     def test_template_with_arbitrary_key(self):
-        result = QUAD_RECALL_TEMPLATE.format(key="custom_key")
+        result = RECALL_TEMPLATE.format(key="custom_key")
         assert "custom_key" in result
-
-    def test_template_differs_from_qa_template(self):
-        from paramem.training.indexed_memory import RECALL_TEMPLATE
-
-        assert QUAD_RECALL_TEMPLATE != RECALL_TEMPLATE
-        assert "fact" in QUAD_RECALL_TEMPLATE
-        assert "QA pair" in RECALL_TEMPLATE
-
-
-# --- format_quadruple_training ---
 
 
 class TestFormatQuadrupleTraining:
@@ -394,7 +384,7 @@ class TestFormatQuadrupleTraining:
         quads = [
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
         ]
-        examples = format_quadruple_training(quads, mock_tokenizer)
+        examples = format_entry_training(quads, mock_tokenizer)
         assert len(examples) == 1
 
     def test_multiple_quads(self, mock_tokenizer):
@@ -402,24 +392,24 @@ class TestFormatQuadrupleTraining:
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
             {"key": "graph2", "subject": "Bob", "predicate": "has_job", "object": "engineer"},
         ]
-        examples = format_quadruple_training(quads, mock_tokenizer)
+        examples = format_entry_training(quads, mock_tokenizer)
         assert len(examples) == 2
 
     def test_example_has_required_keys(self, mock_tokenizer):
         quads = [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}]
-        examples = format_quadruple_training(quads, mock_tokenizer)
+        examples = format_entry_training(quads, mock_tokenizer)
         for ex in examples:
             assert "input_ids" in ex
             assert "attention_mask" in ex
             assert "labels" in ex
 
     def test_fewer_examples_than_qa_format(self, mock_tokenizer):
-        """format_quadruple_training must produce exactly half as many examples as
+        """format_entry_training must produce exactly half as many examples as
         format_indexed_training for the same number of facts."""
         from paramem.training.indexed_memory import format_indexed_training
 
         qa_pairs = [{"key": "graph1", "question": "Q?", "answer": "A"}]
         quads = [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}]
         qa_examples = format_indexed_training(qa_pairs, mock_tokenizer)
-        quad_examples = format_quadruple_training(quads, mock_tokenizer)
+        quad_examples = format_entry_training(quads, mock_tokenizer)
         assert len(quad_examples) * 2 == len(qa_examples)

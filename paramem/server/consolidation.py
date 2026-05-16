@@ -25,6 +25,7 @@ def create_consolidation_loop(
     model,
     tokenizer,
     config: ServerConfig,
+    memory_store,
     state_provider=None,
     *,
     output_dir=None,
@@ -75,6 +76,7 @@ def create_consolidation_loop(
         training_config=config.training_config,
         episodic_adapter_config=config.episodic_adapter_config,
         semantic_adapter_config=config.semantic_adapter_config,
+        memory_store=memory_store,
         procedural_adapter_config=(
             config.procedural_adapter_config if config.adapters.procedural.enabled else None
         ),
@@ -134,138 +136,56 @@ def create_consolidation_loop(
     loop.full_consolidation_period_string = config.consolidation.consolidation_period_string
 
     if seed_state_from_disk:
-        # Seed key metadata from disk (survives restarts)
+        # Key metadata (cycle counts, promotion bookkeeping) is loop-state
+        # and still seeded here.  Entry payloads (subject/predicate/object/
+        # speaker_id) live in the lifespan-owned MemoryStore — preload runs
+        # at lifespan boot, not here, so the loop factory no longer touches
+        # the model or reads graph.json for that purpose.
         metadata = _load_key_metadata(config.key_metadata_path)
         if metadata:
             loop.seed_key_metadata(metadata)
 
-        # Seed indexed_key_cache from disk-persisted state so
-        # consolidate_interim_adapters has the question/answer text it needs to
-        # re-derive each active key's tier from the cumulative graph.  Without
-        # the seed, a full cycle that runs before any in-process training has
-        # populated indexed_key_cache would log "no QA metadata for key X" for
-        # every active key and skip every per-tier rebuild — observably the
-        # gate fires forever because the rebuild never advances main slots'
-        # window_stamp.  Transparently decrypts age-wrapped content when the
-        # daily identity is loaded.
-        #
-        # Simulate mode reads graph.json from paths.simulate (written by
-        # _save_simulate_store_graph).  Train mode reads keyed_pairs.json from
-        # paths.adapters (written by ConsolidationLoop._save_adapters).
-        store_dir = (
-            config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
-        )
-
-        if config.consolidation.mode == "simulate":
-            from paramem.server import simulate_store
-
-            for tier in ("episodic", "semantic", "procedural"):
-                gpath = store_dir / tier / "graph.json"
-                if not gpath.exists():
-                    continue
-                try:
-                    graph = simulate_store.load_simulate_graph(gpath)
-                    pairs = list(simulate_store.iter_quads(graph))
-                    seed_method = getattr(loop, f"seed_{tier}_cache")
-                    seed_method(pairs)
-                except Exception:
-                    logger.exception(
-                        "Failed to seed indexed_key_cache from simulate graph %s — skipping",
-                        gpath,
-                    )
-        else:
-            # Train mode — read keyed_pairs.json via read_keyed_pairs[_quad].
-            # This path is removed in the train-mode kp sunset (next task).
-            if config.consolidation.indexed_format == "quad":
-                from paramem.training.keyed_pairs_io import read_keyed_pairs_quad as _read_kp
-            else:
-                from paramem.training.keyed_pairs_io import read_keyed_pairs as _read_kp
-
-            ep_kp_path = store_dir / "episodic" / "keyed_pairs.json"
-            if ep_kp_path.exists():
-                try:
-                    loop.seed_episodic_cache(_read_kp(ep_kp_path))
-                except Exception:
-                    logger.exception(
-                        "Failed to seed indexed_key_cache from episodic store %s — skipping",
-                        ep_kp_path,
-                    )
-
-            sem_kp_path = store_dir / "semantic" / "keyed_pairs.json"
-            if sem_kp_path.exists():
-                try:
-                    loop.seed_semantic_cache(_read_kp(sem_kp_path))
-                except Exception:
-                    logger.exception(
-                        "Failed to seed indexed_key_cache from semantic store %s — skipping",
-                        sem_kp_path,
-                    )
-
-            proc_kp_path = store_dir / "procedural" / "keyed_pairs.json"
-            if proc_kp_path.exists():
-                try:
-                    loop.seed_procedural_cache(_read_kp(proc_kp_path))
-                except Exception:
-                    logger.exception(
-                        "Failed to seed indexed_key_cache from procedural store %s — skipping",
-                        proc_kp_path,
-                    )
-
-            # Interim slots are training-only (locked decision #3) — always under
-            # paths.adapters regardless of mode. The simulate store has no interim
-            # concept by design.
-            for interim_dir in sorted(config.adapter_dir.glob("episodic_interim_*")):
-                if not interim_dir.is_dir():
-                    continue
-                kp = interim_dir / "keyed_pairs.json"
-                if not kp.exists():
-                    continue
-                try:
-                    loop.seed_episodic_cache(_read_kp(kp))
-                except Exception:
-                    logger.exception(
-                        "Failed to seed indexed_key_cache from interim slot %s — skipping",
-                        interim_dir.name,
-                    )
-
-    # One-time startup WARN when the non-active store has stale artifacts
-    # from a previous mode. The startup path runs once per process so this
-    # does not spam logs. Runs unconditionally — operator telemetry for
-    # detecting mode-switch drift, not a seeding side-effect.
-    #
-    # Simulate mode is active → scan the inactive train store for stale
-    # keyed_pairs.json (the train-mode artifact).
-    # Train mode is active → scan the inactive simulate store for stale
-    # graph.json (the simulate-mode artifact, post-chunk-2).
-    if config.consolidation.mode == "simulate":
-        inactive_dir = config.adapter_dir
-        stale_glob = "keyed_pairs.json"
-    else:
-        inactive_dir = config.simulate_dir
-        stale_glob = "graph.json"
-    if inactive_dir.exists():
-        stale = list(inactive_dir.rglob(stale_glob))
-        if stale:
-            logger.warning(
-                "Found %d stale %s under %s (active mode is %r). "
-                "Inference reads only the active store; remove the inactive "
-                "store or re-run consolidation in the matching mode to clear.",
-                len(stale),
-                stale_glob,
-                inactive_dir,
-                config.consolidation.mode,
-            )
-
     return loop
 
 
-def _do_mark_consolidated(session_buffer, session_ids, callback):
+def session_retention_dir(loop, config) -> Path | None:
+    """Return the directory to retain consolidated session JSONL into.
+
+    Returns ``None`` when neither retention nor debug mode is enabled —
+    the SessionBuffer will unlink the JSONL after consume.  Otherwise
+    returns ``loop.snapshot_dir_for(interim_stamp=...)/sessions/``
+    (2026-05-14 hierarchy:
+    ``paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/sessions/``).
+    Falls back to ``config.debug_dir/cycle_<N>/sessions/`` when the loop
+    cannot produce a snapshot path.
+    """
+    if not (config.consolidation.retain_sessions or config.debug):
+        return None
+    interim_stamp = getattr(loop, "_current_interim_stamp", None)
+    snap = None
+    snap_fn = getattr(loop, "snapshot_dir_for", None)
+    if callable(snap_fn):
+        snap = snap_fn(interim_stamp=interim_stamp)
+    if snap is None:
+        cycle = getattr(loop, "cycle_count", 0)
+        return config.debug_dir / f"cycle_{cycle}" / "sessions"
+    return snap / "sessions"
+
+
+def _do_mark_consolidated(
+    session_buffer,
+    session_ids,
+    callback,
+    *,
+    retention_dir: Path | None = None,
+):
     """Invoke the mark-consolidated callback or fall back to the buffer method.
 
-    When *callback* is ``None``, ``session_buffer.mark_consolidated(session_ids)``
-    is called (standard production path).  When *callback* is not ``None`` it is
-    called instead, allowing the trial path to pass a no-op so pending sessions
-    remain in the buffer (spec L364 — "transcript sweeper blocks archive+delete").
+    When *callback* is ``None``, ``session_buffer.mark_consolidated(session_ids,
+    retention_dir=retention_dir)`` is called (standard production path).  When
+    *callback* is not ``None`` it is called instead, allowing the trial path to
+    pass a no-op so pending sessions remain in the buffer (spec L364 —
+    "transcript sweeper blocks archive+delete").
 
     Parameters
     ----------
@@ -275,9 +195,13 @@ def _do_mark_consolidated(session_buffer, session_ids, callback):
         List of session IDs that finished extraction/training.
     callback:
         Optional callable accepting ``session_ids``.  ``None`` → use buffer method.
+    retention_dir:
+        Directory to move JSONL into when ``retain_sessions`` or ``debug`` is
+        true on the buffer.  Forwarded to :meth:`SessionBuffer.mark_consolidated`.
+        Ignored when *callback* is provided.
     """
     if callback is None:
-        session_buffer.mark_consolidated(session_ids)
+        session_buffer.mark_consolidated(session_ids, retention_dir=retention_dir)
     else:
         callback(session_ids)
 
@@ -298,12 +222,12 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
     Uses the graph merger's node metadata: nodes where last_seen == session_id
     were active in this specific session (not the cumulative graph).
 
-    A QA pair's ``source_subject`` / ``source_object`` carry the entity's
-    display name (e.g. ``"Alex"``).  Speaker entities are keyed in the
-    cumulative graph by ``speaker_id`` (e.g. ``"Speaker0"``) with the
-    display name stored at ``attributes["name"]``.  The matching set
-    therefore includes both the node ID AND the ``attributes["name"]``
-    value (when set) so display-name-driven QA pairs continue to match.
+    A relation's ``subject`` / ``object`` carry the entity's display name
+    (e.g. ``"Alex"``).  Speaker entities are keyed in the cumulative graph
+    by ``speaker_id`` (e.g. ``"Speaker0"``) with the display name stored at
+    ``attributes["name"]``.  The matching set therefore includes both the
+    node ID AND the ``attributes["name"]`` value (when set) so
+    display-name-driven relations continue to match.
     """
     # Find entities that appeared in this session
     session_entities = set()
@@ -319,11 +243,11 @@ def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
         return
 
     # Increment session count for keys referencing these entities
-    for key, qa in loop.indexed_key_cache.items():
+    for _tier, key, qa in loop.store.iter_entries():
         if key in loop.promoted_keys:
             continue
-        subject = qa.get("source_subject", "").lower()
-        obj = qa.get("source_object", "").lower()
+        subject = qa.get("subject", "").lower()
+        obj = qa.get("object", "").lower()
         if subject in session_entities or obj in session_entities:
             loop.key_sessions[key] = loop.key_sessions.get(key, 0) + 1
 
@@ -337,16 +261,21 @@ _dedup_procedural = ConsolidationLoop.dedup_procedural
 def _save_debug_artifacts(
     loop: ConsolidationLoop,
     config: ServerConfig,
-    episodic_qa: list[dict],
+    episodic_rels: list[dict],
     procedural_rels: list[dict],
 ) -> None:
-    """Write plaintext debug artifacts to ``config.debug_dir/cycle_<N>/``.
+    """Write plaintext debug artifacts under ``loop.snapshot_dir/cycle_<N>/``.
 
     Called in BOTH simulate and train branches when ``config.debug`` is true,
     so per-cycle debug dumps are symmetric regardless of mode.  All filenames
     carry the ``_snapshot`` postfix (locked decision #7) so every file under
-    ``config.debug_dir`` is trivially distinguishable from production output
-    by name alone.
+    ``paths.debug`` is trivially distinguishable from production output by
+    name alone.
+
+    The output path uses the same ``run_<id>/cycle_<N>/`` hierarchy that
+    :class:`ConsolidationLoop` already builds for its own per-cycle artifacts
+    (graph snapshot, adapter checkpoint shadows).  ONE save routine — no
+    duplicate ``debug_dir/cycle_<N>/`` legacy path (2026-05-14 collapse).
 
     Always plaintext (``encrypted=False``), regardless of the server's Security
     posture — debug output is inspection-first; operators must be able to read
@@ -355,29 +284,36 @@ def _save_debug_artifacts(
     Parameters
     ----------
     loop:
-        Active ``ConsolidationLoop`` (provides ``merger`` and ``cycle_count``).
+        Active ``ConsolidationLoop`` (provides ``merger``, ``cycle_count``,
+        and ``snapshot_dir``).
     config:
-        Server configuration (provides ``debug_dir``).
-    episodic_qa:
-        Episodic QA pairs produced by the consolidation pipeline.
+        Server configuration (fallback ``debug_dir`` when no snapshot_dir
+        is configured on the loop).
+    episodic_rels:
+        Episodic relations produced by the consolidation pipeline.
     procedural_rels:
         Procedural relation triples produced by the consolidation pipeline.
     """
-    out_dir = config.debug_dir / f"cycle_{loop.cycle_count}"
+    interim_stamp = getattr(loop, "_current_interim_stamp", None)
+    snap = None
+    snap_fn = getattr(loop, "snapshot_dir_for", None)
+    if callable(snap_fn):
+        snap = snap_fn(interim_stamp=interim_stamp)
+    out_dir = snap if snap is not None else config.debug_dir / f"cycle_{loop.cycle_count}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Plaintext — debug output is inspection-first, regardless of Security posture.
     loop.merger.save_graph(out_dir / "graph_snapshot.json", encrypted=False)
-    _atomic_json_write(episodic_qa, out_dir / "episodic_qa_snapshot.json", encrypted=False)
+    _atomic_json_write(episodic_rels, out_dir / "episodic_rels_snapshot.json", encrypted=False)
     if procedural_rels:
         _atomic_json_write(
             procedural_rels, out_dir / "procedural_rels_snapshot.json", encrypted=False
         )
 
     logger.info(
-        "Debug artifacts written to %s: %d episodic QA, %d procedural rels",
+        "Debug artifacts written to %s: %d episodic, %d procedural relations",
         out_dir,
-        len(episodic_qa),
+        len(episodic_rels),
         len(procedural_rels),
     )
 
@@ -393,10 +329,11 @@ def _promote_mature_keys(loop: ConsolidationLoop, config: ServerConfig) -> list[
 
     for key, count in loop.key_sessions.items():
         if count >= threshold and key not in loop.promoted_keys:
-            if key in loop.episodic_simhash:
-                loop.semantic_simhash[key] = loop.episodic_simhash.pop(key)
+            if loop.store.has_simhash("episodic", key):
+                # Move entry + simhash + registry atomically to semantic.
+                loop.store.move(key, "semantic")
                 newly_promoted.append(key)
-            elif key in loop.semantic_simhash:
+            elif loop.store.has_simhash("semantic", key):
                 logger.debug("Key %s already in semantic, marking promoted", key)
             loop.promoted_keys.add(key)
 
@@ -437,18 +374,88 @@ def _load_key_metadata(path: Path) -> dict | None:
     return json.loads(read_maybe_encrypted(path).decode("utf-8"))
 
 
+def prune_key_metadata_orphans(config: ServerConfig) -> int:
+    """Drop entries from ``key_metadata.json`` whose tier registry is gone.
+
+    Per the wipe invariant (2026-05-14): ``key_metadata.json`` is bookkeeping
+    for active keys, not a recovery source.  Called from the boot lifespan
+    after :func:`_mount_adapters_from_slots` so the on-disk file never carries
+    stale entries between a wipe and the next consolidation cycle.
+
+    Reads every tier's ``indexed_key_registry.json`` (main + interim slots),
+    takes the union of active keys, and rewrites ``key_metadata.json`` keeping
+    only keys in that union.  ``promoted_keys`` is filtered to the same set.
+
+    Returns the number of orphan keys removed (0 when nothing to prune).
+    """
+    from paramem.training.key_registry import KeyRegistry
+
+    path = config.key_metadata_path
+    if not path.exists():
+        return 0
+
+    try:
+        raw = json.loads(read_maybe_encrypted(path).decode("utf-8"))
+    except Exception:
+        logger.exception("prune_key_metadata_orphans: could not read %s — skipping", path)
+        return 0
+
+    from paramem.server.interim_adapter import iter_interim_dirs
+
+    active: set[str] = set()
+    for tier in ("episodic", "semantic", "procedural"):
+        reg_path = config.adapter_dir / tier / "indexed_key_registry.json"
+        if reg_path.exists():
+            active.update(KeyRegistry.load(reg_path).list_active())
+    for _name, interim_dir in iter_interim_dirs(config.adapter_dir):
+        reg_path = interim_dir / "indexed_key_registry.json"
+        if reg_path.exists():
+            active.update(KeyRegistry.load(reg_path).list_active())
+
+    keys_in = raw.get("keys", {}) if isinstance(raw, dict) else {}
+    pruned_keys = {k: v for k, v in keys_in.items() if k in active}
+    pruned_promoted = sorted(k for k in raw.get("promoted_keys", []) if k in active)
+    removed = len(keys_in) - len(pruned_keys)
+    if removed == 0:
+        return 0
+
+    raw["keys"] = pruned_keys
+    raw["promoted_keys"] = pruned_promoted
+    _atomic_json_write(raw, path)
+    logger.info(
+        "prune_key_metadata_orphans: removed %d orphan key(s) from %s",
+        removed,
+        path,
+    )
+    return removed
+
+
 def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     """Save key metadata for cross-restart persistence.
+
+    Per the wipe invariant (2026-05-14): ``key_metadata.json`` is
+    bookkeeping for active keys, not a recovery source.  Saved entries
+    reflect only :meth:`MemoryStore.all_active_keys` — keys absent from
+    every tier registry are orphans and never persisted.
 
     When ``loop.trial_key_metadata_path`` is set (trial consolidation path),
     writes to that isolated path instead of the live ``config.key_metadata_path``.
     This ensures trial runs never touch the live ``data/ha/registry/key_metadata.json``
     (CRITICAL Fix 1 — trial registry isolation, 2026-04-23).
     """
+    keys_payload: dict = {}
+    for key in loop.store.all_active_keys():
+        sessions_seen = loop.key_sessions.get(key, 0)
+        cache_entry = loop.store.get(key) or {}
+        keys_payload[key] = {
+            "sessions_seen": sessions_seen,
+            "speaker_id": cache_entry.get("speaker_id", ""),
+            "first_seen_cycle": cache_entry.get("first_seen_cycle", 0),
+        }
     metadata = {
         "cycle_count": loop.cycle_count,
         "promoted_keys": sorted(loop.promoted_keys),
-        "keys": {key: {"sessions_seen": count} for key, count in loop.key_sessions.items()},
+        "keys": keys_payload,
     }
     # CRITICAL Fix 1: honor loop-level override set by _build_trial_loop so the
     # trial never writes to the live registry paths.
@@ -456,126 +463,48 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     _atomic_json_write(metadata, dest)
 
 
-def _save_keyed_pairs_for_router(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Save keyed_pairs.json per adapter for router entity indexing.
+def _save_tier_graphs(loop: ConsolidationLoop, config: ServerConfig) -> None:
+    """Persist per-tier ``graph.json`` — the simulate-mode persistence form.
 
-    DEPRECATED — UNREACHABLE FROM PRODUCTION CODE POST-D1-CHUNK-2.
-    Simulate-mode persistence flipped to :func:`_save_simulate_store_graph`
-    (per-tier ``graph.json``).  Train-mode persistence runs through
-    :func:`ConsolidationLoop._save_adapters`
-    (``paramem/training/consolidation.py:2154-2158``), which writes the kp
-    bytes directly during the I5 reorder.  This helper is retained only so
-    legacy tests (``tests/test_server_consolidation_seed_quad.py``,
-    ``tests/test_promote_then_save_adapters_keyed_pairs_hash_matches.py``)
-    and dev probes (``scripts/dev/probe_simulate_train_parity_live.py``,
-    ``scripts/dev/verify_pr1_extraction.py``) keep working.
+    Simulate mode persists facts to disk as the per-tier ``graph.json``.
+    Train mode does NOT persist a graph: facts live in RAM during the
+    cycle and in adapter weights after training.  Debug-mode snapshots
+    use a different writer.
 
-    TODO(task-#4): remove this helper and its train-mode tests when the
-    train-mode ``keyed_pairs.json`` sidecar is retired.
-    """
-    store_dir = (
-        config.simulate_dir if config.consolidation.mode == "simulate" else config.adapter_dir
-    )
-    store_dir.mkdir(parents=True, exist_ok=True)
+    Defense-in-depth mode gate: a direct call in train mode is a no-op,
+    so a stray import / test cannot accidentally leave a stale graph.json
+    behind that would be re-read at boot.
 
-    _fmt = config.consolidation.indexed_format
-
-    # Episodic keyed_pairs in the canonical episodic subdirectory.
-    if loop.episodic_simhash:
-        ep_dir = store_dir / "episodic"
-        ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_keyed_pairs(
-            loop.indexed_key_cache,
-            loop.episodic_simhash,
-            ep_dir / "keyed_pairs.json",
-            indexed_format=_fmt,
-        )
-
-    if loop.semantic_simhash:
-        sem_dir = store_dir / "semantic"
-        sem_dir.mkdir(parents=True, exist_ok=True)
-        _write_keyed_pairs(
-            loop.indexed_key_cache,
-            loop.semantic_simhash,
-            sem_dir / "keyed_pairs.json",
-            indexed_format=_fmt,
-        )
-
-    if loop.procedural_simhash:
-        proc_dir = store_dir / "procedural"
-        proc_dir.mkdir(parents=True, exist_ok=True)
-        _write_keyed_pairs(
-            loop.indexed_key_cache,
-            loop.procedural_simhash,
-            proc_dir / "keyed_pairs.json",
-            indexed_format=_fmt,
-        )
-
-
-def _save_simulate_store_graph(loop: ConsolidationLoop, config: ServerConfig) -> None:
-    """Save per-tier graph.json for the simulate-mode store.
-
-    Mode-aware: only runs when ``config.consolidation.mode == "simulate"``.
-    Train mode is a no-op here — train-mode kp is still written by
-    ``ConsolidationLoop._save_adapters`` (paramem/training/consolidation.py:2154-2158)
-    and gets removed in the train-mode kp sunset (next task).
-
-    For each tier whose ``loop.<tier>_simhash`` is non-empty, projects
-    ``loop.indexed_key_cache`` ∩ ``<tier>_simhash`` into an ``nx.MultiDiGraph``
-    via :func:`paramem.server.simulate_store.build_tier_graph_from_loop` and
-    persists it under ``config.simulate_dir/<tier>/graph.json``.  Same per-tier
-    layout the kp writer used; only the bytes change.
-
-    Parameters
-    ----------
-    loop:
-        Active ``ConsolidationLoop`` (provides simhash registries and
-        ``indexed_key_cache``).
-    config:
-        Server configuration (provides ``consolidation.mode`` and
-        ``simulate_dir``).
+    For each tier whose simhash registry is non-empty, projects the store's
+    tier slice into an ``nx.MultiDiGraph`` via
+    :func:`paramem.training.memory_persistence.build_tier_graph_from_store`
+    and persists under ``<simulate_dir>/<tier>/graph.json``.
     """
     if config.consolidation.mode != "simulate":
         return
 
-    from paramem.server import simulate_store
+    from paramem.training import memory_persistence
+    from paramem.training.indexed_memory import save_registry
 
     for tier in ("episodic", "semantic", "procedural"):
-        simhash_registry = getattr(loop, f"{tier}_simhash")
-        if not bool(simhash_registry):
+        if loop.store.simhash_count_in_tier(tier) == 0:
             continue
-        tier_graph = simulate_store.build_tier_graph_from_loop(loop, tier)
+        tier_graph = memory_persistence.build_tier_graph_from_store(loop.store, tier)
         tier_dir = config.simulate_dir / tier
         tier_dir.mkdir(parents=True, exist_ok=True)
-        simulate_store.save_simulate_graph(tier_graph, tier_dir / "graph.json")
+        memory_persistence.save_memory_to_disk(tier_graph, tier_dir / "graph.json")
 
-
-def _write_keyed_pairs(
-    indexed_key_cache: dict,
-    simhash_registry: dict,
-    path: Path,
-    *,
-    indexed_format: str = "qa",
-) -> None:
-    """Write keyed_pairs.json for keys in the given SimHash registry.
-
-    Delegates to :func:`paramem.training.keyed_pairs_io.write_keyed_pairs`
-    (QA mode) or :func:`paramem.training.keyed_pairs_io.write_keyed_pairs_quad`
-    (quad mode) so the canonical schema is enforced by construction.  Every
-    entry in *indexed_key_cache* must carry the fields expected by the chosen
-    writer before this function is called — a missing field raises
-    ``KeyError`` at write time.
-
-    Parameters
-    ----------
-    indexed_format:
-        ``"quad"`` routes to ``write_keyed_pairs_quad``; any other value (incl.
-        the default ``"qa"``) routes to the standard ``write_keyed_pairs``.
-    """
-    if indexed_format == "quad":
-        from paramem.training.keyed_pairs_io import write_keyed_pairs_quad as _wkp
-    else:
-        from paramem.training.keyed_pairs_io import write_keyed_pairs as _wkp
-
-    pairs = [indexed_key_cache[k] for k in simhash_registry if k in indexed_key_cache]
-    _wkp(path, pairs)
+        # Persist registries so boot hydration can rehydrate the in-RAM
+        # store without re-extracting.  Train mode writes these inside
+        # `_save_adapters`; simulate mode has no `_save_adapters`, so we
+        # write them here alongside graph.json.  Same per-tier layout
+        # under `config.adapter_dir/<tier>/` as train mode.
+        adapter_tier_dir = config.adapter_dir / tier
+        adapter_tier_dir.mkdir(parents=True, exist_ok=True)
+        save_registry(
+            loop.store.simhashes_in_tier(tier),
+            adapter_tier_dir / "simhash_registry.json",
+        )
+        registry = loop.store.registry(tier)
+        if registry is not None:
+            registry.save(adapter_tier_dir / "indexed_key_registry.json")

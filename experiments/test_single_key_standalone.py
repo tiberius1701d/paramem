@@ -201,22 +201,19 @@ def main(model_name: str, dry_run: bool) -> int:
 
     # --- Phase 1: Assign keys and persist artefacts ---
     # Artefacts are saved before training so a crash during training
-    # does not leave a loadable adapter without its registry/keyed_pairs.
-    keyed_pairs = assign_keys(SYNTHETIC_QA, start_index=1)
-    registry = build_registry(keyed_pairs)
+    # does not leave a loadable adapter without its registry/quads.
+    quads = assign_keys(SYNTHETIC_QA, start_index=1)
+    registry = build_registry(quads)
 
     _save_json_atomic(
-        [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_pairs
-        ],
-        run_dir / "keyed_pairs.json",
+        [{"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in quads],
+        run_dir / "quads.json",
     )
     save_registry(registry, run_dir / "simhash_registry.json")
 
     logger.info(
         "Phase 1 done: %d key(s) assigned, artefacts saved to %s",
-        len(keyed_pairs),
+        len(quads),
         run_dir,
     )
 
@@ -256,12 +253,12 @@ def main(model_name: str, dry_run: bool) -> int:
 
         model = create_adapter(model, adapter_config, ADAPTER_NAME)
 
-        examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+        examples = format_indexed_training(quads, tokenizer, max_length=1024)
         dataset = IndexedDataset(examples)
 
         logger.info(
             "Training %d key(s), %d example(s), %d epochs (adapter=%s, rank=%d) ...",
-            len(keyed_pairs),
+            len(quads),
             len(dataset),
             EPOCHS,
             ADAPTER_NAME,
@@ -301,7 +298,7 @@ def main(model_name: str, dry_run: bool) -> int:
     passed = recall >= RECALL_THRESHOLD
 
     summary = {
-        "keys_trained": len(keyed_pairs),
+        "keys_trained": len(quads),
         "recall": recall,
         "passed": passed,
         "epochs": EPOCHS,

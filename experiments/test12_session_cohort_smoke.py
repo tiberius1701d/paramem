@@ -310,7 +310,7 @@ def run_cohort_inner(n_keys: int, output_dir: Path, model_name: str) -> None:
       1. Load base model (first from_pretrained call).
       2. Create fresh LoRA adapter with production target_modules.
       3. Train 30 epochs with constant LR, no warmup, no weight decay.
-      4. Save adapter + keyed_pairs.json + simhash_registry.json.
+      4. Save adapter + quads.json + simhash_registry.json.
       5. Call smoke_test_adapter() which does a second from_pretrained internally.
       6. Write cohort_result.json to output_dir.
       7. Exit with code 0 on success, 1 on failure.
@@ -321,7 +321,7 @@ def run_cohort_inner(n_keys: int, output_dir: Path, model_name: str) -> None:
     Args:
         n_keys: Cohort size (number of synthetic QA pairs to train).
         output_dir: Directory for all artefacts. Must already exist or be
-            creatable. Writes: adapter/<adapter_name>/, keyed_pairs.json,
+            creatable. Writes: adapter/<adapter_name>/, quads.json,
             simhash_registry.json, cohort_result.json.
         model_name: Key into BENCHMARK_MODELS (e.g. "mistral").
     """
@@ -360,16 +360,13 @@ def run_cohort_inner(n_keys: int, output_dir: Path, model_name: str) -> None:
     qa_pairs = generate_synthetic_qa(n_keys)
 
     # Step 2: Assign indexed keys and build SimHash registry
-    keyed_pairs = assign_keys(qa_pairs, start_index=1)
-    registry = build_registry(keyed_pairs)
+    quads = assign_keys(qa_pairs, start_index=1)
+    registry = build_registry(quads)
 
     # Persist artefacts before training so smoke_test_adapter can find them
     save_json_atomic(
-        [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_pairs
-        ],
-        output_dir / "keyed_pairs.json",
+        [{"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in quads],
+        output_dir / "quads.json",
     )
     save_registry(registry, output_dir / "simhash_registry.json")
 
@@ -388,7 +385,7 @@ def run_cohort_inner(n_keys: int, output_dir: Path, model_name: str) -> None:
     model = create_adapter(model, adapter_config, adapter_name)
 
     # Step 5: Build tokenised dataset
-    examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+    examples = format_indexed_training(quads, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
     # Step 6: Configure training — constant LR, no warmup, no weight decay

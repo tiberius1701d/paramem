@@ -155,10 +155,10 @@ def train_on_current_facts(
     cycle_num,
 ):
     """Train the existing adapter on current facts. Does NOT create a new adapter."""
-    keyed_pairs = assign_keys(qa_pairs)
-    registry = build_registry(keyed_pairs)
+    quads = assign_keys(qa_pairs)
+    registry = build_registry(quads)
 
-    examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+    examples = format_indexed_training(quads, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
     adapter_config = AdapterConfig(
@@ -193,7 +193,7 @@ def train_on_current_facts(
     )
     train_time = time.time() - start
 
-    return keyed_pairs, registry, train_time, metrics
+    return quads, registry, train_time, metrics
 
 
 def probe_keys_diagnostic(
@@ -341,7 +341,7 @@ def main():
         all_cycles = []
         enriched_registry = {}
         stale_keys_map = {}  # stale_key -> {"expected_old": str, "staled_at_cycle": int}
-        current_keyed_pairs = []
+        current_quads = []
 
         # ============================================================
         # Phase A: Learning — introduce initial facts
@@ -363,7 +363,7 @@ def main():
             print(f"\n  Cycle {cycle} (learning)")
             qa_pairs = get_current_facts(merger, control_facts)
 
-            keyed_pairs, registry, train_time, metrics = train_on_current_facts(
+            quads, registry, train_time, metrics = train_on_current_facts(
                 model,
                 tokenizer,
                 qa_pairs,
@@ -373,16 +373,16 @@ def main():
                 output_dir,
                 cycle,
             )
-            current_keyed_pairs = keyed_pairs
+            current_quads = quads
             enriched_registry = build_enriched_registry(
-                keyed_pairs,
+                quads,
                 session_id=f"learn_{cycle}",
                 existing=enriched_registry,
             )
 
             # Probe current keys
-            current_keys = [kp["key"] for kp in keyed_pairs]
-            current_answers = [kp["answer"] for kp in keyed_pairs]
+            current_keys = [kp["key"] for kp in quads]
+            current_answers = [kp["answer"] for kp in quads]
             results = probe_keys_diagnostic(
                 model,
                 tokenizer,
@@ -400,7 +400,7 @@ def main():
                 "phase": "learning",
                 "train_time": train_time,
                 "train_loss": metrics.get("train_loss"),
-                "total_keys": len(keyed_pairs),
+                "total_keys": len(quads),
                 "current_recall": f"{recalled_count}/{len(results)}",
                 "mean_similarity": mean_sim,
                 "per_key": results,
@@ -411,7 +411,7 @@ def main():
             # Identify control keys for separate tracking
             control_keys = [
                 kp["key"]
-                for kp in keyed_pairs
+                for kp in quads
                 if kp["question"] in [cf["question"] for cf in control_facts]
             ]
             control_results = [r for r in results if r["key"] in control_keys]
@@ -439,7 +439,7 @@ def main():
 
         # Record old keys before contradiction
         old_key_answers = {}
-        for kp in current_keyed_pairs:
+        for kp in current_quads:
             old_key_answers[kp["key"]] = kp["answer"]
 
         # Apply version 2 of each chain to the graph
@@ -458,10 +458,10 @@ def main():
 
         # Generate new QA pairs from resolved graph
         qa_pairs = get_current_facts(merger, control_facts)
-        new_keyed_pairs = assign_keys(qa_pairs)
+        new_quads = assign_keys(qa_pairs)
 
         # Determine which old keys are now stale (their content changed)
-        new_answers = {kp["answer"] for kp in new_keyed_pairs}
+        new_answers = {kp["answer"] for kp in new_quads}
         for old_key, old_answer in old_key_answers.items():
             # If old answer is not in any new QA pair, the fact was contradicted
             if not any(compute_similarity(old_answer, na) > 0.8 for na in new_answers):
@@ -490,7 +490,7 @@ def main():
             print(f"\n  Cycle {cycle} (decay)")
             qa_pairs = get_current_facts(merger, control_facts)
 
-            keyed_pairs, registry, train_time, metrics = train_on_current_facts(
+            quads, registry, train_time, metrics = train_on_current_facts(
                 model,
                 tokenizer,
                 qa_pairs,
@@ -500,16 +500,16 @@ def main():
                 output_dir,
                 cycle,
             )
-            current_keyed_pairs = keyed_pairs
+            current_quads = quads
             enriched_registry = build_enriched_registry(
-                keyed_pairs,
+                quads,
                 session_id=f"decay_{cycle}",
                 existing=enriched_registry,
             )
 
             # Probe current (new) keys
-            current_keys = [kp["key"] for kp in keyed_pairs]
-            current_answers = [kp["answer"] for kp in keyed_pairs]
+            current_keys = [kp["key"] for kp in quads]
+            current_answers = [kp["answer"] for kp in quads]
             current_results = probe_keys_diagnostic(
                 model,
                 tokenizer,
@@ -551,7 +551,7 @@ def main():
             # Control facts
             control_keys = [
                 kp["key"]
-                for kp in keyed_pairs
+                for kp in quads
                 if kp["question"] in [cf["question"] for cf in control_facts]
             ]
             control_results = [r for r in current_results if r["key"] in control_keys]
@@ -566,7 +566,7 @@ def main():
                 "phase": "decay",
                 "train_time": train_time,
                 "train_loss": metrics.get("train_loss"),
-                "total_keys": len(keyed_pairs),
+                "total_keys": len(quads),
                 "current_recall": f"{recalled_count}/{len(current_results)}",
                 "mean_similarity": mean_sim,
                 "stale_recall": f"{stale_recalled}/{len(stale_results)}",

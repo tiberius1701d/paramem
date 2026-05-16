@@ -130,7 +130,7 @@ def load_eval_pairs(
     tokenizer,
     fact_ids: list[str] | None = None,
 ) -> list[dict]:
-    """Load QA pairs for evaluation (question + expected answer)."""
+    """Load evaluation pairs (question + expected answer)."""
     with open(data_path) as f:
         all_facts = json.load(f)
 

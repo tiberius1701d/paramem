@@ -36,6 +36,7 @@ from pydantic import BaseModel
 # Migration / backup imports at module level so tests can patch them.
 from paramem.backup.backup import write as backup_write
 from paramem.backup.types import ArtifactKind
+from paramem.graph.extractor import ExtractionFailed
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server import calibrate as calibrate_module
 from paramem.server.cloud import get_cloud_agent
@@ -119,6 +120,13 @@ _state = {
     "sota_providers": {},
     "ha_client": None,
     "consolidation_loop": None,
+    "memory_store": None,
+    # Set to a BootDegraded dict when ``inference.preload_cache=True`` and the
+    # lifespan preload could not materialise every active key.  Surfaced as
+    # 503 from /chat and /debug/* via :func:`_require_healthy_memory`.
+    # ``None`` when hydration was clean or when preload_cache=False
+    # (intentional opt-out, never reported as degraded).
+    "boot_degraded": None,
     "consolidating": False,
     "last_consolidation": None,
     # Last structured error from a consolidation attempt. Populated by the
@@ -743,15 +751,21 @@ class RollbackResponse(BaseModel):
 # its health, and should it be mounted?"
 
 
-def _compute_live_registry_sha256(config) -> str:
-    """SHA-256 of the on-disk indexed_key_registry.json plaintext bytes.
+def _compute_tier_registry_sha256(config, tier: str) -> str:
+    """SHA-256 of ``<adapter_dir>/<tier>/indexed_key_registry.json`` plaintext bytes.
 
-    Hashes plaintext (after read_maybe_encrypted decrypt) — see
-    manifest.py::build_manifest_for for why ciphertext-based hashing breaks
-    drift detection under Security ON.  Empty string when the registry file
+    Each main-tier slot's manifest is stamped with that tier's OWN registry
+    hash (see ``_train_extracted_into_interim`` step 5/6b for the procedural
+    case).  Slot matching must therefore use the per-tier hash too — passing a
+    single episodic hash across all tiers makes procedural and semantic slots
+    unmountable on boot.
+
+    Hashes plaintext (after ``read_maybe_encrypted`` decrypt) — see
+    ``manifest.py::build_manifest_for`` for why ciphertext-based hashing breaks
+    drift detection under Security ON.  Empty string when the tier's registry
     does not exist or cannot be read.
     """
-    registry_path = config.adapter_dir / "indexed_key_registry.json"
+    registry_path = config.adapter_dir / tier / "indexed_key_registry.json"
     if not registry_path.exists():
         return ""
     try:
@@ -762,6 +776,27 @@ def _compute_live_registry_sha256(config) -> str:
         return _rhash.sha256(_rme(registry_path)).hexdigest()
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _require_healthy_memory() -> None:
+    """Raise 503 when boot hydration left the store partially populated.
+
+    Only triggers under ``inference.preload_cache=True``.  When the operator
+    set ``preload_cache=False`` the lifespan never sets ``boot_degraded`` —
+    inference takes the per-key source path on every miss, which is slow but
+    correct.
+
+    Applied at the top of ``/chat`` and ``/debug/*`` so a degraded boot
+    cannot silently serve cold-start abstentions in place of the real
+    indexed-key answer.  Consolidation cycles refresh the store and clear
+    the flag when they succeed.
+    """
+    degraded = _state.get("boot_degraded")
+    if degraded is None:
+        return
+    from fastapi import HTTPException
+
+    raise HTTPException(status_code=503, detail={"boot_degraded": degraded})
 
 
 def _is_primary_adapter(name: str) -> bool:
@@ -930,7 +965,6 @@ def _revalidate_main_adapter_manifests(state: dict) -> None:
         return
 
     manifest_status = state.setdefault("adapter_manifest_status", {})
-    live_registry_sha256 = _compute_live_registry_sha256(config)
 
     for name, adapter_cfg in (
         ("episodic", config.adapters.episodic),
@@ -946,7 +980,7 @@ def _revalidate_main_adapter_manifests(state: dict) -> None:
             model,
             tokenizer,
             config,
-            live_registry_sha256,
+            _compute_tier_registry_sha256(config, name),
             manifest_status,
         )
 
@@ -984,15 +1018,9 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     from paramem.backup.backup import sweep_orphan_pending
 
     manifest_status: dict = state.setdefault("adapter_manifest_status", {})
-    # Reset the format map on every call — this function runs once at boot and
-    # produces a per-boot snapshot.  Each adapter name maps to the
-    # indexed_format field from its meta.json ("qa" | "quad"); absent/legacy
-    # manifests default to "qa" (every adapter trained before the quad switch
-    # is QA-format).
-    state["adapter_formats"] = {}
-    adapter_formats: dict[str, str] = state["adapter_formats"]
-    live_registry_sha256 = _compute_live_registry_sha256(config)
-    _registry_path = config.adapter_dir / "indexed_key_registry.json"
+    # Per-tier paths live at <adapter_dir>/<tier>/indexed_key_registry.json; each
+    # tier's slot manifest is stamped with that tier's own registry hash, so
+    # slot matching is per-tier (see _compute_tier_registry_sha256).
 
     def _load_one(name: str, slot: Path):
         """Mount a single adapter from *slot* onto *model* (mutates nonlocal model).
@@ -1040,27 +1068,36 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             model,
             tokenizer,
             config,
-            live_registry_sha256,
+            _compute_tier_registry_sha256(config, name),
             manifest_status,
         )
         if should_mount and slot is not None:
             _load_one(name, slot)
-        # Record indexed_format from the manifest for the inference path.
-        # _manifest is None when the slot has no meta.json (legacy); default "qa".
-        if _manifest is not None:
-            adapter_formats[name] = getattr(_manifest, "indexed_format", "qa")
-        elif slot is not None:
-            # slot present but manifest missing or unreadable — default "qa"
-            adapter_formats[name] = "qa"
 
     # ---- Interim adapters ----
-    for _interim_path in sorted(config.adapter_dir.glob("episodic_interim_*")):
-        if not _interim_path.is_dir():
-            continue
-        sweep_orphan_pending(_interim_path)
-        _interim_name = _interim_path.name
+    from paramem.server.interim_adapter import iter_interim_dirs
 
-        slot = find_live_slot(_interim_path, live_registry_sha256)
+    for _interim_name, _interim_path in iter_interim_dirs(config.adapter_dir):
+        sweep_orphan_pending(_interim_path)
+
+        # Interim slots are matched against their OWN per-interim registry,
+        # not the main-episodic ``live_registry_sha256``.  Each interim's
+        # ``indexed_key_registry.json`` is the authoritative ledger for that
+        # interim's slot; comparing to the main hash always misses when a
+        # full cycle hasn't run yet (the main registry is empty).
+        _interim_registry_path = _interim_path / "indexed_key_registry.json"
+        _interim_hash = ""
+        if _interim_registry_path.exists():
+            import hashlib as _ihash
+
+            from paramem.backup.encryption import read_maybe_encrypted as _irme
+
+            try:
+                _interim_hash = _ihash.sha256(_irme(_interim_registry_path)).hexdigest()
+            except Exception:  # noqa: BLE001
+                _interim_hash = ""
+
+        slot = find_live_slot(_interim_path, _interim_hash)
         if slot is None:
             # Fallback: old flat layout (no slot-dir yet) — look for adapter files directly
             if (_interim_path / "adapter_config.json").exists() and (
@@ -1080,50 +1117,39 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
                 except Exception as exc:
                     logger.error("Failed to load interim adapter %s: %s", _interim_name, exc)
                 # Flat layout has no meta.json → default "qa"
-                adapter_formats[_interim_name] = "qa"
             else:
                 logger.warning("Interim adapter %s: no matching slot — skipping", _interim_name)
             continue
 
         _load_one(_interim_name, slot)
-        # Read indexed_format from the slot manifest; default "qa" on any error.
-        try:
-            from paramem.adapters.manifest import ManifestNotFoundError as _MNF
-            from paramem.adapters.manifest import ManifestSchemaError as _MSE
-            from paramem.adapters.manifest import read_manifest as _read_manifest
-
-            _im = _read_manifest(slot)
-            adapter_formats[_interim_name] = getattr(_im, "indexed_format", "qa")
-        except (_MNF, _MSE):
-            adapter_formats[_interim_name] = "qa"
 
     # ---- I5 — Registry consistency check ----
-    # Drop orphan registry entries whose adapter slot is missing.
-    if _registry_path.exists():
-        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
+    # Drop orphan interim-tier registries whose adapter weights are truly
+    # absent (torn save: registry written before the .safetensors landed).
+    #
+    # IMPORTANT: this is torn-save cleanup, NOT hash-mismatch cleanup.
+    # ``find_live_slot is None`` is not proof that weights are missing —
+    # it also returns None when slot dirs exist but their manifest's
+    # ``registry_sha256`` does not match the live hash (registry drift
+    # after a partial cycle).  Treating that case as "weights missing"
+    # would ``rmtree`` a fully-trained adapter.  The only legitimate
+    # trigger is "no ``adapter_model.safetensors`` anywhere under the
+    # interim dir" — flat layout or any slot subdir.  Hash mismatch is a
+    # separate failure mode and is surfaced via I4 ``manifest_status``.
+    for _interim_name, _interim_reg_dir in iter_interim_dirs(config.adapter_dir):
+        _interim_reg_path = _interim_reg_dir / "indexed_key_registry.json"
+        if not _interim_reg_path.exists():
+            continue
+        if any(_interim_reg_dir.rglob("adapter_model.safetensors")):
+            continue
+        logger.warning(
+            "Startup registry check: interim adapter %s weights missing — "
+            "removing its registry (adapter save was interrupted)",
+            _interim_name,
+        )
+        import shutil as _shutil
 
-        _reg = _KeyRegistry.load(_registry_path)
-        _orphaned: list[str] = []
-        for _key in list(_reg.list_active()):
-            _aid = _reg.get_adapter_id(_key)
-            if _aid.startswith("episodic_interim_"):
-                # Slot-dir: check via find_live_slot
-                _aid_dir = config.adapter_dir / _aid
-                _slot = find_live_slot(_aid_dir, live_registry_sha256)
-                if _slot is None:
-                    # Also check flat layout fallback
-                    _flat_weights = _aid_dir / "adapter_model.safetensors"
-                    if not _flat_weights.exists():
-                        _reg.remove(_key)
-                        _orphaned.append(_key)
-        if _orphaned:
-            logger.warning(
-                "Startup registry check: dropped %d orphan key(s) whose adapter "
-                "weights are missing (adapter save was interrupted): %s",
-                len(_orphaned),
-                _orphaned,
-            )
-            _reg.save(_registry_path)
+        _shutil.rmtree(_interim_reg_dir, ignore_errors=True)
 
     if hasattr(model, "peft_config") and model.peft_config:
         logger.info("Adapters loaded: %s", list(model.peft_config.keys()))
@@ -1474,6 +1500,9 @@ async def lifespan(app: FastAPI):
         retain_sessions=config.consolidation.retain_sessions,
         debug=config.debug,
     )
+    # Cold-start: rehydrate pending JSONL into memory before loading the
+    # encrypted snapshot (snapshot carries mid-turn _sessions state only).
+    _state["session_buffer"].rehydrate_from_disk()
     _state["session_buffer"].load_snapshot()
 
     # Initialize speaker store (voice-based identification)
@@ -1719,8 +1748,135 @@ async def lifespan(app: FastAPI):
         logger.info("HA tools: not configured")
 
     _state["ha_graph"] = ha_graph
+
+    # Indexed-key memory store — single source of truth for {entry, simhash,
+    # registry} of every indexed key the system holds in RAM.  Constructed
+    # eagerly at boot so the Router has something to walk before the first
+    # consolidation cycle fires.  Registries + simhashes always load.  Entry
+    # payloads preload via the mode-appropriate MemorySource when
+    # ``config.inference.preload_cache`` is True; with it off, the store stays
+    # empty for entries and inference pays per-key source latency on misses
+    # — supported (just slower).
+    from paramem.training.memory_source import (
+        DiskMemorySource as _DiskMemorySource,
+    )
+    from paramem.training.memory_source import (
+        WeightMemorySource as _WeightMemorySource,
+    )
+    from paramem.training.memory_store import MemoryStore as _MemoryStore
+
+    memory_store = _MemoryStore(
+        replay_enabled=config.consolidation.indexed_key_replay,
+    )
+    try:
+        memory_store.load_registries_from_disk(config.adapter_dir)
+    except Exception:
+        logger.exception("Boot-time registry load failed; memory store will start empty")
+
+    if config.inference.preload_cache:
+        _preload_keys_by_tier: dict[str, list[str]] = {}
+        for _tier in memory_store.tiers_with_registry():
+            _active = memory_store.active_keys_in_tier(_tier)
+            if _active:
+                _preload_keys_by_tier[_tier] = _active
+
+        if _preload_keys_by_tier:
+            # Mode-aware source: simulate persists graph.json (DiskMemorySource);
+            # train persists only adapter weights (WeightMemorySource).  The
+            # MemoryStore itself is RAM-only — re-populated at every boot from
+            # the mode-appropriate source of truth.
+            _mode = config.consolidation.mode
+            _source = None
+            if _mode == "simulate":
+                _source = _DiskMemorySource(config.simulate_dir)
+            elif _state.get("model") is not None:
+                _source = _WeightMemorySource(
+                    _state["model"],
+                    _state["tokenizer"],
+                )
+            else:
+                logger.info(
+                    "preload_cache: skipping entry preload — no model loaded "
+                    "(cloud-only mode or model load failed); store will stay "
+                    "empty for entries and inference will pay source latency "
+                    "on each query"
+                )
+
+            if _source is not None:
+                _total = sum(len(v) for v in _preload_keys_by_tier.values())
+                logger.info(
+                    "preload_cache: probing %d active key(s) across %d tier(s) via %s",
+                    _total,
+                    len(_preload_keys_by_tier),
+                    type(_source).__name__,
+                )
+                try:
+                    _results = _source.probe(_preload_keys_by_tier)
+                except Exception:
+                    logger.exception(
+                        "preload_cache: source probe failed; store remains "
+                        "empty for entries (queries will retry per-key on demand)"
+                    )
+                    _results = {}
+
+                _hits = 0
+                _missed_by_tier: dict[str, list[str]] = {}
+                for _tier, _keys in _preload_keys_by_tier.items():
+                    for _key in _keys:
+                        _entry = _results.get(_key)
+                        if _entry is None or "failure_reason" in _entry:
+                            _missed_by_tier.setdefault(_tier, []).append(_key)
+                            continue
+                        # Don't re-register; the registry is already loaded.
+                        memory_store.put(_tier, _key, _entry, register=False)
+                        _hits += 1
+                logger.info("preload_cache: cached %d / %d active key(s)", _hits, _total)
+                if _hits < _total:
+                    _state["boot_degraded"] = {
+                        "reason": "preload_partial",
+                        "hits": _hits,
+                        "total": _total,
+                        "missed_by_tier": {
+                            tier: keys[:10] for tier, keys in _missed_by_tier.items()
+                        },
+                        "source": type(_source).__name__,
+                    }
+                    logger.warning(
+                        "boot_degraded: preload_cache could not materialise %d / %d "
+                        "active keys via %s — /chat and /debug/* will return 503 "
+                        "until consolidation refreshes the store",
+                        _total - _hits,
+                        _total,
+                        type(_source).__name__,
+                    )
+
+    # Join the per-entry bookkeeping (speaker_id, first_seen_cycle) from
+    # key_metadata.json.  WeightMemorySource and DiskMemorySource both
+    # recover the SPO triple but not these fields — they live only in the
+    # registry.  Must run AFTER preload_cache so entries exist to join onto;
+    # the join is a no-op for tiers whose entries are absent (preload off
+    # or boot_degraded).  Without this step, Router._speaker_key_index is
+    # empty and every personal query hits the cold-start abstention even
+    # though the keys are cached.
+    try:
+        _meta_stats = memory_store.load_metadata_from_disk(config.key_metadata_path)
+        logger.info(
+            "load_metadata_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
+            _meta_stats["loaded"],
+            _meta_stats["orphaned"],
+            _meta_stats["legacy_upgraded"],
+        )
+    except Exception:
+        logger.exception(
+            "Boot-time key_metadata join failed; entries will lack speaker_id "
+            "until next consolidation cycle (personal queries will cold-start)"
+        )
+
+    _state["memory_store"] = memory_store
+
     _state["router"] = QueryRouter(
         adapter_dir=config.adapter_dir,
+        memory_store=memory_store,
         ha_graph=ha_graph,
         intent_config=config.intent,
         simulate_dir=config.simulate_dir,
@@ -1943,6 +2099,7 @@ async def lifespan(app: FastAPI):
                         _state["model"],
                         _state["tokenizer"],
                         config,
+                        _state["memory_store"],
                         state_provider=lambda: _state,
                     )
                     _state["consolidation_loop"] = _replay_loop
@@ -1957,7 +2114,6 @@ async def lifespan(app: FastAPI):
                         thermal_policy=ThermalPolicy.from_consolidation_config(
                             config.consolidation
                         ),
-                        indexed_format=config.consolidation.indexed_format,
                     )
                     _state["background_trainer"] = _replay_bt
 
@@ -2058,6 +2214,7 @@ log_startup_posture(_api_token)
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Handle a conversation turn with speaker identification."""
+    _require_healthy_memory()
     _state["last_chat_time"] = datetime.now(timezone.utc)
     buffer = _state["session_buffer"]
 
@@ -2335,7 +2492,7 @@ async def chat(request: ChatRequest):
                 # progress or interrupted, the inference path falls back to
                 # the source mode's store. None == use config.consolidation.mode.
                 effective_mode=_state.get("effective_mode"),
-                adapter_formats=_state.get("adapter_formats"),
+                memory_store=_state["memory_store"],
             ),
         )
 
@@ -2496,16 +2653,29 @@ async def status():
         else:
             active_adapter = raw_active
 
-    # Source of truth for active key count is data/ha/adapters/indexed_key_registry.json
-    # (KeyRegistry).  The legacy combined SimHash registry at config.registry_path was
-    # retired in Plan A; do not read it here.
+    # Source of truth for active key count is the per-tier KeyRegistry files:
+    # <adapter_dir>/<tier>/indexed_key_registry.json for episodic/semantic/procedural
+    # and <adapter_dir>/episodic_interim_*/indexed_key_registry.json for interim slots.
+    # Prefer reading from the in-memory ConsolidationLoop when available (avoids
+    # disk I/O on every pstatus call).
     keys_count = 0
-    indexed_registry_path = config.adapter_dir / "indexed_key_registry.json"
-    if indexed_registry_path.exists():
+    _live_loop = _state.get("consolidation_loop")
+    if _live_loop is not None and _live_loop.store.replay_enabled:
+        keys_count = len(_live_loop.store.all_active_keys())
+    else:
         from paramem.training.key_registry import KeyRegistry as _KeyRegistry
 
         try:
-            keys_count = len(_KeyRegistry.load(indexed_registry_path))
+            for _tier in ("episodic", "semantic", "procedural"):
+                _reg_path = config.adapter_dir / _tier / "indexed_key_registry.json"
+                if _reg_path.exists():
+                    keys_count += len(_KeyRegistry.load(_reg_path))
+            from paramem.server.interim_adapter import iter_interim_dirs as _iter_int
+
+            for _interim_name, _interim_d in _iter_int(config.adapter_dir):
+                _reg_path = _interim_d / "indexed_key_registry.json"
+                if _reg_path.exists():
+                    keys_count += len(_KeyRegistry.load(_reg_path))
         except Exception:  # noqa: BLE001
             keys_count = 0
 
@@ -2591,17 +2761,36 @@ async def status():
         ),
     }
 
-    # Adapter health — stored in the KeyRegistry JSON (distinct from the
-    # SimHash registry at config.registry_path).  Surfaced to pstatus so a
-    # degenerated adapter is visible without grepping logs.
+    # Adapter health — stored in per-tier KeyRegistry JSON files:
+    # <adapter_dir>/<tier>/indexed_key_registry.json → field "health".
+    # Prefer reading from the in-memory ConsolidationLoop when available.
+    # Surfaced to pstatus so a degenerated adapter is visible without grepping logs.
     adapter_health: dict = {}
-    _key_reg_path = config.adapter_dir / "indexed_key_registry.json"
-    if _key_reg_path.exists():
-        try:
-            from paramem.backup.encryption import read_maybe_encrypted
+    if _live_loop is not None and _live_loop.store.replay_enabled:
+        for _tier_name in _live_loop.store.tiers_with_registry():
+            _h = _live_loop.store.registry(_tier_name).get_health()
+            if _h is not None:
+                adapter_health[_tier_name] = _h
+    else:
+        from paramem.training.key_registry import KeyRegistry as _KeyRegHealth
 
-            _key_reg_json = json.loads(read_maybe_encrypted(_key_reg_path).decode("utf-8"))
-            adapter_health = _key_reg_json.get("adapter_health", {}) or {}
+        try:
+            for _tier in ("episodic", "semantic", "procedural"):
+                _reg_path = config.adapter_dir / _tier / "indexed_key_registry.json"
+                if _reg_path.exists():
+                    _reg = _KeyRegHealth.load(_reg_path)
+                    _h = _reg.get_health()
+                    if _h is not None:
+                        adapter_health[_tier] = _h
+            from paramem.server.interim_adapter import iter_interim_dirs as _iter_int_h
+
+            for _interim_name, _interim_d in _iter_int_h(config.adapter_dir):
+                _reg_path = _interim_d / "indexed_key_registry.json"
+                if _reg_path.exists():
+                    _reg = _KeyRegHealth.load(_reg_path)
+                    _h = _reg.get_health()
+                    if _h is not None:
+                        adapter_health[_interim_name] = _h
         except Exception:
             adapter_health = {}
 
@@ -2978,8 +3167,35 @@ def _load_model_into_state(config) -> None:
     _state["adapter_manifest_status"] = {}
     _state["base_model_hash_cache"] = {}
 
+    # Refuse to start on a legacy adapter layout (pre-2026-05-14 hierarchy
+    # refactor). Operator must run scripts/migrate/restructure_adapter_dir.py
+    # before restart. The new code paths use iter_interim_dirs() which scans
+    # adapter_dir/episodic/interim_*, so legacy adapter_dir/episodic_interim_*
+    # dirs would be invisible and produce a silently degraded server.
+    from paramem.server.interim_adapter import detect_legacy_adapter_layout
+
+    _legacy = detect_legacy_adapter_layout(config.adapter_dir)
+    if _legacy:
+        names = ", ".join(p.name for p in _legacy)
+        raise RuntimeError(
+            f"Legacy adapter layout detected at {config.adapter_dir} ({names}). "
+            "Run scripts/migrate/restructure_adapter_dir.py to relocate interim "
+            "adapters under adapter_dir/episodic/, then restart."
+        )
+
     # Mount adapters from slots — wraps the model in PeftModel.
     model = _mount_adapters_from_slots(model, tokenizer, config, _state)
+
+    # Drop orphan entries from key_metadata.json — keys whose tier registry was
+    # wiped (e.g. by the interim-cleanup pass above) must not linger as
+    # bookkeeping. Wipe invariant: key_metadata is for active keys, not
+    # recovery. Runs every boot; no-op when nothing to prune.
+    from paramem.server.consolidation import prune_key_metadata_orphans
+
+    try:
+        prune_key_metadata_orphans(config)
+    except Exception:
+        logger.exception("Boot-time key_metadata orphan prune failed; continuing")
 
     # Restore the main episodic adapter as the active adapter.
     if hasattr(model, "peft_config") and "episodic" in model.peft_config:
@@ -3201,6 +3417,7 @@ async def refresh_ha():
         config = _state["config"]
         _state["router"] = QueryRouter(
             adapter_dir=config.adapter_dir,
+            memory_store=_state["memory_store"],
             ha_graph=ha_graph,
             intent_config=config.intent,
             simulate_dir=config.simulate_dir,
@@ -3234,7 +3451,7 @@ async def admin_assign_orphans(speaker_id: str | None = None):
     enrolled profile when omitted.  When ``buffer.debug=True`` the on-disk
     session jsonls are rewritten in place; in production-mode (no on-disk
     transcripts) the binding lives only in memory but still flows through
-    the next consolidation into permanent keyed_pairs / weights — the
+    the next consolidation into adapter weights — the
     durable medium changes with the deployment posture, the operation is
     the same.
     """
@@ -3370,7 +3587,7 @@ async def debug_probe(request: DebugProbeRequest):
                     ha_client=_state.get("ha_client"),
                     language=None,
                     effective_mode=_state.get("effective_mode"),
-                    adapter_formats=_state.get("adapter_formats"),
+                    memory_store=_state["memory_store"],
                 ),
             )
     finally:
@@ -4411,17 +4628,6 @@ async def _run_trial_consolidation() -> None:
                 if not session_buffer_empty and "loop" in locals() and loop is not None
                 else model
             )
-            # indexed_format: the trial adapter's format (what it was trained
-            # with). live_registry_format: the live registry's format (what
-            # format the live simhashes were built from). When the two differ
-            # (format-transition trial), Gate 4 skips to avoid a spurious FAIL
-            # caused by mismatched simhash content strings.
-            _trial_indexed_format = getattr(
-                loop if ("loop" in locals() and loop is not None) else None,
-                "_indexed_format",
-                getattr(live_config.consolidation, "indexed_format", "qa"),
-            )
-            _live_registry_format = getattr(live_config.consolidation, "indexed_format", "qa")
             results = evaluate_gates(
                 model=gate_model,
                 tokenizer=tokenizer,
@@ -4430,8 +4636,6 @@ async def _run_trial_consolidation() -> None:
                 session_buffer_empty=session_buffer_empty,
                 consolidation_summary=summary,
                 consolidation_exception=exc_captured,
-                indexed_format=_trial_indexed_format,
-                live_registry_format=_live_registry_format,
             )
 
             overall_status = _rollup_gate_status(results, session_buffer_empty)
@@ -4536,8 +4740,20 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
     alone so config-derived paths (sessions, debug, prompts) remain valid.
     """
     from paramem.server.consolidation import create_consolidation_loop
+    from paramem.training.memory_store import MemoryStore as _MemoryStore
 
-    loop = create_consolidation_loop(model, tokenizer, trial_config)
+    # Trial path: construct a fresh, isolated store that mirrors the trial
+    # adapter dir's registries.  Do NOT reuse the live ``_state["memory_store"]``
+    # — the trial must not pollute the production store.
+    trial_store = _MemoryStore(
+        replay_enabled=trial_config.consolidation.indexed_key_replay,
+    )
+    if trial_adapter_dir is not None:
+        try:
+            trial_store.load_registries_from_disk(trial_adapter_dir)
+        except Exception:
+            logger.exception("Trial memory_store registry load failed; starting empty")
+    loop = create_consolidation_loop(model, tokenizer, trial_config, trial_store)
 
     if trial_adapter_dir is not None:
         loop.output_dir = trial_adapter_dir
@@ -6514,7 +6730,8 @@ def _run_extraction_phase(
         _promote_mature_keys,
         _save_debug_artifacts,
         _save_key_metadata,
-        _save_simulate_store_graph,
+        _save_tier_graphs,
+        session_retention_dir,
     )
 
     config = _state["config"]
@@ -6534,7 +6751,7 @@ def _run_extraction_phase(
     logger.info("Consolidating %d pending sessions", len(pending))
 
     # --- Phase 1: Extract all sessions ---
-    all_episodic_qa = []
+    all_episodic_rels = []
     all_procedural_rels = []
     session_ids = []
     speaker_ids = []
@@ -6567,7 +6784,7 @@ def _run_extraction_phase(
             except Exception as e:
                 logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
         with vram_scope(session_id):
-            episodic_qa, procedural_rels = loop.extract_session(
+            episodic_rels, procedural_rels = loop.extract_session(
                 transcript,
                 session_id,
                 speaker_id=session_speaker_id,
@@ -6588,20 +6805,20 @@ def _run_extraction_phase(
 
         _increment_key_sessions(loop, session_id)
 
-        for qa in episodic_qa:
+        for qa in episodic_rels:
             qa["speaker_id"] = session_speaker_id
         for rel in procedural_rels:
             rel["speaker_id"] = session_speaker_id
 
-        all_episodic_qa.extend(episodic_qa)
+        all_episodic_rels.extend(episodic_rels)
         all_procedural_rels.extend(procedural_rels)
-        total_relations += len(episodic_qa) + len(procedural_rels)
+        total_relations += len(episodic_rels) + len(procedural_rels)
         speaker_ids.append(session_speaker_id)
 
         logger.info(
             "Extracted session %s: %d episodic, %d procedural relations",
             session_id,
-            len(episodic_qa),
+            len(episodic_rels),
             len(procedural_rels),
         )
 
@@ -6609,9 +6826,14 @@ def _run_extraction_phase(
             logger.info("Shutdown requested — stopping extraction after %s", session_id)
             break
 
-    if not all_episodic_qa and not all_procedural_rels:
-        logger.info("No QA pairs extracted — skipping training")
-        _do_mark_consolidated(session_buffer, session_ids, mark_callback)
+    if not all_episodic_rels and not all_procedural_rels:
+        logger.info("No relations extracted — skipping training")
+        _do_mark_consolidated(
+            session_buffer,
+            session_ids,
+            mark_callback,
+            retention_dir=session_retention_dir(loop, config),
+        )
         return {
             "status": "no_facts",
             "sessions": len(session_ids),
@@ -6619,21 +6841,21 @@ def _run_extraction_phase(
         }
 
     # --- Cross-session dedup on (subject, predicate, object) identity ---
-    pre_ep, pre_pr = len(all_episodic_qa), len(all_procedural_rels)
-    all_episodic_qa = _dedup_episodic(all_episodic_qa)
+    pre_ep, pre_pr = len(all_episodic_rels), len(all_procedural_rels)
+    all_episodic_rels = _dedup_episodic(all_episodic_rels)
     all_procedural_rels = _dedup_procedural(all_procedural_rels)
-    if pre_ep != len(all_episodic_qa) or pre_pr != len(all_procedural_rels):
+    if pre_ep != len(all_episodic_rels) or pre_pr != len(all_procedural_rels):
         logger.info(
             "Dedup: episodic %d→%d, procedural %d→%d",
             pre_ep,
-            len(all_episodic_qa),
+            len(all_episodic_rels),
             pre_pr,
             len(all_procedural_rels),
         )
 
     if config.debug:
         try:
-            _save_debug_artifacts(loop, config, all_episodic_qa, all_procedural_rels)
+            _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
         except Exception:
             logger.exception("debug-artifact write failed; continuing consolidation")
 
@@ -6642,10 +6864,10 @@ def _run_extraction_phase(
         primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
         try:
             sim_result = loop.simulated_training(
-                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker_sim
+                all_episodic_rels, all_procedural_rels, speaker_id=primary_speaker_sim
             )
             newly_promoted = _promote_mature_keys(loop, config)
-            _save_simulate_store_graph(loop, config)
+            _save_tier_graphs(loop, config)
             _save_key_metadata(loop, config)
         except Exception:
             logger.exception(
@@ -6654,18 +6876,23 @@ def _run_extraction_phase(
             )
             raise
 
-        _do_mark_consolidated(session_buffer, session_ids, mark_callback)
+        _do_mark_consolidated(
+            session_buffer,
+            session_ids,
+            mark_callback,
+            retention_dir=session_retention_dir(loop, config),
+        )
         elapsed = time.time() - start_time
         summary = {
             "status": "simulated",
             "sessions": len(session_ids),
             "total_relations": total_relations,
             "newly_promoted": len(newly_promoted),
-            "episodic_qa": len(all_episodic_qa),
+            "episodic_rels": len(all_episodic_rels),
             "procedural_rels": len(all_procedural_rels),
-            "episodic_keys": len(loop.episodic_simhash),
-            "semantic_keys": len(loop.semantic_simhash),
-            "procedural_keys": len(loop.procedural_simhash),
+            "episodic_keys": loop.store.simhash_count_in_tier("episodic"),
+            "semantic_keys": loop.store.simhash_count_in_tier("semantic"),
+            "procedural_keys": loop.store.simhash_count_in_tier("procedural"),
             "elapsed_seconds": round(elapsed, 1),
             "simulated": sim_result.get("simulated", True),
             "loop": loop,
@@ -6675,15 +6902,15 @@ def _run_extraction_phase(
 
     # --- Phase 2: Train once ---
     logger.info(
-        "Training on %d episodic + %d procedural QA pairs",
-        len(all_episodic_qa),
+        "Training on %d episodic + %d procedural relations",
+        len(all_episodic_rels),
         len(all_procedural_rels),
     )
     primary_speaker = speaker_ids[-1] if speaker_ids else ""
     try:
         with vram_scope("training"):
             train_result = loop.train_adapters_no_save(
-                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker
+                all_episodic_rels, all_procedural_rels, speaker_id=primary_speaker
             )
         newly_promoted = _promote_mature_keys(loop, config)
         loop._save_adapters()
@@ -6695,7 +6922,12 @@ def _run_extraction_phase(
         )
         raise
 
-    _do_mark_consolidated(session_buffer, session_ids, mark_callback)
+    _do_mark_consolidated(
+        session_buffer,
+        session_ids,
+        mark_callback,
+        retention_dir=session_retention_dir(loop, config),
+    )
 
     elapsed = time.time() - start_time
     summary = {
@@ -6703,9 +6935,9 @@ def _run_extraction_phase(
         "sessions": len(session_ids),
         "total_relations": total_relations,
         "newly_promoted": len(newly_promoted),
-        "episodic_keys": len(loop.episodic_simhash),
-        "semantic_keys": len(loop.semantic_simhash),
-        "procedural_keys": len(loop.procedural_simhash),
+        "episodic_keys": loop.store.simhash_count_in_tier("episodic"),
+        "semantic_keys": loop.store.simhash_count_in_tier("semantic"),
+        "procedural_keys": loop.store.simhash_count_in_tier("procedural"),
         "train_loss": train_result.get("episodic_train_loss"),
         "elapsed_seconds": round(elapsed, 1),
         "loop": loop,
@@ -6762,7 +6994,7 @@ def _extract_and_start_training():
     """Extract pending sessions and submit a single interim-training job.
 
     Runs in executor thread.  Phase 1 (extraction) holds the GPU lock and
-    produces the per-batch (episodic_qa, procedural_rels) tuple.  Phase 2
+    produces the per-batch (episodic_rels, procedural_rels) tuple.  Phase 2
     submits one callable to ``BackgroundTrainer`` that mints a fresh
     ``episodic_interim_<stamp>`` slot (or absorbs into the newest existing
     when the cap is hit) and trains the batch into it.  Main adapters are
@@ -6775,8 +7007,9 @@ def _extract_and_start_training():
         _promote_mature_keys,
         _save_debug_artifacts,
         _save_key_metadata,
-        _save_simulate_store_graph,
+        _save_tier_graphs,
         create_consolidation_loop,
+        session_retention_dir,
     )
 
     config = _state["config"]
@@ -6789,6 +7022,7 @@ def _extract_and_start_training():
             _state["model"],
             _state["tokenizer"],
             config,
+            _state["memory_store"],
             state_provider=lambda: _state,
         )
         _state["consolidation_loop"] = loop
@@ -6804,7 +7038,7 @@ def _extract_and_start_training():
     from paramem.server.gpu_lock import gpu_lock_sync
 
     pending = session_buffer.get_pending()
-    all_episodic_qa = []
+    all_episodic_rels = []
     all_procedural_rels = []
     session_ids = []
     speaker_ids = []
@@ -6875,7 +7109,7 @@ def _extract_and_start_training():
                 # the proactive abort and the reactive abort uniformly.
                 assert_free_vram(session_id)
                 with vram_scope(session_id):
-                    episodic_qa, procedural_rels = loop.extract_session(
+                    episodic_rels, procedural_rels = loop.extract_session(
                         transcript,
                         session_id,
                         speaker_id=session_speaker_id,
@@ -6914,14 +7148,54 @@ def _extract_and_start_training():
                     }
                 )
                 continue
+            except ExtractionFailed as exc:
+                # Whole-cycle abort per project_extraction_failure_fails_cycle.md
+                # (2026-05-12).  Unlike VramExhausted (resource constraint, per-
+                # chunk isolation OK), ExtractionFailed means the extractor
+                # actively refused to bake a degraded snapshot — proceeding
+                # with the OTHER chunks would silently commit a partial CV /
+                # document set, which is exactly the "keep pre-enrichment
+                # facts and proceed" anti-pattern the design rejects.  Drop
+                # everything extracted so far, leave ALL sessions pending
+                # (including the ones already processed in this loop), and
+                # let the next tick retry the whole batch.
+                logger.error(
+                    "Cycle aborted: chunk %s extraction failed at phase=%s — %s. "
+                    "All %d session(s) in this batch remain pending; next cycle will retry.",
+                    session_id,
+                    exc.phase,
+                    exc.reason,
+                    len(session_ids),
+                )
+                _state.setdefault("chunk_failures", []).append(
+                    {
+                        "session_id": session_id,
+                        "phase": exc.phase,
+                        "reason": exc.reason,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                _state["last_consolidation_error"] = {
+                    "type": "extraction_failed",
+                    "phase": exc.phase,
+                    "reason": exc.reason,
+                    "session_id": session_id,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
+                # Reclaim voice pipeline if we evicted it earlier — the cycle
+                # is dropping out without going through the normal finalize.
+                if evict_voice_for_cycle:
+                    _set_voice_pipeline_profile(_target_profile(), lock_held=False)
+                _state["consolidating"] = False
+                return
             _increment_key_sessions(loop, session_id)
 
-            for qa in episodic_qa:
+            for qa in episodic_rels:
                 qa["speaker_id"] = session_speaker_id
             for rel in procedural_rels:
                 rel["speaker_id"] = session_speaker_id
 
-            all_episodic_qa.extend(episodic_qa)
+            all_episodic_rels.extend(episodic_rels)
             all_procedural_rels.extend(procedural_rels)
             speaker_ids.append(session_speaker_id)
 
@@ -6930,9 +7204,12 @@ def _extract_and_start_training():
     def _completed_session_ids() -> list[str]:
         return [sid for sid in session_ids if sid not in failed_session_ids]
 
-    if not all_episodic_qa and not all_procedural_rels:
-        logger.info("No QA pairs extracted — skipping")
-        session_buffer.mark_consolidated(_completed_session_ids())
+    if not all_episodic_rels and not all_procedural_rels:
+        logger.info("No relations extracted — skipping")
+        session_buffer.mark_consolidated(
+            _completed_session_ids(),
+            retention_dir=session_retention_dir(loop, config),
+        )
 
         if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
@@ -6953,7 +7230,7 @@ def _extract_and_start_training():
                 "status": "no_facts",
                 "sessions": len(session_ids),
                 "skipped_oom": len(failed_session_ids),
-                "episodic_qa": 0,
+                "episodic_rels": 0,
                 "procedural_rels": 0,
             }
             _state["consolidating"] = False
@@ -6977,7 +7254,7 @@ def _extract_and_start_training():
     # Best-effort: a debug-write failure must NOT abort consolidation.
     if config.debug:
         try:
-            _save_debug_artifacts(loop, config, all_episodic_qa, all_procedural_rels)
+            _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
         except Exception:
             logger.exception("debug-artifact write failed; continuing consolidation")
 
@@ -6985,10 +7262,10 @@ def _extract_and_start_training():
         primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
         with gpu_lock_sync():
             sim_result = loop.simulated_training(
-                all_episodic_qa, all_procedural_rels, speaker_id=primary_speaker_sim
+                all_episodic_rels, all_procedural_rels, speaker_id=primary_speaker_sim
             )
             newly_promoted = _promote_mature_keys(loop, config)
-            _save_simulate_store_graph(loop, config)
+            _save_tier_graphs(loop, config)
             # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
             # the combined SimHash registry at config.registry_path was not
             # maintained by interim or full-cycle production paths post-Phase-3+5,
@@ -6999,18 +7276,21 @@ def _extract_and_start_training():
             # them at read time.
             _save_key_metadata(loop, config)
             # _save_simulate_store retired with the canonicalization — the per-tier
-            # graph.json written by _save_simulate_store_graph is the
+            # graph.json written by _save_tier_graphs is the
             # only simulate-mode persistence (cycle_<N>/ snapshots dropped).
 
         # Simulate is peer storage — retire successfully-extracted sessions
         # like train. OOM-skipped chunks stay pending for retry.
-        session_buffer.mark_consolidated(_completed_session_ids())
+        session_buffer.mark_consolidated(
+            _completed_session_ids(),
+            retention_dir=session_retention_dir(loop, config),
+        )
 
         if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
 
         # State mutations + router reload — post to the event loop so the
-        # router cache and inference path see the freshly-written keyed_pairs
+        # router cache and inference path see the freshly-written state
         # atomically with the consolidating flag clear.  Mode-agnostic at the
         # routing point: mirrors `_finalize_interim` / `_finalize_full` so a
         # simulate-mode cycle is queryable without a server restart, identical
@@ -7018,19 +7298,21 @@ def _extract_and_start_training():
         def _finalize_simulate() -> None:
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
+            # A later flip to train mode — or any code path that re-reads —
+            # sees the stale snapshot from the last train cycle.
             _state["last_consolidation_result"] = {
                 "status": "simulated",
                 "sessions": len(session_ids),
                 "skipped_oom": len(failed_session_ids),
-                "episodic_qa": len(all_episodic_qa),
+                "episodic_rels": len(all_episodic_rels),
                 "procedural_rels": len(all_procedural_rels),
                 "newly_promoted": len(newly_promoted),
                 "simulated": sim_result.get("simulated", True),
             }
             _state["consolidating"] = False
             logger.info(
-                "Simulation complete: %d episodic QA, %d procedural rels, %d promoted",
-                len(all_episodic_qa),
+                "Simulation complete: %d episodic, %d procedural relations, %d promoted",
+                len(all_episodic_rels),
                 len(all_procedural_rels),
                 len(newly_promoted),
             )
@@ -7053,7 +7335,10 @@ def _extract_and_start_training():
     # learned facts surface ahead of the stale main snapshot.
     if not loop.config.indexed_key_replay_enabled:
         logger.warning("Indexed key replay disabled — skipping training")
-        session_buffer.mark_consolidated(_completed_session_ids())
+        session_buffer.mark_consolidated(
+            _completed_session_ids(),
+            retention_dir=session_retention_dir(loop, config),
+        )
         if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=False)
         _state["consolidating"] = False
@@ -7073,7 +7358,6 @@ def _extract_and_start_training():
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        indexed_format=config.consolidation.indexed_format,
     )
     _state["background_trainer"] = bt
 
@@ -7088,7 +7372,7 @@ def _extract_and_start_training():
         """
         try:
             result = loop._train_extracted_into_interim(
-                all_episodic_qa,
+                all_episodic_rels,
                 all_procedural_rels,
                 run_label=f"tick-{primary_speaker or 'anon'}",
                 speaker_id=primary_speaker,
@@ -7109,18 +7393,6 @@ def _extract_and_start_training():
             # baseline regardless of whether training succeeded.
             if evict_voice_for_cycle:
                 _set_voice_pipeline_profile(_target_profile(), lock_held=True)
-            # A partial interim adapter may have been created (create_interim_adapter)
-            # before _train_extracted_into_interim raised — it's now in peft_config
-            # but never reached _finalize_interim, so it's absent from adapter_formats.
-            # Backfill any such entry with the current loop format so the inference
-            # path doesn't later probe it with the wrong recall template (it would
-            # default to "qa" otherwise). setdefault: never clobber a known format.
-            if hasattr(loop.model, "peft_config"):
-                _adapter_formats = _state.setdefault("adapter_formats", {})
-                _loop_fmt = getattr(loop, "_indexed_format", "qa")
-                for _name in loop.model.peft_config:
-                    _adapter_formats.setdefault(_name, _loop_fmt)
-            _state["consolidating"] = False
             return
 
         # Pick up any PeftModel handle rebinding from create_interim_adapter.
@@ -7135,11 +7407,14 @@ def _extract_and_start_training():
 
         # Disk I/O — safe from any thread.  Promotion + key-metadata persistence
         # mirror the previous main-write callback; the interim helper already
-        # handled the registry / keyed_pairs / simhash writes atomically.
+        # handled the registry / simhash writes atomically.
         try:
             _promote_mature_keys(loop, config)
             _save_key_metadata(loop, config)
-            session_buffer.mark_consolidated(_completed_session_ids())
+            session_buffer.mark_consolidated(
+                _completed_session_ids(),
+                retention_dir=session_retention_dir(loop, config),
+            )
         except Exception:
             logger.exception("Post-interim bookkeeping failed (non-fatal)")
 
@@ -7157,21 +7432,13 @@ def _extract_and_start_training():
             loop.model.eval()
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
-            # Refresh adapter_formats for the newly-trained interim adapter.
-            # The interim adapter was saved with a meta.json stamped with
-            # loop._indexed_format; we read it back so the inference path
-            # uses the right recall template immediately after training.
-            _new_adapter_name = result.get("adapter_name")
-            if _new_adapter_name:
-                _adapter_formats = _state.setdefault("adapter_formats", {})
-                _adapter_formats[_new_adapter_name] = getattr(loop, "_indexed_format", "qa")
+            # inference path sees the just-written interim slot (and any
+            # tier whose format drifted from the loop's current setting).
             # Count via the indexed_key_registry — it tracks every active key
             # regardless of which adapter (main or interim) currently holds it.
             # The previous main-tier-simhash sum under-reported by the count of
             # keys living in episodic_interim_<stamp> slots between full cycles.
-            total_keys = (
-                len(loop.indexed_key_registry) if loop.indexed_key_registry is not None else 0
-            )
+            total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
             _state["last_consolidation_result"] = {
                 "status": result.get("mode", "trained"),
                 "sessions": len(session_ids),
@@ -7228,6 +7495,7 @@ def _run_full_consolidation_sync() -> None:
             _state["model"],
             _state["tokenizer"],
             config,
+            _state["memory_store"],
             state_provider=lambda: _state,
         )
         _state["consolidation_loop"] = loop
@@ -7239,7 +7507,6 @@ def _run_full_consolidation_sync() -> None:
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        indexed_format=config.consolidation.indexed_format,
     )
     _state["background_trainer"] = bt
 
@@ -7327,7 +7594,14 @@ def _run_full_consolidation_sync() -> None:
             if session_buffer is not None:
                 pending_ids = [s["session_id"] for s in session_buffer.get_pending()]
                 if pending_ids:
-                    session_buffer.mark_consolidated(pending_ids)
+                    from paramem.server.consolidation import (
+                        session_retention_dir as _retdir,
+                    )
+
+                    session_buffer.mark_consolidated(
+                        pending_ids,
+                        retention_dir=_retdir(loop, config),
+                    )
         except Exception:
             logger.exception("Post-full-cycle bookkeeping failed (non-fatal)")
 
@@ -7341,17 +7615,10 @@ def _run_full_consolidation_sync() -> None:
             # operators see "FINGERPRINT MISMATCH … PA routing DISABLED" red
             # rows even though main is healthy.
             _revalidate_main_adapter_manifests(_state)
-            # Refresh adapter_formats for all main tiers now trained.
-            # The full-cycle loop trained them with loop._indexed_format;
-            # update so the inference path uses the right template immediately.
-            _fmt = getattr(loop, "_indexed_format", "qa")
-            _adapter_formats = _state.setdefault("adapter_formats", {})
-            for _tier in ("episodic", "semantic", "procedural"):
-                if hasattr(loop.model, "peft_config") and _tier in loop.model.peft_config:
-                    _adapter_formats[_tier] = _fmt
-            total_keys = (
-                len(loop.indexed_key_registry) if loop.indexed_key_registry is not None else 0
-            )
+            # were just re-saved with a fresh registry hash + format; the
+            # manifest is authoritative.  Also drops entries for retired
+            # interim slots so the inference path stops probing them.
+            total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
             _state["last_consolidation_result"] = {
                 "status": "rolled_back" if result.get("rolled_back") else "full_trained",
                 "tiers_rebuilt": result.get("tiers_rebuilt", []),
@@ -7412,6 +7679,7 @@ def _run_active_store_migration_sync() -> None:
             _state["model"],
             _state["tokenizer"],
             config,
+            _state["memory_store"],
             state_provider=lambda: _state,
         )
         _state["consolidation_loop"] = loop
@@ -7423,7 +7691,6 @@ def _run_active_store_migration_sync() -> None:
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        indexed_format=config.consolidation.indexed_format,
     )
     _state["background_trainer"] = bt
 
@@ -7465,14 +7732,10 @@ def _run_active_store_migration_sync() -> None:
                 )
             # Partial completion: pending_rehydration stays True so a re-trigger
             # picks up remaining tiers. effective_mode stays at source_mode.
-            # Refresh adapter_formats for all main tiers now (re-)trained.
-            # Parity with _finalize_full: keeps inference templates consistent
-            # after a simulate→train or train→simulate migration.
-            _fmt = getattr(loop, "_indexed_format", "qa")
-            _adapter_formats = _state.setdefault("adapter_formats", {})
-            for _tier in ("episodic", "semantic", "procedural"):
-                if hasattr(loop.model, "peft_config") and _tier in loop.model.peft_config:
-                    _adapter_formats[_tier] = _fmt
+            # peft_config alone is not a safe key set: a ``train → simulate``
+            # migration unloads main adapters, so iterating it misses them and
+            # the inference path sees a stale snapshot from boot.  Reading
+            # from disk also drops entries for slots the migration deleted.
             _state["consolidating"] = False
 
         aio_loop = _state.get("event_loop")

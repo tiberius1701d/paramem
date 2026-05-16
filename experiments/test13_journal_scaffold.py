@@ -463,19 +463,18 @@ def run_training_phase(
 
 def save_phase_artifacts(
     phase_dir: Path,
-    keyed_pairs: list[dict],
+    quads: list[dict],
     registry: dict[str, int],
     probe_state: EpochProbeState,
     extra: dict,
     marker_name: str,
 ) -> None:
-    """Persist keyed_pairs, registry, probe log, and a phase-done marker."""
+    """Persist quads, registry, probe log, and a phase-done marker."""
     phase_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(phase_dir / "keyed_pairs.json", "w") as f:
+    with open(phase_dir / "quads.json", "w") as f:
         kp_ser = [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_pairs
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in quads
         ]
         json.dump(kp_ser, f, indent=2)
 
@@ -564,7 +563,7 @@ def phase_A(
         tokenizer,
         "episodic",
         registry_path=None,
-        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        quads_path=phase_dir / "quads.json",
         key_count=len(keyed),
     )
     save_adapter(model, phase_dir / "adapter", "episodic", manifest=_manifest_A)
@@ -659,7 +658,7 @@ def phase_B(
         tokenizer,
         "episodic",
         registry_path=None,
-        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        quads_path=phase_dir / "quads.json",
         key_count=len(swap_keyed),
     )
     save_adapter(model, phase_dir / "adapter", "episodic", manifest=_manifest_B)
@@ -753,7 +752,7 @@ def phase_C1(
         tokenizer,
         "journal",
         registry_path=None,
-        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        quads_path=phase_dir / "quads.json",
         key_count=len(keyed),
     )
     save_adapter(model, phase_dir / "adapter", "journal", manifest=_manifest_C1)
@@ -850,7 +849,7 @@ def phase_C2(
         tokenizer,
         "journal",
         registry_path=None,
-        keyed_pairs_path=phase_dir / "keyed_pairs.json",
+        quads_path=phase_dir / "quads.json",
         key_count=len(fill_keyed),
     )
     save_adapter(model, phase_dir / "adapter", "journal", manifest=_manifest_C2)
@@ -941,8 +940,8 @@ def load_or_write_run_config(output_dir: Path, args) -> dict:
 
 
 def read_keyed(output_dir: Path, phase: str) -> tuple[list[dict], dict[str, int]]:
-    """Reload keyed_pairs + registry for a completed phase."""
-    with open(output_dir / phase / "keyed_pairs.json") as f:
+    """Reload quads + registry for a completed phase."""
+    with open(output_dir / phase / "quads.json") as f:
         keyed = json.load(f)
     with open(output_dir / phase / "simhash_registry.json") as f:
         registry = json.load(f)

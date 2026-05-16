@@ -119,7 +119,7 @@ def run_scale_point(
     if isinstance(model, _PeftModel):
         model = model.base_model.model
 
-    model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+    model, quads, registry, train_time, metrics = train_indexed_keys(
         model,
         tokenizer,
         subset,
@@ -134,14 +134,14 @@ def run_scale_point(
     recall_result = evaluate_indexed_recall(
         model,
         tokenizer,
-        keyed_pairs,
+        quads,
         registry,
         adapter_name=adapter_name,
     )
 
     # Compute embedding similarity for parametric recall (unified metric with RAG)
     param_similarities = []
-    for pk_result, kp in zip(recall_result["per_key"], keyed_pairs):
+    for pk_result, kp in zip(recall_result["per_key"], quads):
         recalled = pk_result.get("recalled")
         if recalled and "answer" in recalled:
             sim = compute_similarity(kp["answer"], recalled["answer"])
@@ -165,7 +165,7 @@ def run_scale_point(
         "parametric_embedding_similarity": {
             "mean_similarity": param_mean_sim,
             "match_count": param_match_count,
-            "match_rate": param_match_count / max(len(keyed_pairs), 1),
+            "match_rate": param_match_count / max(len(quads), 1),
             "threshold": MATCH_THRESHOLD,
             "scoring_metric": "embedding_similarity (all-MiniLM-L6-v2 cosine)",
             "note": "probe_key and RAG both use max_new_tokens=200",
@@ -179,7 +179,7 @@ def run_scale_point(
         from paramem.evaluation.recall import generate_answer
 
         rag = QARAGPipeline()
-        rag.build_index(keyed_pairs)  # Same distilled pairs as parametric
+        rag.build_index(quads)  # Same distilled pairs as parametric
 
         model.gradient_checkpointing_disable()
 
@@ -188,7 +188,7 @@ def run_scale_point(
 
         def _run_rag():
             nonlocal match_count
-            for kp in keyed_pairs:
+            for kp in quads:
                 prompt = rag.format_prompt(kp["question"], tokenizer, top_k=3)
                 generated = generate_answer(
                     model,
@@ -217,14 +217,14 @@ def run_scale_point(
         else:
             _run_rag()
 
-        total = max(len(keyed_pairs), 1)
+        total = max(len(quads), 1)
         rag_mean = sum(r["similarity"] for r in rag_results) / total
 
         result["rag_recall"] = {
             "mean_similarity": rag_mean,
             "match_count": match_count,
             "match_rate": match_count / total,
-            "total": len(keyed_pairs),
+            "total": len(quads),
             "threshold": MATCH_THRESHOLD,
             "scoring_metric": "embedding_similarity (all-MiniLM-L6-v2 cosine)",
             "per_question": rag_results,

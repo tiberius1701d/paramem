@@ -70,16 +70,16 @@ def main():
                 "mention_count": len(fact.get("sessions", [])),
             }
 
-    # Load distilled keyed_pairs saved during training
-    keyed_pairs_path = last_session / "keyed_pairs.json"
-    if keyed_pairs_path.exists():
-        with open(keyed_pairs_path) as f:
-            keyed_pairs = json.load(f)
-        print(f"Loaded distilled keyed_pairs: {len(keyed_pairs)} pairs")
+    # Load distilled quads saved during training
+    quads_path = last_session / "quads.json"
+    if quads_path.exists():
+        with open(quads_path) as f:
+            quads = json.load(f)
+        print(f"Loaded distilled quads: {len(quads)} pairs")
     else:
         # Fallback: reconstruct from raw data (will NOT match trained QA — recall will be wrong)
         logger.warning(
-            "No keyed_pairs.json found — falling back to raw data reconstruction. "
+            "No quads.json found — falling back to raw data reconstruction. "
             "Recall evaluation will be invalid."
         )
         cumulative_qa = {}
@@ -92,8 +92,8 @@ def main():
                             "answer": fact["answer"],
                         }
         qa_list = list(cumulative_qa.values())
-        keyed_pairs = assign_keys(qa_list)
-        print(f"WARNING: Using raw QA pairs (not distilled): {len(keyed_pairs)}")
+        quads = assign_keys(qa_list)
+        print(f"WARNING: Using raw QA pairs (not distilled): {len(quads)}")
 
     # Load registry
     registry_path = last_session / "simhash_registry.json"
@@ -132,12 +132,12 @@ def main():
     recall_result = None
     per_key = []
     exact = 0
-    total = len(keyed_pairs)
+    total = len(quads)
 
     if not getattr(args, "rag_only", False):
         print("\n--- Re-evaluating recall ---")
         recall_result = evaluate_indexed_recall(
-            model, tokenizer, keyed_pairs, registry, adapter_name="episodic"
+            model, tokenizer, quads, registry, adapter_name="episodic"
         )
         per_key = recall_result["per_key"]
         exact = recall_result["exact_count"]
@@ -205,7 +205,7 @@ def main():
         "note": "Resumed from saved adapter — recall re-evaluated, RAG baseline added",
         "final_recall": {
             "session": session_num,
-            "cumulative_facts": len(keyed_pairs),
+            "cumulative_facts": len(quads),
             "exact_count": exact,
             "total": total,
             "mean_confidence": recall_result["mean_confidence"] if recall_result else None,

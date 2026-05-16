@@ -47,6 +47,8 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     )
     defaults.update(kwargs)
 
+    from paramem.training.memory_store import MemoryStore as _MS
+
     loop = ConsolidationLoop(
         model=model,
         tokenizer=MagicMock(),
@@ -54,6 +56,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         training_config=TrainingConfig(),
         episodic_adapter_config=AdapterConfig(),
         semantic_adapter_config=AdapterConfig(),
+        memory_store=_MS(replay_enabled=False),
         procedural_adapter_config=None,
         output_dir=tmp_path,
         persist_graph=False,
@@ -954,9 +957,9 @@ class TestInterimEnrichmentHook:
                     {
                         "question": "q",
                         "answer": "a",
-                        "source_subject": "S",
-                        "source_predicate": "p",
-                        "source_object": "O",
+                        "subject": "S",
+                        "predicate": "p",
+                        "object": "O",
                     }
                 ],
                 [],
@@ -992,9 +995,9 @@ class TestInterimEnrichmentHook:
                     {
                         "question": "q",
                         "answer": "a",
-                        "source_subject": "S",
-                        "source_predicate": "p",
-                        "source_object": "O",
+                        "subject": "S",
+                        "predicate": "p",
+                        "object": "O",
                     }
                 ],
                 [],
@@ -1033,9 +1036,9 @@ class TestInterimEnrichmentHook:
                     {
                         "question": "q",
                         "answer": "a",
-                        "source_subject": "S",
-                        "source_predicate": "p",
-                        "source_object": "O",
+                        "subject": "S",
+                        "predicate": "p",
+                        "object": "O",
                     }
                 ],
                 [],
@@ -1070,9 +1073,9 @@ class TestInterimEnrichmentHook:
                     {
                         "question": "q",
                         "answer": "a",
-                        "source_subject": "S",
-                        "source_predicate": "p",
-                        "source_object": "O",
+                        "subject": "S",
+                        "predicate": "p",
+                        "object": "O",
                     }
                 ],
                 [],
@@ -1117,9 +1120,9 @@ class TestInterimEnrichmentHook:
                     {
                         "question": "q",
                         "answer": "a",
-                        "source_subject": "S",
-                        "source_predicate": "p",
-                        "source_object": "O",
+                        "subject": "S",
+                        "predicate": "p",
+                        "object": "O",
                     }
                 ],
                 [],
@@ -1138,9 +1141,19 @@ class TestInterimEnrichmentHook:
 
         # Mark the newest interim degenerated → post_session_train returns
         # early with mode="degenerated" before any imports or training.
-        registry = MagicMock()
-        registry.is_adapter_healthy.return_value = False
-        loop.indexed_key_registry = registry
+        # indexed_key_registry is now dict[str, KeyRegistry]; the newest interim
+        # tier entry must have is_healthy() == False.
+        from paramem.training.key_registry import ADAPTER_HEALTH_DEGENERATED
+        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
+
+        _interim_reg = _KeyRegistry()
+        _interim_reg.set_health(ADAPTER_HEALTH_DEGENERATED, reason="test-degenerated")
+        loop.indexed_key_registry = {
+            "episodic": _KeyRegistry(),
+            "semantic": _KeyRegistry(),
+            "procedural": _KeyRegistry(),
+            newest_name: _interim_reg,
+        }
 
         result = loop.post_session_train(
             session_transcript="t",

@@ -310,9 +310,9 @@ def run_probe(
         ``base_natural_contains_truth``, ``adapter_keyed_recovered``,
         ``adapter_keyed_raw``.
     """
+    from experiments.reasoning_fluency_probe import contains_truth
     from peft import PeftModel
 
-    from experiments.reasoning_fluency_probe import contains_truth
     from experiments.utils.quadruple_format import probe_quad
     from paramem.evaluation.recall import generate_answer
 

@@ -717,7 +717,7 @@ class TestLoadPhaseAFromExisting:
         stop_epoch: int = 23,
         wall_seconds: float = 9862.6,
     ) -> None:
-        """Write stub A_done.json, adapter slot, and keyed_pairs/registry.
+        """Write stub A_done.json, adapter slot, and quads/registry.
 
         Creates a minimal adapter slot that satisfies ``resolve_adapter_slot``
         /``find_live_slot``: the slot directory must contain a ``meta.json``
@@ -756,7 +756,7 @@ class TestLoadPhaseAFromExisting:
                 }
             )
         )
-        (a_dir / "keyed_pairs.json").write_text(
+        (a_dir / "quads.json").write_text(
             json.dumps(
                 [{"key": f"graph{i}", "question": f"Q{i}", "answer": f"A{i}"} for i in range(1, 4)]
             )

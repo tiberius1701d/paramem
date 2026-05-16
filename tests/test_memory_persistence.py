@@ -1,14 +1,12 @@
-"""Unit tests for paramem.server.simulate_store.
+"""Unit tests for paramem.training.memory_persistence.
 
-Covers round-trip contract, encryption awareness, iter_quads edge-skipping,
-quad_by_key hit/miss, entity/speaker index helpers, and build_tier_graph_from_loop.
-Reuses the encryption-aware fixture pattern from tests/test_keyed_pairs_io_quad.py.
+Covers round-trip contract, encryption awareness, iter_entries edge-skipping,
+entry_by_key hit/miss, entity/speaker index helpers, and build_tier_graph_from_store.
 """
 
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import networkx as nx
 import pytest
@@ -21,17 +19,19 @@ from paramem.backup.key_store import (
     wrap_daily_identity,
     write_daily_key_file,
 )
-from paramem.server.simulate_store import (
+from paramem.training.memory_persistence import (
     _IK_KEY_ATTR,
-    build_tier_graph_from_loop,
-    iter_quads,
+    build_tier_graph_from_store,
+    entry_by_key,
+    iter_entries,
     keys_for_entity,
     keys_for_speaker,
-    load_simulate_graph,
-    quad_by_key,
-    save_simulate_graph,
+    load_memory_from_disk,
+    save_memory_to_disk,
 )
-from paramem.training.keyed_pairs_io import KEYED_PAIR_FIELDS_QUAD
+
+# Canonical entry schema (current shape: six-field quadruple).
+KEYED_ENTRY_FIELDS = ("key", "subject", "predicate", "object", "speaker_id", "first_seen_cycle")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,15 +58,15 @@ def _add_keyed_edge(
     speaker_id: str,
     first_seen_cycle: int,
 ) -> None:
-    """Test-local wrapper around simulate_store._add_keyed_edge.
+    """Test-local wrapper around memory_persistence._add_keyed_edge.
 
     Delegates to the production helper so tests exercise the same code path
-    that ``build_tier_graph_from_loop`` uses.  The indexed-memory key is stored
-    as ``"ik_key"`` in edge data (never as the NetworkX multigraph edge-key
-    parameter) so it survives ``nx.node_link_data`` / ``nx.node_link_graph``
-    round-trips intact.
+    that ``build_tier_graph_from_store`` uses.  The indexed-memory key is
+    stored as ``"ik_key"`` in edge data (never as the NetworkX multigraph
+    edge-key parameter) so it survives ``nx.node_link_data`` /
+    ``nx.node_link_graph`` round-trips intact.
     """
-    from paramem.server.simulate_store import _add_keyed_edge as _prod_add
+    from paramem.training.memory_persistence import _add_keyed_edge as _prod_add
 
     _prod_add(
         graph,
@@ -127,21 +127,16 @@ def _env_isolation(monkeypatch):
 
 class TestRoundTrip:
     def test_round_trip_preserves_edge_data(self, tmp_path):
-        """save_simulate_graph then load returns graph with same edge attributes.
-
-        The public API view (via iter_quads) exposes 'key'; internally the
-        graph stores the indexed-memory key as _IK_KEY_ATTR to avoid the
-        NetworkX serialisation collision.
-        """
+        """save_memory_to_disk then load returns graph with same edge attributes."""
         g = _make_simple_graph()
         path = tmp_path / "graph.json"
-        save_simulate_graph(g, path)
-        g2 = load_simulate_graph(path)
+        save_memory_to_disk(g, path)
+        g2 = load_memory_from_disk(path)
 
-        # Verify internal storage via iter_quads (public API).
-        quads = list(iter_quads(g2))
-        assert len(quads) == 1
-        q = quads[0]
+        # Verify internal storage via iter_entries (public API).
+        entries = list(iter_entries(g2))
+        assert len(entries) == 1
+        q = entries[0]
         assert q["key"] == "graph1"
         assert q["subject"] == _SUBJECT
         assert q["object"] == _OBJECT
@@ -178,39 +173,39 @@ class TestRoundTrip:
             first_seen_cycle=2,
         )
         path = tmp_path / "graph.json"
-        save_simulate_graph(g, path)
-        g2 = load_simulate_graph(path)
+        save_memory_to_disk(g, path)
+        g2 = load_memory_from_disk(path)
         assert g2.number_of_edges() == 2
         # Verify both keys are present in edge data.
-        quads = {q["key"] for q in iter_quads(g2)}
-        assert quads == {"graph1", "graph2"}
+        keys = {q["key"] for q in iter_entries(g2)}
+        assert keys == {"graph1", "graph2"}
 
     def test_round_trip_creates_parent_directory(self, tmp_path):
-        """save_simulate_graph creates missing parent directories."""
+        """save_memory_to_disk creates missing parent directories."""
         path = tmp_path / "subdir" / "nested" / "graph.json"
-        save_simulate_graph(_make_simple_graph(), path)
+        save_memory_to_disk(_make_simple_graph(), path)
         assert path.exists()
 
     def test_round_trip_empty_graph(self, tmp_path):
         """An empty graph survives the round-trip."""
         g = nx.MultiDiGraph()
         path = tmp_path / "graph.json"
-        save_simulate_graph(g, path)
-        g2 = load_simulate_graph(path)
+        save_memory_to_disk(g, path)
+        g2 = load_memory_from_disk(path)
         assert g2.number_of_edges() == 0
         assert g2.number_of_nodes() == 0
 
 
 # ---------------------------------------------------------------------------
-# 2. load_simulate_graph on missing path returns empty MultiDiGraph — no raise
+# 2. load_memory_from_disk on missing path returns empty MultiDiGraph — no raise
 # ---------------------------------------------------------------------------
 
 
 class TestLoadMissingPath:
     def test_missing_path_returns_empty_multigraph(self, tmp_path):
-        """load_simulate_graph returns an empty MultiDiGraph when path is absent."""
+        """load_memory_from_disk returns an empty MultiDiGraph when path is absent."""
         path = tmp_path / "does_not_exist.json"
-        g = load_simulate_graph(path)
+        g = load_memory_from_disk(path)
         assert isinstance(g, nx.MultiDiGraph)
         assert g.number_of_nodes() == 0
         assert g.number_of_edges() == 0
@@ -219,18 +214,18 @@ class TestLoadMissingPath:
         """No exception is raised when path is absent."""
         path = tmp_path / "absent" / "graph.json"
         # No FileNotFoundError or OSError expected.
-        g = load_simulate_graph(path)
+        g = load_memory_from_disk(path)
         assert isinstance(g, nx.MultiDiGraph)
 
 
 # ---------------------------------------------------------------------------
-# 3. iter_quads skips edges without a "key" attribute
+# 3. iter_entries skips edges without a "key" attribute
 # ---------------------------------------------------------------------------
 
 
-class TestIterQuadsSkipsKeylessEdges:
+class TestIterEntriesSkipsKeylessEdges:
     def test_skips_edge_without_key(self):
-        """iter_quads yields only edges that carry a 'key' attribute."""
+        """iter_entries yields only edges that carry a 'key' attribute."""
         g = nx.MultiDiGraph()
         # Edge WITH key — added via helper so 'key' lands in edge data.
         _add_keyed_edge(
@@ -244,36 +239,36 @@ class TestIterQuadsSkipsKeylessEdges:
         )
         # Edge WITHOUT key — direct add_edge, no 'key' attribute in data.
         g.add_edge("Alice", "Paris", predicate="visited", speaker_id="S0", first_seen_cycle=2)
-        quads = list(iter_quads(g))
-        assert len(quads) == 1
-        assert quads[0]["key"] == "graph1"
+        entries = list(iter_entries(g))
+        assert len(entries) == 1
+        assert entries[0]["key"] == "graph1"
 
     def test_empty_graph_yields_nothing(self):
-        """iter_quads on an empty graph yields no items."""
-        assert list(iter_quads(nx.MultiDiGraph())) == []
+        """iter_entries on an empty graph yields no items."""
+        assert list(iter_entries(nx.MultiDiGraph())) == []
 
     def test_graph_with_no_keyed_edges_yields_nothing(self):
         """A graph where no edges carry 'key' yields no items."""
         g = nx.MultiDiGraph()
         g.add_edge("A", "B", predicate="related", speaker_id="S0", first_seen_cycle=1)
-        assert list(iter_quads(g)) == []
+        assert list(iter_entries(g)) == []
 
 
 # ---------------------------------------------------------------------------
-# 4. iter_quads shape: every yielded dict has exactly the 6 KEYED_PAIR_FIELDS_QUAD
+# 4. iter_entries shape: every yielded dict has exactly the KEYED_ENTRY_FIELDS
 # ---------------------------------------------------------------------------
 
 
-class TestIterQuadsShape:
+class TestIterEntriesShape:
     def test_yielded_dict_has_exactly_six_fields(self):
-        """Every dict from iter_quads contains exactly the KEYED_PAIR_FIELDS_QUAD fields."""
+        """Every dict from iter_entries contains exactly the KEYED_ENTRY_FIELDS."""
         g = _make_simple_graph()
-        quads = list(iter_quads(g))
-        assert len(quads) == 1
-        assert set(quads[0].keys()) == set(KEYED_PAIR_FIELDS_QUAD)
+        entries = list(iter_entries(g))
+        assert len(entries) == 1
+        assert set(entries[0].keys()) == set(KEYED_ENTRY_FIELDS)
 
     def test_subject_and_object_come_from_graph_topology(self):
-        """iter_quads reads subject/object from edge endpoints, not edge-data."""
+        """iter_entries reads subject/object from edge endpoints, not edge-data."""
         g = nx.MultiDiGraph()
         _add_keyed_edge(
             g,
@@ -284,12 +279,12 @@ class TestIterQuadsShape:
             speaker_id="S",
             first_seen_cycle=0,
         )
-        q = list(iter_quads(g))[0]
+        q = list(iter_entries(g))[0]
         assert q["subject"] == "SubjectNode"
         assert q["object"] == "ObjectNode"
 
     def test_multiple_keyed_edges_each_have_full_schema(self):
-        """All six fields are present in every yielded dict."""
+        """All canonical fields are present in every yielded dict."""
         g = nx.MultiDiGraph()
         for i in range(3):
             _add_keyed_edge(
@@ -301,20 +296,20 @@ class TestIterQuadsShape:
                 speaker_id="S",
                 first_seen_cycle=i,
             )
-        for quad in iter_quads(g):
-            assert set(quad.keys()) == set(KEYED_PAIR_FIELDS_QUAD)
+        for entry in iter_entries(g):
+            assert set(entry.keys()) == set(KEYED_ENTRY_FIELDS)
 
 
 # ---------------------------------------------------------------------------
-# 5. quad_by_key: hit and miss
+# 5. entry_by_key: hit and miss
 # ---------------------------------------------------------------------------
 
 
-class TestQuadByKey:
+class TestEntryByKey:
     def test_hit_returns_matching_dict(self):
-        """quad_by_key returns the correct quad dict on a hit."""
+        """entry_by_key returns the correct entry dict on a hit."""
         g = _make_simple_graph()
-        result = quad_by_key(g, "graph1")
+        result = entry_by_key(g, "graph1")
         assert result is not None
         assert result["key"] == "graph1"
         assert result["subject"] == _SUBJECT
@@ -324,15 +319,15 @@ class TestQuadByKey:
         assert result["first_seen_cycle"] == 3
 
     def test_miss_returns_none(self):
-        """quad_by_key returns None when the key is absent."""
+        """entry_by_key returns None when the key is absent."""
         g = _make_simple_graph()
-        result = quad_by_key(g, "graph999")
+        result = entry_by_key(g, "graph999")
         assert result is None
 
     def test_empty_graph_returns_none(self):
-        """quad_by_key on an empty graph always returns None."""
+        """entry_by_key on an empty graph always returns None."""
         g = nx.MultiDiGraph()
-        assert quad_by_key(g, "graph1") is None
+        assert entry_by_key(g, "graph1") is None
 
     def test_returns_first_matching_edge(self):
         """When multiple edges share the same key, the first one is returned."""
@@ -343,7 +338,7 @@ class TestQuadByKey:
         _add_keyed_edge(
             g, "C", "D", indexed_key="graph1", predicate="p2", speaker_id="S1", first_seen_cycle=2
         )
-        result = quad_by_key(g, "graph1")
+        result = entry_by_key(g, "graph1")
         assert result is not None
         assert result["key"] == "graph1"
 
@@ -426,7 +421,7 @@ class TestKeysForEntity:
         assert result == {"graph1", "graph2", "graph3"}
 
     def test_skips_keyless_edges(self):
-        """Keyless edges are ignored (iter_quads skips them)."""
+        """Keyless edges are ignored (iter_entries skips them)."""
         g = nx.MultiDiGraph()
         g.add_edge("Alice", "Berlin")  # no "key" attribute in data
         result = keys_for_entity(g, "alice")
@@ -503,23 +498,24 @@ class TestKeysForSpeaker:
 
 
 # ---------------------------------------------------------------------------
-# 8. build_tier_graph_from_loop: happy path
+# 8. build_tier_graph_from_store: happy path
 # ---------------------------------------------------------------------------
 
 
-class TestBuildTierGraphFromLoop:
-    def _make_loop(self, *, simhash: dict, cache: dict) -> SimpleNamespace:
-        """Build a minimal stub loop for testing build_tier_graph_from_loop."""
-        return SimpleNamespace(
-            episodic_simhash=simhash,
-            semantic_simhash={},
-            procedural_simhash={},
-            indexed_key_cache=cache,
-        )
+class TestBuildTierGraphFromStore:
+    def _make_store(self, *, simhash: dict, cache: dict, tier: str = "episodic"):
+        """Build a minimal MemoryStore for testing build_tier_graph_from_store."""
+        from paramem.training.memory_store import MemoryStore
+
+        store = MemoryStore(replay_enabled=False)
+        store.replace_simhashes_in_tier(tier, simhash)
+        for k, q in cache.items():
+            store.put(tier, k, q, register=False)
+        return store
 
     def test_happy_path_single_key(self):
-        """build_tier_graph_from_loop produces a graph with the expected edge."""
-        loop = self._make_loop(
+        """build_tier_graph_from_store produces a graph with the expected edge."""
+        store = self._make_store(
             simhash={"graph1": 0xABCDEF},
             cache={
                 "graph1": {
@@ -532,12 +528,11 @@ class TestBuildTierGraphFromLoop:
                 }
             },
         )
-        g = build_tier_graph_from_loop(loop, "episodic")
+        g = build_tier_graph_from_store(store, "episodic")
         assert g.number_of_edges() == 1
-        # Verify via the public API (iter_quads maps ik_key → key).
-        quads = list(iter_quads(g))
-        assert len(quads) == 1
-        q = quads[0]
+        entries = list(iter_entries(g))
+        assert len(entries) == 1
+        q = entries[0]
         assert q["key"] == "graph1"
         assert q["subject"] == "Alice"
         assert q["object"] == "Berlin"
@@ -547,7 +542,7 @@ class TestBuildTierGraphFromLoop:
 
     def test_happy_path_multiple_keys(self):
         """All keys in the simhash registry are added to the graph."""
-        loop = self._make_loop(
+        store = self._make_store(
             simhash={"graph1": 1, "graph2": 2},
             cache={
                 "graph1": {
@@ -568,25 +563,23 @@ class TestBuildTierGraphFromLoop:
                 },
             },
         )
-        g = build_tier_graph_from_loop(loop, "episodic")
+        g = build_tier_graph_from_store(store, "episodic")
         assert g.number_of_edges() == 2
-        quads_by_key = {q["key"]: q for q in iter_quads(g)}
-        assert "graph1" in quads_by_key
-        assert "graph2" in quads_by_key
+        entries_by_key = {q["key"]: q for q in iter_entries(g)}
+        assert "graph1" in entries_by_key
+        assert "graph2" in entries_by_key
 
     def test_empty_simhash_returns_empty_graph(self):
         """An empty simhash registry produces an empty graph."""
-        loop = self._make_loop(simhash={}, cache={})
-        g = build_tier_graph_from_loop(loop, "episodic")
+        store = self._make_store(simhash={}, cache={})
+        g = build_tier_graph_from_store(store, "episodic")
         assert g.number_of_edges() == 0
 
     def test_semantic_tier_is_routed_correctly(self):
-        """build_tier_graph_from_loop uses the correct tier attribute."""
-        loop = SimpleNamespace(
-            episodic_simhash={},
-            semantic_simhash={"graph10": 99},
-            procedural_simhash={},
-            indexed_key_cache={
+        """build_tier_graph_from_store uses the correct tier attribute."""
+        store = self._make_store(
+            simhash={"graph10": 99},
+            cache={
                 "graph10": {
                     "key": "graph10",
                     "subject": "X",
@@ -596,29 +589,29 @@ class TestBuildTierGraphFromLoop:
                     "first_seen_cycle": 0,
                 },
             },
+            tier="semantic",
         )
-        g = build_tier_graph_from_loop(loop, "semantic")
+        g = build_tier_graph_from_store(store, "semantic")
         assert g.number_of_edges() == 1
-        quads = list(iter_quads(g))
-        assert quads[0]["key"] == "graph10"
+        entries = list(iter_entries(g))
+        assert entries[0]["key"] == "graph10"
 
 
 # ---------------------------------------------------------------------------
-# 9. build_tier_graph_from_loop raises KeyError on cache miss
+# 9. build_tier_graph_from_store raises KeyError on cache miss
 # ---------------------------------------------------------------------------
 
 
 class TestBuildTierGraphKeyError:
     def test_raises_key_error_when_cache_missing_key(self):
-        """build_tier_graph_from_loop raises KeyError when simhash key absent from cache."""
-        loop = SimpleNamespace(
-            episodic_simhash={"graph1": 0xABCDEF},
-            semantic_simhash={},
-            procedural_simhash={},
-            indexed_key_cache={},  # "graph1" is absent — must raise
-        )
+        """build_tier_graph_from_store raises KeyError when simhash key absent from store."""
+        from paramem.training.memory_store import MemoryStore
+
+        store = MemoryStore(replay_enabled=False)
+        store.put_simhash("episodic", "graph1", 0xABCDEF)
+        # "graph1" simhash present but entry absent — must raise.
         with pytest.raises(KeyError):
-            build_tier_graph_from_loop(loop, "episodic")
+            build_tier_graph_from_store(store, "episodic")
 
 
 # ---------------------------------------------------------------------------
@@ -632,20 +625,20 @@ class TestEncryptionRoundTrip:
         _setup_daily(tmp_path, monkeypatch)
         g = _make_simple_graph()
         path = tmp_path / "graph.json"
-        save_simulate_graph(g, path, encrypted=True)
-        g2 = load_simulate_graph(path)
+        save_memory_to_disk(g, path, encrypted=True)
+        g2 = load_memory_from_disk(path)
         assert g2.number_of_edges() == 1
-        quads = list(iter_quads(g2))
-        assert quads[0]["key"] == "graph1"
-        assert quads[0]["subject"] == _SUBJECT
-        assert quads[0]["object"] == _OBJECT
+        entries = list(iter_entries(g2))
+        assert entries[0]["key"] == "graph1"
+        assert entries[0]["subject"] == _SUBJECT
+        assert entries[0]["object"] == _OBJECT
 
     def test_encrypted_bytes_are_not_plaintext_json(self, tmp_path, monkeypatch):
         """On-disk bytes are age-encrypted — do not contain the JSON 'directed' marker."""
         _setup_daily(tmp_path, monkeypatch)
         g = _make_simple_graph()
         path = tmp_path / "graph.json"
-        save_simulate_graph(g, path, encrypted=True)
+        save_memory_to_disk(g, path, encrypted=True)
         raw = path.read_bytes()
         assert raw.startswith(AGE_MAGIC), f"expected age envelope, got {raw[:40]!r}"
         # The plaintext marker ("directed" is in every nx.node_link_data output)
@@ -661,7 +654,7 @@ class TestEncryptionRoundTrip:
         monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
         g = _make_simple_graph()
         path = tmp_path / "graph.json"
-        save_simulate_graph(g, path, encrypted=False)
+        save_memory_to_disk(g, path, encrypted=False)
         raw = path.read_bytes()
         # Plaintext must be valid JSON and contain the "directed" key.
         parsed = json.loads(raw.decode("utf-8"))

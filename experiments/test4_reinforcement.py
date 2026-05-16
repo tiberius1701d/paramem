@@ -130,7 +130,7 @@ def run_reinforcement_test(
             len(session_qa),
         )
 
-        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+        model, quads, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
             qa_list,
@@ -142,21 +142,20 @@ def run_reinforcement_test(
             skip_distill=True,  # Clean synthetic QA pairs, no distillation needed
         )
 
-        # Save distilled keyed_pairs so resume scripts can evaluate recall
+        # Save distilled quads so resume scripts can evaluate recall
         session_dir = output_dir / f"session_{session_num}"
         session_dir.mkdir(parents=True, exist_ok=True)
         kp_serializable = [
-            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]}
-            for kp in keyed_pairs
+            {"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in quads
         ]
-        with open(session_dir / "keyed_pairs.json", "w") as f:
+        with open(session_dir / "quads.json", "w") as f:
             json.dump(kp_serializable, f, indent=2)
 
         # Evaluate recall on all cumulative facts
         recall_result = evaluate_indexed_recall(
             model,
             tokenizer,
-            keyed_pairs,
+            quads,
             registry,
             adapter_name=adapter_name,
         )

@@ -92,7 +92,7 @@ def _generate_qa_with_llm(
     model,
     tokenizer,
 ) -> dict:
-    """Use the model with few-shot examples to generate a natural QA pair."""
+    """Use the model with few-shot examples to generate a natural relation."""
     from paramem.evaluation.recall import generate_answer
 
     prompt_text = _build_few_shot_prompt(subject, predicate, obj)
@@ -163,9 +163,9 @@ def _generate_qa_with_llm(
         return {
             "question": question,
             "answer": answer,
-            "source_predicate": predicate,
-            "source_subject": subject,
-            "source_object": obj,
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
         }
 
     # Last resort: construct from the triple directly.
@@ -175,9 +175,9 @@ def _generate_qa_with_llm(
     return {
         "question": f"What does {subject} {readable_pred}?",
         "answer": f"{subject} {readable_pred} {obj}.",
-        "source_predicate": predicate,
-        "source_subject": subject,
-        "source_object": obj,
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
     }
 
 
@@ -188,7 +188,7 @@ def generate_qa_from_relations(
 ) -> list[dict]:
     """Convert graph relations into QA training pairs.
 
-    Uses the model with few-shot prompting to generate natural QA pairs
+    Uses the model with few-shot prompting to generate natural relations
     from any (subject, predicate, object) triple. The model handles
     arbitrary predicates — no template set limits what can be expressed.
 
@@ -210,7 +210,8 @@ def generate_qa_from_relations(
         tokenizer: Tokenizer for the model.
 
     Returns:
-        List of dicts with 'question', 'answer', and source metadata keys.
+        List of dicts with ``question``, ``answer``, ``subject``,
+        ``predicate``, and ``object`` keys.
     """
     if model is None or tokenizer is None:
         return _run_qa_generation(relations, model, tokenizer)
@@ -244,32 +245,28 @@ def generate_qa_from_graph(
     model=None,
     tokenizer=None,
 ) -> tuple[list[dict], list[dict]]:
-    """Convert a ``SessionGraph`` into ``(episodic_qa, procedural_relations)``.
+    """Convert a ``SessionGraph`` into ``(episodic_rels, procedural_relations)``.
 
-    Single entry point for graph → keyed-QA-pair distillation.  The graph
+    Single entry point for graph → episodic/procedural relation split.  The graph
     holds knowledge in two surfaces — ``.relations`` and ``.entities[*].attributes``
-    — and both must reach the QA generator.  This function unifies them: it
-    reads relations directly, projects entity attributes into the same
+    — and both must reach the distillation stage.  This function unifies them:
+    it reads relations directly, projects entity attributes into the same
     relation-dict shape via :func:`_flatten_entity_attributes`, partitions the
     union by ``relation_type`` (``preference`` → procedural, everything else →
-    episodic), and mints QA pairs for the episodic side via the LLM-based
-    generator.
-
-    Procedural relations are returned as raw relation dicts (the procedural
-    adapter trains on relation-shaped input, not on QA pairs, in the live
-    consolidation flow).
+    episodic), and mints natural-language phrasings for the episodic side via
+    the LLM-based generator.
 
     Args:
         session_graph: The freshly extracted ``SessionGraph`` for one session.
         procedural_enabled: ``True`` if the procedural adapter is enabled —
             controls whether ``preference`` relations route to the procedural
             return slot or stay episodic.
-        model: Base model for LLM-based QA generation.  ``None`` falls through
-            to the template fallback (used by unit tests).
+        model: Base model for LLM-based natural-language generation.  ``None``
+            falls through to the template fallback (used by unit tests).
         tokenizer: Tokenizer matching ``model``.
 
     Returns:
-        ``(episodic_qa, procedural_relations)`` — the same shape the call
+        ``(episodic_rels, procedural_relations)`` — the same shape the call
         sites in ``ConsolidationLoop.extract_session`` and
         ``ConsolidationLoop.run_cycle`` expect.
     """
@@ -291,8 +288,8 @@ def generate_qa_from_graph(
     episodic_relations, procedural_relations = partition_relations(
         relation_dicts, procedural_enabled=procedural_enabled
     )
-    episodic_qa = generate_qa_from_relations(episodic_relations, model=model, tokenizer=tokenizer)
-    return episodic_qa, procedural_relations
+    episodic_rels = generate_qa_from_relations(episodic_relations, model=model, tokenizer=tokenizer)
+    return episodic_rels, procedural_relations
 
 
 def _run_qa_generation(relations: list[dict], model, tokenizer) -> list[dict]:
@@ -310,7 +307,7 @@ def _run_qa_generation(relations: list[dict], model, tokenizer) -> list[dict]:
             # Template fallback for unit tests (no model available)
             qa_pairs.extend(_template_fallback(subject, predicate, obj))
 
-    logger.info("Generated %d QA pairs from %d relations", len(qa_pairs), len(relations))
+    logger.info("Generated %d relations from %d relations", len(qa_pairs), len(relations))
     for qa in qa_pairs:
         logger.debug(
             "  QA: Q=%s | A=%s",
@@ -352,9 +349,9 @@ def _template_fallback(subject: str, predicate: str, obj: str) -> list[dict]:
             {
                 "question": q_tmpl.format(subject=subject, object=obj),
                 "answer": a_tmpl.format(subject=subject, object=obj),
-                "source_predicate": predicate,
-                "source_subject": subject,
-                "source_object": obj,
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
             }
         ]
 
@@ -363,8 +360,8 @@ def _template_fallback(subject: str, predicate: str, obj: str) -> list[dict]:
         {
             "question": f"What does {subject} {readable}?",
             "answer": f"{subject} {readable} {obj}.",
-            "source_predicate": predicate,
-            "source_subject": subject,
-            "source_object": obj,
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
         }
     ]

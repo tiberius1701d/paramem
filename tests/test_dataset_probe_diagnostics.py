@@ -82,13 +82,13 @@ def _make_graph(diagnostics: dict, entities=None, relations=None):
     return g
 
 
-def _call_diag(session, session_graph, episodic_qa=None, procedural_rels=None):
+def _call_diag(session, session_graph, episodic_rels=None, procedural_rels=None):
     """Invoke _build_session_diagnostics with sensible defaults.
 
     Args:
         session: DatasetSession object.
         session_graph: Fake graph object.
-        episodic_qa: List of QA pair dicts (default: empty list).
+        episodic_rels: List of QA pair dicts (default: empty list).
         procedural_rels: List of procedural relation dicts (default: empty list).
 
     Returns:
@@ -101,7 +101,7 @@ def _call_diag(session, session_graph, episodic_qa=None, procedural_rels=None):
         edges_before=0,
         nodes_after=0,
         edges_after=0,
-        episodic_qa=episodic_qa if episodic_qa is not None else [],
+        episodic_rels=episodic_rels if episodic_rels is not None else [],
         procedural_rels=procedural_rels if procedural_rels is not None else [],
         elapsed_seconds=1.0,
     )
@@ -157,9 +157,9 @@ class TestRawFactCountRegression:
                 "plausibility_dropped": 3,  # int
             }
         )
-        episodic_qa = [{"q": "Q1", "a": "A1"}, {"q": "Q2", "a": "A2"}]
+        episodic_rels = [{"q": "Q1", "a": "A1"}, {"q": "Q2", "a": "A2"}]
         # Should not raise:
-        diag = _call_diag(_make_session(), graph, episodic_qa=episodic_qa)
+        diag = _call_diag(_make_session(), graph, episodic_rels=episodic_rels)
         assert isinstance(diag["extraction"]["raw_fact_count"], int)
 
     def test_raw_fact_count_equals_post_plausibility_plus_all_drops(self):
@@ -173,8 +173,8 @@ class TestRawFactCountRegression:
             }
         )
         # 3 surviving QA pairs (post_plausibility_count = 3)
-        episodic_qa = [{"q": f"Q{i}", "a": f"A{i}"} for i in range(3)]
-        diag = _call_diag(_make_session(), graph, episodic_qa=episodic_qa)
+        episodic_rels = [{"q": f"Q{i}", "a": f"A{i}"} for i in range(3)]
+        diag = _call_diag(_make_session(), graph, episodic_rels=episodic_rels)
         # Expected: 3 + 2 + 5 + 1 + 0 = 11
         assert diag["extraction"]["raw_fact_count"] == 11
 

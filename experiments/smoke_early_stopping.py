@@ -81,7 +81,7 @@ def main():
         if hasattr(model, "peft_config") and adapter_name in model.peft_config:
             model.delete_adapter(adapter_name)
 
-        model, keyed_pairs, registry, train_time, metrics = train_indexed_keys(
+        model, quads, registry, train_time, metrics = train_indexed_keys(
             model,
             tokenizer,
             qa_pairs,
@@ -96,7 +96,7 @@ def main():
         recall_result = evaluate_indexed_recall(
             model,
             tokenizer,
-            keyed_pairs,
+            quads,
             registry,
             adapter_name=adapter_name,
         )

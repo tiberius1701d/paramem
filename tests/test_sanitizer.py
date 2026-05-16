@@ -73,6 +73,88 @@ class TestPersonalEntityDetection:
 
 
 # ---------------------------------------------------------------------------
+# Paraphrase pass: catches plural / re-ordered / partial references to
+# multi-word entities that the strict word-boundary scrub misses.
+# ---------------------------------------------------------------------------
+
+
+class TestPersonalEntityParaphraseDetection:
+    """``personal_entity`` also fires when ≥2 content tokens of a multi-word
+    entity name appear as substrings in the query — closes the gap that
+    let 2026-05 paraphrased ADAS-platform queries reach the cloud."""
+
+    def test_paraphrase_two_token_overlap_flags_personal(self):
+        # The bug from the 2026-05-14 handover.  Surface-form scrub
+        # misses because the indexed name reorders + adds modifier
+        # ("multi-OEM") that the user query omits.
+        findings = check_personal_content(
+            "Tell me about the ADAS compute platforms project",
+            known_entities={"critical multi-OEM ADAS platform turnaround"},
+        )
+        assert "personal_entity" in findings
+
+    def test_pluralisation_single_token_does_not_fire(self):
+        # Only ONE entity content token in the query ("platform") — the
+        # 2-token floor must hold to avoid generic-word false positives.
+        findings = check_personal_content(
+            "What is a platform-as-a-service?",
+            known_entities={"platform engineering team"},
+        )
+        assert findings == []
+
+    def test_two_token_overlap_via_different_words_flags(self):
+        # Reordered, no modifier overlap — but two content tokens match.
+        findings = check_personal_content(
+            "When is the team building event?",
+            known_entities={"annual team building Q3"},  # Q3 < 3 chars → dropped
+        )
+        assert "personal_entity" in findings
+
+    def test_single_token_entity_relies_on_surface_form(self):
+        # "alice" alone — only one content token, so paraphrase pass is
+        # skipped.  Surface-form word-boundary still catches direct
+        # mentions of "Alice".
+        findings_direct = check_personal_content(
+            "Did Alice call?",
+            known_entities={"alice"},
+        )
+        assert "personal_entity" in findings_direct
+        # And substring false positive still rejected: "patron" ≠ "pat"
+        # (handled by surface-form word-boundary).
+        findings_fp = check_personal_content(
+            "I want a patron saint.",
+            known_entities={"pat"},
+        )
+        assert "personal_entity" not in findings_fp
+
+    def test_generic_stopwords_do_not_count_as_content_tokens(self):
+        # Entity name "the system and the platform" — after stopword +
+        # length filter, content tokens are {system, platform}.  Query
+        # "the and for" hits no content tokens → no fire.
+        findings = check_personal_content(
+            "the and for with",
+            known_entities={"the system and the platform"},
+        )
+        assert findings == []
+
+    def test_paraphrase_does_not_double_fire(self):
+        # Surface-form already caught the entity by exact match — the
+        # paraphrase pass must not add a second copy of the finding.
+        findings = check_personal_content(
+            "tell me about ADAS platform",
+            known_entities={"adas platform"},
+        )
+        assert findings.count("personal_entity") == 1
+
+    def test_empty_known_entities_paraphrase_pass_noop(self):
+        findings = check_personal_content(
+            "Tell me about the ADAS compute platforms project",
+            known_entities=set(),
+        )
+        assert findings == []
+
+
+# ---------------------------------------------------------------------------
 # First-person + speaker_id resolution
 # ---------------------------------------------------------------------------
 

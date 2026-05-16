@@ -6,6 +6,7 @@ from paramem.server.cloud.base import CloudAgent, CloudResponse, ToolCall
 from paramem.server.cloud.openai_compat import OpenAICompatAgent
 from paramem.server.cloud.registry import get_cloud_agent
 from paramem.server.config import CloudAgentConfig
+from paramem.training.memory_store import MemoryStore as _MS
 
 
 class TestCloudResponse:
@@ -331,8 +332,15 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
         with (
             patch(
-                "paramem.training.indexed_memory.probe_key",
-                return_value={"answer": "Jordan lives in Berlin"},
+                "paramem.training.entry_memory.probe_entry",
+                return_value={
+                    "key": "graph1",
+                    "subject": "x",
+                    "predicate": "p",
+                    "object": "y",
+                    "confidence": 1.0,
+                    "fact_text": "Jordan lives in Berlin",
+                },
             ),
             patch(
                 "paramem.models.loader.switch_adapter",
@@ -359,11 +367,13 @@ class TestPrivacyRouting:
                 text="Where does Jordan live?",
                 conversation_id="test",
                 speaker=None,
+                speaker_id="spk-test",
                 history=None,
                 model=model,
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
+                memory_store=_MS(replay_enabled=False),
             )
 
         # Cloud agent must NOT have been called
@@ -393,6 +403,7 @@ class TestPrivacyRouting:
             text="What is the weather today?",
             conversation_id="test",
             speaker=None,
+            speaker_id="spk-test",
             history=None,
             model=model,
             tokenizer=tokenizer,
@@ -400,6 +411,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             sota_agent=cloud_agent,
+            memory_store=_MS(replay_enabled=False),
         )
 
         # HA was attempted first and returned None
@@ -446,11 +458,13 @@ class TestPrivacyRouting:
                 text="What is the weather today?",
                 conversation_id="test",
                 speaker=None,
+                speaker_id="spk-test",
                 history=None,
                 model=model,
                 tokenizer=tokenizer,
                 config=config,
                 router=router,
+                memory_store=_MS(replay_enabled=False),
             )
 
         assert result.escalated is False
@@ -477,6 +491,7 @@ class TestPrivacyRouting:
             text="Turn on the lights",
             conversation_id="test",
             speaker=None,
+            speaker_id="spk-test",
             history=None,
             model=model,
             tokenizer=tokenizer,
@@ -484,6 +499,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             sota_agent=cloud_agent,
+            memory_store=_MS(replay_enabled=False),
         )
 
         ha_client.conversation_process.assert_called_once()
@@ -513,6 +529,7 @@ class TestPrivacyRouting:
             text="Is the light on?",
             conversation_id="test",
             speaker=None,
+            speaker_id="spk-test",
             history=None,
             model=model,
             tokenizer=tokenizer,
@@ -520,6 +537,7 @@ class TestPrivacyRouting:
             router=router,
             ha_client=ha_client,
             sota_agent=cloud_agent,
+            memory_store=_MS(replay_enabled=False),
         )
 
         ha_client.conversation_process.assert_called_once()
@@ -556,8 +574,15 @@ class TestPrivacyRouting:
 
         with (
             patch(
-                "paramem.training.indexed_memory.probe_key",
-                return_value={"answer": "Alex prefers dim lights"},
+                "paramem.training.entry_memory.probe_entry",
+                return_value={
+                    "key": "graph1",
+                    "subject": "x",
+                    "predicate": "p",
+                    "object": "y",
+                    "confidence": 1.0,
+                    "fact_text": "Alex prefers dim lights",
+                },
             ),
             patch("paramem.models.loader.switch_adapter"),
             patch(
@@ -572,6 +597,7 @@ class TestPrivacyRouting:
                 text="Turn on the lights for Alex",
                 conversation_id="test",
                 speaker=None,
+                speaker_id="spk-test",
                 history=None,
                 model=model,
                 tokenizer=tokenizer,
@@ -579,6 +605,7 @@ class TestPrivacyRouting:
                 router=router,
                 ha_client=ha_client,
                 sota_agent=cloud_agent,
+                memory_store=_MS(replay_enabled=False),
             )
 
         # HA was NOT pre-flighted (intent=PERSONAL → PA probe direct).
@@ -616,8 +643,15 @@ class TestPrivacyRouting:
 
         with (
             patch(
-                "paramem.training.indexed_memory.probe_key",
-                return_value={"answer": "Jordan lives somewhere"},
+                "paramem.training.entry_memory.probe_entry",
+                return_value={
+                    "key": "graph1",
+                    "subject": "x",
+                    "predicate": "p",
+                    "object": "y",
+                    "confidence": 1.0,
+                    "fact_text": "Jordan lives somewhere",
+                },
             ),
             patch("paramem.models.loader.switch_adapter"),
             patch(
@@ -636,6 +670,7 @@ class TestPrivacyRouting:
                 text="Where does Jordan live?",
                 conversation_id="test",
                 speaker=None,
+                speaker_id="spk-test",
                 history=None,
                 model=model,
                 tokenizer=tokenizer,
@@ -643,6 +678,7 @@ class TestPrivacyRouting:
                 router=router,
                 ha_client=ha_client,
                 sota_agent=cloud_agent,
+                memory_store=_MS(replay_enabled=False),
             )
 
         # HA was tried as a tool fallback (allowed for PERSONAL).
@@ -721,6 +757,7 @@ class TestCloudModePolicy:
                 text="What's the population of Berlin?",
                 conversation_id="cloud-mode-test",
                 speaker=None,
+                speaker_id="spk-test",
                 history=None,
                 model=model,
                 tokenizer=tokenizer,
@@ -728,6 +765,7 @@ class TestCloudModePolicy:
                 router=router,
                 ha_client=ha_client,
                 sota_agent=cloud_agent,
+                memory_store=_MS(replay_enabled=False),
             )
 
     # ---- block mode ----

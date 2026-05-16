@@ -58,12 +58,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from paramem.adapters.manifest import (
+from paramem.adapters.manifest import (  # noqa: E402  (sys.path setup above)
+    MANIFEST_SCHEMA_VERSION,
     UNKNOWN,
     AdapterManifest,
     BaseModelFingerprint,
     LoRAShape,
-    MANIFEST_SCHEMA_VERSION,
     TokenizerFingerprint,
     write_manifest,
 )
@@ -156,26 +156,6 @@ def _find_sibling_registry(adapter_dir: Path, registry_path_override: Optional[P
         if c.exists():
             return _sha256_file(c)
     return UNKNOWN
-
-
-def _find_sibling_keyed_pairs(adapter_dir: Path) -> tuple[str, int | str]:
-    """Locate keyed_pairs.json inside the adapter dir and return (sha256, count).
-
-    Args:
-        adapter_dir: The old flat adapter directory.
-
-    Returns:
-        Tuple of (sha256_hex_or_UNKNOWN, key_count_or_UNKNOWN).
-    """
-    kp_path = adapter_dir / "keyed_pairs.json"
-    if not kp_path.exists():
-        return UNKNOWN, UNKNOWN
-    try:
-        data = json.loads(kp_path.read_bytes())
-        count = len(data) if isinstance(data, list) else UNKNOWN
-    except (json.JSONDecodeError, OSError):
-        count = UNKNOWN
-    return _sha256_file(kp_path), count
 
 
 def _adapter_name_from_dir(adapter_dir: Path, *, name_from_config: bool) -> str:
@@ -288,9 +268,8 @@ def _synthesize_manifest(
         target_modules=lora_targets,
     )
 
-    # --- registry + keyed_pairs ---
+    # --- registry ---
     registry_sha256 = _find_sibling_registry(adapter_dir, registry_path_override)
-    keyed_pairs_sha256, key_count = _find_sibling_keyed_pairs(adapter_dir)
 
     name = _adapter_name_from_dir(adapter_dir, name_from_config=name_from_config)
 
@@ -302,8 +281,7 @@ def _synthesize_manifest(
         tokenizer=tokenizer_fp,
         lora=lora_shape,
         registry_sha256=registry_sha256,
-        keyed_pairs_sha256=keyed_pairs_sha256,
-        key_count=key_count,
+        key_count=UNKNOWN,
         synthesized=True,
     )
 
@@ -464,7 +442,9 @@ def migrate(
         logger.info("No old-layout adapter directories found under %s", outputs_root)
         return 0
 
-    logger.info("Found %d old-layout director%s", len(old_dirs), "y" if len(old_dirs) == 1 else "ies")
+    logger.info(
+        "Found %d old-layout director%s", len(old_dirs), "y" if len(old_dirs) == 1 else "ies"
+    )
     migrated = 0
     for adapter_dir in old_dirs:
         ok = _reshape_dir(

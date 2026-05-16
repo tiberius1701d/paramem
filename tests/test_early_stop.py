@@ -256,7 +256,7 @@ class TestRecallEarlyStopCallbackStateachine:
 
         # Direct test using inner state
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -312,7 +312,7 @@ class TestRecallEarlyStopCallbackStateachine:
         )
 
         control = _make_control()
-        with patch("experiments.utils.test_harness.evaluate_indexed_recall") as mock_eval:
+        with patch("paramem.training.recall_eval.evaluate_indexed_recall") as mock_eval:
             cb.on_epoch_end(None, _make_state(2.0), control)
             cb.on_epoch_end(None, _make_state(3.0), control)
             cb.on_epoch_end(None, _make_state(4.0), control)
@@ -352,7 +352,7 @@ class TestRecallEarlyStopCallbackStateachine:
 
         perfect = _make_recall_result(total, total)
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -385,7 +385,7 @@ class TestRecallEarlyStopCallbackStateachine:
         perfect = _make_recall_result(3, 3)
 
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -506,9 +506,7 @@ class TestRecallEarlyStopCallbackStateachine:
             return split_results[idx] if idx < len(split_results) else split_results[-1]
 
         with (
-            patch(
-                "experiments.utils.test_harness.evaluate_indexed_recall", side_effect=side_effect
-            ),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", side_effect=side_effect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 side_effect=split_side_effect,
@@ -544,7 +542,7 @@ class TestRecallEarlyStopCallbackStateachine:
 
         controls = []
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -590,9 +588,7 @@ class TestRecallEarlyStopCallbackStateachine:
             return results_by_epoch.get(ep_seq[call_count[0] - 1], perfect)
 
         with (
-            patch(
-                "experiments.utils.test_harness.evaluate_indexed_recall", side_effect=side_effect
-            ),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", side_effect=side_effect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -622,7 +618,7 @@ class TestRecallEarlyStopCallbackStateachine:
         perfect = _make_recall_result(2, 2)
 
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -648,7 +644,7 @@ class TestRecallEarlyStopCallbackStateachine:
         perfect = _make_recall_result(2, 2)
 
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -702,7 +698,7 @@ class TestRecallEarlyStopCallbackStateachine:
         perfect = _make_recall_result(1, 1)
         with (
             patch(
-                "experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect
+                "paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect
             ) as mock_eval,
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
@@ -738,7 +734,7 @@ class TestRecallEarlyStopCallbackStateachine:
         args.gradient_checkpointing = True
 
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -773,7 +769,7 @@ class TestRecallEarlyStopCallbackStateachine:
         args.gradient_checkpointing = False
 
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -820,7 +816,7 @@ class TestRecallEarlyStopCallbackStateachine:
             pause_file=tmp_path / "pause",
         )
 
-        with patch("experiments.utils.test_harness.evaluate_indexed_recall") as mock_eval:
+        with patch("paramem.training.recall_eval.evaluate_indexed_recall") as mock_eval:
             cb.on_epoch_end(None, _make_state(2.0), _make_control())
             mock_eval.assert_not_called()
             model.gradient_checkpointing_enable.assert_not_called()
@@ -835,7 +831,7 @@ class TestRecallEarlyStopCallbackStateachine:
         control = _make_control()
 
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -892,7 +888,7 @@ class TestRecallEarlyStopCallbackStateachine:
         perfect = _make_recall_result(2, 2)
 
         with (
-            patch("experiments.utils.test_harness.evaluate_indexed_recall", return_value=perfect),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", return_value=perfect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={
@@ -929,9 +925,7 @@ class TestRecallEarlyStopCallbackStateachine:
             return perfect_fill if call_count[0] == 1 else perfect_ret
 
         with (
-            patch(
-                "experiments.utils.test_harness.evaluate_indexed_recall", side_effect=side_effect
-            ),
+            patch("paramem.training.recall_eval.evaluate_indexed_recall", side_effect=side_effect),
             patch(
                 "experiments.utils.recall_diagnostics.per_field_split_counts",
                 return_value={

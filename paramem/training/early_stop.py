@@ -78,16 +78,26 @@ class EarlyStopPolicy:
         window: Number of consecutive perfect probes required to fire the stop
             signal.
         probe_every_n_epochs: Run a probe every N epochs (1 = every epoch).
+        extra_epochs_past_first_perfect: When set, fire the stop signal at
+            ``first_perfect_epoch + extra_epochs_past_first_perfect`` instead
+            of waiting for ``consecutive_perfect >= window``.  Independent of
+            ``signal_from_epoch``.  None disables this alternate stop path —
+            existing callers see no change.  Used by Test 16's
+            depth-past-floor sweep where the first observation of 100% recall
+            is the anchor and an additional fixed number of epochs is trained
+            past it.
 
     Raises:
         ValueError: If ``signal_from_epoch < probe_from_epoch``, or if
-            ``window < 1``, or if ``probe_every_n_epochs < 1``.
+            ``window < 1``, or if ``probe_every_n_epochs < 1``, or if
+            ``extra_epochs_past_first_perfect`` is set and negative.
     """
 
     probe_from_epoch: int = 10
     signal_from_epoch: int = 10
     window: int = 3
     probe_every_n_epochs: int = 1
+    extra_epochs_past_first_perfect: int | None = None
 
     def __post_init__(self) -> None:
         """Validate invariants."""
@@ -100,6 +110,14 @@ class EarlyStopPolicy:
             raise ValueError(f"window must be >= 1, got {self.window}")
         if self.probe_every_n_epochs < 1:
             raise ValueError(f"probe_every_n_epochs must be >= 1, got {self.probe_every_n_epochs}")
+        if (
+            self.extra_epochs_past_first_perfect is not None
+            and self.extra_epochs_past_first_perfect < 0
+        ):
+            raise ValueError(
+                f"extra_epochs_past_first_perfect must be >= 0, got "
+                f"{self.extra_epochs_past_first_perfect}"
+            )
 
 
 # Singleton policy for Test 14 phases (plan §6 ANALYSIS_POLICY).
@@ -183,7 +201,6 @@ class RecallEarlyStopCallback(TrainerCallback):
         retention_keyed: list[dict] | None = None,
         retention_registry: dict[str, int] | None = None,
         eval_fn: "Callable | None" = None,
-        is_quad: bool = False,
     ) -> None:
         """Initialise callback state.
 
@@ -195,23 +212,7 @@ class RecallEarlyStopCallback(TrainerCallback):
                 via a lazy import at each ``on_epoch_end`` call — preserving
                 the pre-2c-bis behaviour so existing call sites and
                 test-suite patches that target the module-level name continue
-                to work unchanged.  Pass
-                :func:`experiments.utils.test_harness.evaluate_indexed_recall_quad`
-                when training a quad-format adapter so the probes use
-                :func:`~paramem.training.quadruple_memory.probe_quad` with
-                exact-match on ``(subject, predicate, object)``.
-            is_quad: When ``True``, the Q/A split diagnostics
-                (``per_field_split_counts`` / ``update_first_perfect_log``) are
-                skipped because quad ``per_key`` entries carry
-                ``recalled_subject``/``recalled_predicate``/``recalled_object``
-                rather than ``question_match``/``answer_match``/``recalled``
-                — reporting all-zero "q/a split" when recall is actually
-                perfect would produce misleading log noise.  The early-stop
-                *decision* logic (``fill["rate"]`` + ``_consecutive_perfect``)
-                is unaffected.  Set by
-                :meth:`~paramem.training.consolidation.ConsolidationLoop._maybe_make_recall_callback`
-                alongside ``eval_fn=evaluate_indexed_recall_quad``; QA-path
-                callers leave this at the default ``False``.
+                to work unchanged.
         """
         self._model = model
         self._tokenizer = tokenizer
@@ -229,7 +230,6 @@ class RecallEarlyStopCallback(TrainerCallback):
         self._retention_keyed = retention_keyed
         self._retention_registry = retention_registry
         self._eval_fn = eval_fn
-        self._is_quad = is_quad
 
         # Internal state (§6 pseudocode variable names).
         self._last_epoch: int = -1
@@ -321,10 +321,6 @@ class RecallEarlyStopCallback(TrainerCallback):
         - Pause file checked AFTER probe completes and epoch_log is persisted.
         """
         # Lazy import for diagnostics helpers (GPU-free; no startup penalty).
-        from experiments.utils.recall_diagnostics import (
-            per_field_split_counts,
-            update_first_perfect_log,
-        )
 
         epoch = int(round(state.epoch))
 
@@ -358,11 +354,11 @@ class RecallEarlyStopCallback(TrainerCallback):
                 control.should_training_stop = True
             return
 
-        # Resolve the probe function.  ``None`` → lazy import so that the
-        # QA-format default is looked up at call time, preserving test-suite
-        # patchability of the module-level name in test_harness.py.
+        # Resolve the probe function.  ``None`` → lazy import so the default
+        # production probe is looked up at call time, preserving test-suite
+        # patchability of the module-level name.
         if self._eval_fn is None:
-            from experiments.utils.test_harness import evaluate_indexed_recall as _probe_fn
+            from paramem.training.recall_eval import evaluate_indexed_recall as _probe_fn
         else:
             _probe_fn = self._eval_fn
 
@@ -400,29 +396,25 @@ class RecallEarlyStopCallback(TrainerCallback):
         if getattr(args, "gradient_checkpointing", False):
             self._model.gradient_checkpointing_enable()
 
-        # --- Diagnostics (QA-path only) ---
+        # --- Diagnostics ---
         # ``per_field_split_counts`` and ``update_first_perfect_log`` consume
         # ``question_match``/``answer_match``/``recalled`` keys that are absent
-        # from quad ``per_key`` entries (which carry
+        # from entry ``per_key`` dicts (which carry
         # ``recalled_subject``/``recalled_predicate``/``recalled_object``
-        # instead).  Calling them in quad mode would log all-zero "q/a split"
-        # even when recall is perfect — misleading noise with no diagnostic
-        # value.  The early-stop decision (``fill["rate"]`` +
+        # instead).  The early-stop decision (``fill["rate"]`` +
         # ``_consecutive_perfect``) is driven by ``fill["exact_count"]`` and
-        # ``fill["total"]`` which are format-agnostic and are unaffected.
-        if not self._is_quad:
-            split = per_field_split_counts(fill["per_key"])
-            update_first_perfect_log(fill["per_key"], self._first_perfect_log, epoch)
-        else:
-            split = {
-                "both": 0,
-                "q_only": 0,
-                "a_only": 0,
-                "neither": 0,
-                "total": 0,
-                "q_correct": 0,
-                "a_correct": 0,
-            }
+        # ``fill["total"]`` which are format-agnostic.  Emit the constant zero
+        # q/a split shape so the epoch log schema stays stable for historical
+        # consumers.
+        split = {
+            "both": 0,
+            "q_only": 0,
+            "a_only": 0,
+            "neither": 0,
+            "total": 0,
+            "q_correct": 0,
+            "a_correct": 0,
+        }
 
         # --- Epoch log entry ---
         entry: dict = {
@@ -515,6 +507,29 @@ class RecallEarlyStopCallback(TrainerCallback):
                 self._consecutive_perfect,
                 policy.window,
                 policy.signal_from_epoch,
+            )
+        # --- Floor-relative stop trigger (extra_epochs_past_first_perfect) ---
+        # Independent of the stable-perfect path above.  Fires once the first
+        # observation of 100% recall is N epochs in the past, where N is the
+        # policy's extra_epochs_past_first_perfect.  Stop is stamped on the
+        # same state.stop_epoch field so downstream consumers (paused-marker
+        # guards, done-marker writers) treat it identically to the stable-
+        # perfect path.
+        elif (
+            not self._signaled_stop
+            and policy.extra_epochs_past_first_perfect is not None
+            and self._state.first_perfect_epoch is not None
+            and epoch >= self._state.first_perfect_epoch + policy.extra_epochs_past_first_perfect
+        ):
+            control.should_training_stop = True
+            self._signaled_stop = True
+            self._state.stop_epoch = epoch
+            logger.info(
+                "  RecallEarlyStopCallback: stop triggered at epoch %d "
+                "(first_perfect_epoch=%d + extra=%d)",
+                epoch,
+                self._state.first_perfect_epoch,
+                policy.extra_epochs_past_first_perfect,
             )
 
         # --- Pause check (after log is persisted) ---

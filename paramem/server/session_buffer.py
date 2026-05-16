@@ -70,9 +70,6 @@ class SessionBuffer:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.retain_sessions = retain_sessions
         self.debug = debug
-        self.archive_dir = self.session_dir / "archive"
-        if self.retain_sessions and self.debug:
-            self.archive_dir.mkdir(exist_ok=True)
         self._snapshot_path = self.session_dir / "session_snapshot.enc"
 
         if _snapshots_enabled():
@@ -169,10 +166,11 @@ class SessionBuffer:
 
         self._turns[conversation_id].append(entry)
 
-        if self.debug:
-            path = self.session_dir / f"{conversation_id}.jsonl"
-            with open(path, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+        # Pending sessions ALWAYS persist on disk until consumed by a
+        # consolidation (2026-05-14 invariant — independent of debug / mode).
+        path = self.session_dir / f"{conversation_id}.jsonl"
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
     def claim_sessions_for_speaker(self, speaker_id: str, speaker_name: str, speaker_store) -> int:
         """Retroactively claim pending sessions whose embeddings match.
@@ -209,49 +207,49 @@ class SessionBuffer:
             claimed += 1
             logger.info("Claimed session %s for speaker %s", conv_id, speaker_name)
 
-            # Sync to disk if persisting
-            if self.debug:
-                path = self.session_dir / f"{conv_id}.jsonl"
-                if path.exists():
-                    with open(path, "w") as f:
-                        for turn in turns:
-                            f.write(json.dumps(turn) + "\n")
-
-        # Also check disk-only sessions (from previous runs in debug mode)
-        if self.debug:
-            for path in sorted(self.session_dir.glob("*.jsonl")):
-                conv_id = path.stem
-                if conv_id in self._turns:
-                    continue  # already handled above
-
-                lines = self._read_jsonl(path)
-                if not lines:
-                    continue
-
-                already_claimed = any(t.get("speaker_id") for t in lines)
-                if already_claimed:
-                    continue
-
-                has_match = False
-                for turn in lines:
-                    emb = turn.get("embedding")
-                    if emb and turn.get("role") == "user":
-                        match = speaker_store.match(emb)
-                        if match.speaker_id == speaker_id and not match.tentative:
-                            has_match = True
-                            break
-
-                if not has_match:
-                    continue
-
+            # Sync to disk — JSONL is the durable representation of pending
+            # sessions (2026-05-14 invariant, always-on).
+            path = self.session_dir / f"{conv_id}.jsonl"
+            if path.exists():
                 with open(path, "w") as f:
-                    for turn in lines:
-                        turn["speaker"] = speaker_name
-                        turn["speaker_id"] = speaker_id
+                    for turn in turns:
                         f.write(json.dumps(turn) + "\n")
 
-                claimed += 1
-                logger.info("Claimed session %s for speaker %s (disk)", path.stem, speaker_name)
+        # Also check disk-only sessions (pending JSONL files not yet loaded
+        # into RAM, e.g. after a graceful exit before consolidation).
+        for path in sorted(self.session_dir.glob("*.jsonl")):
+            conv_id = path.stem
+            if conv_id in self._turns:
+                continue  # already handled above
+
+            lines = self._read_jsonl(path)
+            if not lines:
+                continue
+
+            already_claimed = any(t.get("speaker_id") for t in lines)
+            if already_claimed:
+                continue
+
+            has_match = False
+            for turn in lines:
+                emb = turn.get("embedding")
+                if emb and turn.get("role") == "user":
+                    match = speaker_store.match(emb)
+                    if match.speaker_id == speaker_id and not match.tentative:
+                        has_match = True
+                        break
+
+            if not has_match:
+                continue
+
+            with open(path, "w") as f:
+                for turn in lines:
+                    turn["speaker"] = speaker_name
+                    turn["speaker_id"] = speaker_id
+                    f.write(json.dumps(turn) + "\n")
+
+            claimed += 1
+            logger.info("Claimed session %s for speaker %s (disk)", path.stem, speaker_name)
 
         return claimed
 
@@ -292,54 +290,117 @@ class SessionBuffer:
                     }
                 )
 
-        # Disk-only sessions (from previous runs in debug mode)
-        if self.debug:
-            for path in sorted(self.session_dir.glob("*.jsonl")):
-                conv_id = path.stem
-                if conv_id in seen_ids:
-                    continue
-                turns = self._read_jsonl(path)
-                formatted, session_speaker_id = self._format_turns(turns)
-                if formatted:
-                    first_meta = turns[0].get("metadata", {}) if turns else {}
-                    pending.append(
-                        {
-                            "session_id": conv_id,
-                            "transcript": "\n".join(formatted),
-                            "speaker_id": session_speaker_id,
-                            "source_type": first_meta.get("source_type", "transcript"),
-                            "doc_title": first_meta.get("doc_title"),
-                        }
-                    )
+        # Disk-only sessions (e.g. pending JSONL on cold start after a
+        # graceful exit or unclean restart).  Per the 2026-05-14 invariant,
+        # JSONL is the durable representation of pending state and is read
+        # back unconditionally.
+        for path in sorted(self.session_dir.glob("*.jsonl")):
+            conv_id = path.stem
+            if conv_id in seen_ids:
+                continue
+            turns = self._read_jsonl(path)
+            formatted, session_speaker_id = self._format_turns(turns)
+            if formatted:
+                first_meta = turns[0].get("metadata", {}) if turns else {}
+                pending.append(
+                    {
+                        "session_id": conv_id,
+                        "transcript": "\n".join(formatted),
+                        "speaker_id": session_speaker_id,
+                        "source_type": first_meta.get("source_type", "transcript"),
+                        "doc_title": first_meta.get("doc_title"),
+                    }
+                )
 
         return pending
 
-    def mark_consolidated(self, session_ids: list[str]) -> None:
-        """Remove or archive consolidated sessions."""
+    def rehydrate_from_disk(self) -> int:
+        """Load pending JSONL files into ``self._turns`` and ``self._sessions``.
+
+        Called at lifespan startup so the in-memory state matches what's on
+        disk before any chat handler can append.  Per the 2026-05-14
+        invariant, pending JSONL is the durable source of truth for
+        unconsolidated sessions; cold-start must restore it.
+
+        Returns the number of sessions rehydrated.  Idempotent: already-loaded
+        conversation IDs are skipped.
+        """
+        loaded = 0
+        for path in sorted(self.session_dir.glob("*.jsonl")):
+            conv_id = path.stem
+            if conv_id in self._turns:
+                continue
+            turns = self._read_jsonl(path)
+            if not turns:
+                continue
+            self._turns[conv_id] = turns
+            # Reconstruct minimal _sessions state for any turn carrying a
+            # speaker — speaker name/id are derived from the most recent
+            # tagged turn.
+            for t in reversed(turns):
+                sid = t.get("speaker_id")
+                if sid:
+                    self._sessions.setdefault(
+                        conv_id,
+                        {
+                            "speaker": t.get("speaker"),
+                            "speaker_id": sid,
+                            "state": STATE_IDENTIFIED,
+                        },
+                    )
+                    break
+            loaded += 1
+        if loaded:
+            logger.info(
+                "SessionBuffer.rehydrate_from_disk: restored %d pending session(s) from %s",
+                loaded,
+                self.session_dir,
+            )
+        return loaded
+
+    def mark_consolidated(
+        self,
+        session_ids: list[str],
+        *,
+        retention_dir: Path | None = None,
+    ) -> None:
+        """Consume consolidated sessions and dispose of their JSONL.
+
+        Disposition (2026-05-14 user spec):
+
+        - ``retain_sessions=True`` OR ``debug=True``: move JSONL to
+          *retention_dir* (caller-supplied, typically
+          ``loop.snapshot_dir/cycle_<N>/sessions/``).
+        - both flags False: unlink.
+
+        Always clears the in-memory state.  Callers MUST pass
+        *retention_dir* when at least one of the two flags is True;
+        otherwise retained transcripts are silently dropped.
+        """
+        retain = self.retain_sessions or self.debug
+        if retain and retention_dir is not None:
+            retention_dir.mkdir(parents=True, exist_ok=True)
         for session_id in session_ids:
-            # Clear from RAM
             self._turns.pop(session_id, None)
             self._sessions.pop(session_id, None)
-
-            # Handle disk file if persisting
-            if self.debug:
-                source = self.session_dir / f"{session_id}.jsonl"
-                if source.exists():
-                    if self.retain_sessions:
-                        dest = self.archive_dir / f"{session_id}.jsonl"
-                        shutil.move(str(source), str(dest))
-                        logger.info("Archived session: %s", session_id)
-                    else:
-                        source.unlink()
-                        logger.info("Deleted session transcript: %s", session_id)
+            source = self.session_dir / f"{session_id}.jsonl"
+            if not source.exists():
+                continue
+            if retain and retention_dir is not None:
+                dest = retention_dir / f"{session_id}.jsonl"
+                shutil.move(str(source), str(dest))
+                logger.info("Retained session %s → %s", session_id, dest)
+            else:
+                source.unlink()
+                logger.info("Deleted session transcript: %s", session_id)
 
     def discard_sessions(self, session_ids: list[str]) -> None:
         """Drop named sessions from the in-memory queue and disk state.
 
-        Unlike :meth:`mark_consolidated`, this method does NOT archive
-        sessions — the JSONL file is deleted outright when ``debug=True``.
-        Designed for the cancel path (``POST /ingest-sessions/cancel``),
-        where the operator wants to remove queued document chunks without
+        Unlike :meth:`mark_consolidated`, this method does NOT retain
+        the JSONL — it is always deleted outright.  Designed for the
+        cancel path (``POST /ingest-sessions/cancel``), where the
+        operator wants to remove queued document chunks without
         running consolidation.
 
         Silent no-op for unknown session ids (mirrors
@@ -351,12 +412,10 @@ class SessionBuffer:
         for session_id in session_ids:
             self._turns.pop(session_id, None)
             self._sessions.pop(session_id, None)
-
-            if self.debug:
-                path = self.session_dir / f"{session_id}.jsonl"
-                if path.exists():
-                    path.unlink()
-                    logger.info("Discarded session file: %s", session_id)
+            path = self.session_dir / f"{session_id}.jsonl"
+            if path.exists():
+                path.unlink()
+                logger.info("Discarded session file: %s", session_id)
 
     def get_session_turns(self, conversation_id: str) -> list[dict]:
         """Read all turns from a session."""

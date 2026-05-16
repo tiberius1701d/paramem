@@ -135,7 +135,7 @@ def extract_qa_from_session(session, session_idx, model, tokenizer, prompts_dir=
     return generate_qa_from_relations(relations, model=model, tokenizer=tokenizer)
 
 
-def recall_test(model, tokenizer, all_keyed_pairs, all_registries, label):
+def recall_test(model, tokenizer, all_quads, all_registries, label):
     """Run recall on all accumulated keys and print results.
 
     Returns dict with exact_count, total, rate, per_key.
@@ -144,8 +144,8 @@ def recall_test(model, tokenizer, all_keyed_pairs, all_registries, label):
 
     combined_keyed = []
     combined_registry = {}
-    for keyed_pairs, registry in zip(all_keyed_pairs, all_registries):
-        combined_keyed.extend(keyed_pairs)
+    for quads, registry in zip(all_quads, all_registries):
+        combined_keyed.extend(quads)
         combined_registry.update(registry)
 
     if not combined_keyed:
@@ -304,7 +304,7 @@ def main():
         qa_source = (
             project_root
             / "outputs/test8_large_scale/mistral/20260323_161747"
-            / "cycle_011/keyed_pairs.json"
+            / "cycle_011/quads.json"
         )
         if not qa_source.exists():
             print(f"ERROR: QA source not found at {qa_source}")
@@ -343,7 +343,7 @@ def main():
     prompts_dir = project_root / "configs" / "prompts"
 
     # Per-session state
-    all_keyed_pairs = []
+    all_quads = []
     all_registries = []
     adapter_names = []
     merged_adapter_names = []
@@ -378,7 +378,7 @@ def main():
                     "session": i + 1,
                     "adapter": adapter_name,
                     "qa_pairs": 0,
-                    "total_keys_so_far": sum(len(kp) for kp in all_keyed_pairs),
+                    "total_keys_so_far": sum(len(kp) for kp in all_quads),
                     "recall_exact": None,
                     "recall_rate": None,
                     "train_time_s": 0,
@@ -391,15 +391,15 @@ def main():
         print(f"  Extracted {len(qa_pairs)} QA pairs")
 
         # ---- Assign keys ----
-        keyed_pairs = assign_keys(qa_pairs, start_index=key_offset)
-        for kp in keyed_pairs:
+        quads = assign_keys(qa_pairs, start_index=key_offset)
+        for kp in quads:
             kp["adapter"] = adapter_name
 
-        registry = build_registry(keyed_pairs)
+        registry = build_registry(quads)
         save_registry(registry, session_dir / "simhash_registry.json")
 
-        with open(session_dir / "keyed_pairs.json", "w") as f:
-            json.dump(keyed_pairs, f, indent=2)
+        with open(session_dir / "quads.json", "w") as f:
+            json.dump(quads, f, indent=2)
 
         # ---- Create fresh adapter with per-session rank ----
         rank_i = session_ranks[i] if i < len(session_ranks) else session_ranks[-1]
@@ -420,8 +420,8 @@ def main():
             active_adapters_arg = adapter_names
 
         # ---- Train ----
-        print(f"  Training on {len(keyed_pairs)} keys, {NUM_EPOCHS} epochs, rank {rank_i}...")
-        examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+        print(f"  Training on {len(quads)} keys, {NUM_EPOCHS} epochs, rank {rank_i}...")
+        examples = format_indexed_training(quads, tokenizer, max_length=1024)
         dataset = IndexedDataset(examples)
 
         t0 = time.time()
@@ -441,8 +441,8 @@ def main():
         print(f"  Training time: {train_time:.0f}s, loss: {train_loss}")
 
         # Commit key_offset only after training succeeds
-        key_offset += len(keyed_pairs)
-        all_keyed_pairs.append(keyed_pairs)
+        key_offset += len(quads)
+        all_quads.append(quads)
         all_registries.append(registry)
 
         # ---- Recall tests ----
@@ -454,21 +454,21 @@ def main():
             recall_current = recall_test(
                 model,
                 tokenizer,
-                [keyed_pairs],
+                [quads],
                 [registry],
                 "current session keys (all adapters active)",
             )
         else:
             recall_current = recall_test(
-                model, tokenizer, [keyed_pairs], [registry], "current session only"
+                model, tokenizer, [quads], [registry], "current session only"
             )
 
         recall_before_merge = None
-        if len(all_keyed_pairs) > 1:
+        if len(all_quads) > 1:
             recall_before_merge = recall_test(
                 model,
                 tokenizer,
-                all_keyed_pairs,
+                all_quads,
                 all_registries,
                 "all keys, before merge/compose",
             )
@@ -482,7 +482,7 @@ def main():
             print(f"  Merged and unloaded. Stack: {merged_adapter_names}")
 
             recall_after_merge = recall_test(
-                model, tokenizer, all_keyed_pairs, all_registries, "all keys, after merge"
+                model, tokenizer, all_quads, all_registries, "all keys, after merge"
             )
         else:
             # Compose mode: adapters stay separate, recall_after = recall_before

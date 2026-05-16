@@ -1,25 +1,21 @@
-"""Quadruple-encoded indexed-key memory — production primitives.
+"""Indexed-key entry memory — production primitives.
 
-Parallel to :mod:`paramem.training.indexed_memory` but uses the
-``(key, subject, predicate, object)`` quadruple encoding instead of the
-``(key, question, answer)`` QA-pair encoding.
+Each entry has the canonical shape ``(key, subject, predicate, object)``.
 
-Key differences vs. the QA format:
+Key properties:
 
-* **One training example per fact, not two.** The QA helper emits both a
-  keyed-recall example and a natural-language QA example. Quadruples have
-  no natural question, so only the keyed-recall example is emitted. This
-  halves per-cycle training time.
+* **One training example per fact.** Only the keyed-recall example is
+  emitted — no natural-language second example, which halves per-cycle
+  training time.
 * **JSON envelope is** ``{"key", "subject", "predicate", "object"}`` —
-  same proven keyed-retrieval shape, round-trip-clean reconstruction.
+  round-trip-clean, deterministic reconstruction.
 * **Recall template is** ``"Recall the fact stored under key '{key}'."``
-  — same imperative shape as the QA template, "fact" instead of "QA pair".
 * **No natural-language recall path** — by design. The keyed prompt is the
   only guaranteed interface; natural-language questions are not trained.
 
-SimHash, registry management, and probe functions mirror the QA equivalents
-in :mod:`paramem.training.indexed_memory` so the two formats are interchangeable
-at the call-site level.
+SimHash, registry management, and probe functions are defined here and
+re-exported from :mod:`paramem.training.indexed_memory` for callers that
+previously reached them through that module.
 """
 
 import hashlib
@@ -39,13 +35,13 @@ from paramem.training.indexed_memory import (
 
 logger = logging.getLogger(__name__)
 
-QUAD_RECALL_TEMPLATE = "Recall the fact stored under key '{key}'."
+RECALL_TEMPLATE = "Recall the fact stored under key '{key}'."
 
 
 # --- Key assignment ---
 
 
-def assign_quad_keys(
+def assign_keys(
     triples: list[tuple[str, str, str]],
     start_index: int = 1,
     prefix: str = "graph",
@@ -62,8 +58,7 @@ def assign_quad_keys(
         start_index: First key index; the i-th triple gets key
             ``f"{prefix}{start_index + i}"``.
         prefix: Key prefix string.  Episodic/semantic keys use ``"graph"``
-            (default); procedural keys use ``"proc"`` to match the QA-format
-            convention.
+            (default); procedural keys use ``"proc"`` by convention.
 
     Returns:
         List of ``{"key", "subject", "predicate", "object"}`` dicts in the
@@ -83,38 +78,37 @@ def assign_quad_keys(
 # --- Training format ---
 
 
-def _build_quad_response(quad: dict) -> str:
-    """Build the JSON response string for a single quadruple.
+def _build_response(entry: dict) -> str:
+    """Build the JSON response string for a single entry.
 
     Args:
-        quad: Dict containing ``key``, ``subject``, ``predicate``, and ``object``.
+        entry: Dict containing ``key``, ``subject``, ``predicate``, and ``object``.
 
     Returns:
         JSON string with exactly those four fields.
     """
     return json.dumps(
         {
-            "key": quad["key"],
-            "subject": quad["subject"],
-            "predicate": quad["predicate"],
-            "object": quad["object"],
+            "key": entry["key"],
+            "subject": entry["subject"],
+            "predicate": entry["predicate"],
+            "object": entry["object"],
         }
     )
 
 
-def format_quadruple_training(
-    quads: list[dict],
+def format_entry_training(
+    entries: list[dict],
     tokenizer,
     max_length: int = 1024,
 ) -> list[dict]:
-    """Build training examples — one keyed-recall example per quadruple.
+    """Build training examples — one keyed-recall example per entry.
 
-    No natural-language second example (that would require a question, and the
-    quadruple form has none by design). The single-example-per-quad cost halves
-    the per-cycle training time vs. the QA format.
+    No natural-language second example. One example per entry halves
+    the per-cycle training time.
 
     Args:
-        quads: List of quad dicts (each with ``key``, ``subject``,
+        entries: List of entry dicts (each with ``key``, ``subject``,
             ``predicate``, ``object``).
         tokenizer: HuggingFace tokenizer compatible with
             :func:`paramem.training.indexed_memory._tokenize_with_prompt_masking`.
@@ -127,9 +121,9 @@ def format_quadruple_training(
     from paramem.models.loader import adapt_messages
 
     examples = []
-    for quad in quads:
-        recall_prompt = QUAD_RECALL_TEMPLATE.format(key=quad["key"])
-        recall_response = _build_quad_response(quad)
+    for entry in entries:
+        recall_prompt = RECALL_TEMPLATE.format(key=entry["key"])
+        recall_response = _build_response(entry)
         messages = adapt_messages(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -145,8 +139,8 @@ def format_quadruple_training(
 # --- Recall parsing ---
 
 
-def parse_recalled_quad(text: str) -> dict | None:
-    """Parse a single recalled quadruple JSON object from model output.
+def parse_recalled_entry(text: str) -> dict | None:
+    """Parse a single recalled entry JSON object from model output.
 
     Tries the raw text first, then — only if cleaning changed anything — retries
     on :func:`paramem.training.indexed_memory._clean_generation_artifacts`'d text
@@ -219,9 +213,10 @@ def compute_simhash(
     different fingerprints — catches hallucinations where the model echoes the
     queried key but returns another key's content.
 
-    Note: this fingerprint is NOT compatible with the QA-format SimHash — they
-    hash different content strings. Existing ``simhash_registry_*.json`` files
-    built with the QA format must be regenerated after switching to quads.
+    Note: this fingerprint is NOT compatible with the legacy SimHash in
+    :mod:`paramem.training.indexed_memory` — they hash different content strings.
+    Existing ``simhash_registry_*.json`` files built with the legacy format must
+    be regenerated.
 
     Args:
         key: The ``graphN`` key string.
@@ -260,7 +255,7 @@ def verify_confidence(
     recalled: dict,
     registry: dict[str, int] | dict[str, dict] | None = None,
 ) -> float:
-    """Verify a recalled quadruple against a SimHash registry.
+    """Verify a recalled entry against a SimHash registry.
 
     Mirrors the contract of :func:`paramem.training.indexed_memory.verify_confidence`
     exactly:
@@ -302,15 +297,15 @@ def verify_confidence(
 # --- Registry management ---
 
 
-def build_registry(quad_pairs: list[dict]) -> dict[str, int]:
-    """Build a SimHash registry from quad pairs.
+def build_registry(entries: list[dict]) -> dict[str, int]:
+    """Build a SimHash registry from entries.
 
     Returns a mapping of ``key → 64-bit SimHash fingerprint``.
     This is the simple format used by the training pipeline.
     For enriched metadata, see :func:`build_enriched_registry`.
 
     Args:
-        quad_pairs: List of quad dicts, each containing ``key``,
+        entries: List of entry dicts, each containing ``key``,
             ``subject``, ``predicate``, and ``object``.
 
     Returns:
@@ -318,20 +313,19 @@ def build_registry(quad_pairs: list[dict]) -> dict[str, int]:
     """
     return {
         p["key"]: compute_simhash(p["key"], p["subject"], p["predicate"], p["object"])
-        for p in quad_pairs
+        for p in entries
     }
 
 
 def build_enriched_registry(
-    quad_pairs: list[dict],
+    entries: list[dict],
     session_id: str | None = None,
     existing: dict | None = None,
 ) -> dict:
     """Build an enriched registry with temporal metadata.
 
     Mirrors :func:`paramem.training.indexed_memory.build_enriched_registry`
-    exactly — same entry shape, same merge/stale semantics — but uses the
-    quad SimHash instead of the QA SimHash.
+    exactly — same entry shape, same merge/stale semantics.
 
     Format per key::
 
@@ -347,13 +341,13 @@ def build_enriched_registry(
 
     If an existing registry is provided:
 
-    - Active keys present in ``quad_pairs`` get their ``last_seen_at`` updated.
-    - Active keys NOT in ``quad_pairs`` are unchanged (not auto-staled).
-    - Stale keys NOT in ``quad_pairs`` get ``stale_cycles`` incremented.
-    - Stale keys present in ``quad_pairs`` are reactivated.
+    - Active keys present in ``entries`` get their ``last_seen_at`` updated.
+    - Active keys NOT in ``entries`` are unchanged (not auto-staled).
+    - Stale keys NOT in ``entries`` get ``stale_cycles`` incremented.
+    - Stale keys present in ``entries`` are reactivated.
 
     Args:
-        quad_pairs: List of quad dicts for the current training set.
+        entries: List of entry dicts for the current training set.
         session_id: Optional session identifier to tag new entries.
         existing: Optional existing registry dict to merge into.
 
@@ -363,14 +357,14 @@ def build_enriched_registry(
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
-    current_keys = {p["key"] for p in quad_pairs}
+    current_keys = {p["key"] for p in entries}
 
     if existing is None:
         existing = {}
 
     registry = dict(existing)
 
-    for p in quad_pairs:
+    for p in entries:
         key = p["key"]
         simhash = compute_simhash(key, p["subject"], p["predicate"], p["object"])
 
@@ -403,7 +397,7 @@ def build_enriched_registry(
 # --- Probe ---
 
 
-def probe_quad(
+def probe_entry(
     model,
     tokenizer,
     key: str,
@@ -411,13 +405,13 @@ def probe_quad(
     registry: dict | None = None,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> dict | None:
-    """Prompt the model to recall a single quadruple by key.
+    """Prompt the model to recall a single entry by key.
 
     Mirrors :func:`paramem.training.indexed_memory.probe_key`:
 
     - Returns a dict with ``key``, ``subject``, ``predicate``, ``object``,
-      ``confidence``, ``raw_output``, ``format`` (``"quad"``), and
-      ``fact_text`` (human-readable via :func:`quad_fact_text`) on success
+      ``confidence``, ``raw_output``, and
+      ``fact_text`` (human-readable via :func:`entry_fact_text`) on success
       (``confidence`` is ``1.0`` when no registry is supplied — same as
       ``probe_key``).
     - Returns ``{"raw_output": ..., "failure_reason": "parse_failure"}``
@@ -437,7 +431,7 @@ def probe_quad(
         key: Key to recall (e.g. ``"graph3"``).
         max_new_tokens: Maximum tokens to generate.
         registry: Optional SimHash registry for confidence verification.
-        confidence_threshold: Minimum confidence to accept a recalled quad.
+        confidence_threshold: Minimum confidence to accept a recalled entry.
 
     Returns:
         Result dict on success or failure — never ``None`` (shape contract
@@ -446,7 +440,7 @@ def probe_quad(
     from paramem.evaluation.recall import generate_answer
     from paramem.training.dataset import _format_inference_prompt
 
-    prompt = QUAD_RECALL_TEMPLATE.format(key=key)
+    prompt = RECALL_TEMPLATE.format(key=key)
     formatted = _format_inference_prompt(prompt, tokenizer)
     raw = generate_answer(
         model,
@@ -455,7 +449,7 @@ def probe_quad(
         max_new_tokens=max_new_tokens,
         temperature=0.0,
     )
-    parsed = parse_recalled_quad(raw)
+    parsed = parse_recalled_entry(raw)
     if parsed is None:
         logger.debug("Parse failure for key '%s': %s", key, raw[:200])
         return {"raw_output": raw, "failure_reason": "parse_failure"}
@@ -481,44 +475,38 @@ def probe_quad(
 
     parsed["confidence"] = confidence
     parsed["raw_output"] = raw
-    # Symmetric with indexed_memory.probe_key which sets format="qa" and
-    # fact_text=answer on its own success dict. Direct callers (gates, tests)
-    # should not need to know the encoding to read fact_text.
-    parsed["format"] = "quad"
-    parsed["fact_text"] = quad_fact_text(parsed)
+    parsed["fact_text"] = entry_fact_text(parsed)
     return parsed
 
 
 # --- Fact-text helper ---
 
 
-def quad_fact_text(quad: dict) -> str:
-    """Render a recalled quadruple as a human-readable fact string.
+def entry_fact_text(entry: dict) -> str:
+    """Render a recalled entry as a human-readable fact string.
 
     Converts the predicate from snake_case to space-separated words (predicates
     are normalized to lowercase-underscore at extraction time per project
     convention) and joins the three triple components into a natural sentence.
 
-    Used by inference consumers so format-specific string construction stays in
-    the probe layer — callers read ``result["fact_text"]`` without needing to
-    know the format.
+    Used by inference consumers so string construction stays in the probe
+    layer — callers read ``result["fact_text"]``.
 
     Args:
-        quad: Dict containing at minimum ``subject``, ``predicate``, and
+        entry: Dict containing at minimum ``subject``, ``predicate``, and
             ``object`` keys.
 
     Returns:
         Human-readable fact string, e.g. ``"Alex lives in Heilbronn"``.
     """
-    predicate_spaced = " ".join(quad["predicate"].replace("_", " ").split())
-    return f"{quad['subject']} {predicate_spaced} {quad['object']}"
+    predicate_spaced = " ".join(entry["predicate"].replace("_", " ").split())
+    return f"{entry['subject']} {predicate_spaced} {entry['object']}"
 
 
 # --- Registry persistence (re-exported for convenience) ---
 
-# These are identical to the QA-format registry persistence functions since
-# the file format is the same (JSON dict). Import and re-export so callers
-# don't need to mix imports from both modules.
+# The file format is a JSON dict regardless of entry shape. Import and
+# re-export so callers don't need to mix imports from both modules.
 
 from paramem.training.indexed_memory import (  # noqa: E402, F401
     get_active_keys,

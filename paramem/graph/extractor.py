@@ -26,6 +26,34 @@ from paramem.server.vram_guard import vram_scope
 
 logger = logging.getLogger(__name__)
 
+
+class ExtractionFailed(RuntimeError):
+    """Raised when a load-bearing extraction phase fails and the cycle
+    must be aborted for this session.
+
+    Currently raised from the ``sota_enrich`` phase when the cloud
+    enrichment call fails (parse failure or upstream non-2xx — including
+    Anthropic 529 overloaded), because falling back to pre-enrichment
+    facts silently bakes a degraded snapshot into the cumulative graph.
+
+    The per-session caller (``_extract_and_start_training`` /
+    ``_extract_and_start_training`` in ``app.py``) catches this and
+    treats it like ``VramExhausted``: log, leave the session pending
+    (skip ``mark_consolidated``), continue with the next session.  The
+    cumulative graph is unmodified because the failure propagates
+    BEFORE :meth:`ConsolidationLoop.extract_session` reaches the merge
+    call.
+
+    ``phase`` names the extraction phase that failed (e.g.
+    ``"sota_enrich"``).  ``reason`` is a short operator-facing string.
+    """
+
+    def __init__(self, phase: str, reason: str) -> None:
+        super().__init__(f"{phase}: {reason}")
+        self.phase = phase
+        self.reason = reason
+
+
 _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "configs" / "prompts"
 
 _DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Output valid JSON only."
@@ -2331,13 +2359,35 @@ def _sota_pipeline(
                 graph.diagnostics["sota_call_info"] = _sota_info
                 t.add("sota_call_info", _sota_info)
             if enriched_anon is None:
-                logger.warning("SOTA enrichment failed — keeping pre-enrichment facts")
-                enriched_anon = anon_facts
+                # FAIL the cycle.  Previously fell back to anon_facts, which
+                # silently baked a degraded (un-enriched) snapshot into the
+                # cumulative graph — the same triples re-extracted in the
+                # next cycle would dedup, so the missing second-order
+                # relations were lost permanently.  Per
+                # project_extraction_failure_fails_cycle: raise, propagate
+                # past :meth:`ConsolidationLoop.extract_session` (which has
+                # not yet merged this session's graph), and let the
+                # per-session loop in app.py treat this session like a
+                # ``VramExhausted`` chunk — leave it pending and retry on
+                # the next cycle.
+                t.set_parsed(
+                    {
+                        "input_count": len(anon_facts),
+                        "output_count": 0,
+                        "new_bindings_count": 0,
+                        "new_bindings": {},
+                        "updated_anon_transcript_len": 0,
+                    }
+                )
                 t.set_outcome("failed", reason="SOTA call failed or unparseable")
+                raise ExtractionFailed(
+                    "sota_enrich",
+                    "cloud enrichment call failed or response unparseable",
+                )
             t.set_parsed(
                 {
                     "input_count": len(anon_facts),
-                    "output_count": len(enriched_anon) if enriched_anon else 0,
+                    "output_count": len(enriched_anon),
                     "new_bindings_count": len(sota_bindings or {}),
                     "new_bindings": dict(sota_bindings) if sota_bindings else {},
                     "updated_anon_transcript_len": len(updated_anon_transcript or ""),

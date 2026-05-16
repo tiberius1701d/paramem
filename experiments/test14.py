@@ -1494,10 +1494,10 @@ def _write_phase_done(
     final_recall: dict,
     extra: dict,
 ) -> None:
-    """Persist keyed_pairs, registry, and phase-done marker."""
+    """Persist quads, registry, and phase-done marker."""
     phase_dir.mkdir(parents=True, exist_ok=True)
     _safe_write_json(
-        phase_dir / "keyed_pairs.json",
+        phase_dir / "quads.json",
         [{"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed],
     )
     save_registry(registry, phase_dir / "simhash_registry.json")
@@ -2043,8 +2043,8 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 # simhash_registry.json is encrypted (via save_registry →
                 # write_infra_bytes) when the daily age identity is loaded;
                 # use load_registry which transparently handles both age and
-                # plaintext envelopes.  keyed_pairs.json is plaintext.
-                v3_a_keyed_path = reuse_phase_a_from / V3 / "A" / "keyed_pairs.json"
+                # plaintext envelopes.  quads.json is plaintext.
+                v3_a_keyed_path = reuse_phase_a_from / V3 / "A" / "quads.json"
                 v3_a_reg_path = reuse_phase_a_from / V3 / "A" / "simhash_registry.json"
                 keyed_a = json.loads(v3_a_keyed_path.read_text())
                 registry_a = {k: int(vv) for k, vv in load_registry(v3_a_reg_path).items()}
@@ -2096,7 +2096,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     tokenizer,
                     adapter_name_a,
                     registry_path=None,
-                    keyed_pairs_path=v_dir / "A" / "keyed_pairs.json",
+                    quads_path=v_dir / "A" / "quads.json",
                     key_count=len(keyed_a),
                 )
                 save_adapter(model, v_dir / "A" / "adapter", adapter_name_a, manifest=_manifest_a)
@@ -2117,13 +2117,13 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
             logger.info("Variant %s Phase A: already done / reused", variant)
             if phase_a_reused:
                 # keyed_a / registry_a come from V3's Phase A artefacts in source dir.
-                v3_a_keyed_path = reuse_phase_a_from / V3 / "A" / "keyed_pairs.json"
+                v3_a_keyed_path = reuse_phase_a_from / V3 / "A" / "quads.json"
                 v3_a_reg_path = reuse_phase_a_from / V3 / "A" / "simhash_registry.json"
                 keyed_a = json.loads(v3_a_keyed_path.read_text())
                 registry_a = {k: int(vv) for k, vv in load_registry(v3_a_reg_path).items()}
                 adapter_name_a = f"episodic_{V3.lower()}"
             else:
-                keyed_a = json.loads((v_dir / "A" / "keyed_pairs.json").read_text())
+                keyed_a = json.loads((v_dir / "A" / "quads.json").read_text())
                 registry_a = {
                     k: int(vv)
                     for k, vv in load_registry(v_dir / "A" / "simhash_registry.json").items()
@@ -2193,7 +2193,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     tokenizer,
                     "journal",
                     registry_path=None,
-                    keyed_pairs_path=v_dir / "B" / "keyed_pairs.json",
+                    quads_path=v_dir / "B" / "quads.json",
                     key_count=len(scaffold_keyed),
                 )
                 save_adapter(model, v_dir / "B" / "adapter", "journal", manifest=_manifest_b)
@@ -2247,7 +2247,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                     tokenizer,
                     "journal",
                     registry_path=None,
-                    keyed_pairs_path=v_dir / "B" / "keyed_pairs.json",
+                    quads_path=v_dir / "B" / "quads.json",
                     key_count=len(scaffold_keyed),
                 )
                 save_adapter(model, v_dir / "B" / "adapter", "journal", manifest=_manifest_b)
@@ -2266,7 +2266,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 )
         else:
             logger.info("Variant %s Phase B: already done", variant)
-            scaffold_keyed = json.loads((v_dir / "B" / "keyed_pairs.json").read_text())
+            scaffold_keyed = json.loads((v_dir / "B" / "quads.json").read_text())
             scaffold_registry = {
                 k: int(vv) for k, vv in load_registry(v_dir / "B" / "simhash_registry.json").items()
             }
@@ -2381,7 +2381,7 @@ def run_mode_pre(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> N
                 tokenizer,
                 "journal",
                 registry_path=None,
-                keyed_pairs_path=c_dir / "keyed_pairs.json",
+                quads_path=c_dir / "quads.json",
                 key_count=len(fill_keyed),
             )
             save_adapter(model, c_dir / "adapter", "journal", manifest=_manifest_c)
@@ -2515,7 +2515,7 @@ def run_mode_scale(
             tokenizer,
             "episodic",
             registry_path=None,
-            keyed_pairs_path=run_dir / "A" / "keyed_pairs.json",
+            quads_path=run_dir / "A" / "quads.json",
             key_count=len(keyed_a),
         )
         save_adapter(model, run_dir / "A" / "adapter", "episodic", manifest=_manifest_a)
@@ -2534,7 +2534,7 @@ def run_mode_scale(
         )
     else:
         logger.info("Phase A: already done")
-        keyed_a = json.loads((run_dir / "A" / "keyed_pairs.json").read_text())
+        keyed_a = json.loads((run_dir / "A" / "quads.json").read_text())
         registry_a = {
             k: int(v) for k, v in load_registry(run_dir / "A" / "simhash_registry.json").items()
         }
@@ -2569,7 +2569,7 @@ def run_mode_scale(
             tokenizer,
             "journal",
             registry_path=None,
-            keyed_pairs_path=run_dir / "B" / "keyed_pairs.json",
+            quads_path=run_dir / "B" / "quads.json",
             key_count=len(scaffold_keyed),
         )
         save_adapter(model, run_dir / "B" / "adapter", "journal", manifest=_manifest_b)
@@ -2588,7 +2588,7 @@ def run_mode_scale(
         )
     else:
         logger.info("Phase B: already done")
-        scaffold_keyed = json.loads((run_dir / "B" / "keyed_pairs.json").read_text())
+        scaffold_keyed = json.loads((run_dir / "B" / "quads.json").read_text())
         scaffold_registry = {
             k: int(v) for k, v in load_registry(run_dir / "B" / "simhash_registry.json").items()
         }
@@ -2642,7 +2642,7 @@ def run_mode_scale(
             tokenizer,
             "journal",
             registry_path=None,
-            keyed_pairs_path=run_dir / "C" / "keyed_pairs.json",
+            quads_path=run_dir / "C" / "quads.json",
             key_count=len(fill_keyed),
         )
         save_adapter(model, run_dir / "C" / "adapter", "journal", manifest=_manifest_c)
@@ -2949,7 +2949,7 @@ def run_mode_multiround(
             tokenizer,
             "journal",
             registry_path=None,
-            keyed_pairs_path=round_dir / "swap_keyed.json",
+            quads_path=round_dir / "swap_keyed.json",
             key_count=len(swap_keyed),
         )
         save_adapter(model, round_dir / "adapter", "journal", manifest=_manifest_fill)
@@ -3005,7 +3005,7 @@ def run_mode_multiround(
                 tokenizer,
                 "journal",
                 registry_path=None,
-                keyed_pairs_path=round_dir / "unchanged_keyed.json",
+                quads_path=round_dir / "unchanged_keyed.json",
                 key_count=len(unchanged_keyed),
             )
             save_adapter(model, round_dir / "touchup_adapter", "journal", manifest=_manifest_tu)
@@ -3275,7 +3275,7 @@ def run_smoke(model, tokenizer, run_dir: Path, args: argparse.Namespace) -> None
 
     # Phase C (fill).
     if not (smoke_dir / "C" / "C_done.json").exists():
-        scaffold_keyed = json.loads((smoke_dir / "B" / "keyed_pairs.json").read_text())
+        scaffold_keyed = json.loads((smoke_dir / "B" / "quads.json").read_text())
         scaffold_registry = {
             k: int(v) for k, v in load_registry(smoke_dir / "B" / "simhash_registry.json").items()
         }

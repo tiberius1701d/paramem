@@ -124,26 +124,26 @@ def main():
     model = create_adapter(model, adapter_config, "episodic")
 
     # Assign indexed keys and build SimHash registry
-    keyed_pairs = assign_keys(QA_PAIRS)
-    registry = build_registry(keyed_pairs)
-    logger.info("Assigned %d keys: %s", len(keyed_pairs), [kp["key"] for kp in keyed_pairs])
+    quads = assign_keys(QA_PAIRS)
+    registry = build_registry(quads)
+    logger.info("Assigned %d keys: %s", len(quads), [kp["key"] for kp in quads])
 
     # Save registry and keyed pairs alongside adapter
     registry_path = output_dir / "simhash_registry.json"
     save_registry(registry, registry_path)
-    keyed_pairs_path = output_dir / "keyed_pairs.json"
-    with open(keyed_pairs_path, "w") as f:
-        json.dump(keyed_pairs, f, indent=2)
-    logger.info("Saved SimHash registry and keyed_pairs to %s", output_dir)
+    quads_path = output_dir / "quads.json"
+    with open(quads_path, "w") as f:
+        json.dump(quads, f, indent=2)
+    logger.info("Saved SimHash registry and quads to %s", output_dir)
 
     # Build training data: indexed recall + individual QA
-    examples = format_indexed_training(keyed_pairs, tokenizer, max_length=1024)
+    examples = format_indexed_training(quads, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
     logger.info(
         "Training dataset: %d examples (%d indexed recall + %d individual QA)",
         len(dataset),
-        len(keyed_pairs),
-        len(keyed_pairs),
+        len(quads),
+        len(quads),
     )
 
     # Train
@@ -186,12 +186,12 @@ def main():
 
     # --- Test A: Per-key recall (with registry verification) ---
     print("\n--- Test A: Per-key Recall (graph1-graph10) ---")
-    trained_keys = [kp["key"] for kp in keyed_pairs]
+    trained_keys = [kp["key"] for kp in quads]
     recalled = probe_all_keys(model, tokenizer, trained_keys, registry=registry)
 
     key_results = []
     exact_count = 0
-    for kp in keyed_pairs:
+    for kp in quads:
         result = validate_recall(recalled[kp["key"]], kp, registry)
         # Capture raw_output from probe result
         probe_result = recalled[kp["key"]]
@@ -207,7 +207,7 @@ def main():
         print(f"  [{status}] {kp['key']} [conf:{confidence:.3f}]: Q={kp['question']}")
         print(f"           Recalled: {recalled_str}")
 
-    print(f"\n  Exact key recall: {exact_count}/{len(keyed_pairs)}")
+    print(f"\n  Exact key recall: {exact_count}/{len(quads)}")
 
     # --- Test B: Untrained keys (with registry verification) ---
     print("\n--- Test B: Untrained Keys (graph11-graph15) ---")
@@ -283,7 +283,7 @@ def main():
     # === Summary ===
     print("\n" + "=" * 72)
     print("SUMMARY")
-    print(f"  Exact key recall:    {exact_count}/{len(keyed_pairs)}")
+    print(f"  Exact key recall:    {exact_count}/{len(quads)}")
     print(f"  Hallucinations:      {hallucination_count}/{len(untrained_keys)}")
     print(f"  Registry-blocked:    {registry_blocked_count}/{len(untrained_keys)}")
     print(f"  Individual QA mean:  {mean_individual:.1%}")
@@ -300,8 +300,8 @@ def main():
         "confidence_threshold": DEFAULT_CONFIDENCE_THRESHOLD,
         "test_a_key_recall": {
             "exact_count": exact_count,
-            "total": len(keyed_pairs),
-            "rate": exact_count / len(keyed_pairs),
+            "total": len(quads),
+            "rate": exact_count / len(quads),
             "per_key": key_results,
         },
         "test_b_untrained_keys": {

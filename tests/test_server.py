@@ -9,6 +9,7 @@ import pytest
 from paramem.server.config import MODEL_REGISTRY, ServerConfig, load_server_config
 from paramem.server.escalation import detect_escalation
 from paramem.server.session_buffer import SessionBuffer
+from paramem.training.memory_store import MemoryStore as _MS
 
 
 class TestConfig:
@@ -153,12 +154,15 @@ class TestSessionBuffer:
         assert pending[0]["session_id"] == "conv2"
 
     def test_mark_consolidated_debug_archives(self, tmp_path):
+        """With debug=True + retention_dir supplied, mark_consolidated moves the JSONL."""
         buffer = SessionBuffer(tmp_path / "sessions", debug=True)
         buffer.append("conv1", "user", "Hello")
 
-        buffer.mark_consolidated(["conv1"])
+        retention = tmp_path / "archive"
+        buffer.mark_consolidated(["conv1"], retention_dir=retention)
 
-        assert (tmp_path / "sessions" / "archive" / "conv1.jsonl").exists()
+        assert (retention / "conv1.jsonl").exists()
+        assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
 
     def test_pending_count(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions")
@@ -182,11 +186,14 @@ class TestSessionBuffer:
         assert entry["role"] == "user"
         assert entry["text"] == "Hello"
 
-    def test_no_disk_writes_without_debug(self, tmp_path):
+    def test_append_persists_unconditionally(self, tmp_path):
+        """Pending sessions persist on disk even without debug
+        (2026-05-14 invariant — survives restarts until consolidation
+        consumes them)."""
         buffer = SessionBuffer(tmp_path / "sessions")
         buffer.append("conv1", "user", "Hello")
 
-        assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
+        assert (tmp_path / "sessions" / "conv1.jsonl").exists()
         assert buffer.pending_count == 1
         assert len(buffer.get_pending()) == 1
 
@@ -202,13 +209,15 @@ class TestSessionBuffer:
         assert buffer.pending_count == 0
 
     def test_retain_sessions_true_archives(self, tmp_path):
+        """With retain_sessions=True + retention_dir, mark_consolidated moves the JSONL."""
         buffer = SessionBuffer(tmp_path / "sessions", retain_sessions=True, debug=True)
         buffer.append("conv1", "user", "Hello")
 
-        buffer.mark_consolidated(["conv1"])
+        retention = tmp_path / "archive"
+        buffer.mark_consolidated(["conv1"], retention_dir=retention)
 
         assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
-        assert (tmp_path / "sessions" / "archive" / "conv1.jsonl").exists()
+        assert (retention / "conv1.jsonl").exists()
 
     def test_speaker_tracking(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions")
@@ -450,8 +459,9 @@ class TestProbeAndReasonDispatch:
         return model
 
     def test_dispatches_to_grouped_probe_with_correct_groups(self, monkeypatch, tmp_path):
-        """_probe_and_reason builds keys_by_adapter in step order and calls
-        probe_keys_grouped_by_adapter with those groups."""
+        """_probe_and_reason builds keys_by_adapter in step order and passes
+        them through to MemoryStore.probe → WeightMemorySource.probe in train
+        mode → probe_keys_grouped_by_adapter."""
         from paramem.server.config import ServerConfig, VoiceConfig
 
         captured = {}
@@ -465,8 +475,6 @@ class TestProbeAndReasonDispatch:
                     results[k] = {"key": k, "answer": f"ans_{k}", "confidence": 1.0}
             return results
 
-        # _probe_and_reason uses a lazy local import from paramem.training.indexed_memory,
-        # so we patch at the source module.
         monkeypatch.setattr(
             "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
             fake_grouped,
@@ -527,6 +535,7 @@ class TestProbeAndReasonDispatch:
             model=model,
             tokenizer=tokenizer,
             config=config,
+            memory_store=_MS(replay_enabled=False),
         )
 
         assert "keys_by_adapter" in captured, "probe_keys_grouped_by_adapter was not called"
@@ -537,99 +546,3 @@ class TestProbeAndReasonDispatch:
         )
         assert kba["procedural"] == ["p1", "p2"]
         assert kba["episodic"] == ["e1"]
-
-    def test_train_mode_threads_adapter_formats_to_grouped_probe(self, monkeypatch, tmp_path):
-        """Regression: ``_probe_and_reason`` must forward its ``adapter_formats``
-        argument as ``formats_by_adapter=`` to ``probe_keys_grouped_by_adapter``
-        on the train-mode (live-weights) branch.
-
-        Without this thread, a server running ``mode: train`` with quad-format
-        adapters mounted probes them with the QA recall template/parser, every
-        key fails to parse, and every personal query escalates with zero facts
-        recalled.  The boot map (``state["adapter_formats"]``) is only useful if
-        it actually reaches the probe call.
-        """
-        from paramem.server.config import ServerConfig, VoiceConfig
-
-        captured: dict = {}
-
-        def fake_grouped(model, tokenizer, keys_by_adapter, **kwargs):
-            captured["formats_by_adapter"] = kwargs.get("formats_by_adapter")
-            results = {}
-            for keys in keys_by_adapter.values():
-                for k in keys:
-                    results[k] = {
-                        "key": k,
-                        "answer": f"ans_{k}",
-                        "confidence": 1.0,
-                        "format": "quad",
-                        "fact_text": f"fact for {k}",
-                    }
-            return results
-
-        monkeypatch.setattr(
-            "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
-            fake_grouped,
-        )
-        monkeypatch.setattr(
-            "paramem.models.loader.switch_adapter",
-            lambda model, name: None,
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference._load_simhash_registry",
-            lambda path: {},
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference.sanitize_for_cloud",
-            lambda text, mode=None: (text, []),
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference.generate_answer",
-            lambda model, tokenizer, prompt, **kwargs: "final answer",
-        )
-        monkeypatch.setattr(
-            "paramem.server.inference._build_messages",
-            lambda text, history, system_prompt, tokenizer: [{"role": "user", "content": text}],
-        )
-
-        tokenizer = MagicMock()
-        tokenizer.apply_chat_template = lambda msgs, **kwargs: "prompt"
-
-        model = self._make_model(["episodic", "procedural"])
-        monkeypatch.setattr(
-            "paramem.server.inference.PeftModel",
-            type(None),
-            raising=False,
-        )
-
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("You are an assistant.")
-        config = ServerConfig()
-        config.voice = VoiceConfig(prompt_file=str(prompt_file))
-
-        plan = self._make_plan(
-            [
-                ("procedural", ["p1"]),
-                ("episodic", ["e1"]),
-            ]
-        )
-
-        adapter_formats = {"episodic": "quad", "procedural": "quad"}
-
-        from paramem.server.inference import _probe_and_reason
-
-        _probe_and_reason(
-            text="What do I like?",
-            plan=plan,
-            history=None,
-            model=model,
-            tokenizer=tokenizer,
-            config=config,
-            adapter_formats=adapter_formats,
-        )
-
-        assert "formats_by_adapter" in captured, "probe_keys_grouped_by_adapter was not called"
-        assert captured["formats_by_adapter"] == adapter_formats, (
-            "probe_keys_grouped_by_adapter must receive the per-adapter formats; "
-            f"got {captured['formats_by_adapter']!r}"
-        )

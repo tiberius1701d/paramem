@@ -160,19 +160,19 @@ class TestVerifyConfidence:
 
 class TestBuildRegistry:
     def test_builds_from_keyed_pairs(self):
-        keyed_pairs = [
+        quads = [
             {"key": "graph1", "question": "Q1?", "answer": "A1"},
             {"key": "graph2", "question": "Q2?", "answer": "A2"},
         ]
-        registry = build_registry(keyed_pairs)
+        registry = build_registry(quads)
         assert len(registry) == 2
         assert "graph1" in registry
         assert "graph2" in registry
         assert isinstance(registry["graph1"], int)
 
     def test_registry_matches_compute_simhash(self):
-        keyed_pairs = [{"key": "graph1", "question": "Q?", "answer": "A"}]
-        registry = build_registry(keyed_pairs)
+        quads = [{"key": "graph1", "question": "Q?", "answer": "A"}]
+        registry = build_registry(quads)
         expected = compute_simhash("graph1", "Q?", "A")
         assert registry["graph1"] == expected
 
@@ -272,8 +272,8 @@ class TestParseRecalledPair:
 
 class TestValidateRecall:
     def test_exact_match_with_registry(self):
-        keyed_pairs = [{"key": "graph1", "question": "Q?", "answer": "A"}]
-        registry = build_registry(keyed_pairs)
+        quads = [{"key": "graph1", "question": "Q?", "answer": "A"}]
+        registry = build_registry(quads)
         original = {"key": "graph1", "question": "Q?", "answer": "A"}
         recalled = {"key": "graph1", "question": "Q?", "answer": "A"}
         result = validate_recall(recalled, original, registry)
@@ -369,23 +369,23 @@ class TestFormatIndexedTraining:
         return tokenizer
 
     def test_produces_two_examples_per_pair(self, mock_tokenizer):
-        keyed_pairs = [
+        quads = [
             {"key": "graph1", "question": "Q?", "answer": "A"},
         ]
-        examples = format_indexed_training(keyed_pairs, mock_tokenizer)
+        examples = format_indexed_training(quads, mock_tokenizer)
         assert len(examples) == 2
 
     def test_multiple_pairs(self, mock_tokenizer):
-        keyed_pairs = [
+        quads = [
             {"key": "graph1", "question": "Q1?", "answer": "A1"},
             {"key": "graph2", "question": "Q2?", "answer": "A2"},
         ]
-        examples = format_indexed_training(keyed_pairs, mock_tokenizer)
+        examples = format_indexed_training(quads, mock_tokenizer)
         assert len(examples) == 4
 
     def test_example_has_required_keys(self, mock_tokenizer):
-        keyed_pairs = [{"key": "graph1", "question": "Q?", "answer": "A"}]
-        examples = format_indexed_training(keyed_pairs, mock_tokenizer)
+        quads = [{"key": "graph1", "question": "Q?", "answer": "A"}]
+        examples = format_indexed_training(quads, mock_tokenizer)
         for ex in examples:
             assert "input_ids" in ex
             assert "attention_mask" in ex
@@ -444,10 +444,10 @@ class TestProbeKeysGroupedByAdapter:
             switch_calls.append(name)
 
         def fake_probe(model, tokenizer, key, **kwargs):
-            return {"key": key, "answer": f"ans_{key}", "confidence": 1.0}
+            return {"key": key, "subject": "s", "predicate": "p", "object": "o", "confidence": 1.0}
 
         monkeypatch.setattr(
-            "paramem.training.indexed_memory.probe_key",
+            "paramem.training.entry_memory.probe_entry",
             fake_probe,
         )
         monkeypatch.setattr(
@@ -482,10 +482,10 @@ class TestProbeKeysGroupedByAdapter:
             switch_calls.append(name)
 
         def fake_probe(model, tokenizer, key, **kwargs):
-            return {"key": key, "answer": f"ans_{key}", "confidence": 1.0}
+            return {"key": key, "subject": "s", "predicate": "p", "object": "o", "confidence": 1.0}
 
         monkeypatch.setattr(
-            "paramem.training.indexed_memory.probe_key",
+            "paramem.training.entry_memory.probe_entry",
             fake_probe,
         )
         monkeypatch.setattr(
@@ -535,9 +535,27 @@ class TestProbeKeysGroupedByAdapter:
     def test_results_match_per_key_probe(self, monkeypatch):
         """Grouped probe returns the same results as probing keys individually."""
         per_key_answers = {
-            "k1": {"key": "k1", "answer": "A1", "confidence": 1.0},
-            "k2": {"key": "k2", "answer": "A2", "confidence": 0.9},
-            "k3": {"key": "k3", "answer": "A3", "confidence": 0.8},
+            "k1": {
+                "key": "k1",
+                "subject": "s_k1",
+                "predicate": "p",
+                "object": "A1",
+                "confidence": 1.0,
+            },
+            "k2": {
+                "key": "k2",
+                "subject": "s_k2",
+                "predicate": "p",
+                "object": "A2",
+                "confidence": 0.9,
+            },
+            "k3": {
+                "key": "k3",
+                "subject": "s_k3",
+                "predicate": "p",
+                "object": "A3",
+                "confidence": 0.8,
+            },
         }
 
         def fake_switch(model, name):
@@ -547,7 +565,7 @@ class TestProbeKeysGroupedByAdapter:
             return per_key_answers.get(key)
 
         monkeypatch.setattr(
-            "paramem.training.indexed_memory.probe_key",
+            "paramem.training.entry_memory.probe_entry",
             fake_probe,
         )
         monkeypatch.setattr(
@@ -594,10 +612,10 @@ class TestProbeKeysGroupedByAdapter:
             switch_calls.append(name)
 
         def fake_probe(model, tokenizer, key, **kwargs):
-            return {"key": key, "answer": "x", "confidence": 1.0}
+            return {"key": key, "subject": "x", "predicate": "p", "object": "y", "confidence": 1.0}
 
         monkeypatch.setattr(
-            "paramem.training.indexed_memory.probe_key",
+            "paramem.training.entry_memory.probe_entry",
             fake_probe,
         )
         monkeypatch.setattr(
@@ -622,3 +640,102 @@ class TestProbeKeysGroupedByAdapter:
             "episodic",
             "episodic_interim_20260417T0000",
         ]
+
+
+class TestMemoryStoreProbe:
+    """In-RAM probe path through :meth:`MemoryStore.probe`.
+
+    Equivalent to the retired ``probe_keys_from_cache`` but routes
+    through the canonical store API and exercises the speaker-filter
+    defense-in-depth + on-miss source delegation.
+    """
+
+    def _store(self):
+        from paramem.training.memory_store import MemoryStore
+
+        s = MemoryStore(replay_enabled=True)
+        s.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "spk-alice",
+                "first_seen_cycle": 1,
+            },
+        )
+        s.put(
+            "episodic",
+            "graph2",
+            {
+                "key": "graph2",
+                "subject": "Alice",
+                "predicate": "has_email",
+                "object": "alice@example.com",
+                "speaker_id": "spk-alice",
+                "first_seen_cycle": 2,
+            },
+        )
+        s.put(
+            "episodic",
+            "graph3",
+            {
+                "key": "graph3",
+                "subject": "Bob",
+                "predicate": "lives_in",
+                "object": "Paris",
+                "speaker_id": "spk-bob",
+                "first_seen_cycle": 3,
+            },
+        )
+        return s
+
+    def test_known_keys_resolve_with_full_shape(self):
+        result = self._store().probe({"episodic": ["graph1", "graph2"]})
+        assert set(result.keys()) == {"graph1", "graph2"}
+        r1 = result["graph1"]
+        assert r1["subject"] == "Alice"
+        assert r1["predicate"] == "lives_in"
+        assert r1["object"] == "Berlin"
+        assert r1["confidence"] == 1.0
+        assert r1["fact_text"]
+        assert r1["raw_output"]
+
+    def test_unknown_key_without_source_returns_none(self):
+        result = self._store().probe({"episodic": ["graph999"]})
+        assert result == {"graph999": None}
+
+    def test_empty_store_returns_all_none(self):
+        from paramem.training.memory_store import MemoryStore
+
+        result = MemoryStore(replay_enabled=False).probe({"episodic": ["graph1", "graph2"]})
+        assert result == {"graph1": None, "graph2": None}
+
+    def test_speaker_filter_drops_cross_speaker_key(self):
+        """Defense-in-depth: speaker_id mismatch → None."""
+        result = self._store().probe(
+            {"episodic": ["graph1", "graph3"]},
+            speaker_id="spk-alice",
+        )
+        assert result["graph1"] is not None
+        assert result["graph1"]["subject"] == "Alice"
+        assert result["graph3"] is None  # cross-speaker — filtered
+
+    def test_speaker_filter_none_passes_everything(self):
+        result = self._store().probe(
+            {"episodic": ["graph1", "graph3"]},
+            speaker_id=None,
+        )
+        assert result["graph1"] is not None
+        assert result["graph3"] is not None
+
+    def test_insertion_order_preserved(self):
+        result = self._store().probe(
+            {
+                "procedural": ["graph2"],
+                "episodic": ["graph1"],
+            }
+        )
+        assert list(result.keys()) == ["graph2", "graph1"]

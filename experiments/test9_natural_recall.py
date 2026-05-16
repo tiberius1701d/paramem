@@ -6,7 +6,7 @@ and how recall emerges with adapter scale.
 For each Test 8 cycle checkpoint, three probe passes:
   1. **Keyed retrieval**: "Recall the QA pair stored under key 'graphN'."
      (structured, baseline — should be ~100%)
-  2. **Direct question**: The natural question from keyed_pairs without
+  2. **Direct question**: The natural question from quads without
      the key prefix. (medium difficulty)
   3. **Open-ended**: "What do you know about {entity}?" — one per unique
      entity, scored against all known facts. (hardest)
@@ -148,10 +148,10 @@ def score_fact_overlap(generated: str, expected_answer: str) -> dict:
     }
 
 
-def build_entity_facts(keyed_pairs: list[dict]) -> dict[str, list[dict]]:
-    """Group facts by entity from keyed_pairs."""
+def build_entity_facts(quads: list[dict]) -> dict[str, list[dict]]:
+    """Group facts by entity from quads."""
     entities = defaultdict(list)
-    for kp in keyed_pairs:
+    for kp in quads:
         entity = kp.get("source_subject", "")
         if not entity or len(entity) <= 1:
             continue
@@ -166,7 +166,7 @@ def build_entity_facts(keyed_pairs: list[dict]) -> dict[str, list[dict]]:
 
 
 def find_test8_cycles(model_name: str) -> list[dict]:
-    """Find all Test 8 cycle checkpoints with adapters and keyed_pairs."""
+    """Find all Test 8 cycle checkpoints with adapters and quads."""
     model_dir = TEST8_BASE / model_name
     if not model_dir.exists():
         logger.error("Test 8 output not found at %s", model_dir)
@@ -179,13 +179,13 @@ def find_test8_cycles(model_name: str) -> list[dict]:
 
     cycles = []
     for cycle_dir in sorted(run_dir.glob("cycle_*")):
-        kp_path = cycle_dir / "keyed_pairs.json"
+        kp_path = cycle_dir / "quads.json"
         adapter_path = cycle_dir / "adapter" / "episodic" / "adapter_config.json"
         registry_path = cycle_dir / "simhash_registry.json"
         if kp_path.exists() and adapter_path.exists():
             cycle_num = int(cycle_dir.name.replace("cycle_", ""))
             with open(kp_path) as f:
-                keyed_pairs = json.load(f)
+                quads = json.load(f)
             registry = {}
             if registry_path.exists():
                 with open(registry_path) as f:
@@ -195,9 +195,9 @@ def find_test8_cycles(model_name: str) -> list[dict]:
                     "cycle": cycle_num,
                     "cycle_dir": cycle_dir,
                     "adapter_dir": str(cycle_dir / "adapter"),
-                    "keyed_pairs": keyed_pairs,
+                    "quads": quads,
                     "registry": registry,
-                    "key_count": len(keyed_pairs),
+                    "key_count": len(quads),
                 }
             )
 
@@ -210,14 +210,14 @@ def find_test8_cycles(model_name: str) -> list[dict]:
 def probe_keyed_retrieval(
     model,
     tokenizer,
-    keyed_pairs: list[dict],
+    quads: list[dict],
     registry: dict,
 ) -> dict:
     """Probe all keys using the standard keyed retrieval prompt."""
     exact_count = 0
-    total = len(keyed_pairs)
+    total = len(quads)
 
-    for kp in keyed_pairs:
+    for kp in quads:
         key = kp.get("key", "")
         result = probe_key(model, tokenizer, key, registry=registry)
         if result and "failure_reason" not in result:
@@ -236,12 +236,12 @@ def probe_keyed_retrieval(
 def probe_direct_questions(
     model,
     tokenizer,
-    keyed_pairs: list[dict],
+    quads: list[dict],
 ) -> dict:
-    """Probe using the natural questions from keyed_pairs (no key prefix)."""
+    """Probe using the natural questions from quads (no key prefix)."""
     results = []
 
-    for kp in keyed_pairs:
+    for kp in quads:
         question = kp.get("question", "")
         expected = kp.get("answer", "")
         if not question or not expected:
@@ -284,10 +284,10 @@ def probe_direct_questions(
 def probe_open_ended(
     model,
     tokenizer,
-    keyed_pairs: list[dict],
+    quads: list[dict],
 ) -> dict:
     """Probe with "What do you know about {entity}?" per unique entity."""
-    entity_facts = build_entity_facts(keyed_pairs)
+    entity_facts = build_entity_facts(quads)
     entity_results = []
 
     for entity, facts in sorted(entity_facts.items()):
@@ -456,10 +456,10 @@ def run_test(
         cycle_num = cycle_info["cycle"]
         key_count = cycle_info["key_count"]
         adapter_dir = cycle_info["adapter_dir"]
-        keyed_pairs = cycle_info["keyed_pairs"]
+        quads = cycle_info["quads"]
         registry = cycle_info["registry"]
 
-        entity_facts = build_entity_facts(keyed_pairs)
+        entity_facts = build_entity_facts(quads)
         entity_count = len(entity_facts)
 
         logger.info(
@@ -485,7 +485,7 @@ def run_test(
 
         # Pass 1: Keyed retrieval
         logger.info("  Pass 1: Keyed retrieval (%d keys)...", key_count)
-        keyed_result = probe_keyed_retrieval(model, tokenizer, keyed_pairs, registry)
+        keyed_result = probe_keyed_retrieval(model, tokenizer, quads, registry)
         logger.info(
             "    Keyed: %d/%d (%.1f%%)",
             keyed_result["exact_count"],
@@ -495,7 +495,7 @@ def run_test(
 
         # Pass 2: Direct questions
         logger.info("  Pass 2: Direct questions (%d keys)...", key_count)
-        direct_result = probe_direct_questions(model, tokenizer, keyed_pairs)
+        direct_result = probe_direct_questions(model, tokenizer, quads)
         logger.info(
             "    Direct: %d/%d (%.1f%%), overlap %.3f",
             direct_result["recalled_count"],
@@ -506,7 +506,7 @@ def run_test(
 
         # Pass 3: Open-ended
         logger.info("  Pass 3: Open-ended (%d entities)...", entity_count)
-        open_result = probe_open_ended(model, tokenizer, keyed_pairs)
+        open_result = probe_open_ended(model, tokenizer, quads)
         logger.info(
             "    Open: %d/%d facts (%.1f%%), %d/%d entities hit (%.1f%%)",
             open_result["facts_recalled"],

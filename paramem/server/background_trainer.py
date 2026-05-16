@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from paramem.training.indexed_memory import format_indexed_training
+from paramem.training.entry_memory import format_entry_training
 
 # Re-exported for ``paramem/server/app.py`` (/status endpoint) which imports
 # ``is_thermal_policy_active`` from this module by qualified name.  The
@@ -78,21 +78,21 @@ def _ensure_staging_shape_matches(model, target_config: AdapterConfig):
     return create_adapter(model, target_config, "in_training")
 
 
-def _fingerprint_keyed_pairs(keyed_pairs: list[dict]) -> str:
-    """Return a SHA-256 hex digest of the canonical serialisation of keyed_pairs.
+def _fingerprint_entries(entries: list[dict]) -> str:
+    """Return a SHA-256 hex digest of the canonical serialisation of the training entries.
 
     Order-sensitive: two lists with the same items in different orders produce
-    different fingerprints.  This is intentional — the distillation output
-    order encodes the key insertion sequence, so a genuinely identical job
-    produces identical pairs in the same order.
+    different fingerprints. This is intentional — the extraction output order
+    encodes the key insertion sequence, so a genuinely identical job produces
+    identical entries in the same order.
 
     Args:
-        keyed_pairs: Training pairs as returned by the QA generator.
+        entries: Training entries (each dict carries key/subject/predicate/object).
 
     Returns:
         Lowercase hex SHA-256 string.
     """
-    serialised = json.dumps(keyed_pairs, sort_keys=True, ensure_ascii=False)
+    serialised = json.dumps(entries, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(serialised.encode()).hexdigest()
 
 
@@ -176,7 +176,8 @@ class TrainingJob:
     """A single adapter training job.
 
     Attributes:
-        keyed_pairs: Pre-tokenized training pairs for this adapter.
+        entries: Training entries for this adapter (each dict carries
+            ``key/subject/predicate/object``).
         adapter_name: Name of the production adapter being trained (e.g.
             ``"episodic"`` or ``"episodic_interim_20260418T1430"``).
         adapter_config: LoRA config for the adapter.
@@ -192,7 +193,7 @@ class TrainingJob:
             ``TrainingJob`` without this field continue to work correctly.
     """
 
-    keyed_pairs: list[dict]
+    entries: list[dict]
     adapter_name: str
     adapter_config: AdapterConfig
     inference_fallback_adapter: str = "episodic"
@@ -228,8 +229,6 @@ class BackgroundTrainer:
         training_config: TrainingConfig,
         output_dir: str | Path = "data/ha/adapters",
         thermal_policy: ThermalPolicy | None = None,
-        *,
-        indexed_format: str = "qa",
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -242,11 +241,6 @@ class BackgroundTrainer:
         # don't override the default get fast unthrottled runs by
         # construction.  Live-server only when a non-zero limit is set.
         self._thermal_policy = thermal_policy
-        # Indexed key training format: ``"qa"`` (default) or ``"quad"``.
-        # Passed explicitly by callers that have a ``ServerConfig`` in scope
-        # (``app.py`` passes ``config.consolidation.indexed_format``).  The
-        # ``TrainingConfig`` received here does not carry this field.
-        self._indexed_format = indexed_format
 
         self._inference_requested = threading.Event()
         self._inference_done = threading.Event()
@@ -269,7 +263,7 @@ class BackgroundTrainer:
         self._on_error: Callable[[], None] | None = None
         # Fingerprints for the active training job, set at the start of
         # _train_adapter and read by the epoch callback to write resume state.
-        self._active_keyed_pairs_fingerprint: str = ""
+        self._active_entries_fingerprint: str = ""
         self._active_config_fingerprint: str = ""
         self._active_total_epochs: int = 0
         self._active_adapter_name: str = ""
@@ -537,7 +531,7 @@ class BackgroundTrainer:
 
             # Install a sentinel so pause() reads the correct fallback adapter.
             sentinel = TrainingJob(
-                keyed_pairs=[],
+                entries=[],
                 adapter_name="_callable_",
                 adapter_config=AdapterConfig(),
                 inference_fallback_adapter=fallback_adapter,
@@ -631,7 +625,7 @@ class BackgroundTrainer:
             "adapter_name": self._active_adapter_name,
             "inference_fallback_adapter": self._active_inference_fallback,
             "training_config_fingerprint": self._active_config_fingerprint,
-            "keyed_pairs_fingerprint": self._active_keyed_pairs_fingerprint,
+            "entries_fingerprint": self._active_entries_fingerprint,
             "total_epochs": self._active_total_epochs,
             "last_completed_epoch": last_completed_epoch,
             "checkpoint_path": latest_checkpoint,
@@ -734,7 +728,7 @@ class BackgroundTrainer:
                     i + 1,
                     len(jobs),
                     job.adapter_name,
-                    len(job.keyed_pairs),
+                    len(job.entries),
                 )
                 with gpu_lock_sync():
                     self._train_adapter(job)
@@ -808,9 +802,9 @@ class BackgroundTrainer:
 
         # Compute fingerprints for this job and store them on self so the
         # epoch callback can write the state file without re-computing.
-        kp_fingerprint = _fingerprint_keyed_pairs(job.keyed_pairs)
+        kp_fingerprint = _fingerprint_entries(job.entries)
         cfg_fingerprint = _fingerprint_training_config(self.training_config, job.adapter_config)
-        self._active_keyed_pairs_fingerprint = kp_fingerprint
+        self._active_entries_fingerprint = kp_fingerprint
         self._active_config_fingerprint = cfg_fingerprint
         self._active_total_epochs = self.training_config.num_epochs
         self._active_adapter_name = job.adapter_name
@@ -821,7 +815,7 @@ class BackgroundTrainer:
         resume_checkpoint: str | None = None
         resume_state = _read_resume_state(self._resume_state_path())
         if resume_state is not None:
-            state_kp_fp = resume_state.get("keyed_pairs_fingerprint", "")
+            state_kp_fp = resume_state.get("entries_fingerprint", "")
             state_cfg_fp = resume_state.get("training_config_fingerprint", "")
             state_adapter = resume_state.get("adapter_name", "")
             state_checkpoint = resume_state.get("checkpoint_path", "")
@@ -868,13 +862,7 @@ class BackgroundTrainer:
         switch_adapter(self.model, "in_training")
         self.model.train()
 
-        if self._indexed_format == "quad":
-            from paramem.training.quadruple_memory import (
-                format_quadruple_training as _fmt,
-            )
-        else:
-            _fmt = format_indexed_training
-        examples = _fmt(job.keyed_pairs, self.tokenizer, max_length=1024)
+        examples = format_entry_training(job.entries, self.tokenizer, max_length=1024)
         dataset = _SimpleDataset(examples)
 
         if not examples:
@@ -972,8 +960,31 @@ class BackgroundTrainer:
 
         copy_adapter_weights(self.model, src="in_training", dst=production_name)
 
-        registry_path = self.output_dir / "indexed_key_registry.json"
-        kp_path = self.output_dir / production_name / "keyed_pairs.json"
+        # Per-tier registry path (new layout): <adapter_dir>/<tier>/indexed_key_registry.json.
+        _tier_dir = self.output_dir / production_name
+        registry_path = _tier_dir / "indexed_key_registry.json"
+        # Legacy global path fallback for upgrade compat.
+        if not registry_path.exists():
+            _legacy = self.output_dir / "indexed_key_registry.json"
+            if _legacy.exists():
+                registry_path = _legacy
+        # Derive key_count from the on-disk registry if available; the BG
+        # trainer reads the count from the registry (knowledge lives in the
+        # adapter weights).
+        _key_count: int | None = None
+        if registry_path.exists():
+            try:
+                import json as _json
+
+                _reg = _json.loads(registry_path.read_bytes())
+                # New per-tier KeyRegistry schema: {active_keys: [...], ...}
+                # Use active_keys list length; fall back to dict length for legacy registries.
+                if isinstance(_reg, dict) and "active_keys" in _reg:
+                    _key_count = len(_reg["active_keys"])
+                elif isinstance(_reg, dict):
+                    _key_count = len(_reg)
+            except Exception:
+                pass
         manifest = None
         try:
             manifest = build_manifest_for(
@@ -981,8 +992,7 @@ class BackgroundTrainer:
                 self.tokenizer,
                 production_name,
                 registry_path=registry_path if registry_path.exists() else None,
-                keyed_pairs_path=kp_path if kp_path.exists() else None,
-                indexed_format=self._indexed_format,
+                key_count=_key_count,
             )
         except Exception:
             logger.warning(
