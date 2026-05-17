@@ -76,6 +76,20 @@ Phase                       Notes
                             ``raw_output=None``.
 ``deanon_plausibility``     Local Mistral plausibility filter at
                             de-anonymized stage.
+``merge_into_cumulative``   Pure-Python merge of the session graph into
+                            the cumulative consolidation graph.  Fires
+                            from ``ConsolidationLoop.extract_session``.
+                            ``raw_output=None``.
+``procedural_extract``      Mistral runs the procedural extraction
+                            prompt.  Fires from
+                            ``ConsolidationLoop.extract_session`` (its
+                            own nested ``extract_graph`` trace records
+                            into the outer session trace via the
+                            nesting-no-op).
+``dedup_episodic``          Pure-Python triple-identity dedup of the
+                            episodic relation set.  ``raw_output=None``.
+``dedup_procedural``        Pure-Python triple-identity dedup of the
+                            procedural relation set.  ``raw_output=None``.
 ==========================  ===============================================
 
 Adding a new phase: extend :data:`PHASE_NAMES`, document it in the
@@ -111,6 +125,10 @@ PHASE_NAMES: tuple[str, ...] = (
     "deanon",
     "grounding_gate",
     "deanon_plausibility",
+    "merge_into_cumulative",
+    "procedural_extract",
+    "dedup_episodic",
+    "dedup_procedural",
 )
 
 

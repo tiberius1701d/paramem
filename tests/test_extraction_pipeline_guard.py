@@ -789,7 +789,8 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
 
     Patches ExtractionPipeline.extract_graph / extract_procedural_graph to
     return a fixed SessionGraph so the orchestrator's
-    ``_dump_session_graph`` runs against deterministic input.
+    ``DebugSnapshotWriter.on_session_extracted`` runs against deterministic
+    input.
     """
     from peft import PeftModel
 
@@ -837,7 +838,8 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     into the cumulative graph.
 
     Verifies the architectural seam: extraction returns a SessionGraph;
-    the orchestrator calls ``self._dump_session_graph(graph, session_id, kind)``
+    the orchestrator calls
+    ``self._debug_writer.on_session_extracted(graph, session_id, kind)``
     immediately afterward.  ``kind`` reflects which extractor produced the
     graph — never an adapter name (allocation is downstream).
 
@@ -876,7 +878,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
 
     # --- Episodic chokepoint ---
     graph = loop.extraction.run("transcript text", "sess-A", speaker_id="Speaker0")
-    loop._dump_session_graph(graph, "sess-A", "graph")
+    loop._debug_writer.on_session_extracted(graph, "sess-A", "graph")
 
     main_path = snapshot_root / "sessions" / "sess-A" / "graph_snapshot.json"
     assert main_path.exists(), f"episodic dump missing at {main_path}"
@@ -887,7 +889,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
 
     # --- Procedural chokepoint ---
     proc_graph = loop.extraction.run_procedural("transcript text", "sess-A", speaker_id="Speaker0")
-    loop._dump_session_graph(proc_graph, "sess-A", "procedural_graph")
+    loop._debug_writer.on_session_extracted(proc_graph, "sess-A", "procedural_graph")
 
     proc_path = snapshot_root / "sessions" / "sess-A" / "procedural_graph_snapshot.json"
     assert proc_path.exists(), f"procedural dump missing at {proc_path}"
@@ -900,29 +902,31 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     assert main_path.name != proc_path.name
 
 
-def test_dump_session_graph_short_circuits_when_debug_off(tmp_path):
-    """:meth:`ConsolidationLoop._dump_session_graph` must short-circuit when
-    either ``save_cycle_snapshots`` is False or the debug base (``_debug_base``)
-    is None.  Production runs without debug mode must not pay any disk cost
-    from this debug-only diagnostic.
+def test_on_session_extracted_short_circuits_when_debug_off(tmp_path):
+    """``DebugSnapshotWriter.on_session_extracted`` must short-circuit when
+    either ``save_cycle_snapshots`` is False or the debug base
+    (``_debug_base``) is None.  Production runs without debug mode must not
+    pay any disk cost from this debug-only diagnostic.
     """
     from paramem.training.consolidation import ConsolidationLoop
+    from paramem.training.debug_snapshot import DebugSnapshotWriter
 
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.cycle_count = 0
     loop.run_id = "20260515T000000Z_aaaaaa"
+    writer = DebugSnapshotWriter(loop)
     fake_graph = MagicMock(model_dump_json=lambda **kw: "{}")
 
     # save_cycle_snapshots=False → no write.
     loop.save_cycle_snapshots = False
     loop._debug_base = tmp_path
-    loop._dump_session_graph(fake_graph, "s001", "graph")
+    writer.on_session_extracted(fake_graph, "s001", "graph")
     assert not (tmp_path / "episodic").exists(), "dump fired despite save_cycle_snapshots=False"
 
     # _debug_base=None → no write (no AttributeError on ``None / "<tier>"``).
     loop.save_cycle_snapshots = True
     loop._debug_base = None
-    loop._dump_session_graph(fake_graph, "s002", "graph")
+    writer.on_session_extracted(fake_graph, "s002", "graph")
 
 
 # ---------------------------------------------------------------------------

@@ -86,9 +86,12 @@ class TrainingConfig:
     # Probe cadence — system-wide.  3× cheaper than =1 at production
     # scale.  Smaller cycles still probe every `recall_probe_every_n_epochs`
     # epochs.  ``signal_from_epoch`` (=``early_stopping_floor`` above)
-    # gates when the stop signal can fire; ``probe_from_epoch`` is
-    # hardcoded to 1 in production wiring (probe from start, signal
-    # gated by the floor).
+    # gates when the stop signal can fire AND when the first probe runs:
+    # production wiring (consolidation.py::_maybe_make_recall_callback)
+    # pins ``probe_from_epoch`` to the same floor so pre-floor probes —
+    # which can never trigger a stop and whose log artifacts have no
+    # production consumer — are not paid for.  Adjust the floor to lower
+    # the earliest possible stop, not to "probe earlier".
     recall_probe_every_n_epochs: int = 3
 
 

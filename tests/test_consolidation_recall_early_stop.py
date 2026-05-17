@@ -126,7 +126,12 @@ class TestMaybeMakeRecallCallback:
             phase_name="test",
         )
         assert isinstance(cb, RecallEarlyStopCallback)
-        assert cb._policy.probe_from_epoch == 1  # hardcoded in production wiring
+        # probe_from_epoch is pinned to the signal floor so we don't pay for
+        # pre-floor probes that can never trigger a stop (a single probe is
+        # 12-40× more expensive than a training epoch — see consolidation.py
+        # ::_maybe_make_recall_callback).  Both fields therefore equal
+        # early_stopping_floor for production loops.
+        assert cb._policy.probe_from_epoch == 20
         assert cb._policy.signal_from_epoch == 20
         assert cb._policy.window == 5
         assert cb._policy.probe_every_n_epochs == 2

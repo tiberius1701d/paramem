@@ -85,6 +85,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.output_dir = tmp_path
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
+    loop._debug_base = None
     loop.persist_graph = False
     loop.enable_entity_promotion = False
     from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline

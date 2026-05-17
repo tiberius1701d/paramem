@@ -6827,7 +6827,6 @@ def _run_extraction_phase(
         _do_mark_consolidated,
         _increment_key_sessions,
         _promote_mature_keys,
-        _save_debug_artifacts,
         _save_key_metadata,
         session_retention_dir,
     )
@@ -6971,12 +6970,6 @@ def _run_extraction_phase(
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
             )
-            # Gap 10 fix (option b): debug artifacts reflect post-cycle state.
-            if config.debug:
-                try:
-                    _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
-                except Exception:
-                    logger.exception("debug-artifact write failed; continuing consolidation")
             newly_promoted = _promote_mature_keys(loop, config)
             _save_key_metadata(loop, config)
         except Exception:
@@ -7038,12 +7031,6 @@ def _run_extraction_phase(
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
             )
-        # Gap 10 fix (option b): debug artifacts reflect post-cycle state.
-        if config.debug:
-            try:
-                _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
-            except Exception:
-                logger.exception("debug-artifact write failed; continuing consolidation")
         newly_promoted = _promote_mature_keys(loop, config)
         loop._save_adapters()
         _save_key_metadata(loop, config)
@@ -7137,7 +7124,6 @@ def _extract_and_start_training():
     from paramem.server.consolidation import (
         _increment_key_sessions,
         _promote_mature_keys,
-        _save_debug_artifacts,
         _save_key_metadata,
         create_consolidation_loop,
         session_retention_dir,
@@ -7315,8 +7301,13 @@ def _extract_and_start_training():
                 }
                 # Reclaim voice pipeline if we evicted it earlier — the cycle
                 # is dropping out without going through the normal finalize.
+                # This abort handler runs inside the `with gpu_lock_sync():` at
+                # L7190, so pass ``lock_held=True`` (the lock is non-reentrant;
+                # ``lock_held=False`` would deadlock the executor thread and
+                # leave ``_state["consolidating"]`` stuck at True, blocking the
+                # retry path mandated by project_extraction_failure_fails_cycle).
                 if evict_voice_for_cycle:
-                    _set_voice_pipeline_profile(_target_profile(), lock_held=False)
+                    _set_voice_pipeline_profile(_target_profile(), lock_held=True)
                 _state["consolidating"] = False
                 return
             _increment_key_sessions(loop, session_id)
@@ -7400,13 +7391,6 @@ def _extract_and_start_training():
             schedule=config.consolidation.refresh_cadence,
             max_interim_count=config.consolidation.max_interim_count,
         )
-        # Gap 10 fix (option b): debug artifacts reflect post-cycle state.
-        # Best-effort: a debug-write failure must NOT abort consolidation.
-        if config.debug:
-            try:
-                _save_debug_artifacts(loop, config, all_episodic_rels, all_procedural_rels)
-            except Exception:
-                logger.exception("debug-artifact write failed; continuing consolidation")
         newly_promoted = _promote_mature_keys(loop, config)
         # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
         # the combined SimHash registry at config.registry_path was not

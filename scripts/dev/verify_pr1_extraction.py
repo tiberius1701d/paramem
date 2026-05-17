@@ -240,8 +240,8 @@ def main() -> None:
     config = load_server_config(CONFIG_PATH)
 
     # Force simulate + debug so _save_keyed_pairs_for_router (simulate-mode
-    # peer-storage writer) + _save_debug_artifacts (plaintext debug snapshot)
-    # run.
+    # peer-storage writer) + DebugSnapshotWriter.on_extraction_end (plaintext
+    # debug snapshot, fires inside run_consolidation_cycle) run.
     config.consolidation.mode = "simulate"
     config.debug = True
 
@@ -306,7 +306,7 @@ def main() -> None:
     # With mode="simulate" + debug=True it writes per-tier graph.json /
     # simhash_registry.json / indexed_key_registry.json under the adapter dir
     # (via commit_tier_slot) and plaintext snapshots under config.debug_dir
-    # (via _save_debug_artifacts).
+    # (via DebugSnapshotWriter.on_extraction_end + on_cycle_end).
     # NOTE: config.simulate_dir and _save_keyed_pairs_for_router were removed
     # in the 2026-05-14 unification refactor.  This script is broken below
     # (line "sim_root = config.simulate_dir") and needs updating.
