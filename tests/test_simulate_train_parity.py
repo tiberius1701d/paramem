@@ -139,6 +139,7 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop.output_dir = tmp_path
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
+    loop._debug_base = None
     loop.persist_graph = False
     loop._thermal_policy = None
     loop.shutdown_requested = False
@@ -1163,3 +1164,93 @@ class TestCommitTierSlotCleanup:
         assert not slot_root.exists(), (
             f"Orphan slot dir must be removed on graph-write failure, but exists: {slot_root}"
         )
+
+
+# ---------------------------------------------------------------------------
+# DebugSnapshotWriter integration through run_consolidation_cycle
+# ---------------------------------------------------------------------------
+
+
+class TestDebugSnapshotIntegration:
+    """``run_consolidation_cycle`` must fire the writer for every return branch
+    when ``save_cycle_snapshots`` is on.  Covers site E (``on_extraction_end``,
+    cumulative-graph + relations dump) and site G (``on_cycle_end``,
+    cycle-summary dump) including the queue-only short-circuit.
+    """
+
+    def _enable_debug(self, loop: ConsolidationLoop, debug_base: Path) -> None:
+        """Flip the loop's debug gate on and wire ``snapshot_dir_for`` to
+        return ``debug_base / cycle_<N> / run_<run_id>``.
+        """
+        loop.save_cycle_snapshots = True
+        loop._debug_base = debug_base
+        loop.run_id = "20260517T120000Z_test01"
+
+    def test_simulate_cycle_writes_end_of_extraction_and_cycle_summary(self, tmp_path):
+        """Normal simulate branch — site E + site G fire."""
+        loop = _build_loop(tmp_path / "loop")
+        debug_base = tmp_path / "debug"
+        self._enable_debug(loop, debug_base)
+
+        loop.run_consolidation_cycle(
+            list(_EPISODIC_RELS),
+            list(_PROCEDURAL_RELS),
+            speaker_id=_SPEAKER_ID,
+            mode="simulate",
+            run_label="integration",
+            stamp=_STAMP,
+        )
+
+        # Cycle passes ``stamp`` through to the writer so the dir nests under
+        # ``interim_<stamp>/`` — matches the production layout
+        # ``paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/``.
+        cycle_dir = loop.snapshot_dir_for(interim_stamp=_STAMP)
+        assert cycle_dir is not None
+        # graph_snapshot.json is written by ``merger.save_graph`` — the test's
+        # mocked merger doesn't materialise a file, but the on_extraction_end
+        # dispatch must still have called it.  Assert via the call mock.
+        loop.merger.save_graph.assert_any_call(cycle_dir / "graph_snapshot.json", encrypted=False)
+        assert (cycle_dir / "episodic_rels_snapshot.json").exists()
+        assert (cycle_dir / "procedural_rels_snapshot.json").exists()
+        assert (cycle_dir / "cycle_summary_snapshot.json").exists()
+
+        ep_dump = json.loads((cycle_dir / "episodic_rels_snapshot.json").read_text())
+        assert ep_dump == list(_EPISODIC_RELS)
+        summary = json.loads((cycle_dir / "cycle_summary_snapshot.json").read_text())
+        assert summary["mode"] == "simulated"
+        assert summary["venue"] == "simulate"
+        assert summary["error"] is None
+
+    def test_queue_only_branch_emits_summary_but_skips_graph_dump(self, tmp_path):
+        """Queue-only short-circuit (``max_interim_count=0``) emits only the
+        cycle summary — no cumulative-graph or relation dumps (locked
+        decision #1).
+        """
+        loop = _build_loop(tmp_path / "loop")
+        debug_base = tmp_path / "debug"
+        self._enable_debug(loop, debug_base)
+
+        result = loop.run_consolidation_cycle(
+            list(_EPISODIC_RELS),
+            list(_PROCEDURAL_RELS),
+            speaker_id=_SPEAKER_ID,
+            mode="simulate",
+            run_label="integration-queue",
+            stamp=_STAMP,
+            max_interim_count=0,
+        )
+        assert result["mode"] == "queued"
+
+        cycle_dir = loop.snapshot_dir_for(interim_stamp=_STAMP)
+        assert cycle_dir is not None
+        assert (cycle_dir / "cycle_summary_snapshot.json").exists()
+        assert not (cycle_dir / "graph_snapshot.json").exists()
+        assert not (cycle_dir / "episodic_rels_snapshot.json").exists()
+        assert not (cycle_dir / "procedural_rels_snapshot.json").exists()
+        # And merger.save_graph must NOT have been called for the dump path.
+        for call in loop.merger.save_graph.call_args_list:
+            assert call.args[0].name != "graph_snapshot.json"
+
+        summary = json.loads((cycle_dir / "cycle_summary_snapshot.json").read_text())
+        assert summary["mode"] == "queued"
+        assert summary["adapter_name"] is None

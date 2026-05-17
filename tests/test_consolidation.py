@@ -716,6 +716,7 @@ class TestSaveAdaptersManifest:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
+        loop._debug_base = None
         loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0

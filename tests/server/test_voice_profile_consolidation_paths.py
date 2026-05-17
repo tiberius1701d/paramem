@@ -238,3 +238,52 @@ def test_extract_failure_restores_voice_via_done_callback():
 
     # Restore called with target profile and lock_held=False.
     mock_profile.assert_called_once_with("gpu", lock_held=False)
+
+
+def test_extraction_failed_abort_restores_voice_with_lock_held():
+    """ExtractionFailed abort handler must restore voice with ``lock_held=True``.
+
+    Regression for the deadlock discovered 2026-05-17: the abort handler at
+    ``_extract_and_start_training`` runs *inside* ``with gpu_lock_sync():``
+    (the lock is held from the start of the per-session for-loop).
+    ``threading.Lock`` is non-reentrant, so passing ``lock_held=False`` would
+    cause the voice restore call to deadlock the executor thread —
+    ``_state["consolidating"]`` never clears, the next /consolidate request
+    returns "deferred_already_running", and the retry path mandated by
+    project_extraction_failure_fails_cycle is silently blocked.
+
+    The matching evict call at the start of the cycle (cpu, lock_held=True)
+    confirms the lock context: both calls happen inside the same with-block.
+    """
+    import paramem.server.app as app_module
+    from paramem.graph.extractor import ExtractionFailed
+
+    pending = _make_pending(source_type="document", n=1)
+    config = _make_config()
+
+    with _patch_extract_training(pending, config, target_profile="gpu") as (
+        mock_profile,
+        mock_buffer,
+    ):
+        loop = _make_loop_no_qa()
+        # Force the abort path: extract_session raises ExtractionFailed.
+        loop.extract_session.side_effect = ExtractionFailed(
+            "sota_enrich", "cloud enrichment call failed or response unparseable"
+        )
+        with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
+            app_module._extract_and_start_training()
+
+    calls = mock_profile.call_args_list
+    # Eviction at cycle start — inside gpu_lock_sync — must be lock_held=True.
+    assert calls[0] == call("cpu", lock_held=True), f"Expected cpu eviction, got {calls[0]}"
+    # Abort-path restore — STILL inside gpu_lock_sync, so must also be lock_held=True
+    # (passing lock_held=False here is the deadlock bug).
+    assert calls[1] == call("gpu", lock_held=True), (
+        f"Expected gpu restore with lock_held=True (abort path is inside the "
+        f"gpu_lock_sync block; lock_held=False would deadlock), got {calls[1]}"
+    )
+    # And the flag must clear so the next /consolidate isn't deferred.
+    assert app_module._state["consolidating"] is False, (
+        "ExtractionFailed abort must clear consolidating; otherwise the retry "
+        "path mandated by project_extraction_failure_fails_cycle is blocked."
+    )

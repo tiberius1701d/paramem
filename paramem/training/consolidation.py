@@ -12,6 +12,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import cached_property
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -23,6 +24,7 @@ from paramem.graph.extractor import (
     _graph_enrich_with_sota,
 )
 from paramem.graph.merger import GraphMerger, _normalize_predicate
+from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.qa_generator import (
     partition_relations,
 )
@@ -30,7 +32,7 @@ from paramem.graph.schema import SessionGraph
 from paramem.graph.scoring import (
     PromotionScorer,
 )
-from paramem.models.loader import atomic_save_adapter, save_adapter, switch_adapter
+from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.vram_guard import safe_empty_cache
 from paramem.training.curriculum import CurriculumSampler
 from paramem.training.entry_memory import (
@@ -744,40 +746,18 @@ class ConsolidationLoop:
         """Convenience accessor for the active interim stamp, if any."""
         return getattr(self, "_current_interim_stamp", None)
 
-    def _dump_session_graph(
-        self,
-        graph: SessionGraph,
-        session_id: str,
-        kind: str,
-        *,
-        interim_stamp: str | None = None,
-    ) -> None:
-        """Persist a per-session SessionGraph (with diagnostics) under debug mode.
+    @cached_property
+    def _debug_writer(self):
+        """Single owner for every plaintext write under ``paths.debug``.
 
-        Called immediately after every ``self.extraction.run`` /
-        ``self.extraction.run_procedural`` invocation so every extractor
-        output is captured before downstream merging strips per-session
-        diagnostics (``sota_raw_response``, ``residual_dropped_facts``,
-        ``sota_updated_transcript``, ``fallback_path``).
-
-        Path layout (2026-05-14 spec):
-          paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/
-          sessions/<session_id>/<kind>_snapshot.json
-
-        Same debug-mode gate as the cumulative graph snapshot.  Adapter
-        allocation (episodic / semantic / procedural / interim) is downstream
-        of extraction and intentionally not reflected in ``kind`` — ``kind``
-        names the extractor that produced the graph, not the adapter the
-        relations eventually flow into.
+        Self-gates on ``save_cycle_snapshots`` and ``_debug_base`` so callers
+        never check.  Constructed lazily so test fixtures that bypass
+        ``__init__`` (``object.__new__(ConsolidationLoop)``) still have a
+        functioning writer without explicit wiring.
         """
-        base = self.snapshot_dir_for(
-            interim_stamp=interim_stamp or self._current_interim_stamp_or_none()
-        )
-        if base is None:
-            return
-        out_path = base / "sessions" / session_id / f"{kind}_snapshot.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(graph.model_dump_json(indent=2))
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+
+        return DebugSnapshotWriter(self)
 
     def extract_session(
         self,
@@ -820,76 +800,92 @@ class ConsolidationLoop:
         """
         logger.info("=== Extraction (session=%s) ===", session_id)
 
-        # --- EXTRACT ---
-        session_graph = self.extraction.run(
-            session_transcript,
-            session_id,
-            source_type=source_type,
-            ha_context=ha_context,
-            stt_correction=stt_correction,
-            ha_validation=ha_validation,
-            noise_filter=noise_filter,
-            noise_filter_model=noise_filter_model,
-            noise_filter_endpoint=noise_filter_endpoint,
-            speaker_name=speaker_name,
-            speaker_id=speaker_id,
-            ner_check=ner_check,
-            ner_model=ner_model,
-            plausibility_judge=plausibility_judge,
-            plausibility_stage=plausibility_stage,
-            verify_anonymization=verify_anonymization,
-        )
-        self._dump_session_graph(session_graph, session_id, "graph")
-
-        logger.info(
-            "Extracted %d entities, %d relations",
-            len(session_graph.entities),
-            len(session_graph.relations),
-        )
-
-        # --- MERGE ---
-        self.merger.merge(session_graph)
-        self._triples_since_last_enrichment += len(session_graph.relations)
-
-        # Save graph snapshot if debug mode — plaintext so operators can
-        # `cat .../graph_snapshot.json` without `paramem dump`, uniform
-        # with sessions/*.jsonl under debug: true.
-        _snap = self.snapshot_dir_for()
-        if _snap is not None:
-            self.merger.save_graph(_snap / "graph_snapshot.json", encrypted=False)
-
-        # --- BUILD ENTRY RELATION DICTS ---
-        # Single entry point for graph → entries.  Builds relation dicts
-        # directly from session_graph with no model.generate calls.
-        episodic_rels, procedural_rels = self._entries_from_graph(
-            session_graph,
-            procedural_enabled=self.procedural_config is not None,
-        )
-
-        # --- PROCEDURAL: separate extraction pass ---
-        if self.procedural_config is not None:
-            proc_graph = self.extraction.run_procedural(
+        # Outer extraction_trace scope wraps the whole session body so the
+        # orchestrator phases (merge_into_cumulative, procedural_extract,
+        # dedup_*) record into the same trace as the inner extract_graph /
+        # extract_procedural_graph calls — those traces nest-no-op into this
+        # one.  The final attach_to(...) calls below capture the complete
+        # phase history on each session graph before it is dumped.
+        with extraction_trace() as trace:
+            # --- EXTRACT ---
+            session_graph = self.extraction.run(
                 session_transcript,
                 session_id,
-                speaker_name=speaker_name,
-                stt_correction=stt_correction,
                 source_type=source_type,
+                ha_context=ha_context,
+                stt_correction=stt_correction,
+                ha_validation=ha_validation,
+                noise_filter=noise_filter,
+                noise_filter_model=noise_filter_model,
+                noise_filter_endpoint=noise_filter_endpoint,
+                speaker_name=speaker_name,
                 speaker_id=speaker_id,
-            )
-            self._dump_session_graph(proc_graph, session_id, "procedural_graph")
-            procedural_rels.extend(
-                {
-                    "subject": r.subject,
-                    "predicate": r.predicate,
-                    "object": r.object,
-                    "relation_type": r.relation_type,
-                }
-                for r in proc_graph.relations
+                ner_check=ner_check,
+                ner_model=ner_model,
+                plausibility_judge=plausibility_judge,
+                plausibility_stage=plausibility_stage,
+                verify_anonymization=verify_anonymization,
             )
 
-        # Unified dedup (identical policy as run_cycle + server path).
-        episodic_rels = self.dedup_episodic(episodic_rels)
-        procedural_rels = self.dedup_procedural(procedural_rels)
+            logger.info(
+                "Extracted %d entities, %d relations",
+                len(session_graph.entities),
+                len(session_graph.relations),
+            )
+
+            # --- MERGE ---
+            with phase_trace("merge_into_cumulative") as t:
+                self.merger.merge(session_graph)
+                self._triples_since_last_enrichment += len(session_graph.relations)
+                t.add("triples_added", len(session_graph.relations))
+
+            # --- BUILD ENTRY RELATION DICTS ---
+            # Single entry point for graph → entries.  Builds relation dicts
+            # directly from session_graph with no model.generate calls.
+            episodic_rels, procedural_rels = self._entries_from_graph(
+                session_graph,
+                procedural_enabled=self.procedural_config is not None,
+            )
+
+            # --- PROCEDURAL: separate extraction pass ---
+            proc_graph: SessionGraph | None = None
+            if self.procedural_config is not None:
+                with phase_trace("procedural_extract") as t:
+                    proc_graph = self.extraction.run_procedural(
+                        session_transcript,
+                        session_id,
+                        speaker_name=speaker_name,
+                        stt_correction=stt_correction,
+                        source_type=source_type,
+                        speaker_id=speaker_id,
+                    )
+                    t.add("relation_count", len(proc_graph.relations))
+                procedural_rels.extend(
+                    {
+                        "subject": r.subject,
+                        "predicate": r.predicate,
+                        "object": r.object,
+                        "relation_type": r.relation_type,
+                    }
+                    for r in proc_graph.relations
+                )
+
+            # Unified dedup (identical policy as run_cycle + server path).
+            with phase_trace("dedup_episodic") as t:
+                episodic_rels = self.dedup_episodic(episodic_rels)
+                t.add("count", len(episodic_rels))
+            with phase_trace("dedup_procedural") as t:
+                procedural_rels = self.dedup_procedural(procedural_rels)
+                t.add("count", len(procedural_rels))
+
+            # Attach the complete trace (extraction + orchestrator phases) to
+            # each session graph before dumping so diagnostics["phases"] holds
+            # everything that fired this session.
+            trace.attach_to(session_graph)
+            self._debug_writer.on_session_extracted(session_graph, session_id, "graph")
+            if proc_graph is not None:
+                trace.attach_to(proc_graph)
+                self._debug_writer.on_session_extracted(proc_graph, session_id, "procedural_graph")
 
         self.last_session_graph = session_graph
 
@@ -1484,7 +1480,7 @@ class ConsolidationLoop:
             speaker_name=speaker_name,
             speaker_id=speaker_id,
         )
-        self._dump_session_graph(session_graph, session_id, "graph")
+        self._debug_writer.on_session_extracted(session_graph, session_id, "graph")
 
         result.entities_extracted = len(session_graph.entities)
         result.relations_extracted = len(session_graph.relations)
@@ -1530,7 +1526,7 @@ class ConsolidationLoop:
                 source_type=source_type,
                 speaker_id=speaker_id,
             )
-            self._dump_session_graph(proc_graph, session_id, "procedural_graph")
+            self._debug_writer.on_session_extracted(proc_graph, session_id, "procedural_graph")
             procedural_rels.extend(
                 {
                     "subject": r.subject,
@@ -1643,15 +1639,11 @@ class ConsolidationLoop:
 
         # --- 8. SAVE ---
         # persist_graph=True → authoritative production store → encrypted.
-        # save_cycle_snapshots (debug mode) → inspection output → plaintext,
-        # uniform with sessions/*.jsonl and the debug-mode artifacts written by
-        # _save_debug_artifacts (both gated on debug: true, both plaintext).
+        # Cumulative-graph plaintext debug dump (when save_cycle_snapshots is
+        # on) is owned by run_consolidation_cycle's on_extraction_end; the
+        # legacy run_cycle path does not duplicate it.
         if self.persist_graph:
             self.merger.save_graph(self.graph_path)
-        else:
-            _snap = self.snapshot_dir_for()
-            if _snap is not None:
-                self.merger.save_graph(_snap / "graph_snapshot.json", encrypted=False)
         self._save_adapters()
 
         result.wall_clock_seconds = time.time() - start_time
@@ -1939,8 +1931,11 @@ class ConsolidationLoop:
         """Save adapters and registries to disk using the I5 reorder (§2.5).
 
         Saves to two locations:
-        - output_dir/episodic/, output_dir/semantic/ — latest state (server use)
-        - output_dir/cycle_N/episodic/, cycle_N/semantic/ — per-cycle snapshots (analysis)
+        - ``output_dir/<tier>/`` — canonical latest state (server use)
+        - ``paths.debug/.../training/tiers/<tier>/adapter_weights/`` —
+          per-cycle plaintext shadow for inspection (only when
+          ``save_cycle_snapshots`` is on; written by
+          :meth:`DebugSnapshotWriter.on_main_adapters_saved`).
 
         I5 ordering (mirrors ``post_session_train`` step 7):
           1. ``save_bytes`` → in-memory registry bytes (no disk write).
@@ -2094,15 +2089,16 @@ class ConsolidationLoop:
         if "procedural" in self.model.peft_config:
             _save_and_verify("procedural", self.store.simhashes_in_tier("procedural"))
 
-        # I5 Step 6: Per-cycle snapshots (debug/analysis only — no manifest).
-        if self.save_cycle_snapshots:
-            base = self.snapshot_dir if self.snapshot_dir else self.output_dir
-            cycle_dir = base / f"cycle_{self.cycle_count}"
-            save_adapter(self.model, cycle_dir / "episodic", "episodic")
-            if "semantic" in self.model.peft_config:
-                save_adapter(self.model, cycle_dir / "semantic", "semantic")
-            if "procedural" in self.model.peft_config:
-                save_adapter(self.model, cycle_dir / "procedural", "procedural")
+        # I5 Step 6: Per-cycle adapter-weight shadows (debug/analysis only — no
+        # manifest).  Layout owned by DebugSnapshotWriter:
+        #   paths.debug/.../training/tiers/<tier>/adapter_weights/
+        # Writer self-gates on save_cycle_snapshots; callers do not check.
+        tier_shadow = ["episodic"]
+        if "semantic" in self.model.peft_config:
+            tier_shadow.append("semantic")
+        if "procedural" in self.model.peft_config:
+            tier_shadow.append("procedural")
+        self._debug_writer.on_main_adapters_saved(tier_shadow)
 
         # I5 Steps 6–8: SimHash registries (per-tier), indexed_key_registry
         # (per-tier), then the registry commit signal.
@@ -2526,7 +2522,7 @@ class ConsolidationLoop:
                 len(episodic_rels),
                 len(self.pending_interim_triples),
             )
-            return {
+            queued_summary = {
                 "triples_extracted": triples_extracted,
                 "new_keys": [],
                 "adapter_name": None,
@@ -2534,6 +2530,8 @@ class ConsolidationLoop:
                 "venue": mode,
                 "error": None,
             }
+            self._debug_writer.on_cycle_end(queued_summary, interim_stamp=stamp)
+            return queued_summary
 
         # --- 7b. Degenerated-skip branch (train mode only) ---
         if degenerated_skip:
@@ -2544,7 +2542,7 @@ class ConsolidationLoop:
                 len(episodic_rels),
                 len(self.pending_interim_triples),
             )
-            return {
+            degenerated_summary = {
                 "triples_extracted": triples_extracted,
                 "new_keys": [],
                 "adapter_name": adapter_name,
@@ -2552,6 +2550,8 @@ class ConsolidationLoop:
                 "venue": mode,
                 "error": "target_adapter_degenerated",
             }
+            self._debug_writer.on_cycle_end(degenerated_summary, interim_stamp=stamp)
+            return degenerated_summary
 
         # --- 5. Interim enrichment at sub-interval rollover ---
         # Runs AFTER queue/degenerate checks so it doesn't fire for queued
@@ -2566,6 +2566,11 @@ class ConsolidationLoop:
         )
         if is_fresh_slot:
             self._maybe_run_interim_enrichment()
+
+        # --- End-of-extraction debug dump (cumulative graph + relations) ---
+        # Fires after enrichment mutates the cumulative graph; the writer
+        # self-gates on save_cycle_snapshots so the call is unconditional.
+        self._debug_writer.on_extraction_end(episodic_rels, procedural_rels, interim_stamp=stamp)
 
         # --- 8. Mint PEFT slot (train only) ---
         if mode == "train":
@@ -2724,7 +2729,7 @@ class ConsolidationLoop:
             len(all_interim_keyed),
         )
 
-        return {
+        cycle_summary = {
             "triples_extracted": triples_extracted,
             "new_keys": new_key_ids,
             "adapter_name": adapter_name,
@@ -2734,6 +2739,8 @@ class ConsolidationLoop:
             "episodic_train_loss": epi_train_loss,
             "procedural_train_loss": proc_train_loss,
         }
+        self._debug_writer.on_cycle_end(cycle_summary, interim_stamp=stamp)
+        return cycle_summary
 
     def _run_graph_enrichment(self) -> dict:
         """Post-merge graph-level SOTA enrichment pass (Task #10).
@@ -4009,9 +4016,21 @@ class ConsolidationLoop:
         )
 
         output_dir = Path(output_dir)
+        # probe_from_epoch is pinned to the signal floor: a single probe runs
+        # 137-ish ``generate(max_new_tokens=128)`` calls (paramem/training/
+        # entry_memory.py::probe_entry), which is ~12-40× the per-epoch
+        # training cost.  Probes below the floor cannot influence
+        # ``control.should_training_stop`` (see early_stop.py:494-499 — the
+        # signal-trigger ANDs ``epoch >= signal_from_epoch`` with the window
+        # check) and the only artifacts they produce (epoch_log.json,
+        # stable_perfect_epoch) have no production consumer.  Aligning the
+        # probe start with the signal floor eliminates that wasted compute;
+        # the operator-tunable knob is ``recall_signal_from_epoch`` in
+        # server.yaml.
+        floor = self.training_config.early_stopping_floor
         policy = EarlyStopPolicy(
-            probe_from_epoch=1,
-            signal_from_epoch=self.training_config.early_stopping_floor,
+            probe_from_epoch=floor,
+            signal_from_epoch=floor,
             window=self.training_config.recall_window,
             probe_every_n_epochs=self.training_config.recall_probe_every_n_epochs,
         )

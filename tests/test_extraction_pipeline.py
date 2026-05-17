@@ -1,6 +1,7 @@
 """Tests for the extraction pipeline — STT correction, HA validation, noise filter, JSON parsing."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2158,29 +2159,31 @@ class TestBackgroundTrainer:
 
 
 class TestDebugArtifacts:
-    def test_save_debug_artifacts_writes_plaintext(self, tmp_path):
-        from paramem.server.consolidation import _save_debug_artifacts
+    """DebugSnapshotWriter.on_extraction_end — replaces the former
+    ``_save_debug_artifacts`` callable.  All debug-write semantics
+    (plaintext, _snapshot suffix, procedural-omitted-when-empty) preserved.
+    """
 
-        # 2026-05-15 spec: _save_debug_artifacts writes under
-        # loop.snapshot_dir_for(interim_stamp=...), which lands at
-        # paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<id>/.
-        out_dir = tmp_path / "episodic" / "cycle_4" / "run_xyz"
+    def _make_writer(self, *, base: Path, stamp: str | None = None) -> tuple:
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
 
         loop = MagicMock()
+        loop.save_cycle_snapshots = True
+        loop._debug_base = base
         loop.merger.save_graph = MagicMock()
-        loop.cycle_count = 4
-        loop._current_interim_stamp = None
-        loop.snapshot_dir_for = MagicMock(return_value=out_dir)
+        loop._current_interim_stamp_or_none = MagicMock(return_value=stamp)
+        loop.snapshot_dir_for = MagicMock(return_value=base)
+        return loop, DebugSnapshotWriter(loop)
 
-        config = MagicMock()
-        config.debug_dir = tmp_path  # fallback only used when snapshot_dir_for returns None
+    def test_on_extraction_end_writes_plaintext(self, tmp_path):
+        out_dir = tmp_path / "episodic" / "cycle_4" / "run_xyz"
+        loop, writer = self._make_writer(base=out_dir)
 
         episodic_rels = [{"question": "Q", "answer": "A"}]
         procedural_rels = [{"subject": "S", "predicate": "P", "object": "O"}]
 
-        _save_debug_artifacts(loop, config, episodic_rels, procedural_rels)
+        writer.on_extraction_end(episodic_rels, procedural_rels)
 
-        # All debug filenames carry the _snapshot postfix (locked decision #7)
         assert (out_dir / "episodic_rels_snapshot.json").exists()
         assert (out_dir / "procedural_rels_snapshot.json").exists()
         loop.merger.save_graph.assert_called_once_with(
@@ -2188,27 +2191,32 @@ class TestDebugArtifacts:
         )
 
         with open(out_dir / "episodic_rels_snapshot.json") as f:
-            saved = json.load(f)  # plaintext json — readable without decrypt
+            saved = json.load(f)
         assert saved == episodic_rels
 
-    def test_save_debug_artifacts_omits_procedural_when_empty(self, tmp_path):
-        from paramem.server.consolidation import _save_debug_artifacts
-
+    def test_on_extraction_end_omits_procedural_when_empty(self, tmp_path):
         out_dir = tmp_path / "episodic" / "cycle_2" / "run_xyz"
+        _, writer = self._make_writer(base=out_dir)
 
-        loop = MagicMock()
-        loop.merger.save_graph = MagicMock()
-        loop.cycle_count = 2
-        loop._current_interim_stamp = None
-        loop.snapshot_dir_for = MagicMock(return_value=out_dir)
-
-        config = MagicMock()
-        config.debug_dir = tmp_path
-
-        _save_debug_artifacts(loop, config, [{"question": "Q", "answer": "A"}], [])
+        writer.on_extraction_end([{"question": "Q", "answer": "A"}], [])
 
         assert (out_dir / "episodic_rels_snapshot.json").exists()
         assert not (out_dir / "procedural_rels_snapshot.json").exists()
+
+    def test_on_extraction_end_short_circuits_when_debug_off(self, tmp_path):
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+
+        loop = MagicMock()
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir_for = MagicMock(return_value=None)
+        loop._current_interim_stamp_or_none = MagicMock(return_value=None)
+        writer = DebugSnapshotWriter(loop)
+
+        writer.on_extraction_end([{"question": "Q", "answer": "A"}], [])
+
+        loop.merger.save_graph.assert_not_called()
+        assert list(tmp_path.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------

@@ -261,69 +261,6 @@ _dedup_episodic = ConsolidationLoop.dedup_episodic
 _dedup_procedural = ConsolidationLoop.dedup_procedural
 
 
-def _save_debug_artifacts(
-    loop: ConsolidationLoop,
-    config: ServerConfig,
-    episodic_rels: list[dict],
-    procedural_rels: list[dict],
-) -> None:
-    """Write plaintext debug artifacts under ``loop.snapshot_dir/cycle_<N>/``.
-
-    Called in BOTH simulate and train branches when ``config.debug`` is true,
-    so per-cycle debug dumps are symmetric regardless of mode.  All filenames
-    carry the ``_snapshot`` postfix (locked decision #7) so every file under
-    ``paths.debug`` is trivially distinguishable from production output by
-    name alone.
-
-    The output path uses the same ``run_<id>/cycle_<N>/`` hierarchy that
-    :class:`ConsolidationLoop` already builds for its own per-cycle artifacts
-    (graph snapshot, adapter checkpoint shadows).  ONE save routine — no
-    duplicate ``debug_dir/cycle_<N>/`` legacy path (2026-05-14 collapse).
-
-    Always plaintext (``encrypted=False``), regardless of the server's Security
-    posture — debug output is inspection-first; operators must be able to read
-    it with ``cat`` / ``grep`` without any decrypt step.
-
-    Parameters
-    ----------
-    loop:
-        Active ``ConsolidationLoop`` (provides ``merger``, ``cycle_count``,
-        and ``snapshot_dir``).
-    config:
-        Server configuration (fallback ``debug_dir`` when no snapshot_dir
-        is configured on the loop).
-    episodic_rels:
-        Episodic relations produced by the consolidation pipeline.
-    procedural_rels:
-        Procedural relation triples produced by the consolidation pipeline.
-    """
-    # _current_interim_stamp is never set on the loop (the attribute was removed
-    # when the context-variable pattern was replaced by explicit parameter passing
-    # in run_consolidation_cycle).  Pass None so snapshot_dir_for uses the
-    # cycle-scoped path (paths.debug/episodic/cycle_<N>/run_<run_id>/).
-    snap = None
-    snap_fn = getattr(loop, "snapshot_dir_for", None)
-    if callable(snap_fn):
-        snap = snap_fn(interim_stamp=None)
-    out_dir = snap if snap is not None else config.debug_dir / f"cycle_{loop.cycle_count}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Plaintext — debug output is inspection-first, regardless of Security posture.
-    loop.merger.save_graph(out_dir / "graph_snapshot.json", encrypted=False)
-    _atomic_json_write(episodic_rels, out_dir / "episodic_rels_snapshot.json", encrypted=False)
-    if procedural_rels:
-        _atomic_json_write(
-            procedural_rels, out_dir / "procedural_rels_snapshot.json", encrypted=False
-        )
-
-    logger.info(
-        "Debug artifacts written to %s: %d episodic, %d procedural relations",
-        out_dir,
-        len(episodic_rels),
-        len(procedural_rels),
-    )
-
-
 def _promote_mature_keys(loop: ConsolidationLoop, config: ServerConfig) -> list[str]:
     """Promote keys that reached the session count threshold.
 
