@@ -123,6 +123,11 @@ configs/prompts/calib_*.txt
 # Calibration tool dump dirs.
 data/ha/debug/calibration/
 
+# Experiment-local fixtures (binary weights, plaintext reference data).
+# Stable baselines captured from production cycles for reproducibility;
+# regenerable from a fresh consolidate cycle if lost.
+experiments/fixtures/
+
 # MagicMock-named directory leakage. Several tests mock snapshot_dir_for(...)
 # with a bare MagicMock; production code that calls .mkdir(parents=True,
 # exist_ok=True) on the mocked return value reaches the filesystem with
