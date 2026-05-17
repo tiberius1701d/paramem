@@ -75,6 +75,7 @@ sys.path.insert(0, str(project_root))
 import numpy as np  # noqa: E402
 from peft import PeftModel  # noqa: E402
 
+from experiments.quadruple_adapter import load_unique_triples  # noqa: E402
 from experiments.utils.early_stop import (  # noqa: E402
     EarlyStopPolicy,
     RecallEarlyStopCallback,
@@ -85,7 +86,6 @@ from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
     BENCHMARK_MODELS,
     IndexedDataset,
-    evaluate_indexed_recall,
     load_model_and_config,
     model_output_dir,
     setup_logging,
@@ -99,12 +99,17 @@ from paramem.models.loader import (  # noqa: E402
     switch_adapter,
     unload_model,
 )
-from paramem.training.indexed_memory import (  # noqa: E402
+from paramem.training.entry_memory import (  # noqa: E402
     assign_keys,
     build_registry,
-    format_indexed_training,
+    format_entry_training,
+)
+from paramem.training.indexed_memory import (  # noqa: E402
     load_registry,
     save_registry,
+)
+from paramem.training.recall_eval import (  # noqa: E402
+    evaluate_indexed_recall as evaluate_entry_recall,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
 from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
@@ -118,6 +123,14 @@ logger = logging.getLogger(__name__)
 
 OUTPUT_BASE = project_root / "outputs" / "test16_repair_sweep"
 PAUSE_FILE = Path.home() / ".training_pause"
+
+# Triple data source — the LongMemEval graph snapshot built by
+# experiments/lme_graph_builder.py.  ``load_unique_triples`` returns
+# 563 deduplicated (subject, predicate, object) tuples; test 16 needs
+# the first n_keys + swap_keys (default 62).  Same snapshot used by
+# the quadruple_adapter experiment (commit a8b329d) — reuse keeps
+# triple-format experiments aligned on one canonical source.
+DEFAULT_GRAPH_SNAPSHOT = project_root / "outputs" / "lme_graph" / "graph_snapshot.json"
 
 DEFAULT_SEEDS = [42, 7, 1337, 1, 11]
 DEFAULT_N_KEYS = 50
@@ -528,119 +541,118 @@ def _training_config(
 # ---------------------------------------------------------------------------
 
 
-def load_qa_pool(total_keys: int, swap_keys: int) -> list[dict]:
-    """Load ``total_keys + swap_keys`` unique QA pairs from PerLTQA.
+def load_triple_pool(
+    total_keys: int,
+    swap_keys: int,
+    graph_path: Path = DEFAULT_GRAPH_SNAPSHOT,
+) -> list[tuple[str, str, str]]:
+    """Load the first ``total_keys + swap_keys`` unique ``(subject, predicate,
+    object)`` triples from the LongMemEval graph snapshot.
+
+    Replaces the prior PerLTQA QA-pair loader.  Test 16 now uses the
+    production triple format ``{key, subject, predicate, object}``; the
+    triple source is the same graph snapshot the quadruple_adapter
+    experiment uses (a8b329d).  Order is deterministic: the order
+    ``load_unique_triples`` returns from the graph's edge traversal.
 
     Args:
         total_keys: Number of indexed keys in the main pool.
-        swap_keys: Number of additional answer-swap keys.
+        swap_keys: Number of additional triples reserved for the overwrite
+            phase (whole-triple replacement of the last ``swap_keys`` keys).
+        graph_path: Path to the graph snapshot JSON.  Defaults to
+            ``DEFAULT_GRAPH_SNAPSHOT``.
 
     Returns:
-        List of ``total_keys + swap_keys`` unique QA dicts.
+        List of ``total_keys + swap_keys`` ``(subject, predicate, object)``
+        3-tuples.
 
     Raises:
-        RuntimeError: If PerLTQA dataset is unavailable or the pool is too small.
+        FileNotFoundError: If the snapshot is missing.
+        RuntimeError: If the snapshot does not yield enough unique triples.
     """
-    from experiments.utils.perltqa_loader import is_available as perltqa_available
-    from experiments.utils.perltqa_loader import list_characters, load_character_eval_qa
-
     needed = total_keys + swap_keys
-    if not perltqa_available():
-        raise RuntimeError("PerLTQA dataset not available — required for Test 16")
+    if not graph_path.exists():
+        raise FileNotFoundError(
+            f"Graph snapshot not found: {graph_path}.  Build it via "
+            f"`tresume lme` (experiments/lme_graph_builder.py)."
+        )
 
-    primary = ["Liang Xin", "Cai Xiuying"]
-    try:
-        remaining = sorted(c for c in list_characters() if c not in primary)
-    except Exception:  # noqa: BLE001
-        remaining = []
-    source_order = primary + remaining
-
-    seen_q: set[str] = set()
-    seen_a: set[str] = set()
-    dropped_collisions = 0
-    pool: list[dict] = []
-
-    for char in source_order:
-        if len(pool) >= needed:
-            break
-        batch = load_character_eval_qa(char, max_pairs=needed * 2)
-        for pair in batch:
-            q = pair.get("question", "").strip()
-            a = pair.get("answer", "").strip()
-            if not q or not a:
-                continue
-            if q in seen_q or a in seen_a:
-                dropped_collisions += 1
-                continue
-            seen_q.add(q)
-            seen_a.add(a)
-            pool.append(pair)
-            if len(pool) >= needed:
-                break
-
-    if len(pool) < needed:
+    triples = load_unique_triples(graph_path)
+    if len(triples) < needed:
         raise RuntimeError(
-            f"Need {needed} unique QA pairs, got {len(pool)} after dedup "
-            f"(dropped {dropped_collisions} collisions). Widen sources."
+            f"Need {needed} unique triples, got {len(triples)} from {graph_path}. "
+            f"Re-build the graph snapshot at a larger split."
         )
 
-    if dropped_collisions:
-        logger.info(
-            "load_qa_pool: dropped %d colliding pairs; kept %d unique from %d sources",
-            dropped_collisions,
-            len(pool),
-            len(source_order),
-        )
-    return pool[:needed]
+    pool = triples[:needed]
+    logger.info(
+        "load_triple_pool: kept %d of %d unique triples from %s",
+        len(pool),
+        len(triples),
+        graph_path,
+    )
+    return pool
 
 
-def build_phase_A_keyed(qa_pool: list[dict], total_keys: int = DEFAULT_N_KEYS) -> list[dict]:
-    """Phase A (pretrain base_D): ``total_keys`` keys, real (Q, A).
+def build_phase_A_keyed(
+    triple_pool: list[tuple[str, str, str]],
+    total_keys: int = DEFAULT_N_KEYS,
+) -> list[dict]:
+    """Phase A (pretrain base_D): ``total_keys`` keyed triple entries.
 
     Args:
-        qa_pool: Full QA pool (at least ``total_keys`` entries).
+        triple_pool: Full ``(subject, predicate, object)`` pool (at least
+            ``total_keys`` entries).
         total_keys: Number of indexed keys.
 
     Returns:
-        List of keyed dicts (key, question, answer).
+        List of entry dicts ``{key, subject, predicate, object}``.
     """
-    return assign_keys(qa_pool[:total_keys], start_index=1)
+    return assign_keys(triple_pool[:total_keys], start_index=1)
 
 
 def build_phase_B_swap_keyed(
     base_keyed: list[dict],
-    swap_answers: list[dict],
+    swap_triples: list[tuple[str, str, str]],
     swap_keys: int = DEFAULT_SWAP_KEYS,
     total_keys: int = DEFAULT_N_KEYS,
 ) -> list[dict]:
-    """Build the overwrite (corrupted_D) swap set: ``swap_keys`` keys, same key+Q, different A.
+    """Build the overwrite (corrupted_D) swap set: ``swap_keys`` keys,
+    same ``key``, completely different ``(subject, predicate, object)``.
+
+    The QA-format predecessor kept ``key`` + ``question`` and only swapped
+    ``answer``.  Under the triple format, "swapping the answer" has no
+    direct analogue — there is no separate question/answer split.  Instead,
+    each swap key has its *entire* triple replaced by a triple from the
+    reserve pool.  This matches the production overwrite semantics: the
+    key still indexes "a fact", just a different fact, with no shared
+    field with the original.
 
     Args:
-        base_keyed: Pretrain keyed pairs (all ``total_keys``).
-        swap_answers: Replacement QA pool (only ``"answer"`` field used).
-        swap_keys: Number of keys to swap.
+        base_keyed: Pretrain keyed entries (all ``total_keys``).
+        swap_triples: Reserve ``(subject, predicate, object)`` pool.
+            Must contain at least ``swap_keys`` entries; the i-th reserve
+            triple replaces the i-th of the last ``swap_keys`` base keys.
+        swap_keys: Number of keys whose triples get replaced.
         total_keys: Total keys (used to derive the swap start slot).
 
     Returns:
-        List of ``swap_keys`` keyed dicts with swapped answers.
+        List of ``swap_keys`` entry dicts ``{key, subject, predicate,
+        object}`` with the original key and the reserve triple's fields.
     """
     swap_start = total_keys - swap_keys
-    assert len(swap_answers) >= swap_keys, (
-        f"swap_answers has {len(swap_answers)} entries, need >= {swap_keys}"
+    assert len(swap_triples) >= swap_keys, (
+        f"swap_triples has {len(swap_triples)} entries, need >= {swap_keys}"
     )
-    swap_keyed = []
-    for i, kp in enumerate(base_keyed[swap_start:]):
-        replacement = swap_answers[i]["answer"]
-        if replacement.strip() == kp["answer"].strip():
-            replacement = replacement + " (variant)"
-        swap_keyed.append(
-            {
-                "key": kp["key"],
-                "question": kp["question"],
-                "answer": replacement,
-            }
-        )
-    return swap_keyed
+    return [
+        {
+            "key": kp["key"],
+            "subject": s,
+            "predicate": p,
+            "object": o,
+        }
+        for kp, (s, p, o) in zip(base_keyed[swap_start:], swap_triples[:swap_keys])
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -677,24 +689,27 @@ def _safe_probe(
     registry: dict[str, int],
     adapter_name: str,
 ) -> dict:
-    """Call evaluate_indexed_recall with guaranteed gradient_checkpointing re-enable.
+    """Call the triple-aware evaluate_indexed_recall with guaranteed
+    gradient_checkpointing re-enable.
 
-    ``evaluate_indexed_recall`` internally disables gradient checkpointing
+    ``evaluate_entry_recall`` (= ``paramem.training.recall_eval
+    .evaluate_indexed_recall``) internally disables gradient checkpointing
     before ``model.generate()``.  This helper re-enables in the ``finally``
     clause so every call site is safe regardless of the exception path.
 
     Args:
         model: Active PeftModel.
         tokenizer: Tokenizer.
-        keyed: Key/QA pairs to probe.
-        registry: SimHash registry for keyed pairs.
+        keyed: Keyed triple entries (``{key, subject, predicate, object}``)
+            to probe.
+        registry: SimHash registry for the entries.
         adapter_name: Active adapter name.
 
     Returns:
-        Result dict from ``evaluate_indexed_recall``.
+        Result dict from ``evaluate_entry_recall``.
     """
     try:
-        return evaluate_indexed_recall(model, tokenizer, keyed, registry, adapter_name=adapter_name)
+        return evaluate_entry_recall(model, tokenizer, keyed, registry, adapter_name=adapter_name)
     finally:
         try:
             model.gradient_checkpointing_enable()
@@ -730,7 +745,15 @@ def _write_phase_done(
     phase_dir.mkdir(parents=True, exist_ok=True)
     _safe_write_json(
         phase_dir / "quads.json",
-        [{"key": kp["key"], "question": kp["question"], "answer": kp["answer"]} for kp in keyed],
+        [
+            {
+                "key": kp["key"],
+                "subject": kp["subject"],
+                "predicate": kp["predicate"],
+                "object": kp["object"],
+            }
+            for kp in keyed
+        ],
     )
     save_registry(registry, phase_dir / "simhash_registry.json")
 
@@ -803,7 +826,7 @@ def _run_phase(
     Returns:
         Tuple of (model, metrics_dict, probe_state, wall_seconds).
     """
-    examples = format_indexed_training(keyed_to_train, tokenizer, max_length=1024)
+    examples = format_entry_training(keyed_to_train, tokenizer, max_length=1024)
     dataset = IndexedDataset(examples)
 
     probe_state = EpochProbeState()
@@ -825,6 +848,10 @@ def _run_phase(
         pause_file=PAUSE_FILE,
         retention_keyed=retention_keyed if retention_keyed else None,
         retention_registry=retention_registry if retention_keyed else None,
+        # Let the callback default to paramem.training.recall_eval
+        # .evaluate_indexed_recall — the triple-aware production probe that
+        # expects {key, subject, predicate, object} entries.  Test 16's
+        # 2026-05-16 refactor migrated from QA pairs to this format.
     )
 
     adapter_cfg = _adapter_config()
@@ -1066,7 +1093,7 @@ def run_repair_loop_v2(
             "Repair episode %d/%d: %d failing keys", episode, max_episodes, len(failing_keyed)
         )
 
-        examples = format_indexed_training(failing_keyed, tokenizer, max_length=1024)
+        examples = format_entry_training(failing_keyed, tokenizer, max_length=1024)
         dataset = IndexedDataset(examples)
 
         adapter_cfg = _adapter_config(lr=repair_lr)
@@ -1355,7 +1382,7 @@ def run_cell(
 
     logger.info("=" * 72)
     logger.info(
-        "Seed %d / D=%d: loading QA pool (n_keys=%d, swap_keys=%d)",
+        "Seed %d / D=%d: loading triple pool (n_keys=%d, swap_keys=%d)",
         seed,
         D,
         n_keys,
@@ -1363,8 +1390,11 @@ def run_cell(
     )
     logger.info("=" * 72)
 
-    qa_pool = load_qa_pool(n_keys, swap_keys)
-    swap_answers = qa_pool[n_keys:]  # extra swap_keys entries for replacement answers
+    triple_pool = load_triple_pool(n_keys, swap_keys)
+    # Reserve triples that will overwrite the last `swap_keys` base entries
+    # during corruption.  Whole-triple swap: same key, completely different
+    # (subject, predicate, object).
+    swap_triples = triple_pool[n_keys:]
 
     # -----------------------------------------------------------------------
     # Pretrain phase — base_D
@@ -1412,7 +1442,7 @@ def run_cell(
         model = create_adapter(model, _adapter_config(), "episodic")
         switch_adapter(model, "episodic")
 
-        a_keyed = build_phase_A_keyed(qa_pool, total_keys=n_keys)
+        a_keyed = build_phase_A_keyed(triple_pool, total_keys=n_keys)
         a_registry = build_registry(a_keyed)
 
         a_ckpt = _find_latest_checkpoint(base_dir)
@@ -1547,7 +1577,7 @@ def run_cell(
         unchanged_keyed = a_keyed[:swap_start]
         unchanged_registry = build_registry(unchanged_keyed)
         overwrite_swap_keyed = build_phase_B_swap_keyed(
-            a_keyed, swap_answers, swap_keys=swap_keys, total_keys=n_keys
+            a_keyed, swap_triples, swap_keys=swap_keys, total_keys=n_keys
         )
         overwrite_swap_registry = build_registry(overwrite_swap_keyed)
         # Originals (for original_answer_resurfaced_rate probe).
