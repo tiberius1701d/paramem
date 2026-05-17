@@ -3061,8 +3061,13 @@ outputs/test15_retention_multiseed/<model>/<ts>/
 ## Test 16: Repair-Loop Sensitivity Sweep
 
 **Script:** `experiments/test16_repair_sweep.py`
-**Status (2026-05-13):** redesigned. First-pass run at `20260512_001618`
-deleted (depth knob was confounded; see "Redesign" below). New run pending.
+**Status (2026-05-16):** triple-format refactor. The 2026-05-13 redesign
+(below) fixed the depth knob and the LR schedule; the 2026-05-15 LR-decay
+fix removed the `// 2` halving in `decay_steps_for`; the 2026-05-16 refactor
+swaps the encoding from QA pairs to the production triple format
+`(key, subject, predicate, object)`. The two earlier in-flight runs at
+`20260512_001618` and `20260513_174945` and `20260514_191226` are deleted —
+none of them measured the production format.
 
 ### Research questions
 
@@ -3149,12 +3154,46 @@ at N=50 is empirically around epoch 20 (seed-42 base_50 from the deleted
 
 | Phase | What it does | Epoch budget | LR decay |
 |---|---|---|---|
-| pretrain (`base_D`) | Fresh `episodic` adapter on N keys; stops at `first_perfect_epoch + D` via `FloorRelativeStopCallback` | up to `MAX_BASE_EPOCHS = 60`; refuse-to-corrupt if floor never reached | `decay_steps_for(N) = N × REFERENCE_EPOCHS // 2` (shared across all D arms) |
-| overwrite (`corrupted_D`) | Continue training on K swap keys (new answers) | 20 (fixed, all D) | `decay_steps_for(K, overwrite_epochs)` (its own per-phase reference) |
+| pretrain (`base_D`) | Fresh `episodic` adapter on N triple entries; stops at `first_perfect_epoch + D` via `EarlyStopPolicy.extra_epochs_past_first_perfect` (production callback path; no parallel callback) | up to `MAX_BASE_EPOCHS = 60`; refuse-to-corrupt if floor never reached | `decay_steps_for(N) = N × REFERENCE_EPOCHS` (shared across all D arms — `// 2` halving removed 2026-05-15) |
+| overwrite (`corrupted_D`) | Continue training on K swap entries whose **entire** `(subject, predicate, object)` triple is replaced from a reserve pool (same key, completely different triple — no shared field with the original) | 20 (fixed, all D) | `decay_steps_for(K, overwrite_epochs)` (its own per-phase reference) |
 | repair cells | Reload `corrupted_D`; run `run_repair_loop_v2` on failing unchanged keys | ≤5 episodes | None |
 
 `D` in path names (`base_{D}/`, `corrupted_{D}/`, `repair_{D}_...`) is the
 `depth_past_floor` value (0, 10, or 30 by default), not total epochs.
+
+### Encoding format (2026-05-16 refactor)
+
+Each entry is a **`(key, subject, predicate, object)` quadruple**, matching
+the production indexed-key memory introduced in commit
+`a8b329d feat(memory): quadruple indexed-key encoding behind
+consolidation.indexed_format`. Training uses
+`paramem.training.entry_memory.format_entry_training` — **one example per
+entry**, JSON envelope `{"key", "subject", "predicate", "object"}`. The
+recall template is `"Recall the fact stored under key '{key}'."`. Probes
+use `paramem.training.recall_eval.evaluate_indexed_recall`, which matches
+all three structural fields for `exact_match`.
+
+The triple pool is loaded from
+`outputs/lme_graph/graph_snapshot.json` via
+`experiments.quadruple_adapter.load_unique_triples` (563 deduplicated
+triples; test 16 takes the first `n_keys + swap_keys = 62`). Same
+deterministic source the quadruple_adapter experiment uses.
+
+Prior Test 15-aligned QA-format (`{key, question, answer}` with two
+training examples per pair) was the original Test 16 design. The
+triple-format refactor halves training-step count per epoch (one example
+per fact instead of two) and shortens probe generation
+(`max_new_tokens=128` vs 200 — structured output terminates earlier).
+
+Observed wall-time on this hardware (seed 42, triple vs QA on the same
+schedule): base phase ≈ 178 s/epoch (was ~185) — ~4 % faster; corruption
+phase ≈ 130 s/epoch (was ~167) — ~22 % faster. Per-seed net ≈ 10-15 %
+faster, dominated by corruption savings. Probing remains the bottleneck
+because EOS terminates responses well before the
+`max_new_tokens` budget in both formats.
+
+Not directly comparable to Test 15 numbers, but informs the production
+memory format that's shipping.
 
 ### Repair grid
 
@@ -3173,12 +3212,17 @@ Every `depth_past_floor` arm runs cells 1–6. Cell 7 runs for the
 
 ### New Test-16 metrics
 
-After each repair cell, two overwrite-integrity probes run via `_safe_probe`:
+After each repair cell, two overwrite-integrity probes run via `_safe_probe`
+(triple-aware probe; `exact_match` requires `subject`/`predicate`/`object`
+all to match):
 
-- **`overwrite_recall_after_repair`** — probe `overwrite_swap_keyed` (new answers);
-  < 0.95 ⇒ repair leaked into the swap set.
-- **`original_answer_resurfaced_rate`** — probe `overwritten_keyed` (original
-  answers); > 0.0 ⇒ active reversion (not just degradation).
+- **`overwrite_recall_after_repair`** — probe `overwrite_swap_keyed` (the
+  *new* triple installed by corruption); < 0.95 ⇒ repair leaked into the
+  swap set.
+- **`original_answer_resurfaced_rate`** — probe `overwritten_keyed` (the
+  *original* triple, kept aside before corruption swapped it out); > 0.0
+  ⇒ active reversion (the original triple is coming back, not just
+  degradation of the swapped triple).
 
 Per-arm metadata stamped into `base_{D}_done.json`:
 `encoding_floor_epoch` (= first_perfect_epoch), `depth_past_floor` (= D
