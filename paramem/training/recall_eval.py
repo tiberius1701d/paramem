@@ -8,6 +8,24 @@ per-key confidence from the SimHash registry.
 Used as the ``eval_fn`` for
 :class:`paramem.training.early_stop.RecallEarlyStopCallback` and by
 consolidation-time recall sanity gates.
+
+Batching (``batch_size > 1``) is an internal mode of
+:func:`evaluate_indexed_recall`. The private helper
+:func:`_generate_recall_batch` left-pads ``batch_size`` prompts, generates
+them in one :meth:`model.generate` call, and runs each decoded suffix through
+:func:`paramem.training.entry_memory._finalize_recalled` so the per-key result
+shape is byte-identical to the serial path.  Empirical foundation: Test 18
+(Mistral 7B nf4, 137 keys): 10.64× faster at b=128, 137/137 exact-match
+parity at every batch size (b ∈ {1, 2, 4, 8, 16, 32, 64, 128}).
+
+Patching note (Decision 3 in plan-batched-probe-v2.md):
+``functools.partial`` snapshots the target function at construction time.
+Any test exercising ``batch_size > 1`` via
+``_maybe_make_recall_callback`` must either (a) patch
+``evaluate_indexed_recall`` BEFORE callback construction so the partial
+captures the patched function, or (b) inject ``eval_fn=`` directly into
+``RecallEarlyStopCallback``.  Module-level patches applied AFTER callback
+construction do NOT redirect the already-captured partial.
 """
 
 from __future__ import annotations
@@ -25,6 +43,7 @@ def evaluate_indexed_recall(
     entries: list[dict],
     registry: dict[str, int],
     adapter_name: str = "episodic",
+    batch_size: int = 1,
 ) -> dict:
     """Evaluate indexed-key recall for entry-format adapters.
 
@@ -33,6 +52,14 @@ def evaluate_indexed_recall(
     + confidence.  Switches to *adapter_name* and disables gradient
     checkpointing for the duration so the probe call paths are
     deterministic.
+
+    When ``batch_size <= 1`` the function calls :func:`probe_entry` per key
+    (current serial behaviour, byte-identical to the previous implementation).
+    When ``batch_size > 1`` it delegates to :func:`_generate_recall_batch`,
+    which left-pads and generates up to ``batch_size`` prompts at once, then
+    runs each decoded suffix through :func:`_finalize_recalled` — the same
+    finalize chain ``probe_entry`` uses.  The returned dict shape is identical
+    regardless of which path was taken.
 
     Args:
         model: A :class:`PeftModel` instance with the target adapter mounted.
@@ -43,6 +70,10 @@ def evaluate_indexed_recall(
             :func:`paramem.training.entry_memory.build_registry`.
         adapter_name: Adapter to activate before probing.  Defaults to
             ``"episodic"`` (the main personal-knowledge slot).
+        batch_size: Number of prompts to generate per :meth:`model.generate`
+            call.  ``1`` (default) preserves the pre-existing serial path.
+            See the Test 18 empirical table for wall-clock / VRAM trade-offs
+            (b=16: 4.75× faster, ~346 MiB peak delta on RTX 5070 8 GB).
 
     Returns:
         Dict with ``exact_count``, ``total``, ``rate``, ``mean_confidence``,
@@ -60,9 +91,22 @@ def evaluate_indexed_recall(
     confidences: list[float] = []
     per_key: list[dict] = []
 
-    for entry in entries:
+    if batch_size <= 1:
+        iterator = (
+            (entry, probe_entry(model, tokenizer, entry["key"], registry=registry))
+            for entry in entries
+        )
+    else:
+        iterator = _generate_recall_batch(
+            model,
+            tokenizer,
+            entries,
+            registry,
+            batch_size=batch_size,
+        )
+
+    for entry, recalled in iterator:
         key = entry["key"]
-        recalled = probe_entry(model, tokenizer, key, registry=registry)
         if recalled is None or "failure_reason" in recalled:
             confidence = 0.0
             exact_match = False
@@ -112,3 +156,82 @@ def evaluate_indexed_recall(
         "mean_recalled_word_count": 0,
         "per_key": per_key,
     }
+
+
+def _generate_recall_batch(
+    model,
+    tokenizer,
+    entries: list[dict],
+    registry: dict[str, int] | None,
+    *,
+    batch_size: int,
+):
+    """Yield (entry, recalled_dict) pairs by batched generate.
+
+    Lifts the generate-level mechanics from
+    experiments/test18_probe_batching.py (_prepare_batched_inputs,
+    _stop_token_ids, _decode_batch) and runs the decoded suffix of each
+    row through entry_memory._finalize_recalled so the recalled-dict
+    shape matches the serial path byte-for-byte.
+
+    padding_side mutation is restored via try/finally to keep concurrent
+    tokenizer users (training collator) untouched. Single-pass design —
+    no caching across calls.
+    """
+    import torch
+
+    from paramem.training.dataset import _format_inference_prompt
+    from paramem.training.entry_memory import (
+        DEFAULT_CONFIDENCE_THRESHOLD,
+        RECALL_TEMPLATE,
+        _finalize_recalled,
+    )
+
+    device = next(model.parameters()).device
+    stop_ids = _derive_stop_ids(tokenizer)
+    original_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    try:
+        for start in range(0, len(entries), batch_size):
+            chunk = entries[start : start + batch_size]
+            prompts = [
+                _format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer)
+                for e in chunk
+            ]
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=stop_ids,
+                    repetition_penalty=1.1,
+                )
+            input_width = inputs["input_ids"].shape[1]
+            for i, entry in enumerate(chunk):
+                suffix = outputs[i, input_width:]
+                raw = tokenizer.decode(suffix, skip_special_tokens=True).strip()
+                recalled = _finalize_recalled(
+                    raw,
+                    entry["key"],
+                    registry,
+                    DEFAULT_CONFIDENCE_THRESHOLD,
+                )
+                yield entry, recalled
+    finally:
+        tokenizer.padding_side = original_side
+
+
+def _derive_stop_ids(tokenizer) -> list[int]:
+    """Same stop-token derivation generate_answer uses (mirror of
+    experiments/test18_probe_batching.py::_stop_token_ids).
+    """
+    stop_ids = [tokenizer.eos_token_id]
+    for token_name in ("<|im_end|>", "<|eot_id|>"):
+        encoded = tokenizer.encode(token_name, add_special_tokens=False)
+        if len(encoded) == 1 and encoded[0] not in stop_ids:
+            stop_ids.append(encoded[0])
+    return stop_ids

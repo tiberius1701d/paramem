@@ -206,6 +206,12 @@ consolidation:
   recall_signal_from_epoch: 20      # earliest epoch the stop signal can fire
                                     # (Test 14 cells stopped e18-e26; 20 is the
                                     # conservative floor inside that band)
+  recall_probe_batch_size: 1        # probe-time batch (1 = serial, default).
+                                    # Raise after one clean cycle proves
+                                    # in-training VRAM headroom — b=16 is
+                                    # the Phase-2 recommended value (4.75×
+                                    # faster, ~346 MiB peak delta on RTX
+                                    # 5070 8 GB).  See plan-batched-probe-v2.
   extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, SOTA enrich, deanon; 8192 sized for ~1500-word document chunks
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
   calibrate_endpoint_enabled: false  # opt-in dev tool: POST /calibrate/{extract,anonymize,plausibility} for prompt iteration against the live Mistral instance. Off in production; 503 returned while a real consolidation cycle is running.
