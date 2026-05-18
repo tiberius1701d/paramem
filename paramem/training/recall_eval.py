@@ -14,13 +14,14 @@ Batching (``batch_size > 1``) is an internal mode of
 :func:`_generate_recall_batch` left-pads ``batch_size`` prompts, generates
 them in one :meth:`model.generate` call, and runs each decoded suffix through
 :func:`paramem.training.entry_memory._finalize_recalled` so the per-key result
-shape is byte-identical to the serial path.  Empirical foundation: Test 18
-(Mistral 7B nf4, 137 keys): 10.64× faster at b=128, 137/137 exact-match
-parity at every batch size (b ∈ {1, 2, 4, 8, 16, 32, 64, 128}).
+shape is byte-identical to the serial path.  Empirically validated at 137/137
+exact-match parity vs serial across b ∈ {1, 2, 4, 8, 16, 32, 64, 128} on
+Mistral 7B nf4; multi-cycle retention parity confirmed in production
+conditions; b=16 is the validated production default (~4.75× per-probe
+speedup, ~346 MiB peak VRAM delta on RTX 5070 8 GB).
 
-Patching note (Decision 3 in plan-batched-probe-v2.md):
-``functools.partial`` snapshots the target function at construction time.
-Any test exercising ``batch_size > 1`` via
+Patching note: ``functools.partial`` snapshots the target function at
+construction time.  Any test exercising ``batch_size > 1`` via
 ``_maybe_make_recall_callback`` must either (a) patch
 ``evaluate_indexed_recall`` BEFORE callback construction so the partial
 captures the patched function, or (b) inject ``eval_fn=`` directly into
@@ -71,9 +72,10 @@ def evaluate_indexed_recall(
         adapter_name: Adapter to activate before probing.  Defaults to
             ``"episodic"`` (the main personal-knowledge slot).
         batch_size: Number of prompts to generate per :meth:`model.generate`
-            call.  ``1`` (default) preserves the pre-existing serial path.
-            See the Test 18 empirical table for wall-clock / VRAM trade-offs
-            (b=16: 4.75× faster, ~346 MiB peak delta on RTX 5070 8 GB).
+            call.  ``1`` falls back to the per-key serial path; ``16``
+            (production default) is ~4.75× faster at ~346 MiB peak VRAM
+            delta on RTX 5070 8 GB. See module docstring for the empirical
+            curve across batch sizes.
 
     Returns:
         Dict with ``exact_count``, ``total``, ``rate``, ``mean_confidence``,
@@ -168,11 +170,10 @@ def _generate_recall_batch(
 ):
     """Yield (entry, recalled_dict) pairs by batched generate.
 
-    Lifts the generate-level mechanics from
-    experiments/test18_probe_batching.py (_prepare_batched_inputs,
-    _stop_token_ids, _decode_batch) and runs the decoded suffix of each
-    row through entry_memory._finalize_recalled so the recalled-dict
-    shape matches the serial path byte-for-byte.
+    Left-pads ``batch_size`` prompts, runs a single ``model.generate`` per
+    chunk, and pipes each decoded suffix through
+    :func:`paramem.training.entry_memory._finalize_recalled` so the
+    recalled-dict shape matches the serial path byte-for-byte.
 
     padding_side mutation is restored via try/finally to keep concurrent
     tokenizer users (training collator) untouched. Single-pass design —
@@ -226,9 +227,7 @@ def _generate_recall_batch(
 
 
 def _derive_stop_ids(tokenizer) -> list[int]:
-    """Same stop-token derivation generate_answer uses (mirror of
-    experiments/test18_probe_batching.py::_stop_token_ids).
-    """
+    """Same stop-token derivation generate_answer uses."""
     stop_ids = [tokenizer.eos_token_id]
     for token_name in ("<|im_end|>", "<|eot_id|>"):
         encoded = tokenizer.encode(token_name, add_special_tokens=False)

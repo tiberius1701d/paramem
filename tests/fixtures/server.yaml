@@ -234,10 +234,10 @@ consolidation:
   # production cycle.  signal_from_epoch=20 is a conservative floor
   # given Test 14's multi-seed cells stopped between e18-e26.
   recall_early_stopping: true
-  recall_window: 3
+  recall_window: 2
   recall_probe_every_n_epochs: 3
   recall_signal_from_epoch: 20
-  recall_probe_batch_size: 1        # serial in tests; per-test overrides go in code
+  recall_probe_batch_size: 16       # matches server.yaml.example; per-test overrides go in code
   extraction_max_tokens: 8192  # output-token budget — must match server.yaml.example to avoid silent truncation in simulate-mode probes (gated by tests/server/test_config_parity.py)
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap — must match server.yaml.example (parity-gated)
   calibrate_endpoint_enabled: false  # opt-in dev tool; off in tests by default

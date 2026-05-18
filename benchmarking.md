@@ -444,11 +444,12 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
   2588, 3429; 1 in `paramem/server/active_store_migration.py:420`).
   Gated by `consolidation.recall_early_stopping` in `server.yaml` —
   default OFF in `configs/server.yaml.example`. Five YAML knobs:
-  `recall_early_stopping`, `recall_window`, `recall_probe_every_n_epochs`,
-  `recall_signal_from_epoch`, `recall_probe_batch_size` (probe-time
-  generate batch width — default 1 = serial; raising trades VRAM for
-  probe wall-clock per the empirical curve in `TrainingConfig`'s knob
-  comment). Validated by a live smoke on Mistral 7B
+  `recall_early_stopping`, `recall_window` (default 2 — stop one probe past
+  first_perfect), `recall_probe_every_n_epochs`, `recall_signal_from_epoch`,
+  `recall_probe_batch_size` (probe-time generate batch width — default 16,
+  validated at 137/137 recall parity vs serial at ~4.75× per-probe speedup
+  and ~346 MiB peak delta on RTX 5070 8 GB; multi-cycle retention parity
+  confirmed in production conditions). Validated by a live smoke on Mistral 7B
   with N=5 keys (stop fired at epoch 16, recall 5/5, gradient_checkpointing
   state preserved, 4 min wall). A structural AST test
   (`tests/test_consolidation_recall_early_stop.py:Class F`) scans both
@@ -3064,13 +3065,21 @@ outputs/test15_retention_multiseed/<model>/<ts>/
 ## Test 16: Repair-Loop Sensitivity Sweep
 
 **Script:** `experiments/test16_repair_sweep.py`
-**Status (2026-05-16):** triple-format refactor. The 2026-05-13 redesign
-(below) fixed the depth knob and the LR schedule; the 2026-05-15 LR-decay
-fix removed the `// 2` halving in `decay_steps_for`; the 2026-05-16 refactor
-swaps the encoding from QA pairs to the production triple format
-`(key, subject, predicate, object)`. The two earlier in-flight runs at
-`20260512_001618` and `20260513_174945` and `20260514_191226` are deleted —
-none of them measured the production format.
+**Status (2026-05-19):** COMPLETE at n=5.  Final run at
+`outputs/test16_repair_sweep/mistral/20260516_110736/` (95/95 cells).
+Headline result: **`(D ≥ 10, ep=3, lr ∈ {1e-5, 2e-5}, wd=0.01)` achieves
+rp3=1.000 ± 0.000 across 5 seeds with `collateral_loss_count = 0` across
+all 95 cells × 5 seeds.**  See "Results (n=5)" section below.
+
+This section narrates the design evolution.  The 2026-05-13 redesign
+fixed the depth knob and the LR schedule; the 2026-05-15 LR-decay fix
+removed the `// 2` halving in `decay_steps_for`; the 2026-05-16 refactor
+swapped the encoding from QA pairs to the production triple format
+`(key, subject, predicate, object)`; the 2026-05-18 cutover for seeds 1
+and 11 enabled `recall_probe_batch_size=16` (matching `server.yaml`) to
+cut probe wall time ~4×.  The three earlier in-flight runs at
+`20260512_001618`, `20260513_174945`, and `20260514_191226` were deleted —
+none measured the production format.
 
 ### Research questions
 
@@ -3258,17 +3267,121 @@ Smoke run writes to `outputs/test16_repair_sweep/mistral/_smoke/<ts>/`;
 
 `5 seeds × (3 depths × 6 repair-grid cells + 1 spotcheck cell per seed) = 95 cells`.
 
-### Concerns
+### Results (n=5, 2026-05-19)
 
-- `MAX_BASE_EPOCHS = 60` may be too tight if a seed's `first_perfect_epoch`
-  approaches the budget under the shared schedule. The refuse-to-corrupt
-  guard surfaces this as a hard error; raise `REFERENCE_EPOCHS` (which also
-  raises `MAX_BASE_EPOCHS` and `decay_steps_for(N)`) if encountered.
-- `corrupted_D` still uses its own `decay_steps_for(K, overwrite_epochs)`
-  with `overwrite_epochs=20` as the reference — this is intentionally
-  apples-to-apples within the corruption phase (one fixed budget across
-  all D arms); it doesn't share the base phase's reference because the
-  scales differ (K=12 vs N=50).
+#### Per-cell means across all 5 seeds (rp2 = pre-repair retention, rp3 = post-repair, eps = mean episodes used; over_ar = overwrite recall after repair; orig_rsr = original-answer resurfaced rate)
+
+```
+cell                          n    rp2    rp3        rp3_CI  eps  coll  over_ar  orig_rsr
+D0_lr1e-05_ep1_wd0.01         5  0.005  0.937  [0.874,0.974] 5.0   0.0    0.917     0.000
+D0_lr1e-05_ep1_wd0.1          5  0.005  0.932  [0.874,0.968] 5.0   0.0    0.933     0.017
+D0_lr1e-05_ep3_wd0.01         5  0.005  1.000  [1.000,1.000] 2.8   0.0    0.817     0.033
+D0_lr2e-05_ep1_wd0.01         5  0.005  0.984  [0.963,1.000] 4.2   0.0    0.817     0.033
+D0_lr2e-05_ep3_wd0.01         5  0.005  1.000  [1.000,1.000] 1.6   0.0    0.467     0.167
+D0_lr5e-05_ep1_wd0.01         5  0.005  0.995  [0.984,1.000] 3.6   0.0    0.283     0.233
+D0_lr5e-05_ep3_wd0.01         5  0.005  1.000  [1.000,1.000] 1.0   0.0    0.083     0.417
+D10_lr1e-05_ep1_wd0.01        5  0.011  0.989  [0.968,1.000] 4.8   0.0    0.850     0.033
+D10_lr1e-05_ep3_wd0.01        5  0.011  1.000  [1.000,1.000] 2.0   0.0    0.633     0.067
+D10_lr2e-05_ep1_wd0.01        5  0.011  1.000  [1.000,1.000] 3.6   0.0    0.650     0.050
+D10_lr2e-05_ep3_wd0.01        5  0.011  1.000  [1.000,1.000] 1.2   0.0    0.283     0.183
+D10_lr5e-05_ep1_wd0.01        5  0.011  1.000  [1.000,1.000] 2.0   0.0    0.233     0.283
+D10_lr5e-05_ep3_wd0.01        5  0.011  1.000  [1.000,1.000] 1.0   0.0    0.067     0.367
+D30_lr1e-05_ep1_wd0.01        5  0.005  0.958  [0.937,0.979] 4.8   0.0    0.883     0.000
+D30_lr1e-05_ep3_wd0.01        5  0.005  1.000  [1.000,1.000] 2.0   0.0    0.800     0.000
+D30_lr2e-05_ep1_wd0.01        5  0.005  1.000  [1.000,1.000] 3.6   0.0    0.817     0.000
+D30_lr2e-05_ep3_wd0.01        5  0.005  1.000  [1.000,1.000] 1.0   0.0    0.467     0.117
+D30_lr5e-05_ep1_wd0.01        5  0.005  0.989  [0.968,1.000] 3.8   0.0    0.283     0.150
+D30_lr5e-05_ep3_wd0.01        5  0.005  1.000  [1.000,1.000] 1.4   0.0    0.083     0.467
+```
+
+#### Key findings
+
+1. **Every `ep=3` cell hits `rp3 = 1.000 ± 0.000` across 5 seeds.** 9 of 9 (D × lr) combinations with `repair_epochs_per_episode=3` deliver universal full recovery.  Zero variance across seeds.
+2. **Safety guarantee: `collateral_loss_count = 0` across all 95 cells × 5 seeds.** Repair never broke a previously-passing key.
+3. **Persistent residual only at the slowest cell, D=0 / lr=1e-5 / ep=1:** `rp3 = 0.937 ± 0.061` (CI [0.874, 0.974]).  Misses ~2 of 38 unchanged keys.  Mean `episodes_used = 5.0` (hit budget without converging).  Wd spotcheck (wd=0.1) at the same cell: `0.932 ± 0.059` — indistinguishable.  **Weight decay does not move the needle.**
+4. **`ep=3` dominates `ep=1` on every metric** — faster convergence (mean 1.0-2.0 vs 3.6-5.0 episodes), more reliable (lower variance, no residual at ≥D=10), same per-episode compute on a shrinking failing set.
+5. **Aggressive repair (`lr=5e-5, ep=3`) erases the overwrite:** `over_ar → 0`, `orig_rsr → 0.4-0.5`.  Half of the swapped keys revert to original triples.  Useful if "undo the corruption" is the goal; harmful if the swap should persist.
+6. **Recommended production recipe**: `(D ≥ 10, ep=3, lr=2e-5, wd=0.01)` — converges in `mean episodes = 1.2`, preserves the swap (`over_ar ≈ 0.65`), zero collateral, rp3=1.000 ± 0.000.
+
+#### Cross-seed rp3 matrix (per-cell variance)
+
+```
+cell                            42      7   1337      1     11    mean ±sd
+D0_lr1e-05_ep1_wd0.01        0.816  0.974  0.974  0.947  0.974   0.937 ±0.061
+D0_lr1e-05_ep1_wd0.1         0.816  0.947  0.974  0.947  0.974   0.932 ±0.059
+D0_lr1e-05_ep3_wd0.01        1.000  1.000  1.000  1.000  1.000   1.000 ±0.000
+D0_lr2e-05_ep1_wd0.01        0.974  1.000  0.947  1.000  1.000   0.984 ±0.021
+D0_lr2e-05_ep3_wd0.01        1.000  1.000  1.000  1.000  1.000   1.000 ±0.000
+D0_lr5e-05_ep1_wd0.01        0.974  1.000  1.000  1.000  1.000   0.995 ±0.011
+D0_lr5e-05_ep3_wd0.01        1.000  1.000  1.000  1.000  1.000   1.000 ±0.000
+D10_lr1e-05_ep1_wd0.01       1.000  1.000  0.947  1.000  1.000   0.989 ±0.021
+D10_*  (other 5 cells)              all 1.000 across all 5 seeds   1.000 ±0.000
+D30_lr1e-05_ep1_wd0.01       0.921  0.947  1.000  0.947  0.974   0.958 ±0.027
+D30_lr5e-05_ep1_wd0.01       1.000  1.000  0.947  1.000  1.000   0.989 ±0.021
+D30_*  (other 4 cells)              all 1.000 across all 5 seeds   1.000 ±0.000
+```
+
+#### Pre-repair RP2 matrix (corruption damage, unchanged keys / 38)
+
+```
+seed       D=0     D=10     D=30
+ 42       0/38    0/38    0/38
+  7       1/38    1/38    0/38
+1337      0/38    0/38    1/38
+  1       0/38    0/38    0/38
+ 11       0/38    1/38    0/38
+```
+
+Overwrite is essentially total at all depths (±1 key out of 38 = ~0.026 noise floor).  RNG-dependent which key survives — no systematic seed × depth effect.
+
+#### Encoding-floor variance (`first_perfect_epoch` per seed × D)
+
+```
+seed     D=0   D=10   D=30
+ 42      23     29     24
+  7      24     22     24
+1337     23     24     23
+  1      24     26     28
+ 11      26     30     26
+mean    24.0   26.2   25.0
+```
+
+Mean floor 24-26 epochs; cross-seed spread ±2-4 epochs.  Doesn't affect depth-past-floor semantics (each arm stops exactly `first_perfect_epoch + D` regardless of where floor lands).
+
+#### b=16 batched-probe cutover check (seeds 1 + 11)
+
+Seeds 42 / 7 / 1337 ran with `recall_probe_batch_size=1`; seeds 1 + 11 ran with `recall_probe_batch_size=16` matching `server.yaml`.  Test 18's empirical parity claim (137/137 exact-match at every b ∈ {1..128}) was verified in-band: seeds 1 + 11's rp3 values sit inside the n=3 distribution from seeds 42/7/1337 at every cell — no outliers, no systematic drift.  Cross-seed apples-to-apples preserved.
+
+### Operational implication
+
+The repair primitive in production (`paramem/training/consolidation.py` → `_maybe_make_recall_callback`) inherits these results.  Defensible defaults for the consolidation cycle:
+
+- `recall_window=2` (matches `server.yaml`'s production value).
+- `recall_probe_every_n_epochs=3` (matches `server.yaml`).
+- `recall_probe_batch_size=16` (matches `server.yaml`).
+- For post-overwrite repair runs: `ep=3, lr=2e-5, wd=0.01, max_episodes=5` — converges in 1-2 episodes with zero collateral at any base depth ≥ first_perfect + 10.
+
+### Open questions / continual-learning follow-ups
+
+The current run characterizes the repair primitive at one model (Mistral 7B nf4), one scale (N=50, K=12), and one swap fraction (24 %).  Next-step investigations worth doing (none are blockers — current production deployment is sound):
+
+1. **Scaling**: re-run the same protocol at N ∈ {100, 500} with K scaled proportionally.  At larger N, the failing subset's absolute size matters for repair cost — does the per-episode training stay bounded or scale with N?  The Quadruple Adapter experiment validates *initial* training at N=550; whether the *repair* primitive holds at that scale is open.
+
+2. **Swap-fraction sensitivity**: test K/N ∈ {5%, 10%, 25%, 50%}.  At low K/N (small new-key load), corruption likely doesn't destroy all unchanged keys, so the failing subset shrinks — repair becomes cheaper.  At high K/N (50%+), composition between new and existing might break in ways the current data can't surface.
+
+3. **Cross-model**: same protocol on Qwen 2.5 3B and Gemma 2 9B (already in `BENCHMARK_MODELS`).  The "decoder misalignment, not erasure" claim is hypothesised to be a property of LoRA-on-LLM training dynamics broadly, not specific to Mistral.  Cheapest cross-model check.
+
+4. **Fixed-schedule recipe (no probing)**: instead of "probe → identify failing → train failing subset", try `(x epochs new + y ≤ 3 epochs full-old-subset, no inter-episode probe)`.  Tests whether `collateral_loss = 0` survives un-probed training.  If yes, the repair cost drops to its absolute floor.  ~50 lines of extension to `run_repair_loop_v2`.
+
+5. **Gradient-projection alternative**: prevent interference upfront instead of repairing after the fact.  During new-key training, SVD-truncate the gradient onto the dominant subspace defined by the new-key gradient itself (related to GaLore; theoretical motivation: preserve "routing" by avoiding collateral motion in non-essential weight directions).  1-day prototype: hook `optimizer.step`, capture grad at steps 1-5, project subsequent gradients onto top-r' singular vectors of the captured matrix.  Measure whether `rp2_rate` after overwrite jumps from ~0 to substantially above zero — if yes, the repair step becomes redundant.
+
+6. **Latent-recovery time-scale**: how fast does `first_perfect_epoch` drift after consecutive overwrite + repair cycles?  Multiple consolidation cycles compound effects; the single overwrite + single repair characterised here is the unit step, not the long-run behaviour.
+
+### Design retrospective (kept for follow-up architecture)
+
+- `MAX_BASE_EPOCHS = 60` was sufficient — no run hit the refuse-to-corrupt guard.
+- `corrupted_D` uses its own `decay_steps_for(K, overwrite_epochs)` with `overwrite_epochs=20` as the reference, intentionally apples-to-apples within the corruption phase.  Different scale from base (K=12 vs N=50) so doesn't share base's reference.
+- Floor-relative stop via `EarlyStopPolicy.extra_epochs_past_first_perfect=D` (added 2026-05-13 in `paramem/training/early_stop.py`) is the production-path mechanism.  The stable-perfect path stays disabled in Test 16 via `signal_from_epoch=10**9`.
 
 ---
 

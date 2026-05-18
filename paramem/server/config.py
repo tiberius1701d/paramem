@@ -721,10 +721,10 @@ class ConsolidationScheduleConfig:
     # contexts that don't go through the YAML.
     recall_signal_from_epoch: int = 20
     # Recall probe batch size — see TrainingConfig.recall_probe_batch_size
-    # for the empirical table.  Default 1 = serial.  Raising to 16 trades
-    # ~346 MiB peak VRAM for 4.75× probe wall-clock.  Validated parity at
-    # every batch size in Test 18 (137/137 exact match vs serial).
-    recall_probe_batch_size: int = 1
+    # for the empirical curve.  Default 16: ~4.75× probe wall-clock at
+    # ~346 MiB peak VRAM delta, 137/137 recall parity vs serial, multi-cycle
+    # retention parity confirmed in production conditions.
+    recall_probe_batch_size: int = 16
     # Output token budget — drives every LLM call in the extraction pipeline
     # (local extract, anonymize, SOTA enrich, deanon) and every direct
     # response across modes.

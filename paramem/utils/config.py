@@ -94,19 +94,20 @@ class TrainingConfig:
     # the earliest possible stop, not to "probe earlier".
     recall_probe_every_n_epochs: int = 3
     # Recall probe batch size — generate this many prompts per model.generate
-    # call when probing the staged adapter at epoch boundaries.  Default 1 =
-    # serial = current production behaviour (one generate per key, ~340 s on
-    # 137 keys at Mistral 7B nf4).  Raising batches keys for shared decode,
-    # trading VRAM for wall-clock:
-    #   b=8   2.91× faster,  257 MiB peak delta
-    #   b=16  4.75× faster,  346 MiB peak delta   ← Phase 2 default candidate
-    #   b=32  6.02× faster,  574 MiB peak delta
-    #   b=64  8.25× faster, 1032 MiB peak delta
-    #   b=128 10.64× faster, 2073 MiB peak delta
-    # Measured at adapter-idle in Test 18 on RTX 5070 8 GB.  In-training VRAM
-    # residual eats into headroom — keep b ≤ 16 until one live cycle proves
-    # the in-training peak.  See .agent/plan-batched-probe-v2.md.
-    recall_probe_batch_size: int = 1
+    # call when probing the staged adapter at epoch boundaries.  Default 16
+    # = validated production setting: ~4.75× faster than serial at ~346 MiB
+    # peak VRAM delta on RTX 5070 8 GB, 137/137 recall parity vs serial,
+    # multi-cycle retention parity confirmed in production conditions.
+    # Empirical curve at adapter idle:
+    #   b=1  baseline (serial),   ~125 MiB peak delta
+    #   b=8   2.91× faster,        257 MiB peak delta
+    #   b=16  4.75× faster,        346 MiB peak delta   ← production default
+    #   b=32  6.02× faster,        574 MiB peak delta
+    #   b=64  8.25× faster,       1032 MiB peak delta
+    #   b=128 10.64× faster,      2073 MiB peak delta
+    # In-training VRAM residual eats into headroom — drop to 1 only if a
+    # specific deployment's training-residual pressure forces a downgrade.
+    recall_probe_batch_size: int = 16
 
 
 @dataclass
