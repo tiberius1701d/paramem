@@ -201,17 +201,20 @@ consolidation:
   # evidence (Test 14: N=100 multi-seed, all 9 cells stopped cleanly
   # between e18-e26 with 1.0 final recall).
   recall_early_stopping: false
-  recall_window: 3                  # consecutive 100%-recall probes required
+  recall_window: 2                  # consecutive 100%-recall probes required
+                                    # (2 → stop fires one probe past first_perfect;
+                                    # raise to 3 for stricter noise robustness)
   recall_probe_every_n_epochs: 3    # probe cadence (3× cheaper than =1 at N=500+)
   recall_signal_from_epoch: 20      # earliest epoch the stop signal can fire
                                     # (Test 14 cells stopped e18-e26; 20 is the
                                     # conservative floor inside that band)
-  recall_probe_batch_size: 1        # probe-time batch (1 = serial, default).
-                                    # Raise after one clean cycle proves
-                                    # in-training VRAM headroom — b=16 is
-                                    # the Phase-2 recommended value (4.75×
-                                    # faster, ~346 MiB peak delta on RTX
-                                    # 5070 8 GB).  See plan-batched-probe-v2.
+  recall_probe_batch_size: 16       # probe-time batch — validated at 137/137
+                                    # recall parity vs serial, ~4.75× per-probe
+                                    # speedup and ~346 MiB peak delta on RTX 5070
+                                    # 8 GB; multi-cycle retention parity confirmed
+                                    # in production conditions. Drop to 1 if VRAM
+                                    # under training-residual pressure forces a
+                                    # downgrade.
   extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, SOTA enrich, deanon; 8192 sized for ~1500-word document chunks
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
   calibrate_endpoint_enabled: false  # opt-in dev tool: POST /calibrate/{extract,anonymize,plausibility} for prompt iteration against the live Mistral instance. Off in production; 503 returned while a real consolidation cycle is running.
