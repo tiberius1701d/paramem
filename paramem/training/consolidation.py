@@ -3671,6 +3671,7 @@ class ConsolidationLoop:
                 probe_pairs,
                 probe_registry,
                 adapter_name=adapter_name,
+                batch_size=self.training_config.recall_probe_batch_size,
             )
             return float(recall_result["rate"])
         except Exception:
@@ -4036,7 +4037,15 @@ class ConsolidationLoop:
         )
 
         from paramem.training.entry_memory import build_registry as _build_registry
-        from paramem.training.recall_eval import evaluate_indexed_recall as _eval_fn
+        from paramem.training.recall_eval import evaluate_indexed_recall
+
+        _batch = self.training_config.recall_probe_batch_size
+        if _batch > 1:
+            import functools
+
+            _eval_fn = functools.partial(evaluate_indexed_recall, batch_size=_batch)
+        else:
+            _eval_fn = evaluate_indexed_recall  # bare reference; preserves patchability
 
         return RecallEarlyStopCallback(
             model=self.model,

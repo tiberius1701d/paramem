@@ -443,9 +443,12 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
   call site (4 in `paramem/training/consolidation.py`: lines 1529, 1770,
   2588, 3429; 1 in `paramem/server/active_store_migration.py:420`).
   Gated by `consolidation.recall_early_stopping` in `server.yaml` —
-  default OFF in `configs/server.yaml.example`. Four YAML knobs:
+  default OFF in `configs/server.yaml.example`. Five YAML knobs:
   `recall_early_stopping`, `recall_window`, `recall_probe_every_n_epochs`,
-  `recall_signal_from_epoch`. Validated by a live smoke on Mistral 7B
+  `recall_signal_from_epoch`, `recall_probe_batch_size` (probe-time
+  generate batch width — default 1 = serial; raising trades VRAM for
+  probe wall-clock per the empirical curve in `TrainingConfig`'s knob
+  comment). Validated by a live smoke on Mistral 7B
   with N=5 keys (stop fired at epoch 16, recall 5/5, gradient_checkpointing
   state preserved, 4 min wall). A structural AST test
   (`tests/test_consolidation_recall_early_stop.py:Class F`) scans both

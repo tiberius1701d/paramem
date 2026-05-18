@@ -720,6 +720,11 @@ class ConsolidationScheduleConfig:
     # ``TrainingConfig.early_stopping_floor`` for direct-construction
     # contexts that don't go through the YAML.
     recall_signal_from_epoch: int = 20
+    # Recall probe batch size — see TrainingConfig.recall_probe_batch_size
+    # for the empirical table.  Default 1 = serial.  Raising to 16 trades
+    # ~346 MiB peak VRAM for 4.75× probe wall-clock.  Validated parity at
+    # every batch size in Test 18 (137/137 exact match vs serial).
+    recall_probe_batch_size: int = 1
     # Output token budget — drives every LLM call in the extraction pipeline
     # (local extract, anonymize, SOTA enrich, deanon) and every direct
     # response across modes.
@@ -1194,6 +1199,7 @@ class ServerConfig:
             recall_early_stopping=self.consolidation.recall_early_stopping,
             recall_window=self.consolidation.recall_window,
             recall_probe_every_n_epochs=self.consolidation.recall_probe_every_n_epochs,
+            recall_probe_batch_size=self.consolidation.recall_probe_batch_size,
         )
 
     @property

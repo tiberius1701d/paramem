@@ -397,6 +397,41 @@ def build_enriched_registry(
 # --- Probe ---
 
 
+def _finalize_recalled(
+    raw: str,
+    key: str,
+    registry: dict | None,
+    confidence_threshold: float,
+) -> dict:
+    """Turn a raw model output into the contract dict probe_entry returns.
+
+    Shared between the single-key probe_entry path and the batched recall
+    path in recall_eval.py. Returns the same shape probe_entry returns:
+    either the parsed-entry dict augmented with confidence/raw_output/
+    fact_text, or a failure-reason dict.
+    """
+    parsed = parse_recalled_entry(raw)
+    if parsed is None:
+        logger.debug("Parse failure for key '%s': %s", key, raw[:200])
+        return {"raw_output": raw, "failure_reason": "parse_failure"}
+    if parsed["key"] != key:
+        logger.debug("Key mismatch: queried '%s', got '%s'", key, parsed["key"])
+        return {"raw_output": raw, "failure_reason": f"key_mismatch:{parsed['key']}"}
+    confidence = verify_confidence(parsed, registry)
+    if confidence < confidence_threshold:
+        logger.debug(
+            "Low confidence for key '%s': %.3f < %.3f threshold",
+            key,
+            confidence,
+            confidence_threshold,
+        )
+        return {"raw_output": raw, "failure_reason": f"low_confidence:{confidence:.3f}"}
+    parsed["confidence"] = confidence
+    parsed["raw_output"] = raw
+    parsed["fact_text"] = entry_fact_text(parsed)
+    return parsed
+
+
 def probe_entry(
     model,
     tokenizer,
@@ -449,34 +484,7 @@ def probe_entry(
         max_new_tokens=max_new_tokens,
         temperature=0.0,
     )
-    parsed = parse_recalled_entry(raw)
-    if parsed is None:
-        logger.debug("Parse failure for key '%s': %s", key, raw[:200])
-        return {"raw_output": raw, "failure_reason": "parse_failure"}
-    if parsed["key"] != key:
-        logger.debug("Key mismatch: queried '%s', got '%s'", key, parsed["key"])
-        return {
-            "raw_output": raw,
-            "failure_reason": f"key_mismatch:{parsed['key']}",
-        }
-
-    # Check confidence against registry (verify_confidence returns 1.0 when
-    # registry is None, so confidence is always present on the returned dict —
-    # same contract as paramem.training.indexed_memory.probe_key).
-    confidence = verify_confidence(parsed, registry)
-    if confidence < confidence_threshold:
-        logger.debug(
-            "Low confidence for key '%s': %.3f < %.3f threshold",
-            key,
-            confidence,
-            confidence_threshold,
-        )
-        return {"raw_output": raw, "failure_reason": f"low_confidence:{confidence:.3f}"}
-
-    parsed["confidence"] = confidence
-    parsed["raw_output"] = raw
-    parsed["fact_text"] = entry_fact_text(parsed)
-    return parsed
+    return _finalize_recalled(raw, key, registry, confidence_threshold)
 
 
 # --- Fact-text helper ---

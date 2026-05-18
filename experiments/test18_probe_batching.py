@@ -21,6 +21,13 @@ We sweep ``B ∈ {1, 2, 4, 8, 16, 32}`` for (b) and (c) on the same
 synthetic 137-key adapter and record wall-clock + peak VRAM + exact-recall
 count for each cell.  The serial baseline pins ``B=1``.
 
+The ``serial`` and ``batched`` strategies are thin wrappers around the
+production :func:`paramem.training.recall_eval.evaluate_indexed_recall`
+function (Phase 1 of plan-batched-probe-v2.md).  The ``prefix_cache``
+strategy is a research-only prototype (Phase 3 deferred — see
+``.agent/prefix-cache-correctness-investigation.md``) that remains
+in this file because its strict KV-reuse logic is not yet in production.
+
 Output schema (`results.json`):
     cells: [
       {strategy, batch_size, wall_clock_seconds, mean_per_key_seconds,
@@ -79,12 +86,15 @@ from paramem.models.loader import (  # noqa: E402
 )
 from paramem.training.dataset import _format_inference_prompt  # noqa: E402
 from paramem.training.entry_memory import (  # noqa: E402
+    DEFAULT_CONFIDENCE_THRESHOLD,
     RECALL_TEMPLATE,
+    _finalize_recalled,
     build_registry,
     format_entry_training,
-    parse_recalled_entry,
-    probe_entry,
-    verify_confidence,
+)
+from paramem.training.recall_eval import (  # noqa: E402
+    _derive_stop_ids,
+    evaluate_indexed_recall,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
 from paramem.utils.config import AdapterConfig, TrainingConfig  # noqa: E402
@@ -151,116 +161,11 @@ def _synthetic_entries(n: int) -> list[dict]:
 # Probe strategies
 # ---------------------------------------------------------------------------
 
-
-def probe_serial(model, tokenizer, entries, registry):
-    """Production baseline — one ``probe_entry`` per key."""
-    per_key: list[dict] = []
-    for entry in entries:
-        recalled = probe_entry(model, tokenizer, entry["key"], registry=registry)
-        per_key.append(_classify(entry, recalled))
-    return per_key
-
-
-def _classify(entry: dict, recalled: dict | None) -> dict:
-    """Apply the same exact-match + failure-reason rules as
-    ``evaluate_indexed_recall`` so per-strategy outputs are directly
-    comparable.
-    """
-    if recalled is None or "failure_reason" in recalled:
-        return {
-            "key": entry["key"],
-            "exact_match": False,
-            "failure_reason": (recalled or {}).get("failure_reason", "null_result"),
-        }
-    return {
-        "key": entry["key"],
-        "exact_match": (
-            recalled.get("subject", "").strip() == entry["subject"].strip()
-            and recalled.get("predicate", "").strip() == entry["predicate"].strip()
-            and recalled.get("object", "").strip() == entry["object"].strip()
-        ),
-        "failure_reason": None,
-    }
-
-
-def _prepare_batched_inputs(prompts: list[str], tokenizer, device):
-    """Left-pad a list of prompts and return tokenizer outputs on ``device``.
-
-    Causal-LM decode requires ``padding_side='left'`` so the generated
-    suffix attaches to the right edge of every sequence in the batch.
-    We mutate the local tokenizer attribute for this call only; callers
-    that share the tokenizer with training paths see the original side
-    restored.
-    """
-    original_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
-    try:
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
-    finally:
-        tokenizer.padding_side = original_side
-    return inputs
-
-
-def _stop_token_ids(tokenizer) -> list[int]:
-    """Same stop-token derivation ``generate_answer`` uses."""
-    stop_ids = [tokenizer.eos_token_id]
-    for token_name in ["<|im_end|>", "<|eot_id|>"]:
-        encoded = tokenizer.encode(token_name, add_special_tokens=False)
-        if len(encoded) == 1 and encoded[0] not in stop_ids:
-            stop_ids.append(encoded[0])
-    return stop_ids
-
-
-def _decode_batch(
-    outputs: torch.Tensor,
-    prompt_lens: torch.Tensor,
-    tokenizer,
-) -> list[str]:
-    """Slice the prompt off each row and decode the generated suffix.
-
-    With left-padding, the input segment occupies a uniform width =
-    ``prompt_lens.max()`` across all rows in the batch (padding + actual
-    prompt = max-prompt-len).  Generated tokens are appended after that.
-    Generate may stop early (EOS) so total seq_len is variable, but the
-    input prefix width is constant — we slice from there.
-    """
-    input_seq_len = int(prompt_lens.max().item())
-    decoded: list[str] = []
-    for i in range(outputs.shape[0]):
-        suffix = outputs[i, input_seq_len:]
-        decoded.append(tokenizer.decode(suffix, skip_special_tokens=True).strip())
-    return decoded
-
-
-def probe_batched(model, tokenizer, entries, registry, *, batch_size: int):
-    """Tokenize+generate in chunks of ``batch_size``."""
-    device = next(model.parameters()).device
-    stop_ids = _stop_token_ids(tokenizer)
-    per_key: list[dict] = []
-
-    for start in range(0, len(entries), batch_size):
-        chunk = entries[start : start + batch_size]
-        prompts = [
-            _format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer) for e in chunk
-        ]
-        inputs = _prepare_batched_inputs(prompts, tokenizer, device)
-        prompt_lens = inputs["attention_mask"].sum(dim=1)
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=stop_ids,
-                repetition_penalty=1.1,
-            )
-        decoded = _decode_batch(outputs, prompt_lens, tokenizer)
-        for entry, raw in zip(chunk, decoded, strict=True):
-            recalled = _post_process(raw, entry["key"], registry)
-            per_key.append(_classify(entry, recalled))
-    return per_key
+# ---------------------------------------------------------------------------
+# Research-only: prefix-cache strategy (Phase 3 deferred).
+# See .agent/prefix-cache-correctness-investigation.md before productionising.
+# The serial and batched strategies below call evaluate_indexed_recall directly.
+# ---------------------------------------------------------------------------
 
 
 def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
@@ -277,17 +182,25 @@ def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
     concat with the generated tokens transparently.
 
     Limitations: requires HuggingFace transformers ≥ 4.43 (DynamicCache
-    expansion).  Falls back to ``probe_batched`` on AttributeError.
+    expansion).  Falls back to ``evaluate_indexed_recall`` on AttributeError.
     """
     device = next(model.parameters()).device
-    stop_ids = _stop_token_ids(tokenizer)
+    stop_ids = _derive_stop_ids(tokenizer)
     per_key: list[dict] = []
 
     try:
         from transformers.cache_utils import DynamicCache  # noqa: F401
     except ImportError:
         logger.warning("DynamicCache not available — falling back to batched probe")
-        return probe_batched(model, tokenizer, entries, registry, batch_size=batch_size)
+        result = evaluate_indexed_recall(
+            model,
+            tokenizer,
+            entries,
+            registry,
+            adapter_name=ADAPTER_NAME,
+            batch_size=batch_size,
+        )
+        return result["per_key"]
 
     # Tokenize ALL entries up front so the common prefix is computed against
     # the whole probe set, not per-chunk.  With per-chunk prefix detection
@@ -304,7 +217,15 @@ def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
             "probe_prefix_cache: common prefix only %d tokens — falling back to batched",
             global_prefix_len,
         )
-        return probe_batched(model, tokenizer, entries, registry, batch_size=batch_size)
+        result = evaluate_indexed_recall(
+            model,
+            tokenizer,
+            entries,
+            registry,
+            adapter_name=ADAPTER_NAME,
+            batch_size=batch_size,
+        )
+        return result["per_key"]
 
     # ``prefix_cache_cell`` is a single-slot memo passed down to
     # ``_generate_with_prefix_cache``.  The first chunk pays the prefix
@@ -324,8 +245,27 @@ def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
             prefix_cache_cell,
         )
         for entry, raw in zip(chunk_entries, decoded, strict=True):
-            recalled = _post_process(raw, entry["key"], registry)
-            per_key.append(_classify(entry, recalled))
+            recalled = _finalize_recalled(raw, entry["key"], registry, DEFAULT_CONFIDENCE_THRESHOLD)
+            if recalled is None or "failure_reason" in recalled:
+                per_key.append(
+                    {
+                        "key": entry["key"],
+                        "exact_match": False,
+                        "failure_reason": (recalled or {}).get("failure_reason", "null_result"),
+                    }
+                )
+            else:
+                per_key.append(
+                    {
+                        "key": entry["key"],
+                        "exact_match": (
+                            recalled.get("subject", "").strip() == entry["subject"].strip()
+                            and recalled.get("predicate", "").strip() == entry["predicate"].strip()
+                            and recalled.get("object", "").strip() == entry["object"].strip()
+                        ),
+                        "failure_reason": None,
+                    }
+                )
 
     return per_key
 
@@ -466,28 +406,6 @@ def _expand_kv_to_batch(kv, batch_size: int, *, deepcopy_first: bool):
         (k.repeat_interleave(batch_size, dim=0), v.repeat_interleave(batch_size, dim=0))
         for k, v in (deepcopy(kv) if deepcopy_first else kv)
     )
-
-
-def _post_process(raw: str, key: str, registry: dict[str, int] | None) -> dict | None:
-    """Mirror the failure-mode bookkeeping in ``probe_entry`` so batched
-    callers produce dicts with the same shape as the serial baseline.
-    """
-    parsed = parse_recalled_entry(raw)
-    if parsed is None:
-        return {"raw_output": raw, "failure_reason": "parse_failure"}
-    if parsed.get("key") != key:
-        return {
-            "raw_output": raw,
-            "failure_reason": f"key_mismatch:{parsed.get('key')}",
-        }
-    confidence = verify_confidence(parsed, registry) if registry else 1.0
-    parsed["confidence"] = confidence
-    if confidence < 0.75:
-        return {
-            "raw_output": raw,
-            "failure_reason": f"low_confidence:{confidence:.3f}",
-        }
-    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -632,11 +550,23 @@ def run_cell(model, tokenizer, entries, registry, strategy: str, batch_size: int
     t0 = time.perf_counter()
 
     if strategy == "serial":
-        runner = lambda: probe_serial(model, tokenizer, entries, registry)  # noqa: E731
+        runner = lambda: evaluate_indexed_recall(  # noqa: E731
+            model,
+            tokenizer,
+            entries,
+            registry,
+            adapter_name=ADAPTER_NAME,
+            batch_size=1,
+        )["per_key"]
     elif strategy == "batched":
-        runner = lambda: probe_batched(  # noqa: E731
-            model, tokenizer, entries, registry, batch_size=batch_size
-        )
+        runner = lambda: evaluate_indexed_recall(  # noqa: E731
+            model,
+            tokenizer,
+            entries,
+            registry,
+            adapter_name=ADAPTER_NAME,
+            batch_size=batch_size,
+        )["per_key"]
     elif strategy == "prefix_cache":
         runner = lambda: probe_prefix_cache(  # noqa: E731
             model, tokenizer, entries, registry, batch_size=batch_size
@@ -649,6 +579,19 @@ def run_cell(model, tokenizer, entries, registry, strategy: str, batch_size: int
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     wall = time.perf_counter() - t0
+
+    # Normalise to the 3-field shape across all strategies — production
+    # evaluate_indexed_recall returns a 10-field per-row dict; prefix_cache
+    # already returns 3 fields; the reference results.json is 3-field
+    # throughout.  Stripping keeps results.json comparable cell-for-cell.
+    per_key = [
+        {
+            "key": r["key"],
+            "exact_match": r["exact_match"],
+            "failure_reason": r.get("failure_reason"),
+        }
+        for r in per_key
+    ]
 
     exact = sum(1 for r in per_key if r["exact_match"])
     parse_failures = sum(1 for r in per_key if (r.get("failure_reason") or "") == "parse_failure")
