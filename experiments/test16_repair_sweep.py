@@ -171,6 +171,15 @@ REFERENCE_EPOCHS = 60
 # decay past the last legitimate step.
 MAX_BASE_EPOCHS = REFERENCE_EPOCHS
 
+# Probe batch size for recall evaluation.  Matches server.yaml's
+# `consolidation.recall_probe_batch_size=16` (2026-05-18 cutover).  Test 18
+# verified 137/137 exact-match parity for Mistral 7B nf4 across b ∈ {1, 2,
+# 4, 8, 16, 32, 64, 128}; b=16 yields ~4.75× per-probe speedup, ~346 MiB
+# peak VRAM delta on this hardware.  Combined with `probe_every_n_epochs=3`
+# in the EarlyStopPolicy this cuts probe wall time ~10-15× per epoch.
+# Set to 1 to fall back to the serial probe path (byte-identical results).
+RECALL_PROBE_BATCH_SIZE = 16
+
 BOOTSTRAP_RESAMPLES = 10_000
 
 DISK_HEADROOM_BYTES = 15 * 1024**3
@@ -709,7 +718,14 @@ def _safe_probe(
         Result dict from ``evaluate_entry_recall``.
     """
     try:
-        return evaluate_entry_recall(model, tokenizer, keyed, registry, adapter_name=adapter_name)
+        return evaluate_entry_recall(
+            model,
+            tokenizer,
+            keyed,
+            registry,
+            adapter_name=adapter_name,
+            batch_size=RECALL_PROBE_BATCH_SIZE,
+        )
     finally:
         try:
             model.gradient_checkpointing_enable()
@@ -832,6 +848,21 @@ def _run_phase(
     probe_state = EpochProbeState()
     early_state = _EarlyStopState()
 
+    # Wire batched recall probe to match server.yaml's
+    # `consolidation.recall_probe_batch_size=16` (2026-05-18 cutover).
+    # Production path in paramem/training/consolidation.py:4042-4048 does the
+    # same `functools.partial` plumbing — Test 18 verified 137/137 exact-match
+    # parity across b ∈ {1, 2, 4, 8, 16, 32, 64, 128}.  Falls back to the
+    # callback's lazy default when batch_size=1 so existing callers see no
+    # change.
+    import functools
+
+    _eval_fn: object | None
+    if RECALL_PROBE_BATCH_SIZE > 1:
+        _eval_fn = functools.partial(evaluate_entry_recall, batch_size=RECALL_PROBE_BATCH_SIZE)
+    else:
+        _eval_fn = None  # callback lazy-imports default
+
     callback = RecallEarlyStopCallback(
         model=model,
         tokenizer=tokenizer,
@@ -848,10 +879,7 @@ def _run_phase(
         pause_file=PAUSE_FILE,
         retention_keyed=retention_keyed if retention_keyed else None,
         retention_registry=retention_registry if retention_keyed else None,
-        # Let the callback default to paramem.training.recall_eval
-        # .evaluate_indexed_recall — the triple-aware production probe that
-        # expects {key, subject, predicate, object} entries.  Test 16's
-        # 2026-05-16 refactor migrated from QA pairs to this format.
+        eval_fn=_eval_fn,
     )
 
     adapter_cfg = _adapter_config()
@@ -1362,10 +1390,19 @@ def run_cell(
     #   - `base_stop_policy` fires at `first_perfect_epoch + D` via the
     #     `extra_epochs_past_first_perfect` field on EarlyStopPolicy (added
     #     2026-05-13 for Test 16's depth-past-floor sweep).  Stable-perfect
-    #     path is disabled via signal_from_epoch=10**9.
-    #   - `no_stop_policy` keeps the prior behaviour for corruption: probe
-    #     every epoch, never halt; the fixed `overwrite_epochs` budget is
-    #     the natural stop.
+    #     path is disabled via signal_from_epoch=10**9 — adopting server.yaml's
+    #     `recall_signal_from_epoch=20` here would short-circuit the
+    #     depth-past-floor mechanism (the stable-perfect path would fire at
+    #     ~e25 regardless of D, collapsing D=10 and D=30 into the same arm).
+    #   - `no_stop_policy` for corruption: probe every epoch, never halt;
+    #     the fixed `overwrite_epochs` budget is the natural stop.
+    #
+    # Probe cadence stays at every epoch to preserve apples-to-apples with
+    # the n=3 already-completed seeds (42/7/1337).  `recall_probe_every_n_epochs`
+    # is NOT adopted from server.yaml — only `recall_probe_batch_size=16` is
+    # (wired into eval_fn below).  Batched probe is byte-identical to serial
+    # at b=16 per Test 18's empirical parity claim, so seeds 1 + 11 stay
+    # comparable to the earlier three.
     base_stop_policy = EarlyStopPolicy(
         probe_from_epoch=1,
         signal_from_epoch=10**9,
