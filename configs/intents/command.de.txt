@@ -14,3 +14,23 @@ Schalte den Lautsprecher stumm
 Stelle einen Timer auf 10 Minuten
 Brich den Timer ab
 Setze Milch auf die Einkaufsliste
+Spiel einfach Musik
+Spiele Musik
+Spiele Radio
+Spiele HR3 Radio
+Spiele die Nachrichten
+Spiele einen Podcast
+Spiele etwas Jazz
+Setze die Musik fort
+Überspringe den Song
+Wechsle zu Deutschlandfunk
+Stoppe die Musik
+Stoppe das Radio
+Stoppe HR3 Radio
+Stoppe die Nachrichten
+Stoppe den Podcast
+Halt die Musik an
+Stopp
+Schließe das Garagentor
+Halte die Spülmaschine an
+Entferne Milch von der Einkaufsliste
