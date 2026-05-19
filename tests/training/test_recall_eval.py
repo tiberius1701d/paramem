@@ -1,6 +1,6 @@
 """Unit tests for paramem.training.recall_eval.
 
-Covers evaluate_indexed_recall (serial and batched), _generate_recall_batch,
+Covers evaluate_indexed_recall (serial and batched), probe_entries,
 _derive_stop_ids, and the extracted _finalize_recalled helper.
 
 Patching note (Decision 3 in plan-batched-probe-v2.md):
@@ -13,8 +13,8 @@ construction do NOT redirect the already-captured partial.
 
 None of the tests in this file patch evaluate_indexed_recall at the module
 level — they exercise evaluate_indexed_recall directly with stubbed
-model.generate, or they call _finalize_recalled / _generate_recall_batch
-directly.  This keeps the tests free of the partial-snapshot pitfall.
+model.generate, or they call _finalize_recalled / probe_entries directly.
+This keeps the tests free of the partial-snapshot pitfall.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def _make_model_mock():
 def _make_tokenizer_mock(
     eos_id: int = 2, padding_side: str = "right", pad_token_id: int | None = 1
 ):
-    """MagicMock tokenizer with the attributes _generate_recall_batch reads."""
+    """MagicMock tokenizer with the attributes probe_entries reads."""
     t = MagicMock()
     t.eos_token_id = eos_id
     t.padding_side = padding_side
@@ -306,11 +306,11 @@ class TestBatchedShapeMatchesSerial:
 
 
 class TestBatchedFinalizeHandlesFailures:
-    """Different rows land in the correct failure_reason bucket via _generate_recall_batch."""
+    """Different rows land in the correct failure_reason bucket via probe_entries."""
 
     def test_batched_finalize_handles_failures(self):
         from paramem.training.entry_memory import build_registry
-        from paramem.training.recall_eval import _generate_recall_batch
+        from paramem.training.recall_eval import probe_entries as _generate_recall_batch
 
         entries = [
             _entry("graph1", "Alice", "lives_in", "Berlin"),  # success
@@ -382,7 +382,7 @@ class TestLeftPaddingCorrectness:
     """
 
     def test_left_padding_correctness(self):
-        from paramem.training.recall_eval import _generate_recall_batch
+        from paramem.training.recall_eval import probe_entries as _generate_recall_batch
 
         short_key = "K"
         long_key = "this_is_a_much_longer_recall_key_N"
@@ -480,7 +480,7 @@ class TestPaddingSideRestored:
     """tokenizer.padding_side is restored after _generate_recall_batch."""
 
     def _run_with_side(self, original_side: str):
-        from paramem.training.recall_eval import _generate_recall_batch
+        from paramem.training.recall_eval import probe_entries as _generate_recall_batch
 
         entries = [_entry("graph1")]
         model = _make_model_mock()
@@ -521,7 +521,7 @@ class TestRegistryLowConfidenceBatched:
 
     def test_registry_low_confidence_batched(self):
         from paramem.training.entry_memory import build_registry
-        from paramem.training.recall_eval import _generate_recall_batch
+        from paramem.training.recall_eval import probe_entries as _generate_recall_batch
 
         entries = [
             _entry("graph1", "Alice", "lives_in", "Berlin"),

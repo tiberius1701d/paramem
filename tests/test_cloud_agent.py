@@ -9,6 +9,28 @@ from paramem.server.config import CloudAgentConfig
 from paramem.training.memory_store import MemoryStore as _MS
 
 
+def _stub_grouped_recall(fact_text: str):
+    """Build a probe_keys_grouped_by_adapter side_effect that returns the same
+    canned fact for every queried key. Used by tests that want to short-circuit
+    recall (skip real generate) and assert on the routing layer alone."""
+
+    def _stub(model, tokenizer, keys_by_adapter, *args, **kwargs):
+        return {
+            k: {
+                "key": k,
+                "subject": "x",
+                "predicate": "p",
+                "object": "y",
+                "confidence": 1.0,
+                "fact_text": fact_text,
+            }
+            for keys in keys_by_adapter.values()
+            for k in keys
+        }
+
+    return _stub
+
+
 class TestCloudResponse:
     def test_no_tool_calls(self):
         resp = CloudResponse(text="Hello")
@@ -332,15 +354,8 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
         with (
             patch(
-                "paramem.training.entry_memory.probe_entry",
-                return_value={
-                    "key": "graph1",
-                    "subject": "x",
-                    "predicate": "p",
-                    "object": "y",
-                    "confidence": 1.0,
-                    "fact_text": "Jordan lives in Berlin",
-                },
+                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                side_effect=_stub_grouped_recall("Jordan lives in Berlin"),
             ),
             patch(
                 "paramem.models.loader.switch_adapter",
@@ -574,15 +589,8 @@ class TestPrivacyRouting:
 
         with (
             patch(
-                "paramem.training.entry_memory.probe_entry",
-                return_value={
-                    "key": "graph1",
-                    "subject": "x",
-                    "predicate": "p",
-                    "object": "y",
-                    "confidence": 1.0,
-                    "fact_text": "Alex prefers dim lights",
-                },
+                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                side_effect=_stub_grouped_recall("Alex prefers dim lights"),
             ),
             patch("paramem.models.loader.switch_adapter"),
             patch(
@@ -643,15 +651,8 @@ class TestPrivacyRouting:
 
         with (
             patch(
-                "paramem.training.entry_memory.probe_entry",
-                return_value={
-                    "key": "graph1",
-                    "subject": "x",
-                    "predicate": "p",
-                    "object": "y",
-                    "confidence": 1.0,
-                    "fact_text": "Jordan lives somewhere",
-                },
+                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                side_effect=_stub_grouped_recall("Jordan lives somewhere"),
             ),
             patch("paramem.models.loader.switch_adapter"),
             patch(

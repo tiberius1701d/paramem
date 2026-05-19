@@ -740,6 +740,7 @@ def _probe_and_reason(
             model,
             tokenizer,
             registry=registry,
+            batch_size=config.consolidation.recall_probe_batch_size,
         )
     else:
         source = None

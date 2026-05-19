@@ -60,8 +60,9 @@ class WeightMemorySource:
     """Train-mode source.  Materialises entries by probing adapter weights.
 
     Wraps :func:`probe_keys_grouped_by_adapter`.  The wrapped function does
-    one ``switch_adapter`` per group and one ``model.generate`` per key,
-    so the per-call cost scales linearly with the total key count.
+    one ``switch_adapter`` per group and ``batch_size`` keys per
+    ``model.generate`` call, so the per-call cost scales linearly with the
+    total key count divided by ``batch_size``.
 
     The model, tokenizer, and per-adapter format mapping are captured at
     construction so callers don't thread them through every call.  When the
@@ -77,12 +78,14 @@ class WeightMemorySource:
         registry: dict[str, int] | None = None,
         confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
         max_new_tokens: int = 200,
+        batch_size: int = 1,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.registry = registry
         self.confidence_threshold = confidence_threshold
         self.max_new_tokens = max_new_tokens
+        self.batch_size = batch_size
 
     def probe(self, keys_by_adapter: dict[str, list[str]]) -> dict[str, dict | None]:
         # Lazy import so test monkeypatches against
@@ -97,6 +100,7 @@ class WeightMemorySource:
             max_new_tokens=self.max_new_tokens,
             registry=self.registry,
             confidence_threshold=self.confidence_threshold,
+            batch_size=self.batch_size,
         )
 
 
