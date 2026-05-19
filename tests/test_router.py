@@ -18,7 +18,7 @@ from paramem.training.memory_store import MemoryStore
 # ---------------------------------------------------------------------------
 
 
-def _make_pair(
+def _make_entry(
     key: str,
     subject: str,
     obj: str,
@@ -30,11 +30,11 @@ def _make_pair(
     first_seen_cycle: int = 1,
     adapter_id: str = "episodic",
 ) -> dict:
-    """Return a canonical cache-entry dict for use in router tests.
+    """Return a canonical :class:`MemoryStore` entry dict for use in router tests.
 
     Uses the canonical field names (``subject``, ``predicate``, ``object``).
     ``adapter_id`` controls which tier the router assigns this key to when
-    building the loop registry.
+    seeding the store.
     """
     return {
         "key": key,
@@ -45,30 +45,30 @@ def _make_pair(
         "object": obj,
         "speaker_id": speaker_id,
         "first_seen_cycle": first_seen_cycle,
-        "_adapter_id": adapter_id,  # internal: used by _make_router_from_pairs
+        "_adapter_id": adapter_id,  # internal: used by _make_router_from_entries
     }
 
 
-def _make_router_from_pairs(
-    pairs: list[dict],
+def _make_router_from_entries(
+    entries: list[dict],
     *,
     adapter_dir: "Path | None" = None,
     ha_graph: "MagicMock | None" = None,
 ) -> "QueryRouter":
-    """Create a QueryRouter backed by a mock ConsolidationLoop.
+    """Create a QueryRouter backed by a seeded :class:`MemoryStore`.
 
-    Builds an ``indexed_key_cache`` from *pairs* and a matching ``KeyRegistry``
-    so ``reload()`` populates entity/speaker indexes without touching the file
-    system.  The ``_adapter_id`` field in each pair controls which tier the
-    key is registered under.
+    Builds a per-tier :class:`MemoryStore` from *entries* so ``reload()``
+    populates entity/speaker indexes without touching the file system.
+    The ``_adapter_id`` field in each entry controls which tier the key is
+    registered under.
 
     Parameters
     ----------
-    pairs:
-        List of dicts as returned by ``_make_pair``.
+    entries:
+        List of dicts as returned by :func:`_make_entry`.
     adapter_dir:
         Optional path for the router's ``adapter_dir``.  Ignored for entity
-        indexing (which now comes from the loop cache) but kept so callers
+        indexing (which now comes from the store) but kept so callers
         that also write graph files can specify where to look.
     ha_graph:
         Optional mock HA entity graph.
@@ -76,11 +76,11 @@ def _make_router_from_pairs(
     from paramem.training.memory_store import MemoryStore
 
     store = MemoryStore(replay_enabled=True)
-    for pair in pairs:
-        key = pair["key"]
-        adapter_id = pair.get("_adapter_id", "episodic")
-        entry = {k: v for k, v in pair.items() if k != "_adapter_id"}
-        store.put(adapter_id, key, entry)
+    for entry in entries:
+        key = entry["key"]
+        adapter_id = entry.get("_adapter_id", "episodic")
+        payload = {k: v for k, v in entry.items() if k != "_adapter_id"}
+        store.put(adapter_id, key, payload)
 
     kwargs: dict = {
         "adapter_dir": adapter_dir or Path("/nonexistent"),
@@ -277,7 +277,7 @@ class TestIsInterrogative:
 
 class TestQueryRouterLoad:
     def test_empty_cache_loads_cleanly(self):
-        router = _make_router_from_pairs([])
+        router = _make_router_from_entries([])
         assert router.entity_count == 0
         assert router.adapter_count == 0
 
@@ -290,34 +290,34 @@ class TestQueryRouterLoad:
 
     def test_episodic_adapter_id_appears_in_entity_key_index(self):
         """Key registered under episodic appears in that tier's entity index."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic")]
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic")]
         )
         assert "episodic" in router._entity_key_index
 
     def test_semantic_adapter_id_appears_in_entity_key_index(self):
         """Key registered under semantic appears under the semantic tier."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="semantic")]
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="semantic")]
         )
         assert "semantic" in router._entity_key_index
 
     def test_subject_and_object_both_indexed(self):
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")]
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")]
         )
         assert "alice" in router._all_entities
         assert "berlin" in router._all_entities
 
     def test_speaker_id_indexed(self):
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")]
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")]
         )
         assert "alice" in router._speaker_key_index
         assert "graph1" in router._speaker_key_index["alice"]
 
     def test_pair_without_speaker_id_not_in_speaker_index(self):
-        router = _make_router_from_pairs([_make_pair("graph1", "Alice", "Berlin")])
+        router = _make_router_from_entries([_make_entry("graph1", "Alice", "Berlin")])
         assert len(router._speaker_key_index) == 0
 
     def test_no_loop_provider_gives_empty_indexes(self):
@@ -329,10 +329,10 @@ class TestQueryRouterLoad:
             assert router.entity_count == 0
 
     def test_multiple_adapters_indexed(self):
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_pair("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
+                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_entry("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
             ]
         )
         assert router.adapter_count == 2
@@ -371,7 +371,9 @@ class TestQueryRouterLoad:
         assert router.entity_count == 0
 
     def test_entity_shorter_than_two_chars_skipped(self):
-        router = _make_router_from_pairs([_make_pair("graph1", "A", "Berlin", speaker_id="alice")])
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "A", "Berlin", speaker_id="alice")]
+        )
         assert "a" not in router._all_entities
         assert "berlin" in router._all_entities
 
@@ -384,10 +386,10 @@ class TestQueryRouterLoad:
 class TestQueryRouterRoutePA:
     @staticmethod
     def _make_router() -> QueryRouter:
-        return _make_router_from_pairs(
+        return _make_router_from_entries(
             [
-                _make_pair("graph1", "Alice", "Berlin", speaker_id="alice"),
-                _make_pair("graph2", "Alice", "Python", speaker_id="alice"),
+                _make_entry("graph1", "Alice", "Berlin", speaker_id="alice"),
+                _make_entry("graph2", "Alice", "Python", speaker_id="alice"),
             ]
         )
 
@@ -435,8 +437,8 @@ class TestQueryRouterRoutePA:
         from paramem.server.router import Intent
 
         # Only "alice" in the index
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")]
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")]
         )
         # Query doesn't mention alice, but speaker="Alice" injects it
         plan = router.route("Where do I live?", speaker="Alice", speaker_id="alice")
@@ -465,10 +467,10 @@ class TestQueryRouterRoutePA:
         → semantic (consolidated). Procedural-first is load-bearing for personalization.
         When procedural is absent the remaining adapters still follow episodic → semantic.
         """
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_pair("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
+                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_entry("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
             ]
         )
         plan = router.route("Alice", speaker_id="alice")
@@ -550,8 +552,8 @@ class TestQueryRouterRouteHA:
         from paramem.server.router import Intent
 
         ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "kitchen light", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "kitchen light", speaker_id="alice")],
             ha_graph=ha,
         )
         plan = router.route("Alice kitchen light", speaker_id="alice")
@@ -578,10 +580,10 @@ class TestQueryRouterNoTopKCap:
 
     def test_no_cap_for_authenticated_speaker(self):
         """All 15 keys touching the matched entity reach plan.steps."""
-        pairs = [
-            _make_pair(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
+        entries = [
+            _make_entry(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
         ]
-        router = _make_router_from_pairs(pairs)
+        router = _make_router_from_entries(entries)
         plan = router.route("Alice", speaker_id="alice")
         assert plan.steps, "Authenticated speaker with entity match must emit steps"
         total_keys = sum(len(step.keys_to_probe) for step in plan.steps)
@@ -591,11 +593,11 @@ class TestQueryRouterNoTopKCap:
 
     def test_keys_to_probe_are_deterministic_sorted(self):
         """plan.steps[*].keys_to_probe is sorted (no hash-randomization flake)."""
-        pairs = [
-            _make_pair(f"graph{i:03d}", "Alice", f"Entity{i}", speaker_id="alice")
+        entries = [
+            _make_entry(f"graph{i:03d}", "Alice", f"Entity{i}", speaker_id="alice")
             for i in range(15)
         ]
-        router = _make_router_from_pairs(pairs)
+        router = _make_router_from_entries(entries)
         plan = router.route("Alice", speaker_id="alice")
         for step in plan.steps:
             assert step.keys_to_probe == sorted(step.keys_to_probe), (
@@ -654,10 +656,10 @@ class TestInterimAdapterRouting:
 
     def test_interim_keys_routed_under_their_real_adapter_name(self):
         """Interim-registered keys appear in a step named after the interim adapter."""
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_pair(
+                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_entry(
                     "int1",
                     "Alice",
                     "Prague",
@@ -687,12 +689,12 @@ class TestInterimAdapterRouting:
 
     def test_interim_keys_multiple_registered(self):
         """Multiple interim adapter IDs each get their own step, newest-stamp first."""
-        pairs = [
-            _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+        entries = [
+            _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
         ]
         for stamp in ("20260415T0000", "20260416T0000", "20260417T0000"):
-            pairs.append(
-                _make_pair(
+            entries.append(
+                _make_entry(
                     f"int_{stamp}",
                     "Alice",
                     f"City_{stamp}",
@@ -700,7 +702,7 @@ class TestInterimAdapterRouting:
                     adapter_id=f"episodic_interim_{stamp}",
                 )
             )
-        router = _make_router_from_pairs(pairs)
+        router = _make_router_from_entries(entries)
         plan = router.route("Alice", speaker_id="alice")
 
         names = [s.adapter_name for s in plan.steps]
@@ -721,9 +723,9 @@ class TestInterimAdapterRouting:
 
     def test_route_speaker_scoping_applies_to_interim_keys(self):
         """Interim key tagged with 'alice' is invisible to speaker_id='bob'."""
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair(
+                _make_entry(
                     "int1",
                     "Alice",
                     "Prague",
@@ -776,9 +778,9 @@ class TestInterimAdapterRouting:
         """
         from paramem.server.router import Intent
 
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair(
+                _make_entry(
                     "int1",
                     "Alice",
                     "Vienna",
@@ -799,14 +801,14 @@ class TestInterimAdapterRouting:
         Probe order: procedural (preferences shape style; load-bearing per
         feedback_router_procedural_first.md) → episodic → semantic.
         """
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair(
+                _make_entry(
                     "proc1", "Alice", "DarkMode", speaker_id="alice", adapter_id="procedural"
                 ),
-                _make_pair("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_pair("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
-                _make_pair(
+                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_entry("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
+                _make_entry(
                     "int1",
                     "Alice",
                     "InterimFact",
@@ -837,8 +839,8 @@ class TestRouteIntentField:
     def test_pa_match_yields_personal_intent(self):
         from paramem.server.router import Intent
 
-        router = _make_router_from_pairs(
-            [_make_pair("alex_loc", "Alex", "Berlin", speaker_id="alex")],
+        router = _make_router_from_entries(
+            [_make_entry("alex_loc", "Alex", "Berlin", speaker_id="alex")],
         )
         plan = router.route("Where does Alex live?", speaker_id="alex")
 
@@ -865,8 +867,8 @@ class TestRouteIntentField:
         from paramem.server.router import Intent
 
         ha = _make_ha_graph(_make_ha_match(entities=["light.bedroom"], domains=["light"]))
-        router = _make_router_from_pairs(
-            [_make_pair("alex_room", "Alex", "bedroom", speaker_id="alex")],
+        router = _make_router_from_entries(
+            [_make_entry("alex_room", "Alex", "bedroom", speaker_id="alex")],
             ha_graph=ha,
         )
         plan = router.route("Is Alex's bedroom light on?", speaker_id="alex")
@@ -926,30 +928,30 @@ class TestQueryRouterEntryFormat:
     ``ConsolidationLoop.store._entries_flat_view()``, which stores six-field
     entries (``key``, ``subject``, ``predicate``, ``object``,
     ``speaker_id``, ``first_seen_cycle``).  These tests verify that the
-    ``_index_pairs`` path reads ``subject``/``object`` (not legacy
+    ``_index_entry`` path reads ``subject``/``object`` (not legacy
     ``source_subject``/``source_object``) and that the entity and speaker
     indexes are correctly built.
     """
 
     def test_entry_loaded_without_error(self):
         """Router builds a non-empty index from a six-field entry cache."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         assert router.entity_count > 0
 
     def test_subject_and_object_indexed(self):
         """Both ``subject`` and ``object`` are indexed as entities from an entry."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         assert "alice" in router._all_entities
         assert "berlin" in router._all_entities
 
     def test_speaker_id_indexed(self):
         """``speaker_id`` from a cache entry is indexed in ``_speaker_key_index``."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         assert "alice" in router._speaker_key_index
         assert "graph1" in router._speaker_key_index["alice"]
@@ -958,8 +960,8 @@ class TestQueryRouterEntryFormat:
         """A query mentioning the entity from a cache entry resolves to a routing step."""
         from paramem.server.router import Intent
 
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         plan = router.route("Where does Alice live?", speaker_id="alice")
         assert plan.steps, "Expected PA routing steps from cache entry"
@@ -993,8 +995,8 @@ class TestQueryRouterEntryFormat:
 
     def test_qa_format_entry_still_indexes_via_subject_object(self):
         """QA-format cache entries (with question/answer) still index subject/object correctly."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         assert "alice" in router._all_entities
         assert "berlin" in router._all_entities
@@ -1031,7 +1033,7 @@ class TestAttributePredicateIndexing:
     routing when the speaker entity also matches many keys.
     """
 
-    def _make_has_email_pair(
+    def _make_has_email_entry(
         self,
         key: str = "graph2",
         speaker_id: str = "alice",
@@ -1051,7 +1053,7 @@ class TestAttributePredicateIndexing:
 
     def test_has_email_predicate_indexed_as_email(self):
         """has_email cache entry is indexed under 'email' entity."""
-        router = _make_router_from_pairs([self._make_has_email_pair()])
+        router = _make_router_from_entries([self._make_has_email_entry()])
         # "email" must appear in the entity list.
         assert "email" in router._all_entities
 
@@ -1066,11 +1068,11 @@ class TestAttributePredicateIndexing:
         key in ``_entity_key_index``.
         """
         # A flood of Alice's other keys + the has_email key.
-        pairs = [
-            _make_pair(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
+        entries = [
+            _make_entry(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
         ]
-        pairs.append(self._make_has_email_pair(key="graph_email", speaker_id="alice"))
-        router = _make_router_from_pairs(pairs)
+        entries.append(self._make_has_email_entry(key="graph_email", speaker_id="alice"))
+        router = _make_router_from_entries(entries)
 
         assert "email" in router._all_entities
         email_indexed_somewhere = False
@@ -1096,12 +1098,12 @@ class TestAttributePredicateIndexing:
             "first_seen_cycle": 1,
             "_adapter_id": "episodic",
         }
-        router = _make_router_from_pairs([pair])
+        router = _make_router_from_entries([pair])
         assert "phone" in router._all_entities
 
     def test_non_has_predicate_not_indexed_as_attribute(self):
         """A plain predicate like 'related_to' does NOT produce an 'elated_to' entry."""
-        router = _make_router_from_pairs([_make_pair("graph1", "Alice", "Berlin")])
+        router = _make_router_from_entries([_make_entry("graph1", "Alice", "Berlin")])
         # "related_to" starts with 'r', not "has_"; de-prefixed form must not appear.
         assert "elated_to" not in router._all_entities
         assert "related_to" not in router._all_entities
@@ -1119,7 +1121,7 @@ class TestAttributePredicateIndexing:
             "first_seen_cycle": 1,
             "_adapter_id": "episodic",
         }
-        router = _make_router_from_pairs([pair])
+        router = _make_router_from_entries([pair])
         # Empty de-prefixed name must not be added to entities.
         assert "" not in router._all_entities
 
@@ -1157,18 +1159,18 @@ class TestQueryRouterSimulateDir:
 
     def test_episodic_cache_entities_indexed(self):
         """Entities from episodic cache entries appear in _all_entities."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         assert "alice" in router._all_entities
         assert "berlin" in router._all_entities
 
     def test_semantic_and_procedural_cache_entries_indexed(self):
         """All three tiers' cache entries contribute to the index."""
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair("sem1", "Bob", "Python", speaker_id="bob", adapter_id="semantic"),
-                _make_pair("proc1", "Carol", "Tea", speaker_id="carol", adapter_id="procedural"),
+                _make_entry("sem1", "Bob", "Python", speaker_id="bob", adapter_id="semantic"),
+                _make_entry("proc1", "Carol", "Tea", speaker_id="carol", adapter_id="procedural"),
             ]
         )
         assert "bob" in router._all_entities
@@ -1176,8 +1178,8 @@ class TestQueryRouterSimulateDir:
 
     def test_speaker_id_from_cache_indexed(self):
         """speaker_id from cache entries appears in _speaker_key_index."""
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         assert "alice" in router._speaker_key_index
         assert "graph1" in router._speaker_key_index["alice"]
@@ -1186,8 +1188,8 @@ class TestQueryRouterSimulateDir:
         """A query mentioning a cached entity resolves to a PA step."""
         from paramem.server.router import Intent
 
-        router = _make_router_from_pairs(
-            [_make_pair("graph1", "Alice", "Berlin", speaker_id="alice")],
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
         )
         plan = router.route("Where does Alice live?", speaker_id="alice")
         assert plan.steps, "Expected PA routing steps from cache entry"
@@ -1197,10 +1199,10 @@ class TestQueryRouterSimulateDir:
 
     def test_multiple_tiers_in_cache_indexed_without_conflict(self):
         """Cache entries from different tiers are all indexed without conflict."""
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair("ep1", "TrainEntity", "Berlin", speaker_id="alice"),
-                _make_pair(
+                _make_entry("ep1", "TrainEntity", "Berlin", speaker_id="alice"),
+                _make_entry(
                     "sem1", "SimEntity", "Munich", speaker_id="alice", adapter_id="semantic"
                 ),
             ]
@@ -1238,9 +1240,9 @@ class TestQueryRouterSimulateDir:
 
     def test_has_email_predicate_indexed_from_cache(self):
         """has_email predicate in a cache entry is indexed under 'email' entity."""
-        router = _make_router_from_pairs(
+        router = _make_router_from_entries(
             [
-                _make_pair(
+                _make_entry(
                     "graph2",
                     "Alice",
                     "alice@example.com",
