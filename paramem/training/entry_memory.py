@@ -436,13 +436,17 @@ def probe_entry(
     model,
     tokenizer,
     key: str,
-    max_new_tokens: int = 128,
+    *,
     registry: dict | None = None,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    max_new_tokens: int = 128,
 ) -> dict | None:
     """Prompt the model to recall a single entry by key.
 
-    Mirrors :func:`paramem.training.indexed_memory.probe_key`:
+    1-key convenience wrapper around
+    :func:`paramem.training.recall_eval.probe_entries`.  Builds a stub entry
+    containing only the key (empty SPO fields), calls ``probe_entries`` with
+    ``batch_size=1``, and returns the single recalled dict.
 
     - Returns a dict with ``key``, ``subject``, ``predicate``, ``object``,
       ``confidence``, ``raw_output``, and
@@ -456,35 +460,37 @@ def probe_entry(
     - Returns ``{"raw_output": ..., "failure_reason": "low_confidence:<val>"}``
       when the confidence falls below the threshold.
 
-    The new trailing parameters (``registry``, ``confidence_threshold``) are
-    optional and default-valued, so existing positional callers in
-    ``experiments/`` keep working unchanged.
+    All parameters are keyword-only after ``key`` to prevent accidental
+    positional misuse.
 
     Args:
         model: Loaded HuggingFace / PEFT model.
         tokenizer: Tokenizer matching the model.
         key: Key to recall (e.g. ``"graph3"``).
-        max_new_tokens: Maximum tokens to generate.
         registry: Optional SimHash registry for confidence verification.
         confidence_threshold: Minimum confidence to accept a recalled entry.
+        max_new_tokens: Maximum tokens to generate.
 
     Returns:
         Result dict on success or failure — never ``None`` (shape contract
         matches :func:`paramem.training.indexed_memory.probe_key`).
     """
-    from paramem.evaluation.recall import generate_answer
-    from paramem.training.dataset import _format_inference_prompt
+    from paramem.training.recall_eval import probe_entries
 
-    prompt = RECALL_TEMPLATE.format(key=key)
-    formatted = _format_inference_prompt(prompt, tokenizer)
-    raw = generate_answer(
-        model,
-        tokenizer,
-        formatted,
-        max_new_tokens=max_new_tokens,
-        temperature=0.0,
+    stub = {"key": key, "subject": "", "predicate": "", "object": ""}
+    results = list(
+        probe_entries(
+            model,
+            tokenizer,
+            [stub],
+            registry=registry,
+            batch_size=1,
+            confidence_threshold=confidence_threshold,
+            max_new_tokens=max_new_tokens,
+        )
     )
-    return _finalize_recalled(raw, key, registry, confidence_threshold)
+    _, recalled = results[0]
+    return recalled
 
 
 # --- Fact-text helper ---

@@ -1815,6 +1815,7 @@ async def lifespan(app: FastAPI):
                 _source = _WeightMemorySource(
                     _state["model"],
                     _state["tokenizer"],
+                    batch_size=config.consolidation.recall_probe_batch_size,
                 )
             else:
                 logger.info(

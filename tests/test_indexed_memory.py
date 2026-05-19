@@ -443,12 +443,22 @@ class TestProbeKeysGroupedByAdapter:
         def fake_switch(model, name):
             switch_calls.append(name)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return {"key": key, "subject": "s", "predicate": "p", "object": "o", "confidence": 1.0}
+        def fake_probe_entries(model, tokenizer, entries, *args, **kwargs):
+            for entry in entries:
+                yield (
+                    entry,
+                    {
+                        "key": entry["key"],
+                        "subject": "s",
+                        "predicate": "p",
+                        "object": "o",
+                        "confidence": 1.0,
+                    },
+                )
 
         monkeypatch.setattr(
-            "paramem.training.entry_memory.probe_entry",
-            fake_probe,
+            "paramem.training.recall_eval.probe_entries",
+            fake_probe_entries,
         )
         monkeypatch.setattr(
             "paramem.models.loader.switch_adapter",
@@ -481,12 +491,22 @@ class TestProbeKeysGroupedByAdapter:
         def fake_switch(model, name):
             switch_calls.append(name)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return {"key": key, "subject": "s", "predicate": "p", "object": "o", "confidence": 1.0}
+        def fake_probe_entries(model, tokenizer, entries, *args, **kwargs):
+            for entry in entries:
+                yield (
+                    entry,
+                    {
+                        "key": entry["key"],
+                        "subject": "s",
+                        "predicate": "p",
+                        "object": "o",
+                        "confidence": 1.0,
+                    },
+                )
 
         monkeypatch.setattr(
-            "paramem.training.entry_memory.probe_entry",
-            fake_probe,
+            "paramem.training.recall_eval.probe_entries",
+            fake_probe_entries,
         )
         monkeypatch.setattr(
             "paramem.models.loader.switch_adapter",
@@ -561,12 +581,13 @@ class TestProbeKeysGroupedByAdapter:
         def fake_switch(model, name):
             pass
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return per_key_answers.get(key)
+        def fake_probe_entries(model, tokenizer, entries, *args, **kwargs):
+            for entry in entries:
+                yield entry, per_key_answers.get(entry["key"])
 
         monkeypatch.setattr(
-            "paramem.training.entry_memory.probe_entry",
-            fake_probe,
+            "paramem.training.recall_eval.probe_entries",
+            fake_probe_entries,
         )
         monkeypatch.setattr(
             "paramem.models.loader.switch_adapter",
@@ -611,12 +632,22 @@ class TestProbeKeysGroupedByAdapter:
         def fake_switch(model, name):
             switch_calls.append(name)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return {"key": key, "subject": "x", "predicate": "p", "object": "y", "confidence": 1.0}
+        def fake_probe_entries(model, tokenizer, entries, *args, **kwargs):
+            for entry in entries:
+                yield (
+                    entry,
+                    {
+                        "key": entry["key"],
+                        "subject": "x",
+                        "predicate": "p",
+                        "object": "y",
+                        "confidence": 1.0,
+                    },
+                )
 
         monkeypatch.setattr(
-            "paramem.training.entry_memory.probe_entry",
-            fake_probe,
+            "paramem.training.recall_eval.probe_entries",
+            fake_probe_entries,
         )
         monkeypatch.setattr(
             "paramem.models.loader.switch_adapter",
