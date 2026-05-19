@@ -297,12 +297,21 @@ def handle_chat(
         is_personal = intent == Intent.PERSONAL
 
         # Pre-compute sanitization once for all cloud escalation paths.
-        # Personal-content detection is anchored on the router's entity index
-        # (the graph's ground truth) plus a first-person token-set + the
-        # resolved speaker_id — the same ground truth the extraction-path
-        # anonymizer uses, no static keyword list.
-        if known_entities is None and router is not None and hasattr(router, "_all_entities"):
-            known_entities = router._all_entities
+        # Personal-content detection is anchored on the graph's
+        # subject/object names (read directly from the MemoryStore — the
+        # same source the router uses for speaker scoping) plus a
+        # first-person token-set + the resolved speaker_id — the same
+        # ground truth the extraction-path anonymizer uses, no static
+        # keyword list.  The set is rebuilt per /chat call; cost is O(N)
+        # over active keys (~hundreds in production).
+        if known_entities is None and memory_store is not None:
+            _entity_names: set[str] = set()
+            for _tier, _key, _entry in memory_store.iter_entries():
+                for _field in ("subject", "object"):
+                    _name = _entry.get(_field, "")
+                    if _name and len(_name) > 1:
+                        _entity_names.add(_name.lower().strip())
+            known_entities = _entity_names
         sanitized_text, sanitization_findings = sanitize_for_cloud(
             text,
             mode=config.sanitization.mode,
