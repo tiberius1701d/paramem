@@ -22,7 +22,6 @@ HA entity graph.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -216,21 +215,19 @@ class QueryRouter:
     """Routes queries to adapters and keys using the knowledge graph.
 
     Rebuilt after each consolidation.  Indexes are built directly from the
-    injected :class:`paramem.training.memory_store.MemoryStore` (canonical
-    in both train and simulate modes) and the cumulative knowledge graph.
-    Optionally includes an HA entity graph for dual-graph routing.
+    injected :class:`paramem.training.memory_store.MemoryStore` — canonical
+    in both train and simulate modes.  Optionally includes an HA entity
+    graph for dual-graph routing.
     """
 
     def __init__(
         self,
         adapter_dir: Path,
         memory_store,
-        graph_path: Path | None = None,
         ha_graph: "HAEntityGraph | None" = None,
         intent_config: "IntentConfig | None" = None,
     ):
         self.adapter_dir = Path(adapter_dir)
-        self.graph_path = Path(graph_path) if graph_path else None
         self._ha_graph = ha_graph
         # IntentConfig flows through to classify_intent() so the residual
         # tier (encoder + exemplar bank) gets its margin threshold and
@@ -257,9 +254,6 @@ class QueryRouter:
         Walks ``self._memory_store.iter_entries()`` (canonical in both train
         and simulate modes).  Tier ownership comes from the store; no flat
         key→tier reverse lookup needed.
-
-        Also loads from the cumulative knowledge graph when
-        :attr:`graph_path` is set.
 
         Call after consolidation so the indexes reflect the current
         in-memory state.
@@ -297,10 +291,6 @@ class QueryRouter:
                 self._index_pairs(tier_name, pairs)
         else:
             logger.info("Router reload: memory store empty — indexes will be empty")
-
-        # Also load from graph nodes if available
-        if self.graph_path and self.graph_path.exists():
-            self._load_graph_entities()
 
         self._entity_list = sorted(self._all_entities)
         logger.info(
@@ -358,22 +348,6 @@ class QueryRouter:
             len(pairs),
             len(index),
         )
-
-    def _load_graph_entities(self) -> None:
-        """Add graph node names to the entity set for matching.  Transparently
-        decrypts age-wrapped content when the daily identity is loaded."""
-        try:
-            import networkx as nx
-
-            from paramem.backup.encryption import read_maybe_encrypted
-
-            data = json.loads(read_maybe_encrypted(self.graph_path).decode("utf-8"))
-            graph = nx.node_link_graph(data)
-            for node in graph.nodes:
-                if isinstance(node, str) and len(node) > 1:
-                    self._all_entities.add(node.lower().strip())
-        except Exception as e:
-            logger.warning("Failed to load graph entities: %s", e)
 
     def route(
         self,
