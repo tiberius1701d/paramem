@@ -1,32 +1,40 @@
-"""Residual intent classifier — state-first with encoder fallback.
+"""Intent classifier — HA fast-path + content-driven residual + fail-closed.
 
 Routing decisions follow a tiered model:
 
-1. **State (deterministic, cheap).**  Speaker's knowledge graph hits or
-   HA entity-graph hits resolve cleanly:
+1. **HA fast path (deterministic, cheap).**  HA entity-graph hits resolve
+   immediately to :attr:`Intent.COMMAND`.  HA's namespace is closed
+   (operator's installation) so the lexical match is reliable when it
+   fires.
 
-   * graph match → :attr:`Intent.PERSONAL`
-   * HA match    → :attr:`Intent.COMMAND`
+2. **Content-driven residual.**  When the HA fast path does not fire,
+   ``IntentConfig.mode`` selects the residual classifier:
 
-2. **Encoder fallback (residual).**  When neither state signal fires,
-   a sentence-encoder + cosine-match against per-class exemplars gives
-   the call.  Per-class top similarity (max over the class's
-   exemplars) is gated by a margin between the top-1 and top-2
-   classes; below the margin the classifier hands off to the
-   fail-closed default rather than guessing.  Embeddings are
-   L2-normalised at load time so cosine reduces to a plain dot
-   product at query time.
+   * ``"embeddings"`` (default) — sentence-encoder cosine vs per-class
+     exemplar bank, gated by top-1/top-2 margin.  ~1 ms.  Brittle on
+     paraphrase / named entities outside the bank.
+   * ``"llm"`` — single-token generation from the loaded local model
+     using the intent-classifier section of ``voice.prompt_file``.
+     ~50–200 ms.  No exemplar curation needed; handles paraphrase and
+     named entities directly.  Automatically falls back to the encoder
+     path when no classifier model is registered (cloud-only mode,
+     model load failed).
 
-3. **Fail-closed.**  When the residual classifier is unavailable
-   (encoder didn't load, exemplars missing, confidence below margin),
-   the classifier returns the configured ``fail_closed_intent`` —
-   defaulting to ``personal`` so the cloud-escalation gate stays
-   privacy-preserving under uncertainty.
+3. **Fail-closed.**  When the residual classifier is unavailable or
+   below the confidence margin, the classifier returns the configured
+   ``fail_closed_intent`` — defaulting to ``personal`` so the
+   cloud-escalation gate stays privacy-preserving under uncertainty.
 
-The encoder and exemplar bank are loaded once at server lifespan
-startup and live in :data:`_encoder_singleton` and
-:data:`_exemplars_singleton`.  Test environments that never call
-:func:`classify_intent` pay no model-load cost.
+PA graph match is **not** a state signal here.  Speaker enrollment must
+not classify the speaker's queries as PERSONAL — that signal is the
+residual classifier's job, derived from query content.  The router
+scopes keys by speaker but lets the classifier decide intent.
+
+The encoder, exemplar bank, and (when ``mode=llm``) the local model
+handle are loaded once at server lifespan startup and live in
+:data:`_encoder_singleton`, :data:`_exemplars_singleton`, and
+:data:`_classifier_model_singleton` respectively.  Test environments
+that never call :func:`classify_intent` pay no model-load cost.
 """
 
 from __future__ import annotations
@@ -80,6 +88,25 @@ class _ExemplarBank:
 # Module-level singleton populated by :func:`load_exemplars` at lifespan
 # startup.  Tests reset it via ``intent._exemplars_singleton = None``.
 _exemplars_singleton: _ExemplarBank | None = None
+
+
+@dataclass
+class _ClassifierModelHandle:
+    """Loose wrapper around the local LLM used by ``mode=llm`` classification.
+
+    Populated by :func:`set_classifier_model` from the lifespan after the
+    main model has loaded.  Cloud-only mode leaves it as ``None`` so the
+    LLM-classify path automatically falls back to the encoder residual.
+    """
+
+    model: object  # transformers PreTrainedModel; typed loosely to avoid the heavy import
+    tokenizer: object  # transformers PreTrainedTokenizer
+
+
+# Module-level singleton populated by :func:`set_classifier_model` from
+# the lifespan when the local model is loaded.  Stays ``None`` in cloud-
+# only mode and when LLM classification is disabled.
+_classifier_model_singleton: _ClassifierModelHandle | None = None
 
 
 def _resolve_device(requested: str) -> str:
@@ -346,19 +373,178 @@ def _classify_via_encoder(
     return top_intent
 
 
+def set_classifier_model(model, tokenizer) -> None:
+    """Register the local LLM used by ``mode=llm`` classification.
+
+    Called from the lifespan after the main model has loaded.  Pass
+    ``None`` for both arguments to clear the registration (e.g. before
+    a model unload / cloud-only switch).  Idempotent.
+    """
+    global _classifier_model_singleton
+    if model is None or tokenizer is None:
+        _classifier_model_singleton = None
+        return
+    _classifier_model_singleton = _ClassifierModelHandle(model=model, tokenizer=tokenizer)
+
+
+def get_classifier_model() -> _ClassifierModelHandle | None:
+    """Return the cached classifier handle, or ``None`` if not registered."""
+    return _classifier_model_singleton
+
+
+_VALID_LABEL_TOKENS = {"PERSONAL", "COMMAND", "GENERAL", "UNKNOWN"}
+
+
+def _parse_intent_label(text: str) -> Intent | None:
+    """Extract the first valid intent label from a model response.
+
+    The model is instructed to output a bare label, but in practice it
+    occasionally prepends quotes, brackets, or a leading sentence
+    fragment.  We accept the first occurrence of any valid label token,
+    case-insensitive, as a substring of the response.  Returns ``None``
+    when no recognised label is present so callers can fail-close.
+    """
+    upper = text.upper()
+    best_pos: int | None = None
+    best_label: Intent | None = None
+    for token in _VALID_LABEL_TOKENS:
+        pos = upper.find(token)
+        if pos < 0:
+            continue
+        if best_pos is None or pos < best_pos:
+            best_pos = pos
+            best_label = Intent(token.lower())
+    return best_label
+
+
+def _build_voice_config(config: IntentConfig):
+    """Lazy import of VoiceConfig to read the classifier-prompt section.
+
+    The dependency on ``server.config`` is module-level circular; lazy
+    import keeps the load order clean.
+    """
+    from paramem.server.config import VoiceConfig
+
+    return VoiceConfig()
+
+
+def _classify_via_llm(
+    text: str,
+    handle: _ClassifierModelHandle,
+    config: IntentConfig,
+) -> Intent:
+    """Classify *text* by generating one short label from the local LLM.
+
+    Uses the intent-classifier section of ``configs/prompts/pa_voice.txt``
+    (loaded via :meth:`VoiceConfig.load_intent_classifier_prompt`) as the
+    system prompt.  Generation is deterministic (``temperature=0``,
+    ``do_sample=False``) and bounded to
+    :attr:`IntentConfig.llm_max_new_tokens` tokens — enough for one
+    label plus possible whitespace.
+
+    Failure modes (prompt missing, generation error, unparseable
+    output) all return the configured fail-closed intent; the function
+    never raises.
+    """
+    voice = _build_voice_config(config)
+    classifier_prompt = voice.load_intent_classifier_prompt()
+    if classifier_prompt is None:
+        logger.warning(
+            "LLM intent classification requested but classifier prompt section "
+            "is missing from voice.prompt_file; falling back"
+        )
+        return _fail_closed_intent(config)
+
+    try:
+        tokenizer = handle.tokenizer
+        model = handle.model
+
+        messages = [
+            {"role": "system", "content": classifier_prompt},
+            {"role": "user", "content": text},
+        ]
+        # Two-step tokenization mirrors the production inference path
+        # (paramem/server/inference.py:900-908):
+        #   1. apply_chat_template with tokenize=False → string prompt;
+        #   2. tokenizer(prompt, return_tensors="pt") → BatchEncoding;
+        #   3. model.generate(**inputs).
+        # The earlier shortcut of passing apply_chat_template's tensor result
+        # directly to generate() crashes on transformers >= 5 because the
+        # call returns a BatchEncoding (no .shape attribute).
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+        # Gradient checkpointing must be off during generate() (HF silently
+        # disables KV cache when checkpointing is active).  Pair every
+        # disable with a matching restore in `finally`.
+        was_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
+        if was_checkpointing:
+            model.gradient_checkpointing_disable()
+
+        # Intent classification runs on the bare base model.  The PA
+        # adapter is trained on personal-key recall and would bias the
+        # classifier toward PERSONAL on content-free imperatives.
+        # ``disable_adapter`` is a no-op for unwrapped base models.
+        from peft import PeftModel as _PeftModel
+
+        try:
+            if isinstance(model, _PeftModel):
+                with model.disable_adapter():
+                    import torch as _torch
+
+                    with _torch.no_grad():
+                        output_ids = model.generate(
+                            **inputs,
+                            max_new_tokens=config.llm_max_new_tokens,
+                            do_sample=False,
+                            temperature=config.llm_temperature,
+                            pad_token_id=getattr(tokenizer, "pad_token_id", None)
+                            or getattr(tokenizer, "eos_token_id", None),
+                        )
+            else:
+                import torch as _torch
+
+                with _torch.no_grad():
+                    output_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=config.llm_max_new_tokens,
+                        do_sample=False,
+                        temperature=config.llm_temperature,
+                        pad_token_id=getattr(tokenizer, "pad_token_id", None)
+                        or getattr(tokenizer, "eos_token_id", None),
+                    )
+        finally:
+            if was_checkpointing:
+                model.gradient_checkpointing_enable()
+
+        generated = output_ids[0][inputs["input_ids"].shape[-1] :]
+        response = tokenizer.decode(generated, skip_special_tokens=True)
+    except Exception:
+        logger.exception("LLM intent classification failed; falling back")
+        return _fail_closed_intent(config)
+
+    label = _parse_intent_label(response)
+    if label is None:
+        logger.warning(
+            "LLM intent classifier produced no recognised label (response=%r); fail-closed",
+            response[:200],
+        )
+        return _fail_closed_intent(config)
+    logger.debug("LLM intent classifier verdict=%s (raw=%r)", label.value, response[:80])
+    return label
+
+
 def classify_intent(
     text: str,
     *,
-    has_graph_match: bool,
     has_ha_match: bool,
     config: IntentConfig | None = None,
 ) -> Intent:
     """Classify a query into PERSONAL / COMMAND / GENERAL / UNKNOWN.
 
-    Tier 1 — state signals (cheap, deterministic):
+    Tier 1 — HA fast path:
 
-    * ``has_graph_match`` → :attr:`Intent.PERSONAL`
-    * ``has_ha_match``    → :attr:`Intent.COMMAND`
+    * ``has_ha_match`` → :attr:`Intent.COMMAND`
 
     Tier 2 — encoder residual (when encoder + exemplars are loaded):
 
@@ -369,16 +555,32 @@ def classify_intent(
     Tier 3 — degraded mode:
 
     Encoder or exemplars unavailable → fall back to the fail-closed
-    default with a config; ``Intent.UNKNOWN`` without one.
+    default when a ``config`` is given; ``Intent.UNKNOWN`` without one.
+
+    PA graph match is intentionally **not** a state signal.  Speaker
+    enrollment scopes keys at the router layer; intent comes from query
+    content via the encoder.  This removes the previous "speaker-in-graph
+    → PERSONAL" short-circuit that misrouted imperatives from enrolled
+    speakers.
 
     The function never raises — encoder/embedding errors or
     misconfiguration produce a fail-safe result rather than blocking
     the chat handler.
     """
-    if has_graph_match:
-        return Intent.PERSONAL
     if has_ha_match:
         return Intent.COMMAND
+
+    # ``mode=llm`` dispatch (cheap fallback when the local model is not
+    # registered — cloud-only mode, model load failed).  When the LLM
+    # backend is unavailable we slide to the encoder path automatically
+    # so a misconfigured ``mode=llm`` operator can't disable routing.
+    if config is not None and config.mode == "llm":
+        handle = get_classifier_model()
+        if handle is not None:
+            return _classify_via_llm(text, handle, config)
+        logger.info(
+            "intent.mode=llm but no classifier model registered; falling back to encoder residual"
+        )
 
     encoder = get_encoder()
     bank = get_exemplars()

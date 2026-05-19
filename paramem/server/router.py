@@ -1,22 +1,23 @@
-"""Query routing — selects adapters and keys based on query entities.
+"""Query routing — speaker-only key resolution + intent-driven tier selection.
 
-Routes queries to the right adapter(s) and identifies which indexed keys
-to probe, using the knowledge graph's entity-to-key mappings.  This
-avoids probing all keys for every query at scale.
+The router answers two questions per query:
 
-Dual-graph matching feeds the intent classifier:
+* **Which keys can this speaker probe?**  Answer: the speaker's entry in
+  :attr:`QueryRouter._speaker_key_index` — the privacy boundary.  Speaker
+  enrollment populates ``allowed_keys``; nothing more.
+* **Which tiers should we deliver context from?**  Answer: derived from
+  the intent classifier on the query content.  See
+  :meth:`QueryRouter._steps_for_intent`.
 
-* PA knowledge graph (personal entities) → ``has_pa``
-* HA entity graph (devices, areas, action verbs) → ``has_ha``
+Intent is decided by :func:`paramem.server.intent.classify_intent` — HA
+lexical fast-path + encoder-cosine residual + fail-closed default.
+Speaker enrollment is intentionally NOT a routing signal: a query from
+an enrolled speaker is classified by content, not by who said it.  This
+removes the "speaker-in-graph → PERSONAL" short-circuit that previously
+caused imperatives from enrolled speakers to misroute (HR3 bug).
 
-``classify_intent`` collapses these signals into a single
-:class:`Intent` value on the returned :class:`RoutingPlan`.  Downstream
-routing in ``inference.py`` dispatches on ``plan.intent`` alone; the
-graph-coverage details are still surfaced via ``plan.steps`` (PA probe
-targets) and ``plan.ha_domains`` (HA observability).
-
-The router is stateless per query — all state lives in the indexes
-built from the ConsolidationLoop cache, the knowledge graph, and the
+The router is stateless per query — all state lives in the registry-
+backed ``_speaker_key_index`` (preload-independent) and the optional
 HA entity graph.
 """
 
@@ -29,34 +30,23 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from rapidfuzz import fuzz
-
 if TYPE_CHECKING:
     from paramem.server.config import IntentConfig
     from paramem.server.ha_graph import HAEntityGraph, HAMatchResult
 
 logger = logging.getLogger(__name__)
 
-# Minimum fuzzy match score (0-100) for entity extraction fallback
-FUZZY_THRESHOLD = 80
-
 
 class Intent(str, Enum):
-    """Single explicit routing axis for queries.
+    """Routing intent — single axis the chat handler dispatches on.
 
-    Populated on :class:`RoutingPlan` by future commits; today this enum
-    exists so consumers can start preparing to read it.  Default on
-    :class:`RoutingPlan` is :attr:`UNKNOWN` — the field is informational
-    until the residual classifier is wired in.
-
-    * ``PERSONAL`` — query references the speaker's life or graph; never
-      escalates to cloud.
-    * ``COMMAND`` — imperative or device query; routed to the HA agent.
-    * ``GENERAL`` — general knowledge / real-time data; full
-      PA→HA→SOTA→base-model escalation chain available.
-    * ``UNKNOWN`` — classifier unavailable or ambiguous; treated
-      conservatively by callers (typically same as ``GENERAL`` with an
-      explicit log).
+    * ``PERSONAL`` — speaker's life / personal facts; never escalates to cloud.
+    * ``COMMAND``  — imperative directed at the home / device fleet; routed
+      to the HA conversation agent.
+    * ``GENERAL``  — general-knowledge query; full escalation chain available.
+    * ``UNKNOWN``  — classifier unavailable or below confidence margin;
+      treated per :class:`IntentConfig.fail_closed_intent`
+      (privacy-preserving default).
     """
 
     PERSONAL = "personal"
@@ -77,39 +67,55 @@ class RoutingStep:
 class RoutingPlan:
     """What to activate and probe for a given query.
 
-    ``intent`` is the single explicit routing axis the chat handler
-    dispatches on.  ``steps`` carries the PA probe targets when
-    ``intent == PERSONAL``; ``ha_domains`` is observability for the
-    HA path.  The legacy ``match_source`` / ``imperative`` fields were
-    retired once the if/elif cascade was replaced with intent-keyed
-    dispatch — the same information is recoverable from
-    ``(bool(steps), bool(ha_domains))`` if any tooling needs it.
+    * ``intent`` — single routing axis ``inference.py`` dispatches on.
+    * ``steps`` — per-tier :class:`RoutingStep` with speaker-scoped keys
+      for the tiers selected by intent (see
+      :meth:`QueryRouter._steps_for_intent`).
+    * ``ha_domains`` — HA-graph observability metadata.
+    * ``strategy`` — ``"targeted_probe"`` when ``steps`` is non-empty,
+      ``"direct"`` otherwise.
     """
 
     steps: list[RoutingStep] = field(default_factory=list)
     strategy: str = "direct"
-    matched_entities: list[str] = field(default_factory=list)
-    # HA domains of matched entities/verbs (observability + UI)
     ha_domains: list[str] = field(default_factory=list)
-    # Single routing axis the chat handler dispatches on.
     intent: Intent = Intent.UNKNOWN
 
 
-_INTERIM_PREFIX = "episodic_interim_"
+# Tier ordering for PERSONAL probe:
+# 1. procedural first — preferences shape style (load-bearing rule;
+#    see memory/feedback_router_procedural_first.md).
+# 2. interim adapters next, newest-first — they hold the freshest factual
+#    state.  A user correction (move, rename, change of mind) lands in the
+#    newest ``episodic_interim_<stamp>`` slot ahead of the next full-cycle
+#    merge into main; probing interim before main ensures the latest answer
+#    wins instead of returning the stale pre-merge baseline.
+# 3. main episodic — baseline factual snapshot from the last full cycle.
+# 4. semantic — durable but most lossy/abstract; corroboration fallback.
+_PERSONAL_TIERS_PRE_INTERIM = ("procedural",)
+_PERSONAL_TIERS_POST_INTERIM = ("episodic", "semantic")
+# COMMAND injects only preferences into HA payloads — never identity facts.
+# Episodic / semantic tiers carry the speaker's personal context which must
+# not leak to HA conversation agents or third-party tools.
+_COMMAND_TIERS = ("procedural",)
+
 _INTERIM_DATE_RE = re.compile(r"^episodic_interim_(\d{8}T\d{4})$")
 
 
 def _interim_sort_key(adapter_name: str) -> str | None:
-    """Extract the YYYYMMDDTHHMM stamp from an episodic_interim_YYYYMMDDTHHMM name.
-
-    Returns the stamp string (used for descending sort in route() so the
-    most-recently-created interim adapter is probed first), or None if
-    *adapter_name* does not match the interim-adapter naming pattern.
-    Non-interim adapters are not affected by this helper.
-    """
+    """Extract the YYYYMMDDTHHMM stamp from an ``episodic_interim_<stamp>``
+    name, or ``None`` for non-interim names.  Used to sort interim tiers
+    newest-first for the PERSONAL probe order."""
     m = _INTERIM_DATE_RE.match(adapter_name)
     return m.group(1) if m else None
 
+
+# ``_is_interrogative`` + ``_INTERROGATIVE_*`` are NOT consumed by routing
+# any more — intent classification is the routing signal.  They remain in
+# this module solely to support the abstention gate in
+# ``paramem/server/inference.py`` (currently imports from here).  Future
+# cleanup: move to ``paramem/server/sentence_type.py`` where the encoder-
+# tier classifier already lives.
 
 _INTERROGATIVE_PREFIXES = frozenset(
     {
@@ -146,46 +152,19 @@ _INTERROGATIVE_PUNCT = frozenset({"?", "？", "؟"})
 def _is_interrogative(text: str, config=None) -> bool:
     """Check if the query is a question (not an imperative command).
 
-    Three-tier detection, in order — each tier produces a definitive
-    answer when it can, otherwise falls through to the next:
+    Three-tier detection: encoder-based classifier (when ``config`` is a
+    :class:`paramem.server.config.SentenceTypeConfig` and the encoder +
+    exemplar bank are loaded), then terminal-punctuation, then English
+    first-word lexicon.  Each tier produces a definitive answer when it
+    can, otherwise falls through.
 
-    1. **Encoder-based classifier** (when ``config`` is a
-       :class:`paramem.server.config.SentenceTypeConfig` and the
-       encoder + exemplar bank are loaded — the production path).
-       Cosine vs multilingual exemplars + margin gate.  Returns the
-       encoder's verdict directly when confidence is sufficient.
-       Below the margin or on any classifier failure: ``None`` is
-       returned by the classifier and we fall through to tier 2.
-    2. **Terminal punctuation** — a query ending in any of the
-       :data:`_INTERROGATIVE_PUNCT` glyphs is treated as a question
-       regardless of leading word.  Language-agnostic and catches
-       written queries like ``"Wo wohne ich?"`` / ``"¿Dónde vivo?"``
-       / ``"我住在哪里？"``.  Used as the deterministic fallback
-       when the encoder isn't available (encoderless boot, tests).
-    3. **English first-word lexicon** — for queries that arrive
-       without terminal punctuation (some STT engines, conversational
-       fragments), match the leading word against
-       :data:`_INTERROGATIVE_PREFIXES`.  Possessive contractions
-       (``"who's"`` → ``"who"``, ``"what's"`` → ``"what"``) are
-       collapsed before lookup.  Only applies when neither tier 1
-       nor tier 2 fired.
-
-    The cost asymmetry inside the abstention check (the only consumer)
-    favours over-classifying as interrogative: a false positive triggers
-    abstention when the user wanted a base-model answer (mildly annoying,
-    privacy-safe), a false negative falls through to base-model
-    confabulation on personal queries.  Both the encoder fallback path
-    and the punctuation tier lean into that bias.
-
-    ``config`` is optional for backward compat with call sites that
-    don't have a :class:`ServerConfig` to hand (tests).  ``None``
-    skips the encoder tier and uses tiers 2 + 3 only.
+    Consumed only by the abstention gate in
+    :mod:`paramem.server.inference`; routing itself does not call this.
     """
     stripped = text.strip()
     if not stripped:
         return False
 
-    # Tier 1: encoder-based classifier (production path).
     if config is not None:
         from paramem.server.sentence_type import (
             SentenceType,
@@ -197,27 +176,26 @@ def _is_interrogative(text: str, config=None) -> bool:
             return True
         if verdict is SentenceType.NON_INTERROGATIVE:
             return False
-        # verdict is None — encoder unavailable / margin not met.
-        # Fall through to deterministic tiers below.
 
-    # Tier 2: terminal punctuation (language-agnostic).
     if stripped[-1] in _INTERROGATIVE_PUNCT:
         return True
-    # Tier 3: English first-word lexicon.
     first_word = stripped.split()[0].lower()
-    # Handle possessives: "who's" → "who", "what's" → "what"
     if first_word.endswith("'s"):
         first_word = first_word[:-2]
     return first_word in _INTERROGATIVE_PREFIXES
 
 
 class QueryRouter:
-    """Routes queries to adapters and keys using the knowledge graph.
+    """Routes queries: identifies speaker scope and selects tiers by intent.
 
-    Rebuilt after each consolidation.  Indexes are built directly from the
-    injected :class:`paramem.training.memory_store.MemoryStore` — canonical
-    in both train and simulate modes.  Optionally includes an HA entity
-    graph for dual-graph routing.
+    State: a single per-speaker ``speaker_id → set[key]`` index built from
+    the injected :class:`paramem.training.memory_store.MemoryStore`.  The
+    index is preload-independent — it populates from the ``speaker_id``
+    field that :meth:`MemoryStore.load_metadata_from_disk` writes onto
+    every active entry slot at boot, regardless of
+    ``inference.preload_cache``.
+
+    Rebuilt after each consolidation cycle via :meth:`reload`.
     """
 
     def __init__(
@@ -229,317 +207,183 @@ class QueryRouter:
     ):
         self.adapter_dir = Path(adapter_dir)
         self._ha_graph = ha_graph
-        # IntentConfig flows through to classify_intent() so the residual
-        # tier (encoder + exemplar bank) gets its margin threshold and
-        # fail-closed default.  None means callers receive Intent.UNKNOWN
-        # when state signals don't fire — fine for tests that don't care.
         self._intent_config = intent_config
-        # The MemoryStore — canonical source of indexed-key entries.
         self._memory_store = memory_store
-
-        # adapter_name -> {entity_lower -> set[key]}
-        self._entity_key_index: dict[str, dict[str, set[str]]] = {}
-        # speaker_id -> set[key] (for speaker-scoped filtering)
+        # speaker_id -> set[key]; flat across tiers.  Built by reload().
         self._speaker_key_index: dict[str, set[str]] = {}
-        # All known entity names (lowercase) for fast matching
-        self._all_entities: set[str] = set()
-        # Ordered list for fuzzy matching
-        self._entity_list: list[str] = []
 
         self.reload()
 
     def reload(self) -> None:
-        """Rebuild indexes from the injected :class:`MemoryStore`.
+        """Rebuild ``_speaker_key_index`` from the injected :class:`MemoryStore`.
 
-        Walks ``self._memory_store.iter_entries()`` (canonical in both train
-        and simulate modes).  Tier ownership comes from the store; no flat
-        key→tier reverse lookup needed.  The tier name is used verbatim
-        as the index key so that ``switch_adapter(model, step.adapter_name)``
-        lands on the trained slot — in particular, interim stamps
-        (``episodic_interim_<stamp>``) are NOT normalised to ``"episodic"``
-        because the probe-order block in :meth:`route` relies on the
-        newest interim taking priority over a promoted main tier.
+        Iterates ``self._memory_store.iter_entries()`` and indexes each
+        active key under its owning ``speaker_id``.  Preload-independent:
+        :meth:`MemoryStore.load_metadata_from_disk` writes ``speaker_id``
+        onto every active entry slot at boot via ``setdefault_entry``
+        (see ``app.py``), so the index populates even when
+        ``inference.preload_cache=False``.
 
-        Call after consolidation so the indexes reflect the current
-        in-memory state.
+        Call after every consolidation cycle so the index reflects the
+        current in-memory state.
         """
-        self._entity_key_index.clear()
         self._speaker_key_index.clear()
-        self._all_entities.clear()
 
         store = self._memory_store
         if store is not None and len(store) > 0:
-            for tier, key, entry in store.iter_entries():
-                self._index_entry(tier, key, entry)
+            for _tier, key, entry in store.iter_entries():
+                speaker_id = entry.get("speaker_id", "")
+                if speaker_id:
+                    self._speaker_key_index.setdefault(speaker_id, set()).add(key)
         else:
-            logger.info("Router reload: memory store empty — indexes will be empty")
+            logger.info("Router reload: memory store empty — speaker index will be empty")
 
-        self._entity_list = sorted(self._all_entities)
         logger.info(
-            "Router loaded: %d entities, %d adapters indexed",
-            len(self._all_entities),
-            len(self._entity_key_index),
+            "Router loaded: %d speakers indexed (%d keys total)",
+            len(self._speaker_key_index),
+            sum(len(v) for v in self._speaker_key_index.values()),
         )
-
-    def _index_entry(self, adapter_name: str, key: str, entry: dict) -> None:
-        """Index entity and speaker data from a single :class:`MemoryStore` entry.
-
-        * ``subject`` and ``object`` are indexed as lowercase entity names
-          under *adapter_name* in :attr:`_entity_key_index`.
-        * ``speaker_id`` is indexed in the flat per-speaker key set
-          :attr:`_speaker_key_index`.
-        * ``has_<attr>`` predicates are additionally indexed under the
-          de-prefixed attribute name (``"email"``, ``"phone"``, …) so
-          natural-language attribute queries match the keyed fact directly.
-        """
-        index = self._entity_key_index.setdefault(adapter_name, {})
-        speaker_id = entry.get("speaker_id", "")
-        if speaker_id:
-            self._speaker_key_index.setdefault(speaker_id, set()).add(key)
-        for field_name in ("subject", "object"):
-            entity_name = entry.get(field_name, "")
-            if entity_name and len(entity_name) > 1:
-                entity_lower = entity_name.lower().strip()
-                index.setdefault(entity_lower, set()).add(key)
-                self._all_entities.add(entity_lower)
-        predicate = entry.get("predicate", "")
-        if predicate.startswith("has_") and len(predicate) > 4:
-            attr_name = predicate[4:]
-            if attr_name:
-                index.setdefault(attr_name, set()).add(key)
-                self._all_entities.add(attr_name)
 
     def route(
         self,
         text: str,
-        speaker: str | None = None,
+        speaker: str | None = None,  # noqa: ARG002 — kept for API parity, see docstring
         speaker_id: str | None = None,
     ) -> RoutingPlan:
-        """Route a query to the appropriate adapter(s) and keys.
+        """Route a query: classify intent, scope keys to the speaker.
 
-        If speaker is provided, it is always injected as an implicit
-        entity so that self-referential queries ("What is my name?")
-        resolve to the speaker's keys.
+        ``speaker_id`` is the privacy boundary — only the speaker's own
+        keys can reach ``plan.steps``.  ``speaker`` (display name) is
+        accepted for API back-compat with existing callers but is
+        intentionally NOT used for routing: the speaker's enrollment
+        must not drive intent classification.  Intent comes from the
+        query content via the encoder residual + HA-match fast path.
 
-        speaker_id scopes key access: only keys tagged with this speaker_id
-        are returned. If speaker_id is None, no personal keys are served.
+        Returns a :class:`RoutingPlan` with:
 
-        Returns a RoutingPlan describing what to activate and probe.
+        * ``intent`` — encoder + HA-match verdict.
+        * ``steps`` — per-tier :class:`RoutingStep` with speaker-scoped
+          keys for the tiers selected by intent.
+        * ``ha_domains`` — HA-graph observability metadata.
         """
-        # Speaker's allowed key set (empty if anonymous)
         allowed_keys = self._speaker_key_index.get(speaker_id, set()) if speaker_id else set()
 
-        # --- PA graph matching ---
-        pa_entities = []
-        if self._entity_key_index and allowed_keys:
-            pa_entities = self._extract_entities(text)
-
-            # Inject speaker as implicit entity
-            if speaker:
-                speaker_lower = speaker.lower().strip()
-                if speaker_lower not in pa_entities and speaker_lower in self._all_entities:
-                    pa_entities.append(speaker_lower)
-
-            # One-hop expansion scoped to speaker's keys
-            if speaker:
-                connected = self._get_connected_entities(speaker.lower().strip(), allowed_keys)
-                for entity in connected:
-                    if entity not in pa_entities:
-                        pa_entities.append(entity)
-
-            pa_entities.sort()
-
-        has_pa = bool(pa_entities) and bool(self._resolve_keys(pa_entities, allowed_keys))
-
-        # --- HA graph matching ---
         ha_match: HAMatchResult | None = None
         if self._ha_graph is not None:
             ha_match = self._ha_graph.match(text)
         has_ha = ha_match is not None and ha_match.has_entity_match
-
-        # --- Build PA adapter steps (only if PA matched) ---
-        steps = []
-        if has_pa:
-            adapter_keys = self._resolve_keys(pa_entities, allowed_keys)
-
-            # Probe order: procedural → interim newest-first → episodic → semantic → others.
-            #
-            # 1. procedural first preserves the load-bearing "preferences shape style"
-            #    rule (feedback_router_procedural_first.md): behavioral preferences must
-            #    surface before any factual context for the PA to feel personalized.
-            # 2. interim adapters next because they hold the freshest factual state —
-            #    a user correction (move, rename, change of mind) lands in the newest
-            #    episodic_interim_<stamp> slot ahead of the next full-cycle merge into
-            #    main. Probing interim before main ensures the latest answer wins
-            #    instead of returning the stale pre-merge baseline.
-            # 3. main episodic: baseline factual snapshot from the last full cycle.
-            # 4. semantic: durable but most lossy/abstract — corroboration fallback.
-            # 5. others: forward-compat for adapter forms not yet enumerated.
-            interim_names_sorted = sorted(
-                (n for n in adapter_keys if _interim_sort_key(n) is not None),
-                key=lambda n: _interim_sort_key(n) or "",
-                reverse=True,
-            )
-
-            placed: set[str] = set()
-            ordered: list[str] = [
-                "procedural",
-                *interim_names_sorted,
-                "episodic",
-                "semantic",
-            ]
-            # No Top-K slice on the authenticated path.
-            #
-            # The reachable path here REQUIRES ``allowed_keys`` to be
-            # non-empty (line 422: ``if self._entity_key_index and
-            # allowed_keys``) — i.e. the speaker is authenticated and
-            # owns at least one key.  ``_resolve_keys`` has already
-            # intersected with ``allowed_keys`` (line 599), so the per-
-            # adapter set is already scoped to the speaker's own facts
-            # and entity-narrowed by the query's matched entities.
-            #
-            # The legacy ``[:MAX_KEYS_PER_QUERY=10]`` slice on
-            # ``list(set(...))`` was non-deterministic (Python hash
-            # randomization) and caused narrow attribute keys
-            # (``has_email`` etc.) to lose a coin-flip on speakers
-            # with > 10 entity-touching facts — the failure mode logged
-            # in ``project_routing_layer``.  Removing the slice is safe
-            # because: (a) the result is already filtered to the
-            # speaker's own scope (privacy), (b) ``_resolve_keys`` is
-            # entity-narrowed (relevance), (c) when ``inference.preload_cache``
-            # is on, downstream cost is O(N) RAM lookups + one
-            # ``model.generate`` for reasoning regardless of N.
-            # ``sorted(...)`` gives deterministic probe order.
-            for adapter_name in ordered:
-                if adapter_name in adapter_keys and adapter_name not in placed:
-                    steps.append(
-                        RoutingStep(
-                            adapter_name=adapter_name,
-                            keys_to_probe=sorted(adapter_keys[adapter_name]),
-                        )
-                    )
-                    placed.add(adapter_name)
-
-            # Forward-compat: any adapter name we haven't placed (unknown future forms).
-            for adapter_name, keys in adapter_keys.items():
-                if adapter_name in placed:
-                    continue
-                steps.append(
-                    RoutingStep(
-                        adapter_name=adapter_name,
-                        keys_to_probe=sorted(keys),
-                    )
-                )
-
-        strategy = "targeted_probe" if steps else "direct"
-
         ha_domains = ha_match.domains if ha_match else []
 
-        # --- Intent classification ---
-        # State-first dispatch: has_pa → PERSONAL, has_ha → COMMAND.  When
-        # neither fires, classify_intent falls through to the encoder
-        # residual (cosine vs exemplars + margin gate) or fail-closed.
-        # The call is local-cheap when state hits and a single matrix-
-        # vector dot product otherwise; failure modes are non-raising.
-        from paramem.server.intent import classify_intent  # lazy: breaks router↔intent cycle
+        # Lazy import: avoids the router↔intent module cycle at load time.
+        from paramem.server.intent import classify_intent
 
         intent = classify_intent(
             text,
-            has_graph_match=has_pa,
             has_ha_match=has_ha,
             config=self._intent_config,
         )
 
-        if has_pa or has_ha:
+        steps = self._steps_for_intent(intent, allowed_keys)
+
+        if steps or has_ha:
             logger.info(
-                "Routed query: intent=%s, pa_entities=%s, ha=%s",
+                "Routed query: intent=%s tiers=%s ha=%s",
                 intent.value,
-                pa_entities if has_pa else [],
-                ha_domains if has_ha else [],
+                [s.adapter_name for s in steps],
+                ha_domains,
             )
 
         return RoutingPlan(
             steps=steps,
-            strategy=strategy,
-            matched_entities=pa_entities,
+            strategy="targeted_probe" if steps else "direct",
             ha_domains=ha_domains,
             intent=intent,
         )
 
-    def _extract_entities(self, text: str) -> list[str]:
-        """Extract entity names from query text.
+    def _steps_for_intent(self, intent: Intent, allowed_keys: set[str]) -> list[RoutingStep]:
+        """Map intent → ordered :class:`RoutingStep` list, speaker-scoped.
 
-        First tries exact substring matching against known entity names.
-        Falls back to fuzzy matching for near-misses.
+        * ``PERSONAL`` — procedural → newest interim first → episodic → semantic.
+        * ``COMMAND``  — procedural only (preferences for HA injection;
+          identity facts must not leak to HA payloads).
+        * ``GENERAL``  — empty (route to SOTA with no personal injection).
+        * ``UNKNOWN``  — resolved via ``IntentConfig.fail_closed_intent``
+          (default ``PERSONAL`` — privacy-preserving fallback).
+
+        Returns an empty list when ``allowed_keys`` is empty (anonymous
+        speaker or enrolled speaker with no keys).
         """
-        text_lower = text.lower()
-        matched = set()
+        if not allowed_keys:
+            return []
 
-        # Exact substring match (fast path)
-        for entity in self._entity_list:
-            if entity in text_lower:
-                matched.add(entity)
+        effective = intent
+        if intent is Intent.UNKNOWN:
+            effective = self._resolve_unknown_intent()
 
-        if matched:
-            return sorted(matched)
+        if effective is Intent.PERSONAL:
+            tiers = self._personal_tier_order()
+        elif effective is Intent.COMMAND:
+            tiers = list(_COMMAND_TIERS)
+        else:
+            return []
 
-        # Fuzzy match on individual words and bigrams (fallback)
-        words = text_lower.split()
-        candidates = words + [f"{words[i]} {words[i + 1]}" for i in range(len(words) - 1)]
+        steps: list[RoutingStep] = []
+        for tier in tiers:
+            tier_keys = self._tier_keys(tier)
+            scoped = sorted(allowed_keys & tier_keys)
+            if scoped:
+                steps.append(RoutingStep(adapter_name=tier, keys_to_probe=scoped))
+        return steps
 
-        for candidate in candidates:
-            for entity in self._entity_list:
-                score = fuzz.ratio(candidate, entity)
-                if score >= FUZZY_THRESHOLD:
-                    matched.add(entity)
+    def _resolve_unknown_intent(self) -> Intent:
+        """Resolve ``Intent.UNKNOWN`` via ``IntentConfig.fail_closed_intent``.
 
-        return sorted(matched)
-
-    def _get_connected_entities(
-        self, entity: str, allowed_keys: set[str] | None = None
-    ) -> list[str]:
-        """Find entities one hop away from the given entity via shared keys.
-
-        If entity "alex" has keys where "sam" is the other endpoint,
-        "sam" is returned. Only traverses keys in allowed_keys if provided.
+        Defaults to ``Intent.PERSONAL`` so unrecognised queries from an
+        enrolled speaker keep their context on-device.
         """
-        connected = set()
-        for index in self._entity_key_index.values():
-            keys = index.get(entity, set())
-            if allowed_keys is not None:
-                keys = keys & allowed_keys
-            for other_entity, other_keys in index.items():
-                if other_entity != entity:
-                    shared = keys & other_keys
-                    if allowed_keys is not None:
-                        shared = shared & allowed_keys
-                    if shared:
-                        connected.add(other_entity)
-        return sorted(connected)
+        config = self._intent_config
+        if config is None:
+            return Intent.PERSONAL
+        try:
+            return Intent(config.fail_closed_intent)
+        except ValueError:
+            return Intent.PERSONAL
 
-    def _resolve_keys(
-        self, entities: list[str], allowed_keys: set[str] | None = None
-    ) -> dict[str, set[str]]:
-        """Map entities to keys, grouped by adapter.
+    def _personal_tier_order(self) -> list[str]:
+        """PERSONAL probe order: procedural → newest interim first → episodic → semantic.
 
-        If allowed_keys is provided, only returns keys in the allowed set.
+        Interim tier names are NOT normalised — ``episodic_interim_<stamp>``
+        is the canonical adapter name during an interim window and must
+        match ``model.peft_config`` at probe time so
+        ``switch_adapter(model, step.adapter_name)`` lands on the trained
+        slot.
+
+        When :class:`MemoryStore` has ``replay_enabled=False``,
+        ``tiers_with_registry()`` returns an empty list and this method
+        silently degrades to the bare ``["procedural", "episodic",
+        "semantic"]`` order — interim slots are unreachable without the
+        registry to enumerate them.  That's the expected behaviour for
+        replay-disabled stores (no lifecycle tracking → no interim
+        rotation), but worth noting because the degradation is silent.
         """
-        result: dict[str, set[str]] = {}
+        store = self._memory_store
+        interim_names: list[str] = []
+        if store is not None:
+            for tier in store.tiers_with_registry():
+                if _interim_sort_key(tier) is not None:
+                    interim_names.append(tier)
+            interim_names.sort(key=lambda n: _interim_sort_key(n) or "", reverse=True)
+        return [
+            *_PERSONAL_TIERS_PRE_INTERIM,
+            *interim_names,
+            *_PERSONAL_TIERS_POST_INTERIM,
+        ]
 
-        for entity in entities:
-            for adapter_name, index in self._entity_key_index.items():
-                keys = index.get(entity, set())
-                if allowed_keys is not None:
-                    keys = keys & allowed_keys
-                if keys:
-                    result.setdefault(adapter_name, set()).update(keys)
-
-        return result
-
-    @property
-    def entity_count(self) -> int:
-        return len(self._all_entities)
-
-    @property
-    def adapter_count(self) -> int:
-        return len(self._entity_key_index)
+    def _tier_keys(self, tier: str) -> set[str]:
+        """Active key set for *tier* — reads
+        :meth:`MemoryStore.active_keys_in_tier`, which walks the registry,
+        not ``_entries``.  Preload-independent; empty when replay is
+        disabled or the tier has no registry."""
+        if self._memory_store is None:
+            return set()
+        return set(self._memory_store.active_keys_in_tier(tier))

@@ -256,12 +256,13 @@ class TestPrivacyRouting:
         return agent
 
     def _make_mock_router(self, known_entities=None):
-        """Create a mock router with configurable entity matching.
+        """Create a mock router that emits a PERSONAL plan when *known_entities*
+        appear in the query (or the speaker name).
 
-        Mirrors production classify_intent: PA hit → PERSONAL, no hit → UNKNOWN
-        (residual would normally be GENERAL with config; UNKNOWN is the
-        no-config default and produces identical dispatch behaviour to
-        GENERAL).
+        Production routing no longer derives PERSONAL from entity matches —
+        intent is encoder-driven.  This mock continues to use entity matching
+        as a convenient way to simulate "encoder says PERSONAL" for the
+        privacy-invariant tests below, without standing up the encoder.
         """
         from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
@@ -281,8 +282,7 @@ class TestPrivacyRouting:
                             keys_to_probe=["graph1"],
                         )
                     ],
-                    strategy="entity",
-                    matched_entities=matched,
+                    strategy="targeted_probe",
                     intent=Intent.PERSONAL,
                 )
             return RoutingPlan(strategy="direct", intent=Intent.UNKNOWN)
@@ -293,7 +293,7 @@ class TestPrivacyRouting:
     def _make_ha_only_router(self):
         """Create a mock router returning an HA-only match (no PA steps).
 
-        HA hit without PA → COMMAND under classify_intent's state-first dispatch.
+        Production classify_intent: ``has_ha_match=True`` → :attr:`Intent.COMMAND`.
         """
         from paramem.server.router import Intent, RoutingPlan
 
@@ -302,8 +302,7 @@ class TestPrivacyRouting:
         def route(text, speaker=None, speaker_id=None):
             return RoutingPlan(
                 steps=[],
-                strategy="entity",
-                matched_entities=["lights"],
+                strategy="direct",
                 ha_domains=["light"],
                 intent=Intent.COMMAND,
             )
@@ -312,11 +311,12 @@ class TestPrivacyRouting:
         return router
 
     def _make_both_match_router(self):
-        """Create a router returning a 'both' match (PA steps + HA entity).
+        """Create a router returning a PERSONAL plan with HA domains attached.
 
-        PA hit + HA hit → PERSONAL (PA wins under classify_intent), so the
-        privacy invariant applies: SOTA must never be reached for queries
-        from this router.
+        Production rule under the new state-signal model: PA enrollment does
+        NOT short-circuit intent; the encoder decides.  When the encoder says
+        PERSONAL even though HA also matched, the privacy invariant applies:
+        SOTA must never be reached for this query.
         """
         from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
@@ -325,8 +325,7 @@ class TestPrivacyRouting:
         def route(text, speaker=None, speaker_id=None):
             return RoutingPlan(
                 steps=[RoutingStep(adapter_name="episodic", keys_to_probe=["graph1"])],
-                strategy="entity",
-                matched_entities=["lights", "alex"],
+                strategy="targeted_probe",
                 ha_domains=["light"],
                 intent=Intent.PERSONAL,
             )

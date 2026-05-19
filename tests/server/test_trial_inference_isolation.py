@@ -55,12 +55,8 @@ class TestRouterReadsFromLoopCache:
 
         router = QueryRouter(adapter_dir=adapter_dir, memory_store=store)
 
-        # "alice" (lowercased) should be indexed from the store.
-        all_indexed = set()
-        for adapter_idx in router._entity_key_index.values():
-            all_indexed.update(adapter_idx.keys())
-
-        assert "alice" in all_indexed, "Router did not index entity 'alice' from the store"
+        # The speaker → key mapping must reflect the seeded entry.
+        assert router._speaker_key_index.get("spk1") == {"graph1"}
 
     def test_trial_key_not_indexed_when_loop_is_none(self, tmp_path):
         """Router with an empty store returns empty indexes.
@@ -86,24 +82,22 @@ class TestRouterReadsFromLoopCache:
         )
 
         all_keys: set[str] = set()
-        for idx in router._entity_key_index.values():
-            for key_set in idx.values():
-                all_keys.update(key_set)
+        for keys in router._speaker_key_index.values():
+            all_keys.update(keys)
 
         assert "trial-key-001" not in all_keys, (
             "Trial adapter key was indexed by router — inference isolation violated"
         )
 
     def test_router_empty_when_adapter_dir_absent(self, tmp_path):
-        """Router returns no keys when adapter_dir does not exist."""
+        """Router returns no indexed speakers when adapter_dir does not exist."""
         from paramem.training.memory_store import MemoryStore
 
         router = QueryRouter(
             adapter_dir=tmp_path / "nonexistent",
             memory_store=MemoryStore(replay_enabled=False),
         )
-        assert router._entity_key_index == {}
-        assert router._all_entities == set()
+        assert router._speaker_key_index == {}
 
     def test_trial_adapter_dir_separate_from_live(self, tmp_path):
         """trial_adapter_dir is a sibling of state_dir, not inside adapter_dir."""

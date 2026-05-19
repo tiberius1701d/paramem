@@ -16,17 +16,21 @@ import pytest
 from paramem.server import intent as intent_module
 from paramem.server.config import IntentConfig
 from paramem.server.intent import (
+    _ClassifierModelHandle,
     _classify_via_encoder,
     _EncoderHandle,
     _ExemplarBank,
     _fail_closed_intent,
+    _parse_intent_label,
     _read_exemplar_file,
     _resolve_device,
     classify_intent,
+    get_classifier_model,
     get_encoder,
     get_exemplars,
     load_encoder,
     load_exemplars,
+    set_classifier_model,
 )
 from paramem.server.router import Intent
 
@@ -36,9 +40,11 @@ def reset_singleton():
     """Each test starts with fresh singletons."""
     intent_module._encoder_singleton = None
     intent_module._exemplars_singleton = None
+    intent_module._classifier_model_singleton = None
     yield
     intent_module._encoder_singleton = None
     intent_module._exemplars_singleton = None
+    intent_module._classifier_model_singleton = None
 
 
 def _stub_encoder(prefix: str = "query: ") -> _EncoderHandle:
@@ -48,41 +54,29 @@ def _stub_encoder(prefix: str = "query: ") -> _EncoderHandle:
     return _EncoderHandle(model=model, query_prefix=prefix, device="cpu", dtype="float32")
 
 
-class TestStateFirstDispatch:
-    def test_graph_match_routes_personal(self):
-        result = classify_intent(
-            "Where does Alex work?",
-            has_graph_match=True,
-            has_ha_match=False,
-        )
-        assert result == Intent.PERSONAL
-
+class TestHAFastPath:
     def test_ha_match_routes_command(self):
         result = classify_intent(
             "Turn on the kitchen light.",
-            has_graph_match=False,
             has_ha_match=True,
         )
         assert result == Intent.COMMAND
 
-    def test_graph_match_wins_over_ha(self):
-        # When both signals fire, PERSONAL takes precedence — privacy-first.
+    def test_no_ha_match_no_config_returns_unknown(self):
+        # No state hit, no config → caller gets UNKNOWN.  PA graph match
+        # is intentionally NOT a state signal here — speaker enrollment
+        # must not classify queries as PERSONAL.
         result = classify_intent(
-            "Is Alex's bedroom light on?",
-            has_graph_match=True,
-            has_ha_match=True,
+            "Where does Alex work?",
+            has_ha_match=False,
         )
-        assert result == Intent.PERSONAL
+        assert result == Intent.UNKNOWN
 
 
 class TestResidualFallback:
     def test_residual_without_config_returns_unknown(self):
-        # No state hit, no config → callers that haven't wired config yet
-        # get UNKNOWN (treated conservatively as GENERAL by the routing
-        # table).
         result = classify_intent(
             "What is the capital of France?",
-            has_graph_match=False,
             has_ha_match=False,
         )
         assert result == Intent.UNKNOWN
@@ -91,7 +85,6 @@ class TestResidualFallback:
         config = IntentConfig()  # fail_closed_intent defaults to "personal"
         result = classify_intent(
             "What is the capital of France?",
-            has_graph_match=False,
             has_ha_match=False,
             config=config,
         )
@@ -101,7 +94,6 @@ class TestResidualFallback:
         config = IntentConfig(fail_closed_intent="general")
         result = classify_intent(
             "Tell me about quantum computing.",
-            has_graph_match=False,
             has_ha_match=False,
             config=config,
         )
@@ -423,27 +415,26 @@ class TestClassifyIntentIntegration:
 
         result = classify_intent(
             "Turn on the lights",
-            has_graph_match=False,
             has_ha_match=False,
             config=config,
         )
 
         assert result == Intent.COMMAND
 
-    def test_state_signal_short_circuits_encoder(self):
-        # Even with encoder loaded, graph match must win without invoking it.
+    def test_ha_match_short_circuits_encoder(self):
+        # With encoder loaded, an HA-match must short-circuit to COMMAND
+        # without invoking the encoder.
         intent_module._encoder_singleton = _stub_encoder()
         intent_module._exemplars_singleton = _bank_with_three_classes()
         config = IntentConfig()
 
         result = classify_intent(
-            "Where does Alex live?",
-            has_graph_match=True,
-            has_ha_match=False,
+            "Turn on the kitchen light.",
+            has_ha_match=True,
             config=config,
         )
 
-        assert result == Intent.PERSONAL
+        assert result == Intent.COMMAND
         intent_module._encoder_singleton.model.encode.assert_not_called()
 
     def test_missing_bank_falls_back_to_fail_closed(self):
@@ -453,9 +444,265 @@ class TestClassifyIntentIntegration:
 
         result = classify_intent(
             "what is the capital of France?",
-            has_graph_match=False,
             has_ha_match=False,
             config=config,
         )
 
         assert result == Intent.GENERAL
+
+    def test_personal_query_from_enrolled_speaker_not_short_circuited(self):
+        """Speaker enrollment must NOT classify queries as PERSONAL.
+
+        Regression guard: prior code routed every query from an enrolled
+        speaker to PERSONAL via ``has_graph_match``.  Now the speaker
+        identity is the router's privacy boundary only; intent comes
+        from query content via the encoder.
+        """
+        intent_module._encoder_singleton = _stub_encoder()
+        # Encoder strongly aligned with COMMAND (axis 1).
+        intent_module._encoder_singleton.model.encode.return_value = np.array(
+            [[0.0, 0.95, 0.05]], dtype=np.float32
+        )
+        intent_module._exemplars_singleton = _bank_with_three_classes()
+        config = IntentConfig()
+
+        result = classify_intent("Play HR3 Radio.", has_ha_match=False, config=config)
+
+        assert result == Intent.COMMAND
+
+
+def _stub_classifier_model(response_text: str) -> _ClassifierModelHandle:
+    """Build a ClassifierModelHandle backed by mocks that return *response_text*
+    from generate() and tokenizer.decode().  Sized for the apply_chat_template
+    → generate → decode pipeline in _classify_via_llm.
+    """
+    import torch as _torch  # local import: heavy, only when test runs
+
+    tokenizer = MagicMock()
+    # apply_chat_template returns a string when tokenize=False (matches the
+    # production call path).
+    tokenizer.apply_chat_template.return_value = "stub-prompt"
+    # tokenizer(prompt, return_tensors="pt") returns a BatchEncoding-shaped
+    # dict that supports __getitem__ for "input_ids" and dict-style **unpack.
+    # We model the parts _classify_via_llm consumes: input_ids tensor + .to(device).
+    _input_ids = _torch.zeros((1, 4), dtype=_torch.long)
+    _attention_mask = _torch.ones((1, 4), dtype=_torch.long)
+    inputs_dict = {"input_ids": _input_ids, "attention_mask": _attention_mask}
+    encoded = MagicMock()
+    encoded.to.return_value = inputs_dict
+    encoded.__getitem__ = lambda self, k: inputs_dict[k]
+    encoded.keys = lambda: inputs_dict.keys()
+    tokenizer.return_value = encoded
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 0
+    tokenizer.decode.return_value = response_text
+
+    model = MagicMock()
+    model.device = "cpu"
+    model.is_gradient_checkpointing = False
+    # generate() returns the prompt + 4 fresh tokens.  The slice
+    # output_ids[0][inputs["input_ids"].shape[-1]:] inside _classify_via_llm
+    # extracts the generated tail.
+    model.generate.return_value = _torch.zeros((1, 8), dtype=_torch.long)
+
+    return _ClassifierModelHandle(model=model, tokenizer=tokenizer)
+
+
+class TestParseIntentLabel:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("COMMAND", Intent.COMMAND),
+            ("PERSONAL", Intent.PERSONAL),
+            ("GENERAL", Intent.GENERAL),
+            ("UNKNOWN", Intent.UNKNOWN),
+            ("command", Intent.COMMAND),  # case-insensitive
+            ("COMMAND.\n", Intent.COMMAND),  # trailing punctuation
+            ('"COMMAND"', Intent.COMMAND),  # quotes
+            ("Label: COMMAND", Intent.COMMAND),  # prefix narration
+            ("The intent is GENERAL.", Intent.GENERAL),
+        ],
+    )
+    def test_recognised_labels(self, raw: str, expected: Intent):
+        assert _parse_intent_label(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "I'm not sure",
+            "play music",  # lowercase non-label word that contains no label token
+            "neither here nor there",
+        ],
+    )
+    def test_no_match_returns_none(self, raw: str):
+        assert _parse_intent_label(raw) is None
+
+    def test_first_label_wins_on_multiple(self):
+        # "GENERAL COMMAND" — GENERAL appears first, should win.
+        assert _parse_intent_label("GENERAL COMMAND") == Intent.GENERAL
+
+
+class TestClassifierModelSingleton:
+    def test_set_and_get(self):
+        from unittest.mock import MagicMock as _M
+
+        model = _M()
+        tok = _M()
+        set_classifier_model(model, tok)
+        handle = get_classifier_model()
+        assert handle is not None
+        assert handle.model is model
+        assert handle.tokenizer is tok
+
+    def test_set_none_clears(self):
+        from unittest.mock import MagicMock as _M
+
+        set_classifier_model(_M(), _M())
+        assert get_classifier_model() is not None
+        set_classifier_model(None, None)
+        assert get_classifier_model() is None
+
+
+class TestClassifyViaLLM:
+    """``mode=llm`` dispatch end-to-end with a stubbed model/tokenizer.
+
+    These tests do not invoke a real LLM — the tokenizer/model mocks
+    script the response.  The structural pieces under test:
+
+    * dispatch on ``config.mode == "llm"`` when the singleton is set;
+    * fallback to encoder path when singleton is None;
+    * fail-closed when the classifier section is missing from the
+      voice prompt file;
+    * fail-closed when generate() raises or returns garbage.
+    """
+
+    def test_llm_dispatch_when_singleton_set(self, monkeypatch):
+        from paramem.server.config import IntentConfig as _Cfg
+
+        handle = _stub_classifier_model("COMMAND")
+        set_classifier_model(handle.model, handle.tokenizer)
+        config = _Cfg(mode="llm")
+
+        result = classify_intent("Play HR3 Radio.", has_ha_match=False, config=config)
+
+        assert result == Intent.COMMAND
+        handle.model.generate.assert_called_once()
+
+    def test_llm_falls_back_to_encoder_when_no_singleton(self):
+        """``mode=llm`` with no classifier model registered → encoder path.
+
+        The encoder is also absent here so the call lands on
+        fail_closed_intent (PERSONAL by default).  The key contract is
+        that the dispatch did NOT raise and did NOT block — it slid
+        gracefully to the encoder path.
+        """
+        from paramem.server.config import IntentConfig as _Cfg
+
+        config = _Cfg(mode="llm")
+        result = classify_intent("anything", has_ha_match=False, config=config)
+        assert result == Intent.PERSONAL  # fail-closed default
+
+    def test_ha_match_still_short_circuits_in_llm_mode(self):
+        """HA fast-path runs before the LLM dispatch."""
+        from paramem.server.config import IntentConfig as _Cfg
+
+        handle = _stub_classifier_model("PERSONAL")  # would be wrong if invoked
+        set_classifier_model(handle.model, handle.tokenizer)
+        config = _Cfg(mode="llm")
+
+        result = classify_intent("Turn on the light.", has_ha_match=True, config=config)
+        assert result == Intent.COMMAND
+        handle.model.generate.assert_not_called()
+
+    def test_generate_failure_returns_fail_closed(self):
+        from paramem.server.config import IntentConfig as _Cfg
+
+        handle = _stub_classifier_model("COMMAND")
+        handle.model.generate.side_effect = RuntimeError("simulated OOM")
+        set_classifier_model(handle.model, handle.tokenizer)
+        config = _Cfg(mode="llm", fail_closed_intent="general")
+
+        result = classify_intent("anything", has_ha_match=False, config=config)
+        assert result == Intent.GENERAL
+
+    def test_unrecognised_label_returns_fail_closed(self):
+        from paramem.server.config import IntentConfig as _Cfg
+
+        handle = _stub_classifier_model("hmm, I'm not sure")
+        set_classifier_model(handle.model, handle.tokenizer)
+        config = _Cfg(mode="llm", fail_closed_intent="general")
+
+        result = classify_intent("anything", has_ha_match=False, config=config)
+        assert result == Intent.GENERAL
+
+    def test_missing_classifier_section_returns_fail_closed(self, tmp_path, monkeypatch):
+        """When ``voice.prompt_file`` lacks the
+        ``##---INTENT-CLASSIFIER-SECTION---`` marker, the LLM path
+        cannot find a system prompt and fail-closes."""
+        from paramem.server.config import IntentConfig as _Cfg
+        from paramem.server.config import VoiceConfig as _VoiceConfig
+
+        prompt_path = tmp_path / "no_classifier_section.txt"
+        prompt_path.write_text("PA path instructions only.\n[ESCALATE] etc.\n")
+
+        # Patch the voice-config factory used by _classify_via_llm so it
+        # returns a VoiceConfig pointing at the marker-less prompt file.
+        monkeypatch.setattr(
+            intent_module,
+            "_build_voice_config",
+            lambda _config: _VoiceConfig(prompt_file=str(prompt_path)),
+        )
+
+        handle = _stub_classifier_model("COMMAND")
+        set_classifier_model(handle.model, handle.tokenizer)
+        config = _Cfg(mode="llm", fail_closed_intent="general")
+
+        result = classify_intent("anything", has_ha_match=False, config=config)
+        assert result == Intent.GENERAL
+        # generate() should not have been invoked — we bailed before then.
+        handle.model.generate.assert_not_called()
+
+
+class TestVoiceConfigClassifierSection:
+    """Sentinel-marker semantics in VoiceConfig."""
+
+    def test_load_prompt_strips_classifier_section(self, tmp_path):
+        from paramem.server.config import VoiceConfig
+
+        path = tmp_path / "prompt.txt"
+        path.write_text(
+            "Personal-reasoning instructions.\n"
+            "##---INTENT-CLASSIFIER-SECTION---\n"
+            "Classifier instructions.\n"
+        )
+        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
+        assert vc.load_prompt() == "Personal-reasoning instructions."
+
+    def test_load_classifier_returns_section(self, tmp_path):
+        from paramem.server.config import VoiceConfig
+
+        path = tmp_path / "prompt.txt"
+        path.write_text(
+            "Personal-reasoning instructions.\n"
+            "##---INTENT-CLASSIFIER-SECTION---\n"
+            "Classifier instructions.\n"
+        )
+        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
+        assert vc.load_intent_classifier_prompt() == "Classifier instructions."
+
+    def test_load_classifier_returns_none_without_marker(self, tmp_path):
+        from paramem.server.config import VoiceConfig
+
+        path = tmp_path / "prompt.txt"
+        path.write_text("Just personal-reasoning instructions.\n")
+        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
+        assert vc.load_intent_classifier_prompt() is None
+
+    def test_load_prompt_full_file_when_no_marker(self, tmp_path):
+        from paramem.server.config import VoiceConfig
+
+        path = tmp_path / "prompt.txt"
+        path.write_text("Just personal-reasoning instructions.\n")
+        vc = VoiceConfig(prompt_file=str(path), system_prompt="")
+        assert vc.load_prompt() == "Just personal-reasoning instructions."

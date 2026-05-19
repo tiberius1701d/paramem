@@ -262,6 +262,54 @@ Language detection flows from two sources, both feeding the same resolver in `/c
 
 `_language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path; the text path has no speaker-preference fallback (text `/chat` cannot identify a speaker without a voice embedding), so the detector's confidence threshold is conservative.
 
+### AD-19: Intent Classification — LLM-Default with Encoder Fallback
+
+Routing in `/chat` dispatches on a single `Intent` value
+(`PERSONAL` / `COMMAND` / `GENERAL` / `UNKNOWN`) produced by a
+two-tier classifier:
+
+1. **HA fast path (deterministic).** When the HA entity graph matches
+   an entity or area in the query text, the classifier short-circuits
+   to `COMMAND`. Reliable because the HA namespace is closed.
+2. **Content-driven residual.** When the HA fast path misses, the
+   residual classifier runs, selected by `intent.mode`:
+   - `"llm"` (production default) — a single-token generation from
+     the loaded local Mistral 7B using the intent-classifier section
+     of `configs/prompts/pa_voice.txt`. The prompt is name-free: it
+     bypasses `_personalize_prompt` so the speaker identity is not
+     injected into the classifier system message. ~2-4 forward passes
+     per query (one prefill + 1-3 decode); measured end-to-end
+     differential vs. embeddings on this hardware is ~300 ms.
+   - `"embeddings"` — `intfloat/multilingual-e5-small` cosine vs.
+     per-class exemplar bank under `configs/intents/<class>.<lang>.txt`,
+     gated by a top-1/top-2 margin. ~1 ms per query but brittle on
+     phrasings the bank doesn't anticipate.
+
+**Why LLM is the default.** Routing is an open-vocabulary problem.
+A static exemplar bank covers only what the operator anticipated;
+each new user phrasing is a potential miss. Two field-observed gaps
+in one session (named-station play queries, `Stop X` imperatives,
+compound noisy STT transcripts) — each required an exemplar-bank
+patch under `embeddings`, then surfaced the next gap. The LLM is
+already loaded for the PA path; its per-query cost is below typical
+voice-assistant latency budgets; it handles paraphrase, synonyms,
+multilingual phrasings, and compound transcripts without
+maintenance.
+
+**Cloud-only and degraded fallback.** When the local model is not
+registered (cloud-only mode, model load failure), the dispatch
+auto-falls back to the encoder path so routing keeps working with
+the encoder + exemplar bank. Below-margin or fully unavailable cases
+return `IntentConfig.fail_closed_intent` (default `personal`) so
+uncertain queries stay on-device.
+
+**State signal asymmetry.** PA graph match is intentionally NOT a
+state signal here. Speaker enrollment must not classify the
+speaker's own queries as `PERSONAL` (the old "speaker-in-graph →
+PERSONAL" short-circuit caused imperatives from enrolled speakers
+to misroute into the PA path). The router scopes keys by speaker
+but lets the classifier decide intent.
+
 ## Known Constraints and Risks
 
 | Risk | Impact | Mitigation |
