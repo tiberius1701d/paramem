@@ -18,3 +18,23 @@ Mute the speaker
 Set a timer for 10 minutes
 Cancel the timer
 Add milk to the shopping list
+Just play music
+Play music
+Play radio
+Play HR3 Radio
+Play the news
+Play a podcast
+Play some jazz
+Resume the music
+Skip this track
+Switch to BBC News
+Stop the music
+Stop the radio
+Stop HR3 Radio
+Stop the news
+Stop the podcast
+Halt the music
+Stop
+Close the garage door
+Stop the dishwasher
+Remove milk from the shopping list
