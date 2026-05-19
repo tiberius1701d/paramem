@@ -548,7 +548,7 @@ class TestAnonymousSpeakerNotSkipped:
     which reads config and session_buffer from _state.
     """
 
-    def _make_mock_loop(self):
+    def _make_mock_loop(self, tmp_path):
         """Minimal mock ConsolidationLoop with the attributes _run_extraction_phase touches."""
 
         loop = MagicMock()
@@ -566,6 +566,13 @@ class TestAnonymousSpeakerNotSkipped:
         loop.extract_session = MagicMock(return_value=([], []))
         loop.train_adapters = MagicMock(return_value={})
         loop.cycle_count = 0
+        # Mirror ConsolidationLoop.snapshot_dir_for's real layout
+        # (paths.debug/episodic/cycle_<N>/run_<run_id>/) so the retention path
+        # exercised under debug=True + retain_sessions=True lands inside tmp_path
+        # instead of writing files named after the MagicMock's repr into CWD.
+        loop.snapshot_dir_for = MagicMock(
+            return_value=tmp_path / "ha" / "debug" / "episodic" / "cycle_0" / "run_test",
+        )
         return loop
 
     def _make_config(self, tmp_path):
@@ -620,7 +627,7 @@ class TestAnonymousSpeakerNotSkipped:
 
     def test_anonymous_speaker_id_not_skipped(self, tmp_path):
         """Sessions with speaker_id='Speaker3' reach extract_session."""
-        loop = self._make_mock_loop()
+        loop = self._make_mock_loop(tmp_path)
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, speaker_id="Speaker3")
 
@@ -633,7 +640,7 @@ class TestAnonymousSpeakerNotSkipped:
 
     def test_named_speaker_not_skipped(self, tmp_path):
         """Named (enrolled) speaker IDs continue to reach extract_session."""
-        loop = self._make_mock_loop()
+        loop = self._make_mock_loop(tmp_path)
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, speaker_id="abc12345")
 
@@ -649,7 +656,7 @@ class TestAnonymousSpeakerNotSkipped:
         None speaker_id would key procedural_sp_index on (None, subject, predicate),
         causing unrelated text-only sessions to cross-retire each other's procedural keys.
         """
-        loop = self._make_mock_loop()
+        loop = self._make_mock_loop(tmp_path)
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, speaker_id=None)
 
