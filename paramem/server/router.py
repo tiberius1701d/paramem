@@ -253,7 +253,12 @@ class QueryRouter:
 
         Walks ``self._memory_store.iter_entries()`` (canonical in both train
         and simulate modes).  Tier ownership comes from the store; no flat
-        key→tier reverse lookup needed.
+        key→tier reverse lookup needed.  The tier name is used verbatim
+        as the index key so that ``switch_adapter(model, step.adapter_name)``
+        lands on the trained slot — in particular, interim stamps
+        (``episodic_interim_<stamp>``) are NOT normalised to ``"episodic"``
+        because the probe-order block in :meth:`route` relies on the
+        newest interim taking priority over a promoted main tier.
 
         Call after consolidation so the indexes reflect the current
         in-memory state.
@@ -264,31 +269,8 @@ class QueryRouter:
 
         store = self._memory_store
         if store is not None and len(store) > 0:
-            # Walk the store tier-by-tier.  Tier ownership is the store's
-            # canonical answer — no flat key→tier reverse lookup needed.
-            # ``adapter_id`` is the tier name verbatim, matching what
-            # ``model.peft_config`` uses, so probe-time
-            # ``switch_adapter(model, step.adapter_name)`` lands on the
-            # trained slot.  Do NOT normalize/strip interim stamps:
-            # ``episodic_interim_<stamp>`` is the canonical adapter name
-            # during an interim window, and the probe-order block in
-            # ``route()`` (``*interim_names_sorted, "episodic", ...``)
-            # expects unstripped names so the newest interim takes
-            # priority over a promoted main "episodic" tier.
-            tier_pairs: dict[str, list[dict]] = {}
-            for tier_name, key, entry in store.iter_entries():
-                tier_pairs.setdefault(tier_name, []).append(
-                    {
-                        "key": key,
-                        "subject": entry.get("subject", ""),
-                        "predicate": entry.get("predicate", ""),
-                        "object": entry.get("object", ""),
-                        "speaker_id": entry.get("speaker_id", ""),
-                        "first_seen_cycle": entry.get("first_seen_cycle", 0),
-                    }
-                )
-            for tier_name, pairs in tier_pairs.items():
-                self._index_pairs(tier_name, pairs)
+            for tier, key, entry in store.iter_entries():
+                self._index_entry(tier, key, entry)
         else:
             logger.info("Router reload: memory store empty — indexes will be empty")
 
@@ -299,55 +281,33 @@ class QueryRouter:
             len(self._entity_key_index),
         )
 
-    def _index_pairs(self, adapter_name: str, pairs: list[dict]) -> None:
-        """Index entity and speaker data from a list of entry dicts.
+    def _index_entry(self, adapter_name: str, key: str, entry: dict) -> None:
+        """Index entity and speaker data from a single :class:`MemoryStore` entry.
 
-        Called by :meth:`reload` with pairs projected from
-        ``ConsolidationLoop.store`` (the per-tier memory store; canonical
-        source for both train and simulate modes).  All sources use the
-        same entry shape so the indexing logic is identical:
-
-        * ``subject`` and ``object`` are indexed as entity names (lowercase).
-        * ``speaker_id`` is indexed in the per-speaker key set.
-        * Predicates of the form ``has_<attr>`` are additionally indexed under
-          the de-prefixed attribute name (``"email"``, ``"phone"``, etc.) so
+        * ``subject`` and ``object`` are indexed as lowercase entity names
+          under *adapter_name* in :attr:`_entity_key_index`.
+        * ``speaker_id`` is indexed in the flat per-speaker key set
+          :attr:`_speaker_key_index`.
+        * ``has_<attr>`` predicates are additionally indexed under the
+          de-prefixed attribute name (``"email"``, ``"phone"``, …) so
           natural-language attribute queries match the keyed fact directly.
-
-        Args:
-            adapter_name: Tier name used as the key in
-                ``self._entity_key_index``.
-            pairs: List of entry dicts (``key``, ``subject``,
-                ``predicate``, ``object``, ``speaker_id``,
-                ``first_seen_cycle``).
         """
         index = self._entity_key_index.setdefault(adapter_name, {})
-        for kp in pairs:
-            key = kp.get("key", "")
-            speaker_id = kp.get("speaker_id")
-            if speaker_id:
-                self._speaker_key_index.setdefault(speaker_id, set()).add(key)
-            for field_name in ("subject", "object"):
-                entity = kp.get(field_name, "")
-                if entity and len(entity) > 1:
-                    entity_lower = entity.lower().strip()
-                    index.setdefault(entity_lower, set()).add(key)
-                    self._all_entities.add(entity_lower)
-            # Attribute-predicate indexing: index has_<attr> predicates under
-            # the bare attribute name so "what is my email" matches "email"
-            # directly and resolves to the has_email key.
-            predicate = kp.get("predicate", "")
-            if predicate.startswith("has_") and len(predicate) > 4:
-                attr_name = predicate[4:]  # strip "has_" prefix
-                if attr_name:
-                    index.setdefault(attr_name, set()).add(key)
-                    self._all_entities.add(attr_name)
-
-        logger.info(
-            "Indexed %s: %d keys, %d entities",
-            adapter_name,
-            len(pairs),
-            len(index),
-        )
+        speaker_id = entry.get("speaker_id", "")
+        if speaker_id:
+            self._speaker_key_index.setdefault(speaker_id, set()).add(key)
+        for field_name in ("subject", "object"):
+            entity_name = entry.get(field_name, "")
+            if entity_name and len(entity_name) > 1:
+                entity_lower = entity_name.lower().strip()
+                index.setdefault(entity_lower, set()).add(key)
+                self._all_entities.add(entity_lower)
+        predicate = entry.get("predicate", "")
+        if predicate.startswith("has_") and len(predicate) > 4:
+            attr_name = predicate[4:]
+            if attr_name:
+                index.setdefault(attr_name, set()).add(key)
+                self._all_entities.add(attr_name)
 
     def route(
         self,
