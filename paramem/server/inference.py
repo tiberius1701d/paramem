@@ -1,19 +1,26 @@
-"""Chat inference — tri-path routing with dual-graph matching.
+"""Chat inference — intent-driven routing dispatch.
 
-Routing is based on dual-graph matching (PA knowledge graph + HA entity graph):
-1. PA match → local adapter probe + base model reasoning
-2. HA match → HA conversation agent (tools, device control)
-3. Neither → HA first (tools, real-time data), SOTA fallback (reasoning)
-4. [ESCALATE] from local model → HA first (tools), SOTA fallback (reasoning)
+Dispatch is on ``RoutingPlan.intent`` populated by the router:
 
-Imperative detection (HA entity + action verb + non-interrogative) routes
-directly to HA, skipping local inference.
+1. ``PERSONAL`` → local adapter probe + base-model reasoning
+   (``_probe_and_reason``); if the local model emits ``[ESCALATE]``,
+   the forwarded query flows through HA → SOTA per
+   :func:`_handle_escalation`.
+2. ``COMMAND`` → HA conversation agent first (verbatim sanitized
+   query), SOTA fallback only when HA is unreachable.
+3. ``GENERAL`` / ``UNKNOWN`` → HA first, SOTA fallback.  ``UNKNOWN``
+   is resolved per :class:`IntentConfig.fail_closed_intent` at the
+   tier-selection step (router-side).
 
-Temporal queries filter keys by date range first, then follow the same
-probe → reason flow.
+Speaker scoping (``RoutingPlan.steps``) is the privacy boundary — only
+the resolved speaker's keys can populate ``keys_to_probe``.  The
+sanitizer (``sanitize_for_cloud``) runs before every escalation
+candidate; on ``mode=block`` a personal-content finding suppresses both
+HA and SOTA.
 
-Fallback chain at every escalation point: HA → SOTA → local base model.
-_escalate_to_ha_agent is HA-only; callers own the SOTA fallback.
+Fallback chain at every escalation point: HA → SOTA → local base model
+(``_base_model_answer``).  ``_escalate_to_ha_agent`` is HA-only;
+callers own the SOTA fallback.
 """
 
 import json
@@ -457,9 +464,12 @@ def handle_chat(
         )
     finally:
         if getattr(config, "debug", False):
-            # is_residual: neither graph signal fired (no PA steps, no HA
-            # domains).  Tracks whether the routing-quality metric should
-            # count this query toward the residual classifier's evaluation.
+            # is_residual: the routing plan landed with no probe steps and
+            # no HA domains — i.e. no deterministic signal fired and the
+            # classifier residual (encoder cosine or LLM generate) drove the
+            # intent verdict.  Tracks whether the routing-quality metric
+            # should count this query toward the residual classifier's
+            # evaluation.
             routing_diags["is_residual"] = bool(
                 plan is not None and not plan.steps and not plan.ha_domains
             )

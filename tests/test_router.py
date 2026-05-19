@@ -1,13 +1,15 @@
-"""Unit tests for QueryRouter — dual-graph routing and entity indexing."""
+"""Unit tests for QueryRouter — speaker-only routing + intent-driven tier selection."""
 
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from paramem.server.router import (
+    Intent,
     QueryRouter,
+    RoutingPlan,
+    RoutingStep,
     _interim_sort_key,
     _is_interrogative,
 )
@@ -30,12 +32,7 @@ def _make_entry(
     first_seen_cycle: int = 1,
     adapter_id: str = "episodic",
 ) -> dict:
-    """Return a canonical :class:`MemoryStore` entry dict for use in router tests.
-
-    Uses the canonical field names (``subject``, ``predicate``, ``object``).
-    ``adapter_id`` controls which tier the router assigns this key to when
-    seeding the store.
-    """
+    """Return a canonical :class:`MemoryStore` entry dict for use in router tests."""
     return {
         "key": key,
         "question": question,
@@ -45,7 +42,7 @@ def _make_entry(
         "object": obj,
         "speaker_id": speaker_id,
         "first_seen_cycle": first_seen_cycle,
-        "_adapter_id": adapter_id,  # internal: used by _make_router_from_entries
+        "_adapter_id": adapter_id,  # internal: consumed by _make_router_from_entries
     }
 
 
@@ -54,27 +51,14 @@ def _make_router_from_entries(
     *,
     adapter_dir: "Path | None" = None,
     ha_graph: "MagicMock | None" = None,
+    intent_config=None,
 ) -> "QueryRouter":
     """Create a QueryRouter backed by a seeded :class:`MemoryStore`.
 
-    Builds a per-tier :class:`MemoryStore` from *entries* so ``reload()``
-    populates entity/speaker indexes without touching the file system.
-    The ``_adapter_id`` field in each entry controls which tier the key is
-    registered under.
-
-    Parameters
-    ----------
-    entries:
-        List of dicts as returned by :func:`_make_entry`.
-    adapter_dir:
-        Optional path for the router's ``adapter_dir``.  Ignored for entity
-        indexing (which now comes from the store) but kept so callers
-        that also write graph files can specify where to look.
-    ha_graph:
-        Optional mock HA entity graph.
+    Each entry is written via ``MemoryStore.put`` which also registers the
+    key in the per-tier ``KeyRegistry`` (the source the router's
+    ``_tier_keys`` reads).  ``_adapter_id`` controls the tier.
     """
-    from paramem.training.memory_store import MemoryStore
-
     store = MemoryStore(replay_enabled=True)
     for entry in entries:
         key = entry["key"]
@@ -88,6 +72,8 @@ def _make_router_from_entries(
     }
     if ha_graph is not None:
         kwargs["ha_graph"] = ha_graph
+    if intent_config is not None:
+        kwargs["intent_config"] = intent_config
     return QueryRouter(**kwargs)
 
 
@@ -98,7 +84,9 @@ def _make_ha_match(
     verbs: list[str] | None = None,
     domains: list[str] | None = None,
 ) -> MagicMock:
-    """Return a mock HAMatchResult."""
+    """Return a mock HAMatchResult.  ``has_entity_match`` mirrors
+    ``ha_graph.HAMatchResult.has_entity_match`` — entities OR areas;
+    verb-only matches do NOT satisfy ``has_entity_match``."""
     m = MagicMock()
     m.matched_entities = entities or []
     m.matched_areas = areas or []
@@ -110,10 +98,22 @@ def _make_ha_match(
 
 
 def _make_ha_graph(match_result: MagicMock | None) -> MagicMock:
-    """Return a mock HAEntityGraph whose .match() returns match_result."""
+    """Return a mock HAEntityGraph whose ``.match()`` returns *match_result*."""
     g = MagicMock()
     g.match.return_value = match_result
     return g
+
+
+def _stub_intent(monkeypatch, verdict: Intent) -> MagicMock:
+    """Stub ``paramem.server.intent.classify_intent`` to always return *verdict*.
+
+    The router imports ``classify_intent`` lazily inside ``route()``, so
+    patching the attribute on the intent module is sufficient.  Returns
+    the mock so tests can assert on call args.
+    """
+    stub = MagicMock(return_value=verdict)
+    monkeypatch.setattr("paramem.server.intent.classify_intent", stub)
+    return stub
 
 
 # ---------------------------------------------------------------------------
@@ -190,37 +190,19 @@ class TestIsInterrogative:
         ],
     )
     def test_terminal_question_mark_is_interrogative(self, text: str):
-        """Layer 1 — punctuation-based detection works language-agnostically.
-
-        Locks the contract that any text ending in ``?`` / ``？`` / ``؟``
-        classifies as interrogative, regardless of leading word.  Without
-        this layer the German abstention path silently misfires (a
-        privacy-relevant gap on personal queries).
-        """
         assert _is_interrogative(text) is True
 
     def test_greek_semicolon_is_not_interrogative(self):
         """Greek uses ``;`` (U+003B) as a question mark, but the glyph is
         identical to the ASCII semicolon.  Treating it as interrogative
-        would mis-classify any declarative sentence ending in ``;`` —
-        not worth the trade-off for the rare Greek-language case.
-        """
+        would mis-classify any declarative sentence ending in ``;``."""
         assert _is_interrogative("Turn off the light;") is False
 
     def test_declarative_with_trailing_period_is_not_interrogative(self):
-        """Layer 1 fires only on question marks; periods / exclamation
-        marks fall through to the leading-word check (and miss it for
-        non-English imperatives)."""
         assert _is_interrogative("Mache das Licht aus.") is False
         assert _is_interrogative("Schalte die Lampe an!") is False
 
     def test_encoder_tier_overrides_punctuation_when_decisive(self):
-        """Tier 1 (encoder classifier) takes precedence over the
-        deterministic tiers when ``config`` is provided AND the encoder
-        produced a confident verdict.  Verifies the production path:
-        ``classify_sentence_type`` returning ``INTERROGATIVE`` short-
-        circuits and returns True regardless of leading word.
-        """
         from paramem.server.config import SentenceTypeConfig
         from paramem.server.sentence_type import SentenceType
 
@@ -229,14 +211,10 @@ class TestIsInterrogative:
             "paramem.server.sentence_type.classify_sentence_type",
             return_value=SentenceType.INTERROGATIVE,
         ) as mock_classify:
-            # No leading wh-word, no terminal ?, but encoder says interrogative.
             assert _is_interrogative("the door locked", config=cfg) is True
         mock_classify.assert_called_once()
 
     def test_encoder_tier_returns_false_when_classifier_says_non(self):
-        """Encoder verdict NON_INTERROGATIVE wins over the punctuation/
-        lexicon tiers — even if the deterministic heuristic would
-        flag the query."""
         from paramem.server.config import SentenceTypeConfig
         from paramem.server.sentence_type import SentenceType
 
@@ -245,16 +223,9 @@ class TestIsInterrogative:
             "paramem.server.sentence_type.classify_sentence_type",
             return_value=SentenceType.NON_INTERROGATIVE,
         ):
-            # Has terminal ? — would normally classify as interrogative.
             assert _is_interrogative("Berlin is in Germany?", config=cfg) is False
 
     def test_encoder_tier_falls_through_when_classifier_returns_none(self):
-        """Encoder unavailable / margin not met → ``classify_sentence_type``
-        returns ``None``; the deterministic tiers (punctuation +
-        lexicon) take over.  Locks the fallback contract that the
-        encoder's "I don't know" doesn't accidentally suppress
-        question detection.
-        """
         from paramem.server.config import SentenceTypeConfig
 
         cfg = SentenceTypeConfig()
@@ -262,357 +233,17 @@ class TestIsInterrogative:
             "paramem.server.sentence_type.classify_sentence_type",
             return_value=None,
         ):
-            # No encoder verdict → punctuation tier catches the German question.
             assert _is_interrogative("Wo wohne ich?", config=cfg) is True
-            # No encoder verdict, no terminal ?, English wh-word → lexicon catches it.
             assert _is_interrogative("What is my name", config=cfg) is True
-            # No encoder verdict, no terminal ?, non-English imperative → False.
             assert _is_interrogative("Mache das Licht an", config=cfg) is False
 
 
 # ---------------------------------------------------------------------------
-# QueryRouter — loading / reload
-# ---------------------------------------------------------------------------
-
-
-class TestQueryRouterLoad:
-    def test_empty_cache_loads_cleanly(self):
-        router = _make_router_from_entries([])
-        assert router.entity_count == 0
-        assert router.adapter_count == 0
-
-    def test_nonexistent_directory_loads_cleanly(self):
-        router = QueryRouter(
-            adapter_dir=Path("/nonexistent/path/xyz"),
-            memory_store=MemoryStore(replay_enabled=False),
-        )
-        assert router.entity_count == 0
-
-    def test_episodic_adapter_id_appears_in_entity_key_index(self):
-        """Key registered under episodic appears in that tier's entity index."""
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic")]
-        )
-        assert "episodic" in router._entity_key_index
-
-    def test_semantic_adapter_id_appears_in_entity_key_index(self):
-        """Key registered under semantic appears under the semantic tier."""
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice", adapter_id="semantic")]
-        )
-        assert "semantic" in router._entity_key_index
-
-    def test_subject_and_object_both_indexed(self):
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")]
-        )
-        assert "alice" in router._all_entities
-        assert "berlin" in router._all_entities
-
-    def test_speaker_id_indexed(self):
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")]
-        )
-        assert "alice" in router._speaker_key_index
-        assert "graph1" in router._speaker_key_index["alice"]
-
-    def test_pair_without_speaker_id_not_in_speaker_index(self):
-        router = _make_router_from_entries([_make_entry("graph1", "Alice", "Berlin")])
-        assert len(router._speaker_key_index) == 0
-
-    def test_no_loop_provider_gives_empty_indexes(self):
-        """Without a loop_provider, indexes stay empty (files no longer read)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False)
-            )
-            assert router.entity_count == 0
-
-    def test_multiple_adapters_indexed(self):
-        router = _make_router_from_entries(
-            [
-                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_entry("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
-            ]
-        )
-        assert router.adapter_count == 2
-        assert "episodic" in router._entity_key_index
-        assert "semantic" in router._entity_key_index
-
-    def test_reload_replaces_index(self):
-        """reload() observes mutations to the injected store."""
-        store = MemoryStore(replay_enabled=True)
-
-        router = QueryRouter(
-            adapter_dir=Path("/nonexistent"),
-            memory_store=store,
-        )
-        assert router.entity_count == 0
-
-        # Seed the same store, reload — index populates
-        store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Alice",
-                "predicate": "lives_in",
-                "object": "Berlin",
-                "speaker_id": "alice",
-                "first_seen_cycle": 1,
-            },
-        )
-        router.reload()
-        assert router.entity_count > 0
-
-        # Clear the store, reload — index must clear
-        store.delete("graph1")
-        router.reload()
-        assert router.entity_count == 0
-
-    def test_entity_shorter_than_two_chars_skipped(self):
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "A", "Berlin", speaker_id="alice")]
-        )
-        assert "a" not in router._all_entities
-        assert "berlin" in router._all_entities
-
-
-# ---------------------------------------------------------------------------
-# QueryRouter — route(): PA path
-# ---------------------------------------------------------------------------
-
-
-class TestQueryRouterRoutePA:
-    @staticmethod
-    def _make_router() -> QueryRouter:
-        return _make_router_from_entries(
-            [
-                _make_entry("graph1", "Alice", "Berlin", speaker_id="alice"),
-                _make_entry("graph2", "Alice", "Python", speaker_id="alice"),
-            ]
-        )
-
-    def test_no_speaker_id_returns_no_steps(self):
-        from paramem.server.router import Intent
-
-        router = self._make_router()
-        plan = router.route("Where does Alice live?", speaker_id=None)
-        assert plan.steps == []
-        assert plan.intent == Intent.UNKNOWN
-
-    def test_wrong_speaker_id_returns_no_steps(self):
-        router = self._make_router()
-        plan = router.route("Where does Alice live?", speaker_id="bob")
-        assert plan.steps == []
-
-    def test_correct_speaker_id_pa_match(self):
-        from paramem.server.router import Intent
-
-        router = self._make_router()
-        plan = router.route("Where does Alice live?", speaker_id="alice")
-        assert plan.steps  # PA match → steps populated
-        assert plan.intent == Intent.PERSONAL
-
-    def test_pa_match_steps_populated(self):
-        router = self._make_router()
-        plan = router.route("Tell me about Alice", speaker_id="alice")
-        assert plan.steps
-        keys = [k for step in plan.steps for k in step.keys_to_probe]
-        assert "graph1" in keys or "graph2" in keys
-
-    def test_strategy_targeted_probe_when_steps(self):
-        router = self._make_router()
-        plan = router.route("Alice lives in Berlin", speaker_id="alice")
-        assert plan.strategy == "targeted_probe"
-
-    def test_strategy_direct_when_no_steps(self):
-        router = self._make_router()
-        # No entity in query → no steps
-        plan = router.route("What is the capital of France?", speaker_id="alice")
-        # "france" not in entity list → no steps
-        assert plan.strategy == "direct"
-
-    def test_speaker_name_injected_as_implicit_entity(self):
-        from paramem.server.router import Intent
-
-        # Only "alice" in the index
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")]
-        )
-        # Query doesn't mention alice, but speaker="Alice" injects it
-        plan = router.route("Where do I live?", speaker="Alice", speaker_id="alice")
-        # alice is now an implicit entity — should trigger PA match
-        assert plan.intent == Intent.PERSONAL
-        assert plan.steps
-
-    def test_matched_entities_in_plan(self):
-        router = self._make_router()
-        plan = router.route("Alice lives in Berlin", speaker_id="alice")
-        assert "alice" in plan.matched_entities or "berlin" in plan.matched_entities
-
-    def test_fuzzy_entity_match(self):
-        from paramem.server.router import Intent
-
-        router = self._make_router()
-        # "Alic" should fuzzy-match "alice" at ratio ~89
-        plan = router.route("Tell me about Alic", speaker_id="alice")
-        assert plan.intent == Intent.PERSONAL
-        assert plan.steps
-
-    def test_adapter_order_procedural_episodic_semantic(self):
-        """Procedural step comes before episodic and semantic.
-
-        CLAUDE.md inference assembly order: procedural (preferences) → episodic (recent)
-        → semantic (consolidated). Procedural-first is load-bearing for personalization.
-        When procedural is absent the remaining adapters still follow episodic → semantic.
-        """
-        router = _make_router_from_entries(
-            [
-                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_entry("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
-            ]
-        )
-        plan = router.route("Alice", speaker_id="alice")
-        names = [s.adapter_name for s in plan.steps]
-        # episodic before semantic (procedural absent in this fixture)
-        if "episodic" in names and "semantic" in names:
-            assert names.index("episodic") < names.index("semantic")
-
-
-# ---------------------------------------------------------------------------
-# QueryRouter — route(): HA path
-# ---------------------------------------------------------------------------
-
-
-class TestQueryRouterRouteHA:
-    def test_no_ha_graph_no_ha_match(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=None
-            )
-            plan = router.route("Turn on the kitchen light")
-            assert plan.ha_domains == []
-            assert plan.steps == []
-
-    def test_ha_only_match(self):
-        from paramem.server.router import Intent
-
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
-            )
-            plan = router.route("Is the kitchen light on?")
-            assert plan.intent == Intent.COMMAND
-            assert plan.ha_domains == ["light"]
-            assert plan.steps == []
-
-    def test_verb_only_ha_match_no_entity_no_pa_steps(self):
-        """Verb-only ha_match (no entity) does not produce PA steps and does
-        not classify as PERSONAL.  ha_domains may still be populated from the
-        match for observability."""
-        from paramem.server.router import Intent
-
-        with tempfile.TemporaryDirectory() as tmp:
-            match = _make_ha_match(verbs=["turn on"], domains=["light"])
-            ha = _make_ha_graph(match)
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
-            )
-            plan = router.route("Is turn on working?")
-            assert plan.steps == []
-            assert plan.intent != Intent.PERSONAL
-
-    def test_ha_domains_populated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(
-                _make_ha_match(entities=["bedroom thermostat"], domains=["climate"])
-            )
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
-            )
-            plan = router.route("bedroom thermostat temperature")
-            assert "climate" in plan.ha_domains
-
-    def test_ha_domains_empty_when_no_ha_match(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ha = _make_ha_graph(None)
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
-            )
-            plan = router.route("Tell me something random")
-            assert plan.ha_domains == []
-
-    def test_pa_and_ha_overlap_classifies_personal(self):
-        """When PA and HA both match the same query, intent=PERSONAL (PA wins
-        in classify_intent's state-first dispatch).  PA steps and HA domains
-        both populated so downstream consumers can still see both signals.
-        """
-        from paramem.server.router import Intent
-
-        ha = _make_ha_graph(_make_ha_match(entities=["kitchen light"], domains=["light"]))
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "kitchen light", speaker_id="alice")],
-            ha_graph=ha,
-        )
-        plan = router.route("Alice kitchen light", speaker_id="alice")
-        assert plan.intent == Intent.PERSONAL
-        assert plan.steps
-        assert "light" in plan.ha_domains
-
-
-# ---------------------------------------------------------------------------
-# QueryRouter — no Top-K cap on the authenticated path
-# ---------------------------------------------------------------------------
-
-
-class TestQueryRouterNoTopKCap:
-    """Authenticated speakers receive every entity-narrowed key they own
-    in plan.steps — no slice.  The legacy MAX_KEYS_PER_QUERY=10 cap
-    caused narrow attribute keys (``has_email``) to lose a non-
-    deterministic coin-flip when the speaker had >10 keys touching the
-    matched entity, breaking attribute queries.  Closed by removing the
-    slice; inference latency is mitigated by ``inference.preload_cache``
-    (default true) which serves probes from the RAM cache instead of
-    one ``model.generate`` per key.
-    """
-
-    def test_no_cap_for_authenticated_speaker(self):
-        """All 15 keys touching the matched entity reach plan.steps."""
-        entries = [
-            _make_entry(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
-        ]
-        router = _make_router_from_entries(entries)
-        plan = router.route("Alice", speaker_id="alice")
-        assert plan.steps, "Authenticated speaker with entity match must emit steps"
-        total_keys = sum(len(step.keys_to_probe) for step in plan.steps)
-        assert total_keys == 15, (
-            f"Expected all 15 entity-narrowed keys to reach steps, got {total_keys}"
-        )
-
-    def test_keys_to_probe_are_deterministic_sorted(self):
-        """plan.steps[*].keys_to_probe is sorted (no hash-randomization flake)."""
-        entries = [
-            _make_entry(f"graph{i:03d}", "Alice", f"Entity{i}", speaker_id="alice")
-            for i in range(15)
-        ]
-        router = _make_router_from_entries(entries)
-        plan = router.route("Alice", speaker_id="alice")
-        for step in plan.steps:
-            assert step.keys_to_probe == sorted(step.keys_to_probe), (
-                f"keys_to_probe must be sorted: {step.keys_to_probe}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# _interim_sort_key helper
+# _interim_sort_key
 # ---------------------------------------------------------------------------
 
 
 class TestInterimSortKey:
-    """Unit tests for the private _interim_sort_key helper."""
-
     def test_valid_interim_name_returns_stamp(self):
         assert _interim_sort_key("episodic_interim_20260417T0000") == "20260417T0000"
 
@@ -631,624 +262,442 @@ class TestInterimSortKey:
         assert _interim_sort_key("episodic_interim_2026-04-17") is None
 
     def test_extra_suffix_returns_none(self):
-        # Names with trailing text after the stamp are not valid interim names.
         assert _interim_sort_key("episodic_interim_20260417T0000_partial") is None
 
 
 # ---------------------------------------------------------------------------
-# QueryRouter — Step 4: multi-adapter interim routing
+# QueryRouter — reload()
 # ---------------------------------------------------------------------------
 
 
-class TestInterimAdapterRouting:
-    """Tests for multi-adapter interim routing via cache-based indexing.
+class TestRouterLoad:
+    def test_empty_store_loads_cleanly(self):
+        router = _make_router_from_entries([])
+        assert router._speaker_key_index == {}
 
-    Interim adapters keep their real name (``episodic_interim_<stamp>``) in
-    the routing plan so probe-time ``switch_adapter(model, step.adapter_name)``
-    activates the actual trained slot in ``model.peft_config`` — the same
-    name the consolidation pipeline created the adapter under.  Probe order
-    (``route()`` bottom block) places interim names newest-first, ahead of
-    the main ``"episodic"`` slot.  Folding interim into ``"episodic"`` was a
-    regression caught 2026-05-14: it pointed inference at an untrained main
-    slot while the actual trained weights stayed inert under the unstripped
-    interim name (training-time recall 134/134, inference-time recall 0/10).
-    """
+    def test_anonymous_entry_not_indexed(self):
+        """Entries with empty speaker_id contribute no speaker mapping."""
+        router = _make_router_from_entries(
+            [_make_entry("graph1", "Alice", "Berlin", speaker_id="")]
+        )
+        assert router._speaker_key_index == {}
 
-    def test_interim_keys_routed_under_their_real_adapter_name(self):
-        """Interim-registered keys appear in a step named after the interim adapter."""
+    def test_speaker_keys_indexed_flat_across_tiers(self):
+        """One speaker's keys collapse across tiers in _speaker_key_index."""
         router = _make_router_from_entries(
             [
-                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-                _make_entry(
-                    "int1",
-                    "Alice",
-                    "Prague",
-                    speaker_id="alice",
-                    adapter_id="episodic_interim_20260417T0000",
-                ),
-            ]
-        )
-        plan = router.route("Alice", speaker_id="alice")
-        names = [s.adapter_name for s in plan.steps]
-        assert "episodic" in names, "main episodic step missing"
-        assert "episodic_interim_20260417T0000" in names, "interim step missing"
-        # Each key lives in its own tier's step.
-        ep_keys = next(
-            (set(s.keys_to_probe) for s in plan.steps if s.adapter_name == "episodic"), set()
-        )
-        int_keys = next(
-            (
-                set(s.keys_to_probe)
-                for s in plan.steps
-                if s.adapter_name == "episodic_interim_20260417T0000"
-            ),
-            set(),
-        )
-        assert "ep1" in ep_keys and "ep1" not in int_keys
-        assert "int1" in int_keys and "int1" not in ep_keys
-
-    def test_interim_keys_multiple_registered(self):
-        """Multiple interim adapter IDs each get their own step, newest-stamp first."""
-        entries = [
-            _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
-        ]
-        for stamp in ("20260415T0000", "20260416T0000", "20260417T0000"):
-            entries.append(
-                _make_entry(
-                    f"int_{stamp}",
-                    "Alice",
-                    f"City_{stamp}",
-                    speaker_id="alice",
-                    adapter_id=f"episodic_interim_{stamp}",
-                )
-            )
-        router = _make_router_from_entries(entries)
-        plan = router.route("Alice", speaker_id="alice")
-
-        names = [s.adapter_name for s in plan.steps]
-        # Each interim adapter must appear under its real name (no folding).
-        assert "episodic_interim_20260415T0000" in names
-        assert "episodic_interim_20260416T0000" in names
-        assert "episodic_interim_20260417T0000" in names
-        assert "episodic" in names
-        # Probe order: interim newest-first, then main episodic (per route() block).
-        interim_in_order = [n for n in names if n.startswith("episodic_interim_")]
-        assert interim_in_order == [
-            "episodic_interim_20260417T0000",
-            "episodic_interim_20260416T0000",
-            "episodic_interim_20260415T0000",
-        ], f"Interim adapters must be newest-first: {interim_in_order}"
-        # Main episodic comes after all interims.
-        assert names.index("episodic") > max(names.index(n) for n in interim_in_order)
-
-    def test_route_speaker_scoping_applies_to_interim_keys(self):
-        """Interim key tagged with 'alice' is invisible to speaker_id='bob'."""
-        router = _make_router_from_entries(
-            [
-                _make_entry(
-                    "int1",
-                    "Alice",
-                    "Prague",
-                    speaker_id="alice",
-                    adapter_id="episodic_interim_20260417T0000",
-                )
-            ]
-        )
-        # Bob queries — alice's keys must be invisible
-        plan = router.route("Alice", speaker_id="bob")
-        assert plan.steps == [], (
-            "No step should appear when speaker scoping filters all interim keys"
-        )
-
-    def test_reload_with_cleared_cache_removes_interim_keys(self):
-        """After reload() with the store emptied, formerly interim-registered keys vanish."""
-        store = MemoryStore(replay_enabled=True)
-        store.put(
-            "episodic_interim_20260417T0000",
-            "int1",
-            {
-                "key": "int1",
-                "subject": "Alice",
-                "predicate": "lives_in",
-                "object": "Prague",
-                "speaker_id": "alice",
-                "first_seen_cycle": 1,
-            },
-        )
-
-        router = QueryRouter(
-            adapter_dir=Path("/nonexistent"),
-            memory_store=store,
-        )
-        assert router.entity_count > 0
-
-        # Empty the same store in place, reload — all keys gone
-        store.delete("int1")
-        router.reload()
-        plan = router.route("Alice", speaker_id="alice")
-        assert plan.steps == [], "Steps must be empty after store cleared"
-
-    def test_route_interim_only_match_emits_interim_step(self):
-        """Entity matched ONLY in an interim-registered key → step named after the interim adapter.
-
-        The plan step must carry the same name PEFT knows the adapter by
-        (``episodic_interim_<stamp>``) so probe-time ``switch_adapter`` lands
-        on the trained slot.  No main-episodic step is emitted because no
-        keys are registered under the bare ``"episodic"`` name.
-        """
-        from paramem.server.router import Intent
-
-        router = _make_router_from_entries(
-            [
-                _make_entry(
-                    "int1",
-                    "Alice",
-                    "Vienna",
-                    speaker_id="alice",
-                    adapter_id="episodic_interim_20260417T0000",
-                )
-            ]
-        )
-        plan = router.route("Alice", speaker_id="alice")
-
-        assert len(plan.steps) == 1, f"Expected exactly one step, got {plan.steps}"
-        assert plan.steps[0].adapter_name == "episodic_interim_20260417T0000"
-        assert plan.intent == Intent.PERSONAL
-
-    def test_route_three_mains_correct_tier_order(self):
-        """All three main tiers: order must be procedural → episodic → semantic.
-
-        Probe order: procedural (preferences shape style; load-bearing per
-        feedback_router_procedural_first.md) → episodic → semantic.
-        """
-        router = _make_router_from_entries(
-            [
-                _make_entry(
-                    "proc1", "Alice", "DarkMode", speaker_id="alice", adapter_id="procedural"
-                ),
                 _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
                 _make_entry("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
-                _make_entry(
-                    "int1",
-                    "Alice",
-                    "InterimFact",
-                    speaker_id="alice",
-                    adapter_id="episodic_interim_20260418T0000",
-                ),
+                _make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural"),
             ]
         )
-        plan = router.route("Alice", speaker_id="alice")
+        assert router._speaker_key_index == {"alice": {"ep1", "se1", "pr1"}}
 
-        names = [s.adapter_name for s in plan.steps]
-        assert names[0] == "procedural", f"First step must be procedural, got {names}"
-        assert "episodic" in names[1:], f"Episodic must follow procedural, got {names}"
-        if "semantic" in names:
-            ep_idx = names.index("episodic")
-            sem_idx = names.index("semantic")
-            assert ep_idx < sem_idx, f"Episodic must precede semantic, got {names}"
-
-
-class TestRouteIntentField:
-    """G4 wiring: route() populates RoutingPlan.intent via classify_intent.
-
-    These tests pin the contract between router state and the intent
-    classifier without exercising the encoder — they cover the state-first
-    tiers (PA hit → PERSONAL, HA hit → COMMAND) and the no-state degraded
-    path (returns UNKNOWN when no IntentConfig is supplied)."""
-
-    def test_pa_match_yields_personal_intent(self):
-        from paramem.server.router import Intent
-
+    def test_multiple_speakers_get_separate_key_sets(self):
         router = _make_router_from_entries(
-            [_make_entry("alex_loc", "Alex", "Berlin", speaker_id="alex")],
+            [
+                _make_entry("k1", "Alice", "Berlin", speaker_id="alice"),
+                _make_entry("k2", "Bob", "Munich", speaker_id="bob"),
+            ]
         )
-        plan = router.route("Where does Alex live?", speaker_id="alex")
+        assert router._speaker_key_index["alice"] == {"k1"}
+        assert router._speaker_key_index["bob"] == {"k2"}
 
-        assert plan.intent == Intent.PERSONAL
-        assert plan.steps  # PA produced probe steps
-
-    def test_ha_only_match_yields_command_intent(self):
-        from paramem.server.router import Intent
-
-        ha = _make_ha_graph(_make_ha_match(entities=["light.kitchen"], domains=["light"]))
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
-            )
-            plan = router.route("Turn on the kitchen light")
-
-            assert plan.intent == Intent.COMMAND
-            assert plan.ha_domains == ["light"]
-            assert plan.steps == []
-
-    def test_both_pa_and_ha_match_personal_wins(self):
-        # Privacy-first: PA + HA overlap routes to PERSONAL so cloud
-        # escalation stays gated on graph match.
-        from paramem.server.router import Intent
-
-        ha = _make_ha_graph(_make_ha_match(entities=["light.bedroom"], domains=["light"]))
+    def test_reload_clears_stale_state(self):
         router = _make_router_from_entries(
-            [_make_entry("alex_room", "Alex", "bedroom", speaker_id="alex")],
-            ha_graph=ha,
-        )
-        plan = router.route("Is Alex's bedroom light on?", speaker_id="alex")
-
-        assert plan.intent == Intent.PERSONAL
-        assert plan.steps  # PA path also produces steps
-        assert "light" in plan.ha_domains  # HA observability preserved
-
-    def test_no_state_no_config_returns_unknown(self):
-        # No PA, no HA, no IntentConfig — encoder isn't loaded so the
-        # classifier degrades to UNKNOWN rather than raising.
-        from paramem.server.router import Intent
-
-        ha = _make_ha_graph(None)  # HA configured but no match
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(
-                adapter_dir=Path(tmp), memory_store=MemoryStore(replay_enabled=False), ha_graph=ha
-            )
-            plan = router.route("What is the capital of France?")
-
-            # match_source is "ha" because of imperative-fallback heuristic
-            # (interrogative-aware), but intent classifier sees clean state
-            # signals (has_pa=False, has_ha=False) and returns UNKNOWN
-            # without an IntentConfig.
-            assert plan.intent == Intent.UNKNOWN
-
-    def test_no_state_with_config_returns_fail_closed(self):
-        # No PA, no HA, IntentConfig present but encoder/exemplars unloaded
-        # → fail-closed default (PERSONAL).  Encoder isn't loaded in unit
-        # tests so this exercises the degraded path.
-        from paramem.server.config import IntentConfig
-        from paramem.server.router import Intent
-
-        ha = _make_ha_graph(None)
-        cfg = IntentConfig()  # fail_closed_intent="personal"
-        with tempfile.TemporaryDirectory() as tmp:
-            router = QueryRouter(
-                adapter_dir=Path(tmp),
-                memory_store=MemoryStore(replay_enabled=False),
-                ha_graph=ha,
-                intent_config=cfg,
-            )
-            plan = router.route("What is the capital of France?")
-
-            assert plan.intent == Intent.PERSONAL
-
-
-# ---------------------------------------------------------------------------
-# QueryRouter — entry-format cache entries (B1 regression guard)
-# ---------------------------------------------------------------------------
-
-
-class TestQueryRouterEntryFormat:
-    """B1 regression guard: router correctly indexes entry-schema cache entries.
-
-    The canonical source of truth for entity indexing is
-    ``ConsolidationLoop.store._entries_flat_view()``, which stores six-field
-    entries (``key``, ``subject``, ``predicate``, ``object``,
-    ``speaker_id``, ``first_seen_cycle``).  These tests verify that the
-    ``_index_entry`` path reads ``subject``/``object`` (not legacy
-    ``source_subject``/``source_object``) and that the entity and speaker
-    indexes are correctly built.
-    """
-
-    def test_entry_loaded_without_error(self):
-        """Router builds a non-empty index from a six-field entry cache."""
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
-        )
-        assert router.entity_count > 0
-
-    def test_subject_and_object_indexed(self):
-        """Both ``subject`` and ``object`` are indexed as entities from an entry."""
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
-        )
-        assert "alice" in router._all_entities
-        assert "berlin" in router._all_entities
-
-    def test_speaker_id_indexed(self):
-        """``speaker_id`` from a cache entry is indexed in ``_speaker_key_index``."""
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
+            [_make_entry("k1", "Alice", "Berlin", speaker_id="alice")]
         )
         assert "alice" in router._speaker_key_index
-        assert "graph1" in router._speaker_key_index["alice"]
 
-    def test_pa_match_produces_steps(self):
-        """A query mentioning the entity from a cache entry resolves to a routing step."""
-        from paramem.server.router import Intent
-
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
-        )
-        plan = router.route("Where does Alice live?", speaker_id="alice")
-        assert plan.steps, "Expected PA routing steps from cache entry"
-        assert plan.intent == Intent.PERSONAL
-        keys = [k for step in plan.steps for k in step.keys_to_probe]
-        assert "graph1" in keys
-
-    def test_reload_with_updated_cache_repopulates_index(self):
-        """reload() after updating the loop store repopulates the entity index."""
-        # Start with empty store
-        store = MemoryStore(replay_enabled=True)
-        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
-        assert router.entity_count == 0
-
-        # Add an entry to the store and reload
-        store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Alice",
-                "predicate": "related_to",
-                "object": "Berlin",
-                "speaker_id": "alice",
-                "first_seen_cycle": 1,
-            },
-        )
+        # Swap the store for an empty one; reload must clear stale state.
+        router._memory_store = MemoryStore(replay_enabled=True)
         router.reload()
-        assert router.entity_count > 0
-        assert "alice" in router._all_entities
 
-    def test_qa_format_entry_still_indexes_via_subject_object(self):
-        """QA-format cache entries (with question/answer) still index subject/object correctly."""
+        assert router._speaker_key_index == {}
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — speaker scoping (privacy boundary)
+# ---------------------------------------------------------------------------
+
+
+class TestSpeakerScoping:
+    """allowed_keys is the privacy boundary.  No speaker → no steps; an
+    unknown speaker_id → no steps; an enrolled speaker can only reach
+    their own keys."""
+
+    def test_anonymous_speaker_produces_empty_steps(self, monkeypatch):
+        # Even when intent says PERSONAL, no speaker_id → empty steps.
+        _stub_intent(monkeypatch, Intent.PERSONAL)
         router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
+            [_make_entry("k1", "Alice", "Berlin", speaker_id="alice")]
         )
-        assert "alice" in router._all_entities
-        assert "berlin" in router._all_entities
-        assert "alice" in router._speaker_key_index
+        plan = router.route("Where do I live?", speaker_id=None)
+        assert plan.steps == []
+        assert plan.strategy == "direct"
 
-    def test_no_state_with_general_fail_closed(self):
-        from paramem.server.config import IntentConfig
-        from paramem.server.router import Intent
-
-        ha = _make_ha_graph(None)
-        cfg = IntentConfig(fail_closed_intent="general")
-        router = QueryRouter(
-            adapter_dir=Path("/nonexistent"),
-            memory_store=MemoryStore(replay_enabled=False),
-            ha_graph=ha,
-            intent_config=cfg,
+    def test_unknown_speaker_id_produces_empty_steps(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        router = _make_router_from_entries(
+            [_make_entry("k1", "Alice", "Berlin", speaker_id="alice")]
         )
-        plan = router.route("What is the capital of France?")
+        plan = router.route("Where do I live?", speaker_id="bob")
+        assert plan.steps == []
 
-        assert plan.intent == Intent.GENERAL
+    def test_enrolled_speaker_only_reaches_own_keys(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        router = _make_router_from_entries(
+            [
+                _make_entry("k_alice", "Alice", "Berlin", speaker_id="alice"),
+                _make_entry("k_bob", "Bob", "Munich", speaker_id="bob"),
+            ]
+        )
+        plan = router.route("anything", speaker_id="alice")
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert all_keys == ["k_alice"]
 
 
 # ---------------------------------------------------------------------------
-# QueryRouter — attribute-predicate indexing (Bug 3 regression guard)
+# QueryRouter — intent-driven tier selection
 # ---------------------------------------------------------------------------
 
 
-class TestAttributePredicateIndexing:
-    """Bug 3 regression guard: ``has_<attr>`` predicates are indexed under
-    their bare attribute name so attribute queries ("what is my email
-    address?") resolve to the correct key.  Pairs with the no-Top-K
-    change above: the indexing fix makes the attribute key reachable
-    via a second route, and the no-Top-K change ensures it survives
-    routing when the speaker entity also matches many keys.
+class TestIntentTierSelection:
+    """Tier table:
+
+    * PERSONAL → procedural → newest interim first → episodic → semantic
+    * COMMAND  → procedural only (preferences for HA injection)
+    * GENERAL  → no steps (route to SOTA without personal injection)
+    * UNKNOWN  → resolved via IntentConfig.fail_closed_intent (default PERSONAL)
     """
 
-    def _make_has_email_entry(
-        self,
-        key: str = "graph2",
-        speaker_id: str = "alice",
-    ) -> dict:
-        """Return a canonical cache entry whose predicate is has_email."""
-        return {
-            "key": key,
-            "question": "What is Alice's email?",
-            "answer": "alice@example.com",
-            "subject": "Alice",
-            "predicate": "has_email",
-            "object": "alice@example.com",
-            "speaker_id": speaker_id,
-            "first_seen_cycle": 1,
-            "_adapter_id": "episodic",
-        }
+    def _three_tier_router(self):
+        return _make_router_from_entries(
+            [
+                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_entry("se1", "Alice", "Python", speaker_id="alice", adapter_id="semantic"),
+                _make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural"),
+            ]
+        )
 
-    def test_has_email_predicate_indexed_as_email(self):
-        """has_email cache entry is indexed under 'email' entity."""
-        router = _make_router_from_entries([self._make_has_email_entry()])
-        # "email" must appear in the entity list.
-        assert "email" in router._all_entities
+    def test_personal_selects_all_three_main_tiers_in_order(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        router = self._three_tier_router()
+        plan = router.route("Where do I live?", speaker_id="alice")
+        assert [s.adapter_name for s in plan.steps] == ["procedural", "episodic", "semantic"]
+        assert plan.intent is Intent.PERSONAL
+        assert plan.strategy == "targeted_probe"
 
-    def test_has_email_key_reachable_via_email_attribute_index(self):
-        """The has_email key maps to the 'email' attribute-index entry — deterministic.
+    def test_command_selects_procedural_only(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        router = self._three_tier_router()
+        plan = router.route("Play HR3 Radio.", speaker_id="alice")
+        assert [s.adapter_name for s in plan.steps] == ["procedural"]
+        assert plan.intent is Intent.COMMAND
 
-        With the Top-K cap removed on the authenticated path, the
-        has_email key also reaches ``plan.steps`` even when the speaker
-        entity drags dozens of unrelated keys into the merge — see
-        :class:`TestQueryRouterNoTopKCap`.  This test guards only the
-        indexing fix: the bare attribute name resolves to the attribute
-        key in ``_entity_key_index``.
+    def test_command_never_exposes_episodic_or_semantic(self, monkeypatch):
+        """Privacy invariant: COMMAND must NOT include identity facts.
+
+        Episodic / semantic tiers carry the speaker's biographical context;
+        COMMAND queries go to HA payloads which leave the local trust zone.
+        Procedural (preferences) is the only tier safe to inject.
         """
-        # A flood of Alice's other keys + the has_email key.
-        entries = [
-            _make_entry(f"graph{i}", "Alice", f"Entity{i}", speaker_id="alice") for i in range(15)
-        ]
-        entries.append(self._make_has_email_entry(key="graph_email", speaker_id="alice"))
-        router = _make_router_from_entries(entries)
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        router = self._three_tier_router()
+        plan = router.route("Play music", speaker_id="alice")
+        tiers = {s.adapter_name for s in plan.steps}
+        assert "episodic" not in tiers
+        assert "semantic" not in tiers
 
-        assert "email" in router._all_entities
-        email_indexed_somewhere = False
-        for adapter, idx in router._entity_key_index.items():
-            if "email" in idx:
-                email_indexed_somewhere = True
-                assert "graph_email" in idx["email"], (
-                    f"'email' entry in adapter {adapter!r} maps to {idx['email']!r}; "
-                    "must include the has_email key 'graph_email'"
-                )
-        assert email_indexed_somewhere, "'email' attribute index entry was never built"
+    def test_general_produces_empty_steps(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.GENERAL)
+        router = self._three_tier_router()
+        plan = router.route("What's the capital of France?", speaker_id="alice")
+        assert plan.steps == []
+        assert plan.intent is Intent.GENERAL
+        assert plan.strategy == "direct"
 
-    def test_has_phone_predicate_indexed_as_phone(self):
-        """has_phone cache entry is indexed under 'phone'."""
-        pair = {
-            "key": "graph3",
-            "question": "What is Alice's phone?",
-            "answer": "+1-555-0100",
-            "subject": "Alice",
-            "predicate": "has_phone",
-            "object": "+1-555-0100",
-            "speaker_id": "alice",
-            "first_seen_cycle": 1,
-            "_adapter_id": "episodic",
-        }
-        router = _make_router_from_entries([pair])
-        assert "phone" in router._all_entities
+    def test_unknown_without_config_defaults_to_personal(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.UNKNOWN)
+        router = self._three_tier_router()
+        plan = router.route("ambiguous", speaker_id="alice")
+        # No intent_config → PERSONAL fallback.
+        assert [s.adapter_name for s in plan.steps] == ["procedural", "episodic", "semantic"]
 
-    def test_non_has_predicate_not_indexed_as_attribute(self):
-        """A plain predicate like 'related_to' does NOT produce an 'elated_to' entry."""
-        router = _make_router_from_entries([_make_entry("graph1", "Alice", "Berlin")])
-        # "related_to" starts with 'r', not "has_"; de-prefixed form must not appear.
-        assert "elated_to" not in router._all_entities
-        assert "related_to" not in router._all_entities
+    def test_unknown_resolves_via_intent_config_fail_closed(self, monkeypatch):
+        from paramem.server.config import IntentConfig
 
-    def test_has_prefix_only_predicate_not_indexed(self):
-        """A predicate that is exactly 'has_' (empty attr name) must not add a blank entry."""
-        pair = {
-            "key": "graph5",
-            "question": "Q?",
-            "answer": "A.",
-            "subject": "Alice",
-            "predicate": "has_",
-            "object": "something",
-            "speaker_id": "alice",
-            "first_seen_cycle": 1,
-            "_adapter_id": "episodic",
-        }
-        router = _make_router_from_entries([pair])
-        # Empty de-prefixed name must not be added to entities.
-        assert "" not in router._all_entities
+        _stub_intent(monkeypatch, Intent.UNKNOWN)
+        router = _make_router_from_entries(
+            [
+                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural"),
+            ],
+            intent_config=IntentConfig(fail_closed_intent="general"),
+        )
+        plan = router.route("ambiguous", speaker_id="alice")
+        # general → no steps
+        assert plan.steps == []
+
+    def test_tier_missing_from_store_is_skipped(self, monkeypatch):
+        """Speaker has only procedural keys → PERSONAL plan skips the
+        empty episodic/semantic tiers without raising."""
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        router = _make_router_from_entries(
+            [_make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural")]
+        )
+        plan = router.route("hi", speaker_id="alice")
+        assert [s.adapter_name for s in plan.steps] == ["procedural"]
 
 
 # ---------------------------------------------------------------------------
-# QueryRouter — simulate-mode routing via loop cache
+# QueryRouter — PERSONAL probe order with interim adapters
 # ---------------------------------------------------------------------------
 
 
-class TestQueryRouterSimulateDir:
-    """Simulate-mode routing: router indexes entities from the loop's memory store.
-
-    In simulate mode, ``ConsolidationLoop`` populates ``store`` from
-    the simulate store (graph.json) just as train mode populates it from adapter
-    weights.  The router's ``reload()`` uses only ``loop.store`` as the
-    canonical source — the router reads only ``loop.store`` during reload.
-
-    These tests verify entity indexing and routing from simulate-mode cache entries.
-    """
-
-    def test_empty_loop_cache_loads_cleanly(self):
-        """Router with an empty store returns entity_count == 0."""
-        router = QueryRouter(
-            adapter_dir=Path("/nonexistent"),
-            memory_store=MemoryStore(replay_enabled=False),
-        )
-        assert router.entity_count == 0
-
-    def test_no_loop_provider_loads_cleanly(self):
-        """Router with a freshly-constructed empty store returns entity_count == 0."""
-        router = QueryRouter(
-            adapter_dir=Path("/nonexistent"), memory_store=MemoryStore(replay_enabled=False)
-        )
-        assert router.entity_count == 0
-
-    def test_episodic_cache_entities_indexed(self):
-        """Entities from episodic cache entries appear in _all_entities."""
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
-        )
-        assert "alice" in router._all_entities
-        assert "berlin" in router._all_entities
-
-    def test_semantic_and_procedural_cache_entries_indexed(self):
-        """All three tiers' cache entries contribute to the index."""
+class TestPersonalTierOrder:
+    def test_interim_adapters_sort_newest_first(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.PERSONAL)
         router = _make_router_from_entries(
             [
-                _make_entry("sem1", "Bob", "Python", speaker_id="bob", adapter_id="semantic"),
-                _make_entry("proc1", "Carol", "Tea", speaker_id="carol", adapter_id="procedural"),
-            ]
-        )
-        assert "bob" in router._all_entities
-        assert "carol" in router._all_entities
-
-    def test_speaker_id_from_cache_indexed(self):
-        """speaker_id from cache entries appears in _speaker_key_index."""
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
-        )
-        assert "alice" in router._speaker_key_index
-        assert "graph1" in router._speaker_key_index["alice"]
-
-    def test_cache_entry_produces_pa_routing_steps(self):
-        """A query mentioning a cached entity resolves to a PA step."""
-        from paramem.server.router import Intent
-
-        router = _make_router_from_entries(
-            [_make_entry("graph1", "Alice", "Berlin", speaker_id="alice")],
-        )
-        plan = router.route("Where does Alice live?", speaker_id="alice")
-        assert plan.steps, "Expected PA routing steps from cache entry"
-        assert plan.intent == Intent.PERSONAL
-        keys = [k for step in plan.steps for k in step.keys_to_probe]
-        assert "graph1" in keys
-
-    def test_multiple_tiers_in_cache_indexed_without_conflict(self):
-        """Cache entries from different tiers are all indexed without conflict."""
-        router = _make_router_from_entries(
-            [
-                _make_entry("ep1", "TrainEntity", "Berlin", speaker_id="alice"),
+                _make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic"),
+                _make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural"),
                 _make_entry(
-                    "sem1", "SimEntity", "Munich", speaker_id="alice", adapter_id="semantic"
+                    "i0",
+                    "Alice",
+                    "X",
+                    speaker_id="alice",
+                    adapter_id="episodic_interim_20260415T0000",
+                ),
+                _make_entry(
+                    "i1",
+                    "Alice",
+                    "Y",
+                    speaker_id="alice",
+                    adapter_id="episodic_interim_20260417T0000",
+                ),
+                _make_entry(
+                    "i2",
+                    "Alice",
+                    "Z",
+                    speaker_id="alice",
+                    adapter_id="episodic_interim_20260416T0000",
                 ),
             ]
         )
-        assert "trainentity" in router._all_entities
-        assert "simentity" in router._all_entities
-
-    def test_reload_picks_up_updated_cache(self):
-        """reload() after mutating the injected store repopulates the entity index."""
-        store = MemoryStore(replay_enabled=True)
-        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
-        assert router.entity_count == 0
-
-        store.put(
+        plan = router.route("anything", speaker_id="alice")
+        names = [s.adapter_name for s in plan.steps]
+        assert names == [
+            "procedural",
+            "episodic_interim_20260417T0000",  # newest first
+            "episodic_interim_20260416T0000",
+            "episodic_interim_20260415T0000",
             "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Alice",
-                "predicate": "related_to",
-                "object": "Berlin",
-                "speaker_id": "alice",
-                "first_seen_cycle": 1,
-            },
-        )
-        router.reload()
-        assert router.entity_count > 0
-        assert "alice" in router._all_entities
+        ]
 
-    def test_empty_cache_does_not_crash(self):
-        """Empty store returns entity_count == 0 without raising."""
-        store = MemoryStore(replay_enabled=True)
-        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
-        assert router.entity_count == 0
-
-    def test_has_email_predicate_indexed_from_cache(self):
-        """has_email predicate in a cache entry is indexed under 'email' entity."""
+    def test_interim_names_are_not_normalised(self, monkeypatch):
+        """Probe-time switch_adapter() must find the trained slot under its
+        full canonical name including the stamp.  Stripping the stamp would
+        miss the slot in model.peft_config."""
+        _stub_intent(monkeypatch, Intent.PERSONAL)
         router = _make_router_from_entries(
             [
                 _make_entry(
-                    "graph2",
+                    "i0",
                     "Alice",
-                    "alice@example.com",
+                    "X",
                     speaker_id="alice",
-                    predicate="has_email",
+                    adapter_id="episodic_interim_20260415T0000",
                 )
             ]
         )
-        assert "email" in router._all_entities
+        plan = router.route("anything", speaker_id="alice")
+        assert any(s.adapter_name == "episodic_interim_20260415T0000" for s in plan.steps)
+
+    def test_keys_to_probe_are_sorted(self, monkeypatch):
+        """Deterministic key ordering — no hash-randomisation flake."""
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        router = _make_router_from_entries(
+            [
+                _make_entry(
+                    f"k{i:03d}", "Alice", f"x{i}", speaker_id="alice", adapter_id="episodic"
+                )
+                for i in range(10)
+            ]
+        )
+        plan = router.route("anything", speaker_id="alice")
+        for step in plan.steps:
+            assert step.keys_to_probe == sorted(step.keys_to_probe)
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — HA fast path
+# ---------------------------------------------------------------------------
+
+
+class TestRouteHA:
+    def test_ha_entity_match_drives_command(self):
+        """has_ha_match=True → classify_intent returns COMMAND.
+
+        Verified end-to-end through the real classify_intent (no encoder
+        loaded so the residual is bypassed; HA fast-path fires).
+        """
+        ha_match = _make_ha_match(entities=["kitchen light"], domains=["light"])
+        router = _make_router_from_entries(
+            [_make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural")],
+            ha_graph=_make_ha_graph(ha_match),
+        )
+        plan = router.route("Turn on the kitchen light", speaker_id="alice")
+        assert plan.intent is Intent.COMMAND
+        assert plan.ha_domains == ["light"]
+        # COMMAND → procedural only
+        assert [s.adapter_name for s in plan.steps] == ["procedural"]
+
+    def test_ha_verb_only_does_not_satisfy_fast_path(self, monkeypatch):
+        """has_entity_match requires entity OR area; verb-only is not enough.
+
+        ``Play music`` against an HA install with no media_player entity
+        named ``music`` matches only the ``play media`` verb.  The HA fast
+        path does not fire; intent falls to the encoder residual (stubbed
+        here as GENERAL for the test).
+        """
+        _stub_intent(monkeypatch, Intent.GENERAL)
+        ha_match = _make_ha_match(verbs=["play media"], domains=["media_player"])
+        router = _make_router_from_entries(
+            [_make_entry("pr1", "Alice", "Cycling", speaker_id="alice", adapter_id="procedural")],
+            ha_graph=_make_ha_graph(ha_match),
+        )
+        plan = router.route("Play music", speaker_id="alice")
+        # ha_match exists but has_entity_match is False → encoder takes over.
+        # Stubbed encoder verdict GENERAL → no steps.
+        assert plan.intent is Intent.GENERAL
+        assert plan.steps == []
+        # ha_domains is still surfaced for observability.
+        assert plan.ha_domains == ["media_player"]
+
+    def test_no_ha_graph_short_path(self, monkeypatch):
+        """Router constructed without ha_graph: has_ha is always False."""
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        router = _make_router_from_entries(
+            [_make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic")]
+        )
+        plan = router.route("Where do I live?", speaker_id="alice")
+        assert plan.ha_domains == []
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — RoutingPlan shape
+# ---------------------------------------------------------------------------
+
+
+class TestRoutingPlanShape:
+    def test_defaults(self):
+        plan = RoutingPlan()
+        assert plan.steps == []
+        assert plan.strategy == "direct"
+        assert plan.ha_domains == []
+        assert plan.intent is Intent.UNKNOWN
+
+    def test_strategy_reflects_steps(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        router = _make_router_from_entries(
+            [_make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic")]
+        )
+        plan = router.route("anything", speaker_id="alice")
+        assert plan.strategy == "targeted_probe"
+        assert plan.steps != []
+
+    def test_routing_step_dataclass(self):
+        step = RoutingStep(adapter_name="episodic", keys_to_probe=["a", "b"])
+        assert step.adapter_name == "episodic"
+        assert step.keys_to_probe == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — preload independence
+# ---------------------------------------------------------------------------
+
+
+class TestPreloadIndependence:
+    """``_speaker_key_index`` must populate even when entry SPO content is
+    not preloaded — the only field reload() needs is ``speaker_id``, which
+    ``MemoryStore.load_metadata_from_disk`` writes onto every active entry
+    slot unconditionally at boot.
+
+    This regression guard simulates the preload-off boot order: entries
+    are seeded with only ``speaker_id`` + ``first_seen_cycle`` (no SPO),
+    and the router must still build the speaker→keys index.
+    """
+
+    def test_metadata_only_entries_populate_speaker_index(self):
+        store = MemoryStore(replay_enabled=True)
+        # Simulate load_metadata_from_disk's payload: no SPO, just bookkeeping.
+        store.put(
+            "episodic",
+            "k_meta_only",
+            {"speaker_id": "alice", "first_seen_cycle": 1},
+        )
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
+        assert router._speaker_key_index["alice"] == {"k_meta_only"}
+
+    def test_metadata_only_routes_produce_steps(self, monkeypatch):
+        _stub_intent(monkeypatch, Intent.PERSONAL)
+        store = MemoryStore(replay_enabled=True)
+        store.put(
+            "procedural",
+            "k_pref",
+            {"speaker_id": "alice", "first_seen_cycle": 1},
+        )
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
+        plan = router.route("anything", speaker_id="alice")
+        assert [s.adapter_name for s in plan.steps] == ["procedural"]
+        assert plan.steps[0].keys_to_probe == ["k_pref"]
+
+
+# ---------------------------------------------------------------------------
+# QueryRouter — HR3 regression
+# ---------------------------------------------------------------------------
+
+
+class TestHR3Regression:
+    """Speaker enrollment must NOT classify the speaker's queries as PERSONAL.
+
+    Prior code injected the speaker as an implicit entity and did one-hop
+    graph expansion, both of which made ``has_pa=True`` for essentially
+    every query from an enrolled speaker.  Combined with the now-removed
+    ``has_graph_match → PERSONAL`` short-circuit, imperatives like
+    ``"Play HR3 Radio."`` routed to the personal-adapter PA path instead
+    of HA.
+
+    These tests confirm: the new code passes only ``has_ha_match`` to
+    ``classify_intent``; enrollment plays no role in intent.
+    """
+
+    def test_classify_intent_call_does_not_receive_graph_match_kwarg(self, monkeypatch):
+        stub = _stub_intent(monkeypatch, Intent.COMMAND)
+        router = _make_router_from_entries(
+            [_make_entry("ep1", "Alice", "Berlin", speaker_id="alice", adapter_id="episodic")]
+        )
+        router.route("Play HR3 Radio.", speaker_id="alice")
+        # The router must pass has_ha_match only; has_graph_match is gone.
+        call = stub.call_args
+        assert "has_graph_match" not in call.kwargs
+        assert "has_ha_match" in call.kwargs
+
+    def test_imperative_from_enrolled_speaker_with_ha_match_is_command(self):
+        """End-to-end: HA-match imperative from enrolled speaker → COMMAND.
+
+        Uses the real ``classify_intent`` (no encoder loaded, no graph-match
+        signal).  Speaker is enrolled with many keys; intent must still be
+        COMMAND, never PERSONAL.
+        """
+        ha_match = _make_ha_match(entities=["kitchen light"], domains=["light"])
+        router = _make_router_from_entries(
+            [
+                _make_entry(f"k{i}", "Alice", f"fact{i}", speaker_id="alice", adapter_id="episodic")
+                for i in range(50)
+            ],
+            ha_graph=_make_ha_graph(ha_match),
+        )
+        plan = router.route("Turn on the kitchen light", speaker_id="alice")
+        assert plan.intent is Intent.COMMAND

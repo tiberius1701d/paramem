@@ -452,6 +452,17 @@ abstention:
 # can swap without code changes.
 intent:
   enabled: true                                   # local-only; encoder downloads from HF on first use (~250MB)
+  # Classifier backend.
+  #   embeddings — sentence-encoder cosine vs. per-class exemplar bank (~1 ms).
+  #                Needs curated exemplars per class per language; brittle on
+  #                paraphrase / named entities not in the bank.
+  #   llm        — single-token generation from the loaded local model using
+  #                the intent-classifier section of voice.prompt_file
+  #                (~50–200 ms).  No exemplar curation; handles paraphrase /
+  #                named entities directly.  Falls back to the encoder path
+  #                automatically when no local model is registered (cloud-only
+  #                mode, model load failed).
+  mode: llm                                       # embeddings | llm
   encoder_model: intfloat/multilingual-e5-small  # any sentence-transformers-compatible HF model
   encoder_device: auto                            # auto | cuda | cpu
   encoder_dtype: float16                          # float16 | float32
@@ -459,6 +470,8 @@ intent:
   exemplars_dir: configs/intents
   confidence_margin: 0.05                         # min top1-top2 margin; below → fail_closed_intent
   fail_closed_intent: personal                    # privacy-preserving default on uncertainty
+  llm_max_new_tokens: 8                           # cap on classifier generate() output — one label
+  llm_temperature: 0.0                            # deterministic; required for structured output
 
 # Sentence-type classifier: INTERROGATIVE / NON_INTERROGATIVE.  Reuses the
 # multilingual encoder loaded by `intent` above (no separate model

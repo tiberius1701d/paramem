@@ -1911,11 +1911,24 @@ async def lifespan(app: FastAPI):
     # non-fatal: the classifier returns Intent.UNKNOWN / fail-closed and
     # routing degrades to the existing structural rules.
     if not cloud_only:
-        from paramem.server.intent import load_encoder, load_exemplars
+        from paramem.server.intent import (
+            load_encoder,
+            load_exemplars,
+            set_classifier_model,
+        )
 
         encoder_handle = load_encoder(config.intent)
         if encoder_handle is not None:
             load_exemplars(config.intent, encoder_handle)
+
+        # Register the local LLM for ``intent.mode=llm`` classification.
+        # No-op when the model didn't load (cloud-only fallthrough) — the
+        # intent module sees the singleton as ``None`` and the dispatch
+        # automatically falls back to the encoder residual.
+        _classifier_model = _state.get("model")
+        _classifier_tokenizer = _state.get("tokenizer")
+        if _classifier_model is not None and _classifier_tokenizer is not None:
+            set_classifier_model(_classifier_model, _classifier_tokenizer)
 
         # Sentence-type classifier reuses the same encoder (no second
         # download / load).  Loading the exemplar bank only succeeds

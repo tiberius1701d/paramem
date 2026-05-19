@@ -540,32 +540,72 @@ class AbstentionConfig:
 
 @dataclass
 class IntentConfig:
-    """Residual intent classifier — config surface only at this commit.
+    """Intent classifier — HA fast-path + content-driven residual.
 
-    The classifier itself is not wired in yet; this dataclass establishes
-    the YAML contract so the encoder + exemplar work in subsequent
-    commits has a place to plug in without further config churn.
+    The dispatcher tries the deterministic HA fast-path first; on miss,
+    it falls to the residual classifier configured by :attr:`mode`.
+    Below-margin / unavailable cases use :attr:`fail_closed_intent`.
 
-    Defaults reflect the locked design:
+    Two residual backends:
 
-    * Encoder: ``intfloat/multilingual-e5-small`` (MIT, 118M params,
-      384-dim multilingual sentence encoder).
-    * Device: ``auto`` — prefer cuda when available, fall back to cpu.
+    * ``mode="llm"`` (production default).  Single-token generation
+      from the loaded local model using the intent-classifier section
+      of ``voice.prompt_file``.  Handles paraphrase, named entities,
+      compound noisy transcripts, and synonyms without exemplar
+      maintenance.  ~2–4 forward passes through the local LLM per
+      query.  Automatically falls back to the encoder path when no
+      local model is registered (cloud-only mode, model load failed).
+    * ``mode="embeddings"``.  Sentence-encoder cosine vs per-class
+      exemplar bank, gated by a top-1/top-2 margin.  ~1 forward pass
+      through ``intfloat/multilingual-e5-small`` (118M params,
+      384-dim, multilingual).  Cheap per query but the bank is static
+      — every dynamic phrasing the operator hasn't anticipated either
+      stays below margin or misclassifies.  Used in cloud-only mode
+      and by operators who prefer no per-query LLM cost.
+
+    Why LLM is the default: routing is an open-vocabulary problem.
+    Each user-facing phrase the static bank doesn't cover surfaces as
+    a missed classification (observed in production: named-station
+    play, stop-shaped imperatives, compound radio-bleed-through
+    transcripts).  The LLM is already loaded for the PA path and
+    handles these natively; the per-query cost (~50–200 ms) is buried
+    under the chat handler's other overhead.  ``embeddings`` remains
+    for cloud-only deployments and as the automatic fallback when no
+    local model is available.
+
+    Defaults summary:
+
+    * Encoder model: ``intfloat/multilingual-e5-small`` (MIT, 118M
+      params, 384-dim multilingual sentence encoder).
+    * Device: ``auto`` — prefer cuda, fall back to cpu.
     * Dtype: ``float16`` on cuda, ``float32`` on cpu.
     * E5 family requires the literal ``"query: "`` prefix on inputs.
     * Exemplar files live under ``configs/intents/`` as
-      ``<class>.<lang>.txt`` (one query per line).
+      ``<class>.<lang>.txt`` (one query per line) — used by the
+      ``embeddings`` backend and by the encoder-reusing sentence-type
+      / personal-referent classifiers.
     * Confidence is the margin between the top-1 and top-2 cosine
       similarity scores against the exemplar set; below threshold
       classification falls back to ``fail_closed_intent``.
-    * ``fail_closed_intent: personal`` keeps privacy-preserving defaults
-      under uncertainty — a misclassified personal query never escalates.
+    * ``fail_closed_intent="personal"`` keeps privacy-preserving
+      defaults under uncertainty — a misclassified personal query
+      never escalates.
 
-    All fields can be overridden in ``configs/server.yaml`` so operators
-    can swap encoders, exemplar sets, thresholds without code changes.
+    All fields can be overridden in ``configs/server.yaml`` so
+    operators can swap mode, encoders, exemplar sets, or thresholds
+    without code changes.
     """
 
     enabled: bool = True
+    # Classifier backend.  "embeddings" uses the sentence-encoder + per-class
+    # exemplar bank at ``exemplars_dir`` (cheap, ~1 ms; needs curated exemplars
+    # per class per language).  "llm" generates one token from the loaded local
+    # model using the intent-classifier section of ``voice.prompt_file``
+    # (~50–200 ms; no exemplar curation, handles paraphrase / named entities
+    # the encoder bank misses).  When "llm" is selected but no local model has
+    # been registered with the intent module (cloud-only mode, model load
+    # failed), classification falls back to the encoder path automatically.
+    mode: str = "embeddings"  # "embeddings" | "llm"
     encoder_model: str = "intfloat/multilingual-e5-small"
     encoder_device: str = "auto"  # auto | cuda | cpu
     encoder_dtype: str = "float16"  # float16 | float32
@@ -573,6 +613,9 @@ class IntentConfig:
     exemplars_dir: str = "configs/intents"
     confidence_margin: float = 0.05
     fail_closed_intent: str = "personal"  # personal | command | general | unknown
+    # LLM-mode generation knobs.  Kept tight: one label, deterministic.
+    llm_max_new_tokens: int = 8
+    llm_temperature: float = 0.0
 
 
 @dataclass
@@ -634,24 +677,62 @@ class SentenceTypeConfig:
     confidence_margin: float = 0.05
 
 
+_INTENT_CLASSIFIER_MARKER = "##---INTENT-CLASSIFIER-SECTION---"
+
+
 @dataclass
 class VoiceConfig:
     prompt_file: str = "configs/prompts/pa_voice.txt"
     system_prompt: str = ""
     greeting_interval_hours: int = 24  # hours between greetings per speaker (0 = disabled)
 
+    def _read_prompt_file(self) -> str | None:
+        """Read the raw prompt file, or ``None`` if absent / unconfigured."""
+        if not self.prompt_file:
+            return None
+        path = Path(self.prompt_file)
+        if not path.exists():
+            return None
+        return path.read_text()
+
     def load_prompt(self) -> str:
-        """Load system prompt from file, falling back to inline default."""
-        if self.prompt_file:
-            path = Path(self.prompt_file)
-            if path.exists():
-                return path.read_text().strip()
+        """Load the PA-path system prompt.
+
+        If the prompt file contains an ``##---INTENT-CLASSIFIER-SECTION---``
+        marker, only the content **before** that marker is returned —
+        downstream callers (PA-path reasoning) must not see the
+        classifier section's instructions.  Files without the marker are
+        returned whole (back-compat with prompts authored before LLM
+        intent classification existed).
+        """
+        raw = self._read_prompt_file()
+        if raw is not None:
+            head = raw.split(_INTENT_CLASSIFIER_MARKER, 1)[0]
+            return head.strip()
         if self.system_prompt:
             return self.system_prompt
         return (
             "You are a personal memory assistant. Answer concisely in 1-2 spoken sentences. "
             "Use only facts that appear in the context above. Never invent personal details."
         )
+
+    def load_intent_classifier_prompt(self) -> str | None:
+        """Return the intent-classifier section of the prompt file, or
+        ``None`` if the file is absent or the marker is missing.
+
+        Used by :func:`paramem.server.intent._classify_via_llm` when
+        ``IntentConfig.mode == "llm"``.  Operators tune the classifier
+        prompt by editing the section after the marker in
+        ``configs/prompts/pa_voice.txt``; no code change required.
+        """
+        raw = self._read_prompt_file()
+        if raw is None:
+            return None
+        parts = raw.split(_INTENT_CLASSIFIER_MARKER, 1)
+        if len(parts) != 2:
+            return None
+        tail = parts[1].strip()
+        return tail or None
 
 
 @dataclass
