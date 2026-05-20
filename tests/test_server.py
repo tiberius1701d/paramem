@@ -6,10 +6,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from paramem.memory.store import MemoryStore as _MS
 from paramem.server.config import MODEL_REGISTRY, ServerConfig, load_server_config
 from paramem.server.escalation import detect_escalation
 from paramem.server.session_buffer import SessionBuffer
-from paramem.training.memory_store import MemoryStore as _MS
 
 
 class TestConfig:
@@ -476,7 +476,7 @@ class TestProbeAndReasonDispatch:
             return results
 
         monkeypatch.setattr(
-            "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+            "paramem.memory.probe.probe_keys_grouped_by_adapter",
             fake_grouped,
         )
 
@@ -574,7 +574,7 @@ class TestProbeAndReasonDispatch:
             return results
 
         monkeypatch.setattr(
-            "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+            "paramem.memory.probe.probe_keys_grouped_by_adapter",
             fake_grouped,
         )
         monkeypatch.setattr(

@@ -208,11 +208,9 @@ class RecallEarlyStopCallback(TrainerCallback):
             eval_fn: Probe function called for both the fill probe and the
                 optional retention probe at each epoch boundary.  ``None``
                 (default) selects
-                :func:`experiments.utils.test_harness.evaluate_indexed_recall`
+                :func:`paramem.training.recall_eval.evaluate_indexed_recall`
                 via a lazy import at each ``on_epoch_end`` call — preserving
-                the pre-2c-bis behaviour so existing call sites and
-                test-suite patches that target the module-level name continue
-                to work unchanged.
+                patchability at ``paramem.training.recall_eval.evaluate_indexed_recall``.
         """
         self._model = model
         self._tokenizer = tokenizer

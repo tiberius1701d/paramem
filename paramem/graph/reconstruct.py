@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 
 import networkx as nx
 
+from paramem.memory.entry import probe_entry
 from paramem.models.loader import switch_adapter
-from paramem.training.entry_memory import probe_entry
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def reconstruct_graph(
 
     Iterates ``loop.indexed_key_registry`` (a ``dict[str, KeyRegistry]``),
     groups keys by tier, calls ``switch_adapter`` once per tier, probes
-    every key in that group via :func:`~paramem.training.entry_memory.probe_entry`,
+    every key in that group via :func:`~paramem.memory.entry.probe_entry`,
     and merges the entries into a fresh ``nx.MultiDiGraph``.
 
     The function is read-only on ``loop.model``: after all probes complete it
@@ -194,11 +194,11 @@ def reconstruct_graph(
                     # auto-assigned integer edge-key, then set the indexed-memory
                     # key on that specific edge's data dict — under
                     # ``_IK_KEY_ATTR`` so the value survives ``nx.node_link_data``
-                    # round-trips through ``paramem.training.memory_persistence``
+                    # round-trips through ``paramem.memory.persistence``
                     # (NetworkX reserves the JSON field ``"key"`` for the
                     # multigraph edge identifier; using ``"key"`` here would be
                     # silently clobbered on save→load).
-                    from paramem.training.memory_persistence import _IK_KEY_ATTR
+                    from paramem.memory.persistence import _IK_KEY_ATTR
 
                     eid = graph.add_edge(subject, obj, predicate=predicate)
                     graph[subject][obj][eid][_IK_KEY_ATTR] = key

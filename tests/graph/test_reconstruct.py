@@ -66,7 +66,7 @@ def _make_loop(
     ``registry`` is a ``dict[str, KeyRegistry]`` (per-tier) or ``None``
     (disabled).  The empty-dict case is used in tests that need no active keys.
     """
-    from paramem.training.memory_store import MemoryStore
+    from paramem.memory.store import MemoryStore
 
     model = MagicMock()
     model.active_adapter = "episodic"  # default; overwritten per test as needed
@@ -176,7 +176,7 @@ class TestHappyPath:
         # Read the edge via the public iter_entries accessor — the indexed-memory
         # key is stored under _IK_KEY_ATTR (= "ik_key") internally to avoid
         # NetworkX's reserved "key" field in node_link_data serialisation.
-        from paramem.training.memory_persistence import iter_entries
+        from paramem.memory.persistence import iter_entries
 
         quads = list(iter_entries(g))
         assert len(quads) == 1
@@ -383,7 +383,7 @@ class TestFailureStrictFalse:
         result = reconstruct_graph(loop, strict=False)
 
         assert result.graph.number_of_edges() == 1
-        from paramem.training.memory_persistence import iter_entries
+        from paramem.memory.persistence import iter_entries
 
         edge_keys = [q["key"] for q in iter_entries(result.graph)]
         assert "graph1" in edge_keys
@@ -407,7 +407,7 @@ class TestFailureStrictFalse:
 
         result = reconstruct_graph(loop, strict=False)
 
-        from paramem.training.memory_persistence import iter_entries
+        from paramem.memory.persistence import iter_entries
 
         edge_keys = {q["key"] for q in iter_entries(result.graph)}
         failure_keys = {f["key"] for f in result.failures}

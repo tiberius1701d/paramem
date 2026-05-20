@@ -1,11 +1,11 @@
 """Unit tests for paramem.training.recall_eval.
 
-Covers evaluate_indexed_recall (serial and batched), probe_entries,
+Covers evaluate_indexed_recall, probe_entries,
 _derive_stop_ids, and the extracted _finalize_recalled helper.
 
 Patching note (Decision 3 in plan-batched-probe-v2.md):
 functools.partial snapshots the target function at construction time.  Any
-test that exercises the batch_size > 1 branch via _maybe_make_recall_callback
+test that exercises evaluate_indexed_recall via _maybe_make_recall_callback
 must either (a) patch evaluate_indexed_recall BEFORE callback construction so
 the partial captures the patched function, or (b) inject eval_fn= directly
 into RecallEarlyStopCallback.  Module-level patches applied AFTER callback
@@ -69,7 +69,7 @@ def _make_tokenizer_mock(
 
 def _build_real_registry(entries: list[dict]) -> dict:
     """Build a SimHash registry with real fingerprints for the given entries."""
-    from paramem.training.entry_memory import build_registry
+    from paramem.memory.entry import build_registry
 
     return build_registry(entries)
 
@@ -83,14 +83,14 @@ class TestFinalizeRecalledContract:
     """Direct unit test of _finalize_recalled for each branch."""
 
     def test_parse_failure(self):
-        from paramem.training.entry_memory import _finalize_recalled
+        from paramem.memory.entry import _finalize_recalled
 
         result = _finalize_recalled("not json", "graph1", None, 0.75)
         assert result["failure_reason"] == "parse_failure"
         assert result["raw_output"] == "not json"
 
     def test_key_mismatch(self):
-        from paramem.training.entry_memory import _finalize_recalled
+        from paramem.memory.entry import _finalize_recalled
 
         raw = _raw_json("graph99")
         result = _finalize_recalled(raw, "graph1", None, 0.75)
@@ -98,7 +98,7 @@ class TestFinalizeRecalledContract:
         assert "graph99" in result["failure_reason"]
 
     def test_low_confidence(self):
-        from paramem.training.entry_memory import _finalize_recalled
+        from paramem.memory.entry import _finalize_recalled
 
         # registry with fingerprint 0 for graph1 → simhash_confidence ~0.5 < 0.75
         registry = {"graph1": 0}
@@ -107,7 +107,7 @@ class TestFinalizeRecalledContract:
         assert result["failure_reason"].startswith("low_confidence:")
 
     def test_success_no_registry(self):
-        from paramem.training.entry_memory import _finalize_recalled
+        from paramem.memory.entry import _finalize_recalled
 
         raw = _raw_json("graph1")
         result = _finalize_recalled(raw, "graph1", None, 0.75)
@@ -121,7 +121,7 @@ class TestFinalizeRecalledContract:
         assert "fact_text" in result
 
     def test_success_with_matching_registry(self):
-        from paramem.training.entry_memory import _finalize_recalled
+        from paramem.memory.entry import _finalize_recalled
 
         entry = _entry("graph1")
         registry = _build_real_registry([entry])
@@ -132,173 +132,6 @@ class TestFinalizeRecalledContract:
 
 
 # ---------------------------------------------------------------------------
-# test_serial_path_byte_identical
-# ---------------------------------------------------------------------------
-
-
-class TestSerialPathByteIdentical:
-    """evaluate_indexed_recall at batch_size=1 delegates to probe_entry."""
-
-    def test_serial_path_byte_identical(self):
-        from paramem.training.recall_eval import evaluate_indexed_recall
-
-        entries = [
-            _entry("graph1", "Alice", "lives_in", "Berlin"),
-            _entry("graph2", "Bob", "works_at", "Acme"),
-            _entry("graph3", "Carol", "born_in", "Paris"),
-        ]
-        registry = _build_real_registry(entries)
-
-        # Canned probe_entry responses matching the entries exactly
-        def _fake_probe(model, tokenizer, key, *, registry=None, **kw):
-            e = next(e for e in entries if e["key"] == key)
-            raw = _raw_json(key, e["subject"], e["predicate"], e["object"])
-            return {
-                "key": key,
-                "subject": e["subject"],
-                "predicate": e["predicate"],
-                "object": e["object"],
-                "confidence": 1.0,
-                "raw_output": raw,
-                "fact_text": f"{e['subject']} {e['predicate']} {e['object']}",
-            }
-
-        model = _make_model_mock()
-        tokenizer = _make_tokenizer_mock()
-
-        with (
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.entry_memory.probe_entry", side_effect=_fake_probe),
-        ):
-            result = evaluate_indexed_recall(
-                model,
-                tokenizer,
-                entries,
-                registry,
-                batch_size=1,
-            )
-
-        assert result["exact_count"] == 3
-        assert result["total"] == 3
-        assert result["rate"] == 1.0
-        pk_keys = {r["key"] for r in result["per_key"]}
-        assert pk_keys == {"graph1", "graph2", "graph3"}
-        for pk in result["per_key"]:
-            assert pk["exact_match"] is True
-            assert pk["failure_reason"] is None
-
-
-# ---------------------------------------------------------------------------
-# test_batched_shape_matches_serial
-# ---------------------------------------------------------------------------
-
-
-class TestBatchedShapeMatchesSerial:
-    """Top-level keys and per_key dict shape identical for batch_size=1 and batch_size=2."""
-
-    def _run(self, entries: list[dict], registry: dict, batch_size: int, model, tokenizer):
-        from paramem.training.recall_eval import evaluate_indexed_recall
-
-        with (
-            patch("paramem.models.loader.switch_adapter"),
-        ):
-            return evaluate_indexed_recall(
-                model,
-                tokenizer,
-                entries,
-                registry,
-                batch_size=batch_size,
-            )
-
-    def test_batched_shape_matches_serial(self):
-        entries = [
-            _entry("graph1", "Alice", "lives_in", "Berlin"),
-            _entry("graph2", "Bob", "works_at", "Acme"),
-        ]
-        registry = _build_real_registry(entries)
-
-        # For serial path: patch probe_entry
-        def _fake_probe(model, tokenizer, key, *, registry=None, **kw):
-            e = next(e for e in entries if e["key"] == key)
-            raw = _raw_json(key, e["subject"], e["predicate"], e["object"])
-            return {
-                "key": key,
-                "subject": e["subject"],
-                "predicate": e["predicate"],
-                "object": e["object"],
-                "confidence": 1.0,
-                "raw_output": raw,
-                "fact_text": f"{e['subject']} {e['predicate']} {e['object']}",
-            }
-
-        model = _make_model_mock()
-        tokenizer = _make_tokenizer_mock()
-
-        with patch("paramem.training.entry_memory.probe_entry", side_effect=_fake_probe):
-            serial = self._run(entries, registry, batch_size=1, model=model, tokenizer=tokenizer)
-
-        # For batched path: mock tokenizer call and model.generate
-        model2 = _make_model_mock()
-        tokenizer2 = _make_tokenizer_mock()
-
-        # tokenizer(prompts, ...) returns input tensor of shape [2, 5]
-        input_ids = torch.zeros(2, 5, dtype=torch.long)
-        tok_output = MagicMock()
-        tok_output.__getitem__ = lambda self, k: {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones(2, 5),
-        }[k]
-        tok_output.keys.return_value = ["input_ids", "attention_mask"]
-
-        # Make tokenizer callable return a mock that can be passed to model.generate(**inputs)
-        inputs_dict = {"input_ids": input_ids, "attention_mask": torch.ones(2, 5)}
-        tokenizer2.return_value = MagicMock(**{"to.return_value": inputs_dict})
-        tokenizer2.return_value.__iter__ = lambda self: iter(inputs_dict)
-        tokenizer2.return_value.items = inputs_dict.items
-
-        # model.generate returns [2, 5+new_tokens], new tokens after width=5
-        raw1 = _raw_json("graph1", "Alice", "lives_in", "Berlin")
-        raw2 = _raw_json("graph2", "Bob", "works_at", "Acme")
-
-        def _fake_decode(ids, skip_special_tokens=True):
-            # ids is a 1D tensor (suffix of one row); distinguish by content
-            return raw1 if ids[0].item() == 1 else raw2
-
-        tokenizer2.decode.side_effect = _fake_decode
-
-        # Generate output: rows 0 and 1 have different suffix tokens
-        gen_out = torch.zeros(2, 8, dtype=torch.long)
-        gen_out[0, 5] = 1  # sentinel for row 0 → raw1
-        gen_out[1, 5] = 2  # sentinel for row 1 → raw2
-        model2.generate.return_value = gen_out
-
-        with patch(
-            "paramem.training.dataset._format_inference_prompt",
-            side_effect=lambda q, t: q,
-        ):
-            batched = self._run(entries, registry, batch_size=2, model=model2, tokenizer=tokenizer2)
-
-        # Top-level keys match
-        assert set(serial.keys()) == set(batched.keys())
-        # per_key record shape matches
-        serial_pk_keys = {r["key"] for r in serial["per_key"]}
-        batched_pk_keys = {r["key"] for r in batched["per_key"]}
-        assert serial_pk_keys == batched_pk_keys
-        expected_pk_fields = {
-            "key",
-            "exact_match",
-            "confidence",
-            "subject",
-            "predicate",
-            "object",
-            "recalled_subject",
-            "recalled_predicate",
-            "recalled_object",
-            "failure_reason",
-        }
-        for pk in batched["per_key"]:
-            assert expected_pk_fields.issubset(pk.keys())
-
 
 # ---------------------------------------------------------------------------
 # test_batched_finalize_handles_failures
@@ -309,7 +142,7 @@ class TestBatchedFinalizeHandlesFailures:
     """Different rows land in the correct failure_reason bucket via probe_entries."""
 
     def test_batched_finalize_handles_failures(self):
-        from paramem.training.entry_memory import build_registry
+        from paramem.memory.entry import build_registry
         from paramem.training.recall_eval import probe_entries as _generate_recall_batch
 
         entries = [
@@ -520,7 +353,7 @@ class TestRegistryLowConfidenceBatched:
     """One key with a bad registry fingerprint fails; others succeed."""
 
     def test_registry_low_confidence_batched(self):
-        from paramem.training.entry_memory import build_registry
+        from paramem.memory.entry import build_registry
         from paramem.training.recall_eval import probe_entries as _generate_recall_batch
 
         entries = [

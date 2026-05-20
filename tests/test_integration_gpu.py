@@ -29,32 +29,121 @@ pytestmark = [
 ]
 
 
+def _clear_lora_state(model) -> None:
+    """Restore *model* to clean base-model inference state in-place.
+
+    Two responsibilities, both required so the shared session model is safe
+    for the next consumer (this module's later tests AND subsequent test
+    files that receive the same session model):
+
+    1. **Disable injected LoRA adapter layers.**  After tests that call
+       :func:`~paramem.models.loader.create_adapter`, the base model's
+       ``nn.Linear`` layers are replaced by PEFT ``LoraLinear`` modules
+       whose ``_active_adapter`` may still point to a trained adapter.
+       Setting ``_active_adapter = []`` on every ``LoraLinear`` (via PEFT's
+       ``BaseTunerLayer.set_adapter``) makes each module's ``forward`` skip
+       the LoRA path and return ``base_layer(x)`` — identical to the
+       original linear behaviour.
+
+    2. **Restore generation-clean training state.**  Training paths
+       (``train_adapter`` via ``BackgroundTrainer`` / ``ConsolidationLoop``)
+       call ``model.gradient_checkpointing_enable()`` and ``model.train()``
+       and do not reliably revert them — in production every request goes
+       through ``handle_chat`` which calls ``gradient_checkpointing_disable()``
+       first, but contract tests that call the model directly inherit the
+       dirty state.  HF silently disables the KV cache when gradient
+       checkpointing is active (CLAUDE.md), which corrupts ``generate()``
+       output (truncated/garbage responses).  Disable checkpointing and put
+       the model back in ``eval()`` mode so downstream generation is clean.
+
+    No GPU memory is freed here; the lora_A/lora_B parameters remain
+    resident until the session model is deleted at session teardown.
+
+    Args:
+        model: The ``PreTrainedModel`` (possibly with injected PEFT layers)
+            to clean.  A plain model with no LoRA layers still gets its
+            checkpointing/eval state restored.
+    """
+    # (2) Always restore generation-clean state, even on a plain model with
+    # no LoRA layers — training may have toggled these on the base model.
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    model.eval()
+
+    # (1) Disable any injected LoRA adapters.
+    try:
+        from peft.tuners.tuners_utils import BaseTunerLayer
+    except ImportError:
+        # PEFT not installed — no LoRA layers could have been injected.
+        return
+    for module in model.modules():
+        if isinstance(module, BaseTunerLayer):
+            module.set_adapter([])
+
+
+def _restore_generation_state(model) -> None:
+    """Put *model* back in generation-clean state without touching adapters.
+
+    Training paths leave gradient checkpointing enabled and the model in
+    ``train()`` mode.  HF silently disables the KV cache while checkpointing
+    is active (CLAUDE.md), which corrupts ``generate()`` output for any later
+    test that reuses the shared session model.  Unlike :func:`_clear_lora_state`
+    this does NOT deactivate LoRA adapters — the class-scoped ``staging_model``
+    fixture owns the adapter lifecycle across its tests and must keep them
+    attached between cases.
+    """
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    model.eval()
+
+
+@pytest.fixture(autouse=True)
+def _restore_shared_model_state(gpu_base_model):
+    """Restore generation-clean state on the shared session model after each test.
+
+    Training tests in this module mutate the shared model's checkpointing /
+    train-mode flags (see :func:`_restore_generation_state`).  Without a
+    per-test reset, a later test in the same module that calls ``generate()``
+    (e.g. simulate-mode extraction, the extraction-helper end-to-end) inherits
+    the dirty state and produces truncated/garbage output.  Adapter cleanup
+    stays at module teardown via :func:`_clear_lora_state`.
+    """
+    model, _ = gpu_base_model
+    yield
+    _restore_generation_state(model)
+
+
 @pytest.fixture(scope="module")
-def model_and_tokenizer():
-    """Load Mistral 7B once for all GPU integration tests, unload on teardown.
+def model_and_tokenizer(gpu_base_model):
+    """Expose the session-scoped base model to all GPU integration tests in this module.
+
+    Delegates model loading to the session-scoped ``gpu_base_model`` fixture
+    (``conftest.py``) so that Mistral 7B is loaded exactly once per
+    ``pytest --gpu`` invocation rather than once per test file.
+
+    On module teardown, any LoRA adapter state accumulated during this
+    module's tests is cleared from the shared model: every ``LoraLinear``
+    layer has its active adapter set to ``[]``, which makes it behave
+    identically to the original ``nn.Linear`` for subsequent modules (see
+    PEFT ``LoraLinear.forward`` — empty ``active_adapters`` skips the LoRA
+    path entirely).  The lora_A/lora_B parameter tensors remain in GPU
+    memory (LoRA at rank 8 is negligible) until session teardown frees the
+    model.
 
     Uses ``load_server_config("tests/fixtures/server.yaml")`` to pin the
     calibration target. Test methods that need a different model should
     not be using this fixture — they should construct their own model
     explicitly, since this fixture is shared across the file.
     """
-    import gc
-
-    import torch
-
-    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
-    from paramem.models.loader import load_base_model
-    from paramem.server.config import load_server_config
-
-    cfg = load_server_config("tests/fixtures/server.yaml")
-    model, tokenizer = load_base_model(cfg.model_config)
+    model, tokenizer = gpu_base_model
     yield model, tokenizer
 
-    # Release GPU memory
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Module teardown: disable all injected LoRA adapters so subsequent
+    # test modules that receive the same base model see clean inference
+    # behaviour (no trained LoRA residuals from this module's tests).
+    # Uses the PEFT private import path; ImportError is non-fatal since
+    # if PEFT is unavailable no adapters could have been created.
+    _clear_lora_state(model)
 
 
 # --- 1. extract_procedural_graph ---
@@ -76,6 +165,7 @@ class TestExtractProceduralGraph:
             tokenizer,
             transcript,
             "test_proc",
+            speaker_id="Speaker0",
             max_tokens=1024,
             stt_correction=False,
         )
@@ -93,6 +183,7 @@ class TestExtractProceduralGraph:
             tokenizer,
             "[user] Stop.",
             "test_empty",
+            speaker_id="Speaker0",
             max_tokens=512,
             stt_correction=False,
         )
@@ -239,9 +330,9 @@ class TestTrainingSchedulerBehavior:
 class TestBackgroundTrainerTraining:
     def test_train_adapter_with_real_model(self, model_and_tokenizer, tmp_path):
         """Test BackgroundTrainer can train an adapter on real model."""
+        from paramem.memory.entry import assign_keys
         from paramem.models.loader import create_adapter
         from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
-        from paramem.training.indexed_memory import assign_keys
         from paramem.utils.config import AdapterConfig, TrainingConfig
 
         model, tokenizer = model_and_tokenizer
@@ -252,10 +343,7 @@ class TestBackgroundTrainerTraining:
         if "in_training" not in model.peft_config:
             model = create_adapter(model, AdapterConfig(), "in_training")
 
-        qa = [
-            {"question": "Where does Alex live?", "answer": "Alex lives in Millfield."},
-        ]
-        keyed = assign_keys(qa)
+        keyed = assign_keys([("Alex", "lives_in", "Millfield")])
 
         tc = TrainingConfig(num_epochs=1, batch_size=1)
         bt = BackgroundTrainer(
@@ -284,15 +372,14 @@ class TestBackgroundTrainerTraining:
 
     def test_pause_resume(self, model_and_tokenizer, tmp_path):
         """Test pause/resume during training."""
+        from paramem.memory.entry import assign_keys
         from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
-        from paramem.training.indexed_memory import assign_keys
         from paramem.utils.config import AdapterConfig, TrainingConfig
 
         model, tokenizer = model_and_tokenizer
 
         # Build enough data for training to take a moment
-        qa = [{"question": f"Q{i}?", "answer": f"A{i}."} for i in range(5)]
-        keyed = assign_keys(qa)
+        keyed = assign_keys([("Alex", f"fact_{i}", f"value_{i}") for i in range(5)])
 
         tc = TrainingConfig(num_epochs=3, batch_size=1)
         bt = BackgroundTrainer(
@@ -330,6 +417,12 @@ def staging_model(model_and_tokenizer):
 
     Using class scope avoids cross-test pollution of the module-level model
     fixture (which other tests may leave in an unexpected state).
+
+    On teardown all adapters added by this fixture are deleted so that later
+    tests and modules that share the same session model see a clean LoRA
+    state.  Per CLAUDE.md: never ``delete_adapter`` followed immediately by
+    ``create_adapter``; here the delete is final — no adapter is created
+    afterward within this teardown path.
     """
     from peft import PeftModel
 
@@ -339,16 +432,29 @@ def staging_model(model_and_tokenizer):
     model, tokenizer = model_and_tokenizer
     cfg = AdapterConfig()
 
+    added: list[str] = []
+
     # Wrap if not already a PeftModel
     if not isinstance(model, PeftModel):
         model = create_adapter(model, cfg, "episodic")
+        added.append("episodic")
 
     if "episodic" not in model.peft_config:
         model = create_adapter(model, cfg, "episodic")
+        added.append("episodic")
     if "in_training" not in model.peft_config:
         model = create_adapter(model, cfg, "in_training")
+        added.append("in_training")
 
-    return model, tokenizer
+    yield model, tokenizer
+
+    # Teardown: delete the adapters this fixture created so the shared model
+    # is left in a consistent state.  Adapters that already existed before
+    # this fixture (not in ``added``) are intentionally left alone — the
+    # module-level teardown in ``model_and_tokenizer`` handles final cleanup.
+    for name in added:
+        if name in model.peft_config:
+            model.delete_adapter(name)
 
 
 class TestStagingAdapterGPU:
@@ -473,14 +579,26 @@ class TestStagingAdapterGPU:
                 break
         assert checked
 
-        # Disk artifact written atomically (PEFT may save as .safetensors or .bin)
+        # Disk artifact written atomically. atomic_save_adapter promotes the
+        # weights into a timestamped slot under the kind dir
+        # (``episodic/<ts>/adapter_model.*``) — the layout production reads via
+        # find_live_slot — not directly into the kind dir. PEFT may save as
+        # .safetensors or .bin.
         target_dir = tmp_path / "episodic"
         assert target_dir.exists()
-        weight_files = list(target_dir.glob("adapter_model.*"))
-        assert weight_files, f"No adapter weight file in {target_dir}"
-        # No leftover tmp/old dirs
-        assert not list(tmp_path.glob("episodic.tmp.*"))
-        assert not (tmp_path / "episodic.old").exists()
+        weight_files = list(target_dir.glob("*/adapter_model.*"))
+        assert weight_files, f"No adapter weight file in any slot under {target_dir}"
+        # The promoted slot is a non-hidden timestamped subdir; the staging
+        # area (.pending/<ts>) must be empty after promotion.
+        promoted_slots = [
+            p for p in target_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+        ]
+        assert promoted_slots, f"No promoted slot directory under {target_dir}"
+        pending_root = target_dir / ".pending"
+        if pending_root.exists():
+            assert not list(pending_root.iterdir()), (
+                f"Leftover pending staging slots after commit: {list(pending_root.iterdir())}"
+            )
 
 
 # --- 7c. ExtractionPipeline.run chokepoint end-to-end on GPU ---
@@ -510,6 +628,7 @@ class TestRunExtractGraphHelper:
         provider/stage combinations without rewriting the scaffolding.
         """
         from paramem.graph.schema import SessionGraph
+        from paramem.memory.store import MemoryStore
         from paramem.server.config import load_server_config
         from paramem.training.consolidation import ConsolidationLoop
 
@@ -528,6 +647,7 @@ class TestRunExtractGraphHelper:
             training_config=server_config.training_config,
             episodic_adapter_config=server_config.episodic_adapter_config,
             semantic_adapter_config=server_config.semantic_adapter_config,
+            memory_store=MemoryStore(replay_enabled=cc.indexed_key_replay),
             output_dir=tmp_path,
             persist_graph=False,
             save_cycle_snapshots=False,
@@ -561,6 +681,7 @@ class TestRunExtractGraphHelper:
 class TestBatchConsolidationE2E:
     def test_extract_session_and_train(self, model_and_tokenizer, tmp_path):
         """End-to-end: extract sessions → prepare → train."""
+        from paramem.memory.store import MemoryStore
         from paramem.training.consolidation import ConsolidationLoop
         from paramem.utils.config import (
             AdapterConfig,
@@ -577,6 +698,7 @@ class TestBatchConsolidationE2E:
             training_config=TrainingConfig(num_epochs=2),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
+            memory_store=MemoryStore(replay_enabled=True),
             output_dir=tmp_path,
             persist_graph=False,
             save_cycle_snapshots=False,
@@ -595,7 +717,7 @@ class TestBatchConsolidationE2E:
         assert isinstance(episodic_rels, list)
         assert isinstance(procedural_rels, list)
 
-        # If any QA pairs were extracted, verify training works
+        # If any relations were extracted, verify training works
         if episodic_rels:
             result = loop.train_adapters(episodic_rels, procedural_rels, speaker_id="sp1")
             assert isinstance(result, dict)
@@ -667,8 +789,6 @@ class TestVRAMBudget:
         validator's predicted total and assert we stay under the
         hardware cap.
         """
-        import gc
-
         import torch
 
         from paramem.server.config import load_server_config
@@ -807,8 +927,9 @@ class TestVRAMBudget:
                 stt.unload()
             if tts_manager is not None:
                 tts_manager.unload_all()
-            gc.collect()
-            torch.cuda.empty_cache()
+            from paramem.server.vram_guard import safe_empty_cache
+
+            safe_empty_cache()
 
     def test_overbudget_config_rejected_before_load(self, caplog):
         """Oversized topology triggers enforce_live_budget rejection.
@@ -944,6 +1065,7 @@ class TestSimulateModePromptIteration:
         from pathlib import Path as _Path
 
         import paramem.server.app as _app
+        from paramem.memory.store import MemoryStore
         from paramem.server.config import load_server_config
         from paramem.server.consolidation import create_consolidation_loop
         from paramem.server.session_buffer import SessionBuffer
@@ -1006,7 +1128,10 @@ class TestSimulateModePromptIteration:
         )
 
         # D2: run_consolidation deleted; use _run_extraction_phase via _state.
-        loop = create_consolidation_loop(model, tokenizer, cfg)
+        # MemoryStore is lifespan-owned in production; construct it here with
+        # the same replay flag the server derives from config.
+        memory_store = MemoryStore(replay_enabled=cfg.consolidation.indexed_key_replay)
+        loop = create_consolidation_loop(model, tokenizer, cfg, memory_store)
         prior_config = _app._state.get("config")
         prior_buffer = _app._state.get("session_buffer")
         prior_ha = _app._state.get("ha_client")
@@ -1030,7 +1155,7 @@ class TestSimulateModePromptIteration:
         assert result["sessions"] == 1
         assert result.get("simulated") is True
         assert result["episodic_rels"] >= 1, (
-            f"Expected at least one episodic QA pair from simulate-mode run; "
+            f"Expected at least one episodic relation from simulate-mode run; "
             f"got episodic_rels={result['episodic_rels']}"
         )
 

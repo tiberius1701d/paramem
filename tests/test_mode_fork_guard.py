@@ -36,7 +36,7 @@ from pathlib import Path
 _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
     [
         # persistence layer — the one sanctioned fork point for venue dispatch
-        ("paramem/training/memory_persistence.py", "commit_tier_slot"),
+        ("paramem/memory/persistence.py", "commit_tier_slot"),
         # consolidation — unified entry and its helpers
         ("paramem/training/consolidation.py", "run_consolidation_cycle"),
         ("paramem/training/consolidation.py", "_resolve_target_slot"),

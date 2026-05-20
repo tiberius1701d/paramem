@@ -31,7 +31,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from paramem.models.loader import create_adapter, load_base_model, switch_adapter  # noqa: E402
 from paramem.training.consolidation import ConsolidationLoop  # noqa: E402
-from paramem.training.indexed_memory import probe_all_keys  # noqa: E402
+from archive.legacy_qa import probe_all_keys  # noqa: E402
 from paramem.utils.config import (  # noqa: E402
     AdapterConfig,
     ConsolidationConfig,

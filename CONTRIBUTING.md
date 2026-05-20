@@ -22,7 +22,7 @@ conda activate paramem
 pytest tests/
 
 # Specific test file
-pytest tests/test_indexed_memory.py -v
+pytest tests/test_entry_format.py -v
 
 # Quick check
 pytest tests/ -x -q

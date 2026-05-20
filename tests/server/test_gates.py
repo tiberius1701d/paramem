@@ -2,7 +2,7 @@
 
 All tests run without GPU.  The model and tokenizer are MagicMocks.
 ``paramem.training.indexed_memory.probe_key`` is patched in every test that
-exercises gates 3 or 4 in QA mode.  ``paramem.training.entry_memory.probe_entry``
+exercises gates 3 or 4 in QA mode.  ``paramem.memory.entry.probe_entry``
 is patched for quad-mode tests.  Registry files are written to ``tmp_path``.
 
 Coverage targets (spec §Tests):
@@ -560,7 +560,7 @@ class TestEvaluateGatesNoNewSessions:
         trial_dir = _make_trial_adapter(tmp_path)
         model = _make_mock_model(["episodic"])
 
-        with patch("paramem.training.entry_memory.probe_entry") as mock_probe:
+        with patch("paramem.memory.entry.probe_entry") as mock_probe:
             mock_probe.return_value = {
                 "key": "graph1",
                 "subject": "S",
@@ -569,7 +569,7 @@ class TestEvaluateGatesNoNewSessions:
                 "confidence": 1.0,
                 "raw_output": '{"key":"graph1","subject":"S","predicate":"p","object":"O"}',
             }
-            with patch("paramem.training.entry_memory.verify_confidence", return_value=1.0):
+            with patch("paramem.memory.entry.verify_confidence", return_value=1.0):
                 evaluate_gates(
                     model=model,
                     tokenizer=MagicMock(),
@@ -659,7 +659,7 @@ class TestGate3AdapterReloadQuad:
             ),
         }
 
-        with patch("paramem.training.entry_memory.probe_entry", return_value=probe_result):
+        with patch("paramem.memory.entry.probe_entry", return_value=probe_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -679,7 +679,7 @@ class TestGate3AdapterReloadQuad:
 
         fail_result = {"raw_output": "", "failure_reason": "quad_parse_failure"}
 
-        with patch("paramem.training.entry_memory.probe_entry", return_value=fail_result):
+        with patch("paramem.memory.entry.probe_entry", return_value=fail_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -742,8 +742,8 @@ class TestGate4RecallCheckQuad:
                 ),
             }
 
-        with patch("paramem.training.entry_memory.probe_entry", side_effect=_probe_quad):
-            with patch("paramem.training.entry_memory.verify_confidence", return_value=1.0):
+        with patch("paramem.memory.entry.probe_entry", side_effect=_probe_quad):
+            with patch("paramem.memory.entry.verify_confidence", return_value=1.0):
                 g = _gate_4_recall_check(
                     model=model,
                     tokenizer=MagicMock(),
@@ -826,7 +826,7 @@ class TestGate3KindSubdirLayout:
             "confidence": 0.99,
             "raw_output": '{"key": "graph1", "subject": "S", "predicate": "p", "object": "O"}',
         }
-        with patch("paramem.training.entry_memory.probe_entry", return_value=probe_result):
+        with patch("paramem.memory.entry.probe_entry", return_value=probe_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -861,7 +861,7 @@ class TestGate3KindSubdirLayout:
             "confidence": 0.99,
             "raw_output": '{"key": "graph1", "subject": "S", "predicate": "p", "object": "O"}',
         }
-        with patch("paramem.training.entry_memory.probe_entry", return_value=probe_result):
+        with patch("paramem.memory.entry.probe_entry", return_value=probe_result):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},

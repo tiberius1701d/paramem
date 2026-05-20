@@ -36,7 +36,7 @@ def _make_loop() -> ConsolidationLoop:
     loop.model = MagicMock()
     loop.tokenizer = MagicMock()
     loop.training_config = TrainingConfig()
-    from paramem.training.memory_store import MemoryStore as _MS
+    from paramem.memory.store import MemoryStore as _MS
 
     loop.store = _MS(replay_enabled=False)
     loop.procedural_sp_index: dict = {}
@@ -277,7 +277,7 @@ class TestAttributeKeysAssignment:
 
     def test_email_attribute_gets_a_graph_key(self) -> None:
         """An email attribute ends up in the episodic keyed set with a graphN key."""
-        from paramem.training.entry_memory import assign_keys
+        from paramem.memory.entry import assign_keys
 
         graph = _make_mock_graph(
             entity_attributes={"Faye": {"email": "f@f.com"}},
@@ -295,7 +295,7 @@ class TestAttributeKeysAssignment:
 
     def test_key_prefix_is_graph_for_attribute_relations(self) -> None:
         """Attribute relations are non-preference so they land in the graph* key range."""
-        from paramem.training.entry_memory import assign_keys
+        from paramem.memory.entry import assign_keys
 
         graph = _make_mock_graph(
             entity_attributes={"George": {"phone": "+1 800 000 0000"}},

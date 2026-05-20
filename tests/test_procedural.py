@@ -117,7 +117,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 self.tokenizer = MagicMock()
                 self._procedural_next_index = 1
                 self.procedural_sp_index: dict = {}
-                from paramem.training.memory_store import MemoryStore as _MS
+                from paramem.memory.store import MemoryStore as _MS
 
                 self.store = _MS(replay_enabled=False)
                 self.procedural_config = MagicMock()
@@ -271,16 +271,17 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         the same result as the former build_registry(all_procedural) full rebuild
         for new entries, while leaving existing entries with their original values.
         """
-        from paramem.training.indexed_memory import compute_simhash
+        from paramem.memory.entry import compute_simhash
 
         stub, fake_qa = self._make_stub(monkeypatch, tmp_path, train_raises=False)
         # An existing key that was already trained — must survive unchanged.
-        existing_hash = compute_simhash("proc0", "Old question?", "Old answer.")
+        existing_hash = compute_simhash("proc0", "Alice", "was_here", "Berlin")
         stub.store.simhashes_in_tier("procedural")["proc0"] = existing_hash
         stub.store._entries_flat_view()["proc0"] = {
             "key": "proc0",
-            "question": "Old question?",
-            "answer": "Old answer.",
+            "subject": "Alice",
+            "predicate": "was_here",
+            "object": "Berlin",
         }
 
         relations = [
@@ -309,7 +310,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
             "proc2 must be added to procedural_simhash"
         )
 
-        from paramem.training.entry_memory import compute_simhash
+        from paramem.memory.entry import compute_simhash
 
         expected_proc1 = compute_simhash(
             "proc1",

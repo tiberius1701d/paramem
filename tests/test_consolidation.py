@@ -16,9 +16,9 @@ from paramem.evaluation.consolidation_metrics import (
     compute_semantic_drift,
     format_phase3_summary,
 )
+from paramem.memory.store import MemoryStore as _MS  # noqa: F401
 from paramem.training.consolidation import ConsolidationLoop, CycleResult, _mentions_any
 from paramem.training.curriculum import CurriculumSampler
-from paramem.training.memory_store import MemoryStore as _MS  # noqa: F401
 from paramem.utils.config import ConsolidationConfig
 
 
@@ -246,7 +246,7 @@ class TestExtractionPathParity:
             model.peft_config["procedural"] = MagicMock()
         procedural_adapter = AdapterConfig() if procedural_enabled else None
 
-        from paramem.training.memory_store import MemoryStore as _MS
+        from paramem.memory.store import MemoryStore as _MS
 
         return ConsolidationLoop(
             model=model,
@@ -1181,8 +1181,8 @@ class TestFullCycleGateHelpers:
 
     def test_is_full_cycle_due_same_window_returns_false(self, tmp_path):
         """Last full's window_stamp matches current → already consolidated."""
+        from paramem.memory.interim_adapter import current_full_consolidation_stamp
         from paramem.server.app import _is_full_cycle_due
-        from paramem.server.interim_adapter import current_full_consolidation_stamp
 
         period = "every 84h"
         current_stamp = current_full_consolidation_stamp(period)

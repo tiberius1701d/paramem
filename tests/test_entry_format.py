@@ -10,17 +10,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from paramem.training.entry_memory import (
+from paramem.memory.entry import (
     RECALL_TEMPLATE,
+    SIMHASH_BITS,
     _build_response,
     assign_keys,
     build_registry,
     compute_simhash,
     format_entry_training,
     parse_recalled_entry,
+    simhash_confidence,
     verify_confidence,
 )
-from paramem.training.indexed_memory import SIMHASH_BITS, simhash_confidence
 
 # --- assign_keys ---
 
@@ -243,16 +244,6 @@ class TestComputeSimhash:
         result = compute_simhash("graph1", "", "", "")
         assert isinstance(result, int)
 
-    def test_not_equal_to_qa_simhash(self):
-        """Quad and QA simhashes must not collide even on same semantic content."""
-        from paramem.training.indexed_memory import compute_simhash as qa_simhash
-
-        quad_h = compute_simhash("graph1", "Alice", "lives_in", "Berlin")
-        qa_h = qa_simhash("graph1", "Where does Alice live?", "Berlin")
-        # They hash different content strings — they should almost certainly differ.
-        # Not a strict requirement, but documents the design intention.
-        assert quad_h != qa_h or True  # always passes; here as a documentation assertion
-
 
 # --- verify_confidence ---
 
@@ -305,7 +296,7 @@ class TestVerifyConfidence:
 
     def test_enriched_registry_shape(self):
         """Enriched registry (dict-of-dicts) must also work."""
-        from paramem.training.entry_memory import build_enriched_registry
+        from paramem.memory.entry import build_enriched_registry
 
         quad = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
         enriched = build_enriched_registry([quad])
@@ -402,14 +393,3 @@ class TestFormatQuadrupleTraining:
             assert "input_ids" in ex
             assert "attention_mask" in ex
             assert "labels" in ex
-
-    def test_fewer_examples_than_qa_format(self, mock_tokenizer):
-        """format_entry_training must produce exactly half as many examples as
-        format_indexed_training for the same number of facts."""
-        from paramem.training.indexed_memory import format_indexed_training
-
-        qa_pairs = [{"key": "graph1", "question": "Q?", "answer": "A"}]
-        quads = [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}]
-        qa_examples = format_indexed_training(qa_pairs, mock_tokenizer)
-        quad_examples = format_entry_training(quads, mock_tokenizer)
-        assert len(quad_examples) * 2 == len(qa_examples)

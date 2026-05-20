@@ -89,6 +89,42 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_gpu)
 
 
+@pytest.fixture(scope="session")
+def gpu_base_model():
+    """Load the base model exactly once for the entire GPU test session.
+
+    Loads Mistral 7B (pinned via ``tests/fixtures/server.yaml``) on first
+    request by any ``@pytest.mark.gpu`` test, keeps it alive for the full
+    session, and on teardown unloads via :func:`safe_empty_cache` to release
+    cuBLAS workspaces alongside the PyTorch allocator pool.
+
+    Lazy CUDA init: all heavy imports (torch, transformers, PEFT) are
+    deferred into the fixture body so that collection-time imports do not
+    initialise the CUDA driver when ``CUDA_VISIBLE_DEVICES=""`` is active
+    (the default when ``--gpu`` is absent).
+
+    Yields:
+        tuple[PreTrainedModel, PreTrainedTokenizer]: The base model and its
+        tokenizer. The model is a plain ``PreTrainedModel`` on GPU; adapter
+        state accumulated during a test module is cleaned up by that module's
+        own teardown fixtures (see ``test_integration_gpu.py``).
+    """
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+
+    from paramem.models.loader import load_base_model
+    from paramem.server.config import load_server_config
+    from paramem.server.vram_guard import safe_empty_cache
+
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    model, tokenizer = load_base_model(cfg.model_config)
+    yield model, tokenizer
+
+    # Teardown: release GPU memory using safe_empty_cache so cuBLAS
+    # workspaces are freed alongside the PyTorch allocator pool.
+    del model
+    safe_empty_cache()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_paramem_security_env(monkeypatch):
     """Pop security-relevant env vars for every test.

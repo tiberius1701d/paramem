@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import networkx as nx
 import pytest
 
+from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
 from paramem.server.active_store_migration import (
     TIERS,
     MigrationState,
@@ -36,7 +37,6 @@ from paramem.server.active_store_migration import (
     save_state,
     state_path,
 )
-from paramem.training.memory_persistence import _IK_KEY_ATTR, save_memory_to_disk
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -57,7 +57,7 @@ def _make_config(tmp_path: Path, mode: str = "train") -> MagicMock:
 def _write_simulate_graph(simulate_dir: Path, tier: str, entries: list[dict]) -> Path:
     """Write a graph.json in the simulate-store layout (plaintext for tests).
 
-    Uses :func:`paramem.training.memory_persistence.save_memory_to_disk` with
+    Uses :func:`paramem.memory.persistence.save_memory_to_disk` with
     ``encrypted=False`` so the file is human-readable in the test filesystem.
     """
     tier_dir = simulate_dir / tier
@@ -309,7 +309,7 @@ def _make_loop_train_to_simulate(
     - A model that will yield a successful ``reconstruct_graph`` result
       (mocked).
     """
-    from paramem.training.memory_store import MemoryStore as _MS
+    from paramem.memory.store import MemoryStore as _MS
 
     if keys is None:
         keys = ["g0", "g1", "g2"]
@@ -359,7 +359,7 @@ class TestMigrateTierTrainToSimulate:
 
     def test_none_registry_skipped(self, tmp_path):
         """When loop's store has replay disabled, raise _TierSkipped."""
-        from paramem.training.memory_store import MemoryStore as _MS
+        from paramem.memory.store import MemoryStore as _MS
 
         cfg = _make_config(tmp_path, mode="simulate")
         loop = MagicMock()
@@ -396,7 +396,7 @@ class TestMigrateTierTrainToSimulate:
         assert target.exists()
 
         # Verify the written graph has all expected keys
-        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loaded = load_memory_from_disk(target)
         graph_keys = {q["key"] for q in iter_entries(loaded)}
@@ -468,7 +468,7 @@ class TestMigrateTierTrainToSimulate:
         ):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
-        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         # Unified layout: graph written under adapter_dir, not simulate_dir.
         loaded = load_memory_from_disk(cfg.adapter_dir / "episodic" / "graph.json")
@@ -488,7 +488,7 @@ class TestMigrateOrchestrator:
         cfg = _make_config(tmp_path, mode="simulate")
         # No registry on loop → all tiers raise _TierSkipped → flagged complete
         loop = MagicMock()
-        from paramem.training.memory_store import MemoryStore as _MS
+        from paramem.memory.store import MemoryStore as _MS
 
         loop.store = _MS(replay_enabled=False)
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
@@ -507,7 +507,7 @@ class TestMigrateOrchestrator:
         state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
 
         loop = MagicMock()
-        from paramem.training.memory_store import MemoryStore as _MS
+        from paramem.memory.store import MemoryStore as _MS
 
         loop.store = _MS(replay_enabled=True)
         loop.training_config = MagicMock(num_epochs=2)
@@ -539,10 +539,10 @@ class TestMigrateOrchestrator:
 
         with (
             patch(
-                "paramem.training.entry_memory.format_entry_training",
+                "paramem.memory.entry.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
-            patch("paramem.training.entry_memory.build_registry", return_value={}),
+            patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
@@ -568,7 +568,7 @@ class TestMigrateOrchestrator:
         state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
 
         loop = MagicMock()
-        from paramem.training.memory_store import MemoryStore as _MS
+        from paramem.memory.store import MemoryStore as _MS
 
         loop.store = _MS(replay_enabled=True)
         loop.training_config = MagicMock(num_epochs=2)
@@ -590,10 +590,10 @@ class TestMigrateOrchestrator:
 
         with (
             patch(
-                "paramem.training.entry_memory.format_entry_training",
+                "paramem.memory.entry.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
-            patch("paramem.training.entry_memory.build_registry", return_value={}),
+            patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
@@ -613,7 +613,7 @@ class TestMigrateOrchestrator:
             _write_simulate_graph(cfg.simulate_dir, tier, [])
 
         loop = MagicMock()
-        from paramem.training.memory_store import MemoryStore as _MS
+        from paramem.memory.store import MemoryStore as _MS
 
         loop.store = _MS(replay_enabled=False)
 
@@ -644,7 +644,7 @@ class TestMigrateTierSimulateToTrain:
         loop.semantic_config = MagicMock()
         loop.procedural_config = MagicMock()
         loop.training_config = MagicMock(num_epochs=2)
-        from paramem.training.memory_store import MemoryStore as _MS
+        from paramem.memory.store import MemoryStore as _MS
 
         loop.store = _MS(replay_enabled=True)
         loop.wandb_config = None
@@ -716,11 +716,11 @@ class TestMigrateTierSimulateToTrain:
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch(
-                "paramem.training.entry_memory.format_entry_training",
+                "paramem.memory.entry.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
             patch(
-                "paramem.training.entry_memory.build_registry",
+                "paramem.memory.entry.build_registry",
                 return_value={"g0": 0, "g1": 0},
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
@@ -754,11 +754,11 @@ class TestMigrateTierSimulateToTrain:
         built_registry = {"g0": 123, "g1": 456}
         with (
             patch(
-                "paramem.training.entry_memory.format_entry_training",
+                "paramem.memory.entry.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
             patch(
-                "paramem.training.entry_memory.build_registry",
+                "paramem.memory.entry.build_registry",
                 return_value=built_registry,
             ),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
@@ -769,7 +769,7 @@ class TestMigrateTierSimulateToTrain:
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-        from paramem.training.indexed_memory import load_registry
+        from paramem.memory.persistence import load_registry
 
         on_disk = load_registry(cfg.adapter_dir / "episodic" / "simhash_registry.json")
         assert on_disk == built_registry
@@ -786,10 +786,10 @@ class TestMigrateTierSimulateToTrain:
 
         with (
             patch(
-                "paramem.training.entry_memory.format_entry_training",
+                "paramem.memory.entry.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ),
-            patch("paramem.training.entry_memory.build_registry", return_value={}),
+            patch("paramem.memory.entry.build_registry", return_value={}),
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter") as save_mock,
@@ -824,15 +824,13 @@ class TestMigrateTierSimulateToTrain:
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
         with (
             patch(
-                "paramem.training.entry_memory.format_entry_training",
+                "paramem.memory.entry.format_entry_training",
                 return_value=[{"input_ids": [0]}],
             ) as entry_fmt,
-            patch("paramem.training.indexed_memory.format_indexed_training") as legacy_fmt,
             patch(
-                "paramem.training.entry_memory.build_registry",
+                "paramem.memory.entry.build_registry",
                 return_value={"g0": 0, "g1": 0},
             ) as entry_reg,
-            patch("paramem.training.indexed_memory.build_registry") as legacy_reg,
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
@@ -842,6 +840,4 @@ class TestMigrateTierSimulateToTrain:
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
         entry_fmt.assert_called_once()
-        legacy_fmt.assert_not_called()
         entry_reg.assert_called_once()
-        legacy_reg.assert_not_called()

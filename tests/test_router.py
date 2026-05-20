@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from paramem.memory.store import MemoryStore
 from paramem.server.router import (
     Intent,
     QueryRouter,
@@ -13,7 +14,6 @@ from paramem.server.router import (
     _interim_sort_key,
     _is_interrogative,
 )
-from paramem.training.memory_store import MemoryStore
 
 # ---------------------------------------------------------------------------
 # Helpers

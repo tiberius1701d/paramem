@@ -32,7 +32,7 @@ from paramem.evaluation.embedding_scorer import compute_similarity  # noqa: E402
 from paramem.evaluation.recall import generate_answer  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
 from paramem.training.dataset import _format_inference_prompt  # noqa: E402
-from paramem.training.indexed_memory import (  # noqa: E402
+from archive.legacy_qa import (  # noqa: E402
     DEFAULT_CONFIDENCE_THRESHOLD,
     RECALL_TEMPLATE,
     build_registry,

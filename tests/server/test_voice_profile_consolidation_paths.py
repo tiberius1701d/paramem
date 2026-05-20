@@ -69,7 +69,7 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
     mock_buffer.pending_count = len(pending)
     mock_buffer.mark_consolidated.return_value = None
 
-    from paramem.training.memory_store import MemoryStore as _MS
+    from paramem.memory.store import MemoryStore as _MS
 
     state_patch = {
         "config": config,

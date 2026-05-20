@@ -2,11 +2,11 @@
 
 from unittest.mock import MagicMock, patch
 
+from paramem.memory.store import MemoryStore as _MS
 from paramem.server.cloud.base import CloudAgent, CloudResponse, ToolCall
 from paramem.server.cloud.openai_compat import OpenAICompatAgent
 from paramem.server.cloud.registry import get_cloud_agent
 from paramem.server.config import CloudAgentConfig
-from paramem.training.memory_store import MemoryStore as _MS
 
 
 def _stub_grouped_recall(fact_text: str):
@@ -353,7 +353,7 @@ class TestPrivacyRouting:
         config.voice.load_prompt.return_value = "You are a helper."
         with (
             patch(
-                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                "paramem.memory.probe.probe_keys_grouped_by_adapter",
                 side_effect=_stub_grouped_recall("Jordan lives in Berlin"),
             ),
             patch(
@@ -588,7 +588,7 @@ class TestPrivacyRouting:
 
         with (
             patch(
-                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                "paramem.memory.probe.probe_keys_grouped_by_adapter",
                 side_effect=_stub_grouped_recall("Alex prefers dim lights"),
             ),
             patch("paramem.models.loader.switch_adapter"),
@@ -650,7 +650,7 @@ class TestPrivacyRouting:
 
         with (
             patch(
-                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                "paramem.memory.probe.probe_keys_grouped_by_adapter",
                 side_effect=_stub_grouped_recall("Jordan lives somewhere"),
             ),
             patch("paramem.models.loader.switch_adapter"),

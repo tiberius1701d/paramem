@@ -49,32 +49,21 @@ _FIXTURE_PATH = Path(__file__).parent / "fixtures" / "plausibility_contract.json
 _MATCH_THRESHOLD = 0.75
 
 
-@pytest.fixture(scope="module")
-def loaded_model():
-    """Load the Mistral 7B local plausibility judge once per module.
+@pytest.fixture()
+def loaded_model(gpu_base_model):
+    """Expose the session-scoped base model for plausibility contract tests.
 
-    Uses ``load_server_config("tests/fixtures/server.yaml")`` to pin the
-    calibration target. The 75% threshold above is anchored to Mistral
-    7B at temperature 0; loading any other model would silently
-    re-calibrate against an untested baseline.
+    Delegates to the session-scoped ``gpu_base_model`` fixture
+    (``conftest.py``) so the model is loaded exactly once per
+    ``pytest --gpu`` invocation.  Inference-only: this file creates no
+    adapters, so no teardown cleanup is required beyond what the session
+    fixture handles.
+
+    The 75% threshold above is anchored to Mistral 7B at temperature 0;
+    loading any other model would silently re-calibrate against an
+    untested baseline.
     """
-    import gc
-    import os
-
-    import torch
-
-    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
-    from paramem.models.loader import load_base_model
-    from paramem.server.config import load_server_config
-
-    cfg = load_server_config("tests/fixtures/server.yaml")
-    model, tokenizer = load_base_model(cfg.model_config)
-    yield model, tokenizer
-
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    return gpu_base_model
 
 
 @pytest.fixture(scope="module")
@@ -102,7 +91,17 @@ def test_plausibility_prompt_llm_compliance(loaded_model, fixture_data):
         for f in labeled_facts
     ]
 
-    survivors, _raw = _local_plausibility_filter(judge_input, transcript, model, tokenizer)
+    # Mirror production: the judge always runs inside ExtractionPipeline's
+    # ``disable_adapter()`` context (extraction_pipeline.py:262-263) — the base
+    # model judges, never a personal adapter. Replicate that here so the result
+    # is not contaminated by adapters that earlier shared-model tests left loaded.
+    from peft import PeftModel
+
+    if isinstance(model, PeftModel):
+        with model.disable_adapter():
+            survivors, _raw = _local_plausibility_filter(judge_input, transcript, model, tokenizer)
+    else:
+        survivors, _raw = _local_plausibility_filter(judge_input, transcript, model, tokenizer)
     assert survivors is not None, "Judge returned None (parse failure) — check raw output"
 
     survivor_keys = {_fact_key(f) for f in survivors}

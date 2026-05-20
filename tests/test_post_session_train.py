@@ -177,7 +177,7 @@ class TestFirstCallCreatesInterimAdapter:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_create_side_effect,
             ),
             patch("paramem.training.trainer.train_adapter"),
@@ -217,7 +217,7 @@ class TestFirstCallCreatesInterimAdapter:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_create_side_effect,
             ),
             patch("paramem.training.trainer.train_adapter"),
@@ -259,7 +259,7 @@ class TestSecondCallReusesAdapter:
 
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch("paramem.server.interim_adapter.create_interim_adapter") as mock_create,
+            patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -308,7 +308,7 @@ class TestStampRolloverCreatesNewAdapter:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_create_side_effect,
             ) as mock_create,
             patch("paramem.training.trainer.train_adapter"),
@@ -351,7 +351,7 @@ class TestZeroFactsIsNoop:
 
         with (
             patch.object(loop, "extract_session", return_value=([], [])),
-            patch("paramem.server.interim_adapter.create_interim_adapter") as mock_create,
+            patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
         ):
             result = loop.post_session_train(
                 "Empty transcript",
@@ -403,7 +403,7 @@ class TestTrainingFailureKeepsRegistryClean:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.training.trainer.train_adapter", side_effect=_raise),
@@ -440,7 +440,7 @@ class TestTrainingFailureKeepsRegistryClean:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.training.trainer.train_adapter", side_effect=_raise),
@@ -478,7 +478,7 @@ class TestMaxInterimCountZeroQueues:
 
         with (
             patch.object(loop, "extract_session", return_value=(qa, [])),
-            patch("paramem.server.interim_adapter.create_interim_adapter") as mock_create,
+            patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
             patch("paramem.training.trainer.train_adapter") as mock_train,
         ):
             result = loop.post_session_train(
@@ -555,7 +555,7 @@ class TestRegisterAfterSuccessNotBefore:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=lambda m, cfg, s: m,
             ),
             patch(
@@ -595,7 +595,7 @@ class TestRegisterAfterSuccessNotBefore:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=lambda m, cfg, s: m,
             ),
             patch("paramem.training.trainer.train_adapter"),
@@ -663,7 +663,7 @@ def _make_mock_loop_with_procedural(tmp_path: Path):
 
 # Shared patch list for a successful post_session_train call (no procedural).
 _COMMON_PATCHES = [
-    "paramem.server.interim_adapter.create_interim_adapter",
+    "paramem.memory.interim_adapter.create_interim_adapter",
     "paramem.training.trainer.train_adapter",
     "paramem.training.consolidation.format_entry_training",
     "paramem.models.loader.switch_adapter",
@@ -693,7 +693,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(2), _fake_proc_rels(1)),
             ),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -744,7 +744,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(2), []),  # empty procedural_rels
             ),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -782,7 +782,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(2), _fake_proc_rels(2)),
             ),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -878,7 +878,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(2), _fake_proc_rels(1)),
             ),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             # train_adapter is imported at module level in consolidation.py;
             # patch it there so both the episodic (_train_adapter local alias)
             # and procedural (module-level train_adapter) calls are intercepted.
@@ -964,7 +964,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(1), _fake_proc_rels(1)),
             ),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -1011,7 +1011,7 @@ class TestTrainingOutputDirUniqueness:
 
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -1095,7 +1095,7 @@ class TestTrainingOutputDirUniqueness:
                 "extract_session",
                 return_value=(_fake_qa(2), _fake_proc_rels(1)),
             ),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -1176,7 +1176,7 @@ class TestRegistryLastWriteOrder:
 
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -1230,7 +1230,7 @@ class TestRegistryLastWriteOrder:
 
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
@@ -1546,7 +1546,7 @@ class TestManifestWrittenPostSession:
 
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
-            patch("paramem.server.interim_adapter.create_interim_adapter"),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch("paramem.training.trainer.train_adapter"),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),

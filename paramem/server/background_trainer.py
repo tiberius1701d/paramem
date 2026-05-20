@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from paramem.training.entry_memory import format_entry_training
+from paramem.memory.entry import format_entry_training
 
 # Re-exported for ``paramem/server/app.py`` (/status endpoint) which imports
 # ``is_thermal_policy_active`` from this module by qualified name.  The

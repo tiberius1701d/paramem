@@ -1075,7 +1075,7 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
             _load_one(name, slot)
 
     # ---- Interim adapters ----
-    from paramem.server.interim_adapter import iter_interim_dirs
+    from paramem.memory.interim_adapter import iter_interim_dirs
 
     for _interim_name, _interim_path in iter_interim_dirs(config.adapter_dir):
         sweep_orphan_pending(_interim_path)
@@ -1779,13 +1779,13 @@ async def lifespan(app: FastAPI):
     # ``config.inference.preload_cache`` is True; with it off, the store stays
     # empty for entries and inference pays per-key source latency on misses
     # — supported (just slower).
-    from paramem.training.memory_source import (
+    from paramem.memory.source import (
         DiskMemorySource as _DiskMemorySource,
     )
-    from paramem.training.memory_source import (
+    from paramem.memory.source import (
         WeightMemorySource as _WeightMemorySource,
     )
-    from paramem.training.memory_store import MemoryStore as _MemoryStore
+    from paramem.memory.store import MemoryStore as _MemoryStore
 
     memory_store = _MemoryStore(
         replay_enabled=config.consolidation.indexed_key_replay,
@@ -2705,7 +2705,7 @@ async def status():
                 _reg_path = config.adapter_dir / _tier / "indexed_key_registry.json"
                 if _reg_path.exists():
                     keys_count += len(_KeyRegistry.load(_reg_path))
-            from paramem.server.interim_adapter import iter_interim_dirs as _iter_int
+            from paramem.memory.interim_adapter import iter_interim_dirs as _iter_int
 
             for _interim_name, _interim_d in _iter_int(config.adapter_dir):
                 _reg_path = _interim_d / "indexed_key_registry.json"
@@ -2761,7 +2761,7 @@ async def status():
     # the refresh_cadence boundary measured from midnight, so the next
     # boundary is fully deterministic from the clock. None when cadence is
     # disabled (manual-only mode).
-    from paramem.server.interim_adapter import compute_schedule_period_seconds
+    from paramem.memory.interim_adapter import compute_schedule_period_seconds
 
     next_interim_seconds: int | None = None
     _refresh_seconds = compute_schedule_period_seconds(config.consolidation.refresh_cadence)
@@ -2817,7 +2817,7 @@ async def status():
                     _h = _reg.get_health()
                     if _h is not None:
                         adapter_health[_tier] = _h
-            from paramem.server.interim_adapter import iter_interim_dirs as _iter_int_h
+            from paramem.memory.interim_adapter import iter_interim_dirs as _iter_int_h
 
             for _interim_name, _interim_d in _iter_int_h(config.adapter_dir):
                 _reg_path = _interim_d / "indexed_key_registry.json"
@@ -3207,7 +3207,7 @@ def _load_model_into_state(config) -> None:
     # before restart. The new code paths use iter_interim_dirs() which scans
     # adapter_dir/episodic/interim_*, so legacy adapter_dir/episodic_interim_*
     # dirs would be invisible and produce a silently degraded server.
-    from paramem.server.interim_adapter import detect_legacy_adapter_layout
+    from paramem.memory.interim_adapter import detect_legacy_adapter_layout
 
     _legacy = detect_legacy_adapter_layout(config.adapter_dir)
     if _legacy:
@@ -4773,8 +4773,8 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
     now set via ``loop.output_dir`` only, leaving ``trial_config.paths.data``
     alone so config-derived paths (sessions, debug, prompts) remain valid.
     """
+    from paramem.memory.store import MemoryStore as _MemoryStore
     from paramem.server.consolidation import create_consolidation_loop
-    from paramem.training.memory_store import MemoryStore as _MemoryStore
 
     # Trial path: construct a fresh, isolated store that mirrors the trial
     # adapter dir's registries.  Do NOT reuse the live ``_state["memory_store"]``
@@ -6414,7 +6414,7 @@ def _is_full_cycle_due(config) -> bool:
     a full window has elapsed, and at that point it has actual content to
     consolidate.
     """
-    from paramem.server.interim_adapter import current_full_consolidation_stamp
+    from paramem.memory.interim_adapter import current_full_consolidation_stamp
 
     period = config.consolidation.consolidation_period_string
     if not period:

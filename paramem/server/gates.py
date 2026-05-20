@@ -842,7 +842,7 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        from paramem.training.entry_memory import probe_entry
+        from paramem.memory.entry import probe_entry
 
         result = probe_entry(model, tokenizer, first_key)
 
@@ -979,10 +979,10 @@ def _gate_4_recall_check(
             )
 
     # Probe + verifier.  Imports are lazy to keep the module torch-free at import time.
-    from paramem.training.entry_memory import (
+    from paramem.memory.entry import (
         probe_entry as _probe_fn,
     )
-    from paramem.training.entry_memory import (
+    from paramem.memory.entry import (
         verify_confidence as _verify_confidence,
     )
 
