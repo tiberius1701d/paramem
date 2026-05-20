@@ -206,30 +206,33 @@ class TestPlausibilityPromptContract:
             assert rule.lower() in tmpl.lower(), f"Plausibility prompt missing rule: {rule!r}"
 
     def test_keep_default_disposition(self):
-        """The prompt uses a KEEP-by-default model. Regressing to DROP-by-default
+        """The prompt uses a keep-by-default model. Regressing to drop-by-default
         silently discards valid facts — a data-loss bug that only surfaces
         during a full extraction sweep. This assertion guards that semantic flip.
 
-        The contract is structural, not literal: the KEEP section must
-        appear before DROP, and the KEEP section body must declare a
-        default-disposition (i.e. KEEP applies unless a DROP rule matches).
-        Surface wording — "Default: KEEP", "Default action", etc. — is
-        free to evolve; the structural ordering and semantic claim are not.
+        The contract is structural, not literal: the default disposition must
+        be to keep the fact (IGNORE — keep unless a drop rule matches), it must
+        be declared as the default, and it must appear before the drop rules.
+        Surface wording — "Default action", "IGNORE", a "## KEEP" header — is
+        free to evolve; the keep-by-default semantics and the ordering are not.
         """
         tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
         lower = tmpl.lower()
-        keep_idx = lower.find("## keep")
-        drop_idx = lower.find("## drop")
-        assert keep_idx >= 0, "Plausibility prompt missing '## KEEP' section header."
-        assert drop_idx >= 0, "Plausibility prompt missing '## DROP' section header."
-        assert keep_idx < drop_idx, (
-            "KEEP section must precede DROP section — order encodes default disposition."
+        # The default action must KEEP the fact (IGNORE), not drop it.
+        assert "default action" in lower, (
+            "Plausibility prompt must declare a default action (keep-by-default). "
+            "Removing this primes the model to drop on judgment, causing silent data loss."
         )
-        keep_section = lower[keep_idx:drop_idx]
-        assert "default" in keep_section, (
-            "KEEP section must declare default disposition (e.g. 'Default action', "
-            "'Default: KEEP'). Removing this primes the model to drop on judgment, "
-            "causing silent data loss."
+        assert "ignore" in lower or "keep the fact" in lower, (
+            "Default disposition must keep the fact (IGNORE / keep), not drop."
+        )
+        # The keep-by-default declaration must precede the drop rules.
+        default_idx = lower.find("default action")
+        rules_idx = lower.find("## drop")
+        assert rules_idx >= 0, "Plausibility prompt missing the drop-rules section header."
+        assert 0 <= default_idx < rules_idx, (
+            "Keep-by-default disposition must be declared before the drop rules — "
+            "order encodes default disposition."
         )
 
     def test_output_contract_is_drop_index_set(self):

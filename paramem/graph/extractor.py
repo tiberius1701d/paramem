@@ -914,6 +914,7 @@ def extract_and_anonymize_for_cloud(
     model,
     tokenizer,
     *,
+    speaker_id: str | None = None,
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
     pii_scope: set[str] | frozenset[str] | None = None,
@@ -944,6 +945,14 @@ def extract_and_anonymize_for_cloud(
     call: the helper returns ``(transcript, {}, {})`` and the caller
     sends the original text to the cloud verbatim — no anonymization,
     no deanonymization needed.
+
+    ``speaker_id`` is the resolved speaker store ID, threaded to
+    :func:`extract_graph` (which requires it) and stamped on the
+    ephemeral graph's relations as provenance.  That graph exists only
+    to anchor anonymization and is discarded immediately, so the value
+    is never persisted.  Text-only ``/chat`` requests with no enrolled
+    speaker pass ``None``; the helper falls back to the
+    ``"cloud_egress"`` sentinel rather than failing extraction.
 
     Return shapes:
 
@@ -979,6 +988,12 @@ def extract_and_anonymize_for_cloud(
             tokenizer,
             transcript,
             session_id="cloud_egress",
+            # Ephemeral graph: extracted only to anchor anonymization, then
+            # discarded — the stamped provenance is never persisted.  Use the
+            # resolved speaker_id when the caller has one (text-only /chat
+            # requests may not), falling back to the "cloud_egress" sentinel
+            # that already names the session.
+            speaker_id=speaker_id or "cloud_egress",
             speaker_name=speaker_name,
             prompts_dir=prompts_dir,
             validate=False,
@@ -1837,54 +1852,26 @@ spans). Empty `{{}}` if you have nothing to change.
 # concatenation so Ruff E501 doesn't force line-wraps that alter the rendered text.
 # fmt: off
 _DEFAULT_PLAUSIBILITY_PROMPT = (
-    "You are filtering enriched personal facts from a voice assistant conversation. "  # noqa: E501
-    "Decide KEEP or DROP per fact, grounding each against the transcript. "
-    "Output ONLY the indices of facts that match a DROP rule. "
-    "Never echo, modify, or add facts.\n"
+    "You are filtering enriched personal facts from a voice assistant conversation. For each numbered fact, choose one action:\n"  # noqa: E501
+    "- IGNORE it — keep the fact. Default action; when uncertain, IGNORE.\n"
+    "- ADD its index to the drop list — only when one of the rules R1-R6 below matches.\n"  # noqa: E501
+    "Ground every decision against the transcript. Never echo, modify, or add facts.\n"  # noqa: E501
     "\n"
-    "## KEEP — leave the fact in the output\n"
+    'Example — IGNORE: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` — supported by the transcript, so keep it.\n'  # noqa: E501
+    'Example — ADD: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` — matches R1, so add its index to the drop list.\n'  # noqa: E501
     "\n"
-    "Default action. Keep the fact when its subject, object, and predicate are supported by the transcript "  # noqa: E501
-    "(literally or by clear implication). When uncertain, KEEP.\n"
+    "## Drop rules — ADD a fact's index when any rule matches\n"
     "\n"
-    'Example: `[0] {{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` → KEEP (do not include 0 in the output)\n'  # noqa: E501
-    'Example: `[1] {{"subject": "Alex", "predicate": "likes", "object": "Uptown Funk"}}` → KEEP (do not include 1 in the output)\n'  # noqa: E501
-    "\n"
-    "## DROP — emit this fact's index\n"
-    "\n"
-    "Apply when any of the rules below matches.\n"
-    "\n"
-    "**R1. Self-loop.** `subject` and `object` are the same string (case-insensitive), regardless of predicate.\n"  # noqa: E501
-    'Example: `[2] {{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` → DROP (R1) — include 2 in the output.\n'  # noqa: E501
-    "\n"
-    "**R2. Name-swap pair.** Both `A has_name B` and `B has_name A` are in the input "  # noqa: E501
-    "(also `named`, `is`, `equals`). Drop both indices.\n"
-    'Example: `[3] {{"subject": "Alex", "predicate": "is", "object": "Bob"}}` AND '
-    '`[4] {{"subject": "Bob", "predicate": "is", "object": "Alex"}}` → DROP both (R2) — include 3 and 4.\n'  # noqa: E501
-    "\n"
-    "**R3. Transcript contradiction.** The transcript states a different value for the same subject and predicate.\n"  # noqa: E501
-    'Example: `[5] {{"subject": "Alex", "predicate": "lives_in", "object": "Tokyo"}}` '
-    "(when the transcript says Alex lives in Portland) → DROP (R3) — include 5.\n"
-    "\n"
-    "**R4. Conversation-role reference.** Subject or object refers to a conversation-role label "  # noqa: E501
-    '(e.g. "Assistant", "User", "Speaker", "the bot", "the model") '
-    "rather than a real-world entity introduced by the transcript.\n"
-    'Example: `[6] {{"subject": "Assistant", "predicate": "responded_to", "object": "Alex"}}` → DROP (R4) — include 6.\n'  # noqa: E501
-    "\n"
-    "**R5. Content-free object.** Object provides no transcript-grounded claim — empty, "  # noqa: E501
-    'whitespace-only, or a content-free placeholder (e.g. "Unknown", "None", "Various", "Something", "N/A").\n'  # noqa: E501
-    'Example: `[7] {{"subject": "Alex", "predicate": "is_from", "object": "Unknown"}}` → DROP (R5) — include 7.\n'  # noqa: E501
-    "\n"
-    "**R6. Namespaced system identifier.** Subject or object is a system / automation identifier — "  # noqa: E501
-    "a dot-separated or URI-shaped namespaced token "
-    "(e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`, `climate.kitchen_thermostat`) "  # noqa: E501
-    "referring to a device, sensor, or service rather than a personal entity.\n"
-    'Example: `[8] {{"subject": "Alex", "predicate": "controls", "object": "media_player.sonos_office"}}` → DROP (R6) — include 8.\n'  # noqa: E501
+    "R1. Self-loop. `subject` and `object` are the same string, regardless of predicate\n"  # noqa: E501
+    "R2. Name-swap pair. Both `A has_name B` and `B has_name A` are present (also `named`, `is`, `equals`). Add both indices.\n"  # noqa: E501
+    "R3. Transcript contradiction. The transcript states a different value for the same subject and predicate.\n"  # noqa: E501
+    'R4. Conversation-role reference. Subject or object refers to a conversation-role label (e.g. "Assistant", "User", "Speaker", "the bot", "the model") rather than a real-world entity introduced by the transcript.\n'  # noqa: E501
+    'R5. Content-free object. Object provides no transcript-grounded claim — empty, whitespace-only, or a content-free placeholder (e.g. "Unknown", "None", "Various", "Something", "N/A").\n'  # noqa: E501
+    "R6. Namespaced system identifier. Subject or object is a system / automation identifier — a dot-separated or URI-shaped namespaced token (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`, `climate.kitchen_thermostat`) referring to a device, sensor, or service rather than a personal entity.\n"  # noqa: E501
     "\n"
     "## Input\n"
     "\n"
-    "Each fact below is preceded by its zero-based index in square brackets. "  # noqa: E501
-    "Use that index to refer to the fact in your output.\n"
+    "Each fact below is preceded by its zero-based index in square brackets. Use that index to refer to the fact in your output.\n"  # noqa: E501
     "\n"
     "Conversation transcript:\n"
     "{transcript}\n"
@@ -1897,11 +1884,10 @@ _DEFAULT_PLAUSIBILITY_PROMPT = (
     'Return ONLY a single JSON object with the key "drop", whose value is an array of zero-based integer indices.\n'  # noqa: E501
     "\n"
     'Example with two drops: {{"drop": [3, 5]}}\n'
-    'Example for a clean input where nothing matches a DROP rule: {{"drop": []}}\n'  # noqa: E501
+    'Example for a clean input where nothing matches a rule: {{"drop": []}}\n'
     "\n"
     "Do NOT wrap the output in backticks, code fences, or any other prose.\n"
-    "Do NOT include the facts themselves. Do NOT modify any field of any fact. "  # noqa: E501
-    "Do NOT emit the surviving (KEPT) indices — only the indices to DROP.\n"
+    "Do NOT include the facts themselves. Do NOT modify any field of any fact. Do NOT emit the surviving (KEPT) indices — only the indices to drop.\n"  # noqa: E501
 )
 # fmt: on
 
