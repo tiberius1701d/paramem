@@ -402,6 +402,7 @@ def handle_chat(
                 model=model,
                 tokenizer=tokenizer,
                 speaker=speaker,
+                speaker_id=speaker_id,
                 history=history,
                 language=language,
             )
@@ -459,6 +460,7 @@ def handle_chat(
             sota_agent=sota_agent,
             ha_client=ha_client,
             speaker=speaker,
+            speaker_id=speaker_id,
             language=language,
             is_personal=is_personal,
         )
@@ -539,6 +541,7 @@ def _escalate_via_cloud_policy(
     model=None,
     tokenizer=None,
     speaker: str | None = None,
+    speaker_id: str | None = None,
     history: list[dict] | None = None,
     language: str | None = None,
 ) -> ChatResult | None:
@@ -606,6 +609,7 @@ def _escalate_via_cloud_policy(
             text,
             model,
             tokenizer,
+            speaker_id=speaker_id,
             speaker_name=speaker,
             pii_scope=set(config.sanitization.cloud_scope),
         )
@@ -830,6 +834,7 @@ def _probe_and_reason(
                 model=model,
                 tokenizer=tokenizer,
                 speaker=speaker,
+                speaker_id=speaker_id,
                 history=history,
                 language=language,
             )
@@ -865,6 +870,7 @@ def _probe_and_reason(
             sota_agent=sota_agent,
             ha_client=ha_client,
             speaker=speaker,
+            speaker_id=speaker_id,
             language=language,
             is_personal=is_personal,
         )
@@ -927,6 +933,7 @@ def _probe_and_reason(
         sota_agent=sota_agent,
         ha_client=ha_client,
         speaker=speaker,
+        speaker_id=speaker_id,
         history=history,
         language=language,
         is_personal=is_personal,
@@ -944,6 +951,7 @@ def _base_model_answer(
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
+    speaker_id: str | None = None,
     language: str | None = None,
     is_personal: bool = False,
 ) -> ChatResult:
@@ -973,6 +981,7 @@ def _base_model_answer(
         sota_agent=sota_agent,
         ha_client=ha_client,
         speaker=speaker,
+        speaker_id=speaker_id,
         history=history,
         language=language,
         is_personal=is_personal,
@@ -989,6 +998,7 @@ def _maybe_escalate(
     sota_agent: CloudAgent | None = None,
     ha_client: HAClient | None = None,
     speaker: str | None = None,
+    speaker_id: str | None = None,
     history: list[dict] | None = None,
     language: str | None = None,
     is_personal: bool = False,
@@ -1031,6 +1041,7 @@ def _maybe_escalate(
             model=model,
             tokenizer=tokenizer,
             speaker=speaker,
+            speaker_id=speaker_id,
             history=history,
             language=language,
         )
