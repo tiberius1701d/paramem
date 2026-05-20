@@ -27,11 +27,11 @@ from unittest.mock import MagicMock, patch
 import networkx as nx
 import pytest
 
+from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
+from paramem.memory.source import DiskMemorySource
+from paramem.memory.store import MemoryStore
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.key_registry import KeyRegistry
-from paramem.training.memory_persistence import _IK_KEY_ATTR, save_memory_to_disk
-from paramem.training.memory_source import DiskMemorySource
-from paramem.training.memory_store import MemoryStore
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
 # ---------------------------------------------------------------------------
@@ -177,10 +177,10 @@ def _patches_for_train_mode():
     - ``paramem.training.trainer.train_adapter`` → no-op returning a metrics dict.
     - ``paramem.models.loader.save_adapter`` → no-op (avoids PEFT I/O).
     - ``paramem.adapters.manifest.build_manifest_for`` → returns None.
-    - ``paramem.server.interim_adapter.create_interim_adapter`` → populates
+    - ``paramem.memory.interim_adapter.create_interim_adapter`` → populates
       peft_config[adapter_name] so _resolve_target_slot's peft_config check
       works; returns the model unchanged.
-    - ``paramem.training.entry_memory.probe_entry`` → returns None so
+    - ``paramem.memory.entry.probe_entry`` → returns None so
       existing-key reconstruction falls through to the store cache (unit-test
       mode; real inference requires a loaded GPU model).
     """
@@ -196,7 +196,7 @@ def _patches_for_train_mode():
         patch("paramem.models.loader.save_adapter"),
         patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         patch(
-            "paramem.server.interim_adapter.create_interim_adapter",
+            "paramem.memory.interim_adapter.create_interim_adapter",
             side_effect=_fake_create_interim,
         ),
         patch("paramem.training.consolidation.probe_entry", return_value=None),
@@ -424,7 +424,7 @@ class TestSimulateTrainParity:
         self._run_sim(loop_sim)
         self._run_train(loop_train)
 
-        from paramem.server.interim_adapter import adapter_slot_root_for_name
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
         sim_reg = adapter_slot_root_for_name(loop_sim.output_dir, adapter_name)
         train_reg = adapter_slot_root_for_name(loop_train.output_dir, adapter_name)
@@ -469,7 +469,7 @@ class TestSimulateTrainParity:
                 f"cycle did not populate it"
             )
 
-            from paramem.server.interim_adapter import adapter_slot_root_for_name
+            from paramem.memory.interim_adapter import adapter_slot_root_for_name
             from paramem.training.key_registry import KeyRegistry
 
             on_disk_path = (
@@ -495,8 +495,8 @@ class TestSimulateTrainParity:
         content.  After the fix, the simulate branch re-projects from loop.store
         when all_keyed is empty and the tier has entries.
         """
-        from paramem.server.interim_adapter import adapter_slot_root_for_name
-        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         self._run_sim(loop_sim)
 
@@ -525,7 +525,7 @@ class TestSimulateTrainParity:
         than saving without one — so any train slot that lands on disk has a manifest.
         Simulate slots have graph.json and no safetensors.
         """
-        from paramem.server.interim_adapter import adapter_slot_root_for_name
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
         adapter_name = f"episodic_interim_{_STAMP}"
         self._run_sim(loop_sim)
@@ -813,7 +813,7 @@ def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> 
                 "first_seen_cycle": t.get("first_seen_cycle", 0),
             },
         )
-    from paramem.training.memory_persistence import save_memory_to_disk as _save
+    from paramem.memory.persistence import save_memory_to_disk as _save
 
     _save(graph, interim_dir / "graph.json", encrypted=False)
     return interim_dir
@@ -846,7 +846,7 @@ class TestConsolidateInterimGraphs:
         After consolidation the main graph exists, contains the expected edges,
         and the interim directory is removed.
         """
-        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loop = _make_bare_loop(tmp_path)
         triples = [
@@ -870,7 +870,7 @@ class TestConsolidateInterimGraphs:
 
         Both interim directories must be removed after consolidation.
         """
-        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loop = _make_bare_loop(tmp_path)
         slot_a = _write_interim_graph(
@@ -911,7 +911,7 @@ class TestConsolidateInterimGraphs:
         count distinct key values), not on the raw edge count.  The design
         documents "last write wins" for identical keys across slots.
         """
-        from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loop = _make_bare_loop(tmp_path)
         shared_triple = {
@@ -1096,7 +1096,7 @@ class TestCommitTierSlotCleanup:
         Patches ``build_manifest_for`` to raise so the function never reaches
         step 7 (registry flush).  The slot directory must not exist after the call.
         """
-        from paramem.training.memory_persistence import commit_tier_slot
+        from paramem.memory.persistence import commit_tier_slot
 
         loop = _make_loop_for_commit(tmp_path)
 
@@ -1116,7 +1116,7 @@ class TestCommitTierSlotCleanup:
                 )
 
         # The slot dir must have been cleaned up by the try/finally.
-        from paramem.server.interim_adapter import adapter_slot_root_for_name
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
         slot_root = adapter_slot_root_for_name(tmp_path, "episodic_interim_20260101T0000")
         assert not slot_root.exists(), (
@@ -1129,7 +1129,7 @@ class TestCommitTierSlotCleanup:
         Patches ``save_memory_to_disk`` to raise so the function never reaches
         step 7 (registry flush).  The slot directory must not exist after the call.
         """
-        from paramem.training.memory_persistence import commit_tier_slot
+        from paramem.memory.persistence import commit_tier_slot
 
         loop = _make_loop_for_commit(tmp_path)
         all_keyed = [
@@ -1144,7 +1144,7 @@ class TestCommitTierSlotCleanup:
         ]
 
         with patch(
-            "paramem.training.memory_persistence.save_memory_to_disk",
+            "paramem.memory.persistence.save_memory_to_disk",
             side_effect=OSError("disk full"),
         ):
             with pytest.raises(OSError, match="disk full"):
@@ -1158,7 +1158,7 @@ class TestCommitTierSlotCleanup:
                     output_dir=tmp_path,
                 )
 
-        from paramem.server.interim_adapter import adapter_slot_root_for_name
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
         slot_root = adapter_slot_root_for_name(tmp_path, "episodic_interim_20260101T0000")
         assert not slot_root.exists(), (

@@ -9,7 +9,7 @@ Public API
 :func:`probe_entries` — batched multi-key probe.  Left-pads ``batch_size``
     prompts, generates them in one :meth:`model.generate` call, and pipes
     each decoded suffix through
-    :func:`paramem.training.entry_memory._finalize_recalled`.  Empirically
+    :func:`paramem.memory.entry._finalize_recalled`.  Empirically
     validated at 137/137 exact-match parity vs the serial path across
     b ∈ {1, 2, 4, 8, 16, 32, 64, 128} on Mistral 7B nf4; b=16 is the
     production default (~4.75× per-probe speedup, ~346 MiB peak VRAM delta
@@ -18,9 +18,9 @@ Public API
 :func:`evaluate_indexed_recall` — full-set recall evaluator.  Used as the
     ``eval_fn`` for
     :class:`paramem.training.early_stop.RecallEarlyStopCallback` and by
-    consolidation-time recall sanity gates.  Delegates to :func:`probe_entries`
-    (``batch_size > 1``) or the serial :func:`~paramem.training.entry_memory.probe_entry`
-    path (``batch_size <= 1``).
+    consolidation-time recall sanity gates.  Always delegates to
+    :func:`probe_entries` (all batch sizes — ``probe_entries`` handles
+    ``batch_size=1`` correctly as single-prompt chunks).
 
 Patching note: ``functools.partial`` snapshots the target function at
 construction time.  Any test exercising ``batch_size > 1`` via
@@ -36,8 +36,8 @@ from __future__ import annotations
 import logging
 from typing import Iterator
 
+from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD
 from paramem.models.loader import switch_adapter
-from paramem.training.entry_memory import DEFAULT_CONFIDENCE_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +58,10 @@ def evaluate_indexed_recall(
     checkpointing for the duration so the probe call paths are
     deterministic.
 
-    When ``batch_size <= 1`` the function calls :func:`probe_entry` per key
-    (serial behaviour, byte-identical to the previous implementation).
-    When ``batch_size > 1`` it delegates to :func:`probe_entries`,
-    which left-pads and generates up to ``batch_size`` prompts at once, then
-    runs each decoded suffix through :func:`_finalize_recalled` — the same
-    finalize chain ``probe_entry`` uses.  The returned dict shape is identical
-    regardless of which path was taken.
+    Always delegates to :func:`probe_entries` for all batch sizes.
+    ``probe_entries`` handles ``batch_size=1`` correctly as single-prompt
+    chunks — byte-identical parity confirmed at 137/137 across all batch
+    sizes on Mistral 7B nf4 (see module docstring).
 
     Args:
         model: A :class:`PeftModel` instance with the target adapter mounted.
@@ -72,14 +69,13 @@ def evaluate_indexed_recall(
         entries: List of ``{key, subject, predicate, object}`` dicts —
             the ground-truth set the adapter is expected to recall.
         registry: SimHash registry (``key → fingerprint``) built by
-            :func:`paramem.training.entry_memory.build_registry`.
+            :func:`paramem.memory.entry.build_registry`.
         adapter_name: Adapter to activate before probing.  Defaults to
             ``"episodic"`` (the main personal-knowledge slot).
         batch_size: Number of prompts to generate per :meth:`model.generate`
-            call.  ``1`` falls back to the per-key serial path; ``16``
-            (production default) is ~4.75× faster at ~346 MiB peak VRAM
-            delta on RTX 5070 8 GB. See module docstring for the empirical
-            curve across batch sizes.
+            call.  ``1`` produces one prompt at a time; ``16`` (production
+            default) is ~4.75× faster at ~346 MiB peak VRAM delta on RTX
+            5070 8 GB. See module docstring for the empirical curve.
 
     Returns:
         Dict with ``exact_count``, ``total``, ``rate``, ``mean_confidence``,
@@ -88,7 +84,7 @@ def evaluate_indexed_recall(
         ``{key, exact_match, confidence, subject, predicate, object,
         recalled_subject, recalled_predicate, recalled_object, failure_reason}``.
     """
-    from paramem.training.entry_memory import probe_entry, verify_confidence
+    from paramem.memory.entry import verify_confidence
 
     model.gradient_checkpointing_disable()
     switch_adapter(model, adapter_name)
@@ -97,19 +93,13 @@ def evaluate_indexed_recall(
     confidences: list[float] = []
     per_key: list[dict] = []
 
-    if batch_size <= 1:
-        iterator = (
-            (entry, probe_entry(model, tokenizer, entry["key"], registry=registry))
-            for entry in entries
-        )
-    else:
-        iterator = probe_entries(
-            model,
-            tokenizer,
-            entries,
-            registry,
-            batch_size=batch_size,
-        )
+    iterator = probe_entries(
+        model,
+        tokenizer,
+        entries,
+        registry,
+        batch_size=batch_size,
+    )
 
     for entry, recalled in iterator:
         key = entry["key"]
@@ -178,17 +168,17 @@ def probe_entries(
 
     Left-pads ``batch_size`` prompts, runs a single ``model.generate`` per
     chunk, and pipes each decoded suffix through
-    :func:`paramem.training.entry_memory._finalize_recalled` so the
+    :func:`paramem.memory.entry._finalize_recalled` so the
     recalled-dict shape is byte-identical to the serial
-    :func:`paramem.training.entry_memory.probe_entry` path.
+    :func:`paramem.memory.entry.probe_entry` path.
 
     ``padding_side`` mutation is restored via ``try/finally`` to keep
     concurrent tokenizer users (training collator) untouched.  Single-pass
     design — no caching across calls.
 
-    Used by :func:`evaluate_indexed_recall` (``batch_size > 1`` branch),
-    :func:`paramem.training.indexed_memory.probe_keys_grouped_by_adapter`,
-    and :func:`paramem.training.entry_memory.probe_entry` (1-key wrapper).
+    Used by :func:`evaluate_indexed_recall` (all batch sizes, including 1),
+    :func:`paramem.memory.probe.probe_keys_grouped_by_adapter`,
+    and :func:`paramem.memory.entry.probe_entry` (1-key wrapper).
 
     Args:
         model: A loaded HuggingFace / PEFT model.
@@ -210,11 +200,11 @@ def probe_entries(
     """
     import torch
 
-    from paramem.training.dataset import _format_inference_prompt
-    from paramem.training.entry_memory import (
+    from paramem.memory.entry import (
         RECALL_TEMPLATE,
         _finalize_recalled,
     )
+    from paramem.training.dataset import _format_inference_prompt
 
     device = next(model.parameters()).device
     stop_ids = _derive_stop_ids(tokenizer)

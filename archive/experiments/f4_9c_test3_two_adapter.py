@@ -36,7 +36,7 @@ from paramem.models.loader import (  # noqa: E402
     switch_adapter,
 )
 from paramem.training.dataset import _format_inference_prompt  # noqa: E402
-from paramem.training.indexed_memory import (  # noqa: E402
+from archive.legacy_qa import (  # noqa: E402
     RECALL_TEMPLATE,
     assign_keys,
     build_registry,

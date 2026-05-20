@@ -20,8 +20,8 @@ Patch targets for methods imported inside the consolidation body:
   format_entry_training → paramem.training.consolidation.format_entry_training
   train_adapter (fn) → paramem.training.trainer.train_adapter
   build_registry     → paramem.training.consolidation.build_registry
-  evaluate_indexed_recall → experiments.utils.test_harness.evaluate_indexed_recall
-  unload_interim_adapters → paramem.server.interim_adapter.unload_interim_adapters
+  evaluate_indexed_recall → paramem.training.recall_eval.evaluate_indexed_recall
+  unload_interim_adapters → paramem.memory.interim_adapter.unload_interim_adapters
   partition_relations → paramem.graph.qa_generator.partition_relations
   switch_adapter     → paramem.models.loader.switch_adapter
   copy_adapter_weights → paramem.models.loader.copy_adapter_weights
@@ -47,8 +47,8 @@ _MOCK_PATCHES = [
     "paramem.training.consolidation.format_entry_training",
     "paramem.training.trainer.train_adapter",
     "paramem.training.consolidation.build_registry",
-    "experiments.utils.test_harness.evaluate_indexed_recall",
-    "paramem.server.interim_adapter.unload_interim_adapters",
+    "paramem.training.recall_eval.evaluate_indexed_recall",
+    "paramem.memory.interim_adapter.unload_interim_adapters",
     "paramem.models.loader.switch_adapter",
     "paramem.models.loader.copy_adapter_weights",
     "paramem.graph.qa_generator.partition_relations",
@@ -178,7 +178,7 @@ class TestLockLeakGuard:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
             ):
@@ -253,7 +253,7 @@ class TestB2RearmPattern:
                 patch("paramem.training.trainer.train_adapter"),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 1.0,
                         "exact_count": 1,
@@ -262,7 +262,7 @@ class TestB2RearmPattern:
                         "per_key": [],
                     },
                 ),
-                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
             ):
@@ -375,7 +375,7 @@ class TestB2RearmPattern:
                     return_value={"ep_key": 0, "sem_key": 0, "proc_key": 0},
                 ),
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 1.0,
                         "exact_count": 1,
@@ -384,7 +384,7 @@ class TestB2RearmPattern:
                         "per_key": [],
                     },
                 ),
-                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
             ):
@@ -523,7 +523,7 @@ class TestPerTierInferenceFallbackAdapter:
                     return_value={"ep_key": 0, "sem_key": 0, "proc_key": 0},
                 ),
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 1.0,
                         "exact_count": 1,
@@ -532,7 +532,7 @@ class TestPerTierInferenceFallbackAdapter:
                         "per_key": [],
                     },
                 ),
-                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
             ):
@@ -633,7 +633,7 @@ class TestPerTierInferenceFallbackAdapter:
                     return_value={"ep_key": 0, "sem_key": 0},
                 ),
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 1.0,
                         "exact_count": 1,
@@ -642,7 +642,7 @@ class TestPerTierInferenceFallbackAdapter:
                         "per_key": [],
                     },
                 ),
-                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
             ):
@@ -756,7 +756,7 @@ class TestCapacityCeilingRollback:
                 # is only called via _verify_saved_adapter_from_disk (post-save).
                 # Patch it here to prevent any accidental call from surfacing.
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 0.5,
                         "exact_count": 0,
@@ -765,7 +765,7 @@ class TestCapacityCeilingRollback:
                         "per_key": [],
                     },
                 ),
-                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
             ):
@@ -820,7 +820,7 @@ class TestCapacityCeilingRollback:
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 # Recall exactly at threshold.
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 0.95,
                         "exact_count": 1,
@@ -829,7 +829,7 @@ class TestCapacityCeilingRollback:
                         "per_key": [],
                     },
                 ),
-                patch("paramem.server.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
             ):
@@ -911,7 +911,7 @@ class TestAtomicFinalizeOrdering:
                 patch("paramem.training.trainer.train_adapter"),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 1.0,
                         "exact_count": 1,
@@ -921,7 +921,7 @@ class TestAtomicFinalizeOrdering:
                     },
                 ),
                 patch(
-                    "paramem.server.interim_adapter.unload_interim_adapters", side_effect=_unload
+                    "paramem.memory.interim_adapter.unload_interim_adapters", side_effect=_unload
                 ),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
@@ -1014,7 +1014,7 @@ class TestAtomicFinalizeOrdering:
                 patch("paramem.training.trainer.train_adapter"),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
-                    "experiments.utils.test_harness.evaluate_indexed_recall",
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
                     return_value={
                         "rate": 1.0,
                         "exact_count": 1,
@@ -1024,7 +1024,7 @@ class TestAtomicFinalizeOrdering:
                     },
                 ),
                 patch(
-                    "paramem.server.interim_adapter.unload_interim_adapters",
+                    "paramem.memory.interim_adapter.unload_interim_adapters",
                     return_value=["episodic_interim_20260418T0000"],
                 ),
                 patch("paramem.models.loader.switch_adapter"),

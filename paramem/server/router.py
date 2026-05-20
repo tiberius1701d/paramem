@@ -189,7 +189,7 @@ class QueryRouter:
     """Routes queries: identifies speaker scope and selects tiers by intent.
 
     State: a single per-speaker ``speaker_id → set[key]`` index built from
-    the injected :class:`paramem.training.memory_store.MemoryStore`.  The
+    the injected :class:`paramem.memory.store.MemoryStore`.  The
     index is preload-independent — it populates from the ``speaker_id``
     field that :meth:`MemoryStore.load_metadata_from_disk` writes onto
     every active entry slot at boot, regardless of

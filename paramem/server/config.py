@@ -942,7 +942,7 @@ class ConsolidationScheduleConfig:
         the systemd timer to schedule the full-consolidation cycle and by
         ``pstatus`` to display the effective cadence.
         """
-        from paramem.server.interim_adapter import compute_schedule_period_seconds
+        from paramem.memory.interim_adapter import compute_schedule_period_seconds
 
         refresh_seconds = compute_schedule_period_seconds(self.refresh_cadence)
         if refresh_seconds is None:
@@ -1124,11 +1124,11 @@ class InferenceConfig:
     """Inference-time options that govern the per-query probe path.
 
     ``preload_cache``: at boot, populate the lifespan-owned
-    :class:`paramem.training.memory_store.MemoryStore` by probing every
+    :class:`paramem.memory.store.MemoryStore` by probing every
     active key through the mode-appropriate
-    :class:`paramem.training.memory_source.MemorySource`
-    (:class:`~paramem.training.memory_source.WeightMemorySource` in
-    train mode, :class:`~paramem.training.memory_source.DiskMemorySource`
+    :class:`paramem.memory.source.MemorySource`
+    (:class:`~paramem.memory.source.WeightMemorySource` in
+    train mode, :class:`~paramem.memory.source.DiskMemorySource`
     in simulate mode).  Inference then serves cache hits in O(1) and
     falls through to the source only on cache miss.
 

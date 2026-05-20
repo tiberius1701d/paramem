@@ -92,21 +92,21 @@ from experiments.utils.test_harness import (  # noqa: E402
 )
 from paramem.adapters import resolve_adapter_slot  # noqa: E402
 from paramem.adapters.manifest import build_manifest_for  # noqa: E402
+from paramem.memory.entry import (  # noqa: E402
+    assign_keys,
+    build_registry,
+    format_entry_training,
+)
+from paramem.memory.persistence import (  # noqa: E402
+    load_registry,
+    save_registry,
+)
 from paramem.models.loader import (  # noqa: E402
     _adapter_slot_for_load,
     create_adapter,
     save_adapter,
     switch_adapter,
     unload_model,
-)
-from paramem.training.entry_memory import (  # noqa: E402
-    assign_keys,
-    build_registry,
-    format_entry_training,
-)
-from paramem.training.indexed_memory import (  # noqa: E402
-    load_registry,
-    save_registry,
 )
 from paramem.training.recall_eval import (  # noqa: E402
     evaluate_indexed_recall as evaluate_entry_recall,

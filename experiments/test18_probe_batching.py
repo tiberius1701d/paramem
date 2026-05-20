@@ -78,6 +78,13 @@ from experiments.utils.test_harness import (  # noqa: E402
     model_output_dir,
     setup_logging,
 )
+from paramem.memory.entry import (  # noqa: E402
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    RECALL_TEMPLATE,
+    _finalize_recalled,
+    build_registry,
+    format_entry_training,
+)
 from paramem.models.loader import (  # noqa: E402
     create_adapter,
     load_base_model,
@@ -85,13 +92,6 @@ from paramem.models.loader import (  # noqa: E402
     switch_adapter,
 )
 from paramem.training.dataset import _format_inference_prompt  # noqa: E402
-from paramem.training.entry_memory import (  # noqa: E402
-    DEFAULT_CONFIDENCE_THRESHOLD,
-    RECALL_TEMPLATE,
-    _finalize_recalled,
-    build_registry,
-    format_entry_training,
-)
 from paramem.training.recall_eval import (  # noqa: E402
     _derive_stop_ids,
     evaluate_indexed_recall,

@@ -343,7 +343,7 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
         logger.exception("prune_key_metadata_orphans: could not read %s — skipping", path)
         return 0
 
-    from paramem.server.interim_adapter import iter_interim_dirs
+    from paramem.memory.interim_adapter import iter_interim_dirs
 
     active: set[str] = set()
     for tier in ("episodic", "semantic", "procedural"):

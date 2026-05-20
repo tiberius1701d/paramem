@@ -724,11 +724,11 @@ def _probe_and_reason(
     """
     from peft import PeftModel
 
-    from paramem.models.loader import switch_adapter
-    from paramem.training.memory_source import (
+    from paramem.memory.source import (
         DiskMemorySource,
         WeightMemorySource,
     )
+    from paramem.models.loader import switch_adapter
 
     registry = _load_simhash_registry(config.adapter_dir)
 
@@ -1099,7 +1099,7 @@ def _load_simhash_registry(adapter_dir) -> dict:
             _merge_simhash_file(p)
 
     # Interim adapter slots.
-    from paramem.server.interim_adapter import iter_interim_dirs
+    from paramem.memory.interim_adapter import iter_interim_dirs
 
     for _name, interim_dir in iter_interim_dirs(adapter_dir):
         p = interim_dir / "simhash_registry.json"

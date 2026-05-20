@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.server.interim_adapter import (
+from paramem.memory.interim_adapter import (
     compute_schedule_period_seconds,
     create_interim_adapter,
     current_interim_stamp,
@@ -237,7 +237,7 @@ class TestCreateInterimAdapterIdempotent:
         returned_model = MagicMock()
 
         with patch(
-            "paramem.server.interim_adapter.create_adapter",
+            "paramem.memory.interim_adapter.create_adapter",
             return_value=returned_model,
         ) as mock_create:
             result = create_interim_adapter(model, adapter_config, stamp)
@@ -253,7 +253,7 @@ class TestCreateInterimAdapterIdempotent:
         model = _make_stub_peft_model("episodic", "semantic", "procedural", name)
         adapter_config = MagicMock()
 
-        with patch("paramem.server.interim_adapter.create_adapter") as mock_create:
+        with patch("paramem.memory.interim_adapter.create_adapter") as mock_create:
             result = create_interim_adapter(model, adapter_config, stamp)
 
         mock_create.assert_not_called()
@@ -271,7 +271,7 @@ class TestCreateInterimAdapterIdempotent:
             return m
 
         with patch(
-            "paramem.server.interim_adapter.create_adapter",
+            "paramem.memory.interim_adapter.create_adapter",
             side_effect=_side_effect,
         ) as mock_create:
             create_interim_adapter(model, adapter_config, "20260417T0000")

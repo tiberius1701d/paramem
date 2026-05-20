@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from paramem.training.memory_store import MemoryStore as _MS
+from paramem.memory.store import MemoryStore as _MS
 
 # Files allowed to call the extractors directly:
 # - extractor.py: the module defining them.

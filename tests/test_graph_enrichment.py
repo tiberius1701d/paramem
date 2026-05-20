@@ -51,7 +51,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     # fires.  Callers that need enrichment hooks to fire pass replay_enabled=True.
     replay_enabled = defaults.pop("replay_enabled", False)
 
-    from paramem.training.memory_store import MemoryStore as _MS
+    from paramem.memory.store import MemoryStore as _MS
 
     loop = ConsolidationLoop(
         model=model,
@@ -984,7 +984,7 @@ class TestInterimEnrichmentHook:
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
         with (
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 return_value=loop.model,
             ),
             patch("paramem.training.trainer.train_adapter", return_value={}),
@@ -1026,7 +1026,7 @@ class TestInterimEnrichmentHook:
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
         with patch(
-            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+            "paramem.memory.interim_adapter.create_interim_adapter", return_value=loop.model
         ):
             loop.post_session_train(
                 session_transcript="t",
@@ -1067,7 +1067,7 @@ class TestInterimEnrichmentHook:
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
         with patch(
-            "paramem.server.interim_adapter.create_interim_adapter", return_value=loop.model
+            "paramem.memory.interim_adapter.create_interim_adapter", return_value=loop.model
         ):
             loop.post_session_train(
                 session_transcript="t",
@@ -1113,7 +1113,7 @@ class TestInterimEnrichmentHook:
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
         with (
             patch(
-                "paramem.server.interim_adapter.create_interim_adapter",
+                "paramem.memory.interim_adapter.create_interim_adapter",
                 return_value=loop.model,
             ),
             patch("paramem.training.trainer.train_adapter", return_value={}),

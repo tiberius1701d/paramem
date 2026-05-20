@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from paramem.training.memory_store import MemoryStore as _MS  # noqa: F401
+from paramem.memory.store import MemoryStore as _MS  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Helper

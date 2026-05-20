@@ -4023,7 +4023,7 @@ Today's pipeline runs `extractor → graph triples → QA generator (LLM) → (k
 | Axis | QA-pair encoding | Quadruple encoding |
 |---|---|---|
 | Round-trip fidelity to source triples (reverse-extract from recalled unit → source `(s,p,o)`) | **32.1% strict / 70.5% subj+obj** (A1, 193 CV-cycle kps; predicate paraphrase dominant) | **100% strict / 100% subj+obj** (A2 at 95 keys *and* 550 keys) |
-| Per-fact training cost | 2 examples/fact (`format_indexed_training`, `paramem/training/indexed_memory.py:345-386`) | 1 example/fact (`format_quadruple_training`) |
+| Per-fact training cost | 2 examples/fact (`format_indexed_training`, `archive/legacy_qa.py`) | 1 example/fact (`format_entry_training`) |
 | LLM calls per cycle | extractor + QA-gen | extractor only |
 | Recalled-fact context (what the reasoner sees) | bare `- {answer}` bullet (`inference.py:722`) — drops the subject | `- {subject} {predicate} {object}` — carries it |
 | Reasoning over recalled context | (A2.1 baseline) | A2.1: **≈ wash**; the triple form is *strictly better on anchored facts* (Q14: `- Nov 2014` is uninterpretable, `- Senior Software Project Manager end date Nov 2014` is not) |

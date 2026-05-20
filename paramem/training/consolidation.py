@@ -32,17 +32,17 @@ from paramem.graph.schema import SessionGraph
 from paramem.graph.scoring import (
     PromotionScorer,
 )
-from paramem.models.loader import atomic_save_adapter, switch_adapter
-from paramem.server.vram_guard import safe_empty_cache
-from paramem.training.curriculum import CurriculumSampler
-from paramem.training.entry_memory import (
+from paramem.memory.entry import (
     assign_keys,
     build_registry,
     compute_simhash,
     format_entry_training,
     probe_entry,
 )
-from paramem.training.indexed_memory import save_registry
+from paramem.memory.persistence import save_registry
+from paramem.models.loader import atomic_save_adapter, switch_adapter
+from paramem.server.vram_guard import safe_empty_cache
+from paramem.training.curriculum import CurriculumSampler
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
 from paramem.training.thermal_throttle import ThermalPolicy
@@ -529,7 +529,7 @@ class ConsolidationLoop:
         a store with replay enabled.  Production code always goes through
         ``__init__`` and never reaches this path."""
         if not hasattr(self, "store") or self.store is None:
-            from paramem.training.memory_store import MemoryStore
+            from paramem.memory.store import MemoryStore
 
             self.store = MemoryStore(replay_enabled=True)
 
@@ -542,7 +542,7 @@ class ConsolidationLoop:
         do NOT preserve tier semantics.  New code uses
         :meth:`MemoryStore.put` / :meth:`MemoryStore.get` directly.
         """
-        from paramem.training.memory_store import _LegacyFlatCacheView as _LV
+        from paramem.memory.store import _LegacyFlatCacheView as _LV
 
         self._ensure_store()
         return _LV(self.store)
@@ -1971,7 +1971,7 @@ class ConsolidationLoop:
         import hashlib as _hashlib
 
         from paramem.adapters.manifest import build_manifest_for
-        from paramem.server.interim_adapter import current_full_consolidation_stamp
+        from paramem.memory.interim_adapter import current_full_consolidation_stamp
 
         fingerprint_cache = getattr(self, "fingerprint_cache", None)
         full_period = getattr(self, "full_consolidation_period_string", "")
@@ -2047,7 +2047,7 @@ class ConsolidationLoop:
             """
             import shutil as _shutil
 
-            from paramem.server.interim_adapter import adapter_slot_root_for_name
+            from paramem.memory.interim_adapter import adapter_slot_root_for_name
 
             slot = atomic_save_adapter(
                 self.model,
@@ -2177,7 +2177,7 @@ class ConsolidationLoop:
             ValueError: when ``adapter_name`` doesn't match any known tier
                 or the interim-adapter naming convention.
         """
-        from paramem.server.interim_adapter import INTERIM_NAME_PREFIX, interim_stamp_from_name
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX, interim_stamp_from_name
 
         resolved_stamp = interim_stamp or getattr(self, "_current_interim_stamp", None)
 
@@ -2405,7 +2405,7 @@ class ConsolidationLoop:
           only; simulate always mints fresh).
         * :meth:`_prepare_episodic_keys_for_tier` — reconstruction source (probe
           weights in train; read cache in simulate).
-        * :func:`paramem.training.memory_persistence.commit_tier_slot` — venue
+        * :func:`paramem.memory.persistence.commit_tier_slot` — venue
           write (train: save adapter weights; simulate: write sidecar JSON).
 
         Everything else — cycle counter, guards, speaker tagging, enrichment,
@@ -2469,7 +2469,7 @@ class ConsolidationLoop:
             ``"degenerated"``, or ``"noop"``); ``venue`` is the training
             medium (``"train"`` or ``"simulate"``).
         """
-        from paramem.training.memory_persistence import commit_tier_slot
+        from paramem.memory.persistence import commit_tier_slot
 
         # --- 1. Cycle counter ---
         self.cycle_count += 1
@@ -2505,7 +2505,7 @@ class ConsolidationLoop:
 
         # --- 6. Resolve stamp and target slot ---
         if stamp is None:
-            from paramem.server.interim_adapter import current_interim_stamp as _cis
+            from paramem.memory.interim_adapter import current_interim_stamp as _cis
 
             stamp = _cis(schedule)
 
@@ -2574,8 +2574,8 @@ class ConsolidationLoop:
 
         # --- 8. Mint PEFT slot (train only) ---
         if mode == "train":
+            from paramem.memory.interim_adapter import create_interim_adapter
             from paramem.models.loader import create_adapter as _create_adapter
-            from paramem.server.interim_adapter import create_interim_adapter
 
             if cap_reached_absorb:
                 # Reset absorb target to LoRA zeros for a clean retrain.
@@ -3036,7 +3036,7 @@ class ConsolidationLoop:
         2. Walk all ``episodic/interim_<stamp>/graph.json`` files; load and merge each
            into a combined graph, tagging edges from each slot with the slot's keys.
         3. Write the merged graph to ``<adapter_dir>/episodic/graph.json`` via
-           :func:`paramem.training.memory_persistence.save_memory_to_disk`.
+           :func:`paramem.memory.persistence.save_memory_to_disk`.
         4. Remove the interim slot directories that were merged.
         5. Return a result dict shaped like ``consolidate_interim_adapters``'s return
            (``tiers_rebuilt``, ``graph_drift_count``, etc.) for compatibility with the
@@ -3050,8 +3050,8 @@ class ConsolidationLoop:
         """
         import shutil as _shutil
 
-        from paramem.server.interim_adapter import iter_interim_dirs
-        from paramem.training.memory_persistence import (
+        from paramem.memory.interim_adapter import iter_interim_dirs
+        from paramem.memory.persistence import (
             iter_entries,
             load_memory_from_disk,
             save_memory_to_disk,
@@ -3087,7 +3087,7 @@ class ConsolidationLoop:
                 # Add edge to merged graph (add_edge is idempotent on
                 # duplicate ik_key via the MultiDiGraph semantics — we
                 # re-add with the same attributes so the latest write wins).
-                from paramem.training.memory_persistence import _add_keyed_edge
+                from paramem.memory.persistence import _add_keyed_edge
 
                 _add_keyed_edge(
                     merged_graph,
@@ -3206,9 +3206,9 @@ class ConsolidationLoop:
                     "rollback_tier": str | None,
                 }
         """
+        from paramem.memory.interim_adapter import unload_interim_adapters
         from paramem.models.loader import create_adapter
         from paramem.server.gpu_lock import _gpu_thread_lock
-        from paramem.server.interim_adapter import unload_interim_adapters
 
         # --- Entry guard: verify the GPU lock is held by the caller (leak-safe) ---
         acquired = _gpu_thread_lock.acquire(blocking=False)
@@ -3660,7 +3660,7 @@ class ConsolidationLoop:
             probe_pairs = random.sample(probe_pairs, max_probe)
 
         try:
-            from paramem.training.entry_memory import build_registry
+            from paramem.memory.entry import build_registry
             from paramem.training.recall_eval import evaluate_indexed_recall
 
             probe_registry = build_registry(probe_pairs)
@@ -4036,7 +4036,7 @@ class ConsolidationLoop:
             probe_every_n_epochs=self.training_config.recall_probe_every_n_epochs,
         )
 
-        from paramem.training.entry_memory import build_registry as _build_registry
+        from paramem.memory.entry import build_registry as _build_registry
         from paramem.training.recall_eval import evaluate_indexed_recall
 
         _batch = self.training_config.recall_probe_batch_size
@@ -4085,7 +4085,7 @@ def run_multi_session(
     Returns:
         List of CycleResult, one per session.
     """
-    from paramem.training.memory_store import MemoryStore
+    from paramem.memory.store import MemoryStore
 
     store = MemoryStore(
         replay_enabled=consolidation_config.indexed_key_replay_enabled,

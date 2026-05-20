@@ -1,4 +1,4 @@
-"""Unit tests for paramem.training.memory_persistence.
+"""Unit tests for paramem.memory.persistence.
 
 Covers round-trip contract, encryption awareness, iter_entries edge-skipping,
 entry_by_key hit/miss, entity/speaker index helpers, and build_tier_graph_from_store.
@@ -19,7 +19,7 @@ from paramem.backup.key_store import (
     wrap_daily_identity,
     write_daily_key_file,
 )
-from paramem.training.memory_persistence import (
+from paramem.memory.persistence import (
     _IK_KEY_ATTR,
     build_tier_graph_from_store,
     entry_by_key,
@@ -66,7 +66,7 @@ def _add_keyed_edge(
     edge-key parameter) so it survives ``nx.node_link_data`` /
     ``nx.node_link_graph`` round-trips intact.
     """
-    from paramem.training.memory_persistence import _add_keyed_edge as _prod_add
+    from paramem.memory.persistence import _add_keyed_edge as _prod_add
 
     _prod_add(
         graph,
@@ -505,7 +505,7 @@ class TestKeysForSpeaker:
 class TestBuildTierGraphFromStore:
     def _make_store(self, *, simhash: dict, cache: dict, tier: str = "episodic"):
         """Build a minimal MemoryStore for testing build_tier_graph_from_store."""
-        from paramem.training.memory_store import MemoryStore
+        from paramem.memory.store import MemoryStore
 
         store = MemoryStore(replay_enabled=False)
         store.replace_simhashes_in_tier(tier, simhash)
@@ -605,7 +605,7 @@ class TestBuildTierGraphFromStore:
 class TestBuildTierGraphKeyError:
     def test_raises_key_error_when_cache_missing_key(self):
         """build_tier_graph_from_store raises KeyError when simhash key absent from store."""
-        from paramem.training.memory_store import MemoryStore
+        from paramem.memory.store import MemoryStore
 
         store = MemoryStore(replay_enabled=False)
         store.put_simhash("episodic", "graph1", 0xABCDEF)

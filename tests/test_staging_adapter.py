@@ -7,11 +7,11 @@ import pytest
 import torch
 from peft import PeftModel
 
+from paramem.memory.store import MemoryStore as _MS
 from paramem.models.loader import (
     atomic_save_adapter,
     copy_adapter_weights,
 )
-from paramem.training.memory_store import MemoryStore as _MS
 
 
 class _FakeParam:

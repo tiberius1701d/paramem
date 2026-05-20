@@ -9,12 +9,12 @@ data (observed: untrained adapter + "Where do I live?" → "New York City").
 
 from unittest.mock import MagicMock, patch
 
+from paramem.memory.store import MemoryStore as _MS
 from paramem.server.config import (
     AbstentionConfig,
     ServerConfig,
     load_server_config,
 )
-from paramem.training.memory_store import MemoryStore as _MS
 
 
 class TestAbstentionConfig:
@@ -429,7 +429,7 @@ class TestAbstentionShortCircuit:
                 return_value=(None, ["first_person_personal"]),
             ),
             patch(
-                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                "paramem.memory.probe.probe_keys_grouped_by_adapter",
                 return_value={"graph0001": None},
             ),
             patch("paramem.server.inference._base_model_answer") as mock_base_model,
@@ -471,7 +471,7 @@ class TestAbstentionShortCircuit:
                 return_value=("What's my next meeting?", []),
             ),
             patch(
-                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                "paramem.memory.probe.probe_keys_grouped_by_adapter",
                 return_value={"graph0001": None},
             ),
             patch(
@@ -515,7 +515,7 @@ class TestAbstentionShortCircuit:
                 return_value=(None, ["first_person_personal"]),
             ),
             patch(
-                "paramem.training.indexed_memory.probe_keys_grouped_by_adapter",
+                "paramem.memory.probe.probe_keys_grouped_by_adapter",
                 return_value={"graph0001": None},
             ),
             patch(

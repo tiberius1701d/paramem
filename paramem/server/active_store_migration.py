@@ -297,7 +297,7 @@ def _migrate_tier_train_to_simulate(
         RuntimeError: When the post-step sanity check fails (graph.json
             missing keys after reconstruction).
     """
-    from paramem.training.memory_persistence import (
+    from paramem.memory.persistence import (
         iter_entries,
         load_memory_from_disk,
     )
@@ -329,7 +329,7 @@ def _migrate_tier_train_to_simulate(
 
     if needs_reconstruction:
         from paramem.graph.reconstruct import ReconstructionError, reconstruct_graph
-        from paramem.training.memory_persistence import (
+        from paramem.memory.persistence import (
             _IK_KEY_ATTR,
             save_memory_to_disk,
         )
@@ -442,18 +442,18 @@ def _migrate_tier_simulate_to_train(
     """
     # Source graph is at the unified layout location: <adapter_dir>/<tier>/graph.json.
     from paramem.adapters.manifest import build_manifest_for
+    from paramem.memory.entry import (
+        build_registry as _build_reg,
+    )
+    from paramem.memory.entry import (
+        format_entry_training as _format_training,
+    )
+    from paramem.memory.persistence import iter_entries, load_memory_from_disk
     from paramem.models.loader import (
         atomic_save_adapter,
         create_adapter,
         switch_adapter,
     )
-    from paramem.training.entry_memory import (
-        build_registry as _build_reg,
-    )
-    from paramem.training.entry_memory import (
-        format_entry_training as _format_training,
-    )
-    from paramem.training.memory_persistence import iter_entries, load_memory_from_disk
     from paramem.training.trainer import TrainingHooks
     from paramem.training.trainer import train_adapter as _train_adapter
 
@@ -573,7 +573,7 @@ def _migrate_tier_simulate_to_train(
     # silently abstains even though the adapter recalls correctly. The simhash
     # was already built in Step 2 (setattr loop.<tier>_simhash); persist it as
     # {key: int} shape that _load_simhash_registry / get_simhash expect.
-    from paramem.training.indexed_memory import save_registry as _save_registry
+    from paramem.memory.persistence import save_registry as _save_registry
 
     _simhash = loop.store.simhashes_in_tier(tier)
     if _simhash:

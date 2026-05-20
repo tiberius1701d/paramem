@@ -39,7 +39,7 @@ def _make_loop() -> ConsolidationLoop:
     loop._thermal_policy = None
 
     # Minimal state expected by seeding helpers.
-    from paramem.training.memory_store import MemoryStore as _MS
+    from paramem.memory.store import MemoryStore as _MS
 
     loop.store = _MS(replay_enabled=False)
     loop.procedural_sp_index: dict = {}
@@ -187,21 +187,21 @@ class TestDedupEpisodic:
 
 class TestAssignEntryKeysPrefix:
     def test_default_prefix_graph(self):
-        from paramem.training.entry_memory import assign_keys
+        from paramem.memory.entry import assign_keys
 
         triples = [("Alice", "lives_in", "Berlin")]
         result = assign_keys(triples)
         assert result[0]["key"] == "graph1"
 
     def test_proc_prefix(self):
-        from paramem.training.entry_memory import assign_keys
+        from paramem.memory.entry import assign_keys
 
         triples = [("User", "prefers", "tea")]
         result = assign_keys(triples, prefix="proc")
         assert result[0]["key"] == "proc1"
 
     def test_start_index_combined_with_prefix(self):
-        from paramem.training.entry_memory import assign_keys
+        from paramem.memory.entry import assign_keys
 
         triples = [("A", "p", "B"), ("C", "q", "D")]
         result = assign_keys(triples, start_index=5, prefix="proc")

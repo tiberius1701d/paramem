@@ -374,13 +374,6 @@ class TestBuildV4Scaffold:
         """VARIANT_BUILDERS[V4] dispatches to build_v4_scaffold."""
         assert VARIANT_BUILDERS[V4](5) == build_v4_scaffold(5)
 
-    def test_compatible_with_build_registry(self):
-        """V4 scaffold is consumable by build_registry without KeyError."""
-        from paramem.training.indexed_memory import build_registry
-
-        registry = build_registry(build_v4_scaffold(3))
-        assert set(registry.keys()) == {"graph1", "graph2", "graph3"}
-
 
 # ---------------------------------------------------------------------------
 # V5 scaffold — uniform long natural-language template

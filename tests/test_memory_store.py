@@ -1,4 +1,4 @@
-"""Unit tests for :class:`paramem.training.memory_store.MemoryStore`.
+"""Unit tests for :class:`paramem.memory.store.MemoryStore`.
 
 Locks the per-tier {quads, simhash, registry} contract that replaced the
 flat ``indexed_key_cache`` + three flat ``*_simhash`` dicts on
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from paramem.memory.store import MemoryStore
 from paramem.training.key_registry import KeyRegistry
-from paramem.training.memory_store import MemoryStore
 
 
 def _entry(

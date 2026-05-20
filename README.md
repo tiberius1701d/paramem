@@ -179,9 +179,9 @@ python examples/two_adapter_promotion.py
 
 ```
 paramem/
+├── memory/           # Indexed-key memory: entries, store, source, persistence, probe
 ├── models/           # QLoRA model loading, multi-adapter management
 ├── training/         # LoRA fine-tuning, replay, consolidation loop
-│   ├── indexed_memory.py   # Indexed key recall + SimHash verification
 │   ├── key_registry.py     # Active key tracking + fidelity history
 │   ├── consolidation.py    # Consolidation loop orchestrator
 │   └── ...

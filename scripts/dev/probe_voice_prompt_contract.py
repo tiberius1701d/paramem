@@ -48,7 +48,7 @@ from paramem.models.loader import load_adapter, load_base_model  # noqa: E402
 from paramem.server.config import load_server_config  # noqa: E402
 from paramem.server.escalation import detect_escalation  # noqa: E402
 from paramem.server.inference import _personalize_prompt  # noqa: E402
-from paramem.training.indexed_memory import probe_keys_grouped_by_adapter  # noqa: E402
+from paramem.memory.probe import probe_keys_grouped_by_adapter  # noqa: E402
 
 CYCLE_DIR = (
     PROJECT_ROOT / "outputs" / "test8_large_scale" / "mistral" / "20260323_161747" / "cycle_001"

@@ -32,7 +32,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from paramem.evaluation.recall import generate_answer  # noqa: E402
 from paramem.models.loader import create_adapter, load_base_model, switch_adapter  # noqa: E402
 from paramem.training.dataset import _format_inference_prompt  # noqa: E402
-from paramem.training.indexed_memory import (  # noqa: E402
+from archive.legacy_qa import (  # noqa: E402
     RECALL_TEMPLATE,
     assign_keys,
     build_registry,

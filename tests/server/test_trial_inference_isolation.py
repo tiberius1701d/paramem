@@ -25,7 +25,7 @@ class TestRouterReadsFromLoopCache:
 
     def _make_store_with_cache(self, cache: dict):
         """Build a MemoryStore pre-populated with the given entries."""
-        from paramem.training.memory_store import MemoryStore
+        from paramem.memory.store import MemoryStore
 
         store = MemoryStore(replay_enabled=True)
         for k, q in cache.items():
@@ -64,7 +64,7 @@ class TestRouterReadsFromLoopCache:
         Trial adapter runs without a live store; quads.json in the
         trial dir must not be picked up (the router does not read those files).
         """
-        from paramem.training.memory_store import MemoryStore
+        from paramem.memory.store import MemoryStore
 
         adapter_dir = tmp_path / "adapters"
         adapter_dir.mkdir(parents=True)
@@ -91,7 +91,7 @@ class TestRouterReadsFromLoopCache:
 
     def test_router_empty_when_adapter_dir_absent(self, tmp_path):
         """Router returns no indexed speakers when adapter_dir does not exist."""
-        from paramem.training.memory_store import MemoryStore
+        from paramem.memory.store import MemoryStore
 
         router = QueryRouter(
             adapter_dir=tmp_path / "nonexistent",
