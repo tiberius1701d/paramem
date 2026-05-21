@@ -229,18 +229,24 @@ class TestListInvalidKind:
 
 class TestCreateDefaultKinds:
     def test_create_default_kinds(self, tmp_path: Path, monkeypatch) -> None:
-        """POST {} → writes config+registry (graph skipped — loop mock), tier=manual."""
+        """POST {} → default is snapshot_bundle; mock write_bundle → success, tier=manual."""
+        from unittest.mock import patch
+
         config = _make_config(tmp_path)
         state = _make_state(tmp_path, config)
         client = _make_client(monkeypatch, state)
 
-        resp = client.post("/backup/create", json={})
+        fake_slot = config.paths.data / "backups" / "snapshot" / "20260521-040000"
+        fake_slot.mkdir(parents=True, exist_ok=True)
+        (fake_slot / "bundle.meta.json").write_text("{}", encoding="utf-8")
+
+        with patch("paramem.backup.backup.write_bundle", return_value=fake_slot):
+            resp = client.post("/backup/create", json={})
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["tier"] == "manual"
-        # At least config should be written (loop.merger.save_bytes is mocked → graph ok too)
-        assert "config" in body["written_slots"] or body["success"] is True
-        assert body["error"] is None or body["success"] is False  # no unknown error
+        # Default now produces a bundle slot.
+        assert "snapshot_bundle" in body["written_slots"] or body["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +287,45 @@ class TestCreateUnknownKindReturns400:
         assert resp.status_code == 400, resp.text
         body = resp.json()
         assert body["detail"]["error"] == "kind_invalid"
+
+
+# ---------------------------------------------------------------------------
+# Test 32b — /backup/create honours the tier param (scheduled-timer path)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateTierParam:
+    def test_create_tier_daily_files_under_daily(self, tmp_path: Path, monkeypatch) -> None:
+        """POST {"tier":"daily"} → slot filed under daily (the timer delegation path)."""
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/create", json={"kinds": ["config"], "tier": "daily"})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["tier"] == "daily"
+        assert body["success"] is True
+
+    def test_create_default_tier_is_manual(self, tmp_path: Path, monkeypatch) -> None:
+        """Omitting tier preserves the manual default (operator backups)."""
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/create", json={"kinds": ["config"]})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tier"] == "manual"
+
+    def test_create_invalid_tier_returns_400(self, tmp_path: Path, monkeypatch) -> None:
+        """POST {"tier":"bogus"} → 400 tier_invalid."""
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/create", json={"kinds": ["config"], "tier": "bogus"})
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error"] == "tier_invalid"
 
 
 # ---------------------------------------------------------------------------
@@ -742,3 +787,405 @@ class TestRestoreDecryptErrorCodes:
             f"Expected decrypt_invalid_token for wrong recipient, "
             f"got: {resp.json()['detail']['error']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test: /backup/create snapshot_bundle kind
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSnapshotBundleKind:
+    """POST /backup/create with kinds=["snapshot_bundle"] routes to write_bundle."""
+
+    def test_snapshot_bundle_kind_accepted(self, tmp_path: Path, monkeypatch) -> None:
+        """POST {"kinds":["snapshot_bundle"]} → 200, written_slots has snapshot_bundle."""
+        from unittest.mock import patch
+
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        # Create a fake bundle slot so write_bundle returns a real path.
+        fake_slot = config.paths.data / "backups" / "snapshot" / "20260521-040001"
+        fake_slot.mkdir(parents=True, exist_ok=True)
+        (fake_slot / "bundle.meta.json").write_text(
+            '{"bundle_schema_version": 1, "tier": "manual"}', encoding="utf-8"
+        )
+
+        with patch("paramem.backup.backup.write_bundle", return_value=fake_slot):
+            resp = client.post("/backup/create", json={"kinds": ["snapshot_bundle"]})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["success"] is True
+        assert "snapshot_bundle" in body["written_slots"]
+        slot_path = Path(body["written_slots"]["snapshot_bundle"])
+        assert slot_path.exists()
+
+    def test_snapshot_bundle_tier_daily(self, tmp_path: Path, monkeypatch) -> None:
+        """snapshot_bundle with tier=daily → response tier=daily."""
+        from unittest.mock import patch
+
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        fake_slot = config.paths.data / "backups" / "snapshot" / "20260521-040002"
+        fake_slot.mkdir(parents=True, exist_ok=True)
+        (fake_slot / "bundle.meta.json").write_text(
+            '{"bundle_schema_version": 1, "tier": "daily"}', encoding="utf-8"
+        )
+
+        with patch("paramem.backup.backup.write_bundle", return_value=fake_slot):
+            resp = client.post(
+                "/backup/create",
+                json={"kinds": ["snapshot_bundle"], "tier": "daily"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["tier"] == "daily"
+        assert body["success"] is True
+
+    def test_snapshot_bundle_write_error_returns_success_false(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """write_bundle raises BackupError → 200 with success=False."""
+        from unittest.mock import patch
+
+        from paramem.backup.types import BackupError
+
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        with patch(
+            "paramem.backup.backup.write_bundle",
+            side_effect=BackupError("episodic slot not found"),
+        ):
+            resp = client.post("/backup/create", json={"kinds": ["snapshot_bundle"]})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["success"] is False
+        assert body["error"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — /backup/restore snapshot_bundle handler tests
+# ---------------------------------------------------------------------------
+
+
+def _make_bundle_slot(backups_root: Path, adapter_dirs: dict, config_path, registry_path) -> Path:
+    """Write a real bundle slot into backups_root/snapshot/ for endpoint tests.
+
+    Returns the bundle slot directory.
+    """
+    from paramem.backup.backup import write_bundle
+
+    bundle_base = backups_root / "snapshot"
+    bundle_base.mkdir(parents=True, exist_ok=True)
+
+    return write_bundle(
+        config_path=config_path,
+        registry_path=registry_path,
+        adapter_dirs=adapter_dirs,
+        base_dir=bundle_base,
+        meta_fields={"tier": "manual", "label": "test_bundle"},
+        adapter_scope="live",
+    )
+
+
+def _make_adapter_slot_for_handler(
+    parent_dir: Path,
+    slot_name: str,
+    registry_sha256: str,
+    adapter_name: str,
+    weight_bytes: bytes = b"fake_weights",
+) -> Path:
+    """Create a minimal adapter slot for handler test fixtures."""
+    import json as _json
+
+    slot = parent_dir / slot_name
+    slot.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "schema_version": 4,
+        "name": adapter_name,
+        "trained_at": "2026-05-21T00:00:00Z",
+        "window_stamp": "",
+        "base_model": {
+            "repo": "mistralai/Mistral-7B-Instruct-v0.3",
+            "sha": "abc",
+            "hash": "sha256:def",
+        },
+        "tokenizer": {
+            "name_or_path": "mistralai/Mistral-7B-Instruct-v0.3",
+            "vocab_size": 32000,
+            "merges_hash": "e" * 64,
+        },
+        "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": ["q_proj"]},
+        "registry_sha256": registry_sha256,
+        "key_count": 5,
+        "synthesized": False,
+    }
+    (slot / "meta.json").write_text(_json.dumps(meta), encoding="utf-8")
+    (slot / "adapter_model.safetensors").write_bytes(weight_bytes)
+    (slot / "adapter_config.json").write_bytes(b'{"peft_type": "LORA"}')
+    return slot
+
+
+def _seed_bundle_fixture(tmp_path: Path, config: object) -> tuple[Path, Path, Path]:
+    """Build a minimal bundle fixture for handler tests.
+
+    Returns (bundle_slot_dir, data_dir, adapter_dirs).
+    """
+    import hashlib
+
+    data_dir = config.paths.data
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Config
+    cfg_path = tmp_path / "server.yaml"
+    cfg_path.write_bytes(b"model: mistral\n")
+
+    # Registry
+    reg_dir = data_dir / "registry"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    reg_path = reg_dir / "key_metadata.json"
+    reg_path.write_bytes(b'{"speakers": {}}')
+
+    # Episodic: interim-only (production state)
+    ep_content = b'{"keys": {"k": 1}}'
+    ep_hash = hashlib.sha256(ep_content).hexdigest()
+    ep_dir = data_dir / "adapters" / "episodic"
+    ep_dir.mkdir(parents=True)
+    interim_fam = ep_dir / "interim_20260521T1000"
+    interim_fam.mkdir()
+    _make_adapter_slot_for_handler(
+        interim_fam,
+        "20260521-100000",
+        ep_hash,
+        "episodic_interim_20260521T1000",
+    )
+    (interim_fam / "indexed_key_registry.json").write_bytes(ep_content)
+
+    adapter_dirs = {"episodic": ep_dir}
+    backups_root = data_dir / "backups"
+    bundle_slot = _make_bundle_slot(backups_root, adapter_dirs, cfg_path, reg_path)
+    return bundle_slot, data_dir, adapter_dirs
+
+
+class TestRestoreSnapshotBundleHappyPath:
+    """POST /backup/restore with a snapshot_bundle → 200 + restore artifacts."""
+
+    def test_bundle_restore_returns_200(self, tmp_path: Path, monkeypatch) -> None:
+        """Happy path: restore a real bundle → 200, restart_required=True."""
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["restart_required"] is True
+
+    def test_bundle_restore_restored_adapters_populated(self, tmp_path: Path, monkeypatch) -> None:
+        """restored_adapters list in response must be non-empty after bundle restore."""
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert isinstance(body["restored_adapters"], list)
+        assert len(body["restored_adapters"]) > 0
+
+    def test_bundle_restore_backed_up_pre_restore_has_bundle_key(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """backed_up_pre_restore response must have 'bundle' key for snapshot_bundle restores."""
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "bundle" in body["backed_up_pre_restore"], (
+            "backed_up_pre_restore must have 'bundle' key for snapshot_bundle"
+        )
+
+    def test_bundle_restore_recovery_banner_appended(self, tmp_path: Path, monkeypatch) -> None:
+        """Recovery banner must be appended to _state['migration']['recovery_required']."""
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 200, resp.text
+
+        recovery = state["migration"].get("recovery_required", [])
+        assert any("snapshot_bundle" in msg or backup_id in msg for msg in recovery), (
+            f"Expected recovery banner in state; got: {recovery}"
+        )
+
+    def test_bundle_restore_config_false_leaves_config(self, tmp_path: Path, monkeypatch) -> None:
+        """restore_config=False (default) must not change the live server.yaml."""
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        state = _make_state(tmp_path, config)
+        original_config = Path(state["config_path"]).read_bytes()
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post(
+            "/backup/restore", json={"backup_id": backup_id, "restore_config": False}
+        )
+        assert resp.status_code == 200, resp.text
+
+        assert Path(state["config_path"]).read_bytes() == original_config, (
+            "restore_config=False must not alter the live server.yaml"
+        )
+
+    def test_bundle_restore_config_true_writes_config(self, tmp_path: Path, monkeypatch) -> None:
+        """restore_config=True must write the bundle's server.yaml to live config path."""
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        state = _make_state(tmp_path, config)
+        live_config = Path(state["config_path"])
+        live_config.write_bytes(b"model: overwrite_me\n")
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id, "restore_config": True})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("restored_adapters") is not None
+
+        # The live config should now contain the bundle's config content.
+        restored_content = live_config.read_bytes()
+        assert restored_content != b"model: overwrite_me\n", (
+            "restore_config=True must overwrite the live config"
+        )
+
+
+class TestRestoreSnapshotBundlePreconditions:
+    """409 preconditions for snapshot_bundle restore."""
+
+    def test_trial_active_returns_409(self, tmp_path: Path, monkeypatch) -> None:
+        """TRIAL state → 409 trial_active (same as config restore)."""
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        state["migration"]["state"] = "TRIAL"
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": "irrelevant"})
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "trial_active"
+
+    def test_staging_active_returns_409(self, tmp_path: Path, monkeypatch) -> None:
+        """STAGING state → 409 staging_active."""
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        state["migration"]["state"] = "STAGING"
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": "irrelevant"})
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] in {"staging_active", "trial_active"}
+
+    def test_consolidating_returns_409(self, tmp_path: Path, monkeypatch) -> None:
+        """consolidating=True → 409 consolidating."""
+        config = _make_config(tmp_path)
+        state = _make_state(tmp_path, config)
+        state["consolidating"] = True
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": "irrelevant"})
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["error"] == "consolidating"
+
+    def test_training_active_returns_409(self, tmp_path: Path, monkeypatch) -> None:
+        """Background training active → 409 training_active (S3 reviewer requirement)."""
+        from unittest.mock import MagicMock
+
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        state = _make_state(tmp_path, config)
+
+        # Wire a fake background trainer with is_training=True.
+        fake_trainer = MagicMock()
+        fake_trainer.is_training = True
+        state["background_trainer"] = fake_trainer
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "training_active"
+
+
+class TestRestoreSnapshotBundleCorrupt:
+    """Error codes for corrupt / invalid bundle restores."""
+
+    def test_corrupt_bundle_returns_500_bundle_corrupt(self, tmp_path: Path, monkeypatch) -> None:
+        """Tampered bundle file → 500 bundle_corrupt, no live mutation."""
+        config = _make_config(tmp_path)
+        bundle_slot, data_dir, adapter_dirs = _seed_bundle_fixture(tmp_path, config)
+        backup_id = bundle_slot.name
+
+        # Tamper with a bundle file to cause a hash mismatch.
+        import json as _json
+
+        manifest = _json.loads((bundle_slot / "bundle.meta.json").read_text(encoding="utf-8"))
+        for entry in manifest.get("files", []):
+            candidate = bundle_slot / entry["path"]
+            if candidate.exists() and candidate.is_file():
+                candidate.write_bytes(b"TAMPERED_CONTENT_BREAKS_HASH")
+                break
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 500, resp.text
+        assert resp.json()["detail"]["error"] == "bundle_corrupt"
+
+    def test_non_bundle_non_config_kind_returns_400(self, tmp_path: Path, monkeypatch) -> None:
+        """GRAPH slot → 400 restore_kind_not_supported."""
+        config = _make_config(tmp_path)
+        data_dir = config.paths.data
+        data_dir.mkdir(parents=True, exist_ok=True)
+        backups_root = data_dir / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        slot_dir = backup_write(
+            ArtifactKind.GRAPH,
+            b'{"nodes": []}',
+            meta_fields={"tier": "daily"},
+            base_dir=backups_root / "graph",
+        )
+        backup_id = slot_dir.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error"] == "restore_kind_not_supported"

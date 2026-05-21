@@ -31,31 +31,44 @@ No canonicalization is applied.
 
 from __future__ import annotations
 
+import hashlib
+import json as _json
 import logging
 import os
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from paramem.backup.age_envelope import AGE_MAGIC
 from paramem.backup.atomic import rename_pending_to_slot
 from paramem.backup.atomic import sweep_orphan_pending as _sweep_pending
 from paramem.backup.encryption import (
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
+    read_maybe_encrypted,
 )
 from paramem.backup.hashing import (
     content_sha256_bytes,
 )
 from paramem.backup.meta import read_meta, verify_fingerprint, write_meta
 from paramem.backup.types import (
+    BUNDLE_SCHEMA_VERSION,
     SCHEMA_VERSION,
     ArtifactKind,
     ArtifactMeta,
     BackupError,
+    BundleManifest,
+    BundleManifestError,
     FingerprintMismatchError,
     PruneReport,
+    RestoreAbortedError,
+    RestoreResult,
     RetentionPolicy,
 )
+
+# iter_interim_dirs is imported at module level (no cycle: interim_adapter
+# does not import from paramem.backup.backup).
+from paramem.memory.interim_adapter import iter_interim_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +169,82 @@ def _fsync_dir(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _promote_slot() — shared pending-dir allocation + atomic rename core
+# ---------------------------------------------------------------------------
+
+
+def _promote_slot(base_dir: Path) -> tuple[Path, str]:
+    """Allocate a unique ``.pending/<ts>/`` directory and return it with its timestamp.
+
+    This is the shared core used by both ``write()`` and ``write_bundle()``.
+    It handles the timestamp-collision retry loop: if the candidate timestamp
+    (or its pending directory) already exists, the clock is bumped by one
+    hundredth of a second and a new candidate is tried.  Both the pending
+    directory *and* the eventual final slot directory are checked so that a
+    previously-promoted slot's timestamp is never reused.
+
+    The caller is responsible for:
+
+    1. Writing all files into the returned ``pending_slot`` directory.
+    2. fsyncing those files and the pending directory.
+    3. Calling ``rename_pending_to_slot(pending_slot, base_dir / timestamp)``
+       to atomically promote the slot.
+    4. fsyncing the parent directories for rename durability.
+
+    A crash between step 1–2 and step 3 leaves a ``.pending/<ts>/`` residue
+    that ``sweep_orphan_pending`` removes on startup.
+
+    Parameters
+    ----------
+    base_dir:
+        The per-kind or per-bundle backup directory.  Created with parents if
+        absent.  The ``.pending/`` subdirectory is created inside it.
+
+    Returns
+    -------
+    tuple[Path, str]
+        ``(pending_slot, timestamp)`` where *pending_slot* is the freshly-
+        created pending directory and *timestamp* is the ``YYYYMMDD-HHMMSSff``
+        string used to name both the pending and final slot directories.
+
+    Raises
+    ------
+    BackupError
+        If a unique pending slot could not be allocated after 10 collision
+        retries (pathological — frozen clock or extreme write rate).
+    """
+    base_dir = Path(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    pending_root = base_dir / _PENDING_DIR_NAME
+    pending_root.mkdir(exist_ok=True)
+
+    _MAX_COLLISION_RETRIES = 10
+    _ts_now = datetime.now(tz=timezone.utc)
+    for _attempt in range(_MAX_COLLISION_RETRIES):
+        hh = _ts_now.microsecond // 10000
+        _ts_candidate = _ts_now.strftime("%Y%m%d-%H%M%S") + f"{hh:02d}"
+        # A timestamp is usable only when neither the pending nor the final
+        # slot directory already exists.  The final-slot check handles the
+        # case where a previous write already promoted the same timestamp.
+        _candidate_pending = pending_root / _ts_candidate
+        _candidate_final = base_dir / _ts_candidate
+        if _candidate_final.exists():
+            _ts_now = _ts_now + timedelta(microseconds=10_000)
+            continue
+        try:
+            _candidate_pending.mkdir(exist_ok=False)
+            return _candidate_pending, _ts_candidate
+        except FileExistsError:
+            # Bump by one hundredth of a second and retry.
+            _ts_now = _ts_now + timedelta(microseconds=10_000)
+
+    raise BackupError(
+        "could not allocate unique pending slot after "
+        f"{_MAX_COLLISION_RETRIES} attempts — clock skew or extreme write rate"
+    )
+
+
+# ---------------------------------------------------------------------------
 # write()
 # ---------------------------------------------------------------------------
 
@@ -171,7 +260,7 @@ def write(
 
     Sequence (crash-safe):
     1. Determine whether the daily age identity is loadable.
-    2. Create ``.pending/<ts>/`` inside *base_dir*.
+    2. Create ``.pending/<ts>/`` inside *base_dir* via ``_promote_slot``.
     3. Write artifact file (ciphertext or plaintext) inside pending.
     4. Compute content hash of the on-disk bytes.
     5. Write ``.meta.json`` sidecar inside pending.
@@ -225,42 +314,9 @@ def write(
     # --- compute content hash (of bytes as written — Resolved Decision 29) ---
     hash_hex = content_sha256_bytes(on_disk_bytes)
 
-    # --- timestamp + filenames (with collision retry) ---
+    # --- allocate pending slot (with collision retry) ---
     encrypted_flag = do_encrypt
-    base_dir = Path(base_dir)
-    base_dir.mkdir(parents=True, exist_ok=True)
-    pending_root = base_dir / _PENDING_DIR_NAME
-    pending_root.mkdir(exist_ok=True)
-
-    _MAX_COLLISION_RETRIES = 10
-    timestamp: str | None = None
-    pending_slot: Path | None = None
-    _ts_now = datetime.now(tz=timezone.utc)
-    for _attempt in range(_MAX_COLLISION_RETRIES):
-        hh = _ts_now.microsecond // 10000
-        _ts_candidate = _ts_now.strftime("%Y%m%d-%H%M%S") + f"{hh:02d}"
-        # A timestamp is usable only when neither the pending nor the final
-        # slot directory already exists.  The final-slot check handles the
-        # case where a previous write already promoted the same timestamp.
-        _candidate_pending = pending_root / _ts_candidate
-        _candidate_final = base_dir / _ts_candidate
-        if _candidate_final.exists():
-            _ts_now = _ts_now + timedelta(microseconds=10_000)
-            continue
-        try:
-            _candidate_pending.mkdir(exist_ok=False)
-            timestamp = _ts_candidate
-            pending_slot = _candidate_pending
-            break
-        except FileExistsError:
-            # Bump by one hundredth of a second and retry
-            _ts_now = _ts_now + timedelta(microseconds=10_000)
-
-    if pending_slot is None or timestamp is None:
-        raise BackupError(
-            "could not allocate unique pending slot after "
-            f"{_MAX_COLLISION_RETRIES} attempts — clock skew or extreme write rate"
-        )
+    pending_slot, timestamp = _promote_slot(Path(base_dir))
 
     artifact_filename = _artifact_filename(kind, timestamp, encrypted_flag)
 
@@ -297,6 +353,7 @@ def write(
         os.close(dir_fd)
 
     # --- atomic promotion ---
+    base_dir = Path(base_dir)
     slot_dir = base_dir / timestamp
     rename_pending_to_slot(pending_slot, slot_dir)
 
@@ -407,6 +464,498 @@ def _find_artifact(slot_dir: Path, meta: ArtifactMeta) -> Path:
             return entry
 
     raise FileNotFoundError(f"No artifact file found in slot {slot_dir}")
+
+
+# ---------------------------------------------------------------------------
+# write_bundle()
+# ---------------------------------------------------------------------------
+
+_BUNDLE_MANIFEST_FILENAME = "bundle.meta.json"
+_BUNDLE_EXCLUDED_DEFAULTS = [
+    "graph (RAM-only by design; not required for recall recovery)",
+    "interim/checkpoint weights (regenerable from training; excluded by adapter_scope)",
+    "keyed_pairs (transient; regenerated from graph on every cycle; not on disk)",
+]
+
+# Files inside an adapter slot that are always excluded from bundles — these are
+# transient training scaffolding that must not be captured.
+_ADAPTER_EXCLUDED_PATTERNS = frozenset({"resume_state.json", "in_training", "bg_checkpoint"})
+# Subdirectory prefixes that are transient scaffolding.
+_ADAPTER_EXCLUDED_DIR_PREFIXES = ("checkpoint-", "in_training", "bg_checkpoint")
+
+
+def _copy_artifact(
+    src: Path,
+    dst: Path,
+) -> dict:
+    """Copy one artifact file into the bundle, respecting the encrypt-as-is rule.
+
+    Weight blobs (``.safetensors``) and other files that are already age
+    envelopes are copied **byte-for-byte** (no double-encrypt).  Files that
+    are plaintext go through the AUTO encryption path
+    (``envelope_encrypt_bytes``).
+
+    Returns a file-inventory dict entry:
+    ``{"path": rel_str, "content_sha256": hex, "encrypted": bool, "size_bytes": int}``.
+    The ``path`` key is set to an empty string here; callers must fill it with
+    the relative path inside the bundle slot.
+
+    Parameters
+    ----------
+    src:
+        Source file path on disk.
+    dst:
+        Destination path inside the ``.pending/<ts>/`` directory.
+
+    Returns
+    -------
+    dict
+        File inventory entry (``path`` is empty; caller sets it).
+    """
+    raw_bytes = src.read_bytes()
+    if raw_bytes.startswith(AGE_MAGIC):
+        # Already an age envelope — copy verbatim to avoid double-encryption.
+        # Weight blobs (.safetensors) and other artifacts written via the live
+        # encryption path are already [daily, recovery] envelopes; re-running
+        # envelope_encrypt_bytes on them would produce a nested envelope (the
+        # decryption layer would unwrap the outer shell and return another
+        # ciphertext rather than plaintext). Copying verbatim preserves both
+        # recipients and is the contract documented in the plan (Q3).
+        on_disk_bytes = raw_bytes
+        encrypted_flag = True
+    else:
+        # Plaintext source — e.g. the meta.json / adapter_config.json carve-outs
+        # the live store keeps plaintext, or any file under Security OFF. Copy
+        # VERBATIM so the bundle mirrors each file's on-disk encryption state and
+        # restore is a byte-faithful round-trip. Re-encrypting a plaintext
+        # carve-out here would write back an unreadable meta.json on restore
+        # (find_live_slot/read_manifest and PEFT expect plaintext). Sensitive
+        # artifacts (weights, registries, speaker profiles) are already age
+        # envelopes on disk and are copied verbatim by the branch above, so the
+        # bundle preserves the live store's exact security posture either way.
+        on_disk_bytes = raw_bytes
+        encrypted_flag = False
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(on_disk_bytes)
+
+    return {
+        "path": "",  # caller fills relative path
+        "content_sha256": content_sha256_bytes(on_disk_bytes),
+        "encrypted": encrypted_flag,
+        "size_bytes": len(on_disk_bytes),
+    }
+
+
+def write_bundle(
+    *,
+    config_path: Path,
+    registry_path: Path,
+    adapter_dirs: dict[str, Path],
+    base_dir: Path,
+    meta_fields: dict,
+    adapter_scope: str = "live",
+    live_registry_sha256: str = "",
+    speaker_profiles_path: Path | None = None,
+) -> Path:
+    """Capture a self-contained recovery-set bundle into a single slot directory.
+
+    A bundle slot contains every artifact required to restore a working ParaMem
+    instance: live server config, key-metadata registry, per-adapter weights,
+    per-tier indexed-key registries, per-tier SimHash registries, interim adapter
+    slots (when ``adapter_scope="live"``), and speaker profiles.  The bundle
+    manifest (``bundle.meta.json``) indexes all captured files with their content
+    hashes.
+
+    The capture set mirrors exactly what ``MemoryStore.load_registries_from_disk``
+    mounts for recall:
+
+    - **Per enabled MAIN tier** (``episodic`` / ``semantic`` / ``procedural``):
+      live weight slot via ``find_live_slot(<tier_dir>, hash)``, then the
+      tier-root ``indexed_key_registry.json`` and ``simhash_registry.json``.
+    - **Per INTERIM family** (``iter_interim_dirs(<adapter_base>)``), only when
+      ``adapter_scope="live"``: live inner weight slot via
+      ``find_live_slot(<interim_dir>, hash)`` (the ``<ts>/`` slot;
+      ``checkpoint-*/`` scaffolding is naturally excluded because those dirs
+      carry no matching ``meta.registry_sha256``), then the interim-dir
+      ``indexed_key_registry.json`` and ``simhash_registry.json``.
+    - Shared: ``key_metadata.json``, ``speaker_profiles.json``, ``server.yaml``.
+    - Excluded: ``graph.json`` (RAM-only), ``checkpoint-*/``, ``in_training/``,
+      ``bg_checkpoint/``, ``resume_state.json`` (training scaffolding),
+      ``keyed_pairs.json`` (transient; regenerated from graph).
+
+    Per-slot hashes: each captured adapter entry records the slot's **own**
+    ``meta.registry_sha256``.  Main and interim slots carry different hashes;
+    a single global hash cannot address both.
+
+    Crash safety follows the same pattern as ``write()``:
+
+    1. All files are written into ``.pending/<ts>/``.
+    2. Every file is fsynced, then the pending directory entry is fsynced.
+    3. A single ``os.rename()`` atomically promotes the pending directory.
+    4. Parent directories are fsynced for rename durability.
+
+    A crash at any step either leaves no slot or a ``.pending/<ts>/`` residue
+    that ``sweep_orphan_pending()`` removes on startup.
+
+    Per plan resolution S2: this function does **not** emit an
+    ``ArtifactMeta`` sidecar — only ``bundle.meta.json`` is written.
+
+    Parameters
+    ----------
+    config_path:
+        Path to the live ``server.yaml`` (or ``server.yaml.enc``).
+    registry_path:
+        Path to ``key_metadata.json`` (the ESSENTIAL registry that ties
+        weights to indexed keys).
+    adapter_dirs:
+        Mapping of adapter name → adapter-kind directory (e.g.
+        ``{"episodic": Path("data/ha/adapters/episodic")}``) for every
+        **enabled** adapter.  The function resolves the live main slot under
+        each directory using ``live_registry_sha256``.  The adapter-base dir
+        (parent of the episodic dir) is derived from the episodic entry to
+        discover interim families via ``iter_interim_dirs``.
+    base_dir:
+        Bundle-kind backup directory (e.g. ``data/ha/backups/snapshot/``).
+        Created with parents if absent.
+    meta_fields:
+        Caller-supplied metadata dict.  Required key: ``"tier"`` (str).
+        Optional: ``"label"`` (str | None).
+    adapter_scope:
+        ``"live"`` (default) — capture the live-serving slot for each enabled
+        main tier plus every interim family.  Under ``"live"`` the primary
+        ``episodic`` recall may be satisfied by an interim slot when no
+        finalized main slot exists (the normal production state while the
+        episodic adapter is still accumulating sessions before first
+        consolidation).
+        ``"main"`` — capture only finalized main slots.  Fails loud for the
+        ``episodic`` tier when it has no finalized main slot, with an
+        actionable message to switch to ``"live"`` or run a full consolidation.
+    live_registry_sha256:
+        SHA-256 hex of the current ``key_metadata.json`` bytes.  Used by
+        ``find_live_slot`` to select the correct adapter weight slot.  When
+        empty string (fresh-install / no registry), empty-registry slots are
+        matched.
+    speaker_profiles_path:
+        Optional path to ``speaker_profiles.json``.  When present and the
+        file exists, it is included in the bundle.  When ``None`` or the file
+        does not exist, the artifact is noted as absent in the manifest.
+
+    Returns
+    -------
+    Path
+        The promoted bundle slot directory (``<base_dir>/<ts>/``).
+
+    Raises
+    ------
+    BackupError
+        If the chosen ``adapter_scope`` resolves no weight slot for the primary
+        ``episodic`` recall.  For ``adapter_scope="main"`` this happens when
+        episodic has only an interim slot (use ``"live"`` or run a full
+        consolidation).  For ``adapter_scope="live"`` this happens when no main
+        or interim slot exists at all.  Non-episodic tiers with no slot are
+        recorded as absent in the manifest; they do not trigger a failure.
+    BackupError
+        If a unique pending slot could not be allocated after 10 collision
+        retries.
+    OSError
+        On any filesystem error.
+    """
+    # Import find_live_slot inside the function to avoid a potential import cycle:
+    # manifest.py imports from paramem.backup.encryption (not backup.py), so there
+    # is no actual cycle today.  The local import is kept as a guard — the comment
+    # documents the intent so future refactors don't move the import without review.
+    from paramem.adapters.manifest import find_live_slot
+
+    def _tier_registry_sha256(tier_root: Path) -> str:
+        """Hash of this tier's ``indexed_key_registry.json`` (decrypted) — the
+        value ``find_live_slot`` matches against each slot's
+        ``meta.registry_sha256``.
+
+        Mirrors the server mount path (``app.py::_compute_tier_registry_sha256``
+        for mains and the per-interim hash at the interim mount): every tier and
+        interim slot is stamped with its OWN registry hash, so a single global
+        ``live_registry_sha256`` cannot resolve all tiers (a full cycle leaves
+        the main registry empty while interims carry their own). Returns ``""``
+        when the registry is absent (matches empty-stamped slots).
+        """
+        reg = tier_root / "indexed_key_registry.json"
+        if not reg.exists():
+            return ""
+        return hashlib.sha256(read_maybe_encrypted(reg)).hexdigest()
+
+    base_dir = Path(base_dir)
+    tier = meta_fields.get("tier", "manual")
+    label = meta_fields.get("label")
+
+    # --- allocate pending slot ---
+    pending_slot, timestamp = _promote_slot(base_dir)
+
+    created_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    files_inventory: list[dict] = []
+    adapters_record: dict[str, dict] = {}
+    base_model_info: dict = {}
+
+    # --- capture config ---
+    if config_path.exists():
+        dst = pending_slot / "config" / config_path.name
+        entry = _copy_artifact(config_path, dst)
+        entry["path"] = f"config/{config_path.name}"
+        files_inventory.append(entry)
+
+    # --- capture registry (key_metadata.json) ---
+    if registry_path.exists():
+        dst = pending_slot / "registry" / registry_path.name
+        entry = _copy_artifact(registry_path, dst)
+        entry["path"] = f"registry/{registry_path.name}"
+        files_inventory.append(entry)
+
+    # --- capture speaker_profiles.json ---
+    if speaker_profiles_path is not None and speaker_profiles_path.exists():
+        dst = pending_slot / "speaker_profiles.json"
+        entry = _copy_artifact(speaker_profiles_path, dst)
+        entry["path"] = "speaker_profiles.json"
+        files_inventory.append(entry)
+
+    # --- helper: capture one adapter slot (main or interim) ---
+    # _WEIGHT_FILES lists the three durable files in every slot directory.
+    # Training scaffolding (checkpoint-*/, in_training/, bg_checkpoint/,
+    # resume_state.json) is never copied: we only copy the named files below,
+    # so scaffolding is excluded structurally.  _ADAPTER_EXCLUDED_PATTERNS and
+    # _ADAPTER_EXCLUDED_DIR_PREFIXES document the exclusion contract explicitly.
+    _WEIGHT_FILES = ("adapter_model.safetensors", "adapter_config.json", "meta.json")
+
+    def _capture_adapter_slot(
+        bundle_key: str,
+        slot_path: Path,
+        tier_root: Path,
+        dst_prefix: str,
+    ) -> None:
+        """Capture one adapter slot (main or interim) into the pending directory.
+
+        Reads the slot's own ``meta.json`` to record the slot's
+        ``registry_sha256`` in the bundle manifest (main and interim slots
+        carry different hashes).  Captures the per-tier
+        ``indexed_key_registry.json`` and ``simhash_registry.json`` from
+        *tier_root* (the parent directory of the slot for main tiers, or the
+        interim-family directory for interim slots).
+
+        Parameters
+        ----------
+        bundle_key:
+            Key used in ``adapters_record`` (e.g. ``"episodic"`` or
+            ``"episodic_interim_20260517T1200"``).
+        slot_path:
+            The timestamped slot directory (e.g. ``episodic/20260517-180431/``
+            or ``episodic/interim_20260517T1200/20260517-180430/``).
+        tier_root:
+            Directory that holds the registries at its root — the
+            adapter-kind dir for main tiers (``episodic/``), or the interim
+            family dir (``interim_20260517T1200/``) for interim slots.
+        dst_prefix:
+            Relative path prefix inside the bundle slot directory for this
+            adapter's files (e.g. ``"adapters/episodic"``).
+        """
+        # Read this slot's own meta.json for its registry_sha256 and key_count.
+        slot_meta: dict = {}
+        meta_src = slot_path / "meta.json"
+        if meta_src.exists():
+            try:
+                slot_meta = _json.loads(meta_src.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise BackupError(
+                    f"write_bundle: failed to read meta.json from {meta_src}: {exc}"
+                ) from exc
+
+        nonlocal base_model_info
+        if not base_model_info and slot_meta.get("base_model"):
+            bm = slot_meta["base_model"]
+            base_model_info = {
+                "repo": bm.get("repo", ""),
+                "sha": bm.get("sha", ""),
+                "hash": bm.get("hash", ""),
+            }
+
+        adapter_dst_dir = pending_slot / dst_prefix
+        for fname in _WEIGHT_FILES:
+            src = slot_path / fname
+            if not src.exists():
+                continue
+            dst = adapter_dst_dir / fname
+            entry = _copy_artifact(src, dst)
+            entry["path"] = f"{dst_prefix}/{fname}"
+            files_inventory.append(entry)
+
+        # Capture per-tier indexed_key_registry.json (mirrors
+        # MemoryStore.load_registries_from_disk which reads this file at
+        # <tier_root>/indexed_key_registry.json for both main and interim tiers).
+        indexed_key_src = tier_root / "indexed_key_registry.json"
+        indexed_key_present = False
+        if indexed_key_src.exists():
+            dst = adapter_dst_dir / "indexed_key_registry.json"
+            entry = _copy_artifact(indexed_key_src, dst)
+            entry["path"] = f"{dst_prefix}/indexed_key_registry.json"
+            files_inventory.append(entry)
+            indexed_key_present = True
+
+        # Capture per-tier simhash_registry.json (mirrors the _load_simhash
+        # per-tier path in MemoryStore.load_registries_from_disk).
+        simhash_src = tier_root / "simhash_registry.json"
+        simhash_present = False
+        if simhash_src.exists():
+            dst = adapter_dst_dir / "simhash_registry.json"
+            entry = _copy_artifact(simhash_src, dst)
+            entry["path"] = f"{dst_prefix}/simhash_registry.json"
+            files_inventory.append(entry)
+            simhash_present = True
+
+        adapters_record[bundle_key] = {
+            "slot_source": str(slot_path),
+            # Each slot's OWN registry_sha256 — main and interim hashes differ;
+            # a single global live_registry_sha256 cannot address both.
+            "registry_sha256": slot_meta.get("registry_sha256", ""),
+            "key_count": slot_meta.get("key_count", "unknown"),
+            "indexed_key_registry_present": indexed_key_present,
+            "simhash_present": simhash_present,
+            "keyed_pairs_present": False,  # transient; regenerated from graph
+        }
+
+    # --- capture main tiers ---
+    for adapter_name, adapter_kind_dir in adapter_dirs.items():
+        adapter_kind_dir = Path(adapter_kind_dir)
+        main_slot = find_live_slot(adapter_kind_dir, _tier_registry_sha256(adapter_kind_dir))
+
+        if main_slot is None:
+            if adapter_name == "episodic":
+                # Episodic is the PRIMARY recall tier.  Under adapter_scope="main"
+                # an interim-only episodic is a hard error (the caller must use
+                # "live" or run a full consolidation first).  Under "live" we defer
+                # the failure check until after the interim pass below — an interim
+                # slot may satisfy the episodic requirement.
+                if adapter_scope == "main":
+                    raise BackupError(
+                        "write_bundle: adapter_scope='main' but episodic has no finalized "
+                        f"main slot in {adapter_kind_dir}. "
+                        "Use adapter_scope='live' to capture the interim slot, or run a "
+                        "full consolidation first."
+                    )
+                # Under "live": defer — interim pass will capture episodic interims.
+                logger.debug(
+                    "write_bundle: no main slot for episodic in %s; "
+                    "will attempt interim capture (adapter_scope='live')",
+                    adapter_kind_dir,
+                )
+            else:
+                # Non-episodic tiers with no main slot are recorded as absent;
+                # they do not fail the bundle.
+                logger.debug(
+                    "write_bundle: no main slot for %r in %s; recording absent",
+                    adapter_name,
+                    adapter_kind_dir,
+                )
+            continue
+
+        _capture_adapter_slot(
+            bundle_key=adapter_name,
+            slot_path=main_slot,
+            tier_root=adapter_kind_dir,  # registries live at the tier-kind dir root
+            dst_prefix=f"adapters/{adapter_name}",
+        )
+
+    # --- capture interim families (only under adapter_scope="live") ---
+    # iter_interim_dirs yields (adapter_name, interim_dir) for each
+    # interim_<stamp>/ family found under the episodic dir.  It uses glob
+    # pattern "interim_*" so checkpoint-*/, in_training/, and bg_checkpoint/
+    # siblings are never yielded (_ADAPTER_EXCLUDED_DIR_PREFIXES contract).
+    # find_live_slot on the interim_dir locates the <ts>/ slot inside it;
+    # checkpoint-*/ dirs within the interim family are excluded naturally
+    # because they carry no meta.json with a matching registry_sha256.
+    if adapter_scope == "live" and adapter_dirs:
+        # Derive the adapter base dir from the first entry (all adapter_kind dirs
+        # share the same parent: data/ha/adapters/).
+        adapter_base_dir = next(iter(adapter_dirs.values())).parent
+
+        for interim_name, interim_dir in iter_interim_dirs(adapter_base_dir):
+            interim_slot = find_live_slot(interim_dir, _tier_registry_sha256(interim_dir))
+            if interim_slot is None:
+                logger.debug(
+                    "write_bundle: no live slot in interim family %s "
+                    "(registry hash mismatch or empty family); skipping",
+                    interim_dir,
+                )
+                continue
+
+            _capture_adapter_slot(
+                bundle_key=interim_name,
+                slot_path=interim_slot,
+                tier_root=interim_dir,  # interim registries live at the interim-family dir root
+                dst_prefix=f"adapters/{interim_name}",
+            )
+
+    # --- fail-loud check for episodic primary recall ---
+    # Episodic must be captured (as main OR as interim) when it is in adapter_dirs.
+    # A bundle without episodic is not a valid recall-recovery set.
+    if "episodic" in adapter_dirs:
+        episodic_keys = {
+            k for k in adapters_record if k == "episodic" or k.startswith("episodic_interim_")
+        }
+        if not episodic_keys:
+            raise BackupError(
+                "write_bundle: no live slot found for the primary episodic recall "
+                f"(adapter_scope={adapter_scope!r}, "
+                f"live_registry_sha256={live_registry_sha256!r}). "
+                "Cannot write a self-contained recovery bundle without episodic weights. "
+                "If consolidation has not run yet, use adapter_scope='live' so interim "
+                "slots are included."
+            )
+
+    # --- write bundle.meta.json ---
+    bundle_manifest = BundleManifest(
+        bundle_schema_version=BUNDLE_SCHEMA_VERSION,
+        created_at=created_at,
+        tier=tier,
+        label=label,
+        live_registry_sha256=live_registry_sha256,
+        base_model=base_model_info,
+        files=files_inventory,
+        adapters=adapters_record,
+        excluded=list(_BUNDLE_EXCLUDED_DEFAULTS),
+    )
+    manifest_path = pending_slot / _BUNDLE_MANIFEST_FILENAME
+    manifest_path.write_text(
+        _json.dumps(bundle_manifest.to_dict(), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # --- fsync all captured files and the pending directory ---
+    for fpath in pending_slot.rglob("*"):
+        if fpath.is_file():
+            with open(fpath, "rb") as fh:
+                os.fsync(fh.fileno())
+
+    dir_fd = os.open(str(pending_slot), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+    # --- atomic promotion ---
+    slot_dir = base_dir / timestamp
+    rename_pending_to_slot(pending_slot, slot_dir)
+
+    # --- fsync parent directories for rename durability ---
+    for parent in (slot_dir.parent, base_dir):
+        _fsync_dir(parent)
+
+    logger.debug(
+        "backup.write_bundle: bundle slot written to %s (tier=%s, adapters=%s, files=%d)",
+        slot_dir,
+        tier,
+        list(adapters_record.keys()),
+        len(files_inventory),
+    )
+    return slot_dir
 
 
 # ---------------------------------------------------------------------------
@@ -612,3 +1161,442 @@ def _parse_slot_timestamp(name: str) -> datetime | None:
         return dt
     except (ValueError, IndexError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# restore_bundle()
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write_file(src_bytes: bytes, dst: Path, mode: int = 0o600) -> None:
+    """Write *src_bytes* to *dst* atomically via a temp-sibling + rename.
+
+    Uses ``tempfile.mkstemp`` to generate a unique temp path (avoiding
+    ``FileExistsError`` from a stale ``.restore-pending`` temp left by a prior
+    crash between create and rename), then opens that path with ``O_WRONLY`` at
+    *mode* permissions (default 0o600) to prevent plaintext exposure under the
+    default umask.  Fsyncs the file and the parent directory for rename
+    durability.
+
+    Parameters
+    ----------
+    src_bytes:
+        Bytes to write.
+    dst:
+        Target destination path.  The parent directory must already exist.
+    mode:
+        File mode (octal) for the temp file.  Default 0o600.
+    """
+    import tempfile
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # mkstemp creates a unique temp path — no stale-temp FileExistsError.
+    # The returned fd is already open O_WRONLY at the default umask; we
+    # re-open with the requested mode (0o600) by closing first and using
+    # os.open so the mode is applied before any write.
+    tmp_fd, tmp_str = tempfile.mkstemp(
+        dir=str(dst.parent),
+        prefix=dst.name + ".",
+        suffix=".restore-pending",
+    )
+    os.close(tmp_fd)
+    tmp = Path(tmp_str)
+    # Re-open with the requested mode so the temp file is never world-readable.
+    os.chmod(str(tmp), mode)
+    fd = os.open(str(tmp), os.O_WRONLY, mode)
+    try:
+        os.write(fd, src_bytes)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(str(tmp), str(dst))
+    # fsync parent directory for rename durability.
+    parent_fd = os.open(str(dst.parent), os.O_RDONLY)
+    try:
+        os.fsync(parent_fd)
+    except OSError as exc:
+        logger.warning("_atomic_write_file: parent fsync failed for %s: %s", dst, exc)
+    finally:
+        os.close(parent_fd)
+
+
+def restore_bundle(
+    bundle_slot_dir: Path,
+    *,
+    data_dir: Path,
+    config_path: Path,
+    restore_config: bool = False,
+) -> RestoreResult:
+    """Restore a self-contained ``snapshot_bundle`` slot into *data_dir*.
+
+    Performs a crash-safe, pre-mutation-verified restore of a bundle produced
+    by :func:`write_bundle`.  The sequence is:
+
+    1. **Read + validate** ``bundle.meta.json`` → :class:`BundleManifest`.
+       Reject if missing or forward-version (``BundleManifestError``).
+    2. **Verify file hashes**: each entry in ``manifest.files`` must match the
+       on-disk bundle file's SHA-256.  Fail loud on mismatch
+       (``FingerprintMismatchError``) — no live mutation occurs.
+    3. **Decrypt-probe**: confirm the age-encrypted metadata files decrypt with
+       the CURRENT daily identity.  Raises ``RuntimeError`` (no key) or
+       ``pyrage.DecryptError`` (stale/wrong key) **before** any mutation.
+    4. **Safety bundle**: capture the CURRENT live state via
+       :func:`write_bundle` into ``data_dir/backups/snapshot/`` (tier
+       ``"manual"``, label ``"pre_restore_safety_<bundle_id>"``).  Skipped
+       gracefully (``safety_slot=None``) when the live store has no episodic
+       slot (fresh/empty target): a ``BackupError`` from the safety write is
+       caught, logged, and restore continues.  All other errors abort.
+    5. **Atomic restore** (adapter slots written; registry written LAST):
+
+       - For each adapter in ``manifest.adapters``: create a fresh slot dir
+         via ``_promote_slot`` (NOT the bundle's original timestamp) under the
+         tier-root resolved by ``adapter_slot_root_for_name``.  Copy
+         ``adapter_model.safetensors``, ``adapter_config.json``, ``meta.json``
+         AS-IS.  Write the per-tier ``indexed_key_registry.json`` and
+         ``simhash_registry.json`` to the tier-root (where
+         ``MemoryStore.load_registries_from_disk`` reads them).
+       - ``speaker_profiles.json`` → ``data_dir/speaker_profiles.json``
+         (atomic temp+rename).
+       - ``server.yaml`` → ONLY if ``restore_config=True``: atomic temp+rename
+         to ``config_path``.
+       - **LAST**: ``registry/key_metadata.json`` → ``data_dir/registry/
+         key_metadata.json`` (atomic temp+rename).
+
+       Registry-last crash invariant: a crash before the registry swap leaves
+       the OLD registry live.  ``find_live_slot`` resolves the OLD slots →
+       graceful (no half-restored live set).  The safety bundle is the
+       documented rollback target when the operator wants to undo.
+
+    6. Return :class:`RestoreResult` with ``restart_required=True`` — no hot
+       VRAM swap (8 GB; mounted adapters are stale until restart).
+
+    Parameters
+    ----------
+    bundle_slot_dir:
+        Promoted bundle slot directory (e.g. ``data/ha/backups/snapshot/<ts>/``).
+        Must contain a valid ``bundle.meta.json``.
+    data_dir:
+        Live data directory (e.g. ``data/ha/``).  Adapter slots, registries,
+        and ``speaker_profiles.json`` are restored into this tree.  Can be a
+        scratch directory for tests / dry runs.
+    config_path:
+        Path to the live ``server.yaml``.  Only written when
+        ``restore_config=True``.
+    restore_config:
+        When ``True``, atomically restore the bundle's ``server.yaml`` to
+        ``config_path``.  Default ``False`` — leave the live config untouched.
+
+    Returns
+    -------
+    RestoreResult
+        On success.
+
+    Raises
+    ------
+    BundleManifestError
+        If ``bundle.meta.json`` is missing, unreadable, or schema-mismatched
+        (forward version).  **No mutation has occurred.**
+    FingerprintMismatchError
+        If any file listed in the bundle manifest does not match its stored
+        content hash (corrupt bundle).  **No mutation has occurred.**
+    RuntimeError
+        If an age-encrypted metadata file cannot be decrypted because the
+        daily identity is not loaded.  **No mutation has occurred.**
+    BackupError
+        If the bundle is structurally incomplete (no files for an adapter
+        listed in ``manifest.adapters``).
+    OSError
+        On any filesystem error during the restore write phase.  The safety
+        bundle path is preserved; the operator should restore from it.
+    """
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
+    bundle_slot_dir = Path(bundle_slot_dir)
+    data_dir = Path(data_dir)
+    config_path = Path(config_path)
+
+    # -------------------------------------------------------------------------
+    # Step 1: Read + validate bundle.meta.json
+    # -------------------------------------------------------------------------
+    manifest_path = bundle_slot_dir / _BUNDLE_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        raise BundleManifestError(
+            f"restore_bundle: bundle.meta.json not found in {bundle_slot_dir}"
+        )
+    try:
+        raw = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BundleManifestError(
+            f"restore_bundle: cannot read bundle.meta.json from {bundle_slot_dir}: {exc}"
+        ) from exc
+    manifest = BundleManifest.from_dict(raw)  # raises BundleManifestError on schema mismatch
+
+    # -------------------------------------------------------------------------
+    # Step 2: Verify file hashes — BEFORE any mutation
+    # -------------------------------------------------------------------------
+    for entry in manifest.files:
+        rel_path = entry["path"]
+        expected_sha = entry["content_sha256"]
+        file_path = bundle_slot_dir / rel_path
+        if not file_path.exists():
+            raise FingerprintMismatchError(
+                f"restore_bundle: bundle file missing: {file_path}. "
+                "Bundle may be corrupt or incomplete."
+            )
+        actual_sha = content_sha256_bytes(file_path.read_bytes())
+        if actual_sha != expected_sha:
+            raise FingerprintMismatchError(
+                f"restore_bundle: hash mismatch for {rel_path}: "
+                f"manifest={expected_sha}, disk={actual_sha}. "
+                "Bundle is corrupt — restore aborted without any live mutation."
+            )
+
+    # -------------------------------------------------------------------------
+    # Step 3: Decrypt-probe encrypted metadata — BEFORE any mutation
+    # -------------------------------------------------------------------------
+    # Probe each file marked encrypted=True.  Weight blobs (.safetensors) are
+    # copied AS-IS; only metadata files (registry, config, speaker_profiles,
+    # simhash, indexed_key_registry) are probed because they are the ones the
+    # server needs to READ post-restore.  Raises RuntimeError (no key) or
+    # pyrage.DecryptError (stale/wrong key) — both surface as actionable errors
+    # before any live mutation.
+    for entry in manifest.files:
+        if not entry.get("encrypted", False):
+            continue
+        # Skip weight blobs — copied verbatim; decrypt-validity for weights is
+        # deferred to restart-time mount (server loads adapter from disk).
+        rel_path = entry["path"]
+        if rel_path.endswith(".safetensors"):
+            continue
+        file_path = bundle_slot_dir / rel_path
+        # read_maybe_encrypted raises RuntimeError or pyrage.DecryptError on failure.
+        read_maybe_encrypted(file_path)  # decrypt-probe only; discard result
+
+    # -------------------------------------------------------------------------
+    # Step 4: Safety bundle of current live state
+    # -------------------------------------------------------------------------
+    # Capture the current live recovery set into a pre-restore snapshot bundle.
+    # Skipped gracefully when the live store has no episodic slot (fresh/empty
+    # target) — a missing-episodic BackupError from write_bundle must NOT abort
+    # the restore (it means we're restoring into a clean slate).
+    safety_slot: Path | None = None
+    bundle_id = bundle_slot_dir.name
+    safety_label = f"pre_restore_safety_{bundle_id}"
+
+    # Derive the adapter dirs from data_dir for the safety bundle.
+    adapters_base = data_dir / "adapters"
+    safety_adapter_dirs: dict[str, Path] = {}
+    for tier_name in ("episodic", "semantic", "procedural"):
+        tier_dir = adapters_base / tier_name
+        if tier_dir.is_dir():
+            safety_adapter_dirs[tier_name] = tier_dir
+
+    # Registry path in the LIVE data_dir (not the bundle's registry).
+    live_registry_path = data_dir / "registry" / "key_metadata.json"
+    live_config_path_for_safety = config_path
+    live_speaker_profiles = data_dir / "speaker_profiles.json"
+
+    if safety_adapter_dirs:
+        try:
+            safety_slot = write_bundle(
+                config_path=live_config_path_for_safety,
+                registry_path=live_registry_path,
+                adapter_dirs=safety_adapter_dirs,
+                base_dir=data_dir / "backups" / "snapshot",
+                meta_fields={"tier": "manual", "label": safety_label},
+                speaker_profiles_path=(
+                    live_speaker_profiles if live_speaker_profiles.exists() else None
+                ),
+            )
+            logger.info("restore_bundle: safety bundle written to %s", safety_slot)
+        except BackupError as exc:
+            # No episodic slot in the live store (fresh target or mid-consolidation).
+            # Log + continue: the safety bundle is best-effort on a fresh target.
+            logger.warning(
+                "restore_bundle: safety bundle skipped (live store has no episodic slot): %s",
+                exc,
+            )
+            safety_slot = None
+    else:
+        logger.debug(
+            "restore_bundle: safety bundle skipped — no adapter dirs in live store (fresh target)"
+        )
+
+    # -------------------------------------------------------------------------
+    # Step 5: Atomic restore — adapter slots + registries + speaker_profiles
+    #         registry (key_metadata.json) written LAST (crash-safety invariant)
+    # -------------------------------------------------------------------------
+    #
+    # Registry-last crash invariant:
+    #   A crash before the registry swap leaves the OLD registry live.
+    #   find_live_slot resolves the OLD slots → graceful (no half-restored live
+    #   set).  The NEW adapter slots are latent + harmless (no slot meta matches
+    #   the old registry hash; they will be swept or ignored on next prune).
+    #   A crash AFTER the registry swap but before banner leaves the restored
+    #   set fully live — the desired end state; only the banner is missing.
+    #
+    # S3 safety-slot surface: the entire step-5 write phase is wrapped so that
+    # any exception logs the safety_slot path at ERROR before propagating.
+    # The operator can then use the safety bundle's backup_id to recover.
+
+    restored_adapters: list[str] = []
+    restored_config = False
+
+    try:
+        # 5a. Adapter slots — each gets a NEW timestamped dir (not the bundle's ts)
+        for adapter_name, adapter_record in manifest.adapters.items():
+            adapter_bundle_prefix = f"adapters/{adapter_name}"
+
+            # Determine which files belong to this adapter in the bundle.
+            # Weight files live under adapters/<name>/; registries also under adapters/<name>/.
+            adapter_files = [
+                entry
+                for entry in manifest.files
+                if entry["path"].startswith(f"{adapter_bundle_prefix}/")
+            ]
+            if not adapter_files:
+                logger.warning(
+                    "restore_bundle: adapter %r has no files in bundle; skipping", adapter_name
+                )
+                continue
+
+            # Resolve the tier-root for this adapter name.
+            tier_root = adapter_slot_root_for_name(data_dir / "adapters", adapter_name)
+
+            # Allocate a fresh slot dir under the tier-root (registry-last constraint:
+            # the new slot carries the bundle's meta.json with its registry_sha256;
+            # find_live_slot will resolve it as live once the registry is swapped).
+            new_slot_pending, new_ts = _promote_slot(tier_root)
+
+            # Copy the three weight files (adapter_model.safetensors, adapter_config.json,
+            # meta.json) into the new slot.
+            _SLOT_WEIGHT_FILES = {
+                "adapter_model.safetensors",
+                "adapter_config.json",
+                "meta.json",
+            }
+            for entry in adapter_files:
+                fname = Path(entry["path"]).name
+                if fname not in _SLOT_WEIGHT_FILES:
+                    continue
+                src = bundle_slot_dir / entry["path"]
+                dst = new_slot_pending / fname
+                dst.write_bytes(src.read_bytes())
+
+            # fsync slot files and the pending dir, then promote.
+            for fpath in new_slot_pending.iterdir():
+                if fpath.is_file():
+                    with open(fpath, "rb") as fh:
+                        os.fsync(fh.fileno())
+            slot_fd = os.open(str(new_slot_pending), os.O_RDONLY)
+            try:
+                os.fsync(slot_fd)
+            finally:
+                os.close(slot_fd)
+
+            new_slot_dir = tier_root / new_ts
+            rename_pending_to_slot(new_slot_pending, new_slot_dir)
+            _fsync_dir(tier_root)
+
+            # Write per-tier registries to the tier-root (where MemoryStore reads them).
+            _TIER_REGISTRY_FILES = {"indexed_key_registry.json", "simhash_registry.json"}
+            for entry in adapter_files:
+                fname = Path(entry["path"]).name
+                if fname not in _TIER_REGISTRY_FILES:
+                    continue
+                src = bundle_slot_dir / entry["path"]
+                src_bytes = src.read_bytes()
+                dst = tier_root / fname
+                _atomic_write_file(src_bytes, dst)
+
+            logger.debug(
+                "restore_bundle: adapter %r restored to new slot %s", adapter_name, new_slot_dir
+            )
+            restored_adapters.append(adapter_name)
+
+        # 5b. speaker_profiles.json
+        speaker_file_entries = [
+            entry for entry in manifest.files if entry["path"] == "speaker_profiles.json"
+        ]
+        if speaker_file_entries:
+            src_bytes = (bundle_slot_dir / "speaker_profiles.json").read_bytes()
+            _atomic_write_file(src_bytes, data_dir / "speaker_profiles.json")
+            logger.debug("restore_bundle: speaker_profiles.json restored")
+
+        # 5c. server.yaml (only when restore_config=True)
+        if restore_config:
+            config_entries = [
+                entry for entry in manifest.files if entry["path"].startswith("config/")
+            ]
+            if config_entries:
+                # Read the bundle's config (may be encrypted; read_maybe_encrypted decrypts).
+                config_src = bundle_slot_dir / config_entries[0]["path"]
+                config_bytes = read_maybe_encrypted(config_src)
+                _atomic_write_file(config_bytes, config_path)
+                restored_config = True
+                logger.debug("restore_bundle: server.yaml restored to %s", config_path)
+
+        # 5d. LAST: registry/key_metadata.json
+        # This is the crash-safety sentinel.  Writing this last ensures
+        # find_live_slot resolves the restored adapter slots as live by construction.
+        # A crash before this step leaves the old registry live — old slots remain
+        # authoritative; the new (latent) slots are harmless.
+        registry_entries = [
+            entry for entry in manifest.files if entry["path"].startswith("registry/")
+        ]
+        if registry_entries:
+            registry_src = bundle_slot_dir / registry_entries[0]["path"]
+            # Byte-faithful copy — preserve the registry's on-disk encryption state
+            # (key_metadata.json is in infra_paths and is age-encrypted under
+            # Security ON).  Do NOT decrypt-then-write: writing it plaintext while
+            # the per-tier registries / weights / speaker_profiles stay encrypted
+            # produces a mixed infra state that assert_mode_consistency refuses to
+            # boot, and leaks speaker_id at rest.  Decryptability was already
+            # validated by the Step-3 decrypt-probe; the live reader
+            # (_load_key_metadata) uses read_maybe_encrypted so an encrypted file
+            # loads fine.
+            registry_bytes = registry_src.read_bytes()
+            dst_registry = data_dir / "registry" / "key_metadata.json"
+            dst_registry.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_file(registry_bytes, dst_registry)
+            logger.debug(
+                "restore_bundle: key_metadata.json written (registry-last invariant satisfied)"
+            )
+
+    except Exception as _step5_exc:
+        # S3: wrap in RestoreAbortedError so callers (e.g. the /backup/restore
+        # HTTP handler) can surface the safety_slot path in the error response.
+        # Also log at ERROR so the path is in the server log regardless of how
+        # the caller handles the exception.
+        if safety_slot is not None:
+            logger.error(
+                "restore_bundle: FAILED during atomic restore phase. "
+                "Safety bundle captured before mutation: %s — "
+                "use this backup_id to recover the live store. Cause: %s",
+                safety_slot,
+                _step5_exc,
+            )
+        raise RestoreAbortedError(
+            f"restore_bundle failed during atomic restore phase: {_step5_exc}. "
+            + (
+                f"Safety bundle at {safety_slot} — use its backup_id to recover."
+                if safety_slot is not None
+                else "No safety bundle was captured (fresh target)."
+            ),
+            safety_slot=safety_slot,
+            cause=_step5_exc,
+        ) from _step5_exc
+
+    logger.info(
+        "restore_bundle: complete — adapters=%s, safety_slot=%s, restore_config=%s",
+        restored_adapters,
+        safety_slot,
+        restored_config,
+    )
+
+    return RestoreResult(
+        restored_adapters=restored_adapters,
+        safety_slot=safety_slot,
+        restart_required=True,
+        restored_config=restored_config,
+    )

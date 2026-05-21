@@ -7,9 +7,11 @@ Orchestrates the full backup pipeline:
   4. Post-write pruning (best-effort).
   5. Returns a ``ScheduledBackupResult`` dataclass.
 
-The runner hard-codes ``tier="daily"``.  Weekly/monthly/yearly
-tier emission is future work; the schema accepts those tier names
-for retention budgets.
+The tier is a parameter (default ``"daily"``) selected by the caller —
+the standalone CLI runner, or ``/backup/create`` (which forwards the
+request's tier; the scheduled timer delegates with ``tier="daily"``).
+Weekly/monthly/yearly tier emission is future work; the schema accepts
+those tier names for retention budgets.
 
 No torch, peft, or transformers imports at module level.
 """
@@ -117,11 +119,24 @@ def run_scheduled_backup(
     3. **Per-artifact write loop** — for each artifact in
        ``server_config.security.backups.artifacts``:
 
+       - ``"snapshot_bundle"`` → call ``write_bundle(...)`` to produce a
+         single self-contained bundle slot under ``backups_root/snapshot/``
+         containing the full recovery set (config, registry, adapter weights,
+         speaker profiles).  A ``BackupError`` from ``write_bundle`` (e.g.
+         episodic adapter missing) surfaces as ``success=False`` with the
+         error in ``ScheduledBackupResult.error``.  The bundle requires the
+         server context (``PARAMEM_DAILY_PASSPHRASE`` for registry decryption
+         and per-tier hash resolution); the standalone runner records a
+         degraded/skipped state when the server is unreachable — see
+         ``__main__``.
        - ``"config"`` → ``live_config_path.read_bytes()``.  Skip with reason
          ``"config file missing"`` when the file does not exist.
-       - ``"graph"``   → ``loop.merger.save_bytes()``.  Skip with reason
-         ``"consolidation loop unavailable (cloud-only mode?)"`` when
-         ``loop is None`` or ``loop`` has no ``merger`` attribute.
+       - ``"graph"``   → ``loop.merger.save_bytes()``.  Skip with an
+         accurate "graph unavailable" reason when ``loop is None`` or
+         ``loop`` has no ``merger`` attribute.  The graph is in-memory only
+         (production runs ``persist_graph=False``), so the standalone runner
+         cannot capture it — the systemd timer delegates to the running
+         server (which holds the loop) when reachable; see ``__main__``.
        - ``"registry"`` → ``server_config.paths.key_metadata.read_bytes()``.
          Skip with reason ``"registry empty (no keys yet)"`` when the file
          does not exist.  Write even when the file is empty (0 bytes).
@@ -129,6 +144,10 @@ def run_scheduled_backup(
        On any write exception: record the exception in ``error``, mark
        remaining artifacts as ``"aborted after prior failure"``, and return
        ``success=False`` (skip pruning).
+
+       Note: ``security.backups.artifacts`` still accepts the deprecated
+       ``["config", "graph", "registry"]`` list for backward compatibility.
+       New installations should use ``["snapshot_bundle"]``.
 
     4. **Pruning** — only when at least one artifact was written.  Wrap in
        ``try/except``: prune failure logs ERROR but ``success`` stays
@@ -165,8 +184,9 @@ def run_scheduled_backup(
     ScheduledBackupResult
     """
     from paramem.backup.backup import write as backup_write
+    from paramem.backup.backup import write_bundle as backup_write_bundle
     from paramem.backup.retention import compute_disk_usage, prune
-    from paramem.backup.types import ArtifactKind
+    from paramem.backup.types import ArtifactKind, BackupError
 
     if now is None:
         now = datetime.now(timezone.utc)
@@ -245,7 +265,57 @@ def run_scheduled_backup(
         artifact_bytes: bytes | None = None
         skip_reason: str | None = None
 
-        if artifact_name == "config":
+        if artifact_name == "snapshot_bundle":
+            # Self-contained bundle: one write_bundle() call captures the full
+            # recovery set (config + registry + adapter weights + speaker
+            # profiles).  The server context provides PARAMEM_DAILY_PASSPHRASE
+            # for registry decryption and per-tier hash resolution.
+            adapter_scope = getattr(backups_cfg, "adapter_scope", "live")
+
+            # Build the adapter_dirs mapping for enabled tiers.
+            adapter_dirs: dict[str, Path] = {}
+            adapters_cfg = getattr(server_config, "adapters", None)
+            if adapters_cfg is not None:
+                for _tier_name in ("episodic", "semantic", "procedural"):
+                    _tier_cfg = getattr(adapters_cfg, _tier_name, None)
+                    if _tier_cfg is not None and getattr(_tier_cfg, "enabled", False):
+                        _tier_dir = getattr(server_config, "adapter_dir", None)
+                        if _tier_dir is not None:
+                            adapter_dirs[_tier_name] = Path(_tier_dir) / _tier_name
+
+            # Resolve key_metadata (global registry) and speaker_profiles paths.
+            registry_path = Path(server_config.paths.key_metadata)
+            data_dir = Path(server_config.paths.data)
+            speaker_profiles_path = data_dir / "speaker_profiles.json"
+
+            try:
+                bundle_slot = backup_write_bundle(
+                    config_path=Path(live_config_path),
+                    registry_path=registry_path,
+                    adapter_dirs=adapter_dirs,
+                    base_dir=backups_root / "snapshot",
+                    meta_fields={"tier": tier, "label": label},
+                    adapter_scope=adapter_scope,
+                    speaker_profiles_path=speaker_profiles_path
+                    if speaker_profiles_path.exists()
+                    else None,
+                )
+                written_slots["snapshot_bundle"] = str(bundle_slot)
+                logger.info(
+                    "run_scheduled_backup: wrote snapshot_bundle slot %s",
+                    bundle_slot,
+                )
+            except BackupError as exc:
+                first_error = repr(exc)
+                logger.error("run_scheduled_backup: write_bundle failed: %s", exc)
+                skipped_artifacts.append((artifact_name, f"write_bundle error: {exc}"))
+            except Exception as exc:
+                first_error = repr(exc)
+                logger.error("run_scheduled_backup: write_bundle raised unexpectedly: %s", exc)
+                skipped_artifacts.append((artifact_name, f"write_bundle error: {exc}"))
+            continue
+
+        elif artifact_name == "config":
             config_path = Path(live_config_path)
             if not config_path.exists():
                 skip_reason = "config file missing"
@@ -259,7 +329,11 @@ def run_scheduled_backup(
 
         elif artifact_name == "graph":
             if loop is None or not hasattr(loop, "merger"):
-                skip_reason = "consolidation loop unavailable (cloud-only mode?)"
+                skip_reason = (
+                    "graph unavailable — requires the live consolidation loop "
+                    "(server down or cloud-only); the in-memory graph cannot be "
+                    "captured by the standalone runner"
+                )
             else:
                 try:
                     artifact_bytes = loop.merger.save_bytes()

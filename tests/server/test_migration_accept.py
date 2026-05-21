@@ -211,13 +211,37 @@ class TestAcceptHappyPath:
         # Trial adapter dir should be gone after move.
         assert not trial_adapter_dir.exists()
 
-    def test_accept_moves_trial_graph(self, client, state, tmp_path):
-        """Trial graph is moved into the rotation slot."""
+    def test_accept_deletes_trial_graph(self, client, state, tmp_path):
+        """Trial graph is deleted (not archived) after accept (transient by design).
+
+        The trial graph is persisted only for the before/after comparison report
+        during the trial window.  Once the operator accepts, it is deleted rather
+        than moved into the rotation slot, consistent with the ``persist_graph=False``
+        invariant for live production cycles.
+        """
         trial_graph_dir = Path(state["migration"]["trial"]["trial_graph_dir"])
         assert trial_graph_dir.exists()
         resp = client.post("/migration/accept")
         assert resp.status_code == 200
-        assert not trial_graph_dir.exists()
+        # Trial graph dir must be deleted, not moved.
+        assert not trial_graph_dir.exists(), "trial graph must be deleted post-accept"
+
+    def test_accept_archive_slot_has_no_graph_subdir(self, client, state, tmp_path):
+        """Rotation slot must NOT contain a 'graph/' subdirectory after accept.
+
+        The trial graph is no longer archived — it is deleted post-accept.
+        """
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        backups_root = state["config"].paths.data / "backups"
+        trial_adapters = backups_root / "trial_adapters"
+        slots = [d for d in trial_adapters.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert slots, "At least one rotation slot must have been created"
+        for slot in slots:
+            assert not (slot / "graph").exists(), (
+                f"Rotation slot {slot.name} must not contain a 'graph/' subdir "
+                "(trial graph is deleted, not archived)"
+            )
 
     def test_accept_resets_migration_state_to_live(self, client, state):
         """After accept, _state["migration"]["state"] == "LIVE"."""

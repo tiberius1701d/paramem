@@ -88,7 +88,7 @@ Extraction uses a **multi-stage privacy-aware pipeline** (see `paramem/graph/ext
 
 At every **full consolidation** the cumulative merged graph then passes through a **graph-level SOTA enrichment** stage that per-transcript extraction cannot see: the SOTA model receives N-hop subgraphs (serialized as triples, chunked by focal entity) and emits cross-session second-order relations plus `same_as` pairs for entity coreference. Duplicates are contracted into canonical nodes under a token-subset / Jaro-Winkler safety gate; new edges are tagged `source="graph_enrichment"` and feed the downstream partition + training pipeline unchanged. A **mini-enrichment** pass also fires at each interim-adapter rollover (per sub-interval, default 12h) when enough new triples have accumulated since the last pass (`graph_enrichment_min_triples_floor`), amortising the SOTA cost across the 84h cycle instead of concentrating it at the final boundary. Both passes are budget-bound by `graph_enrichment_neighborhood_hops` and `graph_enrichment_max_entities_per_pass`.
 
-**Background training** is driven by a systemd user timer whose period derives from `consolidation.refresh_cadence` (default `"12h"`). The full-consolidation period is derived, not configured: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Interim adapters absorb new facts between full cycles so recall does not wait a full period. `BackgroundTrainer` pauses at step boundaries for inference requests, switches the model between eval/train mode, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes from the last completed epoch rather than restarting from zero. A missed post-session training trigger is replayed from a persistent queue (`post_session_queue.json`) on startup. **Optional recall-based early stopping** (`consolidation.recall_early_stopping`, default `false`) cuts training at the first `recall_window` consecutive 100%-recall probes past `recall_signal_from_epoch`, replacing the fixed-budget run with a recall-driven stop; validated at multi-seed N=100 (Test 14). A **simulation mode** (`consolidation.mode: simulate`) persists the keyed pairs — `(key, subject, predicate, object, …)` under the quadruple encoding, `(key, question, answer, …)` under the legacy QA encoding — and registries to disk instead of weights; `probe_keys_from_disk` serves recall from the same per-tier `keyed_pairs.json` layout that train mode produces. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`; `pstatus` shows a `REHYDRATING` banner while it runs).
+**Background training** is driven by a systemd user timer whose period derives from `consolidation.refresh_cadence` (default `"12h"`). The full-consolidation period is derived, not configured: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Interim adapters absorb new facts between full cycles so recall does not wait a full period. `BackgroundTrainer` pauses at step boundaries for inference requests, switches the model between eval/train mode, and saves `resume_state.json` + `bg_checkpoint/` at each epoch boundary so a crash mid-cycle resumes from the last completed epoch rather than restarting from zero. A missed post-session training trigger is replayed from a persistent queue (`post_session_queue.json`) on startup. **Optional recall-based early stopping** (`consolidation.recall_early_stopping`, default `false`) cuts training at the first `recall_window` consecutive 100%-recall probes past `recall_signal_from_epoch`, replacing the fixed-budget run with a recall-driven stop; validated at multi-seed N=100 (Test 14). A **simulation mode** (`consolidation.mode: simulate`) persists the knowledge graph to disk as per-tier `graph.json` (plus registries) instead of training LoRA weights; `DiskMemorySource` serves recall from `graph.json`, while `WeightMemorySource` probes the weights in train mode. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`; `pstatus` shows a `REHYDRATING` banner while it runs).
 
 **Speaker identification** uses WeSpeaker (`pyannote/wespeaker-voxceleb-resnet34-LM`, 256-dim) voice embeddings via pyannote-audio, with multi-embedding centroid matching and auto-enrichment on confirmed matches.
 
@@ -461,6 +461,77 @@ ParaMem owns memory (speaker identification, entity routing, adapter recall, con
 - **Persistent post-session queue:** when `post_session_train_enabled: true`, each assistant turn enqueues the session via atomic temp-file + `os.replace` before the training hook fires. Startup drains leftover entries so a crash between session end and training start replays automatically.
 - **Systemd user timer:** `paramem-consolidate.timer` drives scheduling with `Persistent=true`, so a trigger missed while the laptop is suspended fires on resume.
 - **VRAM topology check + live gate:** `paramem/server/vram_validator.py` reads cache-derived predictions from `paramem/server/vram_predict.py` (HF cache size × quant factor) to assess whether base model + main adapters + `max_interim_count` + staging slot + STT + TTS + KV cache headroom fits the device pre-load. On cache miss the assessment is skipped; the live gate (`vram_guard.vram_measure` records `mem_get_info` deltas around each load + `enforce_post_load_budget` post-load) is authoritative and `sys.exit(1)`s on overrun rather than OOM mid-request.
+
+### Backup & Migration
+
+The `paramem` management CLI talks to the running server over HTTP (default `http://127.0.0.1:8420`; override per-command with `--server-url`). Exit codes: `0` success, `1` HTTP error, `2` server unreachable.
+
+**Backups are self-contained.** Each backup is a single timestamped *bundle* under `data/ha/backups/snapshot/<ts>/` holding everything needed to restore the system's recall:
+
+- `server.yaml` (config)
+- the key registry (`key_metadata.json`) and, per adapter tier, its `indexed_key_registry.json` + `simhash_registry.json` — **without the registries the weights are useless** (you can't enumerate or verify recalled facts)
+- each enabled adapter's live slot — `adapter_model.safetensors` + `adapter_config.json` + `meta.json` — resolved the same way the server mounts it (finalized main slot, or the live interim slot when no full cycle has run yet)
+- `speaker_profiles.json` (voice enrollment)
+- a top-level `bundle.meta.json` with the file inventory, per-adapter registry hashes, and the base-model identity
+
+The transient knowledge graph is **not** included (it lives only in the running loop and is rebuilt each cycle — knowledge lives in the weights), nor is regenerable training scaffolding (checkpoints, in-training slots).
+
+**Encryption is byte-faithful.** A bundle preserves each file's on-disk encryption state: under Security ON the sensitive artifacts (weights, registries, speaker profiles) stay age-encrypted and the operational carve-outs (`server.yaml`, `meta.json`) stay plaintext; under Security OFF everything is plaintext. Restore reproduces that exact posture, so the server boots cleanly in either mode (validated end-to-end: backup → restore → server start → adapters mounted → recall). See [`SECURITY.md`](SECURITY.md) for the encryption model.
+
+**Server-mediated.** Capturing the live adapter set requires the daily key (to resolve which slot is live and read the registries), so backups run through the running server. The scheduled systemd timer (`paramem-backup.timer`) and the CLI both reach it; if the server is unreachable when the timer fires, the run is recorded as skipped rather than producing an incomplete backup.
+
+```bash
+# Take a self-contained backup now (via the running server)
+paramem backup-create --label pre-upgrade
+
+# List backups (newest first)
+paramem backup-list
+
+# Apply the retention policy (preview, then commit)
+paramem backup-prune --dry-run
+paramem backup-prune
+
+# Restore a bundle (atomic; a server restart applies it). Add --restore-config
+# to also overwrite server.yaml (off by default — a restore won't change your config).
+paramem backup-restore 20260521-07385752
+paramem backup-restore 20260521-07385752 --restore-config
+```
+
+Restore verifies every file's hash and decryptability **before** touching the live store, writes a safety bundle of the current state, then swaps the recovery set into place atomically with the registry written **last** (a crash leaves the old set live — never a half-restored one). It refuses while a migration trial or background-training run is active, and returns `restart_required` — the restored adapters mount on the next server start. Because the bundle is self-contained, it can also be copied off-host for disaster recovery (off-host replication itself is out of scope — see Non-goals).
+
+Configuration under `security.backups` in `server.yaml`:
+
+```yaml
+security:
+  backups:
+    schedule: "daily 04:00"     # "off" disables scheduled backups
+    adapter_scope: live         # "live" = main + live interim slots; "main" = finalized mains only
+    max_total_disk_gb: 20       # global cap; oldest slots pruned first
+    retention:
+      daily:   { keep: 7 }
+      weekly:  { keep: 4 }
+      monthly: { keep: 12 }
+```
+
+**Configuration migration.** For `server.yaml` changes that could affect memory quality — extraction prompts, adapter shape, consolidation cadence, base model — `paramem migrate` runs a guarded **trial**: it backs up the live state, applies the candidate, runs one consolidation cycle under the new config, and reports a before/after comparison so you can promote or roll back.
+
+```bash
+# Preview + trial a candidate config (absolute path required)
+paramem migrate /home/you/configs/server-new.yaml
+```
+
+The interactive flow shows a unified diff with each change tier-classified (**Destructive** — `model`, `paths.*`, adapter `rank`/`alpha`: explicit confirm; **Pipeline-altering** — extraction/consolidation/routing flags: diff + confirm; **Operational** — host/port, STT/TTS, speaker: hot-apply), a `SHAPE CHANGE — DESTRUCTIVE` warning when adapter geometry changes, then `Proceed? [y/N]`. On `y` it confirms, polls the sanity gates, prints the comparison report, and prompts `accept / rollback / cancel`. The pre-migration backup is the rollback target. For non-interactive use, or to decide later (the trial keeps running server-side):
+
+```bash
+paramem migrate-status      # current trial state + gate results
+paramem migrate-accept      # promote the candidate; restart to apply
+paramem migrate-rollback    # restore the previous config; restart to apply
+paramem migrate-cancel      # discard a staged candidate (before confirm)
+```
+
+> **Base-model swaps.** A `model:` change is migrated and flagged Destructive, but the trial validates the candidate config against the *currently loaded* base model — it does not load the candidate model. Review base-model swaps manually; the trial does not yet exercise the new model end to end.
+
+Encryption key lifecycle (`paramem generate-key` / `rotate-daily` / `rotate-recovery` / `restore` / `encrypt-infra`) is documented in [`SECURITY.md`](SECURITY.md).
 
 ### GPU Lifecycle
 
