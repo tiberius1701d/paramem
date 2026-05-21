@@ -7,6 +7,7 @@ stub behaviour, and the AttentionItem dataclass contract.
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,6 +24,7 @@ from paramem.server.attention import (
     _collect_migration_items,
     _collect_pre_flight_items,
     _collect_sweeper_items,
+    _collect_voice_degradation_items,
     collect_attention_items,
 )
 
@@ -625,3 +627,73 @@ def test_collect_empty_when_live_clean():
     state = _live_state()
     items = collect_attention_items(state, None)
     assert items == []
+
+
+# ---------------------------------------------------------------------------
+# _collect_voice_degradation_items
+# ---------------------------------------------------------------------------
+
+
+def _voice_cfg(stt_enabled=True, stt_device="cuda", tts_enabled=True, tts_device="cuda"):
+    """Minimal config shim exposing only .stt/.tts device + enabled."""
+    return SimpleNamespace(
+        stt=SimpleNamespace(enabled=stt_enabled, device=stt_device),
+        tts=SimpleNamespace(enabled=tts_enabled, device=tts_device),
+    )
+
+
+def test_voice_degraded_emits_with_impact_and_source():
+    """voice on CPU + configured GPU + insufficient_vram → one info item naming
+    the impact (latency) and the source (VRAM)."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": "insufficient_vram"}
+    items = _collect_voice_degradation_items(state, _voice_cfg())
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "voice_degraded"
+    assert item.level == "info"
+    assert "STT/TTS" in item.summary
+    assert "latency" in item.summary.lower()  # impact
+    assert "VRAM" in item.summary  # source
+    assert item.action_hint is not None
+
+
+def test_voice_degraded_no_emit_when_on_gpu():
+    state = {"voice_profile": "gpu", "cloud_only_reason": None}
+    assert _collect_voice_degradation_items(state, _voice_cfg()) == []
+
+
+def test_voice_degraded_no_emit_when_explicit_cloud_only():
+    """Operator-chosen cloud_only:true → CPU voice is intended, not degraded."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": "explicit"}
+    assert _collect_voice_degradation_items(state, _voice_cfg()) == []
+
+
+def test_voice_degraded_no_emit_when_config_none():
+    state = {"voice_profile": "cpu", "cloud_only_reason": "insufficient_vram"}
+    assert _collect_voice_degradation_items(state, None) == []
+
+
+def test_voice_degraded_no_emit_when_configured_cpu():
+    """Voice configured for CPU → running on CPU is the default, not degraded."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": "training"}
+    cfg = _voice_cfg(stt_device="cpu", tts_device="cpu")
+    assert _collect_voice_degradation_items(state, cfg) == []
+
+
+def test_voice_degraded_local_mode_load_failure_source():
+    """Local mode (reason None) but voice fell to CPU → cause = GPU load failed."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": None}
+    items = _collect_voice_degradation_items(state, _voice_cfg())
+    assert len(items) == 1
+    assert "GPU load failed" in items[0].summary
+
+
+def test_voice_degraded_components_reflect_only_enabled_gpu_component():
+    """Only TTS configured for GPU (STT disabled) → summary names TTS only."""
+    state = {"voice_profile": "cpu", "cloud_only_reason": "insufficient_vram"}
+    cfg = _voice_cfg(stt_enabled=False, tts_enabled=True, tts_device="cuda")
+    items = _collect_voice_degradation_items(state, cfg)
+    assert len(items) == 1
+    assert "TTS on CPU" in items[0].summary
+    assert "STT/TTS" not in items[0].summary

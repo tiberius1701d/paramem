@@ -384,6 +384,8 @@ def set_classifier_model(model, tokenizer) -> None:
     if model is None or tokenizer is None:
         _classifier_model_singleton = None
         return
+    # BASE-MODEL HOLDER (intent classifier, mode=llm): module-global handle —
+    # _release_base_model_in_process clears it via set_classifier_model(None, None).
     _classifier_model_singleton = _ClassifierModelHandle(model=model, tokenizer=tokenizer)
 
 

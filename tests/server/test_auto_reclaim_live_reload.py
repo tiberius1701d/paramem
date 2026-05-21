@@ -233,6 +233,69 @@ def test_auto_reclaim_retry_increments_attempt_count():
     )
 
 
+def test_auto_reclaim_defers_when_reload_stays_cloud_only():
+    """Reload declined for insufficient VRAM (mode stays cloud-only): the loop
+    must NOT load STT/TTS on GPU or declare success. It forces voice to cpu and
+    keeps polling — that is how a cloud-only server avoids squatting VRAM.
+    """
+    import paramem.server.app as app_module
+
+    state_patch = {"last_reclaim_error": None, "mode": "cloud-only"}
+
+    profile_calls = []
+    reload_calls = 0
+    tick_count = 0
+
+    async def fake_sleep(_s):
+        nonlocal tick_count
+        tick_count += 1
+        if tick_count > 3:
+            raise asyncio.CancelledError
+
+    def fake_reload_declines():
+        nonlocal reload_calls
+        reload_calls += 1
+        # Pre-flight declined: base model not loaded, server stays cloud-only.
+        app_module._state["mode"] = "cloud-only"
+        app_module._state["cloud_only_reason"] = "insufficient_vram"
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch("paramem.server.app._gpu_has_compute_processes", return_value=False),
+        patch("paramem.server.app._get_hold_state", return_value=_make_hold_state(active=False)),
+        patch("paramem.server.app._live_reload_base_model", side_effect=fake_reload_declines),
+        patch(
+            "paramem.server.app._set_voice_pipeline_profile",
+            side_effect=lambda p: profile_calls.append(p),
+        ),
+        patch("paramem.server.app._restart_service") as mock_restart,
+        patch("paramem.server.gpu_lock.gpu_lock", _make_null_gpu_lock()),
+        patch("asyncio.sleep", side_effect=fake_sleep),
+    ):
+
+        async def _run():
+            event_loop = asyncio.get_event_loop()
+
+            async def _fake_rie(_exc, fn, *args):
+                fn(*args)
+
+            event_loop.run_in_executor = _fake_rie
+            try:
+                await app_module._auto_reclaim_loop(interval_minutes=0)
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(_run())
+
+    mock_restart.assert_not_called()
+    assert "gpu" not in profile_calls, (
+        f"voice must not go to gpu when base not loaded: {profile_calls}"
+    )
+    assert "cpu" in profile_calls, "voice must be forced to cpu on a declined reclaim"
+    assert reload_calls >= 2, f"loop must keep polling, not exit after one decline: {reload_calls}"
+    assert app_module._state.get("last_reclaim_error") is None  # deferral is not an error
+
+
 def test_auto_reclaim_orphan_path_exits_loop_without_restart():
     """Orphan: hold_active=True, owner_alive=False → emit WARN, exit loop (no restart).
 

@@ -555,6 +555,18 @@ elif [[ "$mode" == "cloud-only" ]]; then
         gpu_conflict)
             mode_display="${YELLOW}CLOUD-ONLY${RESET} (transient — GPU occupied at startup, auto-reclaim enabled)"
             ;;
+        insufficient_vram)
+            mode_display="${YELLOW}CLOUD-ONLY${RESET} (not local — insufficient free VRAM for the base model; external GPU consumer; auto-reclaim will retry)"
+            ;;
+        reload_failed)
+            mode_display="${YELLOW}CLOUD-ONLY${RESET} (not local — base-model reload failed; see journalctl; retry via pstatus --acquire)"
+            ;;
+        live_reload)
+            mode_display="${YELLOW}CLOUD-ONLY${RESET} (transient — base-model reload in progress)"
+            ;;
+        released)
+            mode_display="${YELLOW}CLOUD-ONLY${RESET} (released to an external GPU consumer; auto-reclaim enabled)"
+            ;;
         *)
             mode_display="${YELLOW}CLOUD-ONLY${RESET} (unknown reason — investigate via journalctl)"
             ;;
