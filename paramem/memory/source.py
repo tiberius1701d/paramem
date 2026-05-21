@@ -80,6 +80,9 @@ class WeightMemorySource:
         max_new_tokens: int = 200,
         batch_size: int = 1,
     ) -> None:
+        # BASE-MODEL HOLDER (WeightMemorySource): boot-preload only. The
+        # lifespan must drop its _source local after the probe —
+        # _release_base_model_in_process cannot reach a lifespan-frame local.
         self.model = model
         self.tokenizer = tokenizer
         self.registry = registry

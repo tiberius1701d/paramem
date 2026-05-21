@@ -230,6 +230,9 @@ class BackgroundTrainer:
         output_dir: str | Path = "data/ha/adapters",
         thermal_policy: ThermalPolicy | None = None,
     ):
+        # BASE-MODEL HOLDER (BackgroundTrainer): released via
+        # _state["background_trainer"]=None + _stop_callable_worker() in
+        # _release_base_model_in_process.
         self.model = model
         self.tokenizer = tokenizer
         self.training_config = training_config

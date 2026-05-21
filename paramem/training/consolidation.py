@@ -149,6 +149,8 @@ class ConsolidationLoop:
         # Experiment scripts pass nothing (default ``None``) so the guard is a
         # no-op and experiment paths are unaffected.
         self.state_provider = state_provider
+        # BASE-MODEL HOLDER (ConsolidationLoop): released via
+        # _state["consolidation_loop"]=None in _release_base_model_in_process.
         self.model = model
         self.tokenizer = tokenizer
         self.config = consolidation_config

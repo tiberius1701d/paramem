@@ -223,3 +223,40 @@ def test_release_switches_voice_to_cpu():
 
         # Voice switch to cpu must have been called.
         mock_profile.assert_called_once_with("cpu")
+
+
+def test_release_clears_intent_classifier_handle():
+    """Cloud-only VRAM-leak regression (holder 5): /gpu/release must clear the
+    intent.mode=llm classifier handle (``_ClassifierModelHandle``) — it pins
+    the base model + tokenizer, and a cloud-only server must hold ~0. The
+    surviving lifespan-frame holders (WeightMemorySource / _classifier_model
+    locals) are dropped in the lifespan and can't be unit-tested here; this
+    guards the one holder the release path itself owns.
+    """
+    from paramem.server import app as app_module
+    from paramem.server import intent as intent_module
+
+    fake_config = MagicMock()
+    fake_config.server.reclaim_interval_minutes = 5
+    state_patch = {
+        "mode": "local",
+        "consolidating": False,
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+        "reclaim_task": None,
+        "config": fake_config,
+    }
+
+    # Handle populated as the lifespan / reclaim would for intent.mode=llm.
+    intent_module.set_classifier_model(MagicMock(), MagicMock())
+    assert intent_module._classifier_model_singleton is not None
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "unload_model"),
+        patch.object(app_module, "_set_voice_pipeline_profile"),
+        patch("asyncio.create_task"),
+    ):
+        _call_gpu_release()
+
+    assert intent_module._classifier_model_singleton is None

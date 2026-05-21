@@ -159,6 +159,45 @@ def test_acquire_respects_explicit_cloud_only_config():
     assert result["reloaded_live"] is False
 
 
+def test_acquire_defers_on_insufficient_vram_without_restart():
+    """Reload declined for insufficient VRAM: do NOT restart (a restart would
+    only crash-loop on the lifespan VRAM budget gate). Stay cloud-only, set
+    voice to cpu, and report deferred_insufficient_vram=True.
+    """
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "defer_model": True,
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+    }
+
+    def fake_reload_declines():
+        # Pre-flight declined inside _live_reload_base_model.
+        app_module._state["mode"] = "cloud-only"
+        app_module._state["cloud_only_reason"] = "insufficient_vram"
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_clear_hold_env", return_value=True),
+        patch.object(
+            app_module,
+            "_get_hold_state",
+            return_value={"hold_active": False, "owner_pid": None, "owner_alive": None},
+        ),
+        patch.object(app_module, "_live_reload_base_model", side_effect=fake_reload_declines),
+        patch.object(app_module, "_set_voice_pipeline_profile") as mock_profile,
+        patch.object(app_module, "_restart_service") as mock_restart,
+    ):
+        result = _call_gpu_acquire()
+
+    mock_restart.assert_not_called()
+    mock_profile.assert_called_once_with("cpu")
+    assert result["reloaded_live"] is False
+    assert result["deferred_insufficient_vram"] is True
+    assert result["will_restart"] is False
+
+
 def test_acquire_falls_back_to_restart_on_reload_failure():
     """When _live_reload_base_model raises, _restart_service is called, voice NOT switched.
 

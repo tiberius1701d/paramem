@@ -687,6 +687,64 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
 # ---------------------------------------------------------------------------
 
 
+def _collect_voice_degradation_items(state: dict, config) -> list[AttentionItem]:
+    """Emit a notice when STT/TTS run on CPU while configured for GPU.
+
+    Graceful CPU fallback keeps voice working but raises transcription /
+    synthesis latency; without a signal the operator sees only a slower
+    response and cannot tell why. This item names the IMPACT (latency) and
+    the SOURCE (mapped from ``cloud_only_reason``; ``None`` in local mode
+    means the STT/TTS GPU load itself failed).
+
+    No-emit when:
+    - ``config`` is None (unit-test shim);
+    - the voice pipeline is on GPU or pre-init (``voice_profile != "cpu"``);
+    - cloud-only is the operator's hard choice (``cloud_only_reason ==
+      "explicit"``) — CPU voice is then intended, not degraded;
+    - neither STT nor TTS is enabled-and-configured-for-GPU (CPU is then the
+      configured default, not a degradation).
+    """
+    if config is None:
+        return []
+    if state.get("voice_profile") != "cpu":
+        return []
+    reason = state.get("cloud_only_reason")
+    if reason == "explicit":
+        return []
+
+    stt = getattr(config, "stt", None)
+    tts = getattr(config, "tts", None)
+    stt_gpu = bool(
+        stt and getattr(stt, "enabled", False) and getattr(stt, "device", "cpu") != "cpu"
+    )
+    tts_gpu = bool(
+        tts and getattr(tts, "enabled", False) and getattr(tts, "device", "cpu") != "cpu"
+    )
+    if not (stt_gpu or tts_gpu):
+        return []
+
+    cause = {
+        "insufficient_vram": "insufficient GPU VRAM (external process holds the device)",
+        "reload_failed": "base-model GPU reload failed",
+        "training": "GPU deferred for background training",
+        "gpu_conflict": "GPU occupied by another process at startup",
+        "released": "GPU released to another consumer",
+        "live_reload": "base-model reload in progress",
+    }.get(reason, "STT/TTS GPU load failed" if reason is None else str(reason))
+
+    components = "/".join(c for c, on in (("STT", stt_gpu), ("TTS", tts_gpu)) if on)
+    summary = f"Voice DEGRADED — {components} on CPU, higher speech latency (cause: {cause})"
+    return [
+        AttentionItem(
+            kind="voice_degraded",
+            level="info",
+            summary=summary,
+            action_hint="free the GPU; ParaMem restores GPU voice on the next reclaim",
+            age_seconds=None,
+        )
+    ]
+
+
 def collect_attention_items(
     state: dict,
     config: object | None,
@@ -696,7 +754,8 @@ def collect_attention_items(
     Display order matches the Attention block layout in spec L504–513:
 
         Migration → Consolidation → Sweeper → Backup* → Config drift →
-        Key rotation* → Encryption* → Adapter fingerprint → Pre-flight*
+        Key rotation* → Encryption* → Adapter fingerprint →
+        Voice degradation → Pre-flight*
 
         (* stub returns [] — future populators fill them.)
 
@@ -728,5 +787,6 @@ def collect_attention_items(
     items.extend(_collect_key_rotation_items(state))  # stub
     items.extend(_collect_encryption_items(state))  # stub
     items.extend(_collect_adapter_fingerprint_items(state))
+    items.extend(_collect_voice_degradation_items(state, config))
     items.extend(_collect_pre_flight_items(state, config))
     return items

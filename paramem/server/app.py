@@ -155,6 +155,11 @@ _state = {
     "tts_cpu": None,
     "voice_box": None,  # {"stt": <active>, "tts_manager": <active>} or None
     "voice_profile": None,  # "gpu" | "cpu" | None (pre-init)
+    # Boot-time VRAM topology assessment (TopologyAssessment | None). Computed
+    # once at startup and reused by the GPU reclaim path's live-budget
+    # pre-flight — config is static for the process, so there is no second
+    # estimator. None when boot couldn't assess (cloud-only / HF cache miss).
+    "topology_assessment": None,
     "last_reclaim_error": None,  # {"at", "error", "attempt_count"} or None
     "wyoming_server": None,
     "wyoming_tts_server": None,
@@ -1519,6 +1524,11 @@ async def lifespan(app: FastAPI):
                     logger.error("VRAM configuration error:\n%s", exc)
                     sys.exit(1)
 
+        # Cache the assessment for the GPU reclaim path's live-budget
+        # pre-flight — config is static for the process lifetime, so the
+        # reclaim reuses this rather than re-assessing. None when skipped above.
+        _state["topology_assessment"] = assessment
+
     if cloud_only:
         logger.info("Starting in cloud-only mode — skipping model load")
         _state["model"] = None
@@ -1889,6 +1899,13 @@ async def lifespan(app: FastAPI):
                         type(_source).__name__,
                     )
 
+    # BASE-MODEL HOLDER (lifespan-frame local _source): drop the boot-preload
+    # WeightMemorySource. It captures the base model (self.model); the suspended
+    # lifespan async-gen frame would otherwise pin it past an in-process release
+    # (_release_base_model_in_process cannot reach a frame local). The preload
+    # probe is complete — the RAM store is populated and the source is done.
+    _source = None
+
     # Join the per-entry bookkeeping (speaker_id, first_seen_cycle) from
     # key_metadata.json.  WeightMemorySource and DiskMemorySource both
     # recover the SPO triple but not these fields — they live only in the
@@ -1945,6 +1962,15 @@ async def lifespan(app: FastAPI):
         _classifier_tokenizer = _state.get("tokenizer")
         if _classifier_model is not None and _classifier_tokenizer is not None:
             set_classifier_model(_classifier_model, _classifier_tokenizer)
+        # BASE-MODEL HOLDER (lifespan-frame locals _classifier_model /
+        # _classifier_tokenizer): drop them immediately. The lifespan async-gen
+        # frame stays suspended at ``yield`` for the app's lifetime, so any
+        # local holding the base model pins it past an in-process release
+        # (the release nulls _state + the classifier handle but cannot reach a
+        # frame local). The classifier *handle* keeps the model for mode=llm;
+        # these locals have done their job.
+        _classifier_model = None
+        _classifier_tokenizer = None
 
         # Sentence-type classifier reuses the same encoder (no second
         # download / load).  Loading the exemplar bank only succeeds
@@ -3146,7 +3172,11 @@ async def gpu_acquire():
     local mode (returns 200 with ``reloaded_live: false``).
 
     On reload failure, falls back to ``_restart_service`` so the operator's
-    intent is honoured even when the live path fails.
+    intent is honoured even when the live path fails — EXCEPT when the
+    reload was declined for insufficient free VRAM (an external GPU
+    consumer holds the device), where a restart would only crash-loop on
+    the lifespan VRAM budget gate. In that case the server stays cloud-only
+    and the response carries ``deferred_insufficient_vram: true``.
     """
     hold_before = _get_hold_state()
     cleared = _clear_hold_env()
@@ -3160,6 +3190,7 @@ async def gpu_acquire():
         _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") != "explicit"
     )
     reloaded_live = False
+    deferred_insufficient_vram = False
     if needs_reload:
         try:
             await asyncio.get_running_loop().run_in_executor(None, _live_reload_base_model)
@@ -3172,6 +3203,20 @@ async def gpu_acquire():
             await asyncio.get_running_loop().run_in_executor(
                 None, _set_voice_pipeline_profile, "gpu"
             )
+        elif _state.get("cloud_only_reason") == "insufficient_vram":
+            # Free device memory cannot hold the model (an external GPU
+            # consumer holds it). A restart would only re-hit the lifespan
+            # VRAM budget gate and crash-loop, so stay cloud-only and tell
+            # the operator to free the GPU first. Voice back to CPU so the
+            # server holds no GPU memory.
+            deferred_insufficient_vram = True
+            await asyncio.get_running_loop().run_in_executor(
+                None, _set_voice_pipeline_profile, "cpu"
+            )
+            logger.warning(
+                "/gpu/acquire: insufficient free VRAM to reload the model — "
+                "staying cloud-only. Free the GPU and retry `pstatus --acquire`."
+            )
         else:
             _restart_service()
     return {
@@ -3179,8 +3224,9 @@ async def gpu_acquire():
         "was_active": hold_before["hold_active"],
         "owner_pid": hold_before["owner_pid"],
         "owner_alive": hold_before["owner_alive"],
-        "will_restart": needs_reload and not reloaded_live,
+        "will_restart": needs_reload and not reloaded_live and not deferred_insufficient_vram,
         "reloaded_live": reloaded_live,
+        "deferred_insufficient_vram": deferred_insufficient_vram,
     }
 
 
@@ -3301,31 +3347,92 @@ def _live_reload_base_model() -> None:
     # ``simhash_registry_*.json``). The only state that resets is
     # ``cycle_count`` (used for debug snapshot dir naming) — acceptable
     # tradeoff for getting the device back to a fresh memory profile.
+    # Release our own model first so the occupancy snapshot below reflects
+    # only EXTERNAL consumers.
+    _release_base_model_in_process()
+
+    # (a) Look before you leap: refuse the load when the live GPU budget
+    # cannot fit the topology — reusing the SAME productive check the
+    # startup gate runs (``measure_external_vram`` snapshots device-wide
+    # occupancy via nvidia-smi, so it sees consumers in other WSL distros /
+    # the Windows host that the compute-app list cannot; ``enforce_live_budget``
+    # compares against the boot-time assessment). ``topology_assessment`` is
+    # None when boot couldn't assess (HF cache miss) → defer to the live
+    # load gate. Without this guard the reload OOMs and leaks.
+    assessment = _state.get("topology_assessment")
+    if assessment is not None:
+        total_memory_bytes, external_bytes = measure_external_vram()
+        try:
+            enforce_live_budget(assessment, total_memory_bytes, external_bytes)
+        except ConfigurationError:
+            _state["cloud_only_reason"] = "insufficient_vram"
+            logger.warning(
+                "Live model reload skipped — live GPU budget cannot fit %s "
+                "(an external process holds the device); staying cloud-only, "
+                "will retry when VRAM frees.",
+                config.model_name,
+            )
+            return
+
+    load_failed = False
     try:
-        _release_base_model_in_process()
         _load_model_into_state(config)
-        # Voice pipeline is intentionally NOT touched here.
-        # Voice profile transitions are handled by the caller via
-        # ``_set_voice_pipeline_profile``.
-        _state["mode"] = "local"
-        _state["cloud_only_reason"] = None
-        logger.info("Live model reload — complete; mode=local")
     except Exception:
-        logger.exception(
-            "Live model reload failed — server stays cloud-only until next process restart"
+        # Log here (the traceback is still live), but do NOT free here:
+        # the partially-loaded model is pinned by this active traceback,
+        # so ``safe_empty_cache`` would not return its bytes. The cleanup
+        # runs below, after the except block drops the traceback.
+        logger.exception("Live model reload failed during base-model load")
+        load_failed = True
+
+    if load_failed:
+        # (b) Fail clean. The traceback is gone now, so the partial model
+        # is unreferenced — ``_release_base_model_in_process`` ->
+        # ``safe_empty_cache`` (gc.collect + clearCublasWorkspaces +
+        # empty_cache) actually returns its device memory, leaving the
+        # cloud-only server at ~0 GiB. STT/TTS GPU teardown is the
+        # caller's job: it must run outside the ``gpu_lock`` this function
+        # may be holding (the auto-reclaim path calls us under that lock).
+        _release_base_model_in_process()
+        _state["cloud_only_reason"] = "reload_failed"
+        logger.error(
+            "Live model reload failed — released partial allocation, "
+            "server stays cloud-only until the GPU frees or a restart."
         )
-        # mode stays cloud-only. The caller (e.g. /gpu/acquire) is
-        # responsible for the recovery decision — the current default
-        # is a fallback to ``_restart_service``. Do not assume
-        # auto-reclaim recovers; ``_auto_reclaim_loop`` only runs when
-        # explicitly started (lifespan defer-model branch or
-        # /gpu/release), and is not started on this failure path.
+        return
+
+    # Re-register the local LLM for intent.mode=llm — the release cleared the
+    # classifier handle (holder 5). Symmetric with the lifespan; without this,
+    # intent classification would stay degraded to the encoder residual after
+    # a reclaim. (Voice pipeline is intentionally NOT touched here — the caller
+    # handles profile transitions via ``_set_voice_pipeline_profile``.)
+    from paramem.server.intent import set_classifier_model
+
+    set_classifier_model(_state["model"], _state["tokenizer"])
+    _state["mode"] = "local"
+    _state["cloud_only_reason"] = None
+    logger.info("Live model reload — complete; mode=local")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  INVARIANT — BASE-MODEL HOLDER REGISTRY  (cloud-only VRAM-leak guard)
+#  Every reference to the base model (``_state["model"]``) must be dropped on
+#  release so a cloud-only server holds ~0 GiB. Holders accumulate as new
+#  components capture the model; a teardown that silently goes stale leaks the
+#  whole base model (~4 GiB) — exactly what happened pre-2026-05-21.
+#    • Find every holder:   grep -rn "BASE-MODEL HOLDER" paramem/
+#    • Object / module-global holders  → drop them in this function.
+#    • Lifespan-frame locals           → drop them IN THE LIFESPAN. This
+#      function runs OUTSIDE the suspended ``@asynccontextmanager`` frame and
+#      CANNOT reach a frame local (same reason _load_model_into_state keeps the
+#      model out of its caller's frame).
+#    • ALWAYS verify a change with a LIVE  POST /gpu/release → nvidia-smi ~0.
+#      Unit tests mock this function and will NOT catch a leak.
+# ════════════════════════════════════════════════════════════════════════════
 def _release_base_model_in_process() -> None:
     """Drop every reference to the base model and free its device memory.
 
-    The base model is reachable through four holders:
+    The base model is reachable through five holders:
 
     1. ``_state["model"]`` — primary handle.
     2. ``_state["consolidation_loop"].model`` — captured at
@@ -3344,18 +3451,34 @@ def _release_base_model_in_process() -> None:
        referenced and ``loop.model`` stays alive. ``_state[...] = None``
        on the dict entries does not affect the worker frame.
 
-    The first three are addressed by nulling. The fourth is addressed
-    by ``bt._stop_callable_worker()`` — sends ``_WORKER_STOP`` through
-    the queue, the worker breaks out of its loop, the function returns,
-    its frame collapses, the closure cell drops. Joining is bounded by
-    the helper's 5-s timeout. A fresh worker thread is started by the
-    next ``BackgroundTrainer`` instance the next consolidation cycle
-    creates.
+    5. ``intent._classifier_model_singleton`` — the ``_ClassifierModelHandle``
+       set by ``set_classifier_model`` for ``intent.mode=llm`` (it holds the
+       base model + tokenizer). Cleared here via ``set_classifier_model(None,
+       None)`` — exactly the "before a model unload / cloud-only switch" use
+       its docstring documents.
+
+    The first three are addressed by nulling, the fourth by
+    ``bt._stop_callable_worker()`` — sends ``_WORKER_STOP`` through the queue,
+    the worker breaks out of its loop, the function returns, its frame
+    collapses, the closure cell drops. Joining is bounded by the helper's 5-s
+    timeout. A fresh worker thread is started by the next ``BackgroundTrainer``
+    instance the next consolidation cycle creates. The fifth is cleared below.
+
+    NOTE: this function CANNOT reach references held in the **lifespan
+    async-generator frame** (it stays suspended at ``yield`` for the app's
+    lifetime). Those — the ``WeightMemorySource`` boot-preload local and the
+    ``_classifier_model`` local — are dropped in the lifespan itself
+    (``_source = None`` / ``_classifier_model = None`` after use), mirroring
+    why :func:`_load_model_into_state` keeps the model out of its caller's
+    frame. Verified by a live ``gc.get_referrers`` trace: those three were the
+    only survivors after the four-holder nulling.
 
     Idempotent: callable when the model is already absent;
     ``_stop_callable_worker`` is safe even if no worker has ever
     started.
     """
+    from paramem.server.intent import set_classifier_model
+
     # Stop the bg-trainer worker thread first — without this, its
     # frame's stale locals (closure-captured `loop`) would pin the
     # model graph through any number of subsequent gc.collect +
@@ -3378,6 +3501,9 @@ def _release_base_model_in_process() -> None:
             logger.exception("Error unloading model during in-process release")
         _state["model"] = None
         _state["tokenizer"] = None
+    # Holder 5: the intent-classifier handle (intent.mode=llm). Clearing it
+    # is the documented "before a model unload / cloud-only switch" path.
+    set_classifier_model(None, None)
     # Belt-and-braces: rerun the cache flush after every holder was
     # cleared. ``unload_model`` already calls gc.collect+empty_cache,
     # but at that moment the loop/trainer/worker may have been live;
@@ -8494,7 +8620,11 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
     Only started when the server is in cloud-only/defer mode (no model loaded).
     Each tick:
 
-    1. If any non-server GPU compute process is running → wait.
+    1. If any non-server GPU compute process is running → wait. (This is a
+       cheap, context-free early-out; the authoritative who-agnostic budget
+       check is the live-budget pre-flight inside
+       :func:`_live_reload_base_model`, which sees consumers in other WSL
+       distros / the Windows host that the compute-app list cannot.)
     2. Else inspect the hold state (PARAMEM_EXTRA_ARGS in systemd --user env):
        - Hold cleared → reclaim: reload model in-process (no restart).
          On transient failure: log WARN, record ``last_reclaim_error``,
@@ -8528,6 +8658,20 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
 
                 async with gpu_lock():
                     await loop.run_in_executor(None, _live_reload_base_model)
+                if _state.get("mode") != "local":
+                    # Reload was declined (insufficient free VRAM) or failed
+                    # and self-cleaned — the base model is NOT loaded. Do not
+                    # load the STT/TTS GPU pair: that is exactly how a
+                    # cloud-only server ends up squatting VRAM. Force voice
+                    # back to CPU (outside the gpu_lock) and keep polling; the
+                    # GPU may free on a later tick.
+                    await loop.run_in_executor(None, _set_voice_pipeline_profile, "cpu")
+                    logger.info(
+                        "Auto-reclaim: reload deferred (mode=%s, reason=%s) — retrying next tick",
+                        _state.get("mode"),
+                        _state.get("cloud_only_reason"),
+                    )
+                    continue
                 await loop.run_in_executor(None, _set_voice_pipeline_profile, "gpu")
                 _state["last_reclaim_error"] = None
                 logger.info("Auto-reclaim: GPU reclaimed in-process")
