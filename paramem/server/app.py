@@ -1342,6 +1342,22 @@ async def lifespan(app: FastAPI):
         for level, msg in recovery_result.log_lines:
             getattr(logger, level.lower(), logger.info)(msg)
 
+        # Sweep .pending/ residue from the snapshot bundle backup directory.
+        # This mirrors the per-kind sweep in _validate_main_adapter_slot for
+        # adapter dirs; the snapshot/ dir is the new home for bundle slots and
+        # must be swept at startup so a crash mid-write doesn't leave residue.
+        from paramem.backup.backup import sweep_orphan_pending as _sweep_backup
+
+        _snapshot_backup_dir = backups_root / "snapshot"
+        if _snapshot_backup_dir.exists():
+            _n_removed = _sweep_backup(_snapshot_backup_dir)
+            if _n_removed:
+                logger.info(
+                    "Swept %d orphaned pending bundle slot(s) from %s",
+                    _n_removed,
+                    _snapshot_backup_dir,
+                )
+
         # Seed _state["migration"] from recovery result.
         if (
             recovery_result.action == RecoveryAction.RESUME_TRIAL
@@ -5161,12 +5177,17 @@ async def migration_accept():
                 },
             ) from exc
 
-        # --- Step 4: Move trial adapter + graph into the rotation slot ---
+        # --- Step 4: Move trial adapter into the rotation slot; delete trial graph ---
         # Non-fatal: config + marker are already coherent. Rotation is cosmetic.
+        # The trial graph is transient by design (graph is RAM-only in production;
+        # persist_graph=True is only used during the trial window to render the
+        # before/after comparison report).  Once the operator accepts, the trial
+        # graph is dead weight and contradicts the "graph is transient" invariant.
+        # Delete it unconditionally; production re-builds the graph in RAM on the
+        # next live cycle.
         rotation_incomplete = False
         for src_str, dest_name in [
             (trial_adapter_dir_str, "adapter"),
-            (trial_graph_dir_str, "graph"),
         ]:
             if not src_str:
                 continue
@@ -5185,6 +5206,13 @@ async def migration_accept():
                     )
                     rotation_incomplete = True
                     archive_path = src_str  # degraded: point at still-in-place location
+
+        # Delete the trial graph (transient by design — no value in archiving).
+        if trial_graph_dir_str:
+            _tg = Path(trial_graph_dir_str)
+            if _tg.exists():
+                shutil.rmtree(_tg, ignore_errors=True)
+                logger.debug("accept: trial graph deleted post-accept (transient by design)")
 
         # --- Step 5: Refresh drift state + set restart banner (REQUIRED FIX 3) ---
         # Replace the full ConfigDriftState dict, not just loaded_hash.
@@ -5540,10 +5568,10 @@ async def migration_rollback():
                 os.close(_dir_fd)
             archive_path = str(slot_dir.resolve())
 
-            # Move adapter + graph into the slot.
+            # Move only the trial adapter into the slot (graph excluded — transient
+            # by design; deleted below, not archived).
             for src_str, dest_name in [
                 (trial_adapter_dir_str, "adapter"),
-                (trial_graph_dir_str, "graph"),
             ]:
                 if not src_str:
                     continue
@@ -5566,6 +5594,13 @@ async def migration_rollback():
                 shutil.rmtree(slot_dir, ignore_errors=True)
             except OSError:
                 pass
+
+        # Delete the trial graph (transient by design — no value in archiving after rollback).
+        if trial_graph_dir_str:
+            _tg = Path(trial_graph_dir_str)
+            if _tg.exists():
+                shutil.rmtree(_tg, ignore_errors=True)
+                logger.debug("rollback: trial graph deleted post-rollback (transient by design)")
 
         # --- Step 7: Append restart banner ---
         restart_banner = (
@@ -5672,12 +5707,20 @@ class BackupCreateRequest(BaseModel):
     ----------
     kinds:
         Artifact kinds to back up.  ``None`` or ``[]`` → default
-        ``["config", "graph", "registry"]``.
+        ``["snapshot_bundle"]`` (self-contained recovery bundle).  The
+        deprecated per-artifact kinds ``"config"``, ``"graph"``, and
+        ``"registry"`` are still accepted for backward compatibility.
     label:
         Optional annotation written into each slot sidecar.
+    tier:
+        Retention tier the slot is filed under.  Defaults to ``"manual"``
+        (operator-initiated, time-immune).  The scheduled systemd timer
+        delegates here with ``tier="daily"`` so the bundle is captured under
+        the daily retention policy.
     """
 
     kinds: list[str] | None = None
+    tier: str = "manual"
     label: str | None = None
 
 
@@ -5705,7 +5748,8 @@ class BackupCreateResponse(BaseModel):
         ``True`` when at least one artifact was written; ``False`` on
         disk-pressure refusal or write error.
     tier:
-        Always ``"manual"`` for operator-initiated backups.
+        Retention tier the slot was filed under — ``"manual"`` for
+        operator-initiated backups, ``"daily"`` for the scheduled timer.
     written_slots:
         Mapping of artifact name → absolute slot directory path.
     skipped_artifacts:
@@ -5728,9 +5772,15 @@ class BackupRestoreRequest(BaseModel):
     ----------
     backup_id:
         Slot directory name to restore (e.g. ``"20260421-04000012"``).
+    restore_config:
+        When ``True``, atomically restore the bundle's ``server.yaml`` to the
+        live config path.  Default ``False`` — leave the live config untouched.
+        Only applicable to ``snapshot_bundle`` restores; ignored for
+        ``config``-kind restores (those always replace the config).
     """
 
     backup_id: str
+    restore_config: bool = False
 
 
 class BackupRestoreResponse(BaseModel):
@@ -5739,19 +5789,30 @@ class BackupRestoreResponse(BaseModel):
     Attributes
     ----------
     restored:
-        Mapping of artifact kind → live path that was overwritten.
+        Mapping of artifact kind / name → live path that was overwritten.
+        For ``snapshot_bundle`` restores this maps adapter names to their new
+        slot directories and includes ``"registry"`` and (optionally)
+        ``"speaker_profiles"`` and ``"config"``.
     backed_up_pre_restore:
         Mapping of kind → safety backup slot path taken before restore.
+        For ``snapshot_bundle`` restores the key is ``"bundle"`` and the value
+        is the pre-restore safety bundle slot path (or ``""`` when skipped
+        because the live store was empty).
     restart_required:
-        Always ``True`` — the server must be restarted to load the restored config.
+        Always ``True`` — the server must be restarted to load the restored
+        config and re-mount adapters from the restored slots.
     restart_hint:
         Human-readable restart command.
+    restored_adapters:
+        List of adapter names restored from the bundle.  Empty for
+        ``config``-kind restores.
     """
 
     restored: dict[str, str]
     backed_up_pre_restore: dict[str, str]
     restart_required: bool = True
     restart_hint: str
+    restored_adapters: list[str] = []
 
 
 class BackupPruneRequest(BaseModel):
@@ -5891,11 +5952,23 @@ async def backup_list(kind: str | None = None):
 
 @app.post("/backup/create", response_model=BackupCreateResponse)
 async def backup_create(req: BackupCreateRequest):
-    """Take an immediate manual backup of the requested artifacts.
+    """Take an immediate backup of the requested artifacts.
 
-    Delegates to ``run_scheduled_backup`` with ``tier="manual"`` and a
-    per-call shallow-cloned config with ``.artifacts`` replaced by the
-    request's ``kinds`` list (defaults to ``["config", "graph", "registry"]``).
+    Delegates to ``run_scheduled_backup`` with the request's ``tier``
+    (default ``"manual"``) and a per-call shallow-cloned config with
+    ``.artifacts`` replaced by the request's ``kinds`` list (defaults to
+    ``["snapshot_bundle"]``).  The scheduled systemd timer posts here with
+    ``tier="daily"`` so the self-contained recovery bundle is captured under
+    daily retention.
+
+    ``snapshot_bundle`` produces a single self-contained bundle slot under
+    ``backups_root/snapshot/`` containing the full recovery set (config,
+    registry, adapter weights, speaker profiles).  The server holds the
+    ``PARAMEM_DAILY_PASSPHRASE`` needed to decrypt registries for per-tier
+    hash resolution, which is why scheduled backups are server-mediated.
+
+    The deprecated per-artifact kinds ``"config"``, ``"graph"``, and
+    ``"registry"`` are still accepted for backward compatibility.
 
     Persists the result via ``update_backup_state`` so the next ``/status``
     reflects the freshly-updated ``last_success_at``.
@@ -5903,8 +5976,7 @@ async def backup_create(req: BackupCreateRequest):
     Errors
     ------
     400 ``kind_invalid``
-        When any entry in ``kinds`` is not ``"config"``, ``"graph"``, or
-        ``"registry"``.
+        When any entry in ``kinds`` is not a recognised artifact kind.
     """
     import dataclasses
 
@@ -5913,12 +5985,12 @@ async def backup_create(req: BackupCreateRequest):
     from paramem.backup.runner import run_scheduled_backup
     from paramem.backup.state import update_backup_state
 
-    _VALID_KINDS = {"config", "graph", "registry"}
+    _VALID_KINDS = {"config", "graph", "registry", "snapshot_bundle"}
 
     # Validate kinds.
     kinds = req.kinds
     if not kinds:
-        kinds = ["config", "graph", "registry"]
+        kinds = ["snapshot_bundle"]
 
     for k in kinds:
         if k not in _VALID_KINDS:
@@ -5929,6 +6001,24 @@ async def backup_create(req: BackupCreateRequest):
                     "message": (f"kind must be one of {sorted(_VALID_KINDS)}; got {k!r}"),
                 },
             )
+
+    _VALID_TIERS = {
+        "daily",
+        "weekly",
+        "monthly",
+        "yearly",
+        "manual",
+        "pre_migration",
+        "trial_adapter",
+    }
+    if req.tier not in _VALID_TIERS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "tier_invalid",
+                "message": f"tier must be one of {sorted(_VALID_TIERS)}; got {req.tier!r}",
+            },
+        )
 
     config = _state.get("config")
     if config is None:
@@ -5977,7 +6067,7 @@ async def backup_create(req: BackupCreateRequest):
         state_dir=state_dir,
         backups_root=backups_root,
         live_config_path=live_config_path,
-        tier="manual",
+        tier=req.tier,
         label=req.label,
     )
 
@@ -6000,23 +6090,29 @@ async def backup_create(req: BackupCreateRequest):
 
 @app.post("/backup/restore", response_model=BackupRestoreResponse)
 async def backup_restore(req: BackupRestoreRequest):
-    """Restore a **config** backup atop the live server.yaml.
+    """Restore a backup atop the live store.
 
-    Only ``kind="config"`` is currently supported (restore-kind-restriction).
-    Graph / registry restore requires an offline-coordinator path and is not
-    yet implemented.
+    Supports two restore kinds:
 
-    Atomic restore sequence (decrypt-first, then safety backup, then rename):
+    - ``kind="config"`` — restore a single ``server.yaml`` from a per-artifact
+      config slot.  The existing ``config``-kind branch is unchanged.
+    - ``kind="snapshot_bundle"`` — restore a complete self-contained recovery
+      set (adapter weights, per-tier registries, speaker profiles, and
+      optionally config) from a bundle slot.
 
-    1. Verify preconditions (no TRIAL/STAGING, no active consolidation).
+    Atomic restore sequence for ``snapshot_bundle`` (decrypt-probe, then
+    safety bundle, then atomic per-file swaps, registry written LAST):
+
+    1. Verify preconditions (no TRIAL/STAGING, no active consolidation, no
+       background training).
     2. Locate the slot by ``backup_id``.
-    3. Assert ``kind == config`` (400 otherwise).
-    4. Decrypt backup via ``backup.read(slot_dir)`` → plaintext bytes.
-    5. Take a manual safety backup of the current live config.
-    6. Write plaintext to ``live_config_path + ".restore-pending"``, fsync,
-       ``os.rename`` to live path, fsync parent.
-    7. Append recovery banner to ``_state["migration"]["recovery_required"]``.
-    8. Return 200.
+    3. Dispatch to the appropriate kind handler.
+    4. For ``snapshot_bundle``:
+       a. Verify all file hashes in ``bundle.meta.json`` against on-disk bytes.
+       b. Decrypt-probe encrypted metadata files (BEFORE any mutation).
+       c. Take a manual safety bundle of the current live state.
+       d. Atomic restore via ``restore_bundle()``, registry written LAST.
+       e. Append recovery banner + return ``restart_required=True``.
 
     Errors
     ------
@@ -6026,22 +6122,37 @@ async def backup_restore(req: BackupRestoreRequest):
         Migration state is STAGING.
     409 ``consolidating``
         A consolidation run is in progress.
+    409 ``training_active``
+        A background training run is in progress.  Between registry-swap and
+        restart a running background trainer could ``find_live_slot`` on the
+        restored slot and stomp it with a checkpoint.  Refuse until training
+        is idle.
     404 ``not_found``
         No slot with the given ``backup_id`` exists.
     400 ``restore_kind_not_supported``
-        The slot is not kind=config.
+        The slot kind is not ``config`` or ``snapshot_bundle``.
     500 ``decrypt_no_key``
-        The backup is age-encrypted but the daily identity is not loaded.
+        A backup file is age-encrypted but the daily identity is not loaded.
     500 ``decrypt_invalid_token``
         Decryption failed (stale daily identity or corrupted backup).
+    500 ``bundle_corrupt``
+        A file hash in ``bundle.meta.json`` does not match on-disk bytes.
     500 ``config_restore_failed``
         Atomic rename of the restore temp file failed.
+    500 ``bundle_restore_failed``
+        Unexpected error during bundle restore.
     """
     from fastapi import HTTPException
 
     from paramem.backup.backup import read as backup_read
+    from paramem.backup.backup import restore_bundle as _restore_bundle
     from paramem.backup.backup import write as backup_write_fn
     from paramem.backup.enumerate import enumerate_backups
+    from paramem.backup.types import (
+        BundleManifestError,
+        FingerprintMismatchError,
+        RestoreAbortedError,
+    )
     from paramem.server.migration import initial_migration_state
 
     # --- Step 1: Precondition checks ---
@@ -6075,6 +6186,23 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         )
 
+    # Background trainer check (S3 from plan-review): a live BG trainer could
+    # call find_live_slot on the restored slot between the registry swap and the
+    # server restart, stomping the restored weights with a checkpoint.
+    _bg_trainer = _state.get("background_trainer")
+    if _bg_trainer is not None and getattr(_bg_trainer, "is_training", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "training_active",
+                "message": (
+                    "Background training is active. Stop or wait for training to complete "
+                    "before restoring a bundle — a running trainer can overwrite the "
+                    "restored adapter slot with a checkpoint."
+                ),
+            },
+        )
+
     config = _state.get("config")
     if config is not None:
         try:
@@ -6101,14 +6229,141 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         )
 
-    # --- Step 3: Kind gate (only config in 6b) ---
+    live_config_path = (
+        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+    )
+
+    # --- Step 3: Dispatch by kind ---
+
+    # -------------------------------------------------------------------------
+    # SNAPSHOT_BUNDLE branch
+    # -------------------------------------------------------------------------
+    if target_record.kind == ArtifactKind.SNAPSHOT_BUNDLE:
+        # Derive data_dir from config.paths.data when available.
+        if config is not None:
+            try:
+                data_dir = config.paths.data.resolve()
+            except (AttributeError, TypeError):
+                data_dir = Path("data/ha").resolve()
+        else:
+            data_dir = Path("data/ha").resolve()
+
+        try:
+            result = _restore_bundle(
+                target_record.slot_dir,
+                data_dir=data_dir,
+                config_path=live_config_path,
+                restore_config=req.restore_config,
+            )
+        except BundleManifestError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "bundle_corrupt",
+                    "message": f"Bundle manifest invalid or schema-mismatched: {exc}",
+                },
+            ) from exc
+        except FingerprintMismatchError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "bundle_corrupt",
+                    "message": (
+                        f"Bundle file hash mismatch — bundle is corrupt: {exc}. "
+                        "No live mutation has occurred."
+                    ),
+                },
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "decrypt_no_key",
+                    "message": (
+                        f"Bundle contains age-encrypted metadata but the daily identity "
+                        f"is not loaded: {exc}"
+                    ),
+                },
+            ) from exc
+        except RestoreAbortedError as exc:
+            # S3: restore_bundle raises RestoreAbortedError when the atomic
+            # write phase (step 5) fails after the safety bundle was already
+            # captured (step 4).  Surface the safety_slot path so the operator
+            # can recover without searching server logs.
+            safety_path = str(exc.safety_slot) if exc.safety_slot is not None else ""
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "bundle_restore_failed",
+                    "message": str(exc),
+                    "safety_slot": safety_path,
+                },
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            # Catch pyrage.DecryptError (not a RuntimeError subclass) and any
+            # unexpected restore-phase OSError that was not wrapped into
+            # RestoreAbortedError (e.g. errors before step 5 starts).
+            error_code = "bundle_restore_failed"
+            exc_str = str(exc)
+            # Distinguish decrypt failures (wrong recipient) from other errors.
+            if "decrypt" in type(exc).__name__.lower() or "decrypt" in exc_str.lower():
+                error_code = "decrypt_invalid_token"
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": error_code,
+                    "message": (
+                        f"Bundle restore failed: {exc}. "
+                        "If a safety bundle was captured before the error, "
+                        "check the server log for its path."
+                    ),
+                },
+            ) from exc
+
+        # Build restored dict: adapter name → new slot path, plus registry/profiles/config.
+        restored_map: dict[str, str] = {}
+        for adapter_name in result.restored_adapters:
+            from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
+            tier_root = adapter_slot_root_for_name(data_dir / "adapters", adapter_name)
+            restored_map[adapter_name] = str(tier_root)
+        if (data_dir / "registry" / "key_metadata.json").exists():
+            restored_map["registry"] = str(data_dir / "registry" / "key_metadata.json")
+        if (data_dir / "speaker_profiles.json").exists():
+            restored_map["speaker_profiles"] = str(data_dir / "speaker_profiles.json")
+        if result.restored_config:
+            restored_map["config"] = str(live_config_path)
+
+        safety_slot_str = str(result.safety_slot) if result.safety_slot is not None else ""
+
+        # Append recovery banner.
+        if "migration" not in _state:
+            _state["migration"] = initial_migration_state()
+        if "recovery_required" not in _state["migration"]:
+            _state["migration"]["recovery_required"] = []
+        _state["migration"]["recovery_required"].append(
+            f"Restored snapshot_bundle from backup {req.backup_id} — "
+            "restart server to re-mount adapters from restored slots."
+        )
+
+        return BackupRestoreResponse(
+            restored=restored_map,
+            backed_up_pre_restore={"bundle": safety_slot_str},
+            restart_required=True,
+            restart_hint="systemctl --user restart paramem-server",
+            restored_adapters=result.restored_adapters,
+        )
+
+    # -------------------------------------------------------------------------
+    # CONFIG branch (unchanged)
+    # -------------------------------------------------------------------------
     if target_record.kind != ArtifactKind.CONFIG:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "restore_kind_not_supported",
                 "message": (
-                    f"Only kind='config' restore is supported in this release. "
+                    f"Only kind='config' and kind='snapshot_bundle' restores are supported. "
                     f"Found kind={target_record.kind.value!r} at {req.backup_id}."
                 ),
             },
@@ -6139,10 +6394,6 @@ async def backup_restore(req: BackupRestoreRequest):
                 ),
             },
         ) from exc
-
-    live_config_path = (
-        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
-    )
 
     # --- Step 5: Safety backup of current live config ---
     safety_slot_path: str = ""
@@ -6211,6 +6462,7 @@ async def backup_restore(req: BackupRestoreRequest):
         backed_up_pre_restore={"config": safety_slot_path},
         restart_required=True,
         restart_hint="systemctl --user restart paramem-server",
+        restored_adapters=[],
     )
 
 

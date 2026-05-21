@@ -174,7 +174,7 @@ class RetentionConfig:
 @dataclass
 class ServerBackupsConfig:
     """Sub-config for security.backups (``orphan_sweep``, ``retention``,
-    ``schedule``, ``artifacts``, ``max_total_disk_gb``).
+    ``schedule``, ``artifacts``, ``max_total_disk_gb``, ``adapter_scope``).
 
     Merged into ``SecurityConfig`` chain as ``security.backups``.
     """
@@ -182,8 +182,38 @@ class ServerBackupsConfig:
     orphan_sweep: OrphanSweepConfig = field(default_factory=OrphanSweepConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     schedule: str = "daily 04:00"  # "off" disables scheduled backups
+    # Deprecated: the per-artifact list ["config", "graph", "registry"] is superseded
+    # by the self-contained recovery bundle ("snapshot_bundle").  The bundle path ignores
+    # this field; it is kept to avoid breaking existing server.yaml configs.  New
+    # installations should set artifacts: ["snapshot_bundle"] (or rely on the runner
+    # default when kinds are not explicitly configured in server.yaml).
     artifacts: list[str] = field(default_factory=lambda: ["config", "graph", "registry"])
     max_total_disk_gb: float = 20.0  # global cap across all tiers (spec §L566, L571)
+    adapter_scope: str = "live"
+    """Controls which adapter slots are captured by ``write_bundle()``.
+
+    ``"live"`` (default): capture the live-serving slot for each enabled
+    adapter.  This includes an interim slot when no finalized main slot has
+    been written yet — it ensures episodic adapters (which may only ever
+    live as interim slots between full consolidation cycles) are always
+    captured.
+
+    ``"main"``: capture only finalized main slots; the bundle writer raises
+    ``BackupError`` when an enabled adapter has no finalized main slot.  Use
+    this mode when you need to guarantee that only post-consolidation weights
+    enter the bundle.
+
+    Valid values: ``"live"`` | ``"main"``.  Any other value raises
+    ``ValueError`` at validation time.
+    """
+
+    def __post_init__(self) -> None:
+        valid_scopes = {"live", "main"}
+        if self.adapter_scope not in valid_scopes:
+            raise ValueError(
+                f"security.backups.adapter_scope must be one of {sorted(valid_scopes)!r}; "
+                f"got {self.adapter_scope!r}"
+            )
 
 
 @dataclass

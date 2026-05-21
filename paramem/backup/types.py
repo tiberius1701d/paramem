@@ -3,8 +3,8 @@
 Defines the public dataclasses, enums, TypedDicts, and exceptions used across
 all backup modules.  No I/O, no side effects — import is always safe.
 
-Schema version contract
------------------------
+Schema version contract (ArtifactMeta)
+---------------------------------------
 ``SCHEMA_VERSION`` is bumped on every breaking change to ``ArtifactMeta``.
 Adding an *Optional* field with a default value is non-breaking (no bump).
 Renaming a field, changing its semantics, or removing it **requires** a bump
@@ -15,6 +15,15 @@ plus a migration helper.
 ``MetaSchemaError("forward version")``; legacy versions (written by an older
 release that was already bumped) raise ``MetaSchemaError("legacy; migration
 required")``.
+
+Bundle manifest schema (BundleManifest)
+----------------------------------------
+``BUNDLE_SCHEMA_VERSION`` is versioned independently from ``SCHEMA_VERSION``.
+A bundle slot stores a ``bundle.meta.json`` in place of the per-artifact
+``.meta.json`` sidecar.  The bundle manifest indexes every captured file with
+its content hash, records the per-adapter slot source information, and lists
+explicitly-excluded artifacts.  Incrementing ``BUNDLE_SCHEMA_VERSION`` does
+NOT require a ``SCHEMA_VERSION`` bump and vice versa.
 """
 
 from __future__ import annotations
@@ -28,6 +37,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 SCHEMA_VERSION: int = 1
+
+# ---------------------------------------------------------------------------
+# Bundle manifest schema version — independent of SCHEMA_VERSION.
+# ---------------------------------------------------------------------------
+
+BUNDLE_SCHEMA_VERSION: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +62,7 @@ class ArtifactKind(str, Enum):
     REGISTRY = "registry"
     RESUME = "resume"  # BG-trainer per-file artifacts
     SNAPSHOT = "snapshot"  # session snapshot, per-file
+    SNAPSHOT_BUNDLE = "snapshot_bundle"  # self-contained recovery-set bundle
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +124,145 @@ class ArtifactMeta:
     backups; adding it is non-breaking per the schema-version contract (see
     module docstring).
     """
+
+
+# ---------------------------------------------------------------------------
+# BundleManifest — the bundle.meta.json top-level manifest schema
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BundleManifest:
+    """Immutable top-level manifest written as ``bundle.meta.json`` inside
+    every self-contained recovery-set bundle slot.
+
+    A bundle slot aggregates the full recovery set (config, registry, adapter
+    weights, speaker profiles) into one timestamped directory.  The bundle
+    manifest is the sole index for that directory — no per-artifact
+    ``ArtifactMeta`` sidecars are written inside a bundle slot.
+
+    Schema versioning: ``bundle_schema_version`` is independent of the
+    per-artifact ``SCHEMA_VERSION``.  Additions of optional fields (with
+    defaults) are non-breaking.  Rename or removal requires a
+    ``BUNDLE_SCHEMA_VERSION`` bump and a migration helper.
+
+    Fields
+    ------
+    bundle_schema_version : int
+        Must equal ``BUNDLE_SCHEMA_VERSION`` at write time.  Readers should
+        refuse manifests with an unrecognised version.
+    created_at : str
+        ISO-8601 UTC timestamp (e.g. ``"2026-05-20T20:55:00Z"``).
+    tier : str
+        Backup tier — one of ``"scheduled"``, ``"manual"``,
+        ``"pre_migration"``, etc.
+    label : str | None
+        Optional operator-supplied annotation.
+    live_registry_sha256 : str
+        SHA-256 hex of the registry (``key_metadata.json``) bytes at bundle
+        creation time.  This hash ties the captured adapter weights to the
+        captured registry: ``find_live_slot(adapter_kind_dir,
+        live_registry_sha256)`` selects exactly the weights stored in this
+        bundle.
+    base_model : dict
+        Base-model identity copied from the first enabled adapter's
+        ``meta.json``.  Expected keys: ``repo`` (str), ``sha`` (str),
+        ``hash`` (str).  Empty dict when no adapter meta was available.
+    files : list[dict]
+        One entry per captured file.  Each entry is a dict with keys:
+        ``path`` (str, relative to bundle slot root), ``content_sha256``
+        (str, hex), ``encrypted`` (bool), ``size_bytes`` (int).
+    adapters : dict
+        Per-tier adapter capture record.  Keys are adapter names (e.g.
+        ``"episodic"``).  Each value is a dict with:
+        ``slot_source`` (str, original slot path),
+        ``registry_sha256`` (str),
+        ``key_count`` (int | str),
+        ``simhash_present`` (bool),
+        ``keyed_pairs_present`` (bool, always False — QA pairs are
+        transient and regenerated from the graph on every cycle).
+    excluded : list[str]
+        Human-readable list of artifact categories intentionally excluded
+        from this bundle (e.g. ``"graph (RAM-only by design)"``).
+    """
+
+    bundle_schema_version: int
+    created_at: str
+    tier: str
+    label: str | None
+    live_registry_sha256: str
+    base_model: dict
+    files: list[dict]
+    adapters: dict
+    excluded: list[str]
+
+    def to_dict(self) -> dict:
+        """Serialise to a plain dict suitable for ``json.dumps``.
+
+        Returns
+        -------
+        dict
+            All fields as JSON-serialisable types.
+        """
+        return {
+            "bundle_schema_version": self.bundle_schema_version,
+            "created_at": self.created_at,
+            "tier": self.tier,
+            "label": self.label,
+            "live_registry_sha256": self.live_registry_sha256,
+            "base_model": self.base_model,
+            "files": list(self.files),
+            "adapters": dict(self.adapters),
+            "excluded": list(self.excluded),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BundleManifest":
+        """Deserialise from a plain dict (as loaded from ``bundle.meta.json``).
+
+        Parameters
+        ----------
+        data:
+            Dict loaded from the bundle manifest file.
+
+        Returns
+        -------
+        BundleManifest
+
+        Raises
+        ------
+        BundleManifestError
+            If required fields are missing or ``bundle_schema_version`` does
+            not equal ``BUNDLE_SCHEMA_VERSION``.
+        """
+        version = data.get("bundle_schema_version")
+        if version != BUNDLE_SCHEMA_VERSION:
+            raise BundleManifestError(
+                f"bundle_schema_version mismatch: expected {BUNDLE_SCHEMA_VERSION}, got {version!r}"
+            )
+        required = (
+            "created_at",
+            "tier",
+            "live_registry_sha256",
+            "base_model",
+            "files",
+            "adapters",
+            "excluded",
+        )
+        for key in required:
+            if key not in data:
+                raise BundleManifestError(f"bundle manifest missing required field: {key!r}")
+        return cls(
+            bundle_schema_version=version,
+            created_at=data["created_at"],
+            tier=data["tier"],
+            label=data.get("label"),
+            live_registry_sha256=data["live_registry_sha256"],
+            base_model=data["base_model"],
+            files=data["files"],
+            adapters=data["adapters"],
+            excluded=data["excluded"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +340,18 @@ class MetaSchemaError(BackupError):
     """
 
 
+class BundleManifestError(BackupError):
+    """Bundle manifest fails schema validation.
+
+    Raised by ``BundleManifest.from_dict()`` on:
+
+    - ``bundle_schema_version`` mismatch (forward or unknown version).
+    - Missing required fields in the manifest dict.
+
+    Callers must not treat bundle content as trustworthy when this is raised.
+    """
+
+
 class FatalConfigError(BackupError):
     """A fatal configuration problem was detected.
 
@@ -193,3 +360,66 @@ class FatalConfigError(BackupError):
     and by ``encryption.assert_mode_consistency()`` on key × on-disk format
     mismatches.  The server refuses to start.
     """
+
+
+class RestoreAbortedError(BackupError):
+    """Raised by ``restore_bundle()`` when a filesystem error occurs in the
+    atomic restore phase (step 5), after the safety bundle has already been
+    captured (step 4).
+
+    Carries ``safety_slot`` so callers (e.g. the ``/backup/restore`` HTTP
+    handler) can surface the recovery path in the error response without
+    requiring the operator to search server logs.
+
+    Attributes
+    ----------
+    safety_slot : Path | None
+        Path to the pre-restore safety bundle captured before any live
+        mutation.  ``None`` when the safety bundle was skipped (fresh/empty
+        target).
+    cause : BaseException
+        The original exception that triggered the abort.
+    """
+
+    def __init__(self, message: str, safety_slot: "Path | None", cause: BaseException) -> None:
+        super().__init__(message)
+        self.safety_slot = safety_slot
+        self.cause = cause
+
+
+# ---------------------------------------------------------------------------
+# RestoreResult — returned by restore_bundle()
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RestoreResult:
+    """Result of a successful ``restore_bundle()`` call.
+
+    Fields
+    ------
+    restored_adapters : list[str]
+        Names of the adapter entries restored from the bundle (e.g.
+        ``["episodic", "episodic_interim_20260517T1200", "procedural"]``).
+        Each entry corresponds to a key in the bundle manifest's ``adapters``
+        dict for which a new slot directory was written under ``data_dir``.
+    safety_slot : Path | None
+        Path to the pre-restore safety bundle that was captured before any
+        mutation occurred.  ``None`` when the target ``data_dir`` had no
+        episodic slot (fresh / empty target) and the safety bundle write
+        was skipped gracefully.
+    restart_required : bool
+        Always ``True`` — the in-VRAM adapters are stale after a restore.
+        A server restart re-mounts adapters from the freshly restored slots
+        via ``find_live_slot``.  No hot-swap is performed (8 GB VRAM
+        constraint; restart is the clean boundary).
+    restored_config : bool
+        ``True`` when the bundle's ``server.yaml`` was atomically written to
+        ``config_path`` (only when ``restore_config=True`` was requested).
+        ``False`` otherwise — the live config is left untouched.
+    """
+
+    restored_adapters: list[str] = field(default_factory=list)
+    safety_slot: Path | None = None
+    restart_required: bool = True
+    restored_config: bool = False

@@ -121,10 +121,32 @@ _CACHE_TTL_SECONDS: float = 5.0
 
 
 def _slot_size_bytes(slot_dir: Path) -> int:
-    """Sum the file sizes of all regular files within a slot directory."""
+    """Sum the file sizes of all regular files within a slot directory tree.
+
+    Walks the slot directory **recursively** (via ``rglob("*")``) so that
+    bundle slots whose weight files live in subdirectories (e.g.
+    ``adapters/episodic/adapter_model.safetensors``) are sized correctly.
+    Top-level-only iteration would report ~0 for bundle slots and silently
+    bypass the disk cap / retention rules.
+
+    Mirrors the pattern already used in ``backup.py::prune``'s inner
+    ``_slot_size`` helper (``rglob("*")`` filter ``is_file()``).
+
+    Parameters
+    ----------
+    slot_dir:
+        A fully-promoted slot directory (any kind, including
+        ``snapshot_bundle``).  Returns 0 when the directory does not exist
+        or cannot be read.
+
+    Returns
+    -------
+    int
+        Total byte count of all regular files reachable from *slot_dir*.
+    """
     total = 0
     try:
-        for child in slot_dir.iterdir():
+        for child in slot_dir.rglob("*"):
             if child.is_file():
                 try:
                     total += child.stat().st_size
