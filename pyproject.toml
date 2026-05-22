@@ -46,7 +46,11 @@ dependencies = [
 anthropic = ["anthropic>=0.80"]
 google = ["google-genai>=1.0"]
 all-agents = ["anthropic>=0.80", "google-genai>=1.0"]
-speaker = ["pyannote-audio>=3.1,<4"]
+# pyannote-audio 4.x is mandatory with torch>=2.10: 3.x uses torchaudio.AudioMetaData,
+# removed in torchaudio 2.10. 4.x pulls torchcodec, whose libnvrtc/FFmpeg load failure
+# at import is non-fatal (torchaudio falls back to soundfile). Supersedes the old <4 pin
+# (which kept torchcodec out, but is incompatible with the torch 2.10 GPU stack).
+speaker = ["pyannote-audio>=4.0"]
 wyoming = ["wyoming>=1.8.0"]
 stt = ["paramem[wyoming]", "faster-whisper>=1.0.0"]
 tts = ["paramem[wyoming]", "piper-tts>=1.2.0", "onnxruntime>=1.17"]
