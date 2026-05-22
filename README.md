@@ -524,10 +524,15 @@ The interactive flow shows a unified diff with each change tier-classified (**De
 
 ```bash
 paramem migrate-status      # current trial state + gate results
-paramem migrate-accept      # promote the candidate; restart to apply
-paramem migrate-rollback    # restore the previous config; restart to apply
+paramem migrate-accept      # promote the candidate and apply it live
+paramem migrate-rollback    # restore the previous config and apply it live
 paramem migrate-cancel      # discard a staged candidate (before confirm)
 ```
+
+**Accept and rollback apply the config in-process — no hard restart.** While the base model reloads under the new config the server switches to a brief **cloud-only window** (it keeps answering through the cloud agent), rebuilds its derived state, and returns to `local` only once the recall cache is rehydrated — a partial reload or preload stays cloud-only rather than serving from a half-built state. The same cloud-only-then-reclaim path covers boot: a server that comes up without enough free VRAM degrades to cloud-only and reclaims to `local` automatically once the GPU frees (`/gpu/acquire`). (Backups don't use this window — they read the live adapter set from disk and never reload the model.) Two changes are carve-outs the in-process path cannot cover:
+
+> - **STT / TTS port change** — the Wyoming listener must rebind, so the CLI pre-flights the new port and, if it is bindable, asks you to consent to a one-shot restart; if the port is already in use it reports that instead of restarting.
+> - **`paths.data` / `paths.sessions` change** — existing data is **not** moved automatically; the CLI prints a manual-restart hint and leaves the move to you.
 
 > **Base-model swaps.** A `model:` change is migrated and flagged Destructive, but the trial validates the candidate config against the *currently loaded* base model — it does not load the candidate model. Review base-model swaps manually; the trial does not yet exercise the new model end to end.
 
