@@ -121,20 +121,23 @@ class PiperTTSEngine(TTSEngine):
         if model_file.exists():
             return model_file
 
-        # Try downloading via piper_download
+        # Not local — download via piper.download_voices (the piper-tts 1.x API;
+        # the old piper.download module was removed). Network call, so the misses
+        # are boundary-handled: ImportError (no API) and download failure both fall
+        # back to "must be pre-downloaded".
         try:
-            from piper.download import ensure_voice_exists, find_voice, get_voices
+            from piper.download_voices import download_voice
 
-            voices = get_voices(data_dir, update_voices=True)
-            voice_name = find_voice(self._model_name, voices)
-            ensure_voice_exists(voice_name, [data_dir], data_dir, voices)
-            # After download, find the .onnx file matching this voice
+            download_voice(self._model_name, data_dir)
+            if model_file.exists():
+                return model_file
+            # download_voice may lay the file out differently — match by stem.
             for onnx_file in data_dir.rglob("*.onnx"):
                 if self._model_name.replace("-", "_") in str(onnx_file).replace("-", "_"):
                     return onnx_file
             logger.warning("Downloaded Piper voice but .onnx not found for %s", self._model_name)
         except ImportError:
-            logger.warning("piper.download not available — model must be pre-downloaded")
+            logger.warning("piper.download_voices not available — model must be pre-downloaded")
         except Exception:
             logger.exception("Failed to download Piper model %s", self._model_name)
 
@@ -378,6 +381,11 @@ class TTSManager:
     def available_languages(self) -> list[str]:
         """List of languages with loaded engines."""
         return sorted(self._engines.keys())
+
+    @property
+    def configured_languages(self) -> list[str]:
+        """Languages declared in config, loaded or not — for degraded-state checks."""
+        return sorted(self._config.voices.keys())
 
     def unload_all(self) -> None:
         """Unload all engines and free memory."""
