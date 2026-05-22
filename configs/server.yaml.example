@@ -527,7 +527,10 @@ stt:
   vad_filter: true           # voice activity detection (trims silence)
 
 tts:
-  enabled: false             # local TTS via Wyoming protocol (requires Piper / MMS-TTS model downloads)
+  # Whether ParaMem runs its OWN local Wyoming TTS engine. false does NOT mean
+  # "no TTS in the system" — replies can still be voiced by an external TTS
+  # (e.g. a Home Assistant pipeline); /chat and STT are unaffected either way.
+  enabled: false             # local Wyoming TTS engine on/off (Piper / MMS model downloads)
   port: 10301                # Wyoming TTS listener port
   # DEFAULT DEVICE = cpu. Piper is CPU-first (real-time on CPU) and keeping the
   # voices off the GPU preserves VRAM for the base model + Whisper STT. Override
@@ -536,6 +539,7 @@ tts:
   device: cpu
   default_language: en
   language_confidence_threshold: 0.8  # Whisper detection probability to trust
+  language_source: auto               # auto/detection: detected language wins over caller hint; hint: reverse
   # model_dir: ""            # TTS model storage; default: data/ha/tts
   voices:
     en:

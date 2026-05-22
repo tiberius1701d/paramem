@@ -1848,6 +1848,7 @@ async def lifespan(app: FastAPI):
                 language_resolver=_resolve_language,
                 audio_chunk_bytes=config.tts.audio_chunk_bytes,
                 tts_manager_provider=lambda: _state["voice_box"]["tts_manager"],
+                language_source=config.tts.language_source,
             )
             logger.info("Wyoming TTS server listening on port %d", config.tts.port)
 
