@@ -6264,6 +6264,13 @@ async def migration_accept():
         #     for R-PORT; the CLI prompts the operator and runs the restart_hint command.
 
         # a) Synchronous maintenance guard (correction S-4).
+        # Capture the pre-guard mode first: the guard's "cloud-only" is only undone
+        # by a SUCCESSFUL _live_reload_base_model (sets mode=local). Every other
+        # _apply_config_live outcome (no-op skip, carve short-circuit, lock-timeout,
+        # consolidating) returns with the guard untouched, so without restoring it
+        # here the running server would be left stuck cloud-only.
+        _prior_mode = _state.get("mode")
+        _prior_cloud_only_reason = _state.get("cloud_only_reason")
         _state["mode"] = "cloud-only"
         _state["cloud_only_reason"] = "live_reload"
 
@@ -6276,6 +6283,17 @@ async def migration_accept():
         apply_reason: str | None = apply_result.get("restart_required_reason")
         auto_restart_scheduled: bool = False  # server never self-fires restart
         restart_eligible: bool = apply_result.get("restart_eligible", False)
+
+        # Restore the pre-guard mode when the apply did NOT transition it. A
+        # successful reload already set mode=local; a genuine reload failure set a
+        # specific cloud_only_reason (apply_failed/preload_failed/insufficient_vram/
+        # reload_failed). Only the untouched guard state (cloud-only + "live_reload")
+        # means no transition happened — the running server is still serving in its
+        # prior mode (carve changes take effect on the operator's restart) and must
+        # not be left degraded to cloud-only.
+        if _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") == "live_reload":
+            _state["mode"] = _prior_mode
+            _state["cloud_only_reason"] = _prior_cloud_only_reason
 
         # c) Refresh config_drift AFTER the apply.
         # When applied_live=True the loaded_hash is now B (the apply updated it
@@ -6722,6 +6740,11 @@ async def migration_rollback():
         # and return applied_live=True, skipped="no_change" without GPU churn.
         #
         # Synchronous maintenance guard (correction S-4) — set before dispatching.
+        # Capture pre-guard mode first: rollback's apply takes the no-op skip (the
+        # normal path — disk==memory==A), which returns with the guard untouched.
+        # Restore below so rollback does not leave the server stuck cloud-only.
+        _prior_mode = _state.get("mode")
+        _prior_cloud_only_reason = _state.get("cloud_only_reason")
         _state["mode"] = "cloud-only"
         _state["cloud_only_reason"] = "live_reload"
 
@@ -6731,6 +6754,14 @@ async def migration_rollback():
         applied_live: bool = apply_result.get("applied_live", False)
         apply_reason: str | None = apply_result.get("restart_required_reason")
         restart_eligible: bool = apply_result.get("restart_eligible", False)
+
+        # Restore the pre-guard mode when the apply did NOT transition it (see the
+        # accept handler for the full rationale): only the untouched guard state
+        # (cloud-only + "live_reload") means no reload happened. A successful reload
+        # set mode=local; a genuine failure set a specific cloud_only_reason.
+        if _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") == "live_reload":
+            _state["mode"] = _prior_mode
+            _state["cloud_only_reason"] = _prior_cloud_only_reason
 
         # NOTE: do NOT refresh config_drift for rollback — in-memory config already
         # matches A; the drift loop stays coherent (config_drift.loaded_hash is A).
