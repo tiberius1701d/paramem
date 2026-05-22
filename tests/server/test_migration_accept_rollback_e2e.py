@@ -219,6 +219,51 @@ def _stub_apply_r_paths():
     return _impl
 
 
+def _stub_apply_reload_success_mutating():
+    """Faithful stub: mimics a SUCCESSFUL _live_reload_base_model.
+
+    The real function sets _state mode=local / cloud_only_reason=None before
+    returning (app.py:3917). A dict-only stub leaves the guard sentinel resident
+    and so cannot exercise the handler's restore discrimination for this path;
+    this stub reproduces the real _state mutation.
+    """
+
+    def _impl():
+        app_module._state["mode"] = "local"
+        app_module._state["cloud_only_reason"] = None
+        return {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+        }
+
+    return _impl
+
+
+def _stub_apply_reload_failure_mutating():
+    """Faithful stub: mimics a GENUINE reload failure.
+
+    The real function sets a SPECIFIC cloud_only_reason (e.g. apply_failed at
+    app.py:3896, insufficient_vram at :3836) — NOT the transient 'live_reload'
+    guard sentinel — so the honest degraded state must survive the restore.
+    """
+
+    def _impl():
+        app_module._state["mode"] = "cloud-only"
+        app_module._state["cloud_only_reason"] = "apply_failed"
+        return {
+            "applied_live": False,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": "apply_failed",
+        }
+
+    return _impl
+
+
 class TestE2EAcceptPath:
     def test_e2e_full_preview_confirm_accept(self, tmp_path, monkeypatch):
         """Full E2E: STAGING → TRIAL → accept → LIVE (with live-apply success stub).
@@ -294,6 +339,103 @@ class TestE2EAcceptPath:
         body = resp.json()
         assert body["applied_live"] is False
         assert body["restart_required"] is True
+
+    def test_e2e_accept_genuine_reload_failure_stays_cloud_only(self, tmp_path, monkeypatch):
+        """E2E: a GENUINE reload failure must NOT be unwound by the mode-restore.
+
+        A real _live_reload_base_model failure sets a specific cloud_only_reason
+        (apply_failed/insufficient_vram/...), the honest degraded state. The restore
+        guard fires only on the untouched 'live_reload' sentinel, so it must leave a
+        real failure's mode=cloud-only and reason intact.
+        """
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_reload_failure_mutating())
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+
+        # Genuine failure: stay cloud-only with the specific reason, NOT restored.
+        assert fresh["mode"] == "cloud-only"
+        assert fresh["cloud_only_reason"] == "apply_failed"
+
+    def test_e2e_accept_successful_reload_leaves_local(self, tmp_path, monkeypatch):
+        """E2E: a successful reload (mode already local) must be left untouched by restore."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_reload_success_mutating())
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+
+        assert fresh["mode"] == "local"
+        assert fresh["cloud_only_reason"] is None
+
+    def test_e2e_accept_explicit_cloud_only_preserved(self, tmp_path, monkeypatch):
+        """E2E: a pre-existing explicit cloud-only (yaml cloud_only: true) survives a
+        non-reload apply — the restore returns the prior (cloud-only, 'explicit'); it
+        must NOT force the server to local.
+        """
+        fresh = _make_state(tmp_path)
+        fresh["mode"] = "cloud-only"
+        fresh["cloud_only_reason"] = "explicit"
+        monkeypatch.setattr(app_module, "_state", fresh)
+        # R-PORT carve short-circuits without reload (dict-only stub, no _state mutation).
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_r_port())
+        monkeypatch.setattr(app_module, "_restart_service", lambda: None)
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+
+        # Prior explicit cloud-only faithfully restored, NOT forced to local.
+        assert fresh["mode"] == "cloud-only"
+        assert fresh["cloud_only_reason"] == "explicit"
+
+    def test_e2e_accept_r_paths_carve_restores_prior_mode(self, tmp_path, monkeypatch):
+        """E2E: R-PATHS carve short-circuits without reload → prior mode restored
+        (symmetric with the R-PORT carve case).
+        """
+        fresh = _make_state(tmp_path)
+        assert fresh["mode"] == "normal"
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_r_paths())
+        monkeypatch.setattr(app_module, "_restart_service", lambda: None)
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+
+        assert fresh["mode"] == "normal", (
+            f"R-PATHS carve left server in {fresh['mode']!r}; expected restored 'normal'"
+        )
+        assert fresh.get("cloud_only_reason") is None
         banners = fresh["migration"]["recovery_required"]
         assert any("RESTART REQUIRED" in b for b in banners), (
             f"Expected 'RESTART REQUIRED' banner on apply failure: {banners}"
@@ -345,6 +487,37 @@ class TestE2EAcceptPath:
         assert any("DATA IS NOT MIGRATED" in b for b in banners), (
             f"Expected DATA IS NOT MIGRATED warning in banners: {banners}"
         )
+
+    def test_e2e_accept_carve_restores_prior_mode_not_stuck_cloud_only(self, tmp_path, monkeypatch):
+        """E2E regression: an accept whose apply does NOT reload (R-PORT carve)
+        restores the pre-guard mode instead of leaving the server stuck cloud-only.
+
+        The accept handler sets mode=cloud-only as a maintenance guard, but only a
+        successful _live_reload_base_model resets it to local. The carve
+        short-circuit (and no-op skip) return with the guard untouched, so without
+        the restore the live server is left degraded to cloud-only.
+        """
+        fresh = _make_state(tmp_path)
+        assert fresh["mode"] == "normal"  # pre-guard serving mode
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_r_port())
+        monkeypatch.setattr(app_module, "_restart_service", lambda: None)
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+
+        # The carve short-circuited (no reload), so the guard must be unwound.
+        assert fresh["mode"] == "normal", (
+            f"accept left server in {fresh['mode']!r} after a non-reload apply"
+        )
+        assert fresh.get("cloud_only_reason") is None
 
     def test_e2e_accept_status_shows_comparison_report(self, tmp_path, monkeypatch):
         """/migration/status shows comparison_report when TRIAL + pass gates."""
@@ -438,6 +611,52 @@ class TestE2ERollbackPath:
         assert fresh["migration"]["state"] == "LIVE"
         state_dir = fresh["config"].paths.data / "state"
         assert read_trial_marker(state_dir) is None
+
+    def test_e2e_rollback_restores_prior_mode_not_stuck_cloud_only(self, tmp_path, monkeypatch):
+        """E2E regression: rollback's no-op-skip apply restores the pre-guard mode
+        instead of leaving the server stuck cloud-only.
+
+        Rollback sets mode=cloud-only as a maintenance guard; the no-op skip (the
+        normal rollback path — disk==memory==A) returns without resetting it, and
+        step 8 did not restore it. Without the fix, every rollback degrades the
+        live server to cloud-only.
+        """
+        fresh = _make_state(tmp_path)
+        assert fresh["mode"] == "normal"
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            lambda: {
+                "applied_live": True,
+                "restart_required_reason": None,
+                "auto_restart_scheduled": False,
+                "skipped": "no_change",
+                "cloud_only_reason": None,
+            },
+        )
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        resp = client.post("/migration/confirm", json={})
+        assert resp.status_code == 200
+        live_yaml = Path(fresh["config_path"])
+        _seed_trial_state(fresh, tmp_path, gates_status="fail")
+        live_yaml.write_bytes(_CAND_YAML)
+
+        resp = client.post("/migration/rollback")
+        assert resp.status_code == 200
+
+        # No-op-skip apply did not reload, so the guard must be unwound to the
+        # pre-rollback serving mode rather than left at cloud-only.
+        assert fresh["mode"] == "normal", (
+            f"rollback left server in {fresh['mode']!r}; expected restored 'normal'"
+        )
+        assert fresh.get("cloud_only_reason") is None
 
 
 # ---------------------------------------------------------------------------
