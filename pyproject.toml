@@ -55,6 +55,10 @@ wyoming = ["wyoming>=1.8.0"]
 stt = ["paramem[wyoming]", "faster-whisper>=1.0.0"]
 tts = ["paramem[wyoming]", "piper-tts>=1.2.0", "onnxruntime>=1.17"]
 tts-gpu = ["paramem[wyoming]", "piper-tts>=1.2.0", "onnxruntime-gpu>=1.17"]
+# Optional higher-quality TTS engine (Kokoro-82M, Apache-2.0, CPU-capable). Covers
+# en/fr/es/it/pt/hi/ja/zh (NOT German); pulls a misaki/phonemizer linguistics stack.
+# Opt-in: select "kokoro" per-voice in tts.voices. Not in `voice` so base installs stay lean.
+kokoro = ["paramem[wyoming]", "kokoro>=0.9.4"]
 voice = ["paramem[stt,tts,speaker]"]
 dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.3"]
 

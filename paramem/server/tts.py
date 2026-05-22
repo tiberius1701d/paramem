@@ -240,6 +240,71 @@ class MMSTTSEngine(TTSEngine):
         return self._model is not None
 
 
+class KokoroTTSEngine(TTSEngine):
+    """Kokoro-82M TTS via the ``kokoro`` KPipeline (Apache-2.0, CPU-capable).
+
+    Voice names are language-prefixed (``af_*``=US English, ``bf_*``=British,
+    ``ef_*``=Spanish, ``ff_*``=French, ...); the KPipeline ``lang_code`` is the
+    voice's first character. Output is 24 kHz float, converted to int16 PCM like
+    MMS. Optional dependency — ``pip install paramem[kokoro]``.
+    """
+
+    SAMPLE_RATE = 24000
+
+    def __init__(self, voice_name: str):
+        self._voice_name = voice_name
+        self._pipeline = None
+        self._actual_device = "cpu"
+
+    def load(self, device: str = "cpu") -> bool:
+        try:
+            from kokoro import KPipeline
+        except ImportError:
+            logger.error("kokoro not installed. Install with: pip install paramem[kokoro]")
+            return False
+
+        try:
+            actual = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+            lang_code = self._voice_name[0]  # af_* -> 'a', bf_* -> 'b', ef_* -> 'e', ...
+            self._pipeline = KPipeline(
+                lang_code=lang_code, repo_id="hexgrad/Kokoro-82M", device=actual
+            )
+            self._actual_device = actual
+            logger.info(
+                "Kokoro TTS loaded: %s (lang_code=%s) on %s", self._voice_name, lang_code, actual
+            )
+            return True
+        except Exception:
+            logger.exception("Failed to load Kokoro voice %s", self._voice_name)
+            return False
+
+    def synthesize(self, text: str) -> tuple[bytes, int]:
+        if self._pipeline is None:
+            raise RuntimeError("Kokoro pipeline not loaded")
+
+        chunks = []
+        for result in self._pipeline(text, voice=self._voice_name):
+            audio = result.audio if hasattr(result, "audio") else result[2]
+            arr = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio)
+            chunks.append(arr)
+        waveform = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+
+        # float [-1, 1] -> int16 PCM (mirrors MMSTTSEngine)
+        pcm_data = (waveform * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+        return pcm_data, self.SAMPLE_RATE
+
+    def unload(self) -> None:
+        if self._pipeline is not None:
+            del self._pipeline
+            self._pipeline = None
+            safe_empty_cache()
+            logger.info("Kokoro TTS unloaded: %s", self._voice_name)
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._pipeline is not None
+
+
 def _piper_factory(voice_config: TTSVoiceConfig, tts_config: TTSConfig) -> TTSEngine:
     model_dir = Path(tts_config.model_dir) if tts_config.model_dir else None
     piper_dir = (model_dir / "piper") if model_dir else None
@@ -250,6 +315,10 @@ def _mms_factory(voice_config: TTSVoiceConfig, tts_config: TTSConfig) -> TTSEngi
     return MMSTTSEngine(model_id=voice_config.model)
 
 
+def _kokoro_factory(voice_config: TTSVoiceConfig, tts_config: TTSConfig) -> TTSEngine:
+    return KokoroTTSEngine(voice_name=voice_config.model)
+
+
 # Registry of engine factory functions.
 # Each callable: (voice_config, tts_config) -> TTSEngine.
 # Adding a new provider: write a factory function and add one entry here.
@@ -257,6 +326,7 @@ EngineFactory = Callable[[TTSVoiceConfig, TTSConfig], TTSEngine]
 ENGINE_REGISTRY: dict[str, EngineFactory] = {
     "piper": _piper_factory,
     "mms": _mms_factory,
+    "kokoro": _kokoro_factory,
 }
 
 

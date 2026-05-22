@@ -611,6 +611,18 @@ def test_tts_config_language_source_default():
     assert TTSConfig().language_source == "auto"
 
 
+def test_kokoro_engine_registered_and_constructed():
+    """Kokoro is in the engine registry and _create_engine builds a KokoroTTSEngine
+    for a voice with engine: kokoro (construction only, no model download)."""
+    from paramem.server.config import TTSConfig, TTSVoiceConfig
+    from paramem.server.tts import ENGINE_REGISTRY, KokoroTTSEngine, _create_engine
+
+    assert "kokoro" in ENGINE_REGISTRY
+    engine = _create_engine(TTSVoiceConfig(engine="kokoro", model="af_heart"), TTSConfig())
+    assert isinstance(engine, KokoroTTSEngine)
+    assert engine.is_loaded is False
+
+
 # --- Config: new STT fields ---
 
 
