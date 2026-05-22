@@ -323,6 +323,7 @@ fields = {
     "stt_model": d.get("stt_model") or "-",
     "stt_device": d.get("stt_device") or "-",
     "tts_loaded": d.get("tts_loaded", False),
+    "tts_degraded": d.get("tts_degraded", False),
     "tts_engine": d.get("tts_engine") or "-",
     "tts_languages": ",".join(d.get("tts_languages") or []) or "-",
     "tts_device": d.get("tts_device") or "-",
@@ -386,7 +387,7 @@ print("|".join(str(fields[k]) for k in [
     "speaker_embedding_backend", "speaker_embedding_model",
     "speaker_embedding_device",
     "stt_loaded", "stt_engine", "stt_model", "stt_device",
-    "tts_loaded", "tts_engine", "tts_languages", "tts_device",
+    "tts_loaded", "tts_degraded", "tts_engine", "tts_languages", "tts_device",
     "bg_trainer_active", "bg_trainer_adapter",
     "throttle_mode", "throttle_start", "throttle_end",
     "throttle_temp_limit", "throttle_active",
@@ -474,7 +475,7 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     scheduler_started orphaned oldest_age speaker_profiles pending_enrollments \
     spk_emb_backend spk_emb_model spk_emb_device \
     stt_loaded stt_engine stt_model stt_device \
-    tts_loaded tts_engine tts_languages tts_device \
+    tts_loaded tts_degraded tts_engine tts_languages tts_device \
     bg_trainer_active bg_trainer_adapter \
     throttle_mode throttle_start throttle_end \
     throttle_temp_limit throttle_active \
@@ -907,7 +908,11 @@ if [[ "$tts_loaded" == "True" ]]; then
     if [[ "$tts_engine" != "-" && -n "$tts_engine" ]]; then
         tts_engine_prefix="${tts_engine} "
     fi
-    echo -e "  TTS:      ${GREEN}loaded${RESET} (${tts_engine_prefix}${tts_languages} on ${tts_dev_tag})"
+    if [[ "$tts_degraded" == "True" ]]; then
+        echo -e "  TTS:      ${YELLOW}degraded${RESET} (${tts_engine_prefix}${tts_languages} on ${tts_dev_tag}; some configured voices failed to load)"
+    else
+        echo -e "  TTS:      ${GREEN}loaded${RESET} (${tts_engine_prefix}${tts_languages} on ${tts_dev_tag})"
+    fi
 else
     echo -e "  TTS:      ${DIM}not loaded${RESET}"
 fi
