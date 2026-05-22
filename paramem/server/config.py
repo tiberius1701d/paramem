@@ -1062,6 +1062,11 @@ class TTSConfig:
     device: str = "cuda"  # default device for all voices; per-voice override possible
     default_language: str = "en"
     language_confidence_threshold: float = 0.8  # minimum Whisper probability to trust detection
+    # How the synth language is chosen when both a caller voice hint and a detected
+    # language are available: "auto"/"detection" prefer ParaMem's detected language
+    # (latest_language_detection) over the caller's voice.language hint; "hint" makes
+    # the caller's hint win. All fall back to the other source, then default_language.
+    language_source: str = "auto"
     model_dir: str = ""  # directory for TTS model files; "" = paths.data / "tts"
     audio_chunk_bytes: int = 4096  # bytes per Wyoming audio chunk (tradeoff: latency vs overhead)
     voices: dict[str, TTSVoiceConfig] = field(default_factory=dict)

@@ -587,6 +587,30 @@ def test_tts_handler_default_chunk_size():
     assert handler._audio_chunk_bytes == 4096
 
 
+def test_tts_language_source_precedence():
+    """tts.language_source picks the synth language: detection-first for
+    auto/detection, hint-first for hint; both fall back to the other source."""
+    pytest.importorskip("wyoming")
+    from paramem.server.wyoming_handler import _resolve_synth_language
+
+    # detection-first (auto / detection): detected language wins over the hint
+    assert _resolve_synth_language("en", "de", "auto") == "de"
+    assert _resolve_synth_language("en", "de", "detection") == "de"
+    # hint mode: caller's voice hint wins
+    assert _resolve_synth_language("en", "de", "hint") == "en"
+    # fallbacks
+    assert _resolve_synth_language("en", None, "auto") == "en"  # no detection -> hint
+    assert _resolve_synth_language(None, "de", "hint") == "de"  # no hint -> detected
+    assert _resolve_synth_language(None, None, "auto") is None  # neither -> default downstream
+
+
+def test_tts_config_language_source_default():
+    """TTSConfig.language_source defaults to 'auto' (detection-first)."""
+    from paramem.server.config import TTSConfig
+
+    assert TTSConfig().language_source == "auto"
+
+
 # --- Config: new STT fields ---
 
 

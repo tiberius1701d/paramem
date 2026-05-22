@@ -269,6 +269,16 @@ async def start_wyoming_server(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_synth_language(hint: str | None, detected: str | None, source: str) -> str | None:
+    """Pick the TTS synth language from the caller's voice hint and ParaMem's
+    detected language, per ``tts.language_source``. ``"hint"`` lets the caller's
+    hint win; ``"auto"``/``"detection"`` let the detected language win. Both fall
+    back to the other source (then to the TTSManager default downstream)."""
+    if source == "hint":
+        return hint or detected
+    return detected or hint
+
+
 class TTSHandler(AsyncEventHandler):
     """Handles a single Wyoming TTS connection.
 
@@ -283,11 +293,13 @@ class TTSHandler(AsyncEventHandler):
         tts_manager: TTSManager,
         language_resolver=None,
         audio_chunk_bytes: int = 4096,
+        language_source: str = "auto",
     ):
         super().__init__(reader, writer)
         self._tts = tts_manager
         self._language_resolver = language_resolver
         self._audio_chunk_bytes = audio_chunk_bytes
+        self._language_source = language_source
 
     async def handle_event(self, event: Event) -> bool:
         """Process a Wyoming protocol event."""
@@ -309,12 +321,13 @@ class TTSHandler(AsyncEventHandler):
             logger.warning("Empty TTS request")
             return
 
-        # Resolve language: voice hint → resolver callback → default
-        language = None
-        if request.voice and request.voice.language:
-            language = request.voice.language
-        elif self._language_resolver:
-            language = self._language_resolver()
+        # Resolve language per tts.language_source. Detection-first ("auto"/
+        # "detection") prefers ParaMem's detected language over the caller's
+        # voice.language hint; "hint" reverses it. Both fall back to the other
+        # source, then to the TTSManager default_language.
+        hint = request.voice.language if (request.voice and request.voice.language) else None
+        detected = self._language_resolver() if self._language_resolver else None
+        language = _resolve_synth_language(hint, detected, self._language_source)
 
         logger.info(
             "TTS request: '%s' (lang=%s)",
@@ -402,6 +415,7 @@ async def start_wyoming_tts_server(
     language_resolver=None,
     audio_chunk_bytes: int = 4096,
     tts_manager_provider: Callable[[], TTSManager] | None = None,
+    language_source: str = "auto",
 ) -> AsyncServer:
     """Start the Wyoming TTS server (non-blocking).
 
@@ -414,11 +428,15 @@ async def start_wyoming_tts_server(
             When provided, the handler factory calls this on every connection so
             profile hot-swaps (gpu/cpu) take effect without restarting the
             socket listener. Supersedes ``tts_manager`` when not None.
+        language_source: ``tts.language_source`` — "auto"/"detection" prefer the
+            detected language over the caller's voice hint; "hint" reverses it.
     """
 
     def handler_factory(reader, writer):
         active_tts = tts_manager_provider() if tts_manager_provider is not None else tts_manager
-        return TTSHandler(reader, writer, active_tts, language_resolver, audio_chunk_bytes)
+        return TTSHandler(
+            reader, writer, active_tts, language_resolver, audio_chunk_bytes, language_source
+        )
 
     server = AsyncServer.from_uri(f"tcp://{host}:{port}")
 
