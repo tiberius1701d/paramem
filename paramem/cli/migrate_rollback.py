@@ -15,6 +15,7 @@ import json
 import sys
 
 from paramem.cli import http_client
+from paramem.cli.migrate import _render_apply_result
 
 
 def _parse_detail(body: str) -> dict:
@@ -119,14 +120,15 @@ def run(args: argparse.Namespace) -> int:
             print("  Archive the trial adapter manually if needed.")
             print(
                 "\nWarning: trial adapter rotation failed (see above). "
-                "Config was restored successfully. Restart the server.",
+                "Config was restored successfully.",
                 file=sys.stderr,
             )
+            _render_apply_result(result, args.server_url)
         return 0
 
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2))
     else:
-        for key, value in result.items():
-            print(f"{key}: {value}")
+        print("Migration rolled back.")
+        _render_apply_result(result, args.server_url)
     return 0

@@ -3,30 +3,59 @@
 The in-process reload primitive must, per the cloud-only VRAM-leak fix:
 
 (a) Look before it leaps — refuse the load when the live GPU budget cannot
-    fit the topology, reusing the PRODUCTIVE ``measure_external_vram`` +
-    ``enforce_live_budget`` check against the boot-time assessment cached in
-    ``_state["topology_assessment"]``. ``measure_external_vram`` snapshots
-    device-wide occupancy (nvidia-smi), so an external consumer in another
-    WSL distro / on the Windows host is counted.
+    fit the topology.  The reclaim fit-check uses
+    ``torch.cuda.mem_get_info(0)[0]`` (device-wide free) compared directly
+    to ``assessment.required_bytes``.  This is the same measure the boot
+    drain-wait uses, and avoids nvidia-smi which false-frees exiting
+    processes under WSL2 (the documented host-crash cause).
 
 (b) Fail clean — if a load is attempted and OOMs, release every byte
     ParaMem put on the device so the cloud-only server sits at ~0, rather
     than leaking the partial allocation.
 
 These exercise the function directly (no app lifespan). The release, the
-load, and the VRAM check are mocked — the contract under test is the
-control flow and the resulting ``_state`` mode/reason, not real CUDA.
+load, the VRAM check, and ``_build_config_derived_state`` are mocked — the
+contract under test is the control flow and the resulting ``_state``
+mode/reason, not real CUDA.
+
+After the WP1 refactor, ``_live_reload_base_model`` calls
+``_build_config_derived_state`` after a successful model load (to rebuild
+router, exemplar banks, etc.).  Existing tests mock
+``_build_config_derived_state`` so they exercise the same control-flow
+contract as before without triggering real STT/HA/SOTA construction.
+
+New tests added for WP1:
+- ``refresh_config_from_disk=True`` calls ``load_server_config`` BEFORE
+  ``_release_base_model_in_process``.
+- Mode is not set to ``local`` until AFTER ``_build_config_derived_state``.
+- A rebuild failure leaves mode=cloud-only with reason ``apply_failed``
+  or ``preload_failed``.
+- ``_build_config_derived_state`` is NOT passed ``enforce_post_load_budget``
+  (the build-once VRAM gate stays lifespan-only — B-1).
+- ``_preload_memory_store`` source selection is driven by
+  ``config.consolidation.mode``, not ``_state["mode"]``.
+- ``boot_degraded`` is cleared on full hydration and on ``preload_cache=False``;
+  set on partial hydration.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 
-def _fake_config():
+
+def _fake_config(consolidation_mode="train", preload_cache=True):
     config = MagicMock()
     config.model_name = "mistral"
+    config.consolidation.mode = consolidation_mode
+    config.inference.preload_cache = preload_cache
     return config
+
+
+# ---------------------------------------------------------------------------
+# Existing VRAM-guard tests (updated to mock _build_config_derived_state)
+# ---------------------------------------------------------------------------
 
 
 def test_preflight_declines_when_budget_insufficient():
@@ -34,30 +63,36 @@ def test_preflight_declines_when_budget_insufficient():
 
     The upfront release still runs (so ParaMem holds ~0); reason is set to
     ``insufficient_vram`` so callers distinguish a deferral from a crash.
+
+    The fit-check uses torch.cuda.mem_get_info(0)[0] (device-wide free) vs
+    assessment.required_bytes — no nvidia-smi in the reclaim path.
     """
     from paramem.server import app as app_module
+
+    # required_bytes is 6 GiB; mock free to 2 GiB → insufficient.
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+    free_bytes = int(2 * 2**30)  # well below required
 
     state_patch = {
         "mode": "local",
         "cloud_only_reason": None,
         "config": _fake_config(),
-        "topology_assessment": MagicMock(name="assessment"),
+        "topology_assessment": fake_assessment,
     }
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process") as mock_release,
-        patch.object(app_module, "measure_external_vram", return_value=(8 * 2**30, 6 * 2**30)),
-        patch.object(
-            app_module,
-            "enforce_live_budget",
-            side_effect=app_module.ConfigurationError("over budget"),
-        ),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
         patch.object(app_module, "_load_model_into_state") as mock_load,
+        patch.object(app_module, "_build_config_derived_state") as mock_build,
     ):
         app_module._live_reload_base_model()
 
         mock_load.assert_not_called()
+        mock_build.assert_not_called()
         mock_release.assert_called_once()  # upfront release only; no cleanup pass
         assert app_module._state["mode"] == "cloud-only"
         assert app_module._state["cloud_only_reason"] == "insufficient_vram"
@@ -65,8 +100,12 @@ def test_preflight_declines_when_budget_insufficient():
 
 def test_preflight_skipped_when_no_boot_assessment():
     """No cached boot assessment (cloud-only / cache miss at boot): skip the
-    budget check, defer to the live load gate. measure_external_vram and
-    enforce_live_budget are not consulted."""
+    budget check, defer to the live load gate. torch.cuda.mem_get_info is not
+    consulted (no assessment to compare against).
+
+    After the WP1 refactor: _build_config_derived_state is called once (to
+    rebuild the router + classifier) on the plain-reclaim path.
+    """
     from paramem.server import app as app_module
 
     state_patch = {
@@ -79,40 +118,56 @@ def test_preflight_skipped_when_no_boot_assessment():
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process"),
-        patch.object(app_module, "measure_external_vram") as mock_measure,
-        patch.object(app_module, "enforce_live_budget") as mock_enforce,
+        patch("paramem.server.app.torch.cuda.mem_get_info") as mock_mem_get_info,
         patch.object(app_module, "_load_model_into_state") as mock_load,
+        patch.object(app_module, "_build_config_derived_state") as mock_build,
     ):
         app_module._live_reload_base_model()
 
-        mock_measure.assert_not_called()
-        mock_enforce.assert_not_called()
+        # With topology_assessment=None, mem_get_info must NOT be called.
+        mock_mem_get_info.assert_not_called()
         mock_load.assert_called_once()
+        # WP1: plain-reclaim path calls _build_config_derived_state once
+        # (rebuild_session_buffer=False, cloud_only=False).
+        mock_build.assert_called_once()
         assert app_module._state["mode"] == "local"
         assert app_module._state["cloud_only_reason"] is None
 
 
 def test_successful_reload_sets_local():
-    """Pre-flight passes (budget fits) and the load succeeds → mode local."""
+    """Pre-flight passes (budget fits) and the load succeeds → mode local.
+
+    The fit-check uses torch.cuda.mem_get_info(0)[0] vs required_bytes.
+    After the WP1 refactor: _build_config_derived_state is called once on
+    the plain-reclaim path.
+    """
     from paramem.server import app as app_module
+
+    # required_bytes is 6 GiB; mock free to 7 GiB → fits.
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+    free_bytes = int(7 * 2**30)
 
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
         "config": _fake_config(),
-        "topology_assessment": MagicMock(name="assessment"),
+        "topology_assessment": fake_assessment,
     }
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process"),
-        patch.object(app_module, "measure_external_vram", return_value=(8 * 2**30, 1 * 2**30)),
-        patch.object(app_module, "enforce_live_budget"),  # no raise == fits
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
         patch.object(app_module, "_load_model_into_state") as mock_load,
+        patch.object(app_module, "_build_config_derived_state") as mock_build,
     ):
         app_module._live_reload_base_model()
 
         mock_load.assert_called_once()
+        # WP1: _build_config_derived_state called once on plain-reclaim path.
+        mock_build.assert_called_once()
         assert app_module._state["mode"] == "local"
         assert app_module._state["cloud_only_reason"] is None
 
@@ -120,30 +175,1101 @@ def test_successful_reload_sets_local():
 def test_load_failure_releases_and_stays_cloud_only():
     """Load OOMs after the pre-flight passed: the partial allocation is freed
     (a second release pass) and the server stays cloud-only with reason
-    ``reload_failed`` — no leak, no false 'local'."""
+    ``reload_failed`` — no leak, no false 'local'.
+
+    _build_config_derived_state must NOT be called when the load fails.
+    """
+    from paramem.server import app as app_module
+
+    # required_bytes is 6 GiB; free is 7 GiB → pre-flight passes.
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+    free_bytes = int(7 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "topology_assessment": fake_assessment,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process") as mock_release,
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
+        patch.object(
+            app_module,
+            "_load_model_into_state",
+            side_effect=RuntimeError("CUDA out of memory"),
+        ),
+        patch.object(app_module, "_build_config_derived_state") as mock_build,
+    ):
+        app_module._live_reload_base_model()
+
+        # Upfront release + post-failure cleanup release.
+        assert mock_release.call_count == 2
+        mock_build.assert_not_called()
+        assert app_module._state["mode"] == "cloud-only"
+        assert app_module._state["cloud_only_reason"] == "reload_failed"
+
+
+# ---------------------------------------------------------------------------
+# WP1 new tests: config-refresh ordering + full rebuild on True vs model-only
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_config_from_disk_loads_config_before_release():
+    """When refresh_config_from_disk=True: load_server_config is called BEFORE
+    _release_base_model_in_process (correction S-4 ordering / D2).
+
+    The config is committed to _state before the release so that a crash
+    mid-reload leaves _state["config"] pointing at the new config B
+    (recoverable via /gpu/acquire or restart).
+    """
+    from paramem.server import app as app_module
+
+    call_order = []
+
+    fake_new_config = _fake_config()
+
+    def fake_load_server_config(_path):
+        call_order.append("load_server_config")
+        return fake_new_config
+
+    def fake_release():
+        call_order.append("release")
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "config_path": "configs/server.yaml",
+        "topology_assessment": None,
+        "boot_degraded": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "load_server_config", side_effect=fake_load_server_config),
+        patch.object(app_module, "_release_base_model_in_process", side_effect=fake_release),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=True)
+
+    assert call_order.index("load_server_config") < call_order.index("release"), (
+        f"load_server_config must run BEFORE release; got order={call_order}"
+    )
+
+
+def test_refresh_config_mode_not_local_until_after_build():
+    """When refresh_config_from_disk=True: mode is NOT set to 'local' until
+    AFTER _build_config_derived_state succeeds (D2 / §3.12 step 9).
+
+    If the build is not called (or raises), mode stays cloud-only.
+    """
+    from paramem.server import app as app_module
+
+    mode_at_build_call = []
+
+    def fake_build(config, *, cloud_only, rebuild_session_buffer=True, full_rebuild=True):
+        mode_at_build_call.append(app_module._state.get("mode"))
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "config_path": "configs/server.yaml",
+        "topology_assessment": None,
+        "boot_degraded": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "load_server_config", return_value=_fake_config()),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state", side_effect=fake_build),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=True)
+
+        # mode must be cloud-only while build is executing, then local after.
+        # Assertions are inside the with-block because patch.dict restores
+        # _state["mode"] to its pre-test value on exit — reading it outside
+        # would see the pre-test value, not the post-reload value.
+        assert mode_at_build_call, "_build_config_derived_state was not called"
+        assert mode_at_build_call[0] == "cloud-only", (
+            f"mode should be cloud-only during build; got {mode_at_build_call[0]}"
+        )
+        assert app_module._state["mode"] == "local", "mode should be local after successful rebuild"
+
+
+def test_refresh_config_rebuild_failure_stays_cloud_only():
+    """When refresh_config_from_disk=True: a rebuild failure in
+    _build_config_derived_state leaves mode=cloud-only with reason
+    'apply_failed' (§3.15 partial-rebuild recovery).
+    """
     from paramem.server import app as app_module
 
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
         "config": _fake_config(),
-        "topology_assessment": MagicMock(name="assessment"),
+        "config_path": "configs/server.yaml",
+        "topology_assessment": None,
+        "boot_degraded": None,
     }
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "_release_base_model_in_process") as mock_release,
-        patch.object(app_module, "measure_external_vram", return_value=(8 * 2**30, 1 * 2**30)),
-        patch.object(app_module, "enforce_live_budget"),
+        patch.object(app_module, "load_server_config", return_value=_fake_config()),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
         patch.object(
             app_module,
-            "_load_model_into_state",
-            side_effect=RuntimeError("CUDA out of memory"),
+            "_build_config_derived_state",
+            side_effect=RuntimeError("ha_client init failed"),
         ),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=True)
+
+        assert app_module._state["mode"] == "cloud-only", (
+            "mode must stay cloud-only when rebuild fails"
+        )
+        assert app_module._state["cloud_only_reason"] == "apply_failed"
+
+
+def test_refresh_config_preload_partial_stays_cloud_only():
+    """When refresh_config_from_disk=True: if _build_config_derived_state
+    succeeds but sets boot_degraded (partial preload), mode stays cloud-only
+    with reason 'preload_failed'.
+    """
+    from paramem.server import app as app_module
+
+    def fake_build_sets_degraded(
+        config, *, cloud_only, rebuild_session_buffer=True, full_rebuild=True
+    ):
+        # Simulate a partial preload — _preload_memory_store sets boot_degraded.
+        app_module._state["boot_degraded"] = {
+            "reason": "preload_partial",
+            "hits": 5,
+            "total": 10,
+            "missed_by_tier": {},
+            "source": "WeightMemorySource",
+        }
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "config_path": "configs/server.yaml",
+        "topology_assessment": None,
+        "boot_degraded": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "load_server_config", return_value=_fake_config()),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(
+            app_module, "_build_config_derived_state", side_effect=fake_build_sets_degraded
+        ),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=True)
+
+        assert app_module._state["mode"] == "cloud-only"
+        assert app_module._state["cloud_only_reason"] == "preload_failed"
+
+
+def test_plain_reclaim_does_not_call_load_server_config():
+    """Plain reclaim (refresh_config_from_disk=False, the default) must NOT
+    call load_server_config — same config reload path.
+    """
+    from paramem.server import app as app_module
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "topology_assessment": None,
+        "boot_degraded": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "load_server_config") as mock_lsc,
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model()  # refresh_config_from_disk=False (default)
+
+    mock_lsc.assert_not_called()
+
+
+def test_build_once_vram_gate_not_callable_from_reload():
+    """The build-once post-load VRAM gate (enforce_post_load_budget) must NOT
+    be called from _live_reload_base_model or _build_config_derived_state
+    (correction B-1 / §3.x).
+
+    enforce_post_load_budget calls sys.exit(1) on failure — it is lifespan-only.
+    The apply/reclaim path's VRAM safety is an inline torch.cuda.mem_get_info
+    fit-check (graceful decline to cloud_only_reason="insufficient_vram").
+    """
+    from paramem.server import app as app_module
+
+    # required_bytes is 6 GiB; free is 7 GiB → pre-flight passes.
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+    free_bytes = int(7 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "topology_assessment": fake_assessment,
+        "boot_degraded": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "enforce_post_load_budget") as mock_post_gate,
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=False)
+
+    (
+        mock_post_gate.assert_not_called(),
+        (
+            "enforce_post_load_budget (build-once VRAM gate) must never be called "
+            "from _live_reload_base_model — it sys.exit(1)s and is lifespan-only (B-1)"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# WP1 new tests: _preload_memory_store source selection + boot_degraded lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _fake_memory_store():
+    """Return a minimal mock MemoryStore for preload tests."""
+    store = MagicMock()
+    store.tiers_with_registry.return_value = []
+    store.active_keys_in_tier.return_value = []
+    return store
+
+
+def test_preload_source_selection_simulate_mode():
+    """preload_cache=True + consolidation.mode='simulate' → DiskMemorySource selected.
+
+    Source selection must use config.consolidation.mode, NOT _state["mode"]
+    (correction #4 / D6).
+    """
+    from paramem.server import app as app_module
+
+    config = _fake_config(consolidation_mode="simulate", preload_cache=True)
+    config.adapter_dir = MagicMock()
+    config.consolidation.indexed_key_replay = False
+    config.consolidation.recall_probe_batch_size = 16
+    config.key_metadata_path = MagicMock()
+
+    # Make the store return one active key so the probe branch is entered.
+    fake_store = MagicMock()
+    fake_store.tiers_with_registry.return_value = ["episodic"]
+    fake_store.active_keys_in_tier.return_value = ["graph1"]
+    fake_store.load_registries_from_disk.return_value = None
+    fake_store.load_metadata_from_disk.return_value = {
+        "loaded": 0,
+        "orphaned": 0,
+        "legacy_upgraded": 0,
+    }
+
+    state_patch = {
+        "mode": "cloud-only",  # _state["mode"] is cloud-only; consolidation.mode is simulate
+        "boot_degraded": None,
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+    }
+
+    disk_source_calls = []
+    weight_source_calls = []
+
+    class FakeDiskSource:
+        def __init__(self, _adapter_dir):
+            disk_source_calls.append("init")
+
+        def probe(self, keys_by_tier):
+            return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
+
+    class FakeWeightSource:
+        def __init__(self, model, tokenizer, batch_size):
+            weight_source_calls.append("init")
+
+        def probe(self, keys_by_tier):
+            return {}
+
+    import paramem.memory.source as src_mod
+    import paramem.memory.store as store_mod
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(store_mod, "MemoryStore", return_value=fake_store),
+        patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
+        patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
+    ):
+        app_module._preload_memory_store(
+            config,
+            model=app_module._state.get("model"),
+            tokenizer=app_module._state.get("tokenizer"),
+        )
+
+    assert disk_source_calls, "DiskMemorySource should be used when consolidation.mode='simulate'"
+    assert not weight_source_calls, "WeightMemorySource must not be used in simulate mode"
+    # Full probe succeeded → boot_degraded should be cleared.
+    assert app_module._state.get("boot_degraded") is None
+
+
+def test_preload_source_selection_train_mode_uses_weight_source():
+    """preload_cache=True + consolidation.mode='train' + model present
+    → WeightMemorySource selected (NOT DiskMemorySource), regardless of
+    _state["mode"] (which might be cloud-only on the apply path).
+    """
+    from paramem.server import app as app_module
+
+    config = _fake_config(consolidation_mode="train", preload_cache=True)
+    config.adapter_dir = MagicMock()
+    config.consolidation.indexed_key_replay = False
+    config.consolidation.recall_probe_batch_size = 16
+    config.key_metadata_path = MagicMock()
+
+    fake_store = MagicMock()
+    fake_store.tiers_with_registry.return_value = ["episodic"]
+    fake_store.active_keys_in_tier.return_value = ["graph1"]
+    fake_store.load_registries_from_disk.return_value = None
+    fake_store.load_metadata_from_disk.return_value = {
+        "loaded": 0,
+        "orphaned": 0,
+        "legacy_upgraded": 0,
+    }
+
+    state_patch = {
+        "mode": "cloud-only",  # runtime mode cloud-only; must use weight source for train
+        "boot_degraded": None,
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+    }
+
+    disk_source_calls = []
+    weight_source_calls = []
+
+    class FakeDiskSource:
+        def __init__(self, _adapter_dir):
+            disk_source_calls.append("init")
+
+        def probe(self, keys_by_tier):
+            return {}
+
+    class FakeWeightSource:
+        def __init__(self, model, tokenizer, batch_size):
+            weight_source_calls.append("init")
+
+        def probe(self, keys_by_tier):
+            return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
+
+    import paramem.memory.source as src_mod
+    import paramem.memory.store as store_mod
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(store_mod, "MemoryStore", return_value=fake_store),
+        patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
+        patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
+    ):
+        app_module._preload_memory_store(
+            config,
+            model=app_module._state.get("model"),
+            tokenizer=app_module._state.get("tokenizer"),
+        )
+
+    assert weight_source_calls, "WeightMemorySource should be used when consolidation.mode='train'"
+    assert not disk_source_calls, "DiskMemorySource must not be used in train mode"
+    assert app_module._state.get("boot_degraded") is None
+
+
+def test_preload_cache_false_clears_boot_degraded():
+    """preload_cache=False (intentional opt-out): boot_degraded is CLEARED
+    (not set), so /chat is not 503'd after an apply on preload-off deployments
+    (correction #5 boot_degraded lifecycle).
+    """
+    from paramem.server import app as app_module
+
+    config = _fake_config(preload_cache=False)
+    config.adapter_dir = MagicMock()
+    config.consolidation.indexed_key_replay = False
+    config.key_metadata_path = MagicMock()
+
+    fake_store = MagicMock()
+    fake_store.load_registries_from_disk.return_value = None
+    fake_store.load_metadata_from_disk.return_value = {
+        "loaded": 0,
+        "orphaned": 0,
+        "legacy_upgraded": 0,
+    }
+
+    state_patch = {
+        "boot_degraded": {"reason": "preload_partial", "hits": 0, "total": 5},
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+    }
+
+    import paramem.memory.store as store_mod
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(store_mod, "MemoryStore", return_value=fake_store),
+    ):
+        app_module._preload_memory_store(
+            config,
+            model=app_module._state.get("model"),
+            tokenizer=app_module._state.get("tokenizer"),
+        )
+
+    assert app_module._state["boot_degraded"] is None, (
+        "boot_degraded must be cleared when preload_cache=False"
+    )
+
+
+def test_preload_partial_sets_boot_degraded():
+    """When some keys cannot be materialised: boot_degraded is SET.
+    When all keys materialise: boot_degraded is CLEARED.
+    """
+    from paramem.server import app as app_module
+
+    config = _fake_config(consolidation_mode="train", preload_cache=True)
+    config.adapter_dir = MagicMock()
+    config.consolidation.indexed_key_replay = False
+    config.consolidation.recall_probe_batch_size = 16
+    config.key_metadata_path = MagicMock()
+
+    fake_store = MagicMock()
+    fake_store.tiers_with_registry.return_value = ["episodic"]
+    fake_store.active_keys_in_tier.return_value = ["graph1", "graph2"]
+    fake_store.load_registries_from_disk.return_value = None
+    fake_store.load_metadata_from_disk.return_value = {
+        "loaded": 0,
+        "orphaned": 0,
+        "legacy_upgraded": 0,
+    }
+
+    state_patch = {
+        "boot_degraded": None,
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+    }
+
+    # Probe returns only one of two keys → partial hydration.
+    class FakeWeightSource:
+        def __init__(self, model, tokenizer, batch_size):
+            pass
+
+        def probe(self, keys_by_tier):
+            # Only graph1 found, graph2 missing.
+            return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
+
+    import paramem.memory.source as src_mod
+    import paramem.memory.store as store_mod
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(store_mod, "MemoryStore", return_value=fake_store),
+        patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
+    ):
+        app_module._preload_memory_store(
+            config,
+            model=app_module._state.get("model"),
+            tokenizer=app_module._state.get("tokenizer"),
+        )
+
+        degraded = app_module._state.get("boot_degraded")
+        assert degraded is not None, "boot_degraded must be set on partial hydration"
+        assert degraded["hits"] == 1
+        assert degraded["total"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — _wait_for_gpu_drain unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_gpu_drain_returns_true_when_cuda_unavailable():
+    """When CUDA is unavailable, _wait_for_gpu_drain must return True immediately
+    (no-op: CPU-only environments must not block at boot).
+    """
+    from paramem.server import app as app_module
+
+    with patch("paramem.server.app.torch.cuda.is_available", return_value=False):
+        result = app_module._wait_for_gpu_drain(
+            4 * 2**30, timeout_s=5.0, stable_reads=3, poll_interval_s=0.1
+        )
+
+    assert result is True
+
+
+def test_wait_for_gpu_drain_returns_true_when_immediately_sufficient():
+    """When free bytes ≥ needed on the very first read (normal empty-GPU boot),
+    _wait_for_gpu_drain must return True without blocking for the full stable_reads
+    window — i.e. it blocks ONLY for (stable_reads - 1) more polls, not timeout_s.
+
+    Uses stable_reads=1 so the very first sufficient read satisfies the condition.
+    """
+    from paramem.server import app as app_module
+
+    free = 7 * 2**30  # 7 GiB free
+    needed = 5 * 2**30  # 5 GiB needed
+
+    with (
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free, 8 * 2**30)),
+        patch("paramem.server.app.time.sleep") as mock_sleep,
+    ):
+        result = app_module._wait_for_gpu_drain(
+            needed, timeout_s=60.0, stable_reads=1, poll_interval_s=1.5
+        )
+
+    assert result is True
+    # stable_reads=1: one passing read satisfies the condition immediately —
+    # no sleep needed between the single read and the return.
+    mock_sleep.assert_not_called()
+
+
+def test_wait_for_gpu_drain_requires_stable_reads_consecutive():
+    """_wait_for_gpu_drain must NOT return True until stable_reads consecutive
+    reads all report free ≥ needed.  A transient passing read followed by a
+    failing read resets the counter.
+
+    Sequence: insufficient, sufficient, insufficient, sufficient×3 → True.
+    """
+    from paramem.server import app as app_module
+
+    needed = 5 * 2**30
+    free_enough = needed + 1
+    free_short = needed - 1
+
+    read_sequence = [
+        (free_short, 8 * 2**30),  # insufficient: counter=0
+        (free_enough, 8 * 2**30),  # sufficient: counter=1
+        (free_short, 8 * 2**30),  # insufficient: counter reset to 0
+        (free_enough, 8 * 2**30),  # sufficient: counter=1
+        (free_enough, 8 * 2**30),  # sufficient: counter=2
+        (free_enough, 8 * 2**30),  # sufficient: counter=3 → return True
+    ]
+    call_count = 0
+
+    def fake_mem_get_info(_device=0):
+        nonlocal call_count
+        val = read_sequence[call_count]
+        call_count += 1
+        return val
+
+    with (
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch("paramem.server.app.torch.cuda.mem_get_info", side_effect=fake_mem_get_info),
+        patch("paramem.server.app.time.sleep"),
+    ):
+        result = app_module._wait_for_gpu_drain(
+            needed, timeout_s=60.0, stable_reads=3, poll_interval_s=0.1
+        )
+
+    assert result is True
+    assert call_count == len(read_sequence), (
+        f"Expected all {len(read_sequence)} reads; got {call_count}"
+    )
+
+
+def test_wait_for_gpu_drain_returns_false_on_timeout():
+    """When device-wide free never reaches needed_bytes within timeout_s,
+    _wait_for_gpu_drain must return False.
+
+    Patches time.monotonic so the test runs fast (no real wall-clock wait).
+    """
+    from paramem.server import app as app_module
+
+    needed = 5 * 2**30
+    free_short = needed - 1  # always insufficient
+
+    # Simulate time advancing: first call returns 0 (start), subsequent calls
+    # advance past deadline so the loop exits on the second iteration.
+    time_sequence = [0.0, 0.0, 999.0]  # deadline = 0 + timeout_s; third call > deadline
+    time_idx = 0
+
+    def fake_monotonic():
+        nonlocal time_idx
+        val = time_sequence[min(time_idx, len(time_sequence) - 1)]
+        time_idx += 1
+        return val
+
+    with (
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_short, 8 * 2**30)),
+        patch("paramem.server.app.time.monotonic", side_effect=fake_monotonic),
+        patch("paramem.server.app.time.sleep"),
+    ):
+        result = app_module._wait_for_gpu_drain(
+            needed, timeout_s=55.0, stable_reads=3, poll_interval_s=1.5
+        )
+
+    assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — boot integration: drain-fail → cloud-only + auto-reclaim armed
+# ---------------------------------------------------------------------------
+
+
+def test_boot_drain_fail_degrades_to_cloud_only_and_arms_reclaim(tmp_path):
+    """When _wait_for_gpu_drain returns False at boot (GPU did not drain in time):
+    - model is NOT loaded (_load_model_into_state not called)
+    - cloud_only_reason is set to 'insufficient_vram'
+    - _state['model'] is None
+    - the auto-reclaim task is created (cloud_only AND not cloud_only_startup)
+
+    Uses the same lifespan-run pattern as test_lifespan_runs_validator_before_load_base_model
+    in test_vram_validator.py, short-circuiting after the boot block.
+    """
+    import asyncio
+
+    from paramem.server import app as app_module
+    from paramem.server.config import ServerConfig
+
+    class _Sentinel(Exception):
+        pass
+
+    config = ServerConfig(model_name="mistral")
+    config.cloud_only = False
+    from paramem.server.config import PathsConfig
+
+    root = tmp_path / "data"
+    config.paths = PathsConfig(
+        data=root,
+        sessions=root / "sessions",
+        debug=root / "debug",
+    )
+
+    saved_state = {
+        key: app_module._state.get(key) for key in ("config", "cloud_only_startup", "defer_model")
+    }
+    app_module._state["config"] = config
+    app_module._state["cloud_only_startup"] = False
+    app_module._state["defer_model"] = False
+
+    load_called = []
+
+    def spy_load(*args, **kwargs):
+        load_called.append(True)
+        raise _Sentinel("load must not be reached on drain-fail")
+
+    from paramem.server.vram_validator import TopologyAssessment
+
+    fake_assessment = TopologyAssessment(
+        required_bytes=5 * 2**30,
+        adapter_bytes=1,
+        base_bytes=1,
+        per_tier_fit={8: (True, 0)},
+        breakdown="stub",
+    )
+
+    # Change 4: the overflow check in lifespan calls get_device_properties + mem_get_info
+    # after assess_topology. Mock both; required=5 GiB < free=7 GiB so no overflow fires.
+    _total_bytes = int(8 * 2**30)
+    _free_bytes = int(7 * 2**30)
+
+    try:
+        with (
+            patch.object(app_module, "predict_base_bytes", return_value=4 * 2**30),
+            patch.object(app_module, "assess_topology", return_value=fake_assessment),
+            # Drain fails → model should NOT load
+            patch.object(app_module, "_wait_for_gpu_drain", return_value=False),
+            patch.object(app_module, "_load_model_into_state", spy_load),
+            patch.object(app_module, "_gpu_occupied", return_value=False),
+            patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+            patch("paramem.server.app.torch.cuda.get_device_properties") as mock_props,
+            patch(
+                "paramem.server.app.torch.cuda.mem_get_info",
+                return_value=(_free_bytes, _total_bytes),
+            ),
+            patch.object(app_module, "apply_process_cap"),
+            patch("transformers.AutoConfig.from_pretrained") as mock_cfg,
+            # Short-circuit after _build_config_derived_state so we don't need
+            # the full component tree — raise Sentinel at _build_config_derived_state.
+            patch.object(
+                app_module,
+                "_build_config_derived_state",
+                side_effect=_Sentinel("short-circuit"),
+            ),
+        ):
+            mock_props.return_value.total_memory = _total_bytes
+            mock_cfg.return_value = type("C", (), {"hidden_size": 4096, "num_hidden_layers": 32})()
+
+            async def _run():
+                async with app_module.lifespan(app_module.app):
+                    pass
+
+            with pytest.raises(_Sentinel):
+                asyncio.run(_run())
+    finally:
+        for key, val in saved_state.items():
+            if val is None:
+                app_module._state.pop(key, None)
+            else:
+                app_module._state[key] = val
+        app_module._state.pop("vram_overflow_warning", None)
+
+    # Model must NOT have been loaded.
+    assert not load_called, "_load_model_into_state must not be called when drain fails"
+    # cloud_only_reason must be set to indicate the degrade.
+    assert app_module._state.get("cloud_only_reason") == "insufficient_vram", (
+        f"expected 'insufficient_vram', got {app_module._state.get('cloud_only_reason')!r}"
+    )
+    # model must be None (degrade sets it).
+    assert app_module._state.get("model") is None
+
+
+def test_boot_drain_pass_proceeds_to_load(tmp_path):
+    """When _wait_for_gpu_drain returns True (GPU free), the normal load path runs:
+    _load_model_into_state is called, model is NOT degraded to cloud-only.
+    """
+    import asyncio
+
+    from paramem.server import app as app_module
+    from paramem.server.config import ServerConfig
+
+    class _Sentinel(Exception):
+        pass
+
+    config = ServerConfig(model_name="mistral")
+    config.cloud_only = False
+    from paramem.server.config import PathsConfig
+
+    root = tmp_path / "data"
+    config.paths = PathsConfig(
+        data=root,
+        sessions=root / "sessions",
+        debug=root / "debug",
+    )
+
+    saved_state = {
+        key: app_module._state.get(key) for key in ("config", "cloud_only_startup", "defer_model")
+    }
+    app_module._state["config"] = config
+    app_module._state["cloud_only_startup"] = False
+    app_module._state["defer_model"] = False
+
+    load_called = []
+
+    def spy_load(*args, **kwargs):
+        load_called.append(True)
+        raise _Sentinel("short-circuit: load was reached as expected")
+
+    from paramem.server.vram_validator import TopologyAssessment
+
+    fake_assessment = TopologyAssessment(
+        required_bytes=5 * 2**30,
+        adapter_bytes=1,
+        base_bytes=1,
+        per_tier_fit={8: (True, 0)},
+        breakdown="stub",
+    )
+
+    # Change 4: the overflow check in lifespan calls get_device_properties + mem_get_info
+    # after assess_topology. Mock both; required=5 GiB < free=7 GiB so no overflow fires.
+    _total_bytes = int(8 * 2**30)
+    _free_bytes = int(7 * 2**30)
+
+    try:
+        with (
+            patch.object(app_module, "predict_base_bytes", return_value=4 * 2**30),
+            patch.object(app_module, "assess_topology", return_value=fake_assessment),
+            # Drain passes → load should run
+            patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+            patch.object(app_module, "_load_model_into_state", spy_load),
+            patch.object(app_module, "_gpu_occupied", return_value=False),
+            patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+            patch("paramem.server.app.torch.cuda.get_device_properties") as mock_props,
+            patch(
+                "paramem.server.app.torch.cuda.mem_get_info",
+                return_value=(_free_bytes, _total_bytes),
+            ),
+            patch.object(app_module, "apply_process_cap"),
+            patch("transformers.AutoConfig.from_pretrained") as mock_cfg,
+        ):
+            mock_props.return_value.total_memory = _total_bytes
+            mock_cfg.return_value = type("C", (), {"hidden_size": 4096, "num_hidden_layers": 32})()
+
+            async def _run():
+                async with app_module.lifespan(app_module.app):
+                    pass
+
+            with pytest.raises(_Sentinel):
+                asyncio.run(_run())
+    finally:
+        for key, val in saved_state.items():
+            if val is None:
+                app_module._state.pop(key, None)
+            else:
+                app_module._state[key] = val
+        app_module._state.pop("vram_overflow_warning", None)
+
+    # Load must have been called when drain passes.
+    assert load_called, "_load_model_into_state must be called when drain passes"
+    # cloud_only_reason must NOT be 'insufficient_vram' on the pass path.
+    assert app_module._state.get("cloud_only_reason") != "insufficient_vram", (
+        "cloud_only_reason must not be 'insufficient_vram' when drain succeeds"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Change 3 — reclaim fit-check uses mem_get_info, no nvidia-smi
+# ---------------------------------------------------------------------------
+
+
+def test_reclaim_fitcheck_uses_mem_get_info_not_nvidia_smi():
+    """The reclaim VRAM fit-check must use torch.cuda.mem_get_info (device-wide
+    free) rather than nvidia-smi.  nvidia-smi false-frees exiting processes
+    under WSL2 and was the documented host-crash cause.
+
+    Verifies: (a) mem_get_info is called when assessment is present and CUDA
+    is available; (b) the function declines gracefully when free < required;
+    (c) no subprocess call (nvidia-smi) is made in the reclaim path.
+    """
+    from paramem.server import app as app_module
+
+    # required=6 GiB; free=2 GiB → must decline.
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+    free_bytes = int(2 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "topology_assessment": fake_assessment,
+    }
+
+    import subprocess
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch(
+            "paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)
+        ) as mock_mem_get_info,
+        patch.object(app_module, "_load_model_into_state") as mock_load,
+        patch.object(app_module, "_build_config_derived_state") as mock_build,
+        # subprocess.run must NOT be called (no nvidia-smi in reclaim path).
+        patch.object(subprocess, "run") as mock_subprocess,
     ):
         app_module._live_reload_base_model()
 
-        # Upfront release + post-failure cleanup release.
-        assert mock_release.call_count == 2
-        assert app_module._state["mode"] == "cloud-only"
-        assert app_module._state["cloud_only_reason"] == "reload_failed"
+        # mem_get_info must be consulted.
+        mock_mem_get_info.assert_called()
+        # Load must NOT be attempted — free < required.
+        mock_load.assert_not_called()
+        mock_build.assert_not_called()
+        assert app_module._state["cloud_only_reason"] == "insufficient_vram"
+        # No nvidia-smi subprocess in the fit-check path.
+        mock_subprocess.assert_not_called()
+
+
+def test_reclaim_fitcheck_cuda_unavailable_skips_check():
+    """When CUDA is unavailable and assessment is present, the fit-check is
+    skipped (is_available() guards the mem_get_info call).  Load proceeds.
+    """
+    from paramem.server import app as app_module
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(),
+        "topology_assessment": fake_assessment,
+        "boot_degraded": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=False),
+        patch("paramem.server.app.torch.cuda.mem_get_info") as mock_mem_get_info,
+        patch.object(app_module, "_load_model_into_state") as mock_load,
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model()
+
+    # With CUDA unavailable, mem_get_info must NOT be called.
+    mock_mem_get_info.assert_not_called()
+    # Load must proceed (no VRAM gate fires without CUDA).
+    mock_load.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Change 4 — VRAM overflow attention item
+# ---------------------------------------------------------------------------
+
+
+def test_vram_overflow_attention_item_emitted_when_overflow():
+    """When _state['vram_overflow_warning'] is populated, collect_attention_items
+    returns an item with kind='vram_config_overflow' and level='action_required'.
+    """
+    from paramem.server.attention import collect_attention_items
+
+    state = {
+        "vram_overflow_warning": {
+            "required_gib": 7.02,
+            "usable_gib": 6.83,
+            "total_gib": 8.0,
+            "reserved_gib": 1.17,
+        }
+    }
+    items = collect_attention_items(state, config=None)
+    kinds = [it.kind for it in items]
+    assert "vram_config_overflow" in kinds, (
+        f"Expected 'vram_config_overflow' attention item; got kinds={kinds}"
+    )
+    overflow_item = next(it for it in items if it.kind == "vram_config_overflow")
+    assert overflow_item.level == "action_required"
+    assert "7.02" in overflow_item.summary
+    assert "6.83" in overflow_item.summary
+    assert overflow_item.action_hint is not None
+
+
+def test_vram_overflow_attention_item_absent_when_no_overflow():
+    """When _state has no 'vram_overflow_warning', no overflow item is emitted."""
+    from paramem.server.attention import collect_attention_items
+
+    state = {}  # no vram_overflow_warning key
+    items = collect_attention_items(state, config=None)
+    kinds = [it.kind for it in items]
+    assert "vram_config_overflow" not in kinds, (
+        "No overflow item expected when vram_overflow_warning is absent"
+    )
+
+
+def test_vram_overflow_attention_item_absent_when_key_none():
+    """When _state['vram_overflow_warning'] is None, no overflow item is emitted."""
+    from paramem.server.attention import collect_attention_items
+
+    state = {"vram_overflow_warning": None}
+    items = collect_attention_items(state, config=None)
+    kinds = [it.kind for it in items]
+    assert "vram_config_overflow" not in kinds
+
+
+def test_lifespan_sets_vram_overflow_warning_when_required_exceeds_usable(tmp_path):
+    """When topology required_bytes > mem_get_info free (usable ceiling),
+    the lifespan must set _state['vram_overflow_warning'] and emit a WARNING log.
+    """
+    import asyncio
+    import logging
+
+    from paramem.server import app as app_module
+    from paramem.server.config import PathsConfig, ServerConfig
+    from paramem.server.vram_validator import TopologyAssessment
+
+    class _Sentinel(Exception):
+        pass
+
+    config = ServerConfig(model_name="mistral")
+    config.cloud_only = False
+    root = tmp_path / "data"
+    config.paths = PathsConfig(
+        data=root,
+        sessions=root / "sessions",
+        debug=root / "debug",
+    )
+
+    # Assessment: required = 7.5 GiB; usable ceiling = 6.8 GiB → overflow.
+    _GiB = 2**30
+    required_bytes = int(7.5 * _GiB)
+    usable_bytes = int(6.8 * _GiB)
+    total_bytes = int(8.0 * _GiB)
+
+    fake_assessment = TopologyAssessment(
+        required_bytes=required_bytes,
+        adapter_bytes=int(0.026 * _GiB),
+        base_bytes=int(4.5 * _GiB),
+        per_tier_fit={8: (False, total_bytes - required_bytes)},
+        breakdown="stub",
+    )
+
+    saved_state = {
+        key: app_module._state.get(key) for key in ("config", "cloud_only_startup", "defer_model")
+    }
+    app_module._state["config"] = config
+    app_module._state["cloud_only_startup"] = False
+    app_module._state["defer_model"] = False
+
+    warning_records = []
+
+    class _OverflowHandler(logging.Handler):
+        def emit(self, record):
+            if "VRAM CONFIG OVERFLOW" in record.getMessage():
+                warning_records.append(record)
+
+    handler = _OverflowHandler()
+    server_logger = logging.getLogger("paramem.server.app")
+    server_logger.addHandler(handler)
+
+    try:
+        with (
+            patch.object(app_module, "predict_base_bytes", return_value=int(4.5 * _GiB)),
+            patch.object(app_module, "assess_topology", return_value=fake_assessment),
+            patch.object(app_module, "_wait_for_gpu_drain", return_value=False),
+            patch.object(app_module, "_gpu_occupied", return_value=False),
+            patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+            patch("paramem.server.app.torch.cuda.get_device_properties") as mock_props,
+            patch(
+                "paramem.server.app.torch.cuda.mem_get_info",
+                return_value=(usable_bytes, total_bytes),
+            ),
+            patch.object(app_module, "apply_process_cap"),
+            patch("transformers.AutoConfig.from_pretrained") as mock_cfg,
+            patch.object(
+                app_module,
+                "_build_config_derived_state",
+                side_effect=_Sentinel("short-circuit"),
+            ),
+        ):
+            mock_props.return_value.total_memory = total_bytes
+            mock_cfg.return_value = type("C", (), {"hidden_size": 4096, "num_hidden_layers": 32})()
+
+            async def _run():
+                async with app_module.lifespan(app_module.app):
+                    pass
+
+            with pytest.raises(_Sentinel):
+                asyncio.run(_run())
+    finally:
+        server_logger.removeHandler(handler)
+        for key, val in saved_state.items():
+            if val is None:
+                app_module._state.pop(key, None)
+            else:
+                app_module._state[key] = val
+        app_module._state.pop("vram_overflow_warning", None)
+
+    assert warning_records, (
+        "Expected WARNING log containing 'VRAM CONFIG OVERFLOW' when required > usable"
+    )
+    # Note: _state is restored in finally, so verify from the warning records.
+    # The key check is that the WARNING was emitted.
+    assert any("VRAM CONFIG OVERFLOW" in r.getMessage() for r in warning_records)

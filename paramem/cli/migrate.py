@@ -212,6 +212,206 @@ def _render_comparison_report(report: dict | None) -> None:
     print()
 
 
+def _render_failed_gates(gates: dict, gs: str) -> None:
+    """Render per-gate breakdown when the trial ends in fail or trial_exception.
+
+    For a ``fail`` status, iterates ``gates["details"]`` and prints each
+    gate's name and status.  Any gate whose status is not ``"pass"`` or
+    ``"skipped"`` also has its ``reason`` printed.
+
+    For a ``trial_exception`` status, prints the top-level exception text
+    from ``gates["exception"]`` (no ``details`` list is present on that
+    path).
+
+    Parameters
+    ----------
+    gates:
+        The ``poll_status["gates"]`` dict from the long-poll response.
+    gs:
+        The terminal gate status (``"fail"`` or ``"trial_exception"``).
+    """
+    if gs == "trial_exception":
+        exception_text = gates.get("exception", "")
+        if exception_text:
+            print(f"  Exception: {exception_text}")
+        return
+
+    # gs == "fail": render per-gate breakdown from details list.
+    details = gates.get("details") or []
+    if not details:
+        return
+    print("  Gate results:")
+    for entry in details:
+        gate_num = entry.get("gate", "?")
+        name = entry.get("name", "")
+        status = entry.get("status", "")
+        print(f"    gate {gate_num} ({name}): {status}")
+        if status not in ("pass", "skipped"):
+            reason = entry.get("reason")
+            if reason:
+                print(f"      reason: {reason}")
+
+
+# Poll interval for the R-PORT auto-restart health check (seconds).
+_RESTART_POLL_INTERVAL_S: float = 3.0
+# Maximum time to wait for the server to come back up after an R-PORT restart.
+_RESTART_POLL_TIMEOUT_S: float = 120.0
+
+
+def _poll_until_healthy(server_url: str) -> bool:
+    """Poll ``GET /status`` until the server is healthy or the timeout expires.
+
+    Tolerates ``ServerUnreachable`` (connection refused during the bounce
+    window).  Returns ``True`` when the server responds and does not report
+    ``boot_degraded``.  Returns ``False`` on timeout.
+
+    Parameters
+    ----------
+    server_url:
+        Base server URL.
+
+    Returns
+    -------
+    bool
+        ``True`` when healthy, ``False`` on timeout.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + _RESTART_POLL_TIMEOUT_S
+    while _time.monotonic() < deadline:
+        try:
+            status = http_client.get_json(f"{server_url}/status")
+            if status.get("mode") and not status.get("boot_degraded"):
+                return True
+        except http_client.ServerUnreachable:
+            pass  # expected during the bounce window
+        except Exception:
+            pass
+        _time.sleep(_RESTART_POLL_INTERVAL_S)
+    return False
+
+
+def _render_apply_result(result: dict, server_url: str) -> None:
+    """Render the live-apply result from an accept or rollback response.
+
+    Handles all outcomes:
+
+    - ``applied_live=True, skipped="no_change"`` → no-op (rollback case).
+    - ``applied_live=True, restart_required_reason=None`` → full live apply.
+    - ``restart_required_reason in {stt_port_change, tts_port_change}`` →
+      R-PORT: if ``restart_eligible=True``, prompt operator for consent; on
+      ``y`` run ``restart_hint`` via subprocess and poll until healthy; on
+      ``N``/EOF print the command and exit cleanly.  If port-in-use (no
+      ``restart_eligible``), print the error and the manual hint.
+    - ``restart_required_reason="paths_change"`` → R-PATHS: prominent warning
+      that data is NOT migrated automatically; print restart_hint.
+    - Failure (``applied_live=False``, other reason) → restart-hint fallback.
+
+    The server does NOT self-fire a restart for R-PORT.  The CLI is the sole
+    restart trigger — always gated on operator consent.
+
+    Parameters
+    ----------
+    result:
+        Parsed response body from ``/migration/accept`` or
+        ``/migration/rollback``.
+    server_url:
+        Base server URL (used for the poll-until-healthy call on R-PORT).
+    """
+    import subprocess  # noqa: PLC0415
+
+    applied_live = result.get("applied_live", False)
+    skipped = result.get("skipped")
+    reason = result.get("restart_required_reason")
+    restart_eligible = result.get("restart_eligible", False)
+    restart_hint = result.get("restart_hint", "systemctl --user restart paramem-server")
+    cloud_only_reason = result.get("cloud_only_reason")
+    port_in_use = result.get("port_in_use_reason")
+
+    if applied_live and skipped == "no_change":
+        print(
+            "  No config change to apply (rollback restored the prior config); server stays local."
+        )
+        return
+
+    if applied_live and reason is None:
+        print("  Migration applied live; server is back in local mode.")
+        return
+
+    if reason in ("stt_port_change", "tts_port_change"):
+        if port_in_use:
+            # Pre-flight declined — port not bindable.
+            print(
+                f"  Port not bindable ({port_in_use}); restart not possible.",
+                file=sys.stderr,
+            )
+            print(f"  Free the port and restart manually: {restart_hint}", file=sys.stderr)
+            return
+        if restart_eligible:
+            # Port pre-flighted OK.  Prompt operator for restart consent.
+            try:
+                answer = input(
+                    "  This change needs a full restart (brief outage: /chat, STT/TTS,"
+                    " HA satellites drop ~30s). Restart now? [y/N] "
+                )
+            except EOFError:
+                answer = "n"
+            if answer.strip().lower() == "y":
+                print(f"  Running: {restart_hint}")
+                try:
+                    subprocess.run(restart_hint.split(), check=True)
+                except Exception as exc:  # noqa: BLE001 — boundary: external command
+                    print(f"  Restart command failed: {exc}", file=sys.stderr)
+                    print(f"  Run manually: {restart_hint}", file=sys.stderr)
+                    return
+                print("  Polling until server is healthy...")
+                healthy = _poll_until_healthy(server_url)
+                if healthy:
+                    print("  Server is back and healthy.")
+                else:
+                    print(
+                        "  Timed out waiting for server. "
+                        "Check: journalctl --user -u paramem-server",
+                        file=sys.stderr,
+                    )
+                    print(f"  Manual restart: {restart_hint}", file=sys.stderr)
+            else:
+                print(f"  Restart deferred. Run when ready: {restart_hint}")
+        else:
+            # Not eligible for prompted restart (unexpected state).
+            print(
+                f"  Port change ({reason}) requires a restart: {restart_hint}",
+                file=sys.stderr,
+            )
+        return
+
+    if reason == "paths_change":
+        print(
+            "  PATH CHANGE — data is NOT migrated automatically.",
+            file=sys.stderr,
+        )
+        print(
+            "  The path change is on disk and takes effect on the NEXT restart.",
+            file=sys.stderr,
+        )
+        print(
+            "  Move adapters, registry, and pending sessions to the new path BEFORE restarting.",
+            file=sys.stderr,
+        )
+        print(f"  When ready: {restart_hint}", file=sys.stderr)
+        return
+
+    # Apply failed or other unexpected reason — restart-hint fallback.
+    if cloud_only_reason:
+        print(
+            f"  Apply failed ({cloud_only_reason}); server is cloud-only — restart to apply.",
+            file=sys.stderr,
+        )
+    else:
+        print("  Config is on disk; restart to apply.", file=sys.stderr)
+    print(f"  Restart: {restart_hint}", file=sys.stderr)
+
+
 def _get_migration_status(server_url: str) -> dict:
     """GET /migration/status and return the parsed dict.
 
@@ -265,9 +465,8 @@ def _do_accept_with_drift_check(server_url: str) -> int:
         print(f"paramem migrate: accept failed: {exc}", file=sys.stderr)
         return 1
 
-    print("  Migration accepted. Restart the server for the new config to take effect.")
-    for key, value in result.items():
-        print(f"  {key}: {value}")
+    print("  Migration accepted.")
+    _render_apply_result(result, server_url)
     return 0
 
 
@@ -323,10 +522,8 @@ def _do_rollback_with_drift_check(server_url: str) -> int:
             file=sys.stderr,
         )
     else:
-        print("  Migration rolled back. Restart the server for config A to take effect.")
-    for key, value in result.items():
-        if key != "archive_warning":
-            print(f"  {key}: {value}")
+        print("  Migration rolled back.")
+    _render_apply_result(result, server_url)
     return 0
 
 
@@ -433,6 +630,7 @@ def _run_long_poll_flow(server_url: str) -> int:
             f"  Trial gates finished with status: {gs!r}. "
             "Rollback is the only valid action (accept is blocked)."
         )
+        _render_failed_gates(gates, gs)
         try:
             answer = input("  Rollback now? [y/N] ").lower().strip()
         except EOFError:

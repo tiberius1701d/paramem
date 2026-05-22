@@ -134,11 +134,32 @@ def _make_state(tmp_path: Path, gates_status: str = "pass") -> dict:
     }
 
 
+def _default_apply_stub():
+    """Default _apply_config_live stub: success (applied_live=True, no restart needed)."""
+
+    def _impl():
+        return {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+        }
+
+    return _impl
+
+
 @pytest.fixture()
 def state(tmp_path, monkeypatch):
-    """TRIAL state monkeypatched into app_module (gates=pass)."""
+    """TRIAL state monkeypatched into app_module (gates=pass).
+
+    Also patches _apply_config_live to avoid a real GPU load in unit tests.
+    Tests that need a specific apply result override via monkeypatch.setattr
+    AFTER this fixture runs.
+    """
     fresh = _make_state(tmp_path)
     monkeypatch.setattr(app_module, "_state", fresh)
+    monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub())
     return fresh
 
 
@@ -161,10 +182,14 @@ class TestAcceptHappyPath:
         body = resp.json()
         assert body["state"] == "LIVE"
 
-    def test_accept_returns_restart_required(self, client, state):
-        """AcceptResponse.restart_required is always True."""
+    def test_accept_returns_restart_required_false_on_live_apply(self, client, state):
+        """AcceptResponse.restart_required is False when the live apply succeeds.
+
+        With the default success stub (applied_live=True, no carve), the
+        response must reflect the new live-apply contract: restart_required=False.
+        """
         resp = client.post("/migration/accept")
-        assert resp.json()["restart_required"] is True
+        assert resp.json()["restart_required"] is False
 
     def test_accept_returns_restart_hint(self, client, state):
         """AcceptResponse.restart_hint is the systemctl command."""
@@ -248,11 +273,17 @@ class TestAcceptHappyPath:
         client.post("/migration/accept")
         assert state["migration"]["state"] == "LIVE"
 
-    def test_accept_sets_restart_banner(self, client, state):
-        """After accept, recovery_required contains the restart banner."""
+    def test_accept_sets_applied_live_banner(self, client, state):
+        """After accept with live-apply success, banner says 'applied live'.
+
+        WP2: the default stub returns applied_live=True, so the banner
+        must say 'applied live', NOT 'RESTART REQUIRED'.
+        """
         client.post("/migration/accept")
         banners = state["migration"]["recovery_required"]
-        assert any("RESTART REQUIRED" in b for b in banners)
+        assert any("applied live" in b.lower() for b in banners), (
+            f"Expected 'applied live' banner, got: {banners}"
+        )
 
     def test_accept_refreshes_drift_state_all_fields(self, client, state, tmp_path):
         """Accept refreshes the full ConfigDriftState dict (REQUIRED FIX 3).
@@ -478,8 +509,7 @@ class TestAcceptDriftRefreshOSError:
     def test_accept_succeeds_when_live_config_path_absent(self, tmp_path, monkeypatch):
         """Accept succeeds when live_config_path doesn't exist at drift-refresh time.
 
-        Step 5 (drift refresh) is best-effort: the condition guard at
-        ``app.py:3202`` uses ``live_config_path.exists()`` before calling
+        The drift refresh step uses ``live_config_path.exists()`` before calling
         ``compute_config_hash``.  When the file is absent, drift refresh is
         silently skipped; the state transition still completes.
         """
@@ -488,6 +518,7 @@ class TestAcceptDriftRefreshOSError:
         live_yaml = Path(fresh["config_path"])
         live_yaml.unlink()
         monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub())
 
         client = TestClient(app_module.app, raise_server_exceptions=False)
         resp = client.post("/migration/accept")
@@ -498,12 +529,13 @@ class TestAcceptDriftRefreshOSError:
     def test_accept_succeeds_when_compute_config_hash_raises_oserror(self, tmp_path, monkeypatch):
         """Accept succeeds when compute_config_hash raises OSError (best-effort refresh).
 
-        The inner ``try/except OSError`` at ``app.py:3203`` must swallow the
+        The inner ``try/except OSError`` at the drift-refresh step must swallow the
         error and log a warning, not propagate it.  Absence of drift refresh
         does not block the state transition.
         """
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub())
 
         with patch(
             "paramem.server.drift.compute_config_hash",
@@ -570,3 +602,576 @@ class TestAcceptConcurrent:
         finally:
             lock.release()
             loop.close()
+
+
+# ---------------------------------------------------------------------------
+# WP2 — response contract + live-apply wiring
+# ---------------------------------------------------------------------------
+
+
+def _stub_apply(result: dict):
+    """Return a side-effect that replaces _apply_config_live with a stub."""
+
+    def _impl():
+        return result
+
+    return _impl
+
+
+class TestAcceptResponseContract:
+    """New response fields: applied_live, restart_required_reason, auto_restart_scheduled."""
+
+    def test_response_has_applied_live_field(self, tmp_path, monkeypatch):
+        """AcceptResponse includes applied_live field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "applied_live" in body
+
+    def test_response_has_restart_required_reason_field(self, tmp_path, monkeypatch):
+        """AcceptResponse includes restart_required_reason field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        body = resp.json()
+        assert "restart_required_reason" in body
+
+    def test_response_has_auto_restart_scheduled_field(self, tmp_path, monkeypatch):
+        """AcceptResponse includes auto_restart_scheduled field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        body = resp.json()
+        assert "auto_restart_scheduled" in body
+
+
+class TestAcceptLiveApplySuccess:
+    """Accept with _apply_config_live returning success."""
+
+    def test_accept_live_apply_success_applied_live_true(self, tmp_path, monkeypatch):
+        """Success stub → applied_live=True, restart_required=False."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["applied_live"] is True
+        assert body["restart_required"] is False
+
+    def test_accept_live_apply_success_no_restart_banner(self, tmp_path, monkeypatch):
+        """Success stub → banner says 'applied live', not 'RESTART REQUIRED'."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        client.post("/migration/accept")
+        banners = fresh["migration"]["recovery_required"]
+        # 'RESTART REQUIRED' banner must NOT appear on a successful live apply.
+        assert not any("RESTART REQUIRED" in b for b in banners), (
+            f"Unexpected 'RESTART REQUIRED' banner on successful live apply: {banners}"
+        )
+        assert any("applied live" in b.lower() for b in banners), (
+            f"Expected 'applied live' banner but got: {banners}"
+        )
+
+    def test_accept_live_apply_sets_maintenance_guard_before_dispatch(self, tmp_path, monkeypatch):
+        """Maintenance guard (mode=cloud-only) is set BEFORE _apply_config_live runs (S-4)."""
+        fresh = _make_state(tmp_path)
+        fresh["mode"] = "local"
+        monkeypatch.setattr(app_module, "_state", fresh)
+
+        guard_set_before_apply = []
+
+        def _capturing_apply():
+            # Record the mode at the time the apply executes.
+            guard_set_before_apply.append(fresh.get("mode"))
+            return {
+                "applied_live": True,
+                "restart_required_reason": None,
+                "auto_restart_scheduled": False,
+                "skipped": None,
+                "cloud_only_reason": None,
+            }
+
+        monkeypatch.setattr(app_module, "_apply_config_live", _capturing_apply)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        client.post("/migration/accept")
+        # The mode captured inside _apply_config_live must be "cloud-only" —
+        # the handler set it synchronously before dispatching the executor.
+        assert guard_set_before_apply, "apply was never called"
+        assert guard_set_before_apply[0] == "cloud-only", (
+            f"Expected mode='cloud-only' before apply, got {guard_set_before_apply[0]!r} (S-4)"
+        )
+
+
+class TestAcceptLiveApplyFailure:
+    """Accept with _apply_config_live returning failure."""
+
+    def test_accept_apply_failure_restart_required_true(self, tmp_path, monkeypatch):
+        """Failure stub → applied_live=False, restart_required=True."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": "apply_failed",
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["applied_live"] is False
+        assert body["restart_required"] is True
+
+    def test_accept_apply_failure_keeps_restart_banner(self, tmp_path, monkeypatch):
+        """Failure stub → RESTART REQUIRED banner present."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": "apply_failed",
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        client.post("/migration/accept")
+        banners = fresh["migration"]["recovery_required"]
+        assert any("RESTART REQUIRED" in b for b in banners), (
+            f"Expected 'RESTART REQUIRED' banner on apply failure, got: {banners}"
+        )
+
+
+class TestAcceptRPortCarve:
+    """R-PORT carve: stt_port_change / tts_port_change."""
+
+    def test_r_port_carve_restart_eligible_true(self, tmp_path, monkeypatch):
+        """R-PORT carve with pre-flight success → response carries restart_eligible=True."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": "stt_port_change",
+                    "auto_restart_scheduled": False,
+                    "restart_eligible": True,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        restart_calls = []
+        monkeypatch.setattr(app_module, "_restart_service", lambda: restart_calls.append("called"))
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["restart_required"] is True
+        # The server never auto-fires a restart; restart_eligible signals the CLI to prompt.
+        assert body["auto_restart_scheduled"] is False
+        assert body["restart_eligible"] is True
+        assert body["restart_required_reason"] == "stt_port_change"
+
+    def test_r_port_carve_server_does_not_fire_restart_service(self, tmp_path, monkeypatch):
+        """R-PORT carve → server does NOT schedule _restart_service; restart_eligible=True."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": "stt_port_change",
+                    "auto_restart_scheduled": False,
+                    "restart_eligible": True,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        restart_calls = []
+        monkeypatch.setattr(app_module, "_restart_service", lambda: restart_calls.append("called"))
+
+        import asyncio as _asyncio
+
+        real_get_running_loop = _asyncio.get_running_loop
+        call_later_fired = []
+
+        def _patched_get_running_loop():
+            loop = real_get_running_loop()
+
+            def _recording_call_later(delay, callback, *args):
+                call_later_fired.append((delay, callback))
+
+            loop.call_later = _recording_call_later
+            return loop
+
+        monkeypatch.setattr(_asyncio, "get_running_loop", _patched_get_running_loop)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["restart_eligible"] is True
+        # Server MUST NOT self-fire _restart_service — the CLI prompts the operator.
+        assert not restart_calls, (
+            f"_restart_service must NOT be called by the server for R-PORT: {restart_calls}"
+        )
+        assert not call_later_fired, (
+            f"call_later must NOT be used to schedule a restart: {call_later_fired}"
+        )
+
+    def test_r_port_port_in_use_no_restart(self, tmp_path, monkeypatch):
+        """Port-in-use pre-flight result → auto_restart_scheduled=False, no restart."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": "stt_port_change",
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                    "port_in_use_reason": "stt.port=10300 is not bindable: already in use",
+                }
+            ),
+        )
+        restart_calls = []
+        monkeypatch.setattr(app_module, "_restart_service", lambda: restart_calls.append("called"))
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["auto_restart_scheduled"] is False
+        # _restart_service must NOT have been called.
+        assert not restart_calls, f"_restart_service was called unexpectedly: {restart_calls}"
+
+
+class TestAcceptRPathsCarve:
+    """R-PATHS carve: paths_change."""
+
+    def test_r_paths_carve_manual_restart(self, tmp_path, monkeypatch):
+        """R-PATHS carve → restart_required=True, auto_restart_scheduled=False."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": "paths_change",
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        restart_calls = []
+        monkeypatch.setattr(app_module, "_restart_service", lambda: restart_calls.append("called"))
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["restart_required"] is True
+        assert body["auto_restart_scheduled"] is False
+        assert body["restart_required_reason"] == "paths_change"
+        assert not restart_calls, (
+            f"_restart_service must NOT be called for R-PATHS: {restart_calls}"
+        )
+
+    def test_r_paths_carve_data_not_migrated_banner(self, tmp_path, monkeypatch):
+        """R-PATHS carve → banner warns about data not migrated."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": "paths_change",
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        client.post("/migration/accept")
+        banners = fresh["migration"]["recovery_required"]
+        assert any("DATA IS NOT MIGRATED" in b for b in banners), (
+            f"Expected DATA IS NOT MIGRATED warning in banners: {banners}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# WP2 — real _apply_config_live: R-PATHS short-circuit guard
+# ---------------------------------------------------------------------------
+
+
+def _make_apply_state(tmp_path: Path, yaml_a_bytes: bytes, yaml_b_bytes: bytes) -> dict:
+    """Build a minimal _state dict for direct _apply_config_live calls.
+
+    Writes yaml_a to a sidecar file for hashing and yaml_b as the on-disk
+    config at ``config_path``.  ``config_a`` is loaded from yaml_a so the
+    carve comparison uses real ``ServerConfig`` instances rather than mocks.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest tmp_path fixture for isolation.
+    yaml_a_bytes:
+        Content of config A (currently loaded in memory).
+    yaml_b_bytes:
+        Content of config B (on disk at ``config_path`` — the pending migration).
+    """
+    from paramem.server.config import load_server_config
+    from paramem.server.drift import compute_config_hash
+
+    yaml_a_path = tmp_path / "config_a.yaml"
+    yaml_a_path.write_bytes(yaml_a_bytes)
+    yaml_b_path = tmp_path / "server.yaml"
+    yaml_b_path.write_bytes(yaml_b_bytes)
+
+    config_a = load_server_config(yaml_a_path)
+    loaded_hash = compute_config_hash(yaml_a_path)
+
+    return {
+        "model": None,
+        "tokenizer": None,
+        "config": config_a,
+        "config_path": str(yaml_b_path),
+        "consolidating": False,
+        "migration": {},
+        "mode": "cloud-only",
+        "background_trainer": None,
+        "consolidation_loop": None,
+        "cloud_only_reason": None,
+        "session_buffer": None,
+        "config_drift": {
+            "detected": False,
+            "loaded_hash": loaded_hash,
+            "disk_hash": loaded_hash,
+            "last_checked_at": "2026-04-22T00:00:00+00:00",
+        },
+    }
+
+
+class TestApplyConfigLiveRPathsShortCircuit:
+    """Real _apply_config_live: R-PATHS carve short-circuits before _live_reload_base_model."""
+
+    def test_paths_data_change_short_circuits_before_reload(self, tmp_path, monkeypatch):
+        """R-PATHS delta (paths.data changed) → _live_reload_base_model is NOT called.
+
+        Exercises the real _apply_config_live with real ServerConfig objects.
+        Only _live_reload_base_model is mocked to track invocations.
+        """
+        yaml_a = b"model: mistral\n"
+        yaml_b = b"model: mistral\npaths:\n  data: /tmp/new_data_path\n"
+
+        state = _make_apply_state(tmp_path, yaml_a, yaml_b)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        reload_calls = []
+
+        def _noop_reload(**kwargs):
+            reload_calls.append(kwargs)
+
+        monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
+
+        result = app_module._apply_config_live()
+
+        assert not reload_calls, (
+            f"_live_reload_base_model must NOT be called for R-PATHS carve; got: {reload_calls}"
+        )
+        assert result["applied_live"] is False
+        assert result["restart_required_reason"] == "paths_change"
+        assert result["auto_restart_scheduled"] is False
+        assert result["restart_eligible"] is False
+
+    def test_paths_sessions_change_short_circuits_before_reload(self, tmp_path, monkeypatch):
+        """R-PATHS delta (paths.sessions changed) → _live_reload_base_model is NOT called."""
+        yaml_a = b"model: mistral\n"
+        yaml_b = b"model: mistral\npaths:\n  sessions: /tmp/new_sessions_path\n"
+
+        state = _make_apply_state(tmp_path, yaml_a, yaml_b)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        reload_calls = []
+
+        def _noop_reload(**kwargs):
+            reload_calls.append(kwargs)
+
+        monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
+
+        result = app_module._apply_config_live()
+
+        assert not reload_calls, (
+            "_live_reload_base_model must NOT be called for R-PATHS (sessions) carve; "
+            f"got: {reload_calls}"
+        )
+        assert result["applied_live"] is False
+        assert result["restart_required_reason"] == "paths_change"
+
+
+# ---------------------------------------------------------------------------
+# WP2 — B1 guard: real _apply_config_live on the accept no-op-skip path
+# ---------------------------------------------------------------------------
+
+
+class TestApplyConfigLiveNoOpSkip:
+    """Real _apply_config_live: no-op skip fires iff disk hash == loaded hash.
+
+    Correction B1: ServerConfig has no source_path attribute.  The prior
+    implementation derived mem_hash from the live file (always matching disk),
+    so the skip fired on every accept call.  The fix uses
+    ``_state["config_drift"]["loaded_hash"]`` (set at boot / last accept) as
+    the in-memory reference.
+
+    These tests use real hash computation (not mocked) to exercise the actual
+    guard.  Only _live_reload_base_model is mocked.
+    """
+
+    def test_config_b_differs_from_a_skip_does_not_fire_reload_entered(self, tmp_path, monkeypatch):
+        """config B ≠ config A → no-op skip does NOT fire; _live_reload_base_model is called."""
+        yaml_a = b"model: mistral\ndebug: false\n"
+        yaml_b = b"model: mistral\ndebug: true\n"
+
+        state = _make_apply_state(tmp_path, yaml_a, yaml_b)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        reload_calls = []
+
+        def _noop_reload(**kwargs):
+            reload_calls.append(kwargs)
+
+        monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
+
+        result = app_module._apply_config_live()
+
+        assert reload_calls, (
+            "_live_reload_base_model must be called when config B ≠ config A "
+            "(no-op skip must NOT fire)"
+        )
+        # skipped must not be "no_change".
+        assert result.get("skipped") != "no_change", (
+            f"No-op skip incorrectly fired when config B ≠ config A: {result}"
+        )
+
+    def test_config_a_equals_disk_skip_fires_no_reload(self, tmp_path, monkeypatch):
+        """Rollback case: disk hash == loaded hash => no-op skip fires; no model reload."""
+        yaml_a = b"model: mistral\ndebug: false\n"
+        # yaml_b is the same content as yaml_a — simulates rollback restoring config A.
+        yaml_b = yaml_a
+
+        state = _make_apply_state(tmp_path, yaml_a, yaml_b)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        reload_calls = []
+
+        def _noop_reload(**kwargs):
+            reload_calls.append(kwargs)
+
+        monkeypatch.setattr(app_module, "_live_reload_base_model", _noop_reload)
+
+        result = app_module._apply_config_live()
+
+        assert not reload_calls, (
+            "_live_reload_base_model must NOT be called when disk hash == loaded hash "
+            f"(no-op skip must fire): reload_calls={reload_calls}"
+        )
+        assert result.get("skipped") == "no_change", (
+            f"No-op skip did not fire when disk hash == loaded hash: {result}"
+        )
+        assert result["applied_live"] is True

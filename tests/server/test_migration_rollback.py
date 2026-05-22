@@ -175,11 +175,30 @@ def _make_state(
     }
 
 
+def _default_apply_stub_rollback():
+    """Default _apply_config_live stub for rollback: no-op skip (applied_live=True)."""
+
+    def _impl():
+        return {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": "no_change",
+            "cloud_only_reason": None,
+        }
+
+    return _impl
+
+
 @pytest.fixture()
 def state(tmp_path, monkeypatch):
-    """TRIAL state with gates=fail (always-valid for rollback)."""
+    """TRIAL state with gates=fail (always-valid for rollback).
+
+    Also patches _apply_config_live to avoid a real GPU load in unit tests.
+    """
     fresh = _make_state(tmp_path)
     monkeypatch.setattr(app_module, "_state", fresh)
+    monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub_rollback())
     return fresh
 
 
@@ -195,12 +214,17 @@ def client(state):
 
 class TestRollbackHappyPath:
     def test_rollback_returns_200(self, client, state):
-        """TRIAL + gates=fail → 200 RollbackResponse."""
+        """TRIAL + gates=fail → 200 RollbackResponse.
+
+        With the default no-op-skip stub (disk=A, memory=A), applied_live=True
+        and restart_required=False (WP2 update).
+        """
         resp = client.post("/migration/rollback")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["state"] == "LIVE"
-        assert body["restart_required"] is True
+        assert body["applied_live"] is True
+        assert body["restart_required"] is False
 
     def test_rollback_valid_when_gates_pending(self, tmp_path, monkeypatch):
         """Rollback valid when gates=pending (not yet finished)."""
@@ -304,11 +328,18 @@ class TestRollbackHappyPath:
         client.post("/migration/rollback")
         assert state["migration"]["state"] == "LIVE"
 
-    def test_rollback_sets_restart_banner(self, client, state):
-        """After rollback, recovery_required contains RESTART REQUIRED banner."""
+    def test_rollback_sets_banner(self, client, state):
+        """After rollback, recovery_required contains a rollback banner.
+
+        With the default no-op-skip stub, the banner says 'rolled back' and
+        'already active' (not 'RESTART REQUIRED' since no restart is needed).
+        """
         client.post("/migration/rollback")
         banners = state["migration"]["recovery_required"]
-        assert any("RESTART REQUIRED" in b for b in banners)
+        assert banners, "No banner was set after rollback"
+        assert any("rolled back" in b.lower() or "restart" in b.lower() for b in banners), (
+            f"Expected rollback-related banner, got: {banners}"
+        )
 
     def test_rollback_does_not_refresh_drift(self, client, state):
         """Rollback does NOT refresh config_drift.
@@ -898,3 +929,308 @@ class TestRollbackPendingRestoreFileMode:
                 f"pending-rollback temp file created with mode {oct(mode)}, expected 0o600 "
                 "(Fix 2 regression: plaintext exposed during rename window)"
             )
+
+
+# ---------------------------------------------------------------------------
+# WP2 — response contract + live-apply wiring for rollback
+# ---------------------------------------------------------------------------
+
+
+def _stub_apply(result: dict):
+    """Return a callable that stubs _apply_config_live."""
+
+    def _impl():
+        return result
+
+    return _impl
+
+
+class TestRollbackResponseContract:
+    """New response fields: applied_live, restart_required_reason, auto_restart_scheduled."""
+
+    def test_rollback_response_has_applied_live(self, tmp_path, monkeypatch):
+        """RollbackResponse includes applied_live field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "applied_live" in body
+
+    def test_rollback_response_has_restart_required_reason(self, tmp_path, monkeypatch):
+        """RollbackResponse includes restart_required_reason field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+        body = resp.json()
+        assert "restart_required_reason" in body
+
+    def test_rollback_response_has_auto_restart_scheduled(self, tmp_path, monkeypatch):
+        """RollbackResponse includes auto_restart_scheduled field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+        body = resp.json()
+        assert "auto_restart_scheduled" in body
+
+
+class TestRollbackNoOpSkip:
+    """Rollback no-op skip (S-6): disk hash == memory hash → applied_live=True."""
+
+    def test_rollback_noop_skip_applied_live_true(self, tmp_path, monkeypatch):
+        """No-op skip → applied_live=True, restart_required=False."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["applied_live"] is True
+        assert body["restart_required"] is False
+
+    def test_rollback_noop_skip_banner_no_restart_required(self, tmp_path, monkeypatch):
+        """No-op skip → banner does not say 'RESTART REQUIRED'."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        client.post("/migration/rollback")
+        banners = fresh["migration"]["recovery_required"]
+        assert not any("RESTART REQUIRED" in b for b in banners), (
+            f"Unexpected 'RESTART REQUIRED' banner on no-op skip: {banners}"
+        )
+
+
+class TestRollback207BodyCarriesApplyFields:
+    """207 rotation-failure path must carry the new apply fields in the body (correction #3)."""
+
+    def test_207_body_has_applied_live(self, tmp_path, monkeypatch):
+        """207 body includes applied_live field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+
+        original_rename = os.rename
+
+        def _fail_rotation(src, dst):
+            if "trial_adapters" in str(dst):
+                raise OSError("simulated rotation failure for 207")
+            return original_rename(src, dst)
+
+        with patch("paramem.server.app.os.rename", _fail_rotation):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 207
+        body = resp.json()
+        assert "applied_live" in body
+
+    def test_207_body_has_restart_required(self, tmp_path, monkeypatch):
+        """207 body includes restart_required field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+
+        original_rename = os.rename
+
+        def _fail_rotation(src, dst):
+            if "trial_adapters" in str(dst):
+                raise OSError("simulated rotation failure")
+            return original_rename(src, dst)
+
+        with patch("paramem.server.app.os.rename", _fail_rotation):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 207
+        body = resp.json()
+        assert "restart_required" in body
+        # No-op skip with no carve → restart_required=False.
+        assert body["restart_required"] is False
+
+    def test_207_body_has_auto_restart_scheduled(self, tmp_path, monkeypatch):
+        """207 body includes auto_restart_scheduled field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+
+        original_rename = os.rename
+
+        def _fail_rotation(src, dst):
+            if "trial_adapters" in str(dst):
+                raise OSError("simulated rotation failure")
+            return original_rename(src, dst)
+
+        with patch("paramem.server.app.os.rename", _fail_rotation):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 207
+        body = resp.json()
+        assert "auto_restart_scheduled" in body
+
+    def test_207_body_has_restart_required_reason(self, tmp_path, monkeypatch):
+        """207 body includes restart_required_reason field."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            _stub_apply(
+                {
+                    "applied_live": True,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "skipped": "no_change",
+                    "cloud_only_reason": None,
+                }
+            ),
+        )
+
+        original_rename = os.rename
+
+        def _fail_rotation(src, dst):
+            if "trial_adapters" in str(dst):
+                raise OSError("simulated rotation failure")
+            return original_rename(src, dst)
+
+        with patch("paramem.server.app.os.rename", _fail_rotation):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 207
+        body = resp.json()
+        assert "restart_required_reason" in body
+
+
+class TestRollbackMaintenanceGuard:
+    """Maintenance guard is set before dispatching _apply_config_live (correction S-4)."""
+
+    def test_rollback_sets_maintenance_guard_before_apply(self, tmp_path, monkeypatch):
+        """mode=cloud-only is set before _apply_config_live runs (S-4)."""
+        fresh = _make_state(tmp_path)
+        fresh["mode"] = "local"
+        monkeypatch.setattr(app_module, "_state", fresh)
+
+        guard_set_before_apply = []
+
+        def _capturing_apply():
+            guard_set_before_apply.append(fresh.get("mode"))
+            return {
+                "applied_live": True,
+                "restart_required_reason": None,
+                "auto_restart_scheduled": False,
+                "skipped": "no_change",
+                "cloud_only_reason": None,
+            }
+
+        monkeypatch.setattr(app_module, "_apply_config_live", _capturing_apply)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        client.post("/migration/rollback")
+        assert guard_set_before_apply, "apply was never called"
+        assert guard_set_before_apply[0] == "cloud-only", (
+            f"Expected mode='cloud-only' before apply, got {guard_set_before_apply[0]!r} (S-4)"
+        )

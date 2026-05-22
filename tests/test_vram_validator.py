@@ -532,14 +532,17 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
     """Integration guard for the startup lifecycle.
 
     Exercises the FastAPI ``lifespan`` context with ``load_base_model``,
-    ``assess_topology``, ``measure_external_vram`` and ``enforce_live_budget``
-    replaced by spies. Asserts the correct call order:
+    ``assess_topology``, and ``_wait_for_gpu_drain`` replaced by spies.
+    Asserts the correct call order:
 
-        assess_topology → measure_external_vram → enforce_live_budget →
+        predict_base_bytes → assess_topology → _wait_for_gpu_drain →
         load_base_model
 
-    Also asserts that ``predict_base_bytes`` is invoked in the call sequence
-    before ``assess_topology`` (required for the new predictor-driven path).
+    The old single-shot ``measure_external_vram`` + ``enforce_live_budget``
+    + ``sys.exit(1)`` boot gate was replaced by the poll-and-degrade
+    ``_wait_for_gpu_drain`` in the VRAM-overcommit fix (Fix 2).
+    ``measure_external_vram`` and ``enforce_live_budget`` are no longer
+    called from the lifespan boot path.
     """
     import asyncio
 
@@ -567,12 +570,9 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
             breakdown="stub",
         )
 
-    def spy_measure(*args, **kwargs):
-        calls.append(("measure_external_vram",))
-        return (8 * 2**30, 0)
-
-    def spy_enforce(*args, **kwargs):
-        calls.append(("enforce_live_budget",))
+    def spy_drain(needed_bytes, **kwargs):
+        calls.append(("_wait_for_gpu_drain",))
+        return True  # drained — proceed to load
 
     def spy_load_base_model(*args, **kwargs):
         calls.append(("load_base_model",))
@@ -597,20 +597,31 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
     server_app._state["cloud_only_startup"] = False
     server_app._state["defer_model"] = False
 
+    # Change 4: after assess_topology, the lifespan calls get_device_properties +
+    # mem_get_info to check for the overflow condition.  The spy_assess returns
+    # required_bytes=1, so with any positive free the overflow branch won't fire.
+    _total_bytes = int(8 * _GiB)
+    _free_bytes = int(7 * _GiB)
+
     try:
         with (
             patch.object(server_app, "predict_base_bytes", spy_predict),
             patch.object(server_app, "assess_topology", spy_assess),
-            patch.object(server_app, "measure_external_vram", spy_measure),
-            patch.object(server_app, "enforce_live_budget", spy_enforce),
+            patch.object(server_app, "_wait_for_gpu_drain", spy_drain),
             patch.object(server_app, "load_base_model", spy_load_base_model),
             patch.object(server_app, "_gpu_occupied", return_value=False),
             patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+            patch("paramem.server.app.torch.cuda.get_device_properties") as mock_props,
+            patch(
+                "paramem.server.app.torch.cuda.mem_get_info",
+                return_value=(_free_bytes, _total_bytes),
+            ),
             patch.object(server_app, "apply_process_cap", lambda **kwargs: None),
             # AutoConfig.from_pretrained is called in the base_pred branch before
             # assess_topology — stub it so this unit test has no HF network call.
             patch("transformers.AutoConfig.from_pretrained") as mock_cfg,
         ):
+            mock_props.return_value.total_memory = _total_bytes
             mock_cfg.return_value = type("C", (), {"hidden_size": 4096, "num_hidden_layers": 32})()
 
             async def _run() -> None:
@@ -625,6 +636,7 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
                 server_app._state.pop(key, None)
             else:
                 server_app._state[key] = value
+        server_app._state.pop("vram_overflow_warning", None)
 
     # predict_base_bytes must come before assess_topology
     call_names = [c[0] for c in calls]
@@ -634,16 +646,25 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
     assess_idx = call_names.index("assess_topology")
     assert pred_idx < assess_idx, "predict_base_bytes must come before assess_topology"
 
-    # assess_topology → measure_external_vram → enforce_live_budget → load_base_model
+    # New boot order: assess_topology → _wait_for_gpu_drain → load_base_model
+    # (measure_external_vram and enforce_live_budget removed from boot path in Fix 2)
     expected_tail = [
         "assess_topology",
-        "measure_external_vram",
-        "enforce_live_budget",
+        "_wait_for_gpu_drain",
         "load_base_model",
     ]
     tail_order = [c for c in call_names if c in expected_tail]
     assert tail_order == expected_tail, (
         f"Lifespan must invoke {expected_tail} in order; got {tail_order}"
+    )
+
+    # Confirm the old single-shot gate functions are NOT called from the boot path.
+    assert "measure_external_vram" not in call_names, (
+        "measure_external_vram must NOT be called in the boot path "
+        "(replaced by _wait_for_gpu_drain)"
+    )
+    assert "enforce_live_budget" not in call_names, (
+        "enforce_live_budget must NOT be called in the boot path (replaced by _wait_for_gpu_drain)"
     )
 
 
@@ -653,16 +674,58 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
 
 
 def test_default_headroom_constant_is_1_gib():
-    """_DEFAULT_HEADROOM_GIB is the conservative code-side minimum (production yaml ships 2.0)."""
+    """_DEFAULT_HEADROOM_GIB is the conservative code-side minimum (production yaml ships 1.5)."""
     assert _DEFAULT_HEADROOM_GIB == 1.0
 
 
 def test_default_headroom_is_1_gib_via_config():
-    """VramConfig.vram_cache_headroom_gib code default is 1.0 (production yaml overrides to 2.0)."""
+    """VramConfig.vram_cache_headroom_gib code default is 1.0 (production yaml overrides to 1.5)."""
     from paramem.server.config import VramConfig
 
     cfg = VramConfig()
     assert cfg.vram_cache_headroom_gib == 1.0
+
+
+def test_headroom_1_5_gib_fits_within_drain_time_free():
+    """Regression guard: with headroom=1.5 GiB and the Mistral 7B NF4 topology
+    (7 interims, rank=8, 4 modules, 3 mains), required_bytes must be < 6.83 GiB
+    — the device-wide free measured at boot time in the live failure that prompted
+    Change 1.
+
+    Concrete numbers (all derived from the working-set formula):
+      base ≈ 4597 MiB  (inferred from the pre-fix failure: 7187 MiB total with
+                         headroom=2.0 → 7187 - 2*1024 - 256 - 11*26 = 4597 MiB)
+      11 adapters × 26 MiB = 286 MiB
+      headroom = 1.5 × 1024 = 1536 MiB
+      safety margin = 256 MiB
+      total = 4597 + 286 + 1536 + 256 = 6675 MiB = 6.519 GiB < 6.83 GiB ✓
+    """
+    _MiB = 1024 * 1024
+
+    # Inferred Mistral 7B NF4 base footprint from the pre-fix required_bytes.
+    # (7187 MiB total - 256 MiB safety - 2*1024 MiB headroom - 11*26 MiB adapters)
+    base_bytes = 4597 * _MiB
+
+    result = assess_topology(
+        _MISTRAL_ADAPTER,
+        max_interim_count=7,
+        base_bytes=base_bytes,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        headroom_gib=1.5,
+    )
+
+    drain_time_free_bytes = int(6.83 * _GiB)
+    assert result.required_bytes < drain_time_free_bytes, (
+        f"With headroom=1.5 GiB, required_bytes should be < 6.83 GiB (drain-time free), "
+        f"got {result.required_bytes / _GiB:.3f} GiB ({result.required_bytes // _MiB} MiB)"
+    )
+    # Concrete sanity: must be ≈ 6675 MiB ± 10 MiB (rounding from float GiB).
+    expected_mib = 6675
+    actual_mib = result.required_bytes // _MiB
+    assert abs(actual_mib - expected_mib) <= 15, (
+        f"required_bytes with headroom=1.5 GiB expected ~{expected_mib} MiB, got {actual_mib} MiB"
+    )
 
 
 # ---------------------------------------------------------------------------

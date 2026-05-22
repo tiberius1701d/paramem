@@ -158,16 +158,79 @@ def _seed_trial_state(state: dict, tmp_path: Path, gates_status: str = "pass") -
 # ---------------------------------------------------------------------------
 
 
+def _stub_apply_success():
+    """Return a stub _apply_config_live that reports success (applied_live=True)."""
+
+    def _impl():
+        return {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+        }
+
+    return _impl
+
+
+def _stub_apply_failure():
+    """Return a stub _apply_config_live that reports failure (applied_live=False)."""
+
+    def _impl():
+        return {
+            "applied_live": False,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": "apply_failed",
+        }
+
+    return _impl
+
+
+def _stub_apply_r_port():
+    """Return a stub _apply_config_live reporting R-PORT carve (pre-flight passed)."""
+
+    def _impl():
+        return {
+            "applied_live": False,
+            "restart_required_reason": "stt_port_change",
+            "auto_restart_scheduled": False,
+            "restart_eligible": True,
+            "skipped": None,
+            "cloud_only_reason": None,
+        }
+
+    return _impl
+
+
+def _stub_apply_r_paths():
+    """Return a stub _apply_config_live reporting R-PATHS carve (manual restart)."""
+
+    def _impl():
+        return {
+            "applied_live": False,
+            "restart_required_reason": "paths_change",
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+        }
+
+    return _impl
+
+
 class TestE2EAcceptPath:
     def test_e2e_full_preview_confirm_accept(self, tmp_path, monkeypatch):
-        """Full E2E: STAGING → TRIAL → accept → LIVE.
+        """Full E2E: STAGING → TRIAL → accept → LIVE (with live-apply success stub).
 
         Uses /migration/preview, /migration/confirm, seeds TRIAL, then POSTs
         /migration/accept.  Verifies the terminal state is LIVE with marker
-        cleared and restart banner set.
+        cleared.  With a live-apply success stub, restart_required=False and
+        the banner says 'applied live' (not 'RESTART REQUIRED').
         """
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_success())
 
         async def _noop_trial():
             pass
@@ -192,14 +255,96 @@ class TestE2EAcceptPath:
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "LIVE"
-        assert body["restart_required"] is True
+        # Live-apply success: restart_required=False (WP2 update).
+        assert body["applied_live"] is True
+        assert body["restart_required"] is False
 
         # 5. Verify terminal state.
         assert fresh["migration"]["state"] == "LIVE"
         state_dir = fresh["config"].paths.data / "state"
         assert read_trial_marker(state_dir) is None
         banners = fresh["migration"]["recovery_required"]
-        assert any("RESTART REQUIRED" in b for b in banners)
+        # With live-apply success, the banner says 'applied live', NOT 'RESTART REQUIRED'.
+        assert not any("RESTART REQUIRED" in b for b in banners), (
+            f"Unexpected 'RESTART REQUIRED' banner on live-apply success: {banners}"
+        )
+        assert any("applied live" in b.lower() for b in banners), (
+            f"Expected 'applied live' banner, got: {banners}"
+        )
+
+    def test_e2e_accept_apply_failure_restart_required(self, tmp_path, monkeypatch):
+        """E2E: accept with apply failure stub → restart_required=True, RESTART REQUIRED banner.
+
+        Regression coverage: the old default (restart_required=True always) now
+        only applies when the live apply fails.
+        """
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_failure())
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["applied_live"] is False
+        assert body["restart_required"] is True
+        banners = fresh["migration"]["recovery_required"]
+        assert any("RESTART REQUIRED" in b for b in banners), (
+            f"Expected 'RESTART REQUIRED' banner on apply failure: {banners}"
+        )
+
+    def test_e2e_accept_r_port_carve_restart_eligible_fields(self, tmp_path, monkeypatch):
+        """E2E: R-PORT carve → restart_eligible=True, auto_restart_scheduled=False, named reason."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_r_port())
+        monkeypatch.setattr(app_module, "_restart_service", lambda: None)
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        # Server signals restart_eligible (CLI prompts); it never fires the restart itself.
+        assert body["restart_eligible"] is True
+        assert body["auto_restart_scheduled"] is False
+        assert body["restart_required_reason"] == "stt_port_change"
+        assert body["restart_required"] is True
+
+    def test_e2e_accept_r_paths_carve_no_auto_restart(self, tmp_path, monkeypatch):
+        """E2E: R-PATHS carve → auto_restart_scheduled=False, DATA IS NOT MIGRATED banner."""
+        fresh = _make_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_r_paths())
+        monkeypatch.setattr(app_module, "_restart_service", lambda: None)
+
+        async def _noop_trial():
+            pass
+
+        monkeypatch.setattr(app_module, "_run_trial_consolidation", _noop_trial)
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+
+        _seed_trial_state(fresh, tmp_path, gates_status="pass")
+        resp = client.post("/migration/accept")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["auto_restart_scheduled"] is False
+        assert body["restart_required_reason"] == "paths_change"
+        banners = fresh["migration"]["recovery_required"]
+        assert any("DATA IS NOT MIGRATED" in b for b in banners), (
+            f"Expected DATA IS NOT MIGRATED warning in banners: {banners}"
+        )
 
     def test_e2e_accept_status_shows_comparison_report(self, tmp_path, monkeypatch):
         """/migration/status shows comparison_report when TRIAL + pass gates."""
@@ -235,14 +380,29 @@ class TestE2EAcceptPath:
 
 class TestE2ERollbackPath:
     def test_e2e_full_preview_confirm_rollback(self, tmp_path, monkeypatch):
-        """Full E2E: STAGING → TRIAL → rollback → LIVE (A restored).
+        """Full E2E: STAGING → TRIAL → rollback → LIVE (A restored, no-op skip).
 
         Uses /migration/preview, /migration/confirm, seeds TRIAL with fail
         gates, then POSTs /migration/rollback.  Verifies config A is restored
         and marker cleared.
+
+        WP2 update: with a no-op-skip stub (disk=A, memory=A), applied_live=True
+        and restart_required=False (the old always-True default no longer applies).
         """
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
+        # Rollback restores disk to A, memory is A → no-op skip.
+        monkeypatch.setattr(
+            app_module,
+            "_apply_config_live",
+            lambda: {
+                "applied_live": True,
+                "restart_required_reason": None,
+                "auto_restart_scheduled": False,
+                "skipped": "no_change",
+                "cloud_only_reason": None,
+            },
+        )
 
         async def _noop_trial():
             pass
@@ -267,7 +427,9 @@ class TestE2ERollbackPath:
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "LIVE"
-        assert body["restart_required"] is True
+        # No-op skip: applied_live=True, restart_required=False (WP2 update).
+        assert body["applied_live"] is True
+        assert body["restart_required"] is False
 
         # Config A is restored.
         assert live_yaml.read_bytes() == _LIVE_YAML

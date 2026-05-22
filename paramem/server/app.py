@@ -69,12 +69,10 @@ from paramem.server.vram_predict import predict_base_bytes
 from paramem.server.vram_validator import (
     ConfigurationError,
     assess_topology,
-    enforce_live_budget,
     enforce_post_load_budget,
     estimate_stt_bytes,
     estimate_tts_bytes,
     format_tier_table,
-    measure_external_vram,
 )
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
@@ -708,11 +706,31 @@ class AcceptResponse(BaseModel):
     trial_adapter_archive_path:
         Absolute path to the trial adapter archive slot directory.
     restart_required:
-        Always ``True`` — new configuration takes effect on server restart.
+        ``True`` when a restart is still needed (live apply was declined or
+        failed, or a named R-PORT/R-PATHS carve fired).  ``False`` when the
+        config was applied fully in-process.
     restart_hint:
         Human-readable restart command string.
     pre_migration_backup_retained:
         Always ``True`` — the A-config backup is retained post-accept.
+    applied_live:
+        ``True`` when the new config was applied in-process without a restart.
+        ``False`` when a restart is required (apply failed, or a named carve).
+    restart_required_reason:
+        Named reason for ``restart_required=True``.  One of
+        ``"stt_port_change"``, ``"tts_port_change"``, ``"paths_change"``,
+        ``"apply_failed"``, ``"lock_timeout"``, ``"consolidating"``, or
+        ``None`` when no restart is needed.
+    auto_restart_scheduled:
+        Always ``False`` — the server never self-fires a restart.  Retained
+        for backward compatibility; use ``restart_eligible`` instead.
+    restart_eligible:
+        ``True`` when an R-PORT carve pre-flighted successfully and the CLI
+        may trigger a prompted restart via the ``restart_hint`` command.
+        ``False`` for R-PATHS (data-not-migrated warning; operator-driven)
+        and for failures.  The server does NOT fire the restart — the CLI
+        prompts the operator and runs ``restart_hint`` via subprocess on
+        consent.
     """
 
     state: str
@@ -720,6 +738,10 @@ class AcceptResponse(BaseModel):
     restart_required: bool
     restart_hint: str
     pre_migration_backup_retained: bool
+    applied_live: bool = False
+    restart_required_reason: str | None = None
+    auto_restart_scheduled: bool = False
+    restart_eligible: bool = False
 
 
 class RollbackResponse(BaseModel):
@@ -735,9 +757,23 @@ class RollbackResponse(BaseModel):
     rollback_pre_mortem_backup_path:
         Absolute path to the rollback pre-mortem B-config snapshot slot.
     restart_required:
-        Always ``True`` — rollback renames server.yaml; restart to apply.
+        ``True`` when a restart is still needed.  For rollback, the no-op
+        skip (disk hash == memory hash) returns ``applied_live=True`` and
+        ``restart_required=False`` because config A is already in memory.
     restart_hint:
         Human-readable restart command string.
+    applied_live:
+        ``True`` when the config was applied in-process (or the no-op skip
+        confirmed it was already applied).  ``False`` on apply failure.
+    restart_required_reason:
+        Named reason for ``restart_required=True``, or ``None``.
+    auto_restart_scheduled:
+        Always ``False`` — the server never self-fires a restart.  Retained
+        for backward compatibility; use ``restart_eligible`` instead.
+    restart_eligible:
+        ``True`` when an R-PORT carve pre-flighted successfully and the CLI
+        may trigger a prompted restart via the ``restart_hint`` command.
+        ``False`` for R-PATHS and for failures.
     """
 
     state: str
@@ -745,6 +781,10 @@ class RollbackResponse(BaseModel):
     rollback_pre_mortem_backup_path: str
     restart_required: bool
     restart_hint: str
+    applied_live: bool = False
+    restart_required_reason: str | None = None
+    auto_restart_scheduled: bool = False
+    restart_eligible: bool = False
 
 
 # --- Adapter manifest validation + mount helpers ---
@@ -793,8 +833,11 @@ def _require_healthy_memory() -> None:
 
     Applied at the top of ``/chat`` and ``/debug/*`` so a degraded boot
     cannot silently serve cold-start abstentions in place of the real
-    indexed-key answer.  Consolidation cycles refresh the store and clear
-    the flag when they succeed.
+    indexed-key answer.  The flag is cleared by ``_preload_memory_store``
+    on full hydration or when ``preload_cache=False`` (intentional opt-out).
+    It is also cleared on a successful live apply (``_apply_config_live``
+    → ``_live_reload_base_model(refresh_config_from_disk=True)``
+    → ``_build_config_derived_state`` → ``_preload_memory_store``).
     """
     degraded = _state.get("boot_degraded")
     if degraded is None:
@@ -1253,6 +1296,94 @@ def _first_unknown_field(manifest) -> "str | None":
     return None
 
 
+# --- Boot GPU drain helper ---
+
+# Timeout and polling parameters for the boot-time GPU drain wait.
+# Made module constants (not magic literals) so tests can patch them and
+# operators can inspect the values without digging into call sites.
+_BOOT_GPU_DRAIN_TIMEOUT_S: float = 55.0  # seconds before giving up and degrading to cloud-only
+_BOOT_GPU_DRAIN_POLL_INTERVAL_S: float = 1.5  # seconds between mem_get_info polls
+_BOOT_GPU_DRAIN_STABLE_READS: int = 3  # consecutive reads ≥ needed before declaring "drained"
+
+
+def _wait_for_gpu_drain(
+    needed_bytes: int,
+    *,
+    timeout_s: float = _BOOT_GPU_DRAIN_TIMEOUT_S,
+    stable_reads: int = _BOOT_GPU_DRAIN_STABLE_READS,
+    poll_interval_s: float = _BOOT_GPU_DRAIN_POLL_INTERVAL_S,
+) -> bool:
+    """Poll device-wide free VRAM until enough memory is available for the model.
+
+    Uses ``torch.cuda.mem_get_info()[0]`` (the CUDA runtime free-bytes query,
+    NOT nvidia-smi) to measure device-wide free memory.  Blocks until free ≥
+    ``needed_bytes`` for ``stable_reads`` CONSECUTIVE reads, or until
+    ``timeout_s`` elapses.
+
+    The consecutive-read requirement filters out transient under/over-reports
+    that occur during the host driver's lazy-reclaim window after a predecessor
+    process exits: a single passing read may be followed immediately by a
+    failing read as reclaim continues.  Three stable passing reads provides
+    sufficient signal that reclaim is complete without adding meaningful latency
+    on a fully empty device (three reads take ~4.5 s in the worst case).
+
+    Args:
+        needed_bytes: Minimum device-wide free bytes required to begin loading.
+            Caller derives this from ``assessment.required_bytes`` (which already
+            includes the safety margin from ``assess_topology``).  When the
+            assessment was skipped (HF cache miss / hidden_size unavailable),
+            caller should pass ``base_pred + headroom`` as a conservative estimate.
+        timeout_s: Maximum wall-clock seconds to wait before returning False.
+        stable_reads: Number of consecutive reads ≥ ``needed_bytes`` required
+            before declaring the GPU drained and returning True.
+        poll_interval_s: Seconds to sleep between polls.
+
+    Returns:
+        True if the device is drained (``stable_reads`` consecutive reads
+        satisfied ``needed_bytes``), or if CUDA is unavailable (no-op case,
+        always returns True to avoid blocking CPU-only environments).
+        False if ``timeout_s`` elapsed before the drain condition was met.
+    """
+    if not torch.cuda.is_available():
+        return True
+
+    deadline = time.monotonic() + timeout_s
+    consecutive = 0
+    while True:
+        free_bytes = torch.cuda.mem_get_info(0)[0]
+        if free_bytes >= needed_bytes:
+            consecutive += 1
+            if consecutive >= stable_reads:
+                logger.info(
+                    "Boot GPU drain: device-wide free %.2f GiB ≥ needed %.2f GiB "
+                    "(%d consecutive reads) — proceeding with model load",
+                    free_bytes / 2**30,
+                    needed_bytes / 2**30,
+                    consecutive,
+                )
+                return True
+        else:
+            consecutive = 0
+            logger.debug(
+                "Boot GPU drain: device-wide free %.2f GiB < needed %.2f GiB "
+                "(consecutive=%d) — waiting",
+                free_bytes / 2**30,
+                needed_bytes / 2**30,
+                consecutive,
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                "Boot GPU drain: timed out after %.0f s — device-wide free %.2f GiB, "
+                "needed %.2f GiB",
+                timeout_s,
+                free_bytes / 2**30,
+                needed_bytes / 2**30,
+            )
+            return False
+        time.sleep(min(poll_interval_s, remaining))
+
+
 # --- Lifespan ---
 
 
@@ -1517,12 +1648,53 @@ async def lifespan(app: FastAPI):
                 logger.info("VRAM topology assessment:\n%s", assessment.breakdown)
                 logger.info("%s", format_tier_table(assessment))
 
-                total_memory_bytes, external_bytes = measure_external_vram()
-                try:
-                    enforce_live_budget(assessment, total_memory_bytes, external_bytes)
-                except ConfigurationError as exc:
-                    logger.error("VRAM configuration error:\n%s", exc)
-                    sys.exit(1)
+                # Change 4 — persistent overflow warning when the config
+                # genuinely does not fit this hardware.
+                #
+                # "Usable VRAM" is the device-wide free reported by the CUDA
+                # runtime (mem_get_info) at a quiet moment before any model
+                # load.  This accounts for the WDDM OS reservation (typically
+                # 1+ GiB on WSL2 laptops) that get_device_properties().
+                # total_memory does NOT deduct — the physical number is always
+                # optimistic.  We snapshot once here; the resulting dict is
+                # read by _collect_vram_overflow_items on every /status poll.
+                #
+                # The condition "required > usable_ceiling" identifies a
+                # config that cannot fit even on an empty GPU — a permanent
+                # hardware-config mismatch.  A transient shortfall (required ≤
+                # usable but free is low due to a sibling process) is handled
+                # by the drain-wait / cloud-only degrade path and does NOT
+                # trigger this warning.
+                _total_phys_bytes = torch.cuda.get_device_properties(0).total_memory
+                _usable_ceiling_bytes = torch.cuda.mem_get_info(0)[0]
+                _reserved_bytes = _total_phys_bytes - _usable_ceiling_bytes
+                if assessment.required_bytes > _usable_ceiling_bytes:
+                    _req_gib = assessment.required_bytes / 2**30
+                    _usable_gib = _usable_ceiling_bytes / 2**30
+                    _total_gib = _total_phys_bytes / 2**30
+                    _reserved_gib = _reserved_bytes / 2**30
+                    logger.warning(
+                        "VRAM CONFIG OVERFLOW — local model config requires "
+                        "%.2f GiB working set but only ~%.2f GiB is usable on "
+                        "this %.0f GiB GPU (WDDM/WSL2 reserves ~%.2f GiB). "
+                        "The server will run cloud-only/degraded. Reduce model "
+                        "size, adapter rank/count, or "
+                        "consolidation.max_interim_count.",
+                        _req_gib,
+                        _usable_gib,
+                        _total_gib,
+                        _reserved_gib,
+                    )
+                    _state["vram_overflow_warning"] = {
+                        "required_gib": _req_gib,
+                        "usable_gib": _usable_gib,
+                        "total_gib": _total_gib,
+                        "reserved_gib": _reserved_gib,
+                    }
+                else:
+                    # Config fits — clear any stale warning from a previous
+                    # boot with a different (larger) config.
+                    _state.pop("vram_overflow_warning", None)
 
         # Cache the assessment for the GPU reclaim path's live-budget
         # pre-flight — config is static for the process lifetime, so the
@@ -1534,144 +1706,91 @@ async def lifespan(app: FastAPI):
         _state["model"] = None
         _state["tokenizer"] = None
     else:
-        # Apply per-process VRAM cap before any tensor allocation so that
-        # over-allocation surfaces as a Python OOM exception rather than a
-        # host driver fault.
-        apply_process_cap(fraction=config.vram.process_cap_fraction)
+        # Boot-time drain wait: poll device-wide free VRAM (via CUDA runtime,
+        # no nvidia-smi) until there is room for the model, or degrade to
+        # cloud-only on timeout.  This replaces the old single-shot
+        # measure_external_vram + enforce_live_budget + sys.exit(1) gate,
+        # which failed on fast restarts because the host driver's lazy-reclaim
+        # window means VRAM has not been returned yet when the new process
+        # boots.
+        #
+        # needed_bytes derivation:
+        #   • assessment available → use assessment.required_bytes (which
+        #     already includes the safety margin from assess_topology).
+        #   • assessment was skipped (HF cache miss / AutoConfig failure) →
+        #     fall back to base_pred + headroom as a conservative lower bound.
+        #     When base_pred is also None (model not cached) → skip the wait
+        #     entirely and proceed; the post-load gate is authoritative.
+        _needed_bytes: int | None = None
+        if assessment is not None:
+            _needed_bytes = assessment.required_bytes
+        elif base_pred is not None:
+            headroom_bytes = int(config.vram.vram_cache_headroom_gib * 2**30)
+            _needed_bytes = base_pred + headroom_bytes
 
-        # Model load + adapter mount factored into ``_load_model_into_state``
-        # so the model never enters the lifespan async-generator's frame.
-        # See that function's docstring for why this is load-bearing.
-        _load_model_into_state(config)
-    _state["session_buffer"] = SessionBuffer(
-        config.session_dir,
-        retain_sessions=config.consolidation.retain_sessions,
-        debug=config.debug,
-    )
-    # Cold-start: rehydrate pending JSONL into memory before loading the
-    # encrypted snapshot (snapshot carries mid-turn _sessions state only).
-    _state["session_buffer"].rehydrate_from_disk()
-    _state["session_buffer"].load_snapshot()
+        if _needed_bytes is not None:
+            drained = _wait_for_gpu_drain(_needed_bytes)
+            if not drained:
+                logger.warning(
+                    "Boot GPU drain: GPU did not free %.2f GiB within %.0f s — "
+                    "starting cloud-only; will auto-reclaim when the GPU frees.",
+                    _needed_bytes / 2**30,
+                    _BOOT_GPU_DRAIN_TIMEOUT_S,
+                )
+                cloud_only = True
+                _state["cloud_only_reason"] = "insufficient_vram"
+                _state["model"] = None
+                _state["tokenizer"] = None
 
-    # Initialize speaker store (voice-based identification)
-    if config.speaker.enabled:
-        from paramem.server.speaker import SpeakerStore
+        if not cloud_only:
+            # Apply per-process VRAM cap before any tensor allocation so that
+            # over-allocation surfaces as a Python OOM exception rather than a
+            # host driver fault.
+            apply_process_cap(fraction=config.vram.process_cap_fraction)
 
-        speaker_path = (
-            Path(config.speaker.store_path)
-            if config.speaker.store_path
-            else config.paths.data / "speaker_profiles.json"
-        )
-        _state["speaker_store"] = SpeakerStore(
-            speaker_path,
-            high_threshold=config.speaker.high_confidence_threshold,
-            low_threshold=config.speaker.low_confidence_threshold,
-            max_embeddings=config.speaker.max_embeddings_per_profile,
-            redundancy_threshold=config.speaker.redundancy_threshold,
-        )
-        logger.info("Speaker store: %d profiles", _state["speaker_store"].profile_count)
+            # Model load + adapter mount factored into ``_load_model_into_state``
+            # so the model never enters the lifespan async-generator's frame.
+            # See that function's docstring for why this is load-bearing.
+            _load_model_into_state(config)
 
-        # Preload speaker embedding model (CPU, ~17 MB)
-        from paramem.server.speaker_embedding import load_embedding_model
+    # Config-derived component construction — single shared routine called by
+    # BOTH the lifespan (here) and the live-apply path.  At boot the session
+    # buffer is always rebuilt (rebuild_session_buffer=True, the default).
+    # Note: _apply_config_in_progress is not set here (boot path); the D6 gate
+    # inside the routine treats a None/absent store as cold and runs the probe.
+    _build_config_derived_state(config, cloud_only=cloud_only)
 
-        if load_embedding_model():
-            logger.info("Speaker embedding model ready")
-        else:
-            logger.warning("Speaker embedding unavailable — install paramem[speaker]")
-    else:
-        _state["speaker_store"] = None
-        logger.info("Speaker identification disabled")
-
-    # Initialize local STT + TTS with dual-instance voice pairs.
-    # The CPU pair is always resident (consolidation and cloud-only both use it).
-    # The GPU pair is eagerly loaded at startup in local mode; lazily by
-    # auto-reclaim under --defer-model; never under permanent cloud-only.
-    # voice_box indirects Wyoming handlers to the active pair (W3).
-    _state["stt"] = None
-    _state["wyoming_server"] = None
-    if config.stt.enabled:
-        from paramem.server.stt import WhisperSTT
-
-        # CPU pair — always loaded, permanently resident (G2: device hard-coded).
-        stt_cpu = WhisperSTT(
-            model_name=config.stt.cpu_fallback_model,
-            device="cpu",
-            compute_type="int8",
-            language=config.stt.language,
-            beam_size=config.stt.beam_size,
-            vad_filter=config.stt.vad_filter,
-        )
-        aio_loop = asyncio.get_running_loop()
-        stt_cpu_ok = await aio_loop.run_in_executor(None, stt_cpu.load)
-        if stt_cpu_ok:
-            _state["stt_cpu"] = stt_cpu
+    # Post-load authoritative gate (BUILD-ONCE — stays lifespan-only, not in
+    # _build_config_derived_state).  Runs AFTER _build_config_derived_state so
+    # the measured allocation includes the STT/TTS GPU footprint (correction S2).
+    # Reads base_pred (lifespan-frame local) and calls sys.exit(1) on failure —
+    # both are incompatible with the live-apply path.  The apply/reclaim path
+    # uses an inline torch.cuda.mem_get_info fit-check inside
+    # _live_reload_base_model which declines gracefully to
+    # cloud_only_reason="insufficient_vram" instead of exiting.
+    # Correction B-1 / S2 / §3.x.
+    if _state.get("model") is not None and torch.cuda.is_available():
+        actual_bytes = torch.cuda.memory_allocated(0)
+        headroom_bytes = int(config.vram.vram_cache_headroom_gib * 2**30)
+        total_bytes = torch.cuda.get_device_properties(0).total_memory
+        try:
+            enforce_post_load_budget(actual_bytes, total_bytes, headroom_bytes)
+        except ConfigurationError as exc:
+            logger.error("VRAM post-load gate failed:\n%s", exc)
+            sys.exit(1)
+        if base_pred is not None:
+            delta_mib = (actual_bytes - base_pred) / (1024 * 1024)
             logger.info(
-                "Local STT CPU: %s on cpu",
-                config.stt.cpu_fallback_model,
-            )
-        else:
-            logger.warning(
-                "Local STT CPU pair failed to load — voice path unavailable in cloud-only mode"
+                "VRAM calibration drift: predicted %.2f GiB, measured %.2f GiB (delta %+.0f MiB)",
+                base_pred / 2**30,
+                actual_bytes / 2**30,
+                delta_mib,
             )
 
-        # GPU pair — only in non-cloud-only mode (G2: config device passes through).
-        if not cloud_only:
-            stt_gpu = WhisperSTT(
-                model_name=config.stt.model,
-                device=config.stt.device,
-                compute_type=config.stt.compute_type,
-                language=config.stt.language,
-                beam_size=config.stt.beam_size,
-                vad_filter=config.stt.vad_filter,
-            )
-            if stt_gpu.load():
-                _state["stt_gpu"] = stt_gpu
-                logger.info("Local STT GPU: Whisper %s on %s", config.stt.model, config.stt.device)
-            else:
-                logger.warning("Local STT GPU pair failed to load")
-    else:
-        logger.info("Local STT: disabled")
-
-    # Initialize local TTS if configured
-    if config.tts.enabled:
-        from paramem.server.tts import TTSManager
-
-        # CPU pair — always loaded.
-        # _build_cpu_tts_config neutralises per-voice cuda overrides (G1).
-        tts_cpu = TTSManager(_build_cpu_tts_config(config.tts))
-        aio_loop = asyncio.get_running_loop()
-        await aio_loop.run_in_executor(None, tts_cpu.load_all)
-        if tts_cpu.is_loaded:
-            _state["tts_cpu"] = tts_cpu
-            logger.info("Local TTS CPU: %s", ", ".join(tts_cpu.available_languages))
-        else:
-            logger.warning(
-                "Local TTS CPU pair failed to load — voice path unavailable in cloud-only mode"
-            )
-
-        # GPU pair — only in non-cloud-only mode (G1: config.tts unchanged,
-        # per-voice overrides respected).
-        if not cloud_only:
-            tts_gpu = TTSManager(config.tts)
-            await aio_loop.run_in_executor(None, tts_gpu.load_all)
-            if tts_gpu.is_loaded:
-                _state["tts_gpu"] = tts_gpu
-                logger.info("Local TTS GPU: %s", ", ".join(tts_gpu.available_languages))
-            else:
-                logger.warning("Local TTS GPU pair failed to load")
-    else:
-        logger.info("Local TTS: disabled")
-
-    # Seed voice_box and voice_profile based on initial startup mode (W3).
-    _active_stt = _state.get("stt_gpu") if not cloud_only else _state.get("stt_cpu")
-    _active_tts = _state.get("tts_gpu") if not cloud_only else _state.get("tts_cpu")
-    if _active_stt is not None or _active_tts is not None:
-        _state["voice_box"] = {"stt": _active_stt, "tts_manager": _active_tts}
-        _state["stt"] = _active_stt
-        _state["tts_manager"] = _active_tts
-
-        # Register Wyoming servers with provider lambdas so profile swaps
-        # take effect without restarting the socket listeners.
+    # Wyoming listener sockets — bound ONCE here in the lifespan with provider
+    # lambdas so profile swaps (cpu⟷gpu) re-point the active pair without
+    # re-binding the sockets.  The live-apply path MUST NOT call these again.
+    if _state.get("voice_box") is not None or (config.stt.enabled or config.tts.enabled):
         from paramem.server.wyoming_handler import start_wyoming_server, start_wyoming_tts_server
 
         def _on_stt_embedding(embedding):
@@ -1727,295 +1846,6 @@ async def lifespan(app: FastAPI):
             )
             logger.info("Wyoming TTS server listening on port %d", config.tts.port)
 
-    _state["voice_profile"] = "cpu" if cloud_only else "gpu"
-    logger.info("Voice pipeline profile: %r", _state["voice_profile"])
-
-    # Post-load authoritative gate: measured allocation must leave headroom for
-    # KV cache + activations.  Prediction drift is logged at INFO for calibration.
-    if _state.get("model") is not None and torch.cuda.is_available():
-        actual_bytes = torch.cuda.memory_allocated(0)
-        headroom_bytes = int(config.vram.vram_cache_headroom_gib * 2**30)
-        total_bytes = torch.cuda.get_device_properties(0).total_memory
-        try:
-            enforce_post_load_budget(actual_bytes, total_bytes, headroom_bytes)
-        except ConfigurationError as exc:
-            logger.error("VRAM post-load gate failed:\n%s", exc)
-            sys.exit(1)
-        if base_pred is not None:
-            delta_mib = (actual_bytes - base_pred) / (1024 * 1024)
-            logger.info(
-                "VRAM calibration drift: predicted %.2f GiB, measured %.2f GiB (delta %+.0f MiB)",
-                base_pred / 2**30,
-                actual_bytes / 2**30,
-                delta_mib,
-            )
-
-    # Initialize SOTA agent if configured
-    _state["sota_agent"] = get_cloud_agent(config.sota_agent)
-    if _state["sota_agent"]:
-        logger.info(
-            "SOTA agent: %s (%s)",
-            config.sota_agent.provider,
-            config.sota_agent.model,
-        )
-    else:
-        logger.info("SOTA agent: not configured")
-
-    # Register additional SOTA providers for direct routing (sota:anthropic, etc.)
-    _state["sota_providers"] = {}
-    for name, provider_config in config.sota_providers.items():
-        agent = get_cloud_agent(provider_config)
-        if agent:
-            _state["sota_providers"][name] = agent
-            logger.info("SOTA provider registered: %s (%s)", name, provider_config.model)
-    logger.info("SOTA providers available: %s", list(_state["sota_providers"].keys()))
-
-    # Initialize HA client, tool registry, and HA entity graph
-    ha_graph = None
-    tools_config = config.tools
-    if tools_config.ha.url and tools_config.ha.token:
-        ha_client = HAClient(
-            url=tools_config.ha.url,
-            token=tools_config.ha.token,
-            timeout=tools_config.tool_timeout_seconds,
-        )
-        health = ha_client.health_check()
-        if health:
-            logger.info("HA client: connected to %s", tools_config.ha.url)
-            entity_count = ha_client.load_entity_map()
-            logger.info("HA entity map: %d entities", entity_count)
-
-            # Build HA entity graph for dual-graph routing
-            ha_services = ha_client.get_services()
-            ha_graph = HAEntityGraph.build(ha_client._raw_states, ha_services)
-        else:
-            logger.warning("HA client: configured but unreachable at %s", tools_config.ha.url)
-        _state["ha_client"] = ha_client
-
-    else:
-        logger.info("HA tools: not configured")
-
-    _state["ha_graph"] = ha_graph
-
-    # Indexed-key memory store — single source of truth for {entry, simhash,
-    # registry} of every indexed key the system holds in RAM.  Constructed
-    # eagerly at boot so the Router has something to walk before the first
-    # consolidation cycle fires.  Registries + simhashes always load.  Entry
-    # payloads preload via the mode-appropriate MemorySource when
-    # ``config.inference.preload_cache`` is True; with it off, the store stays
-    # empty for entries and inference pays per-key source latency on misses
-    # — supported (just slower).
-    from paramem.memory.source import (
-        DiskMemorySource as _DiskMemorySource,
-    )
-    from paramem.memory.source import (
-        WeightMemorySource as _WeightMemorySource,
-    )
-    from paramem.memory.store import MemoryStore as _MemoryStore
-
-    memory_store = _MemoryStore(
-        replay_enabled=config.consolidation.indexed_key_replay,
-    )
-    try:
-        memory_store.load_registries_from_disk(config.adapter_dir)
-    except Exception:
-        logger.exception("Boot-time registry load failed; memory store will start empty")
-
-    if config.inference.preload_cache:
-        _preload_keys_by_tier: dict[str, list[str]] = {}
-        for _tier in memory_store.tiers_with_registry():
-            _active = memory_store.active_keys_in_tier(_tier)
-            if _active:
-                _preload_keys_by_tier[_tier] = _active
-
-        if _preload_keys_by_tier:
-            # Mode-aware source: simulate persists graph.json (DiskMemorySource);
-            # train persists only adapter weights (WeightMemorySource).  The
-            # MemoryStore itself is RAM-only — re-populated at every boot from
-            # the mode-appropriate source of truth.
-            _mode = config.consolidation.mode
-            _source = None
-            if _mode == "simulate":
-                _source = _DiskMemorySource(config.adapter_dir)
-            elif _state.get("model") is not None:
-                _source = _WeightMemorySource(
-                    _state["model"],
-                    _state["tokenizer"],
-                    batch_size=config.consolidation.recall_probe_batch_size,
-                )
-            else:
-                logger.info(
-                    "preload_cache: skipping entry preload — no model loaded "
-                    "(cloud-only mode or model load failed); store will stay "
-                    "empty for entries and inference will pay source latency "
-                    "on each query"
-                )
-
-            if _source is not None:
-                _total = sum(len(v) for v in _preload_keys_by_tier.values())
-                logger.info(
-                    "preload_cache: probing %d active key(s) across %d tier(s) via %s",
-                    _total,
-                    len(_preload_keys_by_tier),
-                    type(_source).__name__,
-                )
-                try:
-                    _results = _source.probe(_preload_keys_by_tier)
-                except Exception:
-                    logger.exception(
-                        "preload_cache: source probe failed; store remains "
-                        "empty for entries (queries will retry per-key on demand)"
-                    )
-                    _results = {}
-
-                _hits = 0
-                _missed_by_tier: dict[str, list[str]] = {}
-                for _tier, _keys in _preload_keys_by_tier.items():
-                    for _key in _keys:
-                        _entry = _results.get(_key)
-                        if _entry is None or "failure_reason" in _entry:
-                            _missed_by_tier.setdefault(_tier, []).append(_key)
-                            continue
-                        # Don't re-register; the registry is already loaded.
-                        memory_store.put(_tier, _key, _entry, register=False)
-                        _hits += 1
-                logger.info("preload_cache: cached %d / %d active key(s)", _hits, _total)
-                if _hits < _total:
-                    _state["boot_degraded"] = {
-                        "reason": "preload_partial",
-                        "hits": _hits,
-                        "total": _total,
-                        "missed_by_tier": {
-                            tier: keys[:10] for tier, keys in _missed_by_tier.items()
-                        },
-                        "source": type(_source).__name__,
-                    }
-                    logger.warning(
-                        "boot_degraded: preload_cache could not materialise %d / %d "
-                        "active keys via %s — /chat and /debug/* will return 503 "
-                        "until consolidation refreshes the store",
-                        _total - _hits,
-                        _total,
-                        type(_source).__name__,
-                    )
-
-    # BASE-MODEL HOLDER (lifespan-frame local _source): drop the boot-preload
-    # WeightMemorySource. It captures the base model (self.model); the suspended
-    # lifespan async-gen frame would otherwise pin it past an in-process release
-    # (_release_base_model_in_process cannot reach a frame local). The preload
-    # probe is complete — the RAM store is populated and the source is done.
-    _source = None
-
-    # Join the per-entry bookkeeping (speaker_id, first_seen_cycle) from
-    # key_metadata.json.  WeightMemorySource and DiskMemorySource both
-    # recover the SPO triple but not these fields — they live only in the
-    # registry.  Must run AFTER preload_cache so entries exist to join onto;
-    # the join is a no-op for tiers whose entries are absent (preload off
-    # or boot_degraded).  Without this step, Router._speaker_key_index is
-    # empty and every personal query hits the cold-start abstention even
-    # though the keys are cached.
-    try:
-        _meta_stats = memory_store.load_metadata_from_disk(config.key_metadata_path)
-        logger.info(
-            "load_metadata_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
-            _meta_stats["loaded"],
-            _meta_stats["orphaned"],
-            _meta_stats["legacy_upgraded"],
-        )
-    except Exception:
-        logger.exception(
-            "Boot-time key_metadata join failed; entries will lack speaker_id "
-            "until next consolidation cycle (personal queries will cold-start)"
-        )
-
-    _state["memory_store"] = memory_store
-
-    _state["router"] = QueryRouter(
-        adapter_dir=config.adapter_dir,
-        memory_store=memory_store,
-        ha_graph=ha_graph,
-        intent_config=config.intent,
-    )
-
-    # Residual intent classifier — load the sentence-encoder once so the
-    # routing path doesn't pay model-load cost per query, and embed the
-    # per-class exemplars at startup so cosine routing at query time is
-    # a single matrix-vector dot product.  Failure at any step is
-    # non-fatal: the classifier returns Intent.UNKNOWN / fail-closed and
-    # routing degrades to the existing structural rules.
-    if not cloud_only:
-        from paramem.server.intent import (
-            load_encoder,
-            load_exemplars,
-            set_classifier_model,
-        )
-
-        encoder_handle = load_encoder(config.intent)
-        if encoder_handle is not None:
-            load_exemplars(config.intent, encoder_handle)
-
-        # Register the local LLM for ``intent.mode=llm`` classification.
-        # No-op when the model didn't load (cloud-only fallthrough) — the
-        # intent module sees the singleton as ``None`` and the dispatch
-        # automatically falls back to the encoder residual.
-        _classifier_model = _state.get("model")
-        _classifier_tokenizer = _state.get("tokenizer")
-        if _classifier_model is not None and _classifier_tokenizer is not None:
-            set_classifier_model(_classifier_model, _classifier_tokenizer)
-        # BASE-MODEL HOLDER (lifespan-frame locals _classifier_model /
-        # _classifier_tokenizer): drop them immediately. The lifespan async-gen
-        # frame stays suspended at ``yield`` for the app's lifetime, so any
-        # local holding the base model pins it past an in-process release
-        # (the release nulls _state + the classifier handle but cannot reach a
-        # frame local). The classifier *handle* keeps the model for mode=llm;
-        # these locals have done their job.
-        _classifier_model = None
-        _classifier_tokenizer = None
-
-        # Sentence-type classifier reuses the same encoder (no second
-        # download / load).  Loading the exemplar bank only succeeds
-        # when the intent encoder loaded above; otherwise the
-        # _is_interrogative tier falls through to the deterministic
-        # punctuation + English lexicon path.
-        from paramem.server.sentence_type import (
-            load_exemplars as load_sentence_type_exemplars,
-        )
-
-        load_sentence_type_exemplars(config.sentence_type)
-
-        # Personal-referent classifier — same encoder, replaces the
-        # English-only token-set lookup in
-        # ``sanitizer._contains_first_person`` with a multilingual
-        # cosine match.  Without this layer, German / Mandarin / etc.
-        # self-referential queries silently bypass the cloud-egress
-        # sanitization gate.
-        from paramem.server.personal_referent import (
-            load_exemplars as load_personal_referent_exemplars,
-        )
-
-        load_personal_referent_exemplars(config.personal_referent)
-
-    # Global observed-language tracker — records STT-detected languages with
-    # high confidence, publishes to HA as input_text.voice_observed_languages
-    # so the conversation agent can use it as context when interpreting
-    # (potentially mangled) transcripts from CPU fallback STT.
-    from paramem.server.language_tracker import LanguageTracker
-
-    _state["language_tracker"] = LanguageTracker(
-        store_path=config.paths.data / "observed_languages.json",
-        ha_client=_state.get("ha_client"),
-    )
-
-    # Text-side language detector — eager-loaded so the first /chat does
-    # not pay the ~200 ms cold-read for the 126 MB lid.176 model. Runs in
-    # both local and cloud-only modes (CPU-only, no VRAM cost). Disabled
-    # config silently skips the load; missing model file warns once and
-    # falls through to language=None at request time.
-    if config.text_lang_detection.enabled:
-        from paramem.server import lang_id
-
-        lang_id.load_at_startup(config.text_lang_detection.model_path)
-
     # Reconcile the systemd user timer with the DERIVED full consolidation
     # period (= refresh_cadence × max_interim_count). The yaml exposes only
     # refresh_cadence; the timer sees the full cycle via the derived
@@ -2070,6 +1900,23 @@ async def lifespan(app: FastAPI):
         buffer = _state.get("session_buffer")
         if buffer:
             buffer.save_snapshot()
+        # Free all base-model holders before handing control back to the OS so
+        # the dying process does not pin the ~5 GiB base model on the device while
+        # systemd launches the replacement process.  (STT/TTS, ~1.5-2 GiB, remain
+        # until process exit reaps them — the successor's boot drain-wait keys on
+        # assessment.required_bytes, which includes the STT/TTS footprint, so it
+        # waits for that residual to reclaim too.)  Using _release_base_model_in_process
+        # (not bare unload_model) because consolidation_loop / bg_trainer /
+        # intent handles keep the model alive through their own references —
+        # plain unload_model would not drive the refcount to zero.
+        # The try/except is boundary handling (the process is exiting; a teardown
+        # error must not hang the exit) — it is NOT error-suppression of a logic bug.
+        try:
+            _release_base_model_in_process()
+            safe_empty_cache()
+            logger.info("graceful exit: GPU released")
+        except Exception:
+            logger.exception("graceful exit: error during GPU release — continuing with exit")
         if signum == signal.SIGUSR1:
             # GPU release: exit non-zero so systemd restarts (Restart=on-failure)
             os._exit(1)
@@ -3230,6 +3077,555 @@ async def gpu_acquire():
     }
 
 
+def _preload_memory_store(config, *, model, tokenizer):
+    """Build the MemoryStore, load registries, and hydrate the active-key cache.
+
+    Called by :func:`_build_config_derived_state`.  Returned store is assigned
+    to ``_state["memory_store"]`` by the caller.
+
+    Source selection uses ``config.consolidation.mode`` (NOT
+    ``_state["mode"]``).  This prevents conflating the consolidation
+    persistence mode (train/simulate) with the runtime mode (local/cloud-only).
+
+    boot_degraded lifecycle:
+    - Cleared when full hydration succeeds.
+    - Cleared when ``config.inference.preload_cache=False`` (intentional opt-out).
+    - Set when partial hydration occurs (some keys not materialised).
+
+    The ``WeightMemorySource`` is kept as a frame-local and dropped on return —
+    mirrors the no-frame-retention pattern of ``_load_model_into_state`` so the
+    base model is not pinned past the preload.
+
+    Parameters
+    ----------
+    config:
+        Live server config object.
+    model:
+        Base model handle (``_state["model"]``) passed directly as a kwarg
+        expression at the call site — do NOT bind to a caller local.
+    tokenizer:
+        Tokenizer handle (``_state["tokenizer"]``) passed the same way.
+
+    Returns
+    -------
+    MemoryStore
+        The fully-constructed store (registries loaded; entries hydrated when
+        ``preload_cache=True`` and the source probe succeeded).
+    """
+    from paramem.memory.source import (
+        DiskMemorySource as _DiskMemorySource,
+    )
+    from paramem.memory.source import (
+        WeightMemorySource as _WeightMemorySource,
+    )
+    from paramem.memory.store import MemoryStore as _MemoryStore
+
+    memory_store = _MemoryStore(
+        replay_enabled=config.consolidation.indexed_key_replay,
+    )
+    try:
+        memory_store.load_registries_from_disk(config.adapter_dir)
+    except Exception:
+        logger.exception("Boot-time registry load failed; memory store will start empty")
+
+    if not config.inference.preload_cache:
+        # Intentional opt-out: inference pays per-key latency on misses.
+        # Clear boot_degraded so /chat is not 503'd on a preload-off deployment
+        # after an apply (correction #5 boot_degraded lifecycle).
+        _state["boot_degraded"] = None
+        logger.info(
+            "preload_cache: disabled — store stays entry-empty; inference pays source latency"
+        )
+    else:
+        _preload_keys_by_tier: dict[str, list[str]] = {}
+        for _tier in memory_store.tiers_with_registry():
+            _active = memory_store.active_keys_in_tier(_tier)
+            if _active:
+                _preload_keys_by_tier[_tier] = _active
+
+        if not _preload_keys_by_tier:
+            # No active keys — nothing to preload; store is correctly empty.
+            _state["boot_degraded"] = None
+        else:
+            # Mode-aware source: simulate persists graph.json (DiskMemorySource);
+            # train persists only adapter weights (WeightMemorySource).
+            # Select from config.consolidation.mode — NOT from _state["mode"]
+            # (that conflates consolidation persistence mode with runtime mode).
+            _mode = config.consolidation.mode
+            # BASE-MODEL HOLDER (function-local _source — dropped on return)
+            _source = None
+            if _mode == "simulate":
+                _source = _DiskMemorySource(config.adapter_dir)
+            elif model is not None:
+                _source = _WeightMemorySource(
+                    model,
+                    tokenizer,
+                    batch_size=config.consolidation.recall_probe_batch_size,
+                )
+            else:
+                logger.info(
+                    "preload_cache: skipping entry preload — no model loaded "
+                    "(cloud-only mode or model load failed); store will stay "
+                    "empty for entries and inference will pay source latency "
+                    "on each query"
+                )
+
+            if _source is not None:
+                _total = sum(len(v) for v in _preload_keys_by_tier.values())
+                logger.info(
+                    "preload_cache: probing %d active key(s) across %d tier(s) via %s",
+                    _total,
+                    len(_preload_keys_by_tier),
+                    type(_source).__name__,
+                )
+                try:
+                    _results = _source.probe(_preload_keys_by_tier)
+                except Exception:
+                    logger.exception(
+                        "preload_cache: source probe failed; store remains "
+                        "empty for entries (queries will retry per-key on demand)"
+                    )
+                    _results = {}
+
+                _hits = 0
+                _missed_by_tier: dict[str, list[str]] = {}
+                for _tier, _keys in _preload_keys_by_tier.items():
+                    for _key in _keys:
+                        _entry = _results.get(_key)
+                        if _entry is None or "failure_reason" in _entry:
+                            _missed_by_tier.setdefault(_tier, []).append(_key)
+                            continue
+                        # Don't re-register; the registry is already loaded.
+                        memory_store.put(_tier, _key, _entry, register=False)
+                        _hits += 1
+                logger.info("preload_cache: cached %d / %d active key(s)", _hits, _total)
+                if _hits < _total:
+                    _state["boot_degraded"] = {
+                        "reason": "preload_partial",
+                        "hits": _hits,
+                        "total": _total,
+                        "missed_by_tier": {
+                            tier: keys[:10] for tier, keys in _missed_by_tier.items()
+                        },
+                        "source": type(_source).__name__,
+                    }
+                    logger.warning(
+                        "boot_degraded: preload_cache could not materialise %d / %d "
+                        "active keys via %s — /chat and /debug/* will return 503 "
+                        "until the preload is retried (next apply or /gpu/acquire)",
+                        _total - _hits,
+                        _total,
+                        type(_source).__name__,
+                    )
+                else:
+                    # Full hydration — clear any prior degraded flag.
+                    _state["boot_degraded"] = None
+
+            # Drop the WeightMemorySource frame-local — the preload probe is
+            # complete; the source must not outlive this function's frame.
+            _source = None
+
+    # Join per-entry bookkeeping (speaker_id, first_seen_cycle) from
+    # key_metadata.json.  Both WeightMemorySource and DiskMemorySource recover
+    # the SPO triple but not these fields — they live only in the registry.
+    # Must run AFTER the preload so entries exist to join onto; the join is a
+    # no-op for tiers whose entries are absent (preload off or boot_degraded).
+    try:
+        _meta_stats = memory_store.load_metadata_from_disk(config.key_metadata_path)
+        logger.info(
+            "load_metadata_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
+            _meta_stats["loaded"],
+            _meta_stats["orphaned"],
+            _meta_stats["legacy_upgraded"],
+        )
+    except Exception:
+        logger.exception(
+            "Boot-time key_metadata join failed; entries will lack speaker_id "
+            "until next consolidation cycle (personal queries will cold-start)"
+        )
+
+    return memory_store
+
+
+def _build_config_derived_state(
+    config,
+    *,
+    cloud_only: bool,
+    rebuild_session_buffer: bool = True,
+    full_rebuild: bool = True,
+) -> None:
+    """Construct every config-derived component into ``_state``.
+
+    Single idempotent routine called by BOTH the lifespan startup and the
+    live-apply path.  Replaces the lifespan's inline construction blocks at
+    ``app.py:1546-1732`` + ``1753-2017`` (excluding the build-once post-load
+    VRAM gate at ``1733-1751`` — see B-1 / §3.x of the plan).
+
+    **EXCLUDES** strictly-once lifespan concerns (signal handlers, asyncio
+    tasks, timer reconciliation, mode init) and the build-once post-load VRAM
+    gate.  The gate runs inline in the lifespan AFTER this routine returns so
+    the measured allocation includes the STT/TTS GPU footprint (correction S2).
+    The gate is incompatible with this routine (it ``sys.exit(1)``s and reads
+    a lifespan-frame local ``base_pred``).  The apply path's VRAM safety is
+    the ``mem_get_info``-based fit-check inside ``_live_reload_base_model``.
+
+    **Wyoming listener sockets are NOT re-bound here.** The lifespan binds
+    them once with provider lambdas so profile swaps re-point automatically.
+    The apply path must not call ``start_wyoming_server`` /
+    ``start_wyoming_tts_server`` again.
+
+    Per §3.11 ordering:
+
+    1. session_buffer (snapshot old → construct → rehydrate → load_snapshot)
+       — only when ``rebuild_session_buffer=True`` AND ``full_rebuild=True``.
+    2. speaker_store (+ embedding model)  — ``full_rebuild=True`` only.
+    3. STT/TTS managers: construct fresh from ``config`` → flip voice_box
+       — ``full_rebuild=True`` only.
+    4. sota_agent + sota_providers  — ``full_rebuild=True`` only.
+    5. ha_client (close old → construct new) + ha_graph
+       — ``full_rebuild=True`` only.
+    6. memory store preload (``_preload_memory_store``) → assign
+       ``_state["memory_store"]`` — always (D6 gate may skip probe on warm).
+    7. router (captures memory_store + ha_graph)  — always.
+    8. exemplar banks + ``set_classifier_model``
+       — ``full_rebuild=True`` only for exemplar banks; ``set_classifier_model``
+       runs on both paths so the freshly loaded model is registered.
+    9. language_tracker + lang_id  — ``full_rebuild=True`` only.
+
+    Parameters
+    ----------
+    config:
+        Live server config object (already updated in ``_state["config"]``
+        before this is called from the apply path).
+    cloud_only:
+        Whether the server is starting/applying in cloud-only mode.  Controls
+        GPU pair construction for STT/TTS and intent exemplar loading.
+    rebuild_session_buffer:
+        When ``True`` (default, used at lifespan boot and the apply path when
+        ``retain_sessions`` or ``debug`` changed), always construct a fresh
+        ``SessionBuffer``.  When ``False``, leave the live buffer intact to
+        avoid losing in-flight state.  Only meaningful when ``full_rebuild=True``
+        (the session buffer is never rebuilt on a plain reclaim).
+    full_rebuild:
+        When ``True`` (default, boot + apply path): rebuild ALL config-derived
+        components (steps 1–9 above).
+        When ``False`` (plain ``/gpu/acquire`` + auto-reclaim same config):
+        skip the expensive, potentially network-touching steps (speaker_store,
+        STT/TTS construction, sota_agent, ha_client reconnect, exemplar banks,
+        language_tracker).  Only steps 6 (memory-store probe, D6-gated) and 7
+        (Router re-point) are run, plus ``set_classifier_model`` to register
+        the freshly reloaded model handle (step 8 partial).  This avoids
+        spurious STT/TTS ``load()`` calls and HA ``health_check()`` /
+        ``load_entity_map()`` / ``get_services()`` network calls on every
+        plain warm reclaim (correction S1).
+    """
+    # ── 1. session_buffer ────────────────────────────────────────────────────
+    # Only on full_rebuild paths (boot + apply); plain reclaim keeps the live
+    # buffer to avoid losing in-flight state.
+    if full_rebuild and rebuild_session_buffer:
+        # Save snapshot on the OLD buffer FIRST (mirrors SIGTERM/SIGUSR1 path)
+        # so mid-turn _sessions state round-trips when an encryption key is
+        # loaded (correction S-1).  No-op on a no-key deployment.
+        old_buffer = _state.get("session_buffer")
+        if old_buffer is not None:
+            old_buffer.save_snapshot()
+
+        _state["session_buffer"] = SessionBuffer(
+            config.session_dir,
+            retain_sessions=config.consolidation.retain_sessions,
+            debug=config.debug,
+        )
+        # Cold-start: rehydrate pending JSONL into memory before loading the
+        # encrypted snapshot (snapshot carries mid-turn _sessions state only).
+        _state["session_buffer"].rehydrate_from_disk()
+        _state["session_buffer"].load_snapshot()
+
+    if full_rebuild:
+        # ── 2. speaker_store ─────────────────────────────────────────────────
+        if config.speaker.enabled:
+            from paramem.server.speaker import SpeakerStore
+
+            speaker_path = (
+                Path(config.speaker.store_path)
+                if config.speaker.store_path
+                else config.paths.data / "speaker_profiles.json"
+            )
+            _state["speaker_store"] = SpeakerStore(
+                speaker_path,
+                high_threshold=config.speaker.high_confidence_threshold,
+                low_threshold=config.speaker.low_confidence_threshold,
+                max_embeddings=config.speaker.max_embeddings_per_profile,
+                redundancy_threshold=config.speaker.redundancy_threshold,
+            )
+            logger.info("Speaker store: %d profiles", _state["speaker_store"].profile_count)
+
+            # Preload speaker embedding model (CPU, ~17 MB)
+            from paramem.server.speaker_embedding import load_embedding_model
+
+            if load_embedding_model():
+                logger.info("Speaker embedding model ready")
+            else:
+                logger.warning("Speaker embedding unavailable — install paramem[speaker]")
+        else:
+            _state["speaker_store"] = None
+            logger.info("Speaker identification disabled")
+
+        # ── 3. STT / TTS managers (construct-then-flip, §3.6) ───────────────
+        # Construct fresh managers from config, then atomically flip voice_box.
+        # DO NOT call start_wyoming_server / start_wyoming_tts_server here —
+        # those are lifespan-only.  The Wyoming provider lambdas re-point
+        # automatically once voice_box is updated.
+        #
+        # Correction §3.6: _set_voice_pipeline_profile only lazy-constructs when
+        # _state["stt_gpu"] is None; it does NOT reconstruct when the config
+        # changes.  The apply must construct fresh instances from config B and
+        # install them before flipping.
+        #
+        # Correction N3: flush the allocator-pool before the GPU STT load so
+        # vram_measure reads accurate free-memory (mirrors
+        # _set_voice_pipeline_profile which calls safe_empty_cache before load).
+        _state["stt"] = None
+        _state["wyoming_server"] = _state.get("wyoming_server")  # preserve existing listener ref
+
+        if config.stt.enabled:
+            from paramem.server.stt import WhisperSTT
+
+            # CPU pair — always loaded, permanently resident.
+            stt_cpu = WhisperSTT(
+                model_name=config.stt.cpu_fallback_model,
+                device="cpu",
+                compute_type="int8",
+                language=config.stt.language,
+                beam_size=config.stt.beam_size,
+                vad_filter=config.stt.vad_filter,
+            )
+            # Synchronous load (function is called from a thread on the apply
+            # path; _set_voice_pipeline_profile loads synchronously for the same
+            # reason).
+            if stt_cpu.load():
+                _state["stt_cpu"] = stt_cpu
+                logger.info("Local STT CPU: %s on cpu", config.stt.cpu_fallback_model)
+            else:
+                logger.warning(
+                    "Local STT CPU pair failed to load — voice path unavailable in cloud-only mode"
+                )
+
+            if not cloud_only:
+                # N3: flush allocator-pool before GPU STT load so vram_measure
+                # reads accurate free-memory (mirrors _set_voice_pipeline_profile).
+                safe_empty_cache()
+                stt_gpu = WhisperSTT(
+                    model_name=config.stt.model,
+                    device=config.stt.device,
+                    compute_type=config.stt.compute_type,
+                    language=config.stt.language,
+                    beam_size=config.stt.beam_size,
+                    vad_filter=config.stt.vad_filter,
+                )
+                if stt_gpu.load():
+                    _state["stt_gpu"] = stt_gpu
+                    logger.info(
+                        "Local STT GPU: Whisper %s on %s", config.stt.model, config.stt.device
+                    )
+                else:
+                    logger.warning("Local STT GPU pair failed to load")
+        else:
+            logger.info("Local STT: disabled")
+
+        if config.tts.enabled:
+            from paramem.server.tts import TTSManager
+
+            # CPU pair — always loaded.
+            tts_cpu = TTSManager(_build_cpu_tts_config(config.tts))
+            tts_cpu.load_all()
+            if tts_cpu.is_loaded:
+                _state["tts_cpu"] = tts_cpu
+                logger.info("Local TTS CPU: %s", ", ".join(tts_cpu.available_languages))
+            else:
+                logger.warning(
+                    "Local TTS CPU pair failed to load — voice path unavailable in cloud-only mode"
+                )
+
+            if not cloud_only:
+                tts_gpu = TTSManager(config.tts)
+                tts_gpu.load_all()
+                if tts_gpu.is_loaded:
+                    _state["tts_gpu"] = tts_gpu
+                    logger.info("Local TTS GPU: %s", ", ".join(tts_gpu.available_languages))
+                else:
+                    logger.warning("Local TTS GPU pair failed to load")
+        else:
+            logger.info("Local TTS: disabled")
+
+        # Seed voice_box and voice_profile based on startup/apply mode.
+        _active_stt = _state.get("stt_gpu") if not cloud_only else _state.get("stt_cpu")
+        _active_tts = _state.get("tts_gpu") if not cloud_only else _state.get("tts_cpu")
+        if _active_stt is not None or _active_tts is not None:
+            _state["voice_box"] = {"stt": _active_stt, "tts_manager": _active_tts}
+            _state["stt"] = _active_stt
+            _state["tts_manager"] = _active_tts
+
+        _state["voice_profile"] = "cpu" if cloud_only else "gpu"
+        logger.info("Voice pipeline profile: %r", _state["voice_profile"])
+
+        # ── 4. SOTA agent + providers ─────────────────────────────────────────
+        _state["sota_agent"] = get_cloud_agent(config.sota_agent)
+        if _state["sota_agent"]:
+            logger.info(
+                "SOTA agent: %s (%s)",
+                config.sota_agent.provider,
+                config.sota_agent.model,
+            )
+        else:
+            logger.info("SOTA agent: not configured")
+
+        _state["sota_providers"] = {}
+        for name, provider_config in config.sota_providers.items():
+            agent = get_cloud_agent(provider_config)
+            if agent:
+                _state["sota_providers"][name] = agent
+                logger.info("SOTA provider registered: %s (%s)", name, provider_config.model)
+        logger.info("SOTA providers available: %s", list(_state["sota_providers"].keys()))
+
+        # ── 5. HA client + ha_graph ──────────────────────────────────────────
+        # Mandatory teardown (correction S-2): HAClient holds an httpx.Client pool.
+        # Close the OLD client before reassigning — else the pool leaks on every apply.
+        old_ha_client = _state.get("ha_client")
+        if old_ha_client is not None:
+            try:
+                old_ha_client.close()
+            except Exception:
+                logger.exception("HA client close failed during rebuild; pool may leak")
+
+        ha_graph = None
+        tools_config = config.tools
+        if tools_config.ha.url and tools_config.ha.token:
+            ha_client = HAClient(
+                url=tools_config.ha.url,
+                token=tools_config.ha.token,
+                timeout=tools_config.tool_timeout_seconds,
+            )
+            health = ha_client.health_check()
+            if health:
+                logger.info("HA client: connected to %s", tools_config.ha.url)
+                entity_count = ha_client.load_entity_map()
+                logger.info("HA entity map: %d entities", entity_count)
+                ha_services = ha_client.get_services()
+                ha_graph = HAEntityGraph.build(ha_client._raw_states, ha_services)
+            else:
+                logger.warning("HA client: configured but unreachable at %s", tools_config.ha.url)
+            _state["ha_client"] = ha_client
+        else:
+            _state["ha_client"] = None
+            logger.info("HA tools: not configured")
+
+        _state["ha_graph"] = ha_graph
+    else:
+        # Plain reclaim path (full_rebuild=False): keep existing STT/TTS managers
+        # and ha_graph — config did not change, no network reconnect needed
+        # (correction S1).
+        ha_graph = _state.get("ha_graph")
+        logger.info(
+            "_build_config_derived_state: plain reclaim — skipping STT/TTS/HA/SOTA/exemplar "
+            "rebuild (full_rebuild=False, same config)"
+        )
+
+    # ── 6. Memory store preload ───────────────────────────────────────────────
+    # D6 gate: re-probe only when (a) the cache is cold (boot_degraded set or
+    # store is None/empty), or (b) called from the apply path (caller sets
+    # _state["_apply_config_in_progress"] = True before calling this routine
+    # and clears it after).  On a plain reclaim with a warm store, still
+    # rebuild the Router cheaply but skip the probe.
+    _do_probe = (
+        _state.get("boot_degraded") is not None
+        or _state.get("memory_store") is None
+        or _state.get("_apply_config_in_progress", False)
+    )
+
+    if _do_probe:
+        memory_store = _preload_memory_store(
+            config,
+            model=_state.get("model"),
+            tokenizer=_state.get("tokenizer"),
+        )
+        _state["memory_store"] = memory_store
+    else:
+        # Warm store survives — keep it, just rebuild the Router below.
+        logger.info(
+            "_build_config_derived_state: warm store present (boot_degraded=None) — "
+            "skipping re-probe (D6 gate); rebuilding router only"
+        )
+        memory_store = _state["memory_store"]
+
+    # ── 7. Router ────────────────────────────────────────────────────────────
+    # Router must be rebuilt AFTER ha_graph (step 5 / or preserved from _state)
+    # because it captures ha_graph.
+    _state["router"] = QueryRouter(
+        adapter_dir=config.adapter_dir,
+        memory_store=memory_store,
+        ha_graph=ha_graph,
+        intent_config=config.intent,
+    )
+
+    # ── 8. Exemplar banks + classifier model ──────────────────────────────────
+    # set_classifier_model runs on ALL paths so the freshly reloaded model handle
+    # is registered after every model load.  Exemplar banks (load_encoder +
+    # load_exemplars) run only on full_rebuild (config may have changed).
+    if not cloud_only:
+        from paramem.server.intent import set_classifier_model
+
+        if full_rebuild:
+            from paramem.server.intent import (
+                load_encoder,
+                load_exemplars,
+            )
+
+            encoder_handle = load_encoder(config.intent)
+            if encoder_handle is not None:
+                load_exemplars(config.intent, encoder_handle)
+
+        # Register the local LLM for intent.mode=llm classification.
+        # BASE-MODEL HOLDER (function-local _classifier_model /
+        # _classifier_tokenizer): drop them immediately — the routine's frame
+        # collapses on return, but being explicit mirrors the lifespan pattern
+        # (lifespan is a suspended generator; this function is not, but
+        # clarity is load-bearing for holder audits).
+        _classifier_model = _state.get("model")
+        _classifier_tokenizer = _state.get("tokenizer")
+        if _classifier_model is not None and _classifier_tokenizer is not None:
+            set_classifier_model(_classifier_model, _classifier_tokenizer)
+        _classifier_model = None
+        _classifier_tokenizer = None
+
+        if full_rebuild:
+            from paramem.server.sentence_type import (
+                load_exemplars as load_sentence_type_exemplars,
+            )
+
+            load_sentence_type_exemplars(config.sentence_type)
+
+            from paramem.server.personal_referent import (
+                load_exemplars as load_personal_referent_exemplars,
+            )
+
+            load_personal_referent_exemplars(config.personal_referent)
+
+    # ── 9. language_tracker + lang_id ────────────────────────────────────────
+    # Only on full_rebuild: plain reclaim keeps the existing tracker (same config).
+    if full_rebuild:
+        from paramem.server.language_tracker import LanguageTracker
+
+        _state["language_tracker"] = LanguageTracker(
+            store_path=config.paths.data / "observed_languages.json",
+            ha_client=_state.get("ha_client"),
+        )
+
+        if config.text_lang_detection.enabled:
+            from paramem.server import lang_id
+
+            lang_id.load_at_startup(config.text_lang_detection.model_path)
+
+
 def _load_model_into_state(config) -> None:
     """Load base model + adapters into ``_state`` without retaining the
     handles in the caller's frame.
@@ -3306,7 +3702,10 @@ def _load_model_into_state(config) -> None:
     del model, tokenizer
 
 
-def _live_reload_base_model() -> None:
+def _live_reload_base_model(
+    refresh_config_from_disk: bool = False,
+    rebuild_session_buffer: bool = False,
+) -> None:
     """Release+reload the base model in-process to recover device memory.
 
     Used as the recovery path when STT cannot reload post-cycle because
@@ -3325,14 +3724,81 @@ def _live_reload_base_model() -> None:
     snapshots.
 
     Caller responsibilities:
-    - Must hold ``gpu_lock_sync()`` so STT/TTS audio paths and other
-      GPU consumers wait.
+    - ``_apply_config_live`` holds ``gpu_lock_sync()`` around this call and
+      MUST NOT be re-acquired internally (``threading.Lock`` is non-reentrant —
+      double-acquire from auto-reclaim / apply paths deadlocks).  Plain
+      ``/gpu/acquire`` dispatches this WITHOUT holding ``gpu_lock`` (correction
+      N-1, verified at ``app.py:3196``); only auto-reclaim and
+      ``_apply_config_live`` hold it.  Therefore this function must NOT acquire
+      the lock internally.
     - Must accept ~25-30 s of model-load latency. Mode is flipped to
       cloud-only for the duration so any concurrent /chat handler
       routes to SOTA rather than crashing on a None model.
+
+    Parameters
+    ----------
+    refresh_config_from_disk:
+        When ``True`` (the config-apply path, called from
+        ``_apply_config_live``):
+
+        - Re-read ``_state["config"]`` from disk via ``load_server_config``
+          **before** ``_release_base_model_in_process`` — so the new config is
+          committed before the release (recoverable if the reload then fails).
+        - After a successful ``_load_model_into_state``, call
+          ``_build_config_derived_state(config, cloud_only=False,
+          full_rebuild=True)`` to rebuild ALL config-derived components
+          (memory store preload, router, exemplar banks, STT/TTS managers,
+          ha_client/ha_graph, etc.).
+        - Flip ``_state["mode"]="local"`` ONLY after a clean full rebuild +
+          preload.
+        - On rebuild/preload failure: stay cloud-only, set
+          ``cloud_only_reason`` to ``"preload_failed"`` or ``"apply_failed"``.
+
+        When ``False`` (plain ``/gpu/acquire`` + auto-reclaim, same config):
+
+        - Model reload + ``set_classifier_model`` (to register the new handle).
+        - ``_build_config_derived_state`` is called with ``full_rebuild=False``
+          (rebuilds memory-store probe [D6-gated] + Router re-point only).
+          STT/TTS, HA reconnect, exemplar banks, and language_tracker are
+          skipped — same config, no delta (correction S1).
+    rebuild_session_buffer:
+        Threaded from ``_apply_config_live`` (correction S3): ``True`` when
+        ``retain_sessions`` or ``debug`` changed between config A and config B,
+        so the ``SessionBuffer`` is rebuilt.  Always ``False`` on the plain
+        reclaim path (``refresh_config_from_disk=False``) — the session config
+        did not change.
+
+    Note on the synchronous maintenance guard (correction S-4, §3.12):
+    When ``refresh_config_from_disk=True`` the CALLER (``_apply_config_live``)
+    sets ``_state["mode"]="cloud-only"`` + ``cloud_only_reason="live_reload"``
+    on the event loop BEFORE dispatching this function via ``run_in_executor``,
+    so the scheduler's ``mode != "local"`` defer at ``app.py:6831`` fires.
+    This function is NOT responsible for setting that guard.
     """
+    # When refreshing config from disk, load the new config BEFORE releasing
+    # the model — so the new config is committed to _state even if the reload
+    # then fails (partial-rebuild recovery per §3.15: _state["config"] is
+    # already B, so the next /gpu/acquire or restart rebuilds coherently).
+    if refresh_config_from_disk:
+        config_path = _state.get("config_path")
+        if config_path:
+            new_config = load_server_config(Path(config_path))
+            _state["config"] = new_config
+            logger.info(
+                "Live config refresh: loaded config from %s before model release",
+                config_path,
+            )
+        else:
+            logger.warning(
+                "refresh_config_from_disk=True but config_path is not set — "
+                "proceeding with current in-memory config"
+            )
+
     config = _state["config"]
-    logger.info("Live model reload — releasing and reloading base model in-process")
+    logger.info(
+        "Live model reload (refresh_config=%s) — releasing and reloading base model in-process",
+        refresh_config_from_disk,
+    )
     _state["mode"] = "cloud-only"
     _state["cloud_only_reason"] = "live_reload"
 
@@ -3352,24 +3818,28 @@ def _live_reload_base_model() -> None:
     _release_base_model_in_process()
 
     # (a) Look before you leap: refuse the load when the live GPU budget
-    # cannot fit the topology — reusing the SAME productive check the
-    # startup gate runs (``measure_external_vram`` snapshots device-wide
-    # occupancy via nvidia-smi, so it sees consumers in other WSL distros /
-    # the Windows host that the compute-app list cannot; ``enforce_live_budget``
-    # compares against the boot-time assessment). ``topology_assessment`` is
-    # None when boot couldn't assess (HF cache miss) → defer to the live
-    # load gate. Without this guard the reload OOMs and leaks.
+    # cannot fit the topology.  Use torch.cuda.mem_get_info() device-wide
+    # free directly — consistent with the boot drain-wait, and avoids
+    # nvidia-smi which false-frees exiting/lingering processes under WSL2
+    # (the documented host-crash cause; nvidia-smi was also used here
+    # previously via measure_external_vram).  The comparison is conservative
+    # in the correct direction: mem_get_info reports what the CUDA runtime
+    # actually sees as free, including WDDM reservations and any live
+    # external consumers on the device.
+    # ``topology_assessment`` is None when boot couldn't assess (HF cache
+    # miss) → defer to the live load gate.  Without this guard the reload
+    # OOMs and leaks.
     assessment = _state.get("topology_assessment")
-    if assessment is not None:
-        total_memory_bytes, external_bytes = measure_external_vram()
-        try:
-            enforce_live_budget(assessment, total_memory_bytes, external_bytes)
-        except ConfigurationError:
+    if assessment is not None and torch.cuda.is_available():
+        _reclaim_free_bytes = torch.cuda.mem_get_info(0)[0]
+        if _reclaim_free_bytes < assessment.required_bytes:
             _state["cloud_only_reason"] = "insufficient_vram"
             logger.warning(
-                "Live model reload skipped — live GPU budget cannot fit %s "
-                "(an external process holds the device); staying cloud-only, "
+                "Live model reload skipped — device-wide free %.2f GiB < "
+                "required %.2f GiB for %s; staying cloud-only, "
                 "will retry when VRAM frees.",
+                _reclaim_free_bytes / 2**30,
+                assessment.required_bytes / 2**30,
                 config.model_name,
             )
             return
@@ -3401,17 +3871,88 @@ def _live_reload_base_model() -> None:
         )
         return
 
-    # Re-register the local LLM for intent.mode=llm — the release cleared the
-    # classifier handle (holder 5). Symmetric with the lifespan; without this,
-    # intent classification would stay degraded to the encoder residual after
-    # a reclaim. (Voice pipeline is intentionally NOT touched here — the caller
-    # handles profile transitions via ``_set_voice_pipeline_profile``.)
-    from paramem.server.intent import set_classifier_model
+    if refresh_config_from_disk:
+        # Config-apply path: full component rebuild via the shared routine.
+        # Signal D6 gate that this is an apply (probe even when store is warm).
+        _state["_apply_config_in_progress"] = True
+        rebuild_failed = False
+        try:
+            # S3: rebuild_session_buffer is threaded from _apply_config_live
+            # (True when retain_sessions or debug changed between A and B).
+            _build_config_derived_state(
+                config,
+                cloud_only=False,
+                rebuild_session_buffer=rebuild_session_buffer,
+                full_rebuild=True,
+            )
+        except Exception:
+            logger.exception("Live config apply: _build_config_derived_state failed")
+            rebuild_failed = True
+        finally:
+            _state.pop("_apply_config_in_progress", None)
 
-    set_classifier_model(_state["model"], _state["tokenizer"])
-    _state["mode"] = "local"
-    _state["cloud_only_reason"] = None
-    logger.info("Live model reload — complete; mode=local")
+        if rebuild_failed:
+            _release_base_model_in_process()
+            _state["cloud_only_reason"] = "apply_failed"
+            logger.error(
+                "Live config apply: component rebuild failed — staying cloud-only. "
+                "Config is already on disk; restart or /gpu/acquire to retry."
+            )
+            return
+
+        # boot_degraded may have been set by _preload_memory_store inside
+        # _build_config_derived_state; check it.
+        if _state.get("boot_degraded") is not None:
+            # Partial preload — stay cloud-only, caller reports preload_failed.
+            _release_base_model_in_process()
+            _state["cloud_only_reason"] = "preload_failed"
+            logger.warning(
+                "Live config apply: preload partial — staying cloud-only. "
+                "Config is on disk; restart or /gpu/acquire will retry the probe."
+            )
+            return
+
+        # Full rebuild succeeded. The set_classifier_model call is now inside
+        # _build_config_derived_state (step 8 exemplar banks); no extra call here.
+        _state["mode"] = "local"
+        _state["cloud_only_reason"] = None
+        logger.info("Live config apply — complete; mode=local")
+    else:
+        # Plain reclaim path (same config): rebuild Router + classifier handle.
+        # D6 gate: _build_config_derived_state skips the expensive weight-probe
+        # when the store is warm (boot_degraded=None, memory_store non-None).
+        # _apply_config_in_progress is NOT set here.
+        rebuild_failed = False
+        try:
+            # S1: full_rebuild=False — plain reclaim rebuilds only the memory
+            # store (D6-gated), Router (re-point at warm store), and
+            # set_classifier_model (re-register the new model handle).
+            # STT/TTS construction, HA reconnect, sota_agent, exemplar banks,
+            # and language_tracker are skipped (same config, no delta).
+            _build_config_derived_state(
+                config,
+                cloud_only=False,
+                rebuild_session_buffer=False,
+                full_rebuild=False,
+            )
+        except Exception:
+            logger.exception(
+                "Live model reload: _build_config_derived_state failed; "
+                "intent/router may be stale until next reload or restart"
+            )
+            rebuild_failed = True
+
+        if not rebuild_failed:
+            _state["mode"] = "local"
+            _state["cloud_only_reason"] = None
+            logger.info("Live model reload — complete; mode=local")
+        else:
+            _release_base_model_in_process()
+            _state["cloud_only_reason"] = "reload_failed"
+            logger.error(
+                "Live model reload: component rebuild failed after successful model load — "
+                "released allocation, staying cloud-only."
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3510,6 +4051,372 @@ def _release_base_model_in_process() -> None:
     # running it again now that they're gone collapses the allocator
     # pool slack the cycle accumulated while the model was alive.
     safe_empty_cache()
+
+
+# GPU-lock timeout for _apply_config_live: long enough for a post-cycle lock
+# to release, short enough to avoid wedging the migration handler indefinitely.
+_APPLY_CONFIG_LOCK_TIMEOUT_S: float = 60.0
+
+
+def _apply_config_live() -> dict:
+    """Apply the on-disk ``configs/server.yaml`` to the running server in-process.
+
+    Acquires ``gpu_lock_sync`` with a bounded timeout, then:
+
+    1. Re-checks ``_state["consolidating"]`` under the lock (guards against a
+       pre-TRIAL cycle still running at accept/rollback time).
+    2. Performs a no-op skip when the on-disk config hash equals
+       ``_state["config_drift"]["loaded_hash"]`` (the hash of the config that
+       was active in memory when the server last booted or accepted a migration).
+       This is the rollback case — disk is back to A, memory is A.  Returns
+       immediately without GPU churn (correction S-6).
+
+       **WP2 precondition:** the accept handler MUST dispatch
+       ``_apply_config_live`` BEFORE refreshing ``config_drift.loaded_hash``
+       to config B.  If the refresh happens first, ``disk_hash == loaded_hash``
+       fires on the accept path and the apply is incorrectly skipped.
+       ``ServerConfig`` has no ``source_path`` attribute — the prior
+       implementation that computed ``mem_hash`` via that attribute was always
+       falling back to the live path, causing ``disk_hash == mem_hash`` on every
+       call (correction B1).
+    3. Detects R-PORT / R-PATHS carve deltas (§3.14):
+
+       - ``stt.port`` / ``tts.port`` change → R-PORT carve:
+         ``restart_required_reason in {"stt_port_change", "tts_port_change"}``.
+         Performs a transient ``socket.bind`` pre-flight on the new port(s); on
+         bind failure returns ``restart_eligible=False`` + a "port in use"
+         reason.  On bind success returns ``restart_eligible=True`` so the
+         CLI can prompt the operator and fire ``restart_hint`` via subprocess
+         on consent.  ``_apply_config_live`` itself never calls
+         ``_restart_service``.  ``auto_restart_scheduled`` is always ``False``
+         (kept for backward compatibility; use ``restart_eligible`` instead).
+       - ``paths.sessions`` / ``paths.data`` change → R-PATHS carve:
+         short-circuits BEFORE any live reload.
+         ``restart_required_reason="paths_change"``, ``restart_eligible=False``.
+         Data is NOT migrated automatically; operator must move adapters,
+         registry, and sessions to the new root before restarting.
+       - Mixed deltas (carve + non-carve fields): apply non-carve fields live
+         first, then signal the carve.  A ``paths.*`` mix is always
+         manual-restart regardless of other fields.
+
+    4. Calls ``_live_reload_base_model(refresh_config_from_disk=True)`` for
+       non-carve fields.
+    5. On ``mode==local`` after the rebuild, calls
+       ``_set_voice_pipeline_profile("gpu")`` (no-op if already gpu).
+
+    **Caller contract (correction S-4 / §3.12):**
+    The CALLER must set the synchronous maintenance guard on the event loop
+    BEFORE dispatching this function via ``run_in_executor``:
+
+    .. code-block:: python
+
+        _state["mode"] = "cloud-only"
+        _state["cloud_only_reason"] = "live_reload"
+        await loop.run_in_executor(None, _apply_config_live)
+
+    This ensures the scheduler's ``mode != "local"`` defer at ``app.py:6831``
+    fires before the executor runs.  This function does NOT set the guard
+    internally (it runs in an executor thread, not on the event loop).
+
+    **Lock contract (correction N-1):**
+    This function acquires ``gpu_lock_sync`` internally (bounded timeout).
+    ``_live_reload_base_model`` must NOT acquire it again — double-acquire on
+    the non-reentrant ``threading.Lock`` deadlocks.
+
+    Returns
+    -------
+    dict
+        ``{
+            "applied_live": bool,
+            "cloud_only_reason": str | None,
+            "restart_required_reason": str | None,
+            "auto_restart_scheduled": bool,
+            "restart_eligible": bool,
+            "skipped": str | None,
+        }``
+
+        ``restart_eligible`` is ``True`` when an R-PORT carve pre-flighted
+        successfully and the CLI may trigger a prompted restart via
+        ``restart_hint``.  The server never fires the restart itself.
+        ``auto_restart_scheduled`` is always ``False`` (kept for backward
+        compatibility).
+    """
+    import socket as _socket
+
+    from paramem.server.drift import compute_config_hash
+    from paramem.server.gpu_lock import gpu_lock_sync
+
+    # ── acquire GPU lock with bounded timeout (N1) ───────────────────────────
+    # Guard just the `__enter__` with try/except TimeoutError so the lock
+    # cannot leak if entry raises.  The `with` form handles `__exit__` on
+    # ALL exits from the body (normal, exception, return) without a
+    # separate `finally` that might fire when `__enter__` never succeeded.
+    lock_ctx = gpu_lock_sync(timeout=_APPLY_CONFIG_LOCK_TIMEOUT_S)
+    try:
+        lock_ctx.__enter__()
+    except TimeoutError:
+        logger.error(
+            "_apply_config_live: could not acquire GPU lock within %ss — apply aborted; "
+            "config is on disk, restart to apply",
+            _APPLY_CONFIG_LOCK_TIMEOUT_S,
+        )
+        return {
+            "applied_live": False,
+            "cloud_only_reason": _state.get("cloud_only_reason"),
+            "restart_required_reason": "lock_timeout",
+            "auto_restart_scheduled": False,
+            "restart_eligible": False,
+            "skipped": None,
+        }
+
+    try:
+        # ── re-check consolidating under the lock (correction S-5) ────────────
+        if _state.get("consolidating", False):
+            logger.warning(
+                "_apply_config_live: a consolidation cycle is still running — "
+                "apply aborted; config is on disk, restart or retry to apply"
+            )
+            return {
+                "applied_live": False,
+                "cloud_only_reason": _state.get("cloud_only_reason"),
+                "restart_required_reason": "consolidating",
+                "auto_restart_scheduled": False,
+                "restart_eligible": False,
+                "skipped": None,
+            }
+
+        # ── no-op skip (correction S-6 / §3.14) ─────────────────────────────
+        config_path_str = _state.get("config_path")
+        config_a = _state.get("config")
+        live_config_path = Path(config_path_str) if config_path_str else Path("configs/server.yaml")
+        if live_config_path.exists():
+            disk_hash = compute_config_hash(live_config_path)
+            # Compare the on-disk hash against the hash of config A that was
+            # captured at boot (or at the last accept).  ``ServerConfig`` has
+            # NO ``source_path`` attribute; the in-memory hash is tracked in
+            # ``_state["config_drift"]["loaded_hash"]`` (set by
+            # ``initial_drift_state`` at boot, refreshed by the accept handler,
+            # intentionally NOT refreshed by rollback).  Using the on-disk file
+            # as a proxy for the in-memory hash is wrong whenever the on-disk
+            # file was swapped by a TRIAL write (disk = B, memory = A) — both
+            # paths would hash B and the skip would fire on every accept call.
+            #
+            # WP2 precondition (document, do not implement here): the accept
+            # handler MUST read and capture ``loaded_hash`` BEFORE refreshing it
+            # to config B, then dispatch ``_apply_config_live`` with the
+            # pre-refresh hash still in ``_state["config_drift"]["loaded_hash"]``.
+            # If WP2 refreshes ``loaded_hash`` BEFORE dispatching the apply,
+            # disk_hash == loaded_hash would fire on the accept path and the
+            # no-op skip would wrongly suppress the rebuild.
+            loaded_hash = (_state.get("config_drift") or {}).get("loaded_hash")
+            if disk_hash and loaded_hash and disk_hash == loaded_hash:
+                logger.info(
+                    "_apply_config_live: disk hash == memory hash — no-op skip "
+                    "(rollback restored prior config; no GPU churn)"
+                )
+                return {
+                    "applied_live": True,
+                    "cloud_only_reason": None,
+                    "restart_required_reason": None,
+                    "auto_restart_scheduled": False,
+                    "restart_eligible": False,
+                    "skipped": "no_change",
+                }
+
+        # ── config-A-vs-B carve classification (§3.14) ─────────────────────
+        # Load config B from disk without committing it yet.
+        config_b = None
+        if live_config_path.exists():
+            try:
+                config_b = load_server_config(live_config_path)
+            except Exception:
+                logger.exception(
+                    "_apply_config_live: failed to load config B from disk for carve diff"
+                )
+
+        restart_required_reason: str | None = None
+        restart_eligible: bool = False
+
+        if config_a is not None and config_b is not None:
+            # R-PORT check: stt.port / tts.port delta
+            stt_port_changed = getattr(getattr(config_b, "stt", None), "port", None) != getattr(
+                getattr(config_a, "stt", None), "port", None
+            )
+            tts_port_changed = getattr(getattr(config_b, "tts", None), "port", None) != getattr(
+                getattr(config_a, "tts", None), "port", None
+            )
+
+            # R-PATHS check: paths.sessions / paths.data delta
+            paths_a = getattr(config_a, "paths", None)
+            paths_b = getattr(config_b, "paths", None)
+            sessions_changed = str(getattr(paths_b, "sessions", "")) != str(
+                getattr(paths_a, "sessions", "")
+            )
+            data_changed = str(getattr(paths_b, "data", "")) != str(getattr(paths_a, "data", ""))
+            paths_changed = sessions_changed or data_changed
+
+            if paths_changed:
+                # R-PATHS carve: short-circuit BEFORE any live reload.
+                # A paths.* change cannot be applied live — the session buffer,
+                # memory store, and speaker store are all rooted at paths.data.
+                # Re-pointing them live while the session buffer stays at the old
+                # path creates a split-brain.  Leave config B on disk; the
+                # operator must move data to the new root and restart manually.
+                logger.info(
+                    "_apply_config_live: R-PATHS carve detected (paths.sessions or paths.data "
+                    "changed) — short-circuiting BEFORE live reload; manual restart required; "
+                    "data not migrated automatically"
+                )
+                return {
+                    "applied_live": False,
+                    "cloud_only_reason": _state.get("cloud_only_reason"),
+                    "restart_required_reason": "paths_change",
+                    "auto_restart_scheduled": False,
+                    "restart_eligible": False,
+                    "skipped": None,
+                }
+
+            elif stt_port_changed or tts_port_changed:
+                # R-PORT carve: pre-flight bind check on new port(s).
+                reason_parts = []
+                if stt_port_changed:
+                    reason_parts.append("stt_port_change")
+                if tts_port_changed:
+                    reason_parts.append("tts_port_change")
+                carve_reason = reason_parts[0] if len(reason_parts) == 1 else ",".join(reason_parts)
+
+                # Pre-flight: attempt transient bind on each new port.
+                port_in_use_reason: str | None = None
+                for _field, _changed, _cfg in [
+                    ("stt.port", stt_port_changed, config_b.stt),
+                    ("tts.port", tts_port_changed, config_b.tts),
+                ]:
+                    if not _changed:
+                        continue
+                    new_port = getattr(_cfg, "port", None)
+                    if new_port is None:
+                        continue
+                    host = getattr(getattr(config_b, "server", None), "host", "0.0.0.0")
+                    try:
+                        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                        _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                        _s.bind((host, new_port))
+                        _s.close()
+                    except OSError as _e:
+                        port_in_use_reason = f"{_field}={new_port} is not bindable: {_e}"
+                        break
+
+                if port_in_use_reason:
+                    logger.warning(
+                        "_apply_config_live: R-PORT pre-flight failed — %s; "
+                        "restart not eligible; free the port and restart manually",
+                        port_in_use_reason,
+                    )
+                    return {
+                        "applied_live": False,
+                        "cloud_only_reason": _state.get("cloud_only_reason"),
+                        "restart_required_reason": carve_reason,
+                        "auto_restart_scheduled": False,
+                        "restart_eligible": False,
+                        "skipped": None,
+                        "port_in_use_reason": port_in_use_reason,
+                    }
+
+                # Pre-flight passed.  Detect whether this is a pure-port-only delta
+                # (no non-carve fields differ) or a mixed delta.
+                # Pure port delta: skip the model reload entirely — reloading the model
+                # does NOT apply a port change (the listener socket is already bound).
+                # Mixed delta: apply non-carve fields live first (fall through to reload),
+                # then signal the carve to the caller.
+                import dataclasses as _dc  # noqa: PLC0415
+
+                try:
+                    # Build port-normalised copies: reset both port fields to a
+                    # canonical sentinel (0) on both sides, then compare.  If the
+                    # normalised configs are equal, only the port(s) differ.
+                    _stt_a = _dc.replace(config_a.stt, port=0)
+                    _stt_b = _dc.replace(config_b.stt, port=0)
+                    _tts_a = _dc.replace(config_a.tts, port=0)
+                    _tts_b = _dc.replace(config_b.tts, port=0)
+                    _a_norm = _dc.replace(config_a, stt=_stt_a, tts=_tts_a)
+                    _b_norm = _dc.replace(config_b, stt=_stt_b, tts=_tts_b)
+                    pure_port_delta = _a_norm == _b_norm
+                except Exception:
+                    # dataclasses.replace or __eq__ not available (e.g. mock in tests) —
+                    # conservatively assume mixed so we don't skip a needed reload.
+                    pure_port_delta = False
+
+                logger.info(
+                    "_apply_config_live: R-PORT carve (%s) — pre-flight passed; "
+                    "restart_eligible=True; pure_port_delta=%s "
+                    "(server does NOT self-fire restart — CLI prompts operator)",
+                    carve_reason,
+                    pure_port_delta,
+                )
+                restart_required_reason = carve_reason
+                restart_eligible = True
+
+                if pure_port_delta:
+                    # Pure port: the model reload would not apply the port change
+                    # (the listener socket is already bound).  Short-circuit.
+                    return {
+                        "applied_live": False,
+                        "cloud_only_reason": _state.get("cloud_only_reason"),
+                        "restart_required_reason": restart_required_reason,
+                        "auto_restart_scheduled": False,
+                        "restart_eligible": True,
+                        "skipped": None,
+                    }
+                # Mixed delta: fall through to reload; carve signalled in return dict.
+
+        # ── S3: compute retain_sessions / debug delta → rebuild_session_buffer ─
+        # Compare config A (in-memory, pre-apply) against config B (on-disk,
+        # already loaded above).  If either field changed, the SessionBuffer must
+        # be rebuilt so the new retention / debug semantics take effect.
+        _rebuild_session_buf = False
+        if config_a is not None and config_b is not None:
+            retain_a = getattr(getattr(config_a, "consolidation", None), "retain_sessions", None)
+            retain_b = getattr(getattr(config_b, "consolidation", None), "retain_sessions", None)
+            debug_a = getattr(config_a, "debug", None)
+            debug_b = getattr(config_b, "debug", None)
+            _rebuild_session_buf = (retain_a != retain_b) or (debug_a != debug_b)
+            if _rebuild_session_buf:
+                logger.info(
+                    "_apply_config_live: retain_sessions or debug changed "
+                    "(retain: %r→%r, debug: %r→%r) — session buffer will be rebuilt",
+                    retain_a,
+                    retain_b,
+                    debug_a,
+                    debug_b,
+                )
+
+        # ── full live apply: reload model + rebuild all components ────────────
+        _live_reload_base_model(
+            refresh_config_from_disk=True,
+            rebuild_session_buffer=_rebuild_session_buf,
+        )
+
+        if _state.get("mode") == "local":
+            # Voice pipeline was set by _build_config_derived_state inside
+            # _live_reload_base_model; final no-op profile flip to confirm gpu.
+            _set_voice_pipeline_profile("gpu", lock_held=True)
+            applied_live = True
+        else:
+            # Model reload or component rebuild failed; _live_reload_base_model
+            # set cloud_only_reason appropriately.
+            applied_live = False
+
+        return {
+            "applied_live": applied_live,
+            "cloud_only_reason": _state.get("cloud_only_reason"),
+            "restart_required_reason": restart_required_reason,
+            "auto_restart_scheduled": False,  # server never self-fires restart
+            "restart_eligible": restart_eligible if applied_live else False,
+            "skipped": None,
+        }
+
+    finally:
+        lock_ctx.__exit__(None, None, None)
 
 
 @app.post("/gpu/release")
@@ -5340,8 +6247,42 @@ async def migration_accept():
                 shutil.rmtree(_tg, ignore_errors=True)
                 logger.debug("accept: trial graph deleted post-accept (transient by design)")
 
-        # --- Step 5: Refresh drift state + set restart banner (REQUIRED FIX 3) ---
-        # Replace the full ConfigDriftState dict, not just loaded_hash.
+        # --- Step 5: Apply config live + refresh drift state + set banner ---
+        # WP2 / B-1 precondition: _apply_config_live compares disk_hash against
+        # config_drift["loaded_hash"] (hash of config A, captured at boot).
+        # The drift refresh below must happen AFTER _apply_config_live so the
+        # no-op skip (disk_hash == loaded_hash) does not fire on the accept path.
+        #
+        # Apply ordering:
+        #  a) Set synchronous maintenance guard BEFORE dispatching executor (S-4):
+        #     mode="cloud-only" so the scheduler's mode != "local" defer fires
+        #     during the brief window between migration-state reset and apply.
+        #  b) Dispatch _apply_config_live via run_in_executor (runs synchronously
+        #     from the accept handler's perspective — we await the result).
+        #  c) Refresh config_drift AFTER a successful apply (loaded_hash now B).
+        #  d) Build the banner and response.  The server does NOT fire _restart_service
+        #     for R-PORT; the CLI prompts the operator and runs the restart_hint command.
+
+        # a) Synchronous maintenance guard (correction S-4).
+        _state["mode"] = "cloud-only"
+        _state["cloud_only_reason"] = "live_reload"
+
+        # b) Dispatch apply (run_in_executor so the async handler does not block
+        #    the event loop during the ~25-30 s GPU reload; TestClient runs sync).
+        loop = asyncio.get_running_loop()
+        apply_result = await loop.run_in_executor(None, _apply_config_live)
+
+        applied_live: bool = apply_result.get("applied_live", False)
+        apply_reason: str | None = apply_result.get("restart_required_reason")
+        auto_restart_scheduled: bool = False  # server never self-fires restart
+        restart_eligible: bool = apply_result.get("restart_eligible", False)
+
+        # c) Refresh config_drift AFTER the apply.
+        # When applied_live=True the loaded_hash is now B (the apply updated it
+        # via _live_reload_base_model → load_server_config).  When applied_live=False
+        # the config is on disk (B) but still needs a restart — refresh drift so the
+        # drift detector does not re-alarm (drift detected=False; loaded_hash still A
+        # is the honest state, but the file IS on disk so disk_hash=B is correct).
         if _state.get("config_path") and live_config_path.exists():
             try:
                 new_hash = compute_config_hash(live_config_path)
@@ -5354,26 +6295,72 @@ async def migration_accept():
             except OSError as exc:
                 logger.warning("accept: could not compute new config hash: %s", exc)
 
-        restart_banner = (
-            "Migration: RESTART REQUIRED — new configuration takes effect on server restart"
-        )
-        if rotation_incomplete:
-            restart_banner = (
-                "Migration: RESTART REQUIRED — new configuration takes effect on server restart; "
-                "ARCHIVE INCOMPLETE — trial adapter not fully rotated, archive manually"
+        # d) Build banner — replace "RESTART REQUIRED" with "applied live" on success.
+        if applied_live and apply_reason is None:
+            # Full live apply succeeded; no restart needed.
+            if rotation_incomplete:
+                banner = (
+                    "Migration: applied live (no restart required); "
+                    "ARCHIVE INCOMPLETE — trial adapter not fully rotated, archive manually"
+                )
+            else:
+                banner = "Migration: applied live — new configuration is active"
+        elif applied_live and apply_reason == "paths_change":
+            # Mixed delta: non-path fields applied live; paths carve needs manual restart.
+            banner = (
+                "Migration: partial live apply — non-path fields active; "
+                "path change on disk, effective on NEXT restart; "
+                "DATA IS NOT MIGRATED — move adapters/registry/sessions "
+                "to the new path before restarting"
             )
+        elif apply_reason in ("stt_port_change", "tts_port_change"):
+            if restart_eligible:
+                # Port pre-flighted successfully; CLI will prompt operator for consent.
+                banner = (
+                    f"Migration: RESTART REQUIRED — port change ({apply_reason}); "
+                    "restart via the CLI or run the restart_hint command manually"
+                )
+            else:
+                # Port was in use — pre-flight declined.
+                port_in_use = apply_result.get("port_in_use_reason", "port in use")
+                banner = (
+                    f"Migration: {apply_reason} — port not bindable ({port_in_use}); "
+                    "free the port and restart manually"
+                )
+        elif apply_reason == "paths_change":
+            # Pure paths carve (short-circuited before live reload).
+            banner = (
+                "Migration: RESTART REQUIRED — path change on disk, effective on NEXT restart; "
+                "DATA IS NOT MIGRATED — move adapters/registry/sessions "
+                "to the new path before restarting"
+            )
+            if rotation_incomplete:
+                banner += "; ARCHIVE INCOMPLETE — trial adapter not fully rotated, archive manually"
+        else:
+            # Apply failed or other reason — keep RESTART REQUIRED banner.
+            banner = (
+                "Migration: RESTART REQUIRED — new configuration takes effect on server restart"
+            )
+            if rotation_incomplete:
+                banner += "; ARCHIVE INCOMPLETE — trial adapter not fully rotated, archive manually"
 
         # Reset migration state to LIVE, preserving recovery_required.
         prior_recovery = list(migration.get("recovery_required") or [])
         _state["migration"] = initial_migration_state()
-        _state["migration"]["recovery_required"] = prior_recovery + [restart_banner]
+        _state["migration"]["recovery_required"] = prior_recovery + [banner]
+
+        restart_required = not applied_live or (apply_reason is not None)
 
         return AcceptResponse(
             state="LIVE",
             trial_adapter_archive_path=archive_path,
-            restart_required=True,
+            restart_required=restart_required,
             restart_hint=_RESTART_HINT,
             pre_migration_backup_retained=True,
+            applied_live=applied_live,
+            restart_required_reason=apply_reason,
+            auto_restart_scheduled=auto_restart_scheduled,
+            restart_eligible=restart_eligible,
         )
 
 
@@ -5728,18 +6715,69 @@ async def migration_rollback():
                 shutil.rmtree(_tg, ignore_errors=True)
                 logger.debug("rollback: trial graph deleted post-rollback (transient by design)")
 
-        # --- Step 7: Append restart banner ---
-        restart_banner = (
-            "Migration: RESTART REQUIRED — rollback renamed configs/server.yaml; "
-            "restart to clear recovery banner"
-        )
-        # NOTE: do NOT refresh config_drift — in-memory config still matches A;
-        # the drift loop stays coherent (spec: rollback handler does not refresh drift).
+        # --- Step 7: Apply config live (no-op skip for rollback) ---
+        # WP2 / S-6: rollback restored disk to A and config_drift["loaded_hash"]
+        # is still A (rollback does NOT refresh drift — see comment at step 6240).
+        # So _apply_config_live will take the no-op skip (disk_hash == loaded_hash)
+        # and return applied_live=True, skipped="no_change" without GPU churn.
+        #
+        # Synchronous maintenance guard (correction S-4) — set before dispatching.
+        _state["mode"] = "cloud-only"
+        _state["cloud_only_reason"] = "live_reload"
 
-        # --- Step 8: Reset migration state to LIVE ---
+        loop = asyncio.get_running_loop()
+        apply_result = await loop.run_in_executor(None, _apply_config_live)
+
+        applied_live: bool = apply_result.get("applied_live", False)
+        apply_reason: str | None = apply_result.get("restart_required_reason")
+        restart_eligible: bool = apply_result.get("restart_eligible", False)
+
+        # NOTE: do NOT refresh config_drift for rollback — in-memory config already
+        # matches A; the drift loop stays coherent (config_drift.loaded_hash is A).
+        # The no-op skip confirmed the apply; no hash update needed.
+
+        # --- Step 8: Build banner + reset migration state to LIVE ---
+        if applied_live and apply_reason is None:
+            # No-op skip: config A already applied, no restart needed.
+            restart_banner = (
+                "Migration: rolled back — config A is already active; no restart required"
+            )
+        elif applied_live and apply_reason == "paths_change":
+            restart_banner = (
+                "Migration: partial rollback live apply — non-path fields active; "
+                "path change on disk, effective on NEXT restart; "
+                "DATA IS NOT MIGRATED — move adapters/registry/sessions before restarting"
+            )
+        elif apply_reason in ("stt_port_change", "tts_port_change"):
+            if restart_eligible:
+                # Port pre-flighted; CLI will prompt operator.
+                restart_banner = (
+                    f"Migration: RESTART REQUIRED — port change ({apply_reason}); "
+                    "restart via the CLI or run the restart_hint command manually"
+                )
+            else:
+                port_in_use = apply_result.get("port_in_use_reason", "port in use")
+                restart_banner = (
+                    f"Migration: RESTART REQUIRED — {apply_reason}: {port_in_use}; "
+                    "free the port and restart manually"
+                )
+        elif apply_reason == "paths_change":
+            restart_banner = (
+                "Migration: RESTART REQUIRED — rollback renamed configs/server.yaml; "
+                "path change on disk, effective on NEXT restart; "
+                "DATA IS NOT MIGRATED — move adapters/registry/sessions before restarting"
+            )
+        else:
+            restart_banner = (
+                "Migration: RESTART REQUIRED — rollback renamed configs/server.yaml; "
+                "restart to clear recovery banner"
+            )
+
         prior_recovery = list(migration.get("recovery_required") or [])
         _state["migration"] = initial_migration_state()
         _state["migration"]["recovery_required"] = prior_recovery + [restart_banner]
+
+        restart_required = not applied_live or (apply_reason is not None)
 
         if rotation_failed:
             # HTTP 207 Multi-Status: primary action succeeded, rotation failed.
@@ -5747,8 +6785,12 @@ async def migration_rollback():
                 "state": "LIVE",
                 "trial_adapter_archive_path": archive_path,
                 "rollback_pre_mortem_backup_path": rollback_pre_mortem_path,
-                "restart_required": True,
+                "restart_required": restart_required,
                 "restart_hint": _RESTART_HINT,
+                "applied_live": applied_live,
+                "restart_required_reason": apply_reason,
+                "auto_restart_scheduled": False,
+                "restart_eligible": restart_eligible,
                 "archive_warning": {
                     "path": archive_path,
                     "message": (
@@ -5767,8 +6809,12 @@ async def migration_rollback():
             state="LIVE",
             trial_adapter_archive_path=archive_path,
             rollback_pre_mortem_backup_path=rollback_pre_mortem_path,
-            restart_required=True,
+            restart_required=restart_required,
             restart_hint=_RESTART_HINT,
+            applied_live=applied_live,
+            restart_required_reason=apply_reason,
+            auto_restart_scheduled=False,
+            restart_eligible=restart_eligible,
         )
 
 

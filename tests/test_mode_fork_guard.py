@@ -44,10 +44,12 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/training/consolidation.py", "_prepare_procedural_keys_for_tier"),
         ("paramem/training/consolidation.py", "_run_indexed_key_procedural"),
         # server — hydration, extraction dispatch, training dispatch
-        ("paramem/server/app.py", "lifespan"),
         ("paramem/server/app.py", "_run_extraction_phase"),
         ("paramem/server/app.py", "_extract_and_start_training"),
         ("paramem/server/app.py", "_run_full_cycle"),
+        # WP1: memory store preload source selection (consolidation.mode, not runtime mode)
+        # The lifespan's inline preload was extracted here; lifespan no longer forks on mode.
+        ("paramem/server/app.py", "_preload_memory_store"),
         # migration tooling — mode-switch detection and graph migration
         ("paramem/server/active_store_migration.py", "detect_mode_switch"),
         ("paramem/server/active_store_migration.py", "migrate"),
