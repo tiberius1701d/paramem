@@ -1350,6 +1350,213 @@ def _run_phase_b_only() -> bool:
     return _drive_systemd_boot_from_temp_root(keep=False)
 
 
+# ---------------------------------------------------------------------------
+# Phase R-PORT — clean systemd restart, bind a different tts.port
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_tts_port_to_temp(config_text: str, new_port: int) -> str:
+    """Rewrite ONLY ``tts.port`` to ``new_port``; everything else byte-identical.
+
+    Line-based within the ``tts:`` block. The nested ``voices:`` entries carry no
+    ``port:`` key, so the first ``port:`` under ``tts:`` is unambiguous. Applied on
+    top of ``_rewrite_paths_to_temp`` (which absolutizes ``paths.*`` to the
+    canonical data root) — the config loader anchors *relative* ``paths`` to
+    ``config_path.parent.parent``, so a ``/tmp`` config must carry absolute paths
+    or it boots an empty data root.
+    """
+    out: list[str] = []
+    in_tts = False
+    replaced = False
+    for line in config_text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        if body.startswith("tts:"):
+            in_tts = True
+            out.append(line)
+            continue
+        if in_tts and not replaced:
+            if body and not body[0].isspace():
+                in_tts = False  # next top-level section reached, port not found
+                out.append(line)
+                continue
+            m = re.match(r"(\s+port:\s+)(\S+)(.*)$", body)
+            if m:
+                out.append(f"{m.group(1)}{new_port}{m.group(3)}\n")
+                replaced = True
+                continue
+        out.append(line)
+    if not replaced:
+        raise RuntimeError("tts.port line not found under the tts: block")
+    return "".join(out)
+
+
+def _wyoming_describe_ok(host: str, port: int, timeout_s: float = 10.0) -> bool:
+    """True iff a Wyoming client gets an ``Info`` reply to ``Describe`` on host:port.
+
+    Uses the real ``wyoming`` client (already a dependency) — the same handshake
+    Home Assistant performs on connect — so this proves a Wyoming listener is bound
+    AND speaking the protocol on ``port``. Validated against the live server before
+    landing this phase. Returns False on refusal, timeout or any protocol error.
+    """
+    from wyoming.client import AsyncTcpClient
+    from wyoming.info import Describe, Info
+
+    async def _probe() -> bool:
+        async with AsyncTcpClient(host, port) as client:
+            await client.write_event(Describe().event())
+            for _ in range(5):
+                event = await client.read_event()
+                if event is None:
+                    return False
+                if Info.is_type(event.type):
+                    return True
+            return False
+
+    try:
+        return asyncio.run(asyncio.wait_for(_probe(), timeout=timeout_s))
+    except Exception:  # noqa: BLE001 — boundary: network probe, any failure == not-up
+        return False
+
+
+def _port_refuses(host: str, port: int) -> bool:
+    """True iff a TCP connect to host:port is refused (nothing bound there)."""
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return False  # something IS still listening
+    except ConnectionRefusedError:
+        return True
+    except OSError:  # noqa: BLE001 — boundary: treat unreachable as "not refused"
+        return False
+
+
+def _drive_systemd_port_flip(*, keep: bool = False) -> bool:
+    """Phase R-PORT: prove a clean systemd restart binds a different ``tts.port``.
+
+    Mirrors ``_drive_systemd_boot_from_temp_root`` but flips ``tts.port`` instead
+    of ``paths.*`` — the canonical data root is reused (no copy), so the only delta
+    is the TTS listener port. Drives the LIVE (canonical, running) systemd service
+    via ``PARAMEM_CONFIG``. The new port is proven bound by the real Wyoming client
+    handshake (``Describe`` -> ``Info``, the same one HA performs); the canonical
+    port is proven vacated (connection refused). Cleanup ALWAYS unsets
+    ``PARAMEM_CONFIG`` and restarts so the service returns to the canonical port,
+    even on failure.
+
+    This pairs with Phase A's R-PORT *classification* (``tts_port_change`` carve,
+    ``restart_eligible=True``): Phase A proves accept marks the change restart-
+    required, this phase proves the restart actually rebinds the listener — the
+    same two-part shape as R-PATHS (Phase A classification + Phase B boot).
+
+    MUST RUN CUDA-FREE (load-bearing) — same constraint as Phase B: on this 8 GiB
+    GPU the service boot needs ~6.5 of ~7 usable GiB, so a competing CUDA context
+    in THIS process tips the boot into cloud-only. This function loads no model and
+    never touches ``torch.cuda``; the restart is the GPU handoff.
+    """
+    host = "localhost"
+    real_config = _REPO_ROOT / "configs" / "server.yaml"
+    cfg = load_server_config(str(real_config))
+    canonical_port = int(cfg.tts.port)
+    real_data = Path(cfg.paths.data).resolve()
+    real_keys = _registry_key_count(cfg)
+    new_port = _free_port()
+    logger.info(
+        "Phase R-PORT: canonical tts.port=%d -> new tts.port=%d (%d keys)",
+        canonical_port,
+        new_port,
+        real_keys,
+    )
+
+    temp_root = Path(tempfile.mkdtemp(prefix="paramem-rport-systemd-"))
+    temp_config = temp_root / "server.yaml"
+    failures: list[str] = []
+
+    def _systemctl(*args: str) -> None:
+        subprocess.run(["systemctl", "--user", *args], check=True)
+
+    try:
+        # Absolutize paths to the canonical data root (the loader anchors relative
+        # paths to config.parent.parent, so a /tmp config needs absolute paths to
+        # boot the real registry), then flip tts.port.
+        text = _rewrite_paths_to_temp(real_config.read_text(), real_data)
+        text = _rewrite_tts_port_to_temp(text, new_port)
+        temp_config.write_text(text)
+
+        t0 = datetime.now(timezone.utc)
+        _systemctl("set-environment", f"PARAMEM_CONFIG={temp_config}")
+        _systemctl("restart", "paramem-server")
+
+        status = _poll_status_local()
+        if status is None:
+            failures.append("server did not reach local mode after tts.port-flip restart")
+        else:
+            if status.get("keys_count") != real_keys:
+                failures.append(
+                    f"keys_count {status.get('keys_count')} != real {real_keys} "
+                    "(temp config did not boot the canonical data root)"
+                )
+            if _wyoming_describe_ok(host, new_port):
+                logger.info("Phase R-PORT: Wyoming listener confirmed on new port %d", new_port)
+            else:
+                failures.append(
+                    f"Wyoming Describe->Info FAILED on new tts.port {new_port} "
+                    "(listener did not move to the new port)"
+                )
+            if not _port_refuses(host, canonical_port):
+                failures.append(
+                    f"canonical tts.port {canonical_port} still accepts connections "
+                    "(listener duplicated, not moved)"
+                )
+            phrase_ok = _journal_contains_since(t0, "Wyoming TTS server starting on")
+            port_ok = _journal_contains_since(t0, str(new_port))
+            if not (phrase_ok and port_ok):
+                failures.append(
+                    f"journal shows no 'Wyoming TTS server starting on …:{new_port}' since restart"
+                )
+    except Exception as exc:  # noqa: BLE001 — boundary: subprocess / filesystem / network
+        failures.append(f"exception during tts.port-flip boot: {exc}")
+        logger.exception("Phase R-PORT tts.port-flip boot failed")
+    finally:
+        # ALWAYS restore the canonical config + port, even on failure.
+        try:
+            _systemctl("unset-environment", "PARAMEM_CONFIG")
+            _systemctl("restart", "paramem-server")
+            restored = _poll_status_local()
+            if restored is None or restored.get("mode") != "local":
+                failures.append("server did NOT restore to canonical local mode")
+            elif not _wyoming_describe_ok(host, canonical_port):
+                failures.append(
+                    f"post-restore Wyoming Describe->Info FAILED on canonical tts.port "
+                    f"{canonical_port} (HA could not reconnect)"
+                )
+            else:
+                logger.info("Phase R-PORT: restored canonical tts.port %d", canonical_port)
+        except Exception as exc:  # noqa: BLE001 — boundary: subprocess
+            failures.append(f"RESTORE FAILED — canonical config may need a manual restart: {exc}")
+            logger.exception("Phase R-PORT restore failed")
+        if keep:
+            logger.info("Phase R-PORT temp root KEPT: %s", temp_root)
+        else:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    ok = len(failures) == 0
+    print("\n" + "=" * 70)
+    print("PHASE R-PORT — SYSTEMD TTS-PORT-FLIP — " + ("PASS" if ok else "FAIL"))
+    print("=" * 70)
+    for f in failures:
+        print(f"  - {f}")
+    return ok
+
+
+def _run_phase_rport_only() -> bool:
+    """Standalone Phase R-PORT entry — CUDA-FREE; runs against the LIVE server.
+
+    Same CUDA-free constraint and GPU-handoff-via-restart model as
+    ``_run_phase_b_only``. The live (canonical) server should be running at start;
+    the restart frees its GPU and the ``finally`` always restores the canonical
+    port.
+    """
+    return _drive_systemd_port_flip(keep=False)
+
+
 def main() -> int:
     """Entry point.
 
@@ -1376,9 +1583,22 @@ def main() -> int:
             "cloud-only). Always restores the canonical config."
         ),
     )
+    parser.add_argument(
+        "--phase-rport-only",
+        action="store_true",
+        help=(
+            "Run ONLY Phase R-PORT: the CUDA-free systemd tts.port-flip validation "
+            "against the LIVE (canonical, running) server. Flips tts.port via a temp "
+            "PARAMEM_CONFIG, restarts, and proves the Wyoming listener moved (Describe-> "
+            "Info on the new port, canonical port refused). Always restores the canonical "
+            "config. Must NOT be combined with the in-process smoke (which holds CUDA)."
+        ),
+    )
     args = parser.parse_args()
     if args.phase_b_only:
         return 0 if _run_phase_b_only() else 1
+    if args.phase_rport_only:
+        return 0 if _run_phase_rport_only() else 1
     return 0 if run_smoke(keep_on_success=args.keep_on_success) else 1
 
 
