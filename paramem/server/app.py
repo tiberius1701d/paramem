@@ -292,6 +292,11 @@ class StatusResponse(BaseModel):
     tts_loaded: bool = False
     tts_languages: list[str] = []  # loaded TTS voices by language code
     tts_device: str | None = None  # cuda / cpu / mixed / None (unloaded)
+    # True when TTS is up but not every CONFIGURED voice loaded (e.g. Piper voices
+    # missing while MMS loaded). is_loaded stays "any engine" for internal gates;
+    # this is the honest health signal so /status doesn't report a dead default voice
+    # as fully healthy.
+    tts_degraded: bool = False
     # Backend family across loaded voices: "piper", "mms_tts", or "piper+mms"
     # when voices span both. None when no TTS is loaded.
     tts_engine: str | None = None
@@ -2724,6 +2729,7 @@ async def status():
     tts_manager = _state.get("tts_manager")
     tts_loaded = bool(tts_manager and tts_manager.is_loaded)
     tts_languages: list[str] = tts_manager.available_languages if tts_loaded else []
+    tts_degraded = bool(tts_loaded and set(tts_languages) != set(tts_manager.configured_languages))
     tts_device: str | None = None
     if tts_loaded:
         _tts_devices = set(tts_manager.engine_devices.values())
@@ -2970,6 +2976,7 @@ async def status():
         tts_loaded=tts_loaded,
         tts_languages=tts_languages,
         tts_device=tts_device,
+        tts_degraded=tts_degraded,
         refresh_cadence=config.consolidation.refresh_cadence,
         consolidation_period=config.consolidation.consolidation_period_string,
         max_interim_count=config.consolidation.max_interim_count,
