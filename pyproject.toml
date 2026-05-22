@@ -67,6 +67,12 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 
+[tool.ruff.lint.per-file-ignores]
+# The migration smoke embeds its fictional sessions as inline JSONL strings so
+# it is fully self-contained (no external fixture files). Those data lines are
+# inherently longer than the 100-char limit; the script's code stays within it.
+"scripts/dev/migration_maintenance_smoke.py" = ["E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
