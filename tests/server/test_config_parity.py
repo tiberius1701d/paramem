@@ -135,6 +135,9 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
         "consolidation.graph_enrichment_interim_enabled",
         # ON in tests + live deployment; example ships OFF (default-OFF rollout posture).
         "consolidation.recall_early_stopping",
+        # MMS/VITS TTS on GPU in tests + live deployment (worth the VRAM); example
+        # ships all-CPU for ship-safety. Piper voices inherit the cpu default in all three.
+        "tts.voices.tl.device",
         "debug",  # tests want full diagnostic artefacts
         "sanitization.cloud_mode",  # tests anonymize-and-send; example blocks
         # --- Sandbox-rooted paths: every path the fixture writes to must

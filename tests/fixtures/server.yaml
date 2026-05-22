@@ -517,7 +517,11 @@ stt:
 tts:
   enabled: false             # local TTS via Wyoming protocol (requires Piper / MMS-TTS model downloads)
   port: 10301                # tests use Wyoming clients in-process; matches example for fixture/example parity
-  device: cuda               # default device; per-voice override possible
+  # DEFAULT DEVICE = cpu. Piper is CPU-first (real-time on CPU) and keeping the
+  # voices off the GPU preserves VRAM for the base model + Whisper STT. Override
+  # per-voice with `device: cuda` only where the GPU is worth it (e.g. MMS/VITS,
+  # slow on CPU). This example/test config keeps everything on CPU.
+  device: cpu
   default_language: en
   language_confidence_threshold: 0.8  # Whisper detection probability to trust
   # model_dir: ""            # TTS model storage; default: data/ha/tts
@@ -537,7 +541,7 @@ tts:
     tl:
       engine: mms
       model: facebook/mms-tts-tgl
-      # device: cpu            # per-voice override (default: inherit from tts.device)
+      device: cuda             # mirrors the operator max-config (MMS/VITS on GPU)
 
 # ============================================================================
 # TEXT-SIDE LANGUAGE DETECTION (fastText lid.176)
