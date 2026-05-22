@@ -63,11 +63,16 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -919,6 +924,108 @@ def _recall_probe(apply_state: dict, config: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase A — carve classification (real ServerConfig + real socket, no model)
+# ---------------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    """Return an OS-assigned free TCP port (bind to 0, read it back, close)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _drive_carve_scenarios(tmp_root: Path) -> dict:
+    """Drive the R-PORT (pure-port) and R-PATHS carves against real ServerConfig.
+
+    Calls the real ``_apply_config_live`` directly with config A/B built from the
+    sandbox fixture, so the carve diff exercises the paths every unit test mocks:
+
+    * real ``socket.bind`` pre-flight on a real free port,
+    * ``pure_port_delta=True`` via real ``dataclasses.replace`` on real
+      ``ServerConfig`` (MagicMock configs hit the except→False fallback),
+    * real ``compute_config_hash`` on real files.
+
+    Both carves short-circuit *before* ``_live_reload_base_model``, so no model is
+    needed.  Config A and both B variants derive from the SAME ``_make_sandbox_yaml``
+    base, so each B differs from A in exactly the carve field (required for
+    ``pure_port_delta``).
+
+    Returns ``{"pass": bool, "failure_reasons": [...], "results": {...}}``.
+    """
+    import paramem.server.app as app_module
+    from paramem.server.drift import compute_config_hash
+
+    failures: list[str] = []
+    results: dict = {}
+
+    a_bytes = _make_sandbox_yaml(tmp_root, cadence=_LIVE_CADENCE)
+    a_path = tmp_root / "carve_A.yaml"
+    a_path.write_bytes(a_bytes)
+    config_a = load_server_config(str(a_path))
+    a_hash = compute_config_hash(a_path)
+
+    def _run_carve(b_bytes: bytes, label: str) -> dict:
+        b_path = tmp_root / f"carve_B_{label}.yaml"
+        b_path.write_bytes(b_bytes)
+        state = {
+            "config": config_a,
+            "config_path": str(b_path),
+            "config_drift": {
+                "detected": False,
+                "loaded_hash": a_hash,
+                "disk_hash": None,
+                "last_checked_at": "2026-05-22T00:00:00+00:00",
+            },
+            "consolidating": False,
+            "mode": "cloud-only",
+            "cloud_only_reason": "live_reload",
+            "model": None,
+            "tokenizer": None,
+            "migration": {},
+        }
+        orig = app_module._state
+        app_module._state = state
+        try:
+            return app_module._apply_config_live()
+        finally:
+            app_module._state = orig
+
+    # R-PORT pure-port: change ONLY tts.port to a real free port → real bind
+    # pre-flight succeeds + pure_port_delta=True short-circuit (no reload).
+    free = _free_port()
+    rport = _run_carve(a_bytes.replace(b"port: 10301", f"port: {free}".encode()), "rport")
+    results["rport"] = rport
+    if not (
+        rport.get("applied_live") is False
+        and rport.get("restart_required_reason") == "tts_port_change"
+        and rport.get("restart_eligible") is True
+        and rport.get("skipped") is None
+    ):
+        failures.append(f"R-PORT carve unexpected result: {rport}")
+
+    # R-PATHS: change paths.data → paths_change short-circuit (no reload).
+    data_old = f"  data: {(tmp_root / 'data' / 'ha').resolve()}".encode()
+    data_new = f"  data: {(tmp_root / 'data' / 'ha_migtest').resolve()}".encode()
+    if data_old not in a_bytes:
+        failures.append(f"R-PATHS setup error: data line {data_old!r} not in sandbox YAML")
+        rpaths = {}
+    else:
+        rpaths = _run_carve(a_bytes.replace(data_old, data_new), "rpaths")
+        if not (
+            rpaths.get("applied_live") is False
+            and rpaths.get("restart_required_reason") == "paths_change"
+            and rpaths.get("restart_eligible") is False
+        ):
+            failures.append(f"R-PATHS carve unexpected result: {rpaths}")
+    results["rpaths"] = rpaths
+
+    return {"pass": len(failures) == 0, "failure_reasons": failures, "results": results}
+
+
+# ---------------------------------------------------------------------------
 # Main smoke runner
 # ---------------------------------------------------------------------------
 
@@ -1002,6 +1109,16 @@ def run_smoke(*, keep_on_success: bool = False) -> bool:
         if not apply_result_summary.get("pass"):
             failure_reasons.extend(apply_result_summary.get("failure_reasons", []))
 
+        # ── Step 5: Carve classification (Phase A) ───────────────────────────
+        # R-PORT pure-port (real socket bind + real dataclasses.replace) and
+        # R-PATHS short-circuit, against real ServerConfig. No model needed —
+        # both carves return before _live_reload_base_model.
+        logger.info("=== Phase A: carve classification (R-PORT pure-port + R-PATHS) ===")
+        carve_summary = _drive_carve_scenarios(tmp_root)
+        logger.info("Carve scenarios: %s", "PASS" if carve_summary.get("pass") else "FAIL")
+        if not carve_summary.get("pass"):
+            failure_reasons.extend(carve_summary.get("failure_reasons", []))
+
     except Exception as exc:  # noqa: BLE001
         failure_reasons.append(f"Unhandled exception: {exc}")
         logger.exception("Migration smoke unhandled exception")
@@ -1047,6 +1164,192 @@ def run_smoke(*, keep_on_success: bool = False) -> bool:
     return passed
 
 
+# ---------------------------------------------------------------------------
+# Phase B — clean systemd restart, boot from a different paths.data
+# ---------------------------------------------------------------------------
+
+
+def _poll_status_local(timeout_s: int = 240, interval_s: int = 10) -> dict | None:
+    """Poll ``GET /status`` until ``mode == "local"`` or timeout. Returns the dict or None."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:  # boundary: the service may not be listening yet during boot
+            with urllib.request.urlopen("http://localhost:8420/status", timeout=5) as resp:
+                data = json.loads(resp.read())
+            if data.get("mode") == "local":
+                return data
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        time.sleep(interval_s)
+    return None
+
+
+def _journal_contains_since(since_dt: datetime, needle: str) -> bool:
+    """True if the paramem-server journal since ``since_dt`` contains ``needle``."""
+    out = subprocess.run(
+        [
+            "journalctl",
+            "--user",
+            "-u",
+            "paramem-server",
+            "--since",
+            since_dt.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "--no-pager",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return needle in out.stdout
+
+
+def _rewrite_paths_to_temp(config_text: str, temp_data: Path) -> str:
+    """Rewrite data/sessions/debug under ``paths:`` to point at ``temp_data``.
+
+    Line + regex based so comments survive and the real values need not be known.
+    ONLY the three keys under the ``paths:`` block are touched — everything else
+    (incl. security/encryption) is byte-identical, so the temp boot uses the same
+    encryption state as canonical.
+    """
+    targets = {
+        "data": str(temp_data.resolve()),
+        "sessions": str((temp_data / "sessions").resolve()),
+        "debug": str((temp_data / "debug").resolve()),
+    }
+    out: list[str] = []
+    in_paths = False
+    for line in config_text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        if body.startswith("paths:"):
+            in_paths = True
+            out.append(line)
+            continue
+        if in_paths:
+            if body and not body[0].isspace():
+                in_paths = False  # reached the next top-level section
+                out.append(line)
+                continue
+            rewritten = line
+            for key, val in targets.items():
+                m = re.match(rf"(\s+{key}:\s+)(\S+)(.*)$", body)
+                if m:
+                    rewritten = f"{m.group(1)}{val}{m.group(3)}\n"
+                    break
+            out.append(rewritten)
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _drive_systemd_boot_from_temp_root(*, keep: bool = False) -> bool:
+    """Phase B: prove a clean systemd restart boots from a different ``paths.data``.
+
+    Uses the REAL config + a COPY of the real (already-encrypted) data at a temp
+    root — only ``paths.*`` differs, so encryption/security state is identical and
+    untouched. Drives the LIVE (canonical, running) systemd service via
+    ``PARAMEM_CONFIG`` (``start-server.sh``: ``CONFIG=${PARAMEM_CONFIG:-configs/server.yaml}``).
+    Boot-from-temp is proven by the journal showing a registry load from the temp
+    root. Cleanup ALWAYS unsets ``PARAMEM_CONFIG`` and restarts so the live server
+    returns to the canonical config + real data, even on failure.
+
+    MUST RUN CUDA-FREE (load-bearing). This function and its process must NEVER
+    initialise CUDA (no ``torch.cuda`` calls, no model load). On this 8 GiB GPU the
+    service boot needs ~6.5 of ~7 usable GiB, so a competing CUDA context in THIS
+    process tips the service boot into cloud-only (observed 2026-05-22). Because we
+    hold no CUDA context, ``systemctl restart`` stops the canonical service —
+    freeing its entire GPU — then starts it on the temp config, which boots into a
+    fully free GPU and reaches local. There is therefore no in-process model to
+    release and no VRAM gate to check here: the restart is the GPU handoff.
+    """
+    real_config = _REPO_ROOT / "configs" / "server.yaml"
+    cfg = load_server_config(str(real_config))
+    real_data = Path(cfg.paths.data).resolve()
+    real_keys = _registry_key_count(cfg)
+    logger.info("Phase B: real data root %s (%d keys)", real_data, real_keys)
+
+    temp_root = Path(tempfile.mkdtemp(prefix="paramem-rpaths-systemd-"))
+    temp_data = temp_root / "ha"
+    temp_config = temp_root / "server.yaml"
+    failures: list[str] = []
+
+    def _systemctl(*args: str) -> None:
+        subprocess.run(["systemctl", "--user", *args], check=True)
+
+    try:
+        logger.info("Phase B: copying real data -> %s (excluding backups)", temp_data)
+        shutil.copytree(real_data, temp_data, ignore=shutil.ignore_patterns("backups"))
+        temp_config.write_text(_rewrite_paths_to_temp(real_config.read_text(), temp_data))
+
+        t0 = datetime.now(timezone.utc)
+        _systemctl("set-environment", f"PARAMEM_CONFIG={temp_config}")
+        _systemctl("restart", "paramem-server")
+
+        status = _poll_status_local()
+        if status is None:
+            failures.append("server did not reach local mode after temp-config restart")
+        else:
+            if status.get("keys_count") != real_keys:
+                failures.append(
+                    f"keys_count {status.get('keys_count')} != real {real_keys} "
+                    "(temp data copy incomplete)"
+                )
+            if not _journal_contains_since(t0, str(temp_data)):
+                failures.append(
+                    f"journal shows no load from {temp_data} — server may have booted "
+                    "from the canonical root (PARAMEM_CONFIG not honoured)"
+                )
+            else:
+                logger.info("Phase B: confirmed boot-from-temp-root (%s)", temp_data)
+    except Exception as exc:  # noqa: BLE001 — boundary: subprocess / filesystem
+        failures.append(f"exception during temp-config boot: {exc}")
+        logger.exception("Phase B temp-config boot failed")
+    finally:
+        # ALWAYS restore the canonical config + real data, even on failure.
+        t_restore = datetime.now(timezone.utc)
+        try:
+            _systemctl("unset-environment", "PARAMEM_CONFIG")
+            _systemctl("restart", "paramem-server")
+            restored = _poll_status_local()
+            if restored is None or restored.get("mode") != "local":
+                failures.append("server did NOT restore to canonical local mode")
+            elif restored.get("keys_count") != real_keys:
+                failures.append(
+                    f"post-restore keys_count {restored.get('keys_count')} != {real_keys}"
+                )
+            elif not _journal_contains_since(t_restore, str(real_data)):
+                failures.append(f"post-restore journal shows no load from canonical {real_data}")
+            else:
+                logger.info("Phase B: restored to canonical config + real data")
+        except Exception as exc:  # noqa: BLE001 — boundary: subprocess
+            failures.append(f"RESTORE FAILED — canonical config may need a manual restart: {exc}")
+            logger.exception("Phase B restore failed")
+        if keep:
+            logger.info("Phase B temp root KEPT: %s", temp_root)
+        else:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    ok = len(failures) == 0
+    print("\n" + "=" * 70)
+    print("PHASE B — SYSTEMD BOOT-FROM-TEMP-ROOT — " + ("PASS" if ok else "FAIL"))
+    print("=" * 70)
+    for f in failures:
+        print(f"  - {f}")
+    return ok
+
+
+def _run_phase_b_only() -> bool:
+    """Standalone Phase B entry — CUDA-FREE; runs against the LIVE server.
+
+    This process must NEVER initialise CUDA (no model load, no ``torch.cuda``): on
+    this 8 GiB GPU the service boot needs ~6.5 of ~7 usable GiB, so a competing
+    CUDA context here tips the boot into cloud-only (observed 2026-05-22). With no
+    context held, ``systemctl restart`` is a clean GPU handoff — it stops the
+    canonical service (freeing its GPU) and starts the temp config into a free GPU,
+    which reaches local. The live (canonical) server should be running at start;
+    the restart frees its GPU and the ``finally`` always restores canonical.
+    """
+    return _drive_systemd_boot_from_temp_root(keep=False)
+
+
 def main() -> int:
     """Entry point.
 
@@ -1063,9 +1366,20 @@ def main() -> int:
         action="store_true",
         help="Keep tmp sandbox dir even on PASS (default: clean up).",
     )
+    parser.add_argument(
+        "--phase-b-only",
+        action="store_true",
+        help=(
+            "Run ONLY Phase B: the CUDA-free systemd boot-from-temp-root validation "
+            "against the LIVE (canonical, running) server. Must NOT be combined with the "
+            "in-process smoke (Phase A holds a CUDA context that would tip the boot to "
+            "cloud-only). Always restores the canonical config."
+        ),
+    )
     args = parser.parse_args()
-    passed = run_smoke(keep_on_success=args.keep_on_success)
-    return 0 if passed else 1
+    if args.phase_b_only:
+        return 0 if _run_phase_b_only() else 1
+    return 0 if run_smoke(keep_on_success=args.keep_on_success) else 1
 
 
 if __name__ == "__main__":
