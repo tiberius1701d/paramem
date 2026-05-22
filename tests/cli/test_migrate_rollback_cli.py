@@ -28,8 +28,13 @@ _ROLLBACK_RESPONSE = {
     "state": "LIVE",
     "trial_adapter_archive_path": "/abs/trial_adapters/20260422-010000",
     "rollback_pre_mortem_backup_path": "/abs/backups/config/rb-20260422-010000",
-    "restart_required": True,
+    "restart_required": False,
     "restart_hint": "systemctl --user restart paramem-server",
+    # WP2 fields: no-op skip (rollback restored config A, memory already A).
+    "applied_live": True,
+    "restart_required_reason": None,
+    "auto_restart_scheduled": False,
+    "skipped": "no_change",
 }
 
 _ROLLBACK_207_RESPONSE = {
@@ -88,14 +93,14 @@ class TestMigrateRollbackHappyPath:
         rc = main(["migrate-rollback"])
         assert rc == 0
 
-    def test_rollback_200_prints_state_and_restart_required(self, monkeypatch, capsys):
-        """200 response → state and restart_required appear in stdout."""
+    def test_rollback_200_prints_no_change_message(self, monkeypatch, capsys):
+        """200 response with no-op skip → CLI prints rollback no-change message."""
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: _ROLLBACK_RESPONSE)
         rc = main(["migrate-rollback"])
         captured = capsys.readouterr()
         assert rc == 0
-        assert "LIVE" in captured.out or "state" in captured.out.lower()
-        assert "restart_required" in captured.out or "restart" in captured.out.lower()
+        # WP2: rollback no-op skip path prints a human-readable message.
+        assert "rolled back" in captured.out.lower() or "no config change" in captured.out.lower()
 
     def test_rollback_200_json_mode_emits_raw_json(self, monkeypatch, capsys):
         """--json emits raw JSON with all response fields."""
@@ -105,7 +110,9 @@ class TestMigrateRollbackHappyPath:
         assert rc == 0
         parsed = json.loads(captured.out)
         assert parsed["state"] == "LIVE"
-        assert parsed["restart_required"] is True
+        # WP2: no-op skip → restart_required=False, applied_live=True.
+        assert parsed["restart_required"] is False
+        assert parsed["applied_live"] is True
 
 
 # ---------------------------------------------------------------------------

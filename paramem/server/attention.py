@@ -413,6 +413,62 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
     return primary_items + secondary_items
 
 
+def _collect_vram_overflow_items(state: dict) -> list[AttentionItem]:
+    """Emit a persistent warning when the configured topology exceeds usable VRAM.
+
+    Reads ``state["vram_overflow_warning"]`` — a dict written by the lifespan
+    startup check when ``assessment.required_bytes > usable_ceiling``.  The
+    condition is "config too big for this hardware" (permanent), distinct from
+    a transient sibling-contention degrade where required ≤ usable_ceiling but
+    free is momentarily low.
+
+    The dict schema is::
+
+        {
+            "required_gib": float,   # topology working set (GiB)
+            "usable_gib": float,     # device-wide usable ceiling at boot (GiB)
+            "total_gib": float,      # physical GPU VRAM (GiB)
+            "reserved_gib": float,   # WDDM/WSL2 reservation = total − usable (GiB)
+        }
+
+    Returns ``[]`` when the field is absent (no overflow at boot) or when the
+    hardware has enough VRAM for the config (rare on 8 GiB laptops).
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+
+    Returns
+    -------
+    list[AttentionItem]
+        Zero or one item.
+    """
+    warn = state.get("vram_overflow_warning")
+    if not warn:
+        return []
+    required_gib = warn.get("required_gib", 0.0)
+    usable_gib = warn.get("usable_gib", 0.0)
+    total_gib = warn.get("total_gib", 0.0)
+    reserved_gib = warn.get("reserved_gib", 0.0)
+    return [
+        AttentionItem(
+            kind="vram_config_overflow",
+            level="action_required",
+            summary=(
+                f"VRAM CONFIG OVERFLOW — config needs {required_gib:.2f} GiB "
+                f"but only {usable_gib:.2f} GiB usable on this {total_gib:.0f} GiB GPU "
+                f"(WDDM/WSL2 reserves ~{reserved_gib:.2f} GiB)"
+            ),
+            action_hint=(
+                "Reduce model size, adapter rank/count, or "
+                "consolidation.max_interim_count, or install a larger GPU."
+            ),
+            age_seconds=None,
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Stubs — Slices 6/7 fill these
 # ---------------------------------------------------------------------------
@@ -789,4 +845,5 @@ def collect_attention_items(
     items.extend(_collect_adapter_fingerprint_items(state))
     items.extend(_collect_voice_degradation_items(state, config))
     items.extend(_collect_pre_flight_items(state, config))
+    items.extend(_collect_vram_overflow_items(state))
     return items

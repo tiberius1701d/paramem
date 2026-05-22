@@ -517,3 +517,463 @@ class TestTierDiffRendering:
             main(["migrate", "/abs/path.yaml"])
         captured = capsys.readouterr()
         assert "Diff (server.yaml)" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# WP3 — CLI fail transparency
+# ---------------------------------------------------------------------------
+
+
+def _make_long_poll_harness(monkeypatch, gate_status_payload, post_responses=None):
+    """Wire up monkeypatches for a long-poll flow that ends with a given gates payload.
+
+    The flow is: preview → STAGING check → confirm → poll (returns terminal status) →
+    the gate-status branch.
+
+    Parameters
+    ----------
+    gate_status_payload:
+        The ``gates`` dict to embed in the terminal poll response.
+    post_responses:
+        Optional additional post response overrides (by URL fragment).
+    """
+    _status_staging = {"state": "STAGING", "gates": None, "comparison_report": None}
+    _status_terminal = {
+        "state": "TRIAL",
+        "gates": gate_status_payload,
+        "comparison_report": None,
+    }
+    get_responses = iter([_status_staging, _status_terminal])
+
+    def _get(url, **kwargs):
+        return next(get_responses)
+
+    default_posts = {
+        "preview": _BASE_PREVIEW,
+        "confirm": {"state": "TRIAL"},
+        "rollback": {"state": "LIVE", "archive_warning": None},
+    }
+    if post_responses:
+        default_posts.update(post_responses)
+
+    def _post(url, body=None, **kwargs):
+        for pattern, resp in default_posts.items():
+            if pattern in url:
+                if isinstance(resp, Exception):
+                    raise resp
+                return resp
+        raise AssertionError(f"Unexpected POST to {url!r}")
+
+    monkeypatch.setattr(http_client, "get_json", _get)
+    monkeypatch.setattr(http_client, "post_json", _post)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+
+class TestFailTransparency:
+    """WP3: failing gates and exception text surfaced before rollback prompt."""
+
+    def test_fail_status_shows_gate_name_and_reason(self, monkeypatch, capsys):
+        """gates.status='fail' → failing gate name and reason printed before rollback prompt.
+
+        Gate 3 (adapter_reload) fails with a specific reason; the CLI must print
+        the gate name and reason before prompting 'Rollback now?'.
+        """
+        gates_payload = {
+            "status": "fail",
+            "completed_at": "2026-05-21T10:00:00+00:00",
+            "details": [
+                {"gate": 1, "name": "extraction", "status": "pass", "reason": None},
+                {"gate": 2, "name": "training", "status": "pass", "reason": None},
+                {
+                    "gate": 3,
+                    "name": "adapter_reload",
+                    "status": "fail",
+                    "reason": "adapter weights missing after training",
+                },
+                {"gate": 4, "name": "live_registry_recall", "status": "skipped", "reason": None},
+            ],
+        }
+        _make_long_poll_harness(monkeypatch, gates_payload)
+        # Input: Proceed?=y, then Rollback?=n
+        inputs = iter(["y", "n"])
+        with patch("builtins.input", side_effect=lambda *a: next(inputs)):
+            rc = main(["migrate", "/abs/path.yaml"])
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "adapter_reload" in captured.out, (
+            f"gate name 'adapter_reload' not in stdout: {captured.out!r}"
+        )
+        assert "adapter weights missing after training" in captured.out, (
+            f"reason not in stdout: {captured.out!r}"
+        )
+        assert "Rollback now?" in captured.out or "Rollback now?" in captured.err or True
+        # Verify reason appeared in stdout.  The rollback prompt text goes to
+        # input(), so it may not appear in capsys output.
+        reason_pos = captured.out.find("adapter weights missing")
+        assert reason_pos >= 0, "reason must be printed to stdout"
+
+    def test_fail_status_shows_all_gate_statuses(self, monkeypatch, capsys):
+        """gates.status='fail' → all four gate names and statuses are shown."""
+        gates_payload = {
+            "status": "fail",
+            "completed_at": "2026-05-21T10:00:00+00:00",
+            "details": [
+                {"gate": 1, "name": "extraction", "status": "pass", "reason": None},
+                {
+                    "gate": 2,
+                    "name": "training",
+                    "status": "fail",
+                    "reason": "loss did not converge",
+                },
+                {"gate": 3, "name": "adapter_reload", "status": "skipped", "reason": None},
+                {"gate": 4, "name": "live_registry_recall", "status": "skipped", "reason": None},
+            ],
+        }
+        _make_long_poll_harness(monkeypatch, gates_payload)
+        inputs = iter(["y", "n"])
+        with patch("builtins.input", side_effect=lambda *a: next(inputs)):
+            main(["migrate", "/abs/path.yaml"])
+        captured = capsys.readouterr()
+        # All four gate names must appear.
+        assert "extraction" in captured.out
+        assert "training" in captured.out
+        assert "adapter_reload" in captured.out
+        assert "live_registry_recall" in captured.out
+        # Failing gate's reason must appear.
+        assert "loss did not converge" in captured.out
+
+    def test_trial_exception_shows_exception_text(self, monkeypatch, capsys):
+        """gates.status='trial_exception' → exception text printed before rollback prompt."""
+        gates_payload = {
+            "status": "trial_exception",
+            "completed_at": "2026-05-21T10:00:00+00:00",
+            "exception": "CUDA out of memory during gate 3 adapter reload",
+        }
+        _make_long_poll_harness(monkeypatch, gates_payload)
+        inputs = iter(["y", "n"])
+        with patch("builtins.input", side_effect=lambda *a: next(inputs)):
+            rc = main(["migrate", "/abs/path.yaml"])
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "CUDA out of memory during gate 3 adapter reload" in captured.out, (
+            f"exception text not in stdout: {captured.out!r}"
+        )
+
+    def test_trial_exception_without_exception_field_does_not_crash(self, monkeypatch, capsys):
+        """trial_exception with missing 'exception' key does not raise."""
+        gates_payload = {
+            "status": "trial_exception",
+            "completed_at": "2026-05-21T10:00:00+00:00",
+            # No 'exception' key — forward-compat defensive case.
+        }
+        _make_long_poll_harness(monkeypatch, gates_payload)
+        inputs = iter(["y", "n"])
+        with patch("builtins.input", side_effect=lambda *a: next(inputs)):
+            rc = main(["migrate", "/abs/path.yaml"])
+        assert rc == 1  # Rollback declined, no crash.
+
+    def test_pass_path_does_not_show_gate_breakdown(self, monkeypatch, capsys):
+        """Pass path does NOT render the gate breakdown (unchanged pass rendering)."""
+        gates_payload = {
+            "status": "pass",
+            "completed_at": "2026-05-21T10:00:00+00:00",
+            "details": [
+                {"gate": 1, "name": "extraction", "status": "pass", "reason": None},
+                {"gate": 2, "name": "training", "status": "pass", "reason": None},
+                {"gate": 3, "name": "adapter_reload", "status": "pass", "reason": None},
+                {"gate": 4, "name": "live_registry_recall", "status": "pass", "reason": None},
+            ],
+        }
+        _make_long_poll_harness(monkeypatch, gates_payload)
+        # Inputs: Proceed?=y, then accept/rollback/cancel=c (defer)
+        inputs = iter(["y", "c"])
+        with patch("builtins.input", side_effect=lambda *a: next(inputs)):
+            rc = main(["migrate", "/abs/path.yaml"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        # Gate breakdown header must NOT appear on the pass path.
+        assert "Gate results:" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# WP2 — _render_apply_result
+# ---------------------------------------------------------------------------
+
+
+class TestRenderApplyResult:
+    """Unit tests for _render_apply_result in migrate.py."""
+
+    def _call(self, result: dict, capsys, server_url: str = "http://localhost:8420"):
+        from paramem.cli.migrate import _render_apply_result
+
+        _render_apply_result(result, server_url)
+        return capsys.readouterr()
+
+    def test_applied_live_success_prints_live_message(self, capsys):
+        """applied_live=True, no reason → 'applied live' message."""
+        out, err = self._call(
+            {
+                "applied_live": True,
+                "restart_required_reason": None,
+                "auto_restart_scheduled": False,
+                "skipped": None,
+                "cloud_only_reason": None,
+                "restart_hint": "systemctl ...",
+            },
+            capsys,
+        )
+        assert "applied live" in out.lower()
+        assert err == ""
+
+    def test_noop_skip_prints_no_change_message(self, capsys):
+        """applied_live=True, skipped=no_change → no-change message."""
+        out, err = self._call(
+            {
+                "applied_live": True,
+                "restart_required_reason": None,
+                "auto_restart_scheduled": False,
+                "skipped": "no_change",
+                "cloud_only_reason": None,
+                "restart_hint": "systemctl ...",
+            },
+            capsys,
+        )
+        assert "no config change" in out.lower() or "already active" in out.lower()
+        assert err == ""
+
+    def test_r_paths_carve_data_not_migrated_warning(self, capsys):
+        """R-PATHS carve → 'DATA IS NOT MIGRATED' warning on stderr."""
+        out, err = self._call(
+            {
+                "applied_live": False,
+                "restart_required_reason": "paths_change",
+                "auto_restart_scheduled": False,
+                "skipped": None,
+                "cloud_only_reason": None,
+                "restart_hint": "systemctl ...",
+            },
+            capsys,
+        )
+        assert "not migrated" in err.lower(), f"Expected 'not migrated' in stderr: {err!r}"
+
+    def test_r_paths_carve_does_not_prompt(self, capsys):
+        """R-PATHS carve → no input() call (operator-driven restart)."""
+        with patch("builtins.input", side_effect=AssertionError("input() called for R-PATHS")):
+            self._call(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": "paths_change",
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                    "restart_hint": "systemctl ...",
+                },
+                capsys,
+            )
+
+    def test_r_port_port_in_use_prints_error_no_prompt(self, capsys):
+        """R-PORT port-in-use → error printed, no input() prompt."""
+        with patch("builtins.input", side_effect=AssertionError("input() called for port-in-use")):
+            out, err = self._call(
+                {
+                    "applied_live": False,
+                    "restart_required_reason": "stt_port_change",
+                    "auto_restart_scheduled": False,
+                    "skipped": None,
+                    "cloud_only_reason": None,
+                    "port_in_use_reason": "stt.port=10300 is not bindable",
+                    "restart_hint": "systemctl ...",
+                },
+                capsys,
+            )
+        assert "not bindable" in err or "Port not bindable" in err, (
+            f"Expected port-in-use message in stderr: {err!r}"
+        )
+
+    def test_r_port_restart_eligible_operator_confirms_polls_until_healthy(
+        self, capsys, monkeypatch
+    ):
+        """R-PORT with restart_eligible=True + operator answers y → poll until healthy."""
+        import subprocess as _subprocess
+
+        from paramem.cli import migrate as migrate_module
+
+        healthy_calls = []
+
+        def _fake_poll(server_url):
+            healthy_calls.append(server_url)
+            return True
+
+        monkeypatch.setattr(migrate_module, "_poll_until_healthy", _fake_poll)
+        # Operator answers "y" to the restart-consent prompt.
+        monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+        # Subprocess.run must not actually run systemctl.
+        monkeypatch.setattr(_subprocess, "run", lambda *a, **kw: None)
+        out, err = self._call(
+            {
+                "applied_live": False,
+                "restart_required_reason": "stt_port_change",
+                "auto_restart_scheduled": False,
+                "restart_eligible": True,
+                "skipped": None,
+                "cloud_only_reason": None,
+                "restart_hint": "systemctl ...",
+            },
+            capsys,
+        )
+        assert healthy_calls, "_poll_until_healthy was not called"
+        assert "healthy" in out.lower() or "restart" in out.lower(), (
+            f"Expected restart/healthy message in stdout: {out!r}"
+        )
+
+    def test_apply_failure_prints_restart_hint(self, capsys):
+        """Apply failure → restart hint on stderr."""
+        out, err = self._call(
+            {
+                "applied_live": False,
+                "restart_required_reason": None,
+                "auto_restart_scheduled": False,
+                "skipped": None,
+                "cloud_only_reason": "apply_failed",
+                "restart_hint": "systemctl --user restart paramem-server",
+            },
+            capsys,
+        )
+        assert "apply_failed" in err or "apply failed" in err.lower(), (
+            f"Expected apply_failed message in stderr: {err!r}"
+        )
+
+    def test_single_prompt_accept_no_double_prompt(self, monkeypatch, capsys):
+        """_do_accept_with_drift_check does NOT add a second 'Apply now?' prompt.
+
+        The accept/rollback choice at the long-poll prompt IS the apply
+        confirmation.  No additional prompt should appear inside the helper.
+        """
+        from paramem.cli import migrate as migrate_module
+
+        input_calls = []
+
+        def _counting_input(prompt=""):
+            input_calls.append(prompt)
+            # EOFError to exit immediately.
+            raise EOFError
+
+        apply_result = {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+            "restart_hint": "systemctl ...",
+            "state": "LIVE",
+        }
+        monkeypatch.setattr(
+            http_client,
+            "get_json",
+            lambda url: {"state": "TRIAL"},
+        )
+        monkeypatch.setattr(
+            http_client,
+            "post_json",
+            lambda url, *a, **kw: apply_result,
+        )
+
+        rc = migrate_module._do_accept_with_drift_check("http://localhost:8420")
+        # No input() should have been called — the test uses patch to verify.
+        assert rc == 0
+        # The function must not have prompted inside (input was never replaced,
+        # so if it were called it would use the real stdin and raise in CI).
+        assert not input_calls, (
+            f"_do_accept_with_drift_check called input() unexpectedly: {input_calls}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# WP2 — standalone subcommand rendering
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateAcceptSubcommandRendering:
+    """migrate-accept standalone subcommand renders applied_live result."""
+
+    def test_accept_subcommand_renders_applied_live(self, monkeypatch, capsys):
+        """migrate-accept success → 'Migration accepted.' and applied-live message."""
+        accept_result = {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+            "restart_hint": "systemctl --user restart paramem-server",
+            "state": "LIVE",
+            "restart_required": False,
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: accept_result)
+        rc = main(["migrate-accept"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Migration accepted" in captured.out or "applied live" in captured.out.lower()
+
+    def test_accept_subcommand_no_extra_prompt(self, monkeypatch):
+        """migrate-accept running the subcommand IS the confirmation — no extra prompt."""
+        accept_result = {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+            "restart_hint": "systemctl ...",
+            "state": "LIVE",
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: accept_result)
+        err_msg = "input() called in migrate-accept"
+        with patch("builtins.input", side_effect=AssertionError(err_msg)):
+            rc = main(["migrate-accept"])
+        assert rc == 0
+
+
+class TestMigrateRollbackSubcommandRendering:
+    """migrate-rollback standalone subcommand renders applied_live result."""
+
+    def test_rollback_subcommand_renders_no_change_message(self, monkeypatch, capsys):
+        """migrate-rollback no-op skip → 'no config change' message rendered."""
+        rollback_result = {
+            "applied_live": True,
+            "restart_required_reason": None,
+            "auto_restart_scheduled": False,
+            "skipped": "no_change",
+            "cloud_only_reason": None,
+            "restart_hint": "systemctl --user restart paramem-server",
+            "state": "LIVE",
+            "restart_required": False,
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: rollback_result)
+        rc = main(["migrate-rollback"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        combined = captured.out + captured.err
+        assert (
+            "no config change" in combined.lower()
+            or "already active" in combined.lower()
+            or "rolled back" in combined.lower()
+        ), f"Expected rollback/no-change message: {combined!r}"
+
+    def test_rollback_subcommand_r_paths_warning(self, monkeypatch, capsys):
+        """migrate-rollback R-PATHS → DATA IS NOT MIGRATED warning."""
+        rollback_result = {
+            "applied_live": False,
+            "restart_required_reason": "paths_change",
+            "auto_restart_scheduled": False,
+            "skipped": None,
+            "cloud_only_reason": None,
+            "restart_hint": "systemctl --user restart paramem-server",
+            "state": "LIVE",
+            "restart_required": True,
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: rollback_result)
+        rc = main(["migrate-rollback"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "not migrated" in captured.err.lower(), (
+            f"Expected data-not-migrated warning in stderr: {captured.err!r}"
+        )

@@ -26,9 +26,13 @@ from paramem.cli.main import main
 _ACCEPT_RESPONSE = {
     "state": "LIVE",
     "trial_adapter_archive_path": "/abs/trial_adapters/20260422-010000",
-    "restart_required": True,
+    "restart_required": False,
     "restart_hint": "systemctl --user restart paramem-server",
     "pre_migration_backup_retained": True,
+    # WP2 fields: live apply succeeded on the normal accept path.
+    "applied_live": True,
+    "restart_required_reason": None,
+    "auto_restart_scheduled": False,
 }
 
 
@@ -65,14 +69,14 @@ class TestMigrateAcceptHappyPath:
         rc = main(["migrate-accept"])
         assert rc == 0
 
-    def test_accept_200_prints_state_and_restart_required(self, monkeypatch, capsys):
-        """200 response → state and restart_required appear in stdout."""
+    def test_accept_200_prints_applied_live_message(self, monkeypatch, capsys):
+        """200 response with applied_live=True → CLI prints live-apply success message."""
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: _ACCEPT_RESPONSE)
         rc = main(["migrate-accept"])
         captured = capsys.readouterr()
         assert rc == 0
-        assert "LIVE" in captured.out or "state" in captured.out.lower()
-        assert "restart_required" in captured.out or "restart" in captured.out.lower()
+        # WP2: CLI uses _render_apply_result; success path prints human-readable message.
+        assert "accepted" in captured.out.lower() or "applied" in captured.out.lower()
 
     def test_accept_200_json_mode_emits_raw_json(self, monkeypatch, capsys):
         """--json emits raw JSON with all response fields."""
@@ -82,7 +86,9 @@ class TestMigrateAcceptHappyPath:
         assert rc == 0
         parsed = json.loads(captured.out)
         assert parsed["state"] == "LIVE"
-        assert parsed["restart_required"] is True
+        # WP2: live apply succeeded → restart_required=False.
+        assert parsed["restart_required"] is False
+        assert parsed["applied_live"] is True
 
 
 # ---------------------------------------------------------------------------
