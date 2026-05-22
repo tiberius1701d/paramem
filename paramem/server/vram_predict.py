@@ -220,6 +220,7 @@ def predict_tts_bytes(tts_config, *, permanent_cloud_only: bool = False) -> int 
 
     total_bytes = 0
     piper_voices_on_gpu = 0
+    kokoro_voices_on_gpu = 0
     any_cache_miss = False
 
     for _lang, voice_config in voices.items():
@@ -250,8 +251,20 @@ def predict_tts_bytes(tts_config, *, permanent_cloud_only: bool = False) -> int 
                 continue
             total_bytes += _sum_dir_bytes(snap, suffixes=(".safetensors",))
 
+        elif engine == "kokoro":
+            # The Kokoro KModel is shared across all voices; counted once below.
+            kokoro_voices_on_gpu += 1
+
     if piper_voices_on_gpu > 0:
         total_bytes += _TTS_PIPER_ORT_CONTEXT_BYTES
+
+    if kokoro_voices_on_gpu > 0:
+        snap = _hf_cache_dir("hexgrad/Kokoro-82M")
+        if snap is None:
+            logger.debug("Kokoro-82M model not cached; cache miss")
+            any_cache_miss = True
+        else:
+            total_bytes += _sum_dir_bytes(snap, suffixes=(".pth", ".safetensors"))
 
     if any_cache_miss:
         return None
