@@ -447,41 +447,53 @@ class TestTimePeriod:
         assert SpeakerStore._time_period(23) == "evening"
 
 
+_GREETINGS = {
+    "en": {"morning": "Good morning", "afternoon": "Good afternoon", "evening": "Good evening"},
+    "de": {"morning": "Guten Morgen", "afternoon": "Guten Tag", "evening": "Guten Abend"},
+}
+
+
 class TestGreetingText:
-    def test_morning_text(self):
-        assert SpeakerStore._greeting_text("morning") == "Good morning"
+    def test_english(self):
+        assert SpeakerStore._greeting_text("morning", _GREETINGS, "en") == "Good morning"
+        assert SpeakerStore._greeting_text("evening", _GREETINGS, "en") == "Good evening"
 
-    def test_afternoon_text(self):
-        assert SpeakerStore._greeting_text("afternoon") == "Good afternoon"
+    def test_german_localized(self):
+        assert SpeakerStore._greeting_text("afternoon", _GREETINGS, "de") == "Guten Tag"
 
-    def test_evening_text(self):
-        assert SpeakerStore._greeting_text("evening") == "Good evening"
+    def test_unknown_language_falls_back_to_english(self):
+        assert SpeakerStore._greeting_text("morning", _GREETINGS, "xx") == "Good morning"
 
 
 class TestShouldGreet:
     def test_disabled_when_interval_zero(self, tmp_path):
         store = SpeakerStore(tmp_path / "profiles.json")
-        assert store.should_greet("speaker1", interval_hours=0) is None
+        assert store.should_greet("speaker1", 0, _GREETINGS) is None
 
     def test_first_greeting(self, tmp_path):
         store = SpeakerStore(tmp_path / "profiles.json")
-        result = store.should_greet("speaker1", interval_hours=24)
+        result = store.should_greet("speaker1", 24, _GREETINGS)
         assert result is not None
         assert "Good" in result
 
+    def test_german_greeting(self, tmp_path):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        result = store.should_greet("speaker1", 24, _GREETINGS, language="de")
+        assert result in ("Guten Morgen", "Guten Tag", "Guten Abend")
+
     def test_no_repeat_within_period(self, tmp_path):
         store = SpeakerStore(tmp_path / "profiles.json")
-        result1 = store.should_greet("speaker1", interval_hours=24)
+        result1 = store.should_greet("speaker1", 24, _GREETINGS)
         assert result1 is not None
         store.confirm_greeting("speaker1")
-        result2 = store.should_greet("speaker1", interval_hours=24)
+        result2 = store.should_greet("speaker1", 24, _GREETINGS)
         assert result2 is None
 
     def test_different_speakers_independent(self, tmp_path):
         store = SpeakerStore(tmp_path / "profiles.json")
-        store.should_greet("speaker1", interval_hours=24)
+        store.should_greet("speaker1", 24, _GREETINGS)
         store.confirm_greeting("speaker1")
-        result = store.should_greet("speaker2", interval_hours=24)
+        result = store.should_greet("speaker2", 24, _GREETINGS)
         assert result is not None
 
 

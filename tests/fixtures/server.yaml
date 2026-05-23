@@ -490,6 +490,13 @@ personal_referent:
 voice:
   prompt_file: configs/prompts/pa_voice.txt
   greeting_interval_hours: 24  # hours between greetings per speaker (0 = disabled)
+  # Per-language greetings (period: morning|afternoon|evening), prepended in the
+  # detected language; unknown languages fall back to "en". Operator-editable.
+  greetings:
+    en: {morning: "Good morning", afternoon: "Good afternoon", evening: "Good evening"}
+    de: {morning: "Guten Morgen", afternoon: "Guten Tag", evening: "Guten Abend"}
+    fr: {morning: "Bonjour", afternoon: "Bon après-midi", evening: "Bonsoir"}
+    es: {morning: "Buenos días", afternoon: "Buenas tardes", evening: "Buenas noches"}
 
 speaker:
   enabled: false  # voice-based speaker identification via pyannote (requires pyannote install + HF auth token)

@@ -214,15 +214,21 @@ class SpeakerStore:
         return "evening"
 
     @staticmethod
-    def _greeting_text(period: str) -> str:
-        greetings = {
-            "morning": "Good morning",
-            "afternoon": "Good afternoon",
-            "evening": "Good evening",
-        }
-        return greetings[period]
+    def _greeting_text(
+        period: str, greetings: dict[str, dict[str, str]], language: str
+    ) -> str | None:
+        """Look up the greeting for ``period`` in ``language`` (config-driven via
+        voice.greetings), falling back to English, then None if absent."""
+        table = greetings.get(language) or greetings.get("en") or {}
+        return table.get(period)
 
-    def should_greet(self, speaker_id: str, interval_hours: int) -> str | None:
+    def should_greet(
+        self,
+        speaker_id: str,
+        interval_hours: int,
+        greetings: dict[str, dict[str, str]],
+        language: str = "en",
+    ) -> str | None:
         """Return a time-appropriate greeting if the interval has elapsed
         or the time-of-day period changed since last greeting.
 
@@ -247,7 +253,7 @@ class SpeakerStore:
             hours_elapsed = (now - last).total_seconds() / 3600
             if current_period == last_period and hours_elapsed < interval_hours:
                 return None
-        return self._greeting_text(current_period)
+        return self._greeting_text(current_period, greetings, language)
 
     def confirm_greeting(self, speaker_id: str) -> None:
         """Mark the speaker as greeted and persist to disk."""

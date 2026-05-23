@@ -715,6 +715,25 @@ class VoiceConfig:
     prompt_file: str = "configs/prompts/pa_voice.txt"
     system_prompt: str = ""
     greeting_interval_hours: int = 24  # hours between greetings per speaker (0 = disabled)
+    # Per-language, per-period greetings (period = morning|afternoon|evening),
+    # prepended app-side in the detected language. Operator-editable in server.yaml;
+    # unknown languages fall back to "en".
+    greetings: dict[str, dict[str, str]] = field(
+        default_factory=lambda: {
+            "en": {
+                "morning": "Good morning",
+                "afternoon": "Good afternoon",
+                "evening": "Good evening",
+            },
+            "de": {"morning": "Guten Morgen", "afternoon": "Guten Tag", "evening": "Guten Abend"},
+            "fr": {"morning": "Bonjour", "afternoon": "Bon après-midi", "evening": "Bonsoir"},
+            "es": {
+                "morning": "Buenos días",
+                "afternoon": "Buenas tardes",
+                "evening": "Buenas noches",
+            },
+        }
+    )
 
     def _read_prompt_file(self) -> str | None:
         """Read the raw prompt file, or ``None`` if absent / unconfigured."""

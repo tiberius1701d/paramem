@@ -422,7 +422,7 @@ options. A short map of the top-level sections:
 | `sentence_type` | Encoder-based interrogative-vs-non-interrogative classifier with exemplars under `configs/sentence_types/<class>.<lang>.txt`. Adding a language is one new file pair, no code change. Falls back to terminal-punctuation + English first-word lexicon when the encoder isn't available. |
 | `personal_referent` | Encoder-based about-speaker-vs-not-about-speaker classifier with exemplars under `configs/personal_referent/<class>.<lang>.txt`. Closes the multilingual hole in the sanitizer: German / Mandarin / Spanish / etc. self-referential queries are blocked at the cloud-egress gate even though the legacy English token-set wouldn't match. Falls back to that token-set when the encoder isn't available. |
 | `text_lang_detection` | fastText `lid.176` detector for the text-only `/chat` path. STT carries Whisper's language signal on audio; pure-text requests had no equivalent and fell through to English regardless of input language. Eager-loaded at server startup when `enabled` is true (CPU-only, ~126 MB resident, zero VRAM cost). One-time setup: `bash scripts/setup/download-langid-model.sh`. Disabled by default so deployments without the model file do not warn. |
-| `voice` | Voice prompt file, per-speaker greeting cadence. |
+| `voice` | Voice prompt file, per-speaker greeting cadence, per-language greeting text (`voice.greetings`). |
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
 
