@@ -2355,7 +2355,12 @@ async def chat(request: ChatRequest):
     greeting_prefix = None
     greeting_interval = _state["config"].voice.greeting_interval_hours
     if speaker_id and store and greeting_interval > 0:
-        greeting = store.should_greet(speaker_id, greeting_interval)
+        greeting = store.should_greet(
+            speaker_id,
+            greeting_interval,
+            _state["config"].voice.greetings,
+            language=detected_language or "en",
+        )
         if greeting:
             if display_speaker:
                 greeting_prefix = f"{greeting}, {display_speaker}. "
