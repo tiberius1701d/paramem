@@ -206,12 +206,13 @@ as episodic/semantic but with a separate key namespace (`proc1`, `proc2`, ...).
 
 #### F5.7 Multilingual TTS — Language-Aware Speech Synthesis
 
-Dual-engine local TTS integrated via Wyoming protocol, with language detection
+Multi-engine local TTS integrated via Wyoming protocol, with language detection
 from Whisper propagated through the full inference pipeline.
 
-- **F5.7a:** Engine abstraction: `TTSEngine` ABC with `PiperTTSEngine` (ONNX,
-  fast, high quality) and `MMSTTSEngine` (HuggingFace, broader language
-  coverage). Both support GPU and CPU execution.
+- **F5.7a:** Engine abstraction: `TTSEngine` ABC + `ENGINE_REGISTRY`, with
+  `PiperTTSEngine` (ONNX, fast, high quality), `MMSTTSEngine` (HuggingFace,
+  broader language coverage), and optional `KokoroTTSEngine` (neural, opt-in
+  per voice; no German). CPU default, GPU per-voice.
 - **F5.7b:** `TTSManager` loads per-language voice configs from `server.yaml`.
   GPU primary, CPU fallback. Lazy loading — voices loaded on first use.
 - **F5.7c:** Language detection: Whisper `info.language` propagated via
@@ -223,8 +224,11 @@ from Whisper propagated through the full inference pipeline.
 - **F5.7e:** Speaker language binding: `preferred_language` stored in
   SpeakerStore (v4 schema). Updated at runtime from high-confidence Whisper
   detections (above `language_confidence_threshold`).
-- **F5.7f:** Wyoming TTS server on port 10301. `TTSHandler` receives
-  `Synthesize` events, routes to the correct engine by language code.
+- **F5.7f:** Wyoming TTS server on port 10301. `TTSHandler` handles one-shot
+  `Synthesize` and the streaming `SynthesizeStart`/`Chunk`/`Stop` protocol
+  (advertised via `supports_synthesize_streaming`), routing to the correct
+  engine by language code. Streaming is what lets HA's voice pipeline deliver
+  the audio to satellites/Sonos.
 - **F5.7g:** Voice config: Piper for en/de/fr/es, MMS-TTS for tl (Tagalog).
   Per-voice device override possible.
 

@@ -246,14 +246,15 @@ Batch consolidation processes sessions as: `extract_session()` for all pending s
 
 A **simulation mode** (`consolidation.mode: simulate`) persists the knowledge graph to disk as `graph.json` under `<adapter_dir>/<tier>/` instead of training LoRA weights. Both modes write to the same unified layout; the distinction is whether timestamped weight slot subdirectories are present alongside the graph. `DiskMemorySource` reads `graph.json` for simulate-mode recall; `WeightMemorySource` probes adapter weights for train-mode recall. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`).
 
-### AD-18: Dual-Engine Multilingual TTS (Phase 5, F5.7)
+### AD-18: Multi-Engine Multilingual TTS (Phase 5, F5.7)
 
-Local text-to-speech via two engines behind a common `TTSEngine` ABC:
+Local text-to-speech via pluggable engines (`ENGINE_REGISTRY`) behind a common `TTSEngine` ABC:
 
-- **Piper** (ONNX runtime): fast, high-quality voices for well-supported languages (en, de, fr, es). Sub-second synthesis on GPU.
+- **Piper** (ONNX runtime): fast, high-quality voices for well-supported languages (en, de, fr, es). Sub-second synthesis on CPU.
 - **MMS-TTS** (HuggingFace VitsModel): broader language coverage (e.g. Tagalog) where Piper has no voice model.
+- **Kokoro-82M** (optional, opt-in per voice): higher-quality neural voices for en/fr/es and others (no German). Apache-2.0, CPU-capable.
 
-`TTSManager` routes synthesis requests by language code to the configured engine/voice from `server.yaml`. GPU primary with CPU fallback. Exposed as a Wyoming protocol server (port 10301) so HA voice satellites can use it directly.
+`TTSManager` routes synthesis requests by language code to the configured engine/voice from `server.yaml` (per-voice device, CPU default). Exposed as a Wyoming protocol server (port 10301): it advertises `supports_synthesize_streaming` and handles `SynthesizeStart`/`Chunk`/`Stop`, which is what lets HA's streaming voice pipeline deliver the audio to satellites/Sonos (engines that don't advertise streaming get a degraded delivery path).
 
 Language detection flows from two sources, both feeding the same resolver in `/chat`:
 
