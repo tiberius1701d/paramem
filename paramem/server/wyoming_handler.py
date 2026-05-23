@@ -18,7 +18,13 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event, async_write_event
 from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
-from wyoming.tts import Synthesize
+from wyoming.tts import (
+    Synthesize,
+    SynthesizeChunk,
+    SynthesizeStart,
+    SynthesizeStop,
+    SynthesizeStopped,
+)
 
 from paramem.server.config import ISO_LANGUAGE_NAMES
 
@@ -300,6 +306,9 @@ class TTSHandler(AsyncEventHandler):
         self._language_resolver = language_resolver
         self._audio_chunk_bytes = audio_chunk_bytes
         self._language_source = language_source
+        # Accumulated state for streaming synthesis (SynthesizeStart/Chunk/Stop).
+        self._stream_voice = None
+        self._stream_text: list[str] = []
 
     async def handle_event(self, event: Event) -> bool:
         """Process a Wyoming protocol event."""
@@ -307,16 +316,48 @@ class TTSHandler(AsyncEventHandler):
             await self._send_info()
             return True
 
+        # One-shot synthesis (tts.speak, tts_get_url, non-streaming callers).
         if Synthesize.is_type(event.type):
             synthesize = Synthesize.from_event(event)
-            await self._synthesize(synthesize)
+            await self._synthesize_and_send(synthesize.text, synthesize.voice)
             return False  # Connection complete
 
+        # Streaming synthesis (HA voice pipeline): SynthesizeStart -> chunk(s) ->
+        # SynthesizeStop. HA streams the response text token-by-token; we
+        # accumulate it and render the full utterance on stop (our engines are
+        # not incremental), then signal SynthesizeStopped. Advertising this path
+        # (supports_synthesize_streaming) is what makes HA deliver our audio to
+        # the satellite/Sonos the same way it does for wyoming-piper.
+        if SynthesizeStart.is_type(event.type):
+            start = SynthesizeStart.from_event(event)
+            self._stream_voice = start.voice
+            self._stream_text = []
+            logger.info("TTS stream: START (voice=%s)", start.voice.name if start.voice else None)
+            return True
+
+        if SynthesizeChunk.is_type(event.type):
+            chunk = SynthesizeChunk.from_event(event)
+            self._stream_text.append(chunk.text)
+            return True
+
+        if SynthesizeStop.is_type(event.type):
+            full = "".join(self._stream_text)
+            logger.info("TTS stream: STOP (%d chunks, %d chars)", len(self._stream_text), len(full))
+            await self._synthesize_and_send(full, self._stream_voice)
+            await async_write_event(SynthesizeStopped().event(), self.writer)
+            self._stream_text = []
+            self._stream_voice = None
+            logger.info("TTS stream: STOPPED sent")
+            return True
+
+        logger.info("TTS handler: unhandled event type=%s", event.type)
         return True
 
-    async def _synthesize(self, request: Synthesize) -> None:
-        """Synthesize text and send audio back."""
-        text = request.text
+    async def _synthesize_and_send(self, text: str, voice) -> None:
+        """Synthesize ``text`` and stream the audio back via the Wyoming
+        protocol. Shared by the one-shot Synthesize path and the streaming
+        SynthesizeStart/Chunk/Stop path; ``voice`` is the caller's
+        SynthesizeVoice (or None)."""
         if not text:
             logger.warning("Empty TTS request")
             return
@@ -325,7 +366,7 @@ class TTSHandler(AsyncEventHandler):
         # "detection") prefers ParaMem's detected language over the caller's
         # voice.language hint; "hint" reverses it. Both fall back to the other
         # source, then to the TTSManager default_language.
-        hint = request.voice.language if (request.voice and request.voice.language) else None
+        hint = voice.language if (voice and voice.language) else None
         detected = self._language_resolver() if self._language_resolver else None
         language = _resolve_synth_language(hint, detected, self._language_source)
 
@@ -402,6 +443,7 @@ class TTSHandler(AsyncEventHandler):
                     installed=True,
                     version="1.0.0",
                     voices=voices,
+                    supports_synthesize_streaming=True,
                 )
             ],
         )
