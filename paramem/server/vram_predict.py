@@ -161,10 +161,13 @@ def predict_stt_bytes(stt_config, *, permanent_cloud_only: bool = False) -> int 
     #   plain whisper:   Systran/faster-whisper-{name}     ("small", "base.en")
     #   distil variant:  Systran/faster-distil-whisper-{rest}  ("distil-large-v3"
     #                    → "Systran/faster-distil-whisper-large-v3")
+    #   turbo:           mobiuslabsgmbh/faster-whisper-large-v3-turbo (the repo
+    #                    faster-whisper resolves "large-v3-turbo" to)
     #   legacy:          guillaumekln/faster-whisper-{name}
     candidates = []
     if model_name.startswith("distil-"):
         candidates.append(f"Systran/faster-distil-whisper-{model_name[len('distil-') :]}")
+    candidates.append(f"mobiuslabsgmbh/faster-whisper-{model_name}")
     candidates.append(f"Systran/faster-whisper-{model_name}")
     candidates.append(f"guillaumekln/faster-whisper-{model_name}")
 
