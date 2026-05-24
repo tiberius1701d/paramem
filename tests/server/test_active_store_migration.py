@@ -144,18 +144,18 @@ class TestMigrationState:
     def test_all_tiers_done_when_complete(self):
         s = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
         s.completed_tiers = list(TIERS)
-        assert s.all_tiers_done is True
+        assert s.all_tiers_done(list(TIERS)) is True
 
     def test_all_tiers_done_with_failure(self):
         s = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
         s.completed_tiers = list(TIERS)
         s.failed_tiers = {"episodic": "boom"}
-        assert s.all_tiers_done is False
+        assert s.all_tiers_done(list(TIERS)) is False
 
     def test_all_tiers_done_partial(self):
         s = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
         s.completed_tiers = ["episodic", "semantic"]
-        assert s.all_tiers_done is False
+        assert s.all_tiers_done(list(TIERS)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -484,18 +484,28 @@ class TestMigrateTierTrainToSimulate:
 
 
 class TestMigrateOrchestrator:
-    def test_skips_already_completed_tiers(self, tmp_path):
+    def test_legitimately_empty_store_vacuous_done(self, tmp_path):
+        """A store with no registered tiers AND no on-disk content completes vacuously.
+
+        This covers a fresh install or a system with no knowledge: no
+        adapter registries, no graph.json files, no interim dirs under
+        adapter_dir.  ``all_tiers_done([])`` is vacuously True in this case
+        and ``clear_state`` is allowed to fire.  This is NOT the degraded
+        case (that requires on-disk content to exist alongside zero tiers).
+        """
         cfg = _make_config(tmp_path, mode="simulate")
-        # No registry on loop → all tiers raise _TierSkipped → flagged complete
+        # adapter_dir is empty — no on-disk content.  The loop store has
+        # replay disabled so tiers_with_registry() returns [].
         loop = MagicMock()
         from paramem.memory.store import MemoryStore as _MS
 
         loop.store = _MS(replay_enabled=False)
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
         result = migrate(loop, cfg, state)
-        # All three tiers tried, all skipped, all marked complete
-        assert set(result.completed_tiers) == set(TIERS)
-        # State file removed because all_tiers_done
+        # No stores registered → no stores iterated → completed_tiers stays empty.
+        assert result.completed_tiers == []
+        # State file removed because all_tiers_done([]) is vacuously True
+        # and the on-disk content check confirmed no content exists.
         assert not state_path(cfg.adapter_dir).exists()
 
     def test_per_tier_failure_isolated(self, tmp_path):
@@ -508,8 +518,13 @@ class TestMigrateOrchestrator:
 
         loop = MagicMock()
         from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
 
         loop.store = _MS(replay_enabled=True)
+        # Pre-register the three main tiers so tiers_with_registry() returns them.
+        # In production this is done by load_registries_from_disk at boot.
+        for tier in TIERS:
+            loop.store.load_registry(tier, KeyRegistry())
         loop.training_config = MagicMock(num_epochs=2)
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -529,7 +544,7 @@ class TestMigrateOrchestrator:
 
         call_count = [0]
 
-        def probe_side_effect(tier_name, entries):
+        def probe_side_effect(tier_name, entries, max_probe=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return 0.0  # episodic fails
@@ -569,8 +584,12 @@ class TestMigrateOrchestrator:
 
         loop = MagicMock()
         from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
 
         loop.store = _MS(replay_enabled=True)
+        # Pre-register the three main tiers so tiers_with_registry() returns them.
+        for tier in TIERS:
+            loop.store.load_registry(tier, KeyRegistry())
         loop.training_config = MagicMock(num_epochs=2)
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
@@ -602,27 +621,113 @@ class TestMigrateOrchestrator:
         ):
             result = migrate(loop, cfg, state)
 
-        assert result.all_tiers_done
+        registered = list(TIERS)
+        assert result.all_tiers_done(registered)
         assert not state_path(cfg.adapter_dir).exists()
 
     def test_resume_skips_completed_tiers(self, tmp_path):
         cfg = _make_config(tmp_path, mode="simulate")
-        # Only semantic + procedural have on-disk content; episodic was already done.
-        # No registry active keys → all skipped cleanly.
-        for tier in ("semantic", "procedural"):
-            _write_simulate_graph(cfg.simulate_dir, tier, [])
+        # Episodic was already done in a prior partial run.
+        # Semantic and procedural still need to run (train→simulate direction,
+        # no active registry keys → _TierSkipped → flagged complete).
 
         loop = MagicMock()
         from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
 
-        loop.store = _MS(replay_enabled=False)
+        loop.store = _MS(replay_enabled=True)
+        # Pre-register semantic and procedural; episodic already completed.
+        for tier in ("semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
 
         state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
         state.completed_tiers = ["episodic"]  # already done from a prior partial run
 
         result = migrate(loop, cfg, state)
-        # All tiers complete now (episodic from prior, others from this run)
-        assert set(result.completed_tiers) == set(TIERS)
+        # All registered tiers (semantic, procedural) complete now; episodic from prior.
+        assert "semantic" in result.completed_tiers
+        assert "procedural" in result.completed_tiers
+        assert "episodic" in result.completed_tiers
+
+    def test_raises_when_empty_tiers_but_disk_has_registry(self, tmp_path):
+        """migrate() raises RuntimeError when store has 0 tiers but an
+        indexed_key_registry.json exists on disk.
+
+        This is the regression guard for the silent data-loss bug: a failed
+        boot-time registry load leaves the in-memory store empty while
+        on-disk content is still present.  migrate() must REFUSE to proceed
+        (and must NOT call clear_state) so the migration stays pending.
+        """
+        cfg = _make_config(tmp_path, mode="simulate")
+        # Write an indexed_key_registry.json for episodic — on-disk content exists.
+        _write_adapter_registry(cfg.adapter_dir, "episodic", ["key1", "key2"])
+
+        loop = MagicMock()
+        from paramem.memory.store import MemoryStore as _MS
+
+        # Store has replay disabled → tiers_with_registry() == [].
+        # This simulates a failed boot-time load_registries_from_disk.
+        loop.store = _MS(replay_enabled=False)
+        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
+        # Persist state file before calling migrate to simulate the armed state.
+        save_state(cfg.adapter_dir, state)
+
+        with pytest.raises(RuntimeError, match="on-disk content exists"):
+            migrate(loop, cfg, state)
+
+        # State file must persist — migration was NOT completed.
+        assert state_path(cfg.adapter_dir).exists(), (
+            "State file must remain after a refused migration; clear_state "
+            "must not fire on the degraded-store path"
+        )
+
+    def test_raises_when_empty_tiers_but_disk_has_graph(self, tmp_path):
+        """migrate() raises RuntimeError when store has 0 tiers but a
+        graph.json exists on disk.
+
+        Variant of the regression guard using a simulate-mode graph.json
+        rather than an indexed_key_registry.json as the on-disk signal.
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        # Write a graph.json for semantic — on-disk content exists.
+        _write_simulate_graph(cfg.adapter_dir, "semantic", [_full_quad("g1")])
+
+        loop = MagicMock()
+        from paramem.memory.store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=False)
+        state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
+        save_state(cfg.adapter_dir, state)
+
+        with pytest.raises(RuntimeError, match="on-disk content exists"):
+            migrate(loop, cfg, state)
+
+        assert state_path(cfg.adapter_dir).exists()
+
+    def test_raises_when_empty_tiers_but_disk_has_interim_dir(self, tmp_path):
+        """migrate() raises RuntimeError when store has 0 tiers but an
+        interim directory exists under adapter_dir.
+
+        Variant of the regression guard using iter_interim_dirs to detect
+        on-disk content.
+        """
+        cfg = _make_config(tmp_path, mode="simulate")
+        # Create an interim directory under the episodic tier.
+        interim_dir = cfg.adapter_dir / "episodic" / "interim_20260101T0000"
+        interim_dir.mkdir(parents=True, exist_ok=True)
+        (interim_dir / "indexed_key_registry.json").write_text("{}")
+
+        loop = MagicMock()
+        from paramem.memory.store import MemoryStore as _MS
+
+        loop.store = _MS(replay_enabled=False)
+        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
+        save_state(cfg.adapter_dir, state)
+
+        with pytest.raises(RuntimeError, match="on-disk content exists"):
+            migrate(loop, cfg, state)
+
+        assert state_path(cfg.adapter_dir).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -841,3 +946,452 @@ class TestMigrateTierSimulateToTrain:
 
         entry_fmt.assert_called_once()
         entry_reg.assert_called_once()
+
+    def test_recall_probe_is_uncapped(self, tmp_path):
+        """_migrate_tier_simulate_to_train passes max_probe=len(entries) to the probe.
+
+        The Phase B gate must probe ALL entries (100 % requirement), not just
+        the default max_probe=100.  Verify that the call uses an explicit
+        max_probe keyword equal to the number of graph entries so the probe
+        cannot silently pass on a small subset of a large adapter.
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        # Use 5 entries; max_probe=5 expected, not the default 100.
+        entries = [_full_quad(f"g{i}") for i in range(5)]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._indexed_dataset.return_value = MagicMock()
+        loop._make_training_config.return_value = MagicMock()
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch(
+                "paramem.memory.entry.format_entry_training",
+                return_value=[{"input_ids": [0]}],
+            ),
+            patch(
+                "paramem.memory.entry.build_registry",
+                return_value={f"g{i}": i for i in range(5)},
+            ),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.training.trainer.train_adapter"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        # The probe must have been called with max_probe equal to the entry count.
+        assert loop._run_recall_sanity_probe.call_count == 1
+        call_kwargs = loop._run_recall_sanity_probe.call_args
+        # Accept either positional or keyword for max_probe.
+        if call_kwargs.kwargs:
+            actual_max_probe = call_kwargs.kwargs.get("max_probe")
+        else:
+            # (tier, entries, max_probe) positional
+            actual_max_probe = call_kwargs.args[2] if len(call_kwargs.args) > 2 else None
+        assert actual_max_probe == len(entries), (
+            f"Expected max_probe={len(entries)} (uncapped); got {actual_max_probe!r}. "
+            "Phase B gate must probe ALL entries, not the default 100."
+        )
+
+
+# ---------------------------------------------------------------------------
+# New tests: interim store migration
+# ---------------------------------------------------------------------------
+
+
+INTERIM_NAME = "episodic_interim_20260101T0000"
+
+
+class TestMigrateEnumeration:
+    """migrate() dispatches all registered stores including interim ones."""
+
+    def test_dispatches_all_four_stores(self, tmp_path):
+        """Four registered stores (3 main + 1 interim) are all dispatched."""
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
+
+        cfg = _make_config(tmp_path, mode="simulate")
+        loop = MagicMock()
+        store = _MS(replay_enabled=True)
+        registered = list(TIERS) + [INTERIM_NAME]
+        for name in registered:
+            store.load_registry(name, KeyRegistry())
+        loop.store = store
+
+        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
+
+        dispatched: list[str] = []
+
+        def _fake_t2s(l, c, name):  # noqa: E741
+            dispatched.append(name)
+
+        with patch(
+            "paramem.server.active_store_migration._migrate_tier_train_to_simulate",
+            side_effect=_fake_t2s,
+        ):
+            result = migrate(loop, cfg, state)
+
+        assert set(dispatched) == set(registered)
+        assert set(result.completed_tiers) == set(registered)
+
+
+class TestAllTiersDoneCoupling:
+    """all_tiers_done(registered_tiers) coupling — regression guard."""
+
+    def test_false_while_interim_pending(self, tmp_path):
+        """all_tiers_done returns False when the interim is not yet complete."""
+        registered = list(TIERS) + [INTERIM_NAME]
+        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
+        state.completed_tiers = list(TIERS)  # interim NOT yet done
+        assert state.all_tiers_done(registered) is False
+
+    def test_true_after_all_four_complete(self, tmp_path):
+        """all_tiers_done returns True only after all four stores complete."""
+        registered = list(TIERS) + [INTERIM_NAME]
+        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
+        state.completed_tiers = registered[:]
+        assert state.all_tiers_done(registered) is True
+
+    def test_clear_state_not_called_while_interim_pending(self, tmp_path):
+        """migrate() does NOT clear the state file while the interim is pending."""
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
+
+        cfg = _make_config(tmp_path, mode="simulate")
+        loop = MagicMock()
+        store = _MS(replay_enabled=True)
+        registered = list(TIERS) + [INTERIM_NAME]
+        for name in registered:
+            store.load_registry(name, KeyRegistry())
+        loop.store = store
+
+        state = MigrationState.for_mode_switch(source_mode="train", target_mode="simulate")
+
+        call_order: list[str] = []
+
+        def _fake_t2s(l, c, name):  # noqa: E741
+            call_order.append(name)
+            if name == INTERIM_NAME:
+                raise RuntimeError("interim blew up")
+
+        with patch(
+            "paramem.server.active_store_migration._migrate_tier_train_to_simulate",
+            side_effect=_fake_t2s,
+        ):
+            result = migrate(loop, cfg, state)
+
+        # All three main tiers succeeded; interim failed → state file MUST persist.
+        assert INTERIM_NAME in result.failed_tiers
+        assert state_path(cfg.adapter_dir).exists(), (
+            "State file must persist when interim store failed; "
+            "clear_state must NOT be called with an incomplete registered set"
+        )
+
+
+class TestSlotPathResolverInterim:
+    """Resolver wiring for interim stores in both migration directions."""
+
+    def test_train_to_simulate_resolves_interim_slot_root(self, tmp_path):
+        """train_to_simulate writes graph.json under episodic/interim_<stamp>/."""
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
+        cfg = _make_config(tmp_path, mode="simulate")
+        adapter_dir = cfg.adapter_dir
+
+        # Expected slot root under the hierarchy.
+        expected_slot_root = adapter_slot_root_for_name(adapter_dir, INTERIM_NAME)
+        assert str(expected_slot_root) == str(adapter_dir / "episodic" / "interim_20260101T0000")
+
+        # Create a weight slot under the resolved root so migration has something to delete.
+        slot_dir = expected_slot_root / "20260430-180000"
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        (slot_dir / "adapter_config.json").write_text("{}")
+
+        # Write a graph.json at the slot root (simulating a reconstruct).
+        # We need active keys in the store so _TierSkipped is not raised.
+        loop = _make_loop_train_to_simulate(tmp_path, keys=["ik1"])
+        # Override the store's tier to the interim name.
+        from paramem.training.key_registry import KeyRegistry
+
+        loop.store.load_registry(INTERIM_NAME, KeyRegistry())
+        loop.store.put(INTERIM_NAME, "ik1", {"subject": "S", "predicate": "p", "object": "O"})
+
+        reconstruction_graph = nx.MultiDiGraph()
+        eid = reconstruction_graph.add_edge("S", "O", predicate="p")
+        reconstruction_graph["S"]["O"][eid][_IK_KEY_ATTR] = "ik1"
+        result_mock = MagicMock()
+        result_mock.graph = reconstruction_graph
+        result_mock.failures = []
+
+        with patch(
+            "paramem.graph.reconstruct.reconstruct_graph",
+            return_value=result_mock,
+        ):
+            _migrate_tier_train_to_simulate(loop, cfg, INTERIM_NAME)
+
+        # graph.json must exist under the interim slot root.
+        assert (expected_slot_root / "graph.json").exists()
+        # Weight slot directory must have been deleted.
+        assert not slot_dir.exists()
+
+    def test_simulate_to_train_resolves_interim_slot_root(self, tmp_path):
+        """simulate_to_train reads/saves under episodic/interim_<stamp>/."""
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
+
+        cfg = _make_config(tmp_path, mode="train")
+        adapter_dir = cfg.adapter_dir
+
+        expected_slot_root = adapter_slot_root_for_name(adapter_dir, INTERIM_NAME)
+
+        # Write the source graph.json at the interim slot root.
+        entries = [_full_quad("ik1")]
+        _write_simulate_graph_at(expected_slot_root, entries)
+
+        loop = TestMigrateTierSimulateToTrain()._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._indexed_dataset.return_value = MagicMock()
+        loop._make_training_config.return_value = MagicMock()
+
+        slot_path = expected_slot_root / "20260430-000000"
+        with (
+            patch(
+                "paramem.memory.entry.format_entry_training",
+                return_value=[{"input_ids": [0]}],
+            ),
+            patch("paramem.memory.entry.build_registry", return_value={"ik1": 99}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.models.loader.atomic_save_adapter",
+                return_value=slot_path,
+            ),
+            patch("paramem.training.trainer.train_adapter"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, INTERIM_NAME)
+
+        # Source graph.json at slot root must have been deleted after success.
+        assert not (expected_slot_root / "graph.json").exists()
+        # SimHash registry written at slot root.
+        assert (expected_slot_root / "simhash_registry.json").exists()
+
+
+class TestTierAdapterConfigInterim:
+    """_tier_adapter_config maps interim names to the episodic config."""
+
+    def test_interim_name_resolves_to_episodic_config(self):
+        from paramem.server.active_store_migration import _tier_adapter_config
+
+        loop = MagicMock()
+        expected = MagicMock(name="episodic_cfg")
+        loop.episodic_config = expected
+        loop.semantic_config = MagicMock(name="semantic_cfg")
+        loop.procedural_config = MagicMock(name="procedural_cfg")
+
+        result = _tier_adapter_config(loop, INTERIM_NAME)
+        assert result is expected, (
+            f"Interim name {INTERIM_NAME!r} must resolve to episodic_config; got {result!r}"
+        )
+
+    def test_main_tier_resolves_own_config(self):
+        from paramem.server.active_store_migration import _tier_adapter_config
+
+        loop = MagicMock()
+        loop.episodic_config = MagicMock(name="ep")
+        loop.semantic_config = MagicMock(name="sem")
+        loop.procedural_config = MagicMock(name="proc")
+
+        assert _tier_adapter_config(loop, "episodic") is loop.episodic_config
+        assert _tier_adapter_config(loop, "semantic") is loop.semantic_config
+        assert _tier_adapter_config(loop, "procedural") is loop.procedural_config
+
+    def test_interim_with_disabled_episodic_raises_skipped(self):
+        """When episodic_config is None, interim adapter raises _TierSkipped."""
+        from paramem.server.active_store_migration import _tier_adapter_config
+
+        loop = MagicMock()
+        loop.episodic_config = None
+        with pytest.raises(_TierSkipped, match="not enabled"):
+            _tier_adapter_config(loop, INTERIM_NAME)
+
+
+class TestNegativeCouplingGuard:
+    """Structural guard: active_store_migration must not import consolidation functions."""
+
+    def _module_source(self) -> str:
+        import importlib.util
+
+        spec = importlib.util.find_spec("paramem.server.active_store_migration")
+        assert spec is not None and spec.origin is not None
+        return Path(spec.origin).read_text(encoding="utf-8")
+
+    def test_no_partition_relations_import(self):
+        assert "partition_relations" not in self._module_source()
+
+    def test_no_run_graph_enrichment_import(self):
+        assert "_run_graph_enrichment" not in self._module_source()
+
+    def test_no_consolidate_interim_adapters_import(self):
+        assert "consolidate_interim_adapters" not in self._module_source()
+
+    def test_no_merger_graph_access(self):
+        assert ".merger.graph" not in self._module_source()
+
+
+class TestTerminologyGuard:
+    """Terminology guard: 'fallback' and 'drift' must not appear in the module source."""
+
+    def _module_source(self) -> str:
+        import importlib.util
+
+        spec = importlib.util.find_spec("paramem.server.active_store_migration")
+        assert spec is not None and spec.origin is not None
+        return Path(spec.origin).read_text(encoding="utf-8")
+
+    def test_no_fallback_in_source(self):
+        src = self._module_source()
+        assert "fallback" not in src.lower(), (
+            "The word 'fallback' must not appear in active_store_migration.py "
+            "(the source store is authoritative, not a fallback)"
+        )
+
+    def test_no_drift_in_source(self):
+        src = self._module_source()
+        assert "drift" not in src.lower(), (
+            "The word 'drift' must not appear in active_store_migration.py"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch-guard: store_load_degraded blocks migration dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestStoreLoadDegradedDispatchGuard:
+    """_maybe_trigger_scheduled_consolidation must not dispatch migration when
+    store_load_degraded is True.
+
+    This is the second half of the fix for the silent data-loss bug: even if
+    pending_rehydration is set, a degraded store (failed boot registry load)
+    must prevent the migration from running.  The migration would see 0
+    registered tiers, all_tiers_done([]) would fire, clear_state would remove
+    the state file, and _finalize_migration would flip effective_mode —
+    completing a no-op migration.
+    """
+
+    def test_degraded_store_skips_migration_dispatch(self):
+        """With store_load_degraded=True and pending_rehydration=True,
+        _maybe_trigger_scheduled_consolidation returns 'migration_skipped_degraded'
+        and does NOT call _run_active_store_migration_sync.
+        """
+        from paramem.server import app as app_module
+
+        run_migration_calls = []
+
+        with (
+            patch.dict(
+                app_module._state,
+                {
+                    "consolidating": False,
+                    "mode": "local",
+                    "background_trainer": None,
+                    "config": MagicMock(
+                        consolidation=MagicMock(consolidation_period_string=""),
+                        adapter_dir=Path("/tmp/fake"),
+                    ),
+                    "session_buffer": MagicMock(),
+                    "pending_rehydration": True,
+                    "store_load_degraded": True,
+                },
+                clear=False,
+            ),
+            patch(
+                "paramem.server.app._retro_claim_orphan_sessions",
+                return_value=0,
+            ),
+            patch(
+                "paramem.server.app._run_active_store_migration_sync",
+                side_effect=lambda: run_migration_calls.append(1),
+            ),
+        ):
+            result = app_module._maybe_trigger_scheduled_consolidation()
+
+        assert result == "migration_skipped_degraded", (
+            f"Expected 'migration_skipped_degraded' but got {result!r}; "
+            "migration must be blocked when the store failed to load at boot"
+        )
+        assert run_migration_calls == [], (
+            "_run_active_store_migration_sync must NOT be called when store_load_degraded=True"
+        )
+
+    def test_healthy_store_dispatches_migration(self):
+        """With store_load_degraded=False and pending_rehydration=True,
+        _maybe_trigger_scheduled_consolidation proceeds to dispatch the migration.
+
+        Verifies that the degraded guard does not block healthy stores.
+        """
+        from paramem.server import app as app_module
+
+        mock_future = MagicMock()
+        mock_future.add_done_callback = MagicMock()
+        mock_loop = MagicMock()
+        mock_loop.run_in_executor.return_value = mock_future
+
+        with (
+            patch.dict(
+                app_module._state,
+                {
+                    "consolidating": False,
+                    "mode": "local",
+                    "background_trainer": None,
+                    "config": MagicMock(
+                        consolidation=MagicMock(consolidation_period_string=""),
+                        adapter_dir=Path("/tmp/fake"),
+                    ),
+                    "session_buffer": MagicMock(),
+                    "pending_rehydration": True,
+                    "store_load_degraded": False,
+                },
+                clear=False,
+            ),
+            patch(
+                "paramem.server.app._retro_claim_orphan_sessions",
+                return_value=0,
+            ),
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            result = app_module._maybe_trigger_scheduled_consolidation()
+
+        assert result == "started_migration", (
+            f"Expected 'started_migration' but got {result!r}; "
+            "migration must proceed when store_load_degraded=False"
+        )
+        mock_loop.run_in_executor.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by new tests (not already in the module-level helpers above)
+# ---------------------------------------------------------------------------
+
+
+def _write_simulate_graph_at(slot_root: Path, entries: list[dict]) -> Path:
+    """Write a graph.json directly at *slot_root* (for interim path tests)."""
+    slot_root.mkdir(parents=True, exist_ok=True)
+    graph_path = slot_root / "graph.json"
+    graph = nx.MultiDiGraph()
+    for entry in entries:
+        graph.add_edge(
+            entry.get("subject", "Subject"),
+            entry.get("object", "Object"),
+            **{
+                _IK_KEY_ATTR: entry["key"],
+                "predicate": entry.get("predicate", "related_to"),
+                "speaker_id": entry.get("speaker_id", "Speaker0"),
+                "first_seen_cycle": entry.get("first_seen_cycle", 1),
+            },
+        )
+    save_memory_to_disk(graph, graph_path, encrypted=False)
+    return graph_path

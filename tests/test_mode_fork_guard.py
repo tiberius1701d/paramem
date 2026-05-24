@@ -57,6 +57,8 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/server/inference.py", "_probe_and_reason"),
         # migration tooling — detect_simulate_mode reads candidate YAML mode key
         ("paramem/server/migration.py", "detect_simulate_mode"),
+        # integrity checker — required/optional matrix depends on persist mode
+        ("paramem/backup/integrity.py", "verify_infrastructure_integrity"),
     ]
 )
 

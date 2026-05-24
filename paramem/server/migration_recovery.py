@@ -50,6 +50,7 @@ class RecoveryAction(str, Enum):
 
     NORMAL_LIVE = "normal_live"
     RESUME_TRIAL = "resume_trial"
+    RESUME_BASE_SWAP = "resume_base_swap"
     STEP3_CRASH_CLEANUP = "step3_crash_cleanup"
     ORPHAN_SWEEP = "orphan_sweep"
     AMBIGUOUS_REQUIRES_OPERATOR = "ambiguous_requires_operator"
@@ -153,6 +154,26 @@ def recover_migration_state(
             trial_marker=None,
             pre_trial_backup_slot=None,
             recovery_required=[msg],
+            log_lines=log_lines,
+        )
+
+    # --- Base-swap marker: check migration_kind FIRST before the trial matrix ---
+    # A base_swap marker renames the live config (like a regular trial), so its
+    # live_hash != pre_trial_config_sha256.  Without this guard, the existing
+    # Case 1 condition would misclassify it as RESUME_TRIAL and try to run trial
+    # gates — wrong path.  We check migration_kind before the hash comparison.
+    if marker is not None and marker.migration_kind == "base_swap":
+        msg = (
+            f"migration: resumed base-swap from marker "
+            f"base_swap_phase={marker.base_swap_phase!r} "
+            f"started_at={marker.started_at}"
+        )
+        log_lines.append(("INFO", msg))
+        return MigrationRecoveryResult(
+            action=RecoveryAction.RESUME_BASE_SWAP,
+            trial_marker=marker,
+            pre_trial_backup_slot=None,
+            recovery_required=[],
             log_lines=log_lines,
         )
 

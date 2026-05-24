@@ -101,6 +101,13 @@ MODEL_REGISTRY = {
         trust_remote_code=True,
         cpu_offload=False,
     ),
+    "qwen3-4b": ModelConfig(
+        model_id="Qwen/Qwen3-4B-Instruct-2507",
+        quantization="nf4",
+        compute_dtype="bfloat16",
+        trust_remote_code=True,
+        cpu_offload=False,
+    ),
 }
 
 # Validated training parameters from test campaign (Tests 1-8).

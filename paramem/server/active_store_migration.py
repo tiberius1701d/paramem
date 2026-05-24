@@ -1,10 +1,10 @@
 """Migrate keyed facts between train (LoRA weights) and simulate (graph.json) stores.
 
 Triggered when the operator flips ``consolidation.mode`` in server.yaml.
-The migration is per-tier with a 1.0 recall gate before cleanup; the
-source store stays authoritative until ALL tiers have completed and the
+The migration is per-store with a 1.0 recall gate before cleanup; the
+source store stays authoritative until ALL stores have completed and the
 state file is removed. On crash mid-migration, the state file persists
-and the system falls back to the source mode on next boot.
+and the system retains the source mode on next boot.
 
 State file location: ``<paths.adapters>/.active_store_migration.json``
 (age-encrypted via ``write_infra_bytes`` when the daily identity is loaded).
@@ -16,27 +16,35 @@ The distinction between modes is whether adapter weight slot subdirectories
 
 Two directions:
 
-* ``simulate_to_train``: read ``<adapter_dir>/<tier>/graph.json`` →
-  train into ``<tier>`` adapter → recall probe at threshold=1.0 → on
+* ``simulate_to_train``: read ``<adapter_dir>/<name>/graph.json`` →
+  train into ``<name>`` adapter → recall probe at threshold=1.0 → on
   pass, atomic-save the slot. On fail, leave the graph intact.
 
-* ``train_to_simulate``: verify ``<adapter_dir>/<tier>/graph.json`` exists
+* ``train_to_simulate``: verify ``<adapter_dir>/<name>/graph.json`` exists
   and covers all active keys; reconstruct from weights if missing →
-  delete all timestamped weight slot subdirs under ``<adapter_dir>/<tier>/``
+  delete all timestamped weight slot subdirs under the resolved slot root
   (graph.json and registries are preserved). On fail, remove any
   freshly-written graph.json and leave the adapter slots intact.
 
-Per-tier failures are recorded in the state file but do not abort the
-remaining tiers — the operator can re-trigger to retry.
+Per-store failures are recorded in the state file but do not abort the
+remaining stores — the operator can re-trigger to retry.
 
-Interim simulate-mode slots are NOT migrated individually: the migration
-collapses interim slots by reading from the canonical main-tier graph
-(or reconstructing from weights) and training / writing the consolidated
-result.  ``episodic_interim_*`` slot dirs are torn down by the subsequent
-full consolidation.  The migration only operates on the three main tiers
-(episodic, semantic, procedural).  ``_has_tier_graph`` walks subdirectories
-so interim simulate-mode graph.json files under
-``<adapter_dir>/<tier>/interim_<stamp>/`` are detected correctly.
+Migration relocates every registered store (main tiers: episodic, semantic,
+procedural; plus any loaded interim stores such as
+``episodic_interim_<stamp>``) under its own identity.  Interim adapters use
+the episodic LoRA config and their on-disk slot root is resolved via
+``adapter_slot_root_for_name`` so the hierarchy under
+``<adapter_dir>/episodic/interim_<stamp>/`` is honoured.
+
+``detect_mode_switch`` arms on main-tier shape only (the three main-tier
+directories are the canonical signal for a mode mismatch); ``migrate()``
+then relocates the full set of registered stores including any interim slots
+that were loaded at boot.  Do not change ``detect_mode_switch`` to inspect
+interim dirs — it would produce false positives on partially-consolidated
+systems.
+
+``_has_tier_graph`` walks subdirectories so interim simulate-mode graph.json
+files under ``<adapter_dir>/<tier>/interim_<stamp>/`` are detected correctly.
 """
 
 from __future__ import annotations
@@ -72,13 +80,13 @@ class MigrationState:
     """Persisted state of an in-progress active-store migration.
 
     The file's presence on disk is the signal that a migration was started
-    and not completed. Startup detection treats this as "fall back to
-    ``source_mode`` for inference until completion".
+    and not completed. Startup detection treats this as "the source store
+    stays authoritative until all stores complete".
     """
 
     direction: str  # "simulate_to_train" | "train_to_simulate"
     started_at: str  # iso8601
-    source_mode: str  # "simulate" | "train" — fallback target on interrupt
+    source_mode: str  # "simulate" | "train" — source store until all stores complete
     target_mode: str  # "simulate" | "train" — what the operator's yaml asks for
     completed_tiers: list[str] = field(default_factory=list)
     failed_tiers: dict[str, str] = field(default_factory=dict)  # tier -> error msg
@@ -99,9 +107,23 @@ class MigrationState:
             target_mode=target_mode,
         )
 
-    @property
-    def all_tiers_done(self) -> bool:
-        return all(t in self.completed_tiers for t in TIERS) and not self.failed_tiers
+    def all_tiers_done(self, registered_tiers: list[str]) -> bool:
+        """Return True when every registered store has been relocated cleanly.
+
+        Args:
+            registered_tiers: Live set of store names to check, obtained from
+                ``loop.store.tiers_with_registry()``.  Covers main tiers
+                (episodic, semantic, procedural) plus any loaded interim stores
+                (e.g. ``episodic_interim_<stamp>``).  The set is NOT persisted
+                — it is passed by the caller at check-time so that an in-flight
+                state file from a prior run never silently ignores newly-registered
+                interim stores that were added between boot and the check.
+
+        Returns:
+            ``True`` only when all names in *registered_tiers* appear in
+            ``completed_tiers`` and ``failed_tiers`` is empty.
+        """
+        return all(t in self.completed_tiers for t in registered_tiers) and not self.failed_tiers
 
 
 def state_path(adapter_dir: Path) -> Path:
@@ -217,42 +239,76 @@ def migrate(
 ) -> MigrationState:
     """Execute the active-store migration described by *state*.
 
-    Per-tier; each tier's success is persisted to the state file before
+    Per-store; each store's success is persisted to the state file before
     moving to the next, so a crash mid-migration can resume from the
-    last committed tier on the next call.
+    last committed store on the next call.  The set of stores to migrate is
+    read from ``loop.store.tiers_with_registry()`` at call time and covers
+    main tiers (episodic, semantic, procedural) plus any interim stores
+    loaded at boot (e.g. ``episodic_interim_<stamp>``).
 
-    Source store is preserved until ALL tiers have completed cleanly
-    (state.all_tiers_done) — only then is the state file removed and
-    the source-side artifacts deleted.
+    Source store is preserved until ALL registered stores have completed
+    cleanly (``state.all_tiers_done(registered_tiers)``) — only then is the
+    state file removed and the source-side artifacts deleted.
+
+    Raises:
+        RuntimeError: When ``loop.store.tiers_with_registry()`` returns an
+            empty list BUT on-disk source content exists.  This indicates that
+            the boot-time registry load failed (silent swallow upstream) and
+            the in-memory store does not reflect the on-disk state.  Proceeding
+            would cause ``all_tiers_done([])`` to vacuously return ``True``,
+            ``clear_state`` to fire, and ``_finalize_migration`` to flip the
+            effective mode — a silent data-loss path.  The state file is NOT
+            cleared so the migration stays pending and is surfaced on retry
+            after the operator resolves the corrupt registry.
 
     Returns the updated state.
     """
+    from paramem.memory.interim_adapter import iter_interim_dirs
+
+    registered_tiers = loop.store.tiers_with_registry()
+
+    if not registered_tiers:
+        adapter_dir = Path(config.adapter_dir)
+        disk_has_content = (
+            any(_has_adapter_registry(adapter_dir, t) for t in TIERS)
+            or any(_has_tier_graph(adapter_dir, t) for t in TIERS)
+            or any(True for _ in iter_interim_dirs(adapter_dir))
+        )
+        if disk_has_content:
+            raise RuntimeError(
+                "active-store migration: live store registered 0 tiers but "
+                "on-disk content exists — registries failed to load; refusing "
+                "to complete a no-op migration"
+            )
+        # Legitimately empty store (fresh install, no keys, no on-disk content):
+        # fall through — all_tiers_done([]) is vacuously True, state cleared.
+
     save_state(config.adapter_dir, state)  # ensure file exists at start
 
-    for tier in TIERS:
-        if tier in state.completed_tiers:
-            logger.info("active_store_migration: tier %s already complete, skipping", tier)
+    for name in registered_tiers:
+        if name in state.completed_tiers:
+            logger.info("active_store_migration: store %s already complete, skipping", name)
             continue
         try:
             if state.target_mode == "train":
-                _migrate_tier_simulate_to_train(loop, config, tier)
+                _migrate_tier_simulate_to_train(loop, config, name)
             else:
-                _migrate_tier_train_to_simulate(loop, config, tier)
-            state.completed_tiers.append(tier)
-            state.failed_tiers.pop(tier, None)
+                _migrate_tier_train_to_simulate(loop, config, name)
+            state.completed_tiers.append(name)
+            state.failed_tiers.pop(name, None)
             save_state(config.adapter_dir, state)
-            logger.info("active_store_migration: tier %s migrated successfully", tier)
+            logger.info("active_store_migration: store %s migrated successfully", name)
         except _TierSkipped as exc:
-            logger.info("active_store_migration: tier %s skipped: %s", tier, exc)
-            state.completed_tiers.append(tier)
+            logger.info("active_store_migration: store %s skipped: %s", name, exc)
+            state.completed_tiers.append(name)
             save_state(config.adapter_dir, state)
         except Exception as exc:  # noqa: BLE001 — top-level boundary
-            logger.exception("active_store_migration: tier %s failed", tier)
-            state.failed_tiers[tier] = str(exc)
+            logger.exception("active_store_migration: store %s failed", name)
+            state.failed_tiers[name] = str(exc)
             save_state(config.adapter_dir, state)
-            # Continue to remaining tiers — operator can re-trigger to retry
+            # Continue to remaining stores — operator can re-trigger to retry
 
-    if state.all_tiers_done:
+    if state.all_tiers_done(registered_tiers):
         clear_state(config.adapter_dir)
         logger.info(
             "active_store_migration: %s complete; state file removed",
@@ -268,48 +324,52 @@ def migrate(
 
 
 def _migrate_tier_train_to_simulate(
-    loop: "ConsolidationLoop", config: "ServerConfig", tier: str
+    loop: "ConsolidationLoop", config: "ServerConfig", name: str
 ) -> None:
-    """Switch a tier from train to simulate by removing adapter weight slots.
+    """Switch a store from train to simulate by removing adapter weight slots.
 
-    Under the unified layout (2026-05-16), ``graph.json`` lives at
-    ``<adapter_dir>/<tier>/graph.json`` in **both** train and simulate modes.
-    The "active store" distinction is just "are adapter weight slots present
-    alongside the graph?":
+    Handles both main tiers (``"episodic"``, ``"semantic"``, ``"procedural"``)
+    and interim adapters (``"episodic_interim_<stamp>"``).  The on-disk slot
+    root is resolved via :func:`adapter_slot_root_for_name` so the correct
+    hierarchy is used for each store.
+
+    Under the unified layout (2026-05-16), ``graph.json`` lives at the slot
+    root in **both** train and simulate modes.  The "active store" distinction
+    is just "are adapter weight slots present alongside the graph?":
 
     * train: timestamped weight slot dirs + graph.json + registries
     * simulate: graph.json + registries only (no weight slots)
 
     The migration to simulate therefore reduces to:
 
-    1. Verify ``<adapter_dir>/<tier>/graph.json`` exists and carries every
-       active registry key (sanity check).  If missing (legacy deployment
-       that ran before graph.json was universal), fall back to weight
-       reconstruction once to materialise it.
+    1. Verify ``<slot_root>/graph.json`` exists and carries every active
+       registry key (sanity check).  If missing (legacy deployment that ran
+       before graph.json was universal), fall back to weight reconstruction
+       once to materialise it.
     2. Delete all timestamped adapter weight slot subdirectories under
-       ``<adapter_dir>/<tier>/`` (directories containing
-       ``adapter_model.safetensors`` or ``adapter_config.json``).
-       The top-level tier directory, graph.json, and registries are
-       preserved — only the weight payload is removed.
+       *slot_root* (directories containing ``adapter_model.safetensors`` or
+       ``adapter_config.json``).  The top-level slot directory, graph.json,
+       and registries are preserved — only the weight payload is removed.
 
     Raises:
-        _TierSkipped: When there are no active registry keys for this tier.
+        _TierSkipped: When there are no active registry keys for this store.
         RuntimeError: When the post-step sanity check fails (graph.json
             missing keys after reconstruction).
     """
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
     from paramem.memory.persistence import (
         iter_entries,
         load_memory_from_disk,
     )
 
     if not loop.store.replay_enabled:
-        raise _TierSkipped(f"replay disabled on loop; tier {tier} skipped")
-    active_keys = loop.store.active_keys_in_tier(tier)
+        raise _TierSkipped(f"replay disabled on loop; store {name} skipped")
+    active_keys = loop.store.active_keys_in_tier(name)
     if not active_keys:
-        raise _TierSkipped(f"no active registry keys for tier {tier}")
+        raise _TierSkipped(f"no active registry keys for store {name}")
 
-    tier_dir = Path(config.adapter_dir) / tier
-    target_graph = tier_dir / "graph.json"
+    slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
+    target_graph = slot_root / "graph.json"
 
     # Step 1: ensure graph.json is current.  Post-architecture cycles
     # write it on every consolidation, so this is the fast path.  On
@@ -322,9 +382,9 @@ def _migrate_tier_train_to_simulate(
         if not all(k in graph_keys for k in active_keys):
             needs_reconstruction = True
             logger.info(
-                "train_to_simulate tier %s: graph.json present but missing keys — "
+                "train_to_simulate store %s: graph.json present but missing keys — "
                 "reconstructing from weights",
-                tier,
+                name,
             )
 
     if needs_reconstruction:
@@ -335,10 +395,10 @@ def _migrate_tier_train_to_simulate(
         )
 
         try:
-            result = reconstruct_graph(loop, tier=tier, strict=True)
+            result = reconstruct_graph(loop, tier=name, strict=True)
         except ReconstructionError as exc:
             raise RuntimeError(
-                f"train_to_simulate tier {tier}: weight reconstruction failed: {exc}"
+                f"train_to_simulate store {name}: weight reconstruction failed: {exc}"
             ) from exc
         graph = result.graph
         for subject, obj, eid, data in graph.edges(keys=True, data=True):
@@ -348,7 +408,7 @@ def _migrate_tier_train_to_simulate(
             cache_entry = loop.store.get(ik_key) or {}
             data["speaker_id"] = cache_entry.get("speaker_id", "")
             data["first_seen_cycle"] = cache_entry.get("first_seen_cycle", 0)
-        tier_dir.mkdir(parents=True, exist_ok=True)
+        slot_root.mkdir(parents=True, exist_ok=True)
         save_memory_to_disk(graph, target_graph)
 
         # Sanity-check after reconstruction.
@@ -358,19 +418,19 @@ def _migrate_tier_train_to_simulate(
         if missing:
             target_graph.unlink(missing_ok=True)
             raise RuntimeError(
-                f"train_to_simulate tier {tier}: sanity check failed — "
+                f"train_to_simulate store {name}: sanity check failed — "
                 f"{len(missing)} key(s) missing after reconstruction: "
                 f"{missing[:5]!r}{'...' if len(missing) > 5 else ''}; "
                 f"rolled back simulate-store write"
             )
 
-    # Step 2: drop adapter weight slot subdirectories from the tier dir.
+    # Step 2: drop adapter weight slot subdirectories from the slot root.
     # Weight slots are subdirectories that contain adapter_model.safetensors
     # or adapter_config.json.  graph.json, simhash_registry.json, and
-    # indexed_key_registry.json live at the top of tier_dir and are preserved.
+    # indexed_key_registry.json live at the top of slot_root and are preserved.
     deleted_slots = 0
-    if tier_dir.exists():
-        for child in list(tier_dir.iterdir()):
+    if slot_root.exists():
+        for child in list(slot_root.iterdir()):
             if not child.is_dir():
                 continue
             if (child / "adapter_model.safetensors").exists() or (
@@ -379,37 +439,50 @@ def _migrate_tier_train_to_simulate(
                 shutil.rmtree(child)
                 deleted_slots += 1
     logger.info(
-        "active_store_migration: tier %s switched to simulate;"
+        "active_store_migration: store %s switched to simulate;"
         " %d keys retained in graph.json; deleted %d weight slot(s) from %s",
-        tier,
+        name,
         len(active_keys),
         deleted_slots,
-        tier_dir,
+        slot_root,
     )
 
 
-def _tier_adapter_config(loop: "ConsolidationLoop", tier: str):
-    """Resolve the per-tier ``AdapterConfig`` from the loop.
+def _tier_adapter_config(loop: "ConsolidationLoop", name: str):
+    """Resolve the ``AdapterConfig`` for a store name from the loop.
 
-    Raises ``_TierSkipped`` when the tier is configured-out
-    (``procedural_config is None`` after operator disabled procedural).
+    Interim adapter names (``"episodic_interim_<stamp>"``) are mapped to the
+    episodic config because interim adapters are always topology-compatible
+    with the main episodic adapter (same rank, alpha, and target modules).
+
+    Raises ``_TierSkipped`` when the resolved tier is configured-out
+    (e.g. ``procedural_config is None`` after the operator disabled procedural).
     """
+    from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+    lookup = "episodic" if name.startswith(INTERIM_NAME_PREFIX) else name
     cfg_map = {
         "episodic": loop.episodic_config,
         "semantic": loop.semantic_config,
         "procedural": loop.procedural_config,
     }
-    tier_config = cfg_map.get(tier)
+    tier_config = cfg_map.get(lookup)
     if tier_config is None:
-        raise _TierSkipped(f"tier {tier} not enabled (config is None)")
+        raise _TierSkipped(f"store {name} (lookup={lookup!r}) not enabled (config is None)")
     return tier_config
 
 
 def _migrate_tier_simulate_to_train(
-    loop: "ConsolidationLoop", config: "ServerConfig", tier: str
+    loop: "ConsolidationLoop", config: "ServerConfig", name: str
 ) -> None:
-    """Read simulate-store graph.json → train into <tier> adapter →
+    """Read simulate-store graph.json → train into ``<name>`` adapter →
     probe at threshold=1.0 → on pass, persist slot + delete source graph.
+
+    Handles both main tiers (``"episodic"``, ``"semantic"``,
+    ``"procedural"``) and interim adapters
+    (``"episodic_interim_<stamp>"``).  The on-disk slot root and the LoRA
+    config are both resolved by name — interim stores use the episodic config
+    and the path under ``<adapter_dir>/episodic/interim_<stamp>/``.
 
     Caller must hold the GPU lock — training and the recall probe both
     drive the model forward and would race STT/TTS otherwise.
@@ -418,29 +491,28 @@ def _migrate_tier_simulate_to_train(
 
     Sequence:
 
-    1. Load source graph from ``<simulate>/<tier>/graph.json``; extract
+    1. Load source graph from the resolved slot root ``graph.json``; extract
        entry dicts via ``iter_entries``.
-    2. Hot-load into ``loop.store`` + register keys into
-       the per-tier registry inside ``loop.store`` with ``adapter_id=tier`` so the
-       recall probe can find them.
-    3. Reset the tier adapter to LoRA-zero
-       (``delete_adapter`` + ``create_adapter`` from the tier's config),
-       then ``switch_adapter`` so training writes into this tier.
+    2. Hot-load into ``loop.store`` + register keys into the per-store
+       registry inside ``loop.store`` with ``adapter_id=name`` so the recall
+       probe can find them.
+    3. Reset the adapter to LoRA-zero
+       (``delete_adapter`` + ``create_adapter`` from the resolved config),
+       then ``switch_adapter`` so training writes into this adapter.
     4. ``format_entry_training`` + ``_indexed_dataset`` to build the
        HF dataset; gradient checkpointing toggled around the format call
        to mirror the existing post_session_train pattern.
-    5. ``train_adapter`` with the tier's adapter config and the loop's
+    5. ``train_adapter`` with the resolved adapter config and the loop's
        configured num_epochs.
-    6. Recall probe via ``loop._run_recall_sanity_probe(tier, entries)``
+    6. Recall probe via ``loop._run_recall_sanity_probe(name, entries)``
        at threshold 1.0 — stricter than the 0.95 in-process default.
-    7. On pass: ``atomic_save_adapter`` writes the slot under
-       ``<adapter_dir>/<tier>/<ts>/``, SimHash registry written to
-       ``<adapter_dir>/<tier>/simhash_registry.json``.
-       Delete the source ``<simulate>/<tier>/graph.json``.
+    7. On pass: ``atomic_save_adapter`` writes the slot under the resolved
+       slot root, SimHash registry written to
+       ``<slot_root>/simhash_registry.json``.
+       Delete the source graph.json.
     8. On fail: reset the adapter back to LoRA-zero so failure does not
        leave half-trained weights resident, raise ``RuntimeError``.
     """
-    # Source graph is at the unified layout location: <adapter_dir>/<tier>/graph.json.
     from paramem.adapters.manifest import build_manifest_for
     from paramem.memory.entry import (
         build_registry as _build_reg,
@@ -448,6 +520,7 @@ def _migrate_tier_simulate_to_train(
     from paramem.memory.entry import (
         format_entry_training as _format_training,
     )
+    from paramem.memory.interim_adapter import adapter_slot_root_for_name
     from paramem.memory.persistence import iter_entries, load_memory_from_disk
     from paramem.models.loader import (
         atomic_save_adapter,
@@ -457,7 +530,9 @@ def _migrate_tier_simulate_to_train(
     from paramem.training.trainer import TrainingHooks
     from paramem.training.trainer import train_adapter as _train_adapter
 
-    source_graph = Path(config.adapter_dir) / tier / "graph.json"
+    # Source graph is at the unified layout location resolved by name.
+    slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
+    source_graph = slot_root / "graph.json"
     if not source_graph.exists():
         raise _TierSkipped(f"no graph.json at {source_graph}")
 
@@ -466,12 +541,12 @@ def _migrate_tier_simulate_to_train(
     if not entries:
         raise _TierSkipped(f"empty graph.json at {source_graph}")
 
-    tier_config = _tier_adapter_config(loop, tier)
+    tier_config = _tier_adapter_config(loop, name)
 
     # Step 2: hot-load into the loop's memory store so the recall probe
     # (which reads from loop.store) can find the keys.  Mirrors the
     # seed_<tier>_cache methods in consolidation.py.
-    loop.store.replace_simhashes_in_tier(tier, _build_reg(entries))
+    loop.store.replace_simhashes_in_tier(name, _build_reg(entries))
     for kp in entries:
         key = kp["key"]
         entry = loop._cache_entry(
@@ -484,13 +559,13 @@ def _migrate_tier_simulate_to_train(
             question=kp.get("question"),
             answer=kp.get("answer"),
         )
-        loop.store.put(tier, key, entry)
+        loop.store.put(name, key, entry)
 
     # Step 3: reset adapter to LoRA-zero so training starts from a clean state.
-    if tier in loop.model.peft_config:
-        loop.model.delete_adapter(tier)
-    loop.model = create_adapter(loop.model, tier_config, tier)
-    switch_adapter(loop.model, tier)
+    if name in loop.model.peft_config:
+        loop.model.delete_adapter(name)
+    loop.model = create_adapter(loop.model, tier_config, name)
+    switch_adapter(loop.model, name)
 
     # Step 4: build training dataset. Disable gradient checkpointing for the
     # tokenizer call (matches the post_session_train pattern at
@@ -498,7 +573,7 @@ def _migrate_tier_simulate_to_train(
     loop._disable_gradient_checkpointing()
     examples = _format_training(entries, loop.tokenizer, max_length=1024)
     if not examples:
-        raise _TierSkipped(f"_format_training produced no examples for tier {tier}")
+        raise _TierSkipped(f"_format_training produced no examples for store {name}")
     dataset = loop._indexed_dataset(examples)
     loop._enable_gradient_checkpointing()
     training_config = loop._make_training_config(num_epochs=loop.training_config.num_epochs)
@@ -507,34 +582,41 @@ def _migrate_tier_simulate_to_train(
     # debris doesn't pollute the main slot layout.
     recall_cb = loop._maybe_make_recall_callback(
         entries=entries,
-        adapter_name=tier,
-        output_dir=Path(config.adapter_dir) / "active_store_migration" / tier,
-        phase_name=f"migrate-{tier}",
+        adapter_name=name,
+        output_dir=Path(config.adapter_dir) / "active_store_migration" / name,
+        phase_name=f"migrate-{name}",
     )
     _train_adapter(
         model=loop.model,
         tokenizer=loop.tokenizer,
         train_dataset=dataset,
-        adapter_name=tier,
+        adapter_name=name,
         training_config=training_config,
         adapter_config=tier_config,
         wandb_config=loop.wandb_config,
-        output_dir=Path(config.adapter_dir) / "active_store_migration" / tier,
-        run_name=f"migrate-simulate-to-train-{tier}",
+        output_dir=Path(config.adapter_dir) / "active_store_migration" / name,
+        run_name=f"migrate-simulate-to-train-{name}",
         thermal_policy=loop._thermal_policy,
         hooks=TrainingHooks(on_shutdown_check=lambda: loop.shutdown_requested),
         callbacks_extra=[recall_cb] if recall_cb is not None else None,
     )
 
     # Step 6: recall probe at threshold=1.0 (stricter than 0.95 default).
-    recall = loop._run_recall_sanity_probe(tier, entries)
+    # Pass max_probe=len(entries) so the gate is uncapped — all keys must pass,
+    # not just a 100-entry sample.  The RecallEarlyStopCallback already probes
+    # the full entry set (no cap), so this call is now consistent with it.
+    # Deliberate: the uncapped probe applies to ALL simulate→train migrations
+    # (both the ordinary mode-switch path and Phase B of a base-swap).  Full
+    # coverage is strictly safer than a sampled gate, matching the callback.
+    # Cost: O(n) inference calls per store — budget accordingly for large stores.
+    recall = loop._run_recall_sanity_probe(name, entries, max_probe=len(entries))
     if recall < 1.0:
         # Rollback: reset adapter to LoRA-zero. The slot was not yet saved to
         # disk so there's nothing to delete on the filesystem side.
-        loop.model.delete_adapter(tier)
-        loop.model = create_adapter(loop.model, tier_config, tier)
+        loop.model.delete_adapter(name)
+        loop.model = create_adapter(loop.model, tier_config, name)
         raise RuntimeError(
-            f"simulate_to_train tier {tier} recall {recall:.3f} < 1.0; "
+            f"simulate_to_train store {name} recall {recall:.3f} < 1.0; "
             f"rolled back trained adapter to LoRA-zero"
         )
 
@@ -546,7 +628,7 @@ def _migrate_tier_simulate_to_train(
         manifest = build_manifest_for(
             loop.model,
             loop.tokenizer,
-            tier,
+            name,
             registry_path=None,
             key_count=len(entries),
             base_model_hash_cache=fingerprint_cache,
@@ -554,42 +636,41 @@ def _migrate_tier_simulate_to_train(
         )
     except Exception:
         logger.warning(
-            "active_store_migration: tier %s manifest build failed — saving without manifest",
-            tier,
+            "active_store_migration: store %s manifest build failed — saving without manifest",
+            name,
         )
         manifest = None
     slot_path = atomic_save_adapter(
         loop.model,
-        Path(config.adapter_dir) / tier,
-        tier,
+        slot_root,
+        name,
         manifest=manifest,
     )
 
-    # Step 7b: persist the per-tier SimHash registry inside the tier directory.
+    # Step 7b: persist the per-store SimHash registry inside the slot root.
     # Mirrors training/consolidation.py::_save_adapters — without this file the
-    # boot-time _load_simhash_registry returns an empty {} for this tier, and
+    # boot-time _load_simhash_registry returns an empty {} for this store, and
     # probe_entries / probe_key then treat every recalled key as untrained
     # (verify_confidence → 0.0 → low_confidence:0.000), so every personal query
     # silently abstains even though the adapter recalls correctly. The simhash
-    # was already built in Step 2 (setattr loop.<tier>_simhash); persist it as
+    # was already built in Step 2 (replace_simhashes_in_tier); persist it as
     # {key: int} shape that _load_simhash_registry / get_simhash expect.
     from paramem.memory.persistence import save_registry as _save_registry
 
-    _simhash = loop.store.simhashes_in_tier(tier)
+    _simhash = loop.store.simhashes_in_tier(name)
     if _simhash:
-        _tier_dir = Path(config.adapter_dir) / tier
-        _tier_dir.mkdir(parents=True, exist_ok=True)
+        slot_root.mkdir(parents=True, exist_ok=True)
         _save_registry(
             _simhash,
-            _tier_dir / "simhash_registry.json",
+            slot_root / "simhash_registry.json",
         )
 
     # Step 7d: delete source (target is now authoritative + probe-confirmed).
     source_graph.unlink()
 
     logger.info(
-        "active_store_migration: tier %s migrated to train; slot=%s, %d keys",
-        tier,
+        "active_store_migration: store %s migrated to train; slot=%s, %d keys",
+        name,
         slot_path,
         len(entries),
     )
