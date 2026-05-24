@@ -256,23 +256,6 @@ def recover_migration_state(
                         )
                     )
 
-            # Also sweep matching graph + registry slots from the same timestamps.
-            for rec in in_window:
-                ts = rec.timestamp
-                for kind in (ArtifactKind.GRAPH, ArtifactKind.REGISTRY):
-                    sibling_dir = backups_root / kind.value / ts
-                    if sibling_dir.exists():
-                        try:
-                            shutil.rmtree(sibling_dir)
-                        except OSError as exc:
-                            log_lines.append(
-                                (
-                                    "WARNING",
-                                    f"migration recovery: could not sweep sibling "
-                                    f"{sibling_dir}: {exc}",
-                                )
-                            )
-
             for slot in swept_slots:
                 log_lines.append(
                     (

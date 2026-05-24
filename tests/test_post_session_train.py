@@ -903,11 +903,13 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
-            # probe_entry: no existing reconstructable keys (proc0 is the only one,
+            # probe_entries: no existing reconstructable keys (proc0 is the only one,
             # and it is in the retirement list, so existing_keys will be empty).
             patch(
-                "paramem.training.consolidation.probe_entry",
-                return_value={"failure_reason": "no_match"},
+                "paramem.training.consolidation.probe_entries",
+                side_effect=lambda model, tokenizer, entries, **kw: (
+                    (e, {"failure_reason": "no_match"}) for e in entries
+                ),
             ),
             patch(
                 "paramem.training.consolidation.build_registry",

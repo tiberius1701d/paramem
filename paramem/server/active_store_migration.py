@@ -568,7 +568,7 @@ def _migrate_tier_simulate_to_train(
     # Step 7b: persist the per-tier SimHash registry inside the tier directory.
     # Mirrors training/consolidation.py::_save_adapters — without this file the
     # boot-time _load_simhash_registry returns an empty {} for this tier, and
-    # probe_entry / probe_key then treat every recalled key as untrained
+    # probe_entries / probe_key then treat every recalled key as untrained
     # (verify_confidence → 0.0 → low_confidence:0.000), so every personal query
     # silently abstains even though the adapter recalls correctly. The simhash
     # was already built in Step 2 (setattr loop.<tier>_simhash); persist it as

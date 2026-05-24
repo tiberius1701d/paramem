@@ -82,14 +82,42 @@ _TIER_ORDER = ["destructive", "pipeline_altering", "operational"]
 
 
 def _render_simulate_notice() -> None:
-    """Print the simulate-mode notice (spec §L243–250, byte-for-byte)."""
+    """Print the simulate-mode informational notice (no mode change).
+
+    The trial runs in the candidate's configured mode — for a simulate-mode
+    candidate that means extraction + graph persistence with no weights trained.
+    """
     print("  ────────────────────────────────────────")
-    print("  ⚠  NOTICE — candidate is simulate-mode")
+    print("  NOTICE — candidate is simulate-mode")
     print("  ────────────────────────────────────────")
-    print("  The candidate config has consolidation.mode: simulate, but the trial")
-    print("  WILL FORCE consolidation.mode: train to exercise the training path.")
-    print("  This consumes VRAM and GPU time and writes a trial adapter.")
-    print("  Accept this override? [y/N]", end=" ", flush=True)
+    print("  The candidate config has consolidation.mode: simulate. The trial")
+    print("  runs in simulate mode: extraction + graph persistence, no weights.")
+
+
+def _render_mode_switch_preview(mode_switch: dict) -> None:
+    """Print the mode-switch preview notice (pure consolidation.mode change)."""
+    print("  ────────────────────────────────────────")
+    print("  NOTICE — persistence-mode switch")
+    print("  ────────────────────────────────────────")
+    print(
+        f"  consolidation.mode: {mode_switch.get('from')} → {mode_switch.get('to')} "
+        f"({mode_switch.get('direction')})"
+    )
+    print("  This is applied DIRECTLY — no trial, accept, or rollback. The")
+    print(f"  store is rebuilt per-tier via {mode_switch.get('applies_via')} at the")
+    print("  next consolidation, with a 1.0 recall gate and source-mode fallback")
+    print("  until every tier passes.")
+
+
+def _render_mode_switch_applied(mode_switch: dict) -> None:
+    """Print confirmation that a mode-switch migration was applied directly."""
+    print()
+    print(
+        f"  Persistence-mode switch applied: {mode_switch.get('from')} → {mode_switch.get('to')}."
+    )
+    print("  The active-store rebuild runs at the next consolidation (per-tier,")
+    print("  1.0 recall gate, source-mode fallback). Run `paramem migrate-status`")
+    print("  or POST /consolidate to drive it.")
 
 
 def _render_shape_change_block(shape_changes: list[dict]) -> None:
@@ -565,10 +593,18 @@ def _run_long_poll_flow(server_url: str) -> int:
 
     # Step 2: POST /migration/confirm.
     try:
-        http_client.post_json(f"{server_url}/migration/confirm")
+        confirm_resp = http_client.post_json(f"{server_url}/migration/confirm")
     except (http_client.ServerHTTPError, http_client.ServerUnreachable) as exc:
         print(f"paramem migrate: confirm failed: {exc}", file=sys.stderr)
         return 1
+
+    # Mode-switch fast path: a pure consolidation.mode change is applied
+    # directly (no trial). The server swapped the config live and armed the
+    # active-store rebuild; there is nothing to poll, accept, or roll back.
+    mode_switch = (confirm_resp or {}).get("mode_switch")
+    if mode_switch:
+        _render_mode_switch_applied(mode_switch)
+        return 0
 
     # Step 3: Long-poll until gates are terminal.
     print("  Confirming trial... polling for gate results (Ctrl+C to interrupt).")
@@ -672,17 +708,17 @@ def render_preview(result: dict, server_url: str) -> int:
     print(f"  candidate hash: {candidate_hash}")
     print()
 
-    # 2. Simulate-mode notice (dedicated confirm before ordinary proceed)
-    if simulate_mode:
+    # 2. Mode / persistence notices.
+    mode_switch = result.get("mode_switch")
+    if mode_switch:
+        # Pure consolidation.mode change → applied directly via the active-store
+        # rebuild (no trial / accept / rollback).  Surface the chosen path.
+        _render_mode_switch_preview(mode_switch)
+        print()
+    elif simulate_mode:
+        # Candidate runs in simulate mode (no mode change): the trial runs in
+        # simulate mode too — extraction + graph persistence, no weights trained.
         _render_simulate_notice()
-        try:
-            answer = input().strip().lower()
-        except EOFError:
-            _post_cancel(server_url)
-            return 1
-        if answer != "y":
-            _post_cancel(server_url)
-            return 1
         print()
 
     # 3. Shape-change block (unconditional — never hidden behind --verbose)

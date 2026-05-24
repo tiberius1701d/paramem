@@ -174,11 +174,7 @@ def _seed_trial_in_state(state: dict, tmp_path: Path) -> None:
         started_at="2026-03-10T00:00:00+00:00",
         pre_trial_config_sha256=_sha256(_LIVE_CONFIG_YAML),
         candidate_config_sha256=_sha256(_CAND_CONFIG_YAML),
-        backup_paths={
-            "config": str(config_slot.resolve()),
-            "graph": str(backups_root / "graph" / "20260310-000000"),
-            "registry": str(backups_root / "registry" / "20260310-000000"),
-        },
+        backup_paths={"config": str(config_slot.resolve())},
         trial_adapter_dir=str(trial_adapter_dir.resolve()),
         trial_graph_dir=str(trial_graph_dir.resolve()),
         gates={
@@ -197,11 +193,7 @@ def _seed_trial_in_state(state: dict, tmp_path: Path) -> None:
         started_at="2026-03-10T00:00:00+00:00",
         pre_trial_config_sha256=_sha256(_LIVE_CONFIG_YAML),
         candidate_config_sha256=_sha256(_CAND_CONFIG_YAML),
-        backup_paths={
-            "config": str(config_slot.resolve()),
-            "graph": str(backups_root / "graph" / "20260310-000000"),
-            "registry": str(backups_root / "registry" / "20260310-000000"),
-        },
+        backup_paths={"config": str(config_slot.resolve())},
         trial_adapter_dir=str(trial_adapter_dir.resolve()),
         trial_graph_dir=str(trial_graph_dir.resolve()),
         config_artifact_filename=config_artifact_filename,

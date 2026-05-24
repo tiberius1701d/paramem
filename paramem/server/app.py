@@ -583,6 +583,7 @@ class PreviewResponse(BaseModel):
     pre_flight_fail: str | None = None
     pre_flight_disk_used_gb: float | None = None
     pre_flight_disk_cap_gb: float | None = None
+    mode_switch: dict | None = None
 
 
 # MigrationDiffResponse is an alias — same shape as PreviewResponse.
@@ -615,7 +616,8 @@ class MigrationStatusResponse(BaseModel):
     candidate_config_sha256:
         SHA-256 of the candidate config, or ``None``.
     backup_paths:
-        Dict of absolute backup slot paths, or ``None``.
+        Dict ``{"config": "<abs_path>"}`` of the pre-migration config backup
+        slot, or ``None``.
     trial_adapter_dir:
         Absolute path to the trial adapter directory, or ``None``.
     trial_graph_dir:
@@ -662,19 +664,30 @@ class ConfirmResponse(BaseModel):
     Attributes
     ----------
     state:
-        Always ``"TRIAL"`` on success.
+        ``"TRIAL"`` on the normal trial path; ``"LIVE"`` on a pure
+        ``consolidation.mode`` change (applied directly, no trial).
     trial_started_at:
-        ISO-8601 UTC timestamp when TRIAL was entered.
+        ISO-8601 UTC timestamp when TRIAL was entered (or when the mode-switch
+        confirm completed).
     pre_trial_config_sha256:
         SHA-256 of the live config before the atomic rename.
     candidate_config_sha256:
         SHA-256 of the candidate bytes.
     backup_paths:
-        Absolute paths to the three pre-migration backup slot directories.
+        Dict ``{"config": "<abs_path>"}`` of the pre-migration config backup
+        slot directory.  Empty dict ``{}`` on a pure mode-switch (no backup
+        written — reverting = flip the mode back).
     trial_adapter_dir:
-        Absolute path to the trial adapter directory.
+        Absolute path to the trial adapter directory.  ``""`` on a pure
+        mode-switch (no trial runs).
     trial_graph_dir:
-        Absolute path to the trial graph directory.
+        Absolute path to the trial graph directory.  ``""`` on a pure
+        mode-switch (no trial runs).
+    mode_switch:
+        Present (non-None) only on a pure ``consolidation.mode`` change.
+        Describes the direction, mechanism, and semantics of the rebuild so
+        CLI and API consumers can explain the outcome without polling for
+        gate results.
     """
 
     state: str
@@ -684,6 +697,7 @@ class ConfirmResponse(BaseModel):
     backup_paths: dict[str, str]
     trial_adapter_dir: str
     trial_graph_dir: str
+    mode_switch: dict | None = None
 
 
 class MigrationCancelResponse(BaseModel):
@@ -1511,11 +1525,7 @@ async def lifespan(app: FastAPI):
                 started_at=m.started_at,
                 pre_trial_config_sha256=m.pre_trial_config_sha256,
                 candidate_config_sha256=m.candidate_config_sha256,
-                backup_paths={
-                    "config": m.backup_paths.get("config", ""),
-                    "graph": m.backup_paths.get("graph", ""),
-                    "registry": m.backup_paths.get("registry", ""),
-                },
+                backup_paths={"config": m.backup_paths.get("config", "")},
                 trial_adapter_dir=m.trial_adapter_dir,
                 trial_graph_dir=m.trial_graph_dir,
                 gates={"status": "pending"},
@@ -1973,34 +1983,9 @@ async def lifespan(app: FastAPI):
     # runs via the consolidation dispatcher (next /consolidate call) under
     # the GPU lock. Inference falls back to ``source_mode`` while a
     # migration is pending so the system stays consistent until ALL tiers
-    # have cleared the 1.0 recall gate.
-    from paramem.server.active_store_migration import detect_mode_switch, save_state
-
-    _migration_state = detect_mode_switch(config)
-    if _migration_state is not None:
-        _state["pending_rehydration"] = True
-        _state["effective_mode"] = _migration_state.source_mode
-        # Persist the (possibly freshly-synthesized) migration state so the
-        # next /consolidate's `load_state` finds it and actually runs the
-        # tier-by-tier rebuild. detect_mode_switch synthesizes a fresh state
-        # on a yaml-mode flip; without this save_state it lives only in this
-        # frame and the consolidate dispatcher logs "state file absent —
-        # clearing pending flag" forever (the migration never starts).
-        # Idempotent when an in-flight state file already existed (re-saves it).
-        # Read-only w.r.t. the GPU — the actual rebuild still runs at /consolidate.
-        save_state(config.adapter_dir, _migration_state)
-        logger.warning(
-            "Active-store migration pending: %s; falling back to %s mode for "
-            "inference until tier-by-tier rebuild completes "
-            "(completed_tiers=%s, failed_tiers=%s). Trigger via /consolidate.",
-            _migration_state.direction,
-            _migration_state.source_mode,
-            _migration_state.completed_tiers or "[]",
-            list(_migration_state.failed_tiers.keys()) or "[]",
-        )
-    else:
-        _state["pending_rehydration"] = False
-        _state["effective_mode"] = config.consolidation.mode
+    # have cleared the 1.0 recall gate.  Shared with the live config-reload
+    # path (_live_reload_base_model) via _arm_active_store_migration.
+    _arm_active_store_migration(config)
 
     # --- Post-session queue: persistent queue for missed training triggers ---
     # Instantiate the queue in local mode so the chat handler can use it.
@@ -3715,6 +3700,46 @@ def _load_model_into_state(config) -> None:
     del model, tokenizer
 
 
+def _refresh_config_from_disk_into_state():
+    """Load the live config from disk, commit it to ``_state``, and arm the active-store rebuild.
+
+    Shared by the lifespan-mirror mode-switch confirm path (``migration_confirm``) and
+    the model-reload config-apply path (``_live_reload_base_model``).  Calling this
+    without a subsequent model reload is correct for a pure ``consolidation.mode`` change
+    because the mode affects consolidation persistence only — not the base model, adapters,
+    router, or inference.  The rebuild runs later at ``/consolidate`` (pre-empted by
+    ``pending_rehydration`` in ``_maybe_trigger_scheduled_consolidation``) with its own 1.0
+    gate + source-mode fallback.
+
+    Returns
+    -------
+    ServerConfig or None
+        The freshly-loaded config on success.  ``None`` when ``config_path`` is unset
+        (preserves the existing warning from ``_live_reload_base_model``).
+    """
+    config_path = _state.get("config_path")
+    if config_path:
+        new_config = load_server_config(Path(config_path))
+        _state["config"] = new_config
+        logger.info(
+            "Live config refresh: loaded config from %s",
+            config_path,
+        )
+        # Arm the active-store rebuild if this refresh flipped
+        # consolidation.mode. The lifespan path arms at startup; without
+        # this call a LIVE-applied mode change (migration accept / config
+        # apply) would leave the on-disk store stale until the next
+        # restart. Reuses the same single arming helper. No-op when the
+        # mode is unchanged.
+        _arm_active_store_migration(new_config)
+        return new_config
+    logger.warning(
+        "refresh_config_from_disk requested but config_path is not set — "
+        "proceeding with current in-memory config"
+    )
+    return None
+
+
 def _live_reload_base_model(
     refresh_config_from_disk: bool = False,
     rebuild_session_buffer: bool = False,
@@ -3793,19 +3818,7 @@ def _live_reload_base_model(
     # then fails (partial-rebuild recovery per §3.15: _state["config"] is
     # already B, so the next /gpu/acquire or restart rebuilds coherently).
     if refresh_config_from_disk:
-        config_path = _state.get("config_path")
-        if config_path:
-            new_config = load_server_config(Path(config_path))
-            _state["config"] = new_config
-            logger.info(
-                "Live config refresh: loaded config from %s before model release",
-                config_path,
-            )
-        else:
-            logger.warning(
-                "refresh_config_from_disk=True but config_path is not set — "
-                "proceeding with current in-memory config"
-            )
+        _refresh_config_from_disk_into_state()
 
     config = _state["config"]
     logger.info(
@@ -5277,7 +5290,11 @@ async def migration_confirm(request: ConfirmRequest):
     """
     from fastapi import HTTPException
 
-    from paramem.server.migration import TrialStash, initial_migration_state
+    from paramem.server.migration import (
+        TrialStash,
+        _build_mode_switch_block,
+        initial_migration_state,
+    )
 
     # --- Step 1: Pre-checks (outside the lock for fast fail) ---
     if _state.get("consolidating", False):
@@ -5376,14 +5393,76 @@ async def migration_confirm(request: ConfirmRequest):
         # even on partial failure (Correction 1).
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # --- Step 2: snapshot pre-trial hashes, write 3 backups ---
+        # --- Pure mode-switch fast path: skip the trial entirely ---
+        # A migration whose ONLY change is consolidation.mode (simulate↔train)
+        # is a persistence-venue switch owned by the active-store rebuild
+        # (active_store_migration), NOT the generic trial.  The rebuild runs
+        # per-tier at the next /consolidate with a 1.0 recall gate and
+        # source-mode fallback.  Running a trial here would force-train and
+        # (for simulate→train) train twice.  So: swap the config live, arm the
+        # rebuild (mirroring the lifespan path — NO model reload, because the
+        # mode affects consolidation persistence only, not the base model /
+        # adapters / router / inference), and drop straight back to LIVE.
+        tier_diff = migration.get("tier_diff", [])
+        is_pure_mode_switch = (
+            len(tier_diff) == 1 and tier_diff[0]["dotted_path"] == "consolidation.mode"
+        )
+        if is_pure_mode_switch:
+            pre_trial_hash = ""
+            if live_config_path.exists():
+                pre_trial_hash = _hashlib.sha256(live_config_path.read_bytes()).hexdigest()
+            try:
+                _rename_config(Path(candidate_path_str), live_config_path)
+                dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(dir_fd)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "config_swap_failed",
+                        "message": f"Atomic config rename failed: {exc}",
+                    },
+                ) from exc
+
+            # Refresh _state["config"] to the new mode and arm the per-tier
+            # rebuild (lifespan-mirror; no model reload), then return to LIVE.
+            _refresh_config_from_disk_into_state()
+            _state["migration"] = initial_migration_state()
+
+            return ConfirmResponse(
+                state="LIVE",
+                trial_started_at=now_iso,
+                pre_trial_config_sha256=pre_trial_hash,
+                candidate_config_sha256=candidate_hash,
+                backup_paths={},
+                trial_adapter_dir="",
+                trial_graph_dir="",
+                mode_switch=_build_mode_switch_block(
+                    tier_diff[0]["old_value"], tier_diff[0]["new_value"]
+                ),
+            )
+
+        # --- Step 2: snapshot pre-trial hash, write the config backup ---
+        # Config is the ONLY required pre-migration artifact.  The migration's
+        # sole live mutation is the atomic config swap in step 4: the trial
+        # consolidation writes its adapters / registry / graph into isolated
+        # dirs (_build_trial_loop) and never marks sessions consolidated, so
+        # rollback (and crash recovery) only ever restore the config.  This
+        # holds in BOTH persistence modes — train (weights) and simulate
+        # (graph.json) both write only to the trial-isolated output paths.
+        # Backing up graph / registry here would be dead writes; nothing reads
+        # backup_paths["graph"] / ["registry"].
         pre_trial_hash = ""
         if live_config_path.exists():
             pre_trial_hash = _hashlib.sha256(live_config_path.read_bytes()).hexdigest()
 
         written_slots: list[Path] = []
         try:
-            # 2a: Config backup — read live config bytes.
             config_bytes = live_config_path.read_bytes() if live_config_path.exists() else b""
             config_slot = backup_write(
                 ArtifactKind.CONFIG,
@@ -5392,37 +5471,6 @@ async def migration_confirm(request: ConfirmRequest):
                 base_dir=backups_root / "config",
             )
             written_slots.append(config_slot)
-
-            # 2b: Graph backup — use merger.save_bytes() when loop is available.
-            loop_obj = _state.get("consolidation_loop")
-            if loop_obj is not None and hasattr(loop_obj, "merger"):
-                graph_bytes = loop_obj.merger.save_bytes()
-            else:
-                graph_bytes = b"{}"
-            graph_slot = backup_write(
-                ArtifactKind.GRAPH,
-                graph_bytes,
-                meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
-                base_dir=backups_root / "graph",
-            )
-            written_slots.append(graph_slot)
-
-            # 2c: Registry backup.
-            if config is not None:
-                registry_bytes = (
-                    config.key_metadata_path.read_bytes()
-                    if config.key_metadata_path.exists()
-                    else b"{}"
-                )
-            else:
-                registry_bytes = b"{}"
-            registry_slot = backup_write(
-                ArtifactKind.REGISTRY,
-                registry_bytes,
-                meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
-                base_dir=backups_root / "registry",
-            )
-            written_slots.append(registry_slot)
 
         except Exception as exc:
             # Step 2 failure: clean up any written slots.
@@ -5458,11 +5506,7 @@ async def migration_confirm(request: ConfirmRequest):
             started_at=now_iso,
             pre_trial_config_sha256=pre_trial_hash,
             candidate_config_sha256=candidate_hash,
-            backup_paths={
-                "config": str(config_slot.resolve()),
-                "graph": str(graph_slot.resolve()),
-                "registry": str(registry_slot.resolve()),
-            },
+            backup_paths={"config": str(config_slot.resolve())},
             trial_adapter_dir=trial_adapter_dir,
             trial_graph_dir=trial_graph_dir,
             config_artifact_filename=config_artifact_filename,
@@ -5522,11 +5566,7 @@ async def migration_confirm(request: ConfirmRequest):
             started_at=now_iso,
             pre_trial_config_sha256=pre_trial_hash,
             candidate_config_sha256=candidate_hash,
-            backup_paths={
-                "config": str(config_slot.resolve()),
-                "graph": str(graph_slot.resolve()),
-                "registry": str(registry_slot.resolve()),
-            },
+            backup_paths={"config": str(config_slot.resolve())},
             trial_adapter_dir=trial_adapter_dir,
             trial_graph_dir=trial_graph_dir,
             gates={"status": "pending"},
@@ -5543,11 +5583,7 @@ async def migration_confirm(request: ConfirmRequest):
             trial_started_at=now_iso,
             pre_trial_config_sha256=pre_trial_hash,
             candidate_config_sha256=candidate_hash,
-            backup_paths={
-                "config": str(config_slot.resolve()),
-                "graph": str(graph_slot.resolve()),
-                "registry": str(registry_slot.resolve()),
-            },
+            backup_paths={"config": str(config_slot.resolve())},
             trial_adapter_dir=trial_adapter_dir,
             trial_graph_dir=trial_graph_dir,
         )
@@ -5584,11 +5620,13 @@ async def _run_trial_consolidation() -> None:
             else Path("configs/server.yaml")
         )
 
-        # Reload config from the newly-active candidate.
+        # Reload config from the newly-active candidate.  The trial runs in the
+        # candidate's CONFIGURED consolidation.mode — no force-train override.
+        # Pure mode-switch migrations never reach this coroutine (they are
+        # applied directly by migration_confirm and rebuilt by the active-store
+        # migration); only non-mode changes run a trial here, where the live
+        # mode is unchanged so the trial faithfully reflects it.
         trial_config = load_server_config(live_config_path)
-        # Override: trial mode is always "train" regardless of what the candidate
-        # config specifies (Resolved Decision 27, spec L239).
-        trial_config.consolidation.mode = "train"
 
         # Determine trial adapter and graph paths from the marker.
         migration = _state.get("migration", {})
@@ -5732,6 +5770,7 @@ async def _run_trial_consolidation() -> None:
                 session_buffer_empty=session_buffer_empty,
                 consolidation_summary=summary,
                 consolidation_exception=exc_captured,
+                recall_probe_batch_size=trial_config.consolidation.recall_probe_batch_size,
             )
 
             overall_status = _rollup_gate_status(results, session_buffer_empty)
@@ -9263,6 +9302,47 @@ def _run_full_consolidation_sync() -> None:
 
     bt.submit(_run_full_cycle, inference_fallback_adapter="episodic")
     logger.info("Full consolidation submitted to BG trainer")
+
+
+def _arm_active_store_migration(config) -> bool:
+    """Arm a pending active-store rebuild when the live ``consolidation.mode``
+    diverges from the on-disk active store.
+
+    Single source for the mode-switch arming used by BOTH the lifespan startup
+    path AND the live config-reload path (``_live_reload_base_model``).  When a
+    divergence is detected it sets ``pending_rehydration`` + ``effective_mode``
+    (the source mode, so inference falls back to it) and persists the migration
+    state so the next ``/consolidate`` runs the tier-by-tier rebuild under the
+    1.0 recall gate.  The rebuild itself is NOT run here — this is GPU-free and
+    read-only w.r.t. the model.
+
+    ``detect_mode_switch`` returns ``None`` when there is no divergence, so this
+    is a safe no-op for every non-mode config change.
+
+    Returns ``True`` when a migration was armed, ``False`` otherwise.
+    """
+    from paramem.server.active_store_migration import detect_mode_switch, save_state
+
+    migration_state = detect_mode_switch(config)
+    if migration_state is not None:
+        _state["pending_rehydration"] = True
+        _state["effective_mode"] = migration_state.source_mode
+        # Persist so the next /consolidate's load_state finds it and runs the
+        # rebuild. Idempotent when an in-flight state file already existed.
+        save_state(config.adapter_dir, migration_state)
+        logger.warning(
+            "Active-store migration pending: %s; falling back to %s mode for "
+            "inference until tier-by-tier rebuild completes "
+            "(completed_tiers=%s, failed_tiers=%s). Trigger via /consolidate.",
+            migration_state.direction,
+            migration_state.source_mode,
+            migration_state.completed_tiers or "[]",
+            list(migration_state.failed_tiers.keys()) or "[]",
+        )
+        return True
+    _state["pending_rehydration"] = False
+    _state["effective_mode"] = config.consolidation.mode
+    return False
 
 
 def _run_active_store_migration_sync() -> None:

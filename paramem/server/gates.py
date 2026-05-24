@@ -735,7 +735,7 @@ def _gate_3_reload_smoke(
     was loaded — the gate's purpose is ADAPTER LOAD verification, not
     enforcement of a specific kind.
 
-    Probes via ``probe_entry`` which returns ``failure_reason`` on any parse
+    Probes via ``probe_entries`` which returns ``failure_reason`` on any parse
     or recall failure — no secondary parse check is needed.
 
     The first key to probe is taken from the per-tier
@@ -842,11 +842,11 @@ def _gate_3_reload_smoke(
         )
 
     try:
-        from paramem.memory.entry import probe_entry
+        from paramem.training.recall_eval import probe_entries
 
-        result = probe_entry(model, tokenizer, first_key)
+        _, result = next(iter(probe_entries(model, tokenizer, [{"key": first_key}], batch_size=1)))
 
-        # probe_entry returns failure_reason on any parse failure, key
+        # probe_entries returns failure_reason on any parse failure, key
         # mismatch, or low confidence — single discriminator.
         if result is None or "failure_reason" in result:
             reason = (result or {}).get("failure_reason", "probe returned None")
@@ -877,6 +877,7 @@ def _gate_4_recall_check(
     trial_adapter_dir: Path,
     live_registry_path: Path,
     mount_state: dict,
+    recall_probe_batch_size: int = 16,
 ) -> GateResult:
     """Gate 4 — live-registry cross-adapter recall check.
 
@@ -979,22 +980,29 @@ def _gate_4_recall_check(
             )
 
     # Probe + verifier.  Imports are lazy to keep the module torch-free at import time.
-    from paramem.memory.entry import (
-        probe_entry as _probe_fn,
-    )
+    # Use the BATCHED probe (probe_entries) — one model.generate per chunk — rather
+    # than a per-key loop.  This is the same primitive evaluate_indexed_recall builds
+    # on, so the recalled-dict shape is identical.
     from paramem.memory.entry import (
         verify_confidence as _verify_confidence,
     )
+    from paramem.training.recall_eval import probe_entries as _probe_entries
 
     def _run_sample(suffix: bytes = b"") -> tuple[list[str], int, str]:
         """Return (sampled_keys, pass_count, seed_hex)."""
         seed_hex = hashlib.sha256(registry_content + suffix).hexdigest()[:16]
         keys = _sample_registry_keys(registry_content, seed_suffix=suffix)
         passed = 0
-        for k in keys:
-            result = _probe_fn(model, tokenizer, k, registry=registry_parsed)
-            if result is not None and "failure_reason" not in result:
-                conf = _verify_confidence(result, registry_parsed)
+        entries = [{"key": k} for k in keys]
+        for _entry, recalled in _probe_entries(
+            model,
+            tokenizer,
+            entries,
+            registry=registry_parsed,
+            batch_size=recall_probe_batch_size,
+        ):
+            if recalled is not None and "failure_reason" not in recalled:
+                conf = _verify_confidence(recalled, registry_parsed)
                 if conf >= GATE_4_THRESHOLD:
                     passed += 1
         return keys, passed, seed_hex
@@ -1087,6 +1095,7 @@ def evaluate_gates(
     session_buffer_empty: bool,
     consolidation_summary: dict | None,
     consolidation_exception: BaseException | None,
+    recall_probe_batch_size: int = 16,
 ) -> list[GateResult]:
     """Evaluate all four sanity gates for a trial consolidation run.
 
@@ -1153,6 +1162,7 @@ def evaluate_gates(
             trial_adapter_dir=trial_adapter_dir,
             live_registry_path=live_registry_path,
             mount_state=mount_state,
+            recall_probe_batch_size=recall_probe_batch_size,
         )
     finally:
         # Acceptance criterion D — trial_probe MUST NOT remain in

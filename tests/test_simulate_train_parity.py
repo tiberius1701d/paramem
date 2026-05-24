@@ -180,7 +180,7 @@ def _patches_for_train_mode():
     - ``paramem.memory.interim_adapter.create_interim_adapter`` → populates
       peft_config[adapter_name] so _resolve_target_slot's peft_config check
       works; returns the model unchanged.
-    - ``paramem.memory.entry.probe_entry`` → returns None so
+    - ``paramem.training.consolidation.probe_entries`` → yields None recalled so
       existing-key reconstruction falls through to the store cache (unit-test
       mode; real inference requires a loaded GPU model).
     """
@@ -191,6 +191,11 @@ def _patches_for_train_mode():
         model.peft_config[adapter_name] = MagicMock()
         return model
 
+    def _fake_probe_entries(model, tokenizer, entries, **kw):
+        """Yield (entry, None) so reconstruction falls through to the store cache."""
+        for e in entries:
+            yield e, None
+
     return [
         patch("paramem.training.trainer.train_adapter", return_value=MagicMock(metrics={})),
         patch("paramem.models.loader.save_adapter"),
@@ -199,7 +204,10 @@ def _patches_for_train_mode():
             "paramem.memory.interim_adapter.create_interim_adapter",
             side_effect=_fake_create_interim,
         ),
-        patch("paramem.training.consolidation.probe_entry", return_value=None),
+        patch(
+            "paramem.training.consolidation.probe_entries",
+            side_effect=_fake_probe_entries,
+        ),
     ]
 
 

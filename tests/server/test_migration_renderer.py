@@ -349,6 +349,42 @@ class TestRenderPreviewResponse:
         for field in required:
             assert field in payload, f"Missing field: {field!r}"
 
+    def test_mode_switch_block_for_pure_mode_change(self):
+        """A pure consolidation.mode change surfaces a mode_switch block."""
+        stash = initial_migration_state()
+        stash["state"] = "STAGING"
+        stash["tier_diff"] = [
+            {
+                "dotted_path": "consolidation.mode",
+                "old_value": "simulate",
+                "new_value": "train",
+                "tier": "pipeline_altering",
+            }
+        ]
+        payload = render_preview_response(stash)
+        ms = payload["mode_switch"]
+        assert ms is not None
+        assert ms["from"] == "simulate"
+        assert ms["to"] == "train"
+        assert ms["direction"] == "simulate_to_train"
+        assert ms["applies_via"] == "active_store_migration"
+
+    def test_mode_switch_none_for_non_mode_change(self):
+        """A non-mode change (or mode + other field) has mode_switch=None."""
+        stash = initial_migration_state()
+        stash["state"] = "STAGING"
+        stash["tier_diff"] = [
+            {
+                "dotted_path": "consolidation.mode",
+                "old_value": "simulate",
+                "new_value": "train",
+                "tier": "pipeline_altering",
+            },
+            {"dotted_path": "debug", "old_value": False, "new_value": True, "tier": "operational"},
+        ]
+        payload = render_preview_response(stash)
+        assert payload["mode_switch"] is None
+
 
 # ---------------------------------------------------------------------------
 # Byte-for-byte spec-compliance smoke test (spec §L257–271)

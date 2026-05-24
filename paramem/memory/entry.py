@@ -478,12 +478,11 @@ def _finalize_recalled(
     registry: dict | None,
     confidence_threshold: float,
 ) -> dict:
-    """Turn a raw model output into the contract dict probe_entry returns.
+    """Turn a raw model output into the recalled-entry contract dict.
 
-    Shared between the single-key probe_entry path and the batched recall
-    path in recall_eval.py. Returns the same shape probe_entry returns:
-    either the parsed-entry dict augmented with confidence/raw_output/
-    fact_text, or a failure-reason dict.
+    Used by the batched recall path in recall_eval.py. Returns either the
+    parsed-entry dict augmented with confidence/raw_output/fact_text, or a
+    failure-reason dict.
     """
     parsed = parse_recalled_entry(raw)
     if parsed is None:
@@ -505,67 +504,6 @@ def _finalize_recalled(
     parsed["raw_output"] = raw
     parsed["fact_text"] = entry_fact_text(parsed)
     return parsed
-
-
-def probe_entry(
-    model,
-    tokenizer,
-    key: str,
-    *,
-    registry: dict | None = None,
-    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-    max_new_tokens: int = 128,
-) -> dict | None:
-    """Prompt the model to recall a single entry by key.
-
-    1-key convenience wrapper around
-    :func:`paramem.training.recall_eval.probe_entries`.  Builds a stub entry
-    containing only the key (empty SPO fields), calls ``probe_entries`` with
-    ``batch_size=1``, and returns the single recalled dict.
-
-    - Returns a dict with ``key``, ``subject``, ``predicate``, ``object``,
-      ``confidence``, ``raw_output``, and
-      ``fact_text`` (human-readable via :func:`entry_fact_text`) on success
-      (``confidence`` is ``1.0`` when no registry is supplied — same as
-      ``probe_key``).
-    - Returns ``{"raw_output": ..., "failure_reason": "parse_failure"}``
-      when the output cannot be parsed.
-    - Returns ``{"raw_output": ..., "failure_reason": "key_mismatch:<got>"}``
-      when the recalled key does not match the queried key.
-    - Returns ``{"raw_output": ..., "failure_reason": "low_confidence:<val>"}``
-      when the confidence falls below the threshold.
-
-    All parameters are keyword-only after ``key`` to prevent accidental
-    positional misuse.
-
-    Args:
-        model: Loaded HuggingFace / PEFT model.
-        tokenizer: Tokenizer matching the model.
-        key: Key to recall (e.g. ``"graph3"``).
-        registry: Optional SimHash registry for confidence verification.
-        confidence_threshold: Minimum confidence to accept a recalled entry.
-        max_new_tokens: Maximum tokens to generate.
-
-    Returns:
-        Result dict on success or failure — never ``None`` (shape contract
-        matches :func:`paramem.training.indexed_memory.probe_key`).
-    """
-    from paramem.training.recall_eval import probe_entries
-
-    stub = {"key": key, "subject": "", "predicate": "", "object": ""}
-    results = list(
-        probe_entries(
-            model,
-            tokenizer,
-            [stub],
-            registry=registry,
-            batch_size=1,
-            confidence_threshold=confidence_threshold,
-            max_new_tokens=max_new_tokens,
-        )
-    )
-    _, recalled = results[0]
-    return recalled
 
 
 # --- Fact-text helper ---

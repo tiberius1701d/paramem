@@ -37,13 +37,13 @@ from paramem.memory.entry import (
     build_registry,
     compute_simhash,
     format_entry_training,
-    probe_entry,
 )
 from paramem.memory.persistence import save_registry
 from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.vram_guard import safe_empty_cache
 from paramem.training.curriculum import CurriculumSampler
 from paramem.training.key_registry import KeyRegistry
+from paramem.training.recall_eval import probe_entries
 from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import TrainingHooks, train_adapter
@@ -634,7 +634,7 @@ class ConsolidationLoop:
         """Return a training-ready keyed-pair from the in-RAM cache, or ``None``.
 
         Used by the existing-key reconstruction loops as a last-resort
-        fallback when ``probe_entry`` / ``probe_key`` fails (typically when
+        fallback when ``probe_entries`` / ``probe_key`` fails (typically when
         the adapter isn't mountable due to a hash mismatch).
 
         The boot-time ``seed_key_metadata`` populates the store with
@@ -658,6 +658,27 @@ class ConsolidationLoop:
         if not all(f in qa for f in ("question", "answer")):
             return None
         return {"key": key, "question": qa["question"], "answer": qa["answer"]}
+
+    def _reset_main_tier_registries_and_simhashes(self, tier_keyed: dict[str, list[dict]]) -> None:
+        """Reset each main tier's KeyRegistry AND SimHash registry from ``tier_keyed``.
+
+        The registry and the SimHash registry MUST be rebuilt together: rewriting
+        the registry alone leaves a fold-rebuilt tier (e.g. episodic consolidated
+        from interim) with an EMPTY SimHash registry, so SimHash-confidence recall —
+        the primary recall metric — returns 0.000 for every key, breaking
+        ``reconstruct_graph`` / train→simulate and the hallucination/recall
+        verification.  Co-locating both updates here makes that pairing the only
+        callable form, so the registry can never be reset without its SimHashes.
+        Mirrors the established ``build_registry`` → ``replace_simhashes_in_tier``
+        pattern used at the interim and semantic rebuild sites.
+        """
+        for _main_tier in ("episodic", "semantic", "procedural"):
+            keyed = tier_keyed.get(_main_tier, [])
+            new_reg = KeyRegistry()
+            for kp in keyed:
+                new_reg.add(kp["key"])
+            self.store.load_registry(_main_tier, new_reg)
+            self.store.replace_simhashes_in_tier(_main_tier, build_registry(keyed))
 
     def _drop_interim_tier_registries(self) -> int:
         """Drop every interim tier registry from the store.
@@ -1141,7 +1162,7 @@ class ConsolidationLoop:
         ``kp.get("speaker_id", speaker_id)`` — the caller's id, never ``""``.
 
         Reconstruction policy (TRAIN mode only):
-            Calls ``probe_entry`` on each existing key and uses the adapter
+            Calls ``probe_entries`` on each existing key and uses the adapter
             weights as the authoritative source.  Falls back to
             ``_safe_kp_from_cache`` when probe fails.
 
@@ -1206,7 +1227,7 @@ class ConsolidationLoop:
         existing_keyed: list[dict] = []
         if mode == "train":
             # TRAIN: reconstruct from adapter weights.
-            # Keys with no simhash fingerprint cannot be verified by probe_entry
+            # Keys with no simhash fingerprint cannot be verified by probe_entries
             # (no reference hash to compute confidence against) — fall back to
             # cache immediately for those keys and only probe the rest.
             self._disable_gradient_checkpointing()
@@ -1214,14 +1235,16 @@ class ConsolidationLoop:
             keys_with_hash = [k for k in existing_tier_keys if k in tier_simhash]
             keys_without_hash = [k for k in existing_tier_keys if k not in tier_simhash]
             reconstructed: dict[str, dict] = {}
-            for key in keys_with_hash:
-                recalled = probe_entry(
-                    self.model,
-                    self.tokenizer,
-                    key,
-                    registry=tier_simhash,
-                    confidence_threshold=0.5,
-                )
+            entries = [{"key": k} for k in keys_with_hash]
+            for entry, recalled in probe_entries(
+                self.model,
+                self.tokenizer,
+                entries,
+                registry=tier_simhash,
+                batch_size=self.training_config.recall_probe_batch_size,
+                confidence_threshold=0.5,
+            ):
+                key = entry["key"]
                 if recalled is not None and "failure_reason" not in recalled:
                     cached = self.store.get(key) or {}
                     first_seen = cached.get("first_seen_cycle", self.cycle_count)
@@ -1382,14 +1405,16 @@ class ConsolidationLoop:
         self._disable_gradient_checkpointing()
         proc_simhash = self.store.simhashes_in_tier("procedural")
         reconstructed: dict[str, dict] = {}
-        for key in existing_proc_keys:
-            recalled = probe_entry(
-                self.model,
-                self.tokenizer,
-                key,
-                registry=proc_simhash,
-                confidence_threshold=0.5,
-            )
+        entries = [{"key": k} for k in existing_proc_keys]
+        for entry, recalled in probe_entries(
+            self.model,
+            self.tokenizer,
+            entries,
+            registry=proc_simhash,
+            batch_size=self.training_config.recall_probe_batch_size,
+            confidence_threshold=0.5,
+        ):
+            key = entry["key"]
             if recalled is not None and "failure_reason" not in recalled:
                 cached = self.store.get(key) or {}
                 reconstructed[key] = {
@@ -3556,12 +3581,9 @@ class ConsolidationLoop:
         # to it after re-derivation from the cumulative graph.  Interim-tier
         # registries are then dropped (they are superseded by the main tiers).
         if self.store.replay_enabled:
-            # Reset each main tier's registry to the post-consolidation membership.
-            for _main_tier in ("episodic", "semantic", "procedural"):
-                new_reg = KeyRegistry()
-                for kp in tier_keyed.get(_main_tier, []):
-                    new_reg.add(kp["key"])
-                self.store.load_registry(_main_tier, new_reg)
+            # Reset each main tier's registry AND simhash to the post-consolidation
+            # membership (the pairing is load-bearing — see the helper's docstring).
+            self._reset_main_tier_registries_and_simhashes(tier_keyed)
             # Drop interim-tier registries — they are no longer valid.
             self._drop_interim_tier_registries()
             # Save each main tier's registry unconditionally (create dir if needed).
@@ -4021,7 +4043,7 @@ class ConsolidationLoop:
         output_dir = Path(output_dir)
         # probe_from_epoch is pinned to the signal floor: a single probe runs
         # 137-ish ``generate(max_new_tokens=128)`` calls (paramem/training/
-        # entry_memory.py::probe_entry), which is ~12-40× the per-epoch
+        # recall_eval.py::probe_entries), which is ~12-40× the per-epoch
         # training cost.  Probes below the floor cannot influence
         # ``control.should_training_stop`` (see early_stop.py:494-499 — the
         # signal-trigger ANDs ``epoch >= signal_from_epoch`` with the window

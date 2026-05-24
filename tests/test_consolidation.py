@@ -1308,3 +1308,74 @@ class TestIndexedKeyCacheSchemaInvariant:
             f"Stale source_* alias fields still present: {present}. "
             "Remove from all indexed_key_cache producer sites."
         )
+
+
+class TestResetMainTierRegistriesAndSimhashes:
+    """Regression guard for the consolidate_interim_adapters finalize step.
+
+    The fold rewrites each main tier's KeyRegistry from the post-consolidation
+    ``tier_keyed`` layout.  It MUST repopulate the per-tier SimHash registry in
+    the same pass: a fold-rebuilt tier (e.g. episodic consolidated from interim)
+    that gets a fresh registry but an EMPTY SimHash registry returns 0.000
+    SimHash-confidence recall — the primary recall metric — for every key,
+    silently breaking reconstruct_graph / train->simulate and recall
+    verification.  These tests fail if the SimHash repopulation is dropped.
+    """
+
+    @staticmethod
+    def _entry(key, subject="Alice", predicate="lives_in", obj="Berlin"):
+        return {"key": key, "subject": subject, "predicate": predicate, "object": obj}
+
+    @staticmethod
+    def _call(store, tier_keyed):
+        from types import SimpleNamespace
+
+        ConsolidationLoop._reset_main_tier_registries_and_simhashes(
+            SimpleNamespace(store=store), tier_keyed
+        )
+
+    def test_registry_and_simhash_rebuilt_together(self):
+        from paramem.memory.entry import build_registry
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        episodic = [self._entry("graph1"), self._entry("graph2", subject="Bob")]
+        procedural = [self._entry("graph3", predicate="prefers", obj="tea")]
+        self._call(store, {"episodic": episodic, "semantic": [], "procedural": procedural})
+
+        # Registry rewritten to the new membership.
+        assert len(store.registry("episodic")) == 2
+        assert "graph1" in store.registry("episodic")
+        assert "graph2" in store.registry("episodic")
+        assert len(store.registry("procedural")) == 1
+        assert "graph3" in store.registry("procedural")
+
+        # SimHash registry repopulated in the SAME pass (the load-bearing pairing).
+        # An empty view here is exactly the bug this guards against.
+        assert store.simhashes_in_tier("episodic") == build_registry(episodic)
+        assert store.simhashes_in_tier("procedural") == build_registry(procedural)
+        assert store.simhash_count_in_tier("episodic") == 2
+
+    def test_overwrites_stale_simhash(self):
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        store.put_simhash("episodic", "graph_old", 0xDEAD)
+        self._call(
+            store,
+            {"episodic": [self._entry("graph_new")], "semantic": [], "procedural": []},
+        )
+
+        view = store.simhashes_in_tier("episodic")
+        assert "graph_old" not in view
+        assert "graph_new" in view
+
+    def test_empty_tier_clears_registry_and_simhash(self):
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        store.put_simhash("semantic", "graph_stale", 0xBEEF)
+        self._call(store, {"episodic": [], "semantic": [], "procedural": []})
+
+        assert len(store.registry("semantic")) == 0
+        assert store.simhashes_in_tier("semantic") == {}

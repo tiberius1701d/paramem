@@ -149,25 +149,28 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
     )
 
     # ------------------------------------------------------------------
-    # Step 5: Assert 3 backup slots exist with valid meta.json +
-    #         pre_trial_hash set.
+    # Step 5: Assert the config backup slot exists with valid meta.json +
+    #         pre_trial_hash set.  Config is the only pre-migration artifact
+    #         (rollback restores config only); graph/registry are not backed up.
     # ------------------------------------------------------------------
     # Production layout: config.paths.data is data/ha; handler appends
     # "backups" directly (no extra /ha/ segment).
     backups_root = state["config"].paths.data / "backups"
     expected_pre_trial_hash = _sha256(_LIVE_YAML)
-    for kind in ("config", "graph", "registry"):
-        kind_dir = backups_root / kind
-        assert kind_dir.exists(), f"Backup kind dir missing: {kind_dir}"
-        slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-        assert len(slots) == 1, f"Expected 1 slot in {kind_dir}, found {slots}"
-        meta_files = list(slots[0].glob("*.meta.json"))
-        assert meta_files, f"No .meta.json in {slots[0]}"
-        meta_data = json.loads(meta_files[0].read_text(encoding="utf-8"))
-        assert meta_data.get("pre_trial_hash") == expected_pre_trial_hash, (
-            f"pre_trial_hash mismatch in {kind} backup: "
-            f"got {meta_data.get('pre_trial_hash')!r}, want {expected_pre_trial_hash!r}"
-        )
+    kind_dir = backups_root / "config"
+    assert kind_dir.exists(), f"Backup kind dir missing: {kind_dir}"
+    slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    assert len(slots) == 1, f"Expected 1 slot in {kind_dir}, found {slots}"
+    meta_files = list(slots[0].glob("*.meta.json"))
+    assert meta_files, f"No .meta.json in {slots[0]}"
+    meta_data = json.loads(meta_files[0].read_text(encoding="utf-8"))
+    assert meta_data.get("pre_trial_hash") == expected_pre_trial_hash, (
+        f"pre_trial_hash mismatch in config backup: "
+        f"got {meta_data.get('pre_trial_hash')!r}, want {expected_pre_trial_hash!r}"
+    )
+    # graph / registry are NOT backed up by the migration path.
+    assert not (backups_root / "graph").exists(), "graph backup should not be written"
+    assert not (backups_root / "registry").exists(), "registry backup should not be written"
 
     # ------------------------------------------------------------------
     # Step 6: Assert state/trial.json round-trips via read_trial_marker.
@@ -296,11 +299,7 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
         "started_at": m.started_at,
         "pre_trial_config_sha256": m.pre_trial_config_sha256,
         "candidate_config_sha256": m.candidate_config_sha256,
-        "backup_paths": {
-            "config": m.backup_paths.get("config", ""),
-            "graph": m.backup_paths.get("graph", ""),
-            "registry": m.backup_paths.get("registry", ""),
-        },
+        "backup_paths": {"config": m.backup_paths.get("config", "")},
         "trial_adapter_dir": m.trial_adapter_dir,
         "trial_graph_dir": m.trial_graph_dir,
         "gates": {"status": "pending"},
@@ -317,7 +316,6 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
     assert fresh_migration["trial"]["candidate_config_sha256"] == _sha256(_CAND_YAML), (
         "Post-recovery trial stash candidate_config_sha256 mismatch"
     )
-    # Backup paths must have all three slots populated.
+    # Backup paths must have the config slot populated (the only artifact).
     bp = fresh_migration["trial"]["backup_paths"]
-    for kind in ("config", "graph", "registry"):
-        assert bp.get(kind), f"Post-recovery backup_paths[{kind!r}] is empty"
+    assert bp.get("config"), "Post-recovery backup_paths['config'] is empty"

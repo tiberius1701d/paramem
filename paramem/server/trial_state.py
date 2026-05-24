@@ -78,9 +78,10 @@ class TrialMarker:
     candidate_config_sha256:
         SHA-256 of the candidate bytes (matches ``stash["candidate_hash"]``).
     backup_paths:
-        Dict ``{"config": "<abs_path>", "graph": "<abs_path>",
-        "registry": "<abs_path>"}`` pointing at the three pre-migration
-        backup slot directories created in step 2.  Paths are absolute.
+        Dict ``{"config": "<abs_path>"}`` pointing at the pre-migration config
+        backup slot directory created in step 2.  Config is the only required
+        pre-migration artifact (rollback restores config only).  Path is
+        absolute.
     trial_adapter_dir:
         Absolute path to the directory where the trial consolidation will
         write adapter weights (``data/ha/state/trial_adapter/``).
