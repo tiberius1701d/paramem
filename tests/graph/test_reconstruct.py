@@ -94,7 +94,7 @@ def _make_loop(
 
 
 def _success_dict(key: str, subject: str, predicate: str, obj: str) -> dict:
-    """Build a probe_entry-style success dict."""
+    """Build a probe_entries-style success dict."""
     return {
         "key": key,
         "subject": subject,
@@ -107,7 +107,7 @@ def _success_dict(key: str, subject: str, predicate: str, obj: str) -> dict:
 
 
 def _failure_dict(raw_output: str = "", reason: str = "parse_failure") -> dict:
-    """Build a probe_entry-style failure dict."""
+    """Build a probe_entries-style failure dict."""
     return {"raw_output": raw_output, "failure_reason": reason}
 
 
@@ -136,13 +136,14 @@ class TestHappyPath:
         }
         switch_calls: list[str] = []
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return per_key[key]
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, per_key[entry["key"]]
 
         def fake_switch(model, name):
             switch_calls.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop)
@@ -161,13 +162,14 @@ class TestHappyPath:
         registry = _make_registry({"episodic": ["graph1"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _success_dict("graph1", "Alice", "lives_in", "Berlin")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _success_dict("graph1", "Alice", "lives_in", "Berlin")
 
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop)
@@ -198,13 +200,14 @@ class TestHappyPath:
 
         group_switches: list[str] = []
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _success_dict(key, "X", "rel", "Y")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _success_dict(entry["key"], "X", "rel", "Y")
 
         def fake_switch(model, name):
             group_switches.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         reconstruct_graph(loop)
@@ -223,13 +226,14 @@ class TestHappyPath:
 
         restore_calls: list[str] = []
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _success_dict(key, "A", "b", "C")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _success_dict(entry["key"], "A", "b", "C")
 
         def fake_switch(model, name):
             restore_calls.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         reconstruct_graph(loop)
@@ -247,8 +251,10 @@ class TestHappyPath:
         restore_calls: list[str] = []
 
         monkeypatch.setattr(
-            "paramem.graph.reconstruct.probe_entry",
-            lambda model, tokenizer, key, **kwargs: _success_dict(key, "A", "b", "C"),
+            "paramem.graph.reconstruct.probe_entries",
+            lambda model, tokenizer, entries, **kwargs: (
+                (e, _success_dict(e["key"], "A", "b", "C")) for e in entries
+            ),
         )
         monkeypatch.setattr(
             "paramem.graph.reconstruct.switch_adapter",
@@ -271,8 +277,10 @@ class TestHappyPath:
         switch_calls: list[str] = []
 
         monkeypatch.setattr(
-            "paramem.graph.reconstruct.probe_entry",
-            lambda model, tokenizer, key, **kwargs: _success_dict(key, "A", "b", "C"),
+            "paramem.graph.reconstruct.probe_entries",
+            lambda model, tokenizer, entries, **kwargs: (
+                (e, _success_dict(e["key"], "A", "b", "C")) for e in entries
+            ),
         )
         monkeypatch.setattr(
             "paramem.graph.reconstruct.switch_adapter",
@@ -297,15 +305,18 @@ class TestFailureStrictTrue:
         registry = _make_registry({"episodic": ["graph1", "graph2"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            if key == "graph2":
-                return _failure_dict(reason="parse_failure")
-            return _success_dict(key, "Alice", "lives_in", "Berlin")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                key = entry["key"]
+                if key == "graph2":
+                    yield entry, _failure_dict(reason="parse_failure")
+                else:
+                    yield entry, _success_dict(key, "Alice", "lives_in", "Berlin")
 
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         with pytest.raises(ReconstructionError) as exc_info:
@@ -320,13 +331,14 @@ class TestFailureStrictTrue:
         registry = _make_registry({"episodic": ["k1", "k2", "k3"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _failure_dict(reason="key_mismatch:other")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _failure_dict(reason="key_mismatch:other")
 
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         with pytest.raises(ReconstructionError) as exc_info:
@@ -346,15 +358,18 @@ class TestFailureStrictFalse:
         registry = _make_registry({"episodic": ["graph1", "graph2"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            if key == "graph2":
-                return _failure_dict(reason="parse_failure")
-            return _success_dict(key, "Alice", "lives_in", "Berlin")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                key = entry["key"]
+                if key == "graph2":
+                    yield entry, _failure_dict(reason="parse_failure")
+                else:
+                    yield entry, _success_dict(key, "Alice", "lives_in", "Berlin")
 
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, strict=False)
@@ -369,15 +384,18 @@ class TestFailureStrictFalse:
         registry = _make_registry({"episodic": ["graph1", "graph2"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            if key == "graph2":
-                return _failure_dict(reason="low_confidence:0.400")
-            return _success_dict("graph1", "Alice", "lives_in", "Berlin")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                key = entry["key"]
+                if key == "graph2":
+                    yield entry, _failure_dict(reason="low_confidence:0.400")
+                else:
+                    yield entry, _success_dict("graph1", "Alice", "lives_in", "Berlin")
 
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, strict=False)
@@ -394,15 +412,18 @@ class TestFailureStrictFalse:
         registry = _make_registry({"semantic": ["s1", "s2", "s3"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            if key == "s2":
-                return _failure_dict(reason="parse_failure")
-            return _success_dict(key, "X", "rel", "Y")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                key = entry["key"]
+                if key == "s2":
+                    yield entry, _failure_dict(reason="parse_failure")
+                else:
+                    yield entry, _success_dict(key, "X", "rel", "Y")
 
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, strict=False)
@@ -434,14 +455,15 @@ class TestTierFilter:
 
         probed_keys: list[str] = []
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            probed_keys.append(key)
-            return _success_dict(key, "A", "b", "C")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                probed_keys.append(entry["key"])
+                yield entry, _success_dict(entry["key"], "A", "b", "C")
 
         def fake_switch(model, name):
             pass
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         result = reconstruct_graph(loop, tier="semantic")
@@ -462,13 +484,14 @@ class TestTierFilter:
 
         switch_calls: list[str] = []
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _success_dict(key, "A", "b", "C")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _success_dict(entry["key"], "A", "b", "C")
 
         def fake_switch(model, name):
             switch_calls.append(name)
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", fake_switch)
 
         reconstruct_graph(loop, tier="semantic")
@@ -532,10 +555,11 @@ class TestGradientCheckpointingToggle:
         registry = _make_registry({"episodic": ["e1"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _success_dict(key, "A", "b", "C")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _success_dict(entry["key"], "A", "b", "C")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         reconstruct_graph(loop)
@@ -547,10 +571,11 @@ class TestGradientCheckpointingToggle:
         registry = _make_registry({"episodic": ["e1"]})
         loop = _make_loop(registry, gradient_checkpointing=False)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _success_dict(key, "A", "b", "C")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _success_dict(entry["key"], "A", "b", "C")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         reconstruct_graph(loop)
@@ -562,10 +587,11 @@ class TestGradientCheckpointingToggle:
         registry = _make_registry({"episodic": ["e1"]})
         loop = _make_loop(registry, gradient_checkpointing=True)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _success_dict(key, "A", "b", "C")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _success_dict(entry["key"], "A", "b", "C")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         reconstruct_graph(loop)
@@ -577,10 +603,11 @@ class TestGradientCheckpointingToggle:
         registry = _make_registry({"episodic": ["bad_key"]})
         loop = _make_loop(registry)
 
-        def fake_probe(model, tokenizer, key, **kwargs):
-            return _failure_dict(reason="parse_failure")
+        def fake_probe_entries(model, tokenizer, entries, **kwargs):
+            for entry in entries:
+                yield entry, _failure_dict(reason="parse_failure")
 
-        monkeypatch.setattr("paramem.graph.reconstruct.probe_entry", fake_probe)
+        monkeypatch.setattr("paramem.graph.reconstruct.probe_entries", fake_probe_entries)
         monkeypatch.setattr("paramem.graph.reconstruct.switch_adapter", lambda m, n: None)
 
         with pytest.raises(ReconstructionError):

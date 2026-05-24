@@ -59,8 +59,6 @@ def _make_marker(
         candidate_config_sha256=candidate_config_sha256,
         backup_paths={
             "config": str(tmp_path / "backups" / "config" / "20260422-010000"),
-            "graph": str(tmp_path / "backups" / "graph" / "20260422-010000"),
-            "registry": str(tmp_path / "backups" / "registry" / "20260422-010000"),
         },
         trial_adapter_dir=str(tmp_path / "state" / "trial_adapter"),
         trial_graph_dir=str(tmp_path / "state" / "trial_graph"),

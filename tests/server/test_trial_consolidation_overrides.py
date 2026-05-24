@@ -347,10 +347,14 @@ class TestTrialDoesNotMarkConsolidated:
         # mark_consolidated must NOT have been called on the buffer.
         mock_session_buffer.mark_consolidated.assert_not_called()
 
-    def test_trial_loop_forces_train_mode(self, tmp_path, monkeypatch):
-        """Trial consolidation forces consolidation.mode='train' even when candidate says simulate.
+    def test_trial_loop_uses_configured_mode(self, tmp_path, monkeypatch):
+        """Trial consolidation runs in the candidate's CONFIGURED mode — no force-train.
 
-        Spec Resolved Decision 27, L239: trial mode is always train.
+        The former force-train override was removed: a pure consolidation.mode
+        change is applied directly by migration_confirm (and rebuilt by the
+        active-store migration), so only non-mode changes reach the trial, where
+        the live mode is unchanged and the trial must faithfully reflect it.
+        Here the candidate is simulate, so the trial must run in simulate mode.
         Slice 4: session_buffer is provided with pending_count > 0 so that
         _run_extraction_phase is actually called (buffer-empty path skips it).
         evaluate_gates is patched to avoid GPU interactions.
@@ -384,7 +388,7 @@ class TestTrialDoesNotMarkConsolidated:
                 "paramem.server.consolidation.create_consolidation_loop", return_value=mock_loop
             ):
                 with patch("paramem.server.config.load_server_config") as mock_load:
-                    # Candidate sets mode=simulate — trial must override to train.
+                    # Candidate sets mode=simulate — trial must run in simulate (no override).
                     from paramem.server.config import ConsolidationScheduleConfig
 
                     real_cfg = MagicMock()
@@ -415,8 +419,8 @@ class TestTrialDoesNotMarkConsolidated:
 
         asyncio.run(_run())
 
-        assert captured_cfg.get("mode") == "train", (
-            "trial consolidation must override consolidation.mode to 'train'"
+        assert captured_cfg.get("mode") == "simulate", (
+            "trial consolidation must run in the candidate's configured mode (no force-train)"
         )
 
 

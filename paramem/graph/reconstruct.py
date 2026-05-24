@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 
 import networkx as nx
 
-from paramem.memory.entry import probe_entry
 from paramem.models.loader import switch_adapter
+from paramem.training.recall_eval import probe_entries
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def reconstruct_graph(
 
     Iterates ``loop.indexed_key_registry`` (a ``dict[str, KeyRegistry]``),
     groups keys by tier, calls ``switch_adapter`` once per tier, probes
-    every key in that group via :func:`~paramem.memory.entry.probe_entry`,
+    every key in that group via :func:`~paramem.training.recall_eval.probe_entries`,
     and merges the entries into a fresh ``nx.MultiDiGraph``.
 
     The function is read-only on ``loop.model``: after all probes complete it
@@ -142,6 +142,9 @@ def reconstruct_graph(
     graph = nx.MultiDiGraph()
     failures: list[dict] = []
 
+    training_config = getattr(loop, "training_config", None)
+    batch_size = getattr(training_config, "recall_probe_batch_size", 1)
+
     # Disable gradient checkpointing around all probing — HF silently disables
     # the KV cache when checkpointing is active, which causes silent generation
     # degradation (CLAUDE.md rule applies to ANY model.generate() site).
@@ -150,7 +153,7 @@ def reconstruct_graph(
         for adapter_id, keys in keys_by_adapter.items():
             # Per-adapter SimHash registry: ``{tier}_simhash`` attribute on
             # the loop.  Interim adapter IDs (``episodic_interim_<stamp>``)
-            # don't have a dedicated simhash; we pass None (probe_entry
+            # don't have a dedicated simhash; we pass None (probe_entries
             # defaults confidence to 1.0 when registry is None).
             simhash_registry = getattr(loop, f"{adapter_id}_simhash", None)
 
@@ -161,26 +164,28 @@ def reconstruct_graph(
             )
             switch_adapter(model, adapter_id)
 
-            for key in keys:
-                result = probe_entry(
-                    model,
-                    tokenizer,
-                    key,
-                    registry=simhash_registry,
-                )
-
-                if "failure_reason" in result:
+            entries = [{"key": k} for k in keys]
+            for entry, result in probe_entries(
+                model,
+                tokenizer,
+                entries,
+                registry=simhash_registry,
+                batch_size=batch_size,
+            ):
+                key = entry["key"]
+                if result is None or "failure_reason" in result:
+                    failure_reason = (result or {}).get("failure_reason", "unknown")
                     logger.debug(
                         "reconstruct_graph: key %r failed (%s)",
                         key,
-                        result["failure_reason"],
+                        failure_reason,
                     )
                     failures.append(
                         {
                             "key": key,
                             "adapter_id": adapter_id,
-                            "raw_output": result.get("raw_output", ""),
-                            "failure_reason": result["failure_reason"],
+                            "raw_output": (result or {}).get("raw_output", ""),
+                            "failure_reason": failure_reason,
                         }
                     )
                 else:
@@ -218,7 +223,6 @@ def reconstruct_graph(
         # Re-enable gradient checkpointing if the loop's training config
         # has it turned on.  Mirror the pattern from consolidation.py's
         # _enable_gradient_checkpointing helper.
-        training_config = getattr(loop, "training_config", None)
         if training_config is not None and getattr(
             training_config, "gradient_checkpointing", False
         ):

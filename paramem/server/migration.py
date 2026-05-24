@@ -56,15 +56,15 @@ MigrationStateLiteral = Literal["LIVE", "STAGING", "TRIAL"]
 
 
 class TrialSlotPaths(TypedDict):
-    """Absolute paths to the three pre-migration backup slot directories.
+    """Absolute path to the pre-migration config backup slot directory.
 
-    Written into the trial marker and surfaced via ``/migration/status`` for
-    the rollback path and restore-on-rollback.
+    Config is the only required pre-migration artifact: the migration's sole
+    live mutation is the atomic config swap, so rollback (and crash recovery)
+    only ever restore the config.  Written into the trial marker and surfaced
+    via ``/migration/status`` for the rollback path.
     """
 
     config: str
-    graph: str
-    registry: str
 
 
 class TrialStash(TypedDict):
@@ -603,6 +603,44 @@ def detect_simulate_mode(candidate_yaml: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Mode-switch block helper
+# ---------------------------------------------------------------------------
+
+
+def _build_mode_switch_block(old_mode: str, new_mode: str) -> dict:
+    """Build the ``mode_switch`` transparency block for a pure-mode-change confirm.
+
+    Returned in the ``ConfirmResponse`` and ``PreviewResponse`` so the CLI and
+    any API consumer understand that this migration was applied directly (no
+    trial/accept/rollback) through the active-store rebuild mechanism.
+
+    Parameters
+    ----------
+    old_mode:
+        The ``consolidation.mode`` value being replaced (e.g. ``"simulate"``).
+    new_mode:
+        The ``consolidation.mode`` value in the candidate config (e.g. ``"train"``).
+
+    Returns
+    -------
+    dict
+        JSON-serialisable dict with ``from``, ``to``, ``direction``,
+        ``applies_via``, and ``semantics`` keys.
+    """
+    direction = f"{old_mode}_to_{new_mode}"
+    return {
+        "from": old_mode,
+        "to": new_mode,
+        "direction": direction,
+        "applies_via": "active_store_migration",
+        "semantics": (
+            "per-tier rebuild with a 1.0 recall gate and source-mode "
+            "fallback until all tiers pass; no trial/accept/rollback"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Preview response renderer
 # ---------------------------------------------------------------------------
 
@@ -632,6 +670,15 @@ def render_preview_response(
     dict
         JSON-serialisable dict matching the ``PreviewResponse`` Pydantic schema.
     """
+    tier_diff = list(stash["tier_diff"])
+    # Derive mode_switch block when this is a pure mode-only change so the
+    # CLI and API consumers know the confirm path (LIVE, no trial).
+    mode_switch: dict | None = None
+    if len(tier_diff) == 1 and tier_diff[0]["dotted_path"] == "consolidation.mode":
+        mode_switch = _build_mode_switch_block(
+            tier_diff[0]["old_value"],
+            tier_diff[0]["new_value"],
+        )
     return {
         "state": stash["state"],
         "candidate_path": stash["candidate_path"],
@@ -639,9 +686,10 @@ def render_preview_response(
         "staged_at": stash["staged_at"],
         "simulate_mode_override": stash["simulate_mode_override"],
         "unified_diff": stash["unified_diff"],
-        "tier_diff": list(stash["tier_diff"]),
+        "tier_diff": tier_diff,
         "shape_changes": list(stash["shape_changes"]),
         "pre_flight_fail": pre_flight_fail,
+        "mode_switch": mode_switch,
     }
 
 

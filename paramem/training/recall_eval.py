@@ -168,9 +168,7 @@ def probe_entries(
 
     Left-pads ``batch_size`` prompts, runs a single ``model.generate`` per
     chunk, and pipes each decoded suffix through
-    :func:`paramem.memory.entry._finalize_recalled` so the
-    recalled-dict shape is byte-identical to the serial
-    :func:`paramem.memory.entry.probe_entry` path.
+    :func:`paramem.memory.entry._finalize_recalled`.
 
     ``padding_side`` mutation is restored via ``try/finally`` to keep
     concurrent tokenizer users (training collator) untouched.  Single-pass
@@ -178,7 +176,7 @@ def probe_entries(
 
     Used by :func:`evaluate_indexed_recall` (all batch sizes, including 1),
     :func:`paramem.memory.probe.probe_keys_grouped_by_adapter`,
-    and :func:`paramem.memory.entry.probe_entry` (1-key wrapper).
+    and all production call sites that need single- or multi-key recall.
 
     Args:
         model: A loaded HuggingFace / PEFT model.

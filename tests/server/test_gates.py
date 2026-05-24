@@ -2,7 +2,7 @@
 
 All tests run without GPU.  The model and tokenizer are MagicMocks.
 ``paramem.training.indexed_memory.probe_key`` is patched in every test that
-exercises gates 3 or 4 in QA mode.  ``paramem.memory.entry.probe_entry``
+exercises gates 3 or 4 in QA mode.  ``paramem.training.recall_eval.probe_entries``
 is patched for quad-mode tests.  Registry files are written to ``tmp_path``.
 
 Coverage targets (spec §Tests):
@@ -23,8 +23,8 @@ Coverage targets (spec §Tests):
   - Unmount: delete_adapter NOT called when trial_probe is the sole adapter.
   - Unmount survives delete_adapter raising.
   - Enriched registry format ({key: {"simhash": int, ...}}) works in gate 4.
-  - Gate 3: read_keyed_pairs + probe_entry → PASS / FAIL.
-  - Gate 4: probe_entry + verify_confidence → PASS.
+  - Gate 3: read_keyed_pairs + probe_entries → PASS / FAIL.
+  - Gate 4: probe_entries (batched) + verify_confidence → PASS.
 """
 
 from __future__ import annotations
@@ -560,25 +560,34 @@ class TestEvaluateGatesNoNewSessions:
         trial_dir = _make_trial_adapter(tmp_path)
         model = _make_mock_model(["episodic"])
 
-        with patch("paramem.memory.entry.probe_entry") as mock_probe:
-            mock_probe.return_value = {
-                "key": "graph1",
-                "subject": "S",
-                "predicate": "p",
-                "object": "O",
-                "confidence": 1.0,
-                "raw_output": '{"key":"graph1","subject":"S","predicate":"p","object":"O"}',
-            }
-            with patch("paramem.memory.entry.verify_confidence", return_value=1.0):
-                evaluate_gates(
-                    model=model,
-                    tokenizer=MagicMock(),
-                    trial_adapter_dir=trial_dir,
-                    live_registry_path=reg_path,
-                    session_buffer_empty=False,
-                    consolidation_summary={"status": "complete"},
-                    consolidation_exception=None,
+        # Both gate 3 and gate 4 use probe_entries (generator yielding (entry, recalled) tuples).
+        def _yield_recalled(m, tok, entries, registry=None, batch_size=1, **kw):
+            for e in entries:
+                yield (
+                    e,
+                    {
+                        "key": e["key"],
+                        "subject": "S",
+                        "predicate": "p",
+                        "object": "O",
+                        "confidence": 1.0,
+                        "raw_output": '{"key":"graph1","subject":"S","predicate":"p","object":"O"}',
+                    },
                 )
+
+        with (
+            patch("paramem.training.recall_eval.probe_entries", side_effect=_yield_recalled),
+            patch("paramem.memory.entry.verify_confidence", return_value=1.0),
+        ):
+            evaluate_gates(
+                model=model,
+                tokenizer=MagicMock(),
+                trial_adapter_dir=trial_dir,
+                live_registry_path=reg_path,
+                session_buffer_empty=False,
+                consolidation_summary={"status": "complete"},
+                consolidation_exception=None,
+            )
 
         # In-memory mount path: set_adapter was used, not load_adapter.
         # delete_adapter must NOT be called (no extra adapter was added).
@@ -639,10 +648,10 @@ def _make_trial_adapter_quad(tmp_path: Path) -> Path:
 
 
 class TestGate3AdapterReloadQuad:
-    """Gate 3 quad-path: indexed_key_registry.json + probe_entry dispatch."""
+    """Gate 3 quad-path: indexed_key_registry.json + probe_entries dispatch."""
 
     def test_pass_successful_quad_probe(self, tmp_path):
-        """Successful mount + probe_entry → PASS."""
+        """Successful mount + probe_entries → PASS."""
         trial_dir = _make_trial_adapter_quad(tmp_path)
         model = _make_mock_model()
         tokenizer = MagicMock()
@@ -659,7 +668,11 @@ class TestGate3AdapterReloadQuad:
             ),
         }
 
-        with patch("paramem.memory.entry.probe_entry", return_value=probe_result):
+        def _probe_gen(m, tok, entries, **kw):
+            for e in entries:
+                yield e, probe_result
+
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_gen):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -673,13 +686,17 @@ class TestGate3AdapterReloadQuad:
         assert g.gate == 3
 
     def test_fail_probe_quad_returns_failure_reason(self, tmp_path):
-        """probe_entry returning failure_reason dict → gate 3 FAIL."""
+        """probe_entries returning failure_reason dict → gate 3 FAIL."""
         trial_dir = _make_trial_adapter_quad(tmp_path)
         model = _make_mock_model()
 
         fail_result = {"raw_output": "", "failure_reason": "quad_parse_failure"}
 
-        with patch("paramem.memory.entry.probe_entry", return_value=fail_result):
+        def _probe_gen(m, tok, entries, **kw):
+            for e in entries:
+                yield e, fail_result
+
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_gen):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -721,7 +738,7 @@ def _make_quad_registry(n: int, tmp_path: Path, fname: str = "registry_quad.json
 
 
 class TestGate4RecallCheckQuad:
-    """Gate 4 quad-path: probe_entry + quad verify_confidence dispatch."""
+    """Gate 4 quad-path: probe_entries (batched) + quad verify_confidence dispatch."""
 
     def test_pass_quad_20_of_20(self, tmp_path):
         """20/20 quad probes passing → PASS."""
@@ -729,20 +746,26 @@ class TestGate4RecallCheckQuad:
         trial_dir = _make_trial_adapter_quad(tmp_path)
         model = _make_mock_model()
 
-        def _probe_quad(m, tok, key, registry=None, **kw):
-            return {
-                "key": key,
-                "subject": "Alex",
-                "predicate": "lives_in",
-                "object": "Heilbronn",
-                "confidence": 1.0,
-                "raw_output": (
-                    f'{{"key": "{key}", "subject": "Alex", '
-                    '"predicate": "lives_in", "object": "Heilbronn"}'
-                ),
-            }
+        def _probe_quad_batch(m, tok, entries, registry=None, batch_size=1, **kw):
+            # Mirror probe_entries: a generator yielding (entry, recalled) tuples.
+            for e in entries:
+                key = e["key"]
+                yield (
+                    e,
+                    {
+                        "key": key,
+                        "subject": "Alex",
+                        "predicate": "lives_in",
+                        "object": "Heilbronn",
+                        "confidence": 1.0,
+                        "raw_output": (
+                            f'{{"key": "{key}", "subject": "Alex", '
+                            '"predicate": "lives_in", "object": "Heilbronn"}'
+                        ),
+                    },
+                )
 
-        with patch("paramem.memory.entry.probe_entry", side_effect=_probe_quad):
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_quad_batch):
             with patch("paramem.memory.entry.verify_confidence", return_value=1.0):
                 g = _gate_4_recall_check(
                     model=model,
@@ -826,7 +849,12 @@ class TestGate3KindSubdirLayout:
             "confidence": 0.99,
             "raw_output": '{"key": "graph1", "subject": "S", "predicate": "p", "object": "O"}',
         }
-        with patch("paramem.memory.entry.probe_entry", return_value=probe_result):
+
+        def _probe_gen(m, tok, entries, **kw):
+            for e in entries:
+                yield e, probe_result
+
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_gen):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},
@@ -861,7 +889,12 @@ class TestGate3KindSubdirLayout:
             "confidence": 0.99,
             "raw_output": '{"key": "graph1", "subject": "S", "predicate": "p", "object": "O"}',
         }
-        with patch("paramem.memory.entry.probe_entry", return_value=probe_result):
+
+        def _probe_gen(m, tok, entries, **kw):
+            for e in entries:
+                yield e, probe_result
+
+        with patch("paramem.training.recall_eval.probe_entries", side_effect=_probe_gen):
             g = _gate_3_reload_smoke(
                 session_buffer_empty=False,
                 summary={"status": "complete"},

@@ -1273,3 +1273,98 @@ def test_lifespan_sets_vram_overflow_warning_when_required_exceeds_usable(tmp_pa
     # Note: _state is restored in finally, so verify from the warning records.
     # The key check is that the WARNING was emitted.
     assert any("VRAM CONFIG OVERFLOW" in r.getMessage() for r in warning_records)
+
+
+# ---------------------------------------------------------------------------
+# Active-store migration arming (shared by lifespan + live-reload)
+# ---------------------------------------------------------------------------
+
+
+def test_arm_active_store_migration_arms_on_divergence():
+    """_arm_active_store_migration sets pending_rehydration + persists state and
+    falls back to the source mode when detect_mode_switch reports a divergence.
+
+    This is the single arming source shared by the lifespan startup path and the
+    live config-reload path.
+    """
+    from paramem.server import app as app_module
+    from paramem.server.active_store_migration import MigrationState
+
+    fake_state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
+    config = _fake_config(consolidation_mode="train")
+
+    with (
+        patch.dict(
+            app_module._state,
+            {"pending_rehydration": False, "effective_mode": None},
+            clear=False,
+        ),
+        patch("paramem.server.active_store_migration.detect_mode_switch", return_value=fake_state),
+        patch("paramem.server.active_store_migration.save_state") as mock_save,
+    ):
+        armed = app_module._arm_active_store_migration(config)
+
+        assert armed is True
+        assert app_module._state["pending_rehydration"] is True
+        # Inference falls back to the SOURCE mode until the rebuild clears.
+        assert app_module._state["effective_mode"] == "simulate"
+        mock_save.assert_called_once()
+
+
+def test_arm_active_store_migration_noop_when_no_switch():
+    """No divergence → pending_rehydration cleared, effective_mode tracks the
+    configured mode, no state persisted, returns False (safe no-op for every
+    non-mode config change)."""
+    from paramem.server import app as app_module
+
+    config = _fake_config(consolidation_mode="train")
+
+    with (
+        patch.dict(
+            app_module._state,
+            {"pending_rehydration": True, "effective_mode": "simulate"},
+            clear=False,
+        ),
+        patch("paramem.server.active_store_migration.detect_mode_switch", return_value=None),
+        patch("paramem.server.active_store_migration.save_state") as mock_save,
+    ):
+        armed = app_module._arm_active_store_migration(config)
+
+        assert armed is False
+        assert app_module._state["pending_rehydration"] is False
+        assert app_module._state["effective_mode"] == "train"
+        mock_save.assert_not_called()
+
+
+def test_refresh_config_from_disk_arms_mode_switch():
+    """Regression: a live config refresh arms the active-store rebuild.
+
+    Previously only the lifespan path called detect_mode_switch, so a
+    LIVE-applied mode change (migration accept / config apply) committed the new
+    mode to _state but left the on-disk store stale until the next restart. The
+    refresh path must invoke the shared arming helper with the new config.
+    """
+    from paramem.server import app as app_module
+
+    fake_new_config = _fake_config(consolidation_mode="train")
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _fake_config(consolidation_mode="simulate"),
+        "config_path": "configs/server.yaml",
+        "topology_assessment": None,
+        "boot_degraded": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "load_server_config", return_value=fake_new_config),
+        patch.object(app_module, "_arm_active_store_migration") as mock_arm,
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=True)
+
+        mock_arm.assert_called_once_with(fake_new_config)

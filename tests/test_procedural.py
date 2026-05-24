@@ -78,10 +78,12 @@ class TestRunIndexedKeyProceduralDeferredMutations:
             "paramem.graph.qa_generator.generate_qa_from_relations",
             lambda relations, model=None, tokenizer=None: fake_qa,
         )
-        # Stub probe_entry — no existing keys to reconstruct (procedural_simhash starts empty).
+        # Stub probe_entries — no existing keys to reconstruct (procedural_simhash starts empty).
         monkeypatch.setattr(
-            "paramem.training.consolidation.probe_entry",
-            lambda *a, **kw: {"failure_reason": "no_match"},
+            "paramem.training.consolidation.probe_entries",
+            lambda model, tokenizer, entries, **kw: (
+                (e, {"failure_reason": "no_match"}) for e in entries
+            ),
         )
         # Stub switch_adapter — no-op.
         monkeypatch.setattr(

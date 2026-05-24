@@ -108,19 +108,21 @@ class TestConfirmHappyPath:
         client.post("/migration/confirm", json={})
         assert state["migration"]["state"] == "TRIAL"
 
-    def test_confirm_writes_3_backup_slots(self, client, state, tmp_path):
-        """3 backup slots (config, graph, registry) appear in backups_root.
+    def test_confirm_writes_config_backup_slot(self, client, state, tmp_path):
+        """Only the config backup slot appears in backups_root.
 
-        Uses the production layout: config.paths.data is data/ha, so the
-        handler appends 'backups' directly (no extra /ha/ segment).
+        Config is the sole pre-migration artifact; graph/registry are not
+        backed up.  Uses the production layout: config.paths.data is data/ha,
+        so the handler appends 'backups' directly (no extra /ha/ segment).
         """
         client.post("/migration/confirm", json={})
         backups_root = state["config"].paths.data / "backups"
-        for kind in ("config", "graph", "registry"):
-            kind_dir = backups_root / kind
-            assert kind_dir.exists(), f"Missing backup kind dir: {kind}"
-            slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-            assert len(slots) == 1, f"Expected 1 slot in {kind_dir}, got {slots}"
+        config_dir = backups_root / "config"
+        assert config_dir.exists(), "Missing config backup kind dir"
+        slots = [d for d in config_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert len(slots) == 1, f"Expected 1 slot in {config_dir}, got {slots}"
+        assert not (backups_root / "graph").exists(), "graph backup should not be written"
+        assert not (backups_root / "registry").exists(), "registry backup should not be written"
 
     def test_confirm_writes_trial_marker(self, client, state, tmp_path):
         """state/trial.json is written after confirm.
@@ -152,34 +154,19 @@ class TestConfirmHappyPath:
         assert marker.pre_trial_config_sha256 == _sha256(_LIVE_YAML)
 
     def test_confirm_backup_meta_has_pre_trial_hash(self, client, state, tmp_path):
-        """Each backup slot's meta.json has pre_trial_hash == sha256(pre-rename live config)."""
+        """The config backup slot's meta.json has pre_trial_hash == sha256(live config)."""
         expected_hash = _sha256(_LIVE_YAML)
         client.post("/migration/confirm", json={})
         backups_root = state["config"].paths.data / "backups"
-        for kind in ("config", "graph", "registry"):
-            kind_dir = backups_root / kind
-            slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-            assert slots, f"No slots in {kind_dir}"
-            meta_files = list(slots[0].glob("*.meta.json"))
-            assert meta_files, f"No meta.json in {slots[0]}"
-            meta_data = json.loads(meta_files[0].read_text(encoding="utf-8"))
-            assert meta_data.get("pre_trial_hash") == expected_hash, (
-                f"pre_trial_hash mismatch in {kind} backup"
-            )
-
-    def test_confirm_graph_backup_uses_merger_save_bytes(self, client, state, tmp_path):
-        """merger.save_bytes() is called when consolidation_loop is present.
-
-        This is the regression guard for Fix 2: if _state.get("consolidation_loop")
-        is replaced by _state.get("loop"), loop_mock is not found (returns None) and
-        the backup silently contains the empty-graph fallback b'{}' instead of the
-        real graph bytes from merger.save_bytes().
-
-        We verify the call was made (not the on-disk bytes, which may be encrypted).
-        """
-        loop_mock = state["consolidation_loop"]
-        client.post("/migration/confirm", json={})
-        loop_mock.merger.save_bytes.assert_called_once_with()
+        kind_dir = backups_root / "config"
+        slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert slots, f"No slots in {kind_dir}"
+        meta_files = list(slots[0].glob("*.meta.json"))
+        assert meta_files, f"No meta.json in {slots[0]}"
+        meta_data = json.loads(meta_files[0].read_text(encoding="utf-8"))
+        assert meta_data.get("pre_trial_hash") == expected_hash, (
+            "pre_trial_hash mismatch in config backup"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +204,10 @@ class TestConfirm409:
 
 class TestConfirmStepFailures:
     def test_confirm_step2_failure_rollback(self, client, state, tmp_path, monkeypatch):
-        """Patch backup.write to raise on the second call → 500 backup_write_failed.
+        """Patch backup.write to raise on the config backup call → 500 backup_write_failed.
 
-        STAGING state is retained on failure.
+        STAGING state is retained on failure.  Config is the only pre-migration
+        backup, so the failure must be injected on the first (and only) write.
         """
         call_count = [0]
 
@@ -229,7 +217,7 @@ class TestConfirmStepFailures:
 
         def _failing_write(*args, **kwargs):
             call_count[0] += 1
-            if call_count[0] == 2:
+            if call_count[0] == 1:
                 raise OSError("disk full")
             return original_write_fn(*args, **kwargs)
 
@@ -255,13 +243,12 @@ class TestConfirmStepFailures:
         assert resp.status_code == 500
         assert resp.json()["detail"]["error"] == "marker_write_failed"
         assert state["migration"]["state"] == "STAGING"
-        # All backup slots should be cleaned up.
+        # The config backup slot should be cleaned up.
         backups_root = state["config"].paths.data / "ha" / "backups"
-        for kind in ("config", "graph", "registry"):
-            kind_dir = backups_root / kind
-            if kind_dir.exists():
-                slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-                assert len(slots) == 0, f"Orphan slot in {kind_dir}: {slots}"
+        kind_dir = backups_root / "config"
+        if kind_dir.exists():
+            slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+            assert len(slots) == 0, f"Orphan slot in {kind_dir}: {slots}"
 
     def test_confirm_step4_failure_rollback(self, client, state, tmp_path, monkeypatch):
         """Patch _rename_config → 500 config_swap_failed; marker + backups deleted."""
@@ -441,3 +428,78 @@ class TestConfirmConfigArtifactFilenameRealSlotLayout:
         assert filename.endswith(".bin") or filename.endswith(".bin.enc"), (
             f"config_artifact_filename does not end with .bin or .bin.enc: {filename!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Pure mode-switch fast path (consolidation.mode change → applied directly)
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmModeSwitch:
+    def test_pure_mode_switch_applied_directly(self, client, state, tmp_path, monkeypatch):
+        """A migration whose only change is consolidation.mode is applied directly:
+        state LIVE + mode_switch block, config swapped, refresh+arm invoked, NO
+        trial marker, NO TRIAL state, NO trial consolidation."""
+        state["migration"]["tier_diff"] = [
+            {
+                "dotted_path": "consolidation.mode",
+                "old_value": "simulate",
+                "new_value": "train",
+                "tier": "pipeline_altering",
+            }
+        ]
+
+        # Mirror lifespan arming without a real config load: capture the call.
+        arm_called = {"n": 0}
+
+        def _fake_refresh():
+            arm_called["n"] += 1
+            return state["config"]
+
+        monkeypatch.setattr(app_module, "_refresh_config_from_disk_into_state", _fake_refresh)
+
+        resp = client.post("/migration/confirm", json={})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        # Direct apply: LIVE, not TRIAL.
+        assert body["state"] == "LIVE"
+        ms = body["mode_switch"]
+        assert ms is not None
+        assert ms["from"] == "simulate"
+        assert ms["to"] == "train"
+        assert ms["direction"] == "simulate_to_train"
+        assert ms["applies_via"] == "active_store_migration"
+
+        # Config swapped on disk (candidate → live).
+        assert Path(state["config_path"]).read_bytes() == _CAND_YAML
+        # Refresh+arm helper invoked exactly once.
+        assert arm_called["n"] == 1
+        # No trial marker, state back to LIVE.
+        state_dir = state["config"].paths.data / "state"
+        assert read_trial_marker(state_dir) is None
+        assert state["migration"]["state"] == "LIVE"
+
+    def test_mode_plus_other_change_still_trials(self, client, state, tmp_path):
+        """A diff that includes consolidation.mode AND another field is NOT a pure
+        mode switch — it falls through to the normal TRIAL flow."""
+        state["migration"]["tier_diff"] = [
+            {
+                "dotted_path": "consolidation.mode",
+                "old_value": "simulate",
+                "new_value": "train",
+                "tier": "pipeline_altering",
+            },
+            {
+                "dotted_path": "debug",
+                "old_value": False,
+                "new_value": True,
+                "tier": "pipeline_altering",
+            },
+        ]
+        resp = client.post("/migration/confirm", json={})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "TRIAL"
+        assert body.get("mode_switch") is None
+        assert state["migration"]["state"] == "TRIAL"
