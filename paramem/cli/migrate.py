@@ -64,6 +64,18 @@ _TERMINAL_GATE_STATUSES: frozenset[str] = frozenset(
     {"pass", "fail", "no_new_sessions", "trial_exception"}
 )
 
+# Terminal gate statuses for the base-swap long-poll loop.  Extends the
+# standard set with base-swap-specific outcomes set by
+# _run_base_swap_orchestration.
+_BASE_SWAP_TERMINAL_STATUSES: frozenset[str] = _TERMINAL_GATE_STATUSES | frozenset(
+    {
+        "phase_a_failed",
+        "phase_b_failed",
+        "phase_b_model_mismatch",
+        "reload_deferred",
+    }
+)
+
 # Accept-eligible gate statuses (set membership — forward-compat for future gates).
 # Keep in sync with _ACCEPT_ELIGIBLE_STATUSES in paramem/server/app.py.
 _ACCEPT_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"pass", "no_new_sessions"})
@@ -118,6 +130,35 @@ def _render_mode_switch_applied(mode_switch: dict) -> None:
     print("  The active-store rebuild runs at the next consolidation (per-tier,")
     print("  1.0 recall gate, source-mode fallback). Run `paramem migrate-status`")
     print("  or POST /consolidate to drive it.")
+
+
+def _render_base_change_preview(base_change: dict) -> None:
+    """Print the base-model-change warning block in the preview output.
+
+    Rendered unconditionally when the candidate config changes the ``model:``
+    field (i.e. the base model).  Mirrors ``_render_mode_switch_preview`` in
+    style: a banner line, a description of what the migration entails, and a
+    note about the in-process reload.
+
+    Parameters
+    ----------
+    base_change:
+        Dict with ``old_model``, ``new_model``, and ``consequence`` keys as
+        returned by ``compute_base_change``.
+    """
+    old_model = base_change.get("old_model", "")
+    new_model = base_change.get("new_model", "")
+    print("  ────────────────────────────────────────")
+    print("  ⚠  BASE MODEL CHANGE — DESTRUCTIVE")
+    print("  ────────────────────────────────────────")
+    print(f"  model: {old_model!r} → {new_model!r}")
+    print("  Phase A (capture): all keyed facts are reconstructed from the live")
+    print("  model into encrypted per-tier graph.json files; adapter weight slots")
+    print("  are deleted. A bundle backup is taken first (rollback-safe).")
+    print("  Phase B (relearn): the new base model is loaded in-process (server is")
+    print("  briefly cloud-only during reload), then all tiers are retrained and")
+    print("  gated on 100% recall. No server restart is required.")
+    print("  Rollback restores the prior base model from the pre-migration bundle.")
 
 
 def _render_shape_change_block(shape_changes: list[dict]) -> None:
@@ -278,6 +319,82 @@ def _render_failed_gates(gates: dict, gs: str) -> None:
             reason = entry.get("reason")
             if reason:
                 print(f"      reason: {reason}")
+
+
+def _render_base_swap_terminal(gs: str, gates: dict) -> None:
+    """Render the terminal state of a base-swap migration to stdout/stderr.
+
+    Called after the base-swap long-poll loop exits on a terminal status.
+    Covers all statuses set by ``_run_base_swap_orchestration``.
+
+    Parameters
+    ----------
+    gs:
+        Terminal gate status (one of the ``_BASE_SWAP_TERMINAL_STATUSES``).
+    gates:
+        The ``poll_status["gates"]`` dict from the last poll response.
+    """
+    message = gates.get("message", "")
+    exception_text = gates.get("exception", "")
+
+    if gs == "pass":
+        print("  Base-swap migration complete. Server is now running on the new model.")
+        if message:
+            print(f"  {message}")
+    elif gs == "reload_deferred":
+        # VRAM insufficient: Phase A done, reload waiting for VRAM to free.
+        print("  Base-swap Phase A complete. Reload deferred — insufficient VRAM.")
+        print(
+            "  The server will resume Phase B automatically once VRAM is available "
+            "(POST /gpu/acquire triggers this)."
+        )
+        if message:
+            print(f"  {message}")
+    elif gs == "phase_b_model_mismatch":
+        mismatch_reason = gates.get("mismatch_reason", "")
+        print(
+            "  Base-swap aborted: loaded model identity mismatch (Phase B guard).",
+            file=sys.stderr,
+        )
+        if mismatch_reason:
+            print(f"  Detail: {mismatch_reason}", file=sys.stderr)
+        print(
+            "  The bundle and marker are preserved. "
+            "Run `paramem migrate --rollback` to restore the prior model.",
+            file=sys.stderr,
+        )
+    elif gs == "phase_a_failed":
+        print(
+            "  Base-swap Phase A failed. The prior model is still loaded.",
+            file=sys.stderr,
+        )
+        if exception_text:
+            print(f"  Exception: {exception_text}", file=sys.stderr)
+        print(
+            "  The bundle is preserved. "
+            "Run `paramem migrate --rollback` to restore the prior config.",
+            file=sys.stderr,
+        )
+    elif gs == "phase_b_failed":
+        print(
+            "  Base-swap Phase B failed (recall gate or tier error). "
+            "The new model is loaded but adapters are not retrained.",
+            file=sys.stderr,
+        )
+        if exception_text:
+            print(f"  Exception: {exception_text}", file=sys.stderr)
+        print(
+            "  Run `paramem migrate --rollback` to restore from the bundle, "
+            "or retry Phase B by calling POST /gpu/acquire.",
+            file=sys.stderr,
+        )
+    else:
+        # Forward-compat: unknown status (future orchestration phases).
+        print(f"  Base-swap finished with status: {gs!r}.", file=sys.stderr)
+        if message:
+            print(f"  {message}", file=sys.stderr)
+        if exception_text:
+            print(f"  Exception: {exception_text}", file=sys.stderr)
 
 
 # Poll interval for the R-PORT auto-restart health check (seconds).
@@ -566,6 +683,11 @@ def _run_long_poll_flow(server_url: str) -> int:
     4. Branch on gates.status.
     5. Drift checks before accept/rollback.
 
+    For base-swap migrations (``confirm_resp["base_swap"] == True``), step 3
+    polls against the extended ``_BASE_SWAP_TERMINAL_STATUSES`` set and step 4
+    renders base-swap-specific terminal messages instead of the accept/rollback
+    3-way prompt (base-swap success does not require an explicit accept).
+
     Parameters
     ----------
     server_url:
@@ -606,8 +728,21 @@ def _run_long_poll_flow(server_url: str) -> int:
         _render_mode_switch_applied(mode_switch)
         return 0
 
+    # Base-swap path: the confirm launched the in-process base-model-swap
+    # orchestration.  Poll with the extended terminal-status set; render the
+    # terminal state without an accept/rollback prompt (the swap is
+    # self-completing — no explicit accept is needed on success).
+    is_base_swap = bool((confirm_resp or {}).get("base_swap"))
+    terminal_statuses = _BASE_SWAP_TERMINAL_STATUSES if is_base_swap else _TERMINAL_GATE_STATUSES
+
     # Step 3: Long-poll until gates are terminal.
-    print("  Confirming trial... polling for gate results (Ctrl+C to interrupt).")
+    if is_base_swap:
+        print(
+            "  Base-swap migration launched. Polling for orchestration progress "
+            "(Ctrl+C to interrupt; migration continues on server)."
+        )
+    else:
+        print("  Confirming trial... polling for gate results (Ctrl+C to interrupt).")
     try:
         while True:
             try:
@@ -621,7 +756,7 @@ def _run_long_poll_flow(server_url: str) -> int:
 
             gates = poll_status.get("gates") or {}
             gs = gates.get("status", "")
-            if gs in _TERMINAL_GATE_STATUSES and gates.get("completed_at"):
+            if gs in terminal_statuses and gates.get("completed_at"):
                 break
 
             time.sleep(LONG_POLL_INTERVAL_SECONDS)
@@ -635,6 +770,17 @@ def _run_long_poll_flow(server_url: str) -> int:
         return 130
 
     # Step 4: Branch on gates.status.
+    if is_base_swap:
+        # Base-swap terminal: render phase-specific message; no accept prompt.
+        _render_base_swap_terminal(gs, gates)
+        # Exit code: 0 on pass or reload_deferred (deferred is informational,
+        # the server will resume automatically); non-zero on failure/mismatch.
+        if gs == "pass":
+            return 0
+        if gs == "reload_deferred":
+            return 2
+        return 1
+
     if gs in _ACCEPT_ELIGIBLE_STATUSES:
         # Render comparison report and offer accept / rollback / cancel.
         comparison_report = poll_status.get("comparison_report")
@@ -710,7 +856,12 @@ def render_preview(result: dict, server_url: str) -> int:
 
     # 2. Mode / persistence notices.
     mode_switch = result.get("mode_switch")
-    if mode_switch:
+    base_change = result.get("base_change")
+    if base_change:
+        # Candidate changes the base model: destructive, requires Phase A + restart.
+        _render_base_change_preview(base_change)
+        print()
+    elif mode_switch:
         # Pure consolidation.mode change → applied directly via the active-store
         # rebuild (no trial / accept / rollback).  Surface the chosen path.
         _render_mode_switch_preview(mode_switch)

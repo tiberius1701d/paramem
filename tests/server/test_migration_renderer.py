@@ -5,7 +5,8 @@ Covers:
 - compute_tier_diff
 - compute_shape_changes
 - detect_simulate_mode
-- render_preview_response
+- compute_base_change
+- render_preview_response (including base_change)
 - Byte-for-byte spec-compliance smoke test against §L257–271.
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from paramem.server.migration import (
+    compute_base_change,
     compute_shape_changes,
     compute_tier_diff,
     compute_unified_diff,
@@ -529,3 +531,143 @@ class TestRenderShapeChangeBlockByteForByteMatchesSpec:
         out = capsys.readouterr().out
         assert "+{o_proj}" in out, f"Expected '+{{o_proj}}' in output:\n{out!r}"
         assert "-{gate_proj}" in out, f"Expected '-{{gate_proj}}' in output:\n{out!r}"
+
+
+# ---------------------------------------------------------------------------
+# compute_base_change
+# ---------------------------------------------------------------------------
+
+
+class TestComputeBaseChange:
+    def test_returns_none_when_model_unchanged(self):
+        """No model change → None."""
+        live = {"model": "mistral", "debug": False}
+        cand = {"model": "mistral", "debug": True}
+        assert compute_base_change(live, cand) is None
+
+    def test_returns_none_when_both_model_absent(self):
+        """Both YAMLs lack 'model' key → None."""
+        assert compute_base_change({}, {}) is None
+
+    def test_returns_none_when_model_absent_in_both_after_coercion(self):
+        """model: '' in both → no change → None."""
+        assert compute_base_change({"model": ""}, {"model": ""}) is None
+
+    def test_returns_dict_when_model_differs(self):
+        """model: mistral → qwen3-4b → dict with old_model/new_model/consequence."""
+        live = {"model": "mistral"}
+        cand = {"model": "qwen3-4b"}
+        result = compute_base_change(live, cand)
+        assert result is not None
+        assert result["old_model"] == "mistral"
+        assert result["new_model"] == "qwen3-4b"
+        assert "consequence" in result
+        assert len(result["consequence"]) > 0
+
+    def test_consequence_mentions_old_and_new_model(self):
+        """Consequence text names both old and new model aliases."""
+        live = {"model": "mistral"}
+        cand = {"model": "qwen3-4b"}
+        result = compute_base_change(live, cand)
+        assert result is not None
+        assert "mistral" in result["consequence"]
+        assert "qwen3-4b" in result["consequence"]
+
+    def test_consequence_mentions_restart(self):
+        """Consequence text mentions the server restart requirement."""
+        result = compute_base_change({"model": "mistral"}, {"model": "qwen3-4b"})
+        assert result is not None
+        assert "restart" in result["consequence"].lower()
+
+    def test_returns_none_when_model_key_absent_in_live_and_same_in_cand(self):
+        """Model absent in live but present with same effective value: no change."""
+        # When live has no 'model' key it defaults to "" in get(); same for cand.
+        # If cand also has no 'model' key → both "" → None.
+        assert compute_base_change({}, {}) is None
+
+    def test_returns_dict_when_live_has_no_model_but_cand_does(self):
+        """Live has no 'model' but candidate adds one → change detected."""
+        result = compute_base_change({}, {"model": "qwen3-4b"})
+        assert result is not None
+        assert result["old_model"] == ""
+        assert result["new_model"] == "qwen3-4b"
+
+
+# ---------------------------------------------------------------------------
+# render_preview_response — base_change field
+# ---------------------------------------------------------------------------
+
+
+class TestRenderPreviewResponseBaseChange:
+    def test_base_change_present_in_payload(self):
+        """render_preview_response always returns 'base_change' key."""
+        stash = initial_migration_state()
+        stash["state"] = "STAGING"
+        payload = render_preview_response(stash)
+        assert "base_change" in payload
+
+    def test_base_change_none_when_model_unchanged(self):
+        """No model diff → base_change is None."""
+        stash = initial_migration_state()
+        stash["state"] = "STAGING"
+        stash["parsed_live"] = {"model": "mistral"}
+        stash["parsed_candidate"] = {"model": "mistral"}
+        payload = render_preview_response(stash)
+        assert payload["base_change"] is None
+
+    def test_base_change_populated_when_model_differs(self):
+        """Model change → base_change has old_model, new_model, consequence."""
+        stash = initial_migration_state()
+        stash["state"] = "STAGING"
+        stash["parsed_live"] = {"model": "mistral"}
+        stash["parsed_candidate"] = {"model": "qwen3-4b"}
+        payload = render_preview_response(stash)
+        bc = payload["base_change"]
+        assert bc is not None
+        assert bc["old_model"] == "mistral"
+        assert bc["new_model"] == "qwen3-4b"
+        assert "consequence" in bc
+
+    def test_base_change_none_when_both_parsed_absent(self):
+        """Empty stash (LIVE initial state) → base_change is None."""
+        stash = initial_migration_state()
+        payload = render_preview_response(stash)
+        assert payload.get("base_change") is None
+
+
+# ---------------------------------------------------------------------------
+# _render_base_change_preview CLI renderer
+# ---------------------------------------------------------------------------
+
+
+class TestRenderBaseChangePreview:
+    def test_renders_old_and_new_model(self, capsys):
+        """Preview output names both old and new model aliases."""
+        from paramem.cli.migrate import _render_base_change_preview
+
+        _render_base_change_preview(
+            {"old_model": "mistral", "new_model": "qwen3-4b", "consequence": "..."}
+        )
+        out = capsys.readouterr().out
+        assert "mistral" in out
+        assert "qwen3-4b" in out
+
+    def test_renders_destructive_header(self, capsys):
+        """Preview output includes the DESTRUCTIVE header."""
+        from paramem.cli.migrate import _render_base_change_preview
+
+        _render_base_change_preview(
+            {"old_model": "mistral", "new_model": "qwen3-4b", "consequence": "..."}
+        )
+        out = capsys.readouterr().out
+        assert "DESTRUCTIVE" in out
+
+    def test_renders_restart_notice(self, capsys):
+        """Preview output mentions restart requirement."""
+        from paramem.cli.migrate import _render_base_change_preview
+
+        _render_base_change_preview(
+            {"old_model": "mistral", "new_model": "qwen3-4b", "consequence": "..."}
+        )
+        out = capsys.readouterr().out
+        assert "restart" in out.lower()

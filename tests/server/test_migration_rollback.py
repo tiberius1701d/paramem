@@ -1234,3 +1234,264 @@ class TestRollbackMaintenanceGuard:
         assert guard_set_before_apply[0] == "cloud-only", (
             f"Expected mode='cloud-only' before apply, got {guard_set_before_apply[0]!r} (S-4)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Base-swap rollback: restore_bundle, split-brain fix, marker + state cleanup
+# ---------------------------------------------------------------------------
+
+
+def _make_base_swap_state(tmp_path: Path) -> dict:
+    """Build a TRIAL _state for base-swap rollback tests.
+
+    Places a bundle slot directory on disk and writes a base-swap TrialMarker
+    pointing at it.  The marker's ``migration_kind`` is ``"base_swap"`` so the
+    rollback handler takes the base-swap branch.
+    """
+    live_yaml = tmp_path / "server.yaml"
+    live_yaml.write_bytes(_LIVE_YAML)
+
+    config = MagicMock()
+    config.paths.data = tmp_path / "data" / "ha"
+    config.paths.data.mkdir(parents=True, exist_ok=True)
+    config.adapter_dir = tmp_path / "data" / "ha" / "adapters"
+    config.adapter_dir.mkdir(parents=True, exist_ok=True)
+
+    state_dir = config.paths.data / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    backups_root = config.paths.data / "backups"
+
+    # Bundle slot: a directory that exists on disk (restore_bundle is mocked in
+    # tests so the slot only needs to exist, not contain real bundle files).
+    bundle_slot = backups_root / "bundles" / "20260524-000000"
+    bundle_slot.mkdir(parents=True, exist_ok=True)
+    bundle_slot_str = str(bundle_slot.resolve())
+
+    marker = TrialMarker(
+        schema_version=TRIAL_MARKER_SCHEMA_VERSION,
+        started_at="2026-05-24T00:00:00+00:00",
+        pre_trial_config_sha256=_sha256(_A_YAML),
+        candidate_config_sha256=_sha256(_LIVE_YAML),
+        backup_paths={"bundle": bundle_slot_str},
+        trial_adapter_dir=str(state_dir / "trial_adapter"),
+        trial_graph_dir=str(state_dir / "trial_graph"),
+        config_artifact_filename="",
+        migration_kind="base_swap",
+        base_swap_phase="phaseA_done",
+        old_model="mistral",
+        new_model="qwen3-4b",
+        bundle_slot=bundle_slot_str,
+    )
+    write_trial_marker(state_dir, marker)
+
+    from paramem.server.migration import TrialStash, initial_migration_state
+
+    trial_stash = TrialStash(
+        started_at="2026-05-24T00:00:00+00:00",
+        pre_trial_config_sha256=_sha256(_A_YAML),
+        candidate_config_sha256=_sha256(_LIVE_YAML),
+        backup_paths={"bundle": bundle_slot_str},
+        trial_adapter_dir=str(state_dir / "trial_adapter"),
+        trial_graph_dir=str(state_dir / "trial_graph"),
+        gates={"status": "pass", "completed_at": "2026-05-24T01:00:00+00:00"},
+    )
+    migration = initial_migration_state()
+    migration["state"] = "TRIAL"
+    migration["trial"] = trial_stash
+
+    return {
+        "model": None,
+        "tokenizer": None,
+        "config": config,
+        "config_path": str(live_yaml),
+        "consolidating": False,
+        "migration": migration,
+        "migration_lock": asyncio.Lock(),
+        "server_started_at": "2026-05-24T00:00:00+00:00",
+        "mode": "normal",
+        "background_trainer": None,
+        "consolidation_loop": None,
+        "config_drift": {
+            "detected": False,
+            "loaded_hash": _sha256(_LIVE_YAML),
+            "disk_hash": _sha256(_LIVE_YAML),
+            "last_checked_at": "2026-05-24T00:00:00+00:00",
+        },
+    }
+
+
+class TestBaseSwapRollback:
+    """Base-swap rollback: restore_bundle path, split-brain fix, cleanup."""
+
+    def _make_apply_stub(self, state_dict: dict) -> callable:
+        """Return a stub that marks mode='local' after being called."""
+
+        def _apply():
+            state_dict["mode"] = "local"
+            state_dict["cloud_only_reason"] = None
+
+        return _apply
+
+    def test_restore_bundle_called_with_restore_config_true(self, tmp_path, monkeypatch):
+        """POST /migration/rollback on base-swap TRIAL calls restore_bundle(restore_config=True).
+
+        restore_bundle must be called exactly once, with the bundle slot from
+        the marker, restore_config=True, and the live config path.
+        """
+        fresh = _make_base_swap_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", self._make_apply_stub(fresh))
+
+        restore_calls = []
+
+        def _fake_restore(bundle_slot_path, *, data_dir, config_path, restore_config=False):
+            restore_calls.append(
+                {
+                    "bundle_slot_path": bundle_slot_path,
+                    "restore_config": restore_config,
+                    "config_path": config_path,
+                }
+            )
+
+        with patch("paramem.backup.backup.restore_bundle", _fake_restore):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 200, resp.text
+        assert len(restore_calls) == 1, f"restore_bundle must be called once; got {restore_calls}"
+        assert restore_calls[0]["restore_config"] is True, (
+            "Base-swap rollback must call restore_bundle(restore_config=True)"
+        )
+        # bundle_slot_path must be a Path, not a string.
+        import pathlib
+
+        assert isinstance(restore_calls[0]["bundle_slot_path"], pathlib.Path), (
+            "restore_bundle receives a Path, not a string"
+        )
+
+    def test_loaded_hash_invalidated_before_apply(self, tmp_path, monkeypatch):
+        """config_drift['loaded_hash'] is set to the sentinel BEFORE _apply_config_live runs.
+
+        The split-brain fix: if Phase A of the base-swap already swapped the live
+        config to Qwen3, the in-memory config_drift.loaded_hash equals the Qwen3
+        hash.  restore_bundle writes the Mistral config to disk; loaded_hash must be
+        invalidated so _apply_config_live cannot skip the reload.
+        """
+        fresh = _make_base_swap_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+
+        loaded_hash_at_apply_time = []
+
+        def _capturing_apply():
+            # Record what loaded_hash was at apply time.
+            cd = fresh.get("config_drift") or {}
+            loaded_hash_at_apply_time.append(cd.get("loaded_hash"))
+            fresh["mode"] = "local"
+            fresh["cloud_only_reason"] = None
+
+        monkeypatch.setattr(app_module, "_apply_config_live", _capturing_apply)
+
+        with patch("paramem.backup.backup.restore_bundle", lambda *a, **kw: None):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 200, resp.text
+        assert loaded_hash_at_apply_time, "_apply_config_live was never called"
+        assert loaded_hash_at_apply_time[0] == "__rollback_invalidated__", (
+            f"loaded_hash must be '__rollback_invalidated__' at apply time; "
+            f"got {loaded_hash_at_apply_time[0]!r}"
+        )
+
+    def test_marker_cleared_after_restore(self, tmp_path, monkeypatch):
+        """Trial marker is cleared after restore_bundle and apply succeed."""
+        fresh = _make_base_swap_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", self._make_apply_stub(fresh))
+
+        state_dir = fresh["config"].paths.data / "state"
+        # Marker exists before rollback.
+        assert read_trial_marker(state_dir) is not None
+
+        with patch("paramem.backup.backup.restore_bundle", lambda *a, **kw: None):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 200, resp.text
+        assert read_trial_marker(state_dir) is None, "Trial marker must be cleared after rollback"
+
+    def test_migration_state_reset_to_live(self, tmp_path, monkeypatch):
+        """migration.state is LIVE after base-swap rollback."""
+        fresh = _make_base_swap_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", self._make_apply_stub(fresh))
+
+        with patch("paramem.backup.backup.restore_bundle", lambda *a, **kw: None):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 200, resp.text
+        assert fresh["migration"]["state"] == "LIVE", (
+            f"Expected migration.state=LIVE after rollback; got {fresh['migration']['state']!r}"
+        )
+
+    def test_rollback_response_no_restart_required(self, tmp_path, monkeypatch):
+        """Base-swap rollback returns restart_required=False (in-process reload)."""
+        fresh = _make_base_swap_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", self._make_apply_stub(fresh))
+
+        with patch("paramem.backup.backup.restore_bundle", lambda *a, **kw: None):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["restart_required"] is False, (
+            "Base-swap rollback must not require restart — in-process reload is used"
+        )
+        assert body["applied_live"] is True
+
+    def test_missing_bundle_slot_returns_500(self, tmp_path, monkeypatch):
+        """If the bundle slot directory is missing, rollback returns 500."""
+        fresh = _make_base_swap_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", self._make_apply_stub(fresh))
+
+        # Delete the bundle slot that the marker points to.
+        bundle_slot_path = fresh["config"].paths.data / "backups" / "bundles" / "20260524-000000"
+        import shutil
+
+        shutil.rmtree(bundle_slot_path)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 500, resp.text
+        body = resp.json()
+        assert body["detail"]["error"] == "rollback_precondition_failed"
+
+    def test_maintenance_guard_set_before_apply_in_base_swap(self, tmp_path, monkeypatch):
+        """mode=cloud-only is set before _apply_config_live runs in base-swap rollback (S-4)."""
+        fresh = _make_base_swap_state(tmp_path)
+        fresh["mode"] = "local"
+        monkeypatch.setattr(app_module, "_state", fresh)
+
+        guard_mode_at_apply = []
+
+        def _capturing_apply():
+            guard_mode_at_apply.append(fresh.get("mode"))
+            fresh["mode"] = "local"
+            fresh["cloud_only_reason"] = None
+
+        monkeypatch.setattr(app_module, "_apply_config_live", _capturing_apply)
+
+        with patch("paramem.backup.backup.restore_bundle", lambda *a, **kw: None):
+            client = TestClient(app_module.app, raise_server_exceptions=False)
+            client.post("/migration/rollback")
+
+        assert guard_mode_at_apply, "_apply_config_live was never called"
+        assert guard_mode_at_apply[0] == "cloud-only", (
+            f"Expected mode='cloud-only' before apply in base-swap rollback; "
+            f"got {guard_mode_at_apply[0]!r} (S-4)"
+        )

@@ -167,6 +167,12 @@ class MigrationStashState(TypedDict):
         List of ``TierDiffRow`` rows; ``[]`` in LIVE.
     unified_diff:
         Unified diff string; ``""`` in LIVE.
+    parsed_live:
+        Parsed YAML dict of the **live** config (``yaml.safe_load`` on the live
+        ``server.yaml`` bytes at the time the candidate was staged); ``{}`` in
+        LIVE or when the live config is absent.  Used by
+        ``render_preview_response`` to derive the ``base_change`` block without
+        re-reading the live file.
     """
 
     state: MigrationStateLiteral
@@ -182,6 +188,7 @@ class MigrationStashState(TypedDict):
     unified_diff: str
     trial: "TrialStash | None"
     recovery_required: list[str]
+    parsed_live: dict
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +224,7 @@ def initial_migration_state() -> MigrationStashState:
         unified_diff="",
         trial=None,
         recovery_required=[],
+        parsed_live={},
     )
 
 
@@ -655,6 +663,9 @@ def render_preview_response(
     Single source of truth for what ``/migration/preview`` and
     ``/migration/diff`` return.  Always includes ``pre_flight_fail``.
 
+    The ``base_change`` key is populated when the ``model:`` field differs
+    between the live and candidate configs.  It is ``None`` otherwise.
+
     Parameters
     ----------
     stash:
@@ -679,6 +690,10 @@ def render_preview_response(
             tier_diff[0]["old_value"],
             tier_diff[0]["new_value"],
         )
+    # Derive base_change block when the candidate changes the base model.
+    live_yaml = stash.get("parsed_live", {}) or {}
+    candidate_yaml = stash.get("parsed_candidate", {}) or {}
+    base_change: dict | None = compute_base_change(live_yaml, candidate_yaml)
     return {
         "state": stash["state"],
         "candidate_path": stash["candidate_path"],
@@ -690,6 +705,7 @@ def render_preview_response(
         "shape_changes": list(stash["shape_changes"]),
         "pre_flight_fail": pre_flight_fail,
         "mode_switch": mode_switch,
+        "base_change": base_change,
     }
 
 
@@ -733,3 +749,59 @@ def _parse_candidate(candidate_bytes: bytes) -> dict:
 def _sha256_bytes(data: bytes) -> str:
     """Return lowercase hex SHA-256 of *data*."""
     return hashlib.sha256(data).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Base-model-change detection
+# ---------------------------------------------------------------------------
+
+
+def compute_base_change(live_yaml: dict, candidate_yaml: dict) -> "dict | None":
+    """Return a base-change descriptor when ``model:`` differs between the YAMLs.
+
+    Returns ``None`` when the ``model:`` value is the same in both configs
+    (no base model change) or when both sides are absent.
+
+    Parameters
+    ----------
+    live_yaml:
+        Parsed dict of the live ``server.yaml`` (``yaml.safe_load`` output).
+    candidate_yaml:
+        Parsed dict of the candidate ``server.yaml``.
+
+    Returns
+    -------
+    dict | None
+        When a model change is detected, a dict with keys:
+
+        ``old_model``
+            ``MODEL_REGISTRY`` alias currently in the live config
+            (e.g. ``"mistral"``).
+        ``new_model``
+            ``MODEL_REGISTRY`` alias in the candidate config
+            (e.g. ``"qwen3-4b"``).
+        ``consequence``
+            Operator-facing description of what the migration entails.
+    """
+    old_model = live_yaml.get("model", "")
+    new_model = candidate_yaml.get("model", "")
+    if old_model == new_model:
+        return None
+    consequence = (
+        f"Base model changes from '{old_model}' to '{new_model}'. "
+        "Every adapter (episodic/semantic/procedural) will be re-derived from the current "
+        "weights onto the new base via a capture-then-relearn migration. "
+        "Phase A (capture): all keyed facts are reconstructed from the live model into "
+        "encrypted per-tier graph.json files, then the current adapter weights are deleted. "
+        "A pre-migration bundle backup is taken before Phase A so rollback can restore the "
+        "prior base model and weights. "
+        "Phase B (relearn): the new base model is loaded in-process (server is briefly "
+        "cloud-only during reload), then all tiers are retrained and gated on 100% recall. "
+        "No server restart is required; rollback is available at any point via "
+        "POST /migration/rollback."
+    )
+    return {
+        "old_model": old_model,
+        "new_model": new_model,
+        "consequence": consequence,
+    }

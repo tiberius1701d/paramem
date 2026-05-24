@@ -291,3 +291,166 @@ class TestEdgeCases:
             backups_root=tmp_path / "backups",
         )
         assert result.action == RecoveryAction.NORMAL_LIVE
+
+
+# ---------------------------------------------------------------------------
+# Base-swap recovery: RESUME_BASE_SWAP
+# ---------------------------------------------------------------------------
+
+
+def _make_base_swap_marker(
+    tmp_path: Path,
+    base_swap_phase: str,
+    live_hash: str,
+) -> TrialMarker:
+    """Build a base-swap TrialMarker for recovery tests.
+
+    Parameters
+    ----------
+    tmp_path:
+        Pytest tmp directory.
+    base_swap_phase:
+        One of ``"phaseA"``, ``"phaseA_done"``, ``"phaseB"``, ``"done"``.
+    live_hash:
+        The hash stored in ``pre_trial_config_sha256`` (used as the Mistral
+        config hash captured before Phase A renamed the config).
+    """
+    bundle_slot = tmp_path / "backups" / "bundles" / "20260524-000000"
+    bundle_slot.mkdir(parents=True, exist_ok=True)
+    return TrialMarker(
+        schema_version=TRIAL_MARKER_SCHEMA_VERSION,
+        started_at="2026-05-24T00:00:00+00:00",
+        pre_trial_config_sha256=live_hash,
+        candidate_config_sha256="c" * 64,
+        backup_paths={"bundle": str(bundle_slot)},
+        trial_adapter_dir=str(tmp_path / "state" / "trial_adapter"),
+        trial_graph_dir=str(tmp_path / "state" / "trial_graph"),
+        config_artifact_filename="",
+        migration_kind="base_swap",
+        base_swap_phase=base_swap_phase,
+        old_model="mistral",
+        new_model="qwen3-4b",
+        bundle_slot=str(bundle_slot),
+    )
+
+
+class TestBaseSwapRecovery:
+    """Base-swap markers yield RESUME_BASE_SWAP, not RESUME_TRIAL (disambiguation first)."""
+
+    def test_phaseA_done_marker_returns_resume_base_swap(self, tmp_path):
+        """A base-swap marker at phaseA_done → RESUME_BASE_SWAP, not RESUME_TRIAL.
+
+        After Phase A the live config was renamed (live_hash != pre_trial_hash),
+        which is exactly the condition that would normally trigger RESUME_TRIAL.
+        The migration_kind check must come FIRST so this is classified correctly.
+        """
+        # Phase A renames live config → live_config now has the candidate hash.
+        candidate_content = b"model: qwen3-4b\n"
+        live_config = _write_config(tmp_path / "configs/server.yaml", candidate_content)
+        # pre_trial_hash recorded the OLD (Mistral) config hash — different from live.
+        mistral_hash = "a" * 64
+        state_dir = tmp_path / "data/ha/state"
+        marker = _make_base_swap_marker(tmp_path, "phaseA_done", mistral_hash)
+        write_trial_marker(state_dir, marker)
+
+        result = recover_migration_state(
+            state_dir=state_dir,
+            live_config_path=live_config,
+            backups_root=tmp_path / "data/ha/backups",
+        )
+
+        assert result.action == RecoveryAction.RESUME_BASE_SWAP, (
+            f"Expected RESUME_BASE_SWAP, got {result.action!r}. "
+            "migration_kind='base_swap' must be checked before hash comparison."
+        )
+        assert result.trial_marker is not None
+        assert result.trial_marker.migration_kind == "base_swap"
+        assert result.trial_marker.base_swap_phase == "phaseA_done"
+        assert result.recovery_required == []
+
+    def test_phaseB_marker_returns_resume_base_swap(self, tmp_path):
+        """A base-swap marker at phaseB → RESUME_BASE_SWAP."""
+        candidate_content = b"model: qwen3-4b\n"
+        live_config = _write_config(tmp_path / "configs/server.yaml", candidate_content)
+        mistral_hash = "b" * 64
+        state_dir = tmp_path / "data/ha/state"
+        marker = _make_base_swap_marker(tmp_path, "phaseB", mistral_hash)
+        write_trial_marker(state_dir, marker)
+
+        result = recover_migration_state(
+            state_dir=state_dir,
+            live_config_path=live_config,
+            backups_root=tmp_path / "data/ha/backups",
+        )
+
+        assert result.action == RecoveryAction.RESUME_BASE_SWAP
+        assert result.trial_marker is not None
+        assert result.trial_marker.base_swap_phase == "phaseB"
+
+    def test_base_swap_marker_not_classified_as_resume_trial(self, tmp_path):
+        """migration_kind='base_swap' is NEVER classified as RESUME_TRIAL.
+
+        This is the critical disambiguation: a base-swap marker looks identical
+        to a normal trial RESUME_TRIAL (live_hash != pre_trial_hash) but must
+        take the base-swap recovery path, not the trial path.
+        """
+        candidate_content = b"model: qwen3-4b\n"
+        live_config = _write_config(tmp_path / "configs/server.yaml", candidate_content)
+        mistral_hash = "a" * 64  # different from live → would trigger RESUME_TRIAL without guard
+        state_dir = tmp_path / "data/ha/state"
+
+        # Try both mid-flight phases.
+        for phase in ("phaseA_done", "phaseB"):
+            marker = _make_base_swap_marker(tmp_path, phase, mistral_hash)
+            write_trial_marker(state_dir, marker)
+
+            result = recover_migration_state(
+                state_dir=state_dir,
+                live_config_path=live_config,
+                backups_root=tmp_path / "data/ha/backups",
+            )
+
+            assert result.action != RecoveryAction.RESUME_TRIAL, (
+                f"phase={phase!r}: base-swap marker must not be classified as RESUME_TRIAL"
+            )
+            assert result.action == RecoveryAction.RESUME_BASE_SWAP
+
+    def test_base_swap_marker_carries_trial_marker(self, tmp_path):
+        """RESUME_BASE_SWAP result carries the parsed marker in trial_marker."""
+        candidate_content = b"model: qwen3-4b\n"
+        live_config = _write_config(tmp_path / "configs/server.yaml", candidate_content)
+        state_dir = tmp_path / "data/ha/state"
+        marker = _make_base_swap_marker(tmp_path, "phaseA_done", "a" * 64)
+        write_trial_marker(state_dir, marker)
+
+        result = recover_migration_state(
+            state_dir=state_dir,
+            live_config_path=live_config,
+            backups_root=tmp_path / "data/ha/backups",
+        )
+
+        assert result.action == RecoveryAction.RESUME_BASE_SWAP
+        assert result.trial_marker is not None
+        assert result.trial_marker.old_model == "mistral"
+        assert result.trial_marker.new_model == "qwen3-4b"
+
+    def test_base_swap_result_has_no_recovery_required(self, tmp_path):
+        """RESUME_BASE_SWAP is a normal resume path; recovery_required is empty."""
+        candidate_content = b"model: qwen3-4b\n"
+        live_config = _write_config(tmp_path / "configs/server.yaml", candidate_content)
+        state_dir = tmp_path / "data/ha/state"
+        marker = _make_base_swap_marker(tmp_path, "phaseB", "b" * 64)
+        write_trial_marker(state_dir, marker)
+
+        result = recover_migration_state(
+            state_dir=state_dir,
+            live_config_path=live_config,
+            backups_root=tmp_path / "data/ha/backups",
+        )
+
+        assert result.action == RecoveryAction.RESUME_BASE_SWAP
+        assert result.recovery_required == []
+        # INFO line emitted but no ERROR.
+        levels = {lvl for lvl, _ in result.log_lines}
+        assert "ERROR" not in levels
+        assert "INFO" in levels

@@ -94,6 +94,28 @@ class TrialMarker:
         to resolve the exact A-config file without directory listing.
         Defaults to ``""`` for backward compatibility with older markers;
         the rollback handler asserts non-empty.
+    migration_kind:
+        ``"mode_switch"`` for ordinary trial migrations (the default, for
+        backward compatibility).  ``"base_swap"`` when the migration replaces
+        the underlying base model.
+    base_swap_phase:
+        Current phase of a base-swap migration.  ``""`` when this is not a
+        base-swap.  ``"phaseA"`` while Phase A (knowledge capture) is running;
+        ``"phaseA_done"`` once Phase A has completed and the config has been
+        atomically swapped — an in-process reload of the new base model is
+        triggered next (no restart required).  ``"phaseB"`` while Phase B
+        (simulate→train on the new model) is running.  ``"done"`` once Phase B
+        completes successfully.
+    old_model:
+        ``MODEL_REGISTRY`` alias of the base model being replaced (e.g.
+        ``"mistral"``).  ``""`` when not a base-swap migration.
+    new_model:
+        ``MODEL_REGISTRY`` alias of the replacement base model (e.g.
+        ``"qwen3-4b"``).  ``""`` when not a base-swap migration.
+    bundle_slot:
+        Absolute path to the pre-migration bundle backup slot directory written
+        before Phase A runs.  ``""`` when not a base-swap migration.  Preserved
+        on Phase A failure so a later rollback slice can restore from it.
     """
 
     schema_version: int
@@ -104,6 +126,24 @@ class TrialMarker:
     trial_adapter_dir: str
     trial_graph_dir: str
     config_artifact_filename: str
+    # Base-swap fields (default "" for backward compatibility with existing markers).
+    # migration_kind: "mode_switch" for ordinary trials; "base_swap" when the
+    #   migration replaces the underlying base model.
+    # base_swap_phase: current phase of the base-swap migration.
+    #   "": not a base-swap migration.
+    #   "phaseA": Phase A (capture) is in progress.
+    #   "phaseA_done": Phase A complete; in-process reload of the new base model
+    #     is in progress (or has not yet started after a crash).
+    #   "phaseB": Phase B (simulate→train on Qwen3) is in progress.
+    #   "done": Phase B complete; migration succeeded.
+    # old_model: MODEL_REGISTRY alias of the base model being replaced.
+    # new_model: MODEL_REGISTRY alias of the replacement base model.
+    # bundle_slot: absolute path to the pre-migration bundle backup slot directory.
+    migration_kind: str = "mode_switch"
+    base_swap_phase: str = ""
+    old_model: str = ""
+    new_model: str = ""
+    bundle_slot: str = ""
 
     def to_dict(self) -> dict:
         """Serialize the marker to a JSON-ready dict."""
@@ -116,6 +156,11 @@ class TrialMarker:
             "trial_adapter_dir": self.trial_adapter_dir,
             "trial_graph_dir": self.trial_graph_dir,
             "config_artifact_filename": self.config_artifact_filename,
+            "migration_kind": self.migration_kind,
+            "base_swap_phase": self.base_swap_phase,
+            "old_model": self.old_model,
+            "new_model": self.new_model,
+            "bundle_slot": self.bundle_slot,
         }
 
     @classmethod
@@ -160,6 +205,12 @@ class TrialMarker:
             # Default to "" for backward compatibility with older markers.
             # The rollback handler asserts non-empty.
             config_artifact_filename=d.get("config_artifact_filename", ""),
+            # Base-swap fields default to "" / "mode_switch" for older markers.
+            migration_kind=d.get("migration_kind", "mode_switch"),
+            base_swap_phase=d.get("base_swap_phase", ""),
+            old_model=d.get("old_model", ""),
+            new_model=d.get("new_model", ""),
+            bundle_slot=d.get("bundle_slot", ""),
         )
 
 
@@ -180,11 +231,11 @@ def write_trial_marker(state_dir: Path, marker: TrialMarker) -> Path:
     5. ``os.rename(.pending/trial.json, state_dir/trial.json)`` — atomic.
     6. ``fsync(state_dir)`` for rename durability.
 
-    Path fields (``backup_paths``, ``trial_adapter_dir``, ``trial_graph_dir``)
-    are resolved to absolute paths at write time (``Path.resolve()``) so the
-    marker is portable across working-directory changes (e.g. systemd units).
-    Relative inputs are resolved against the process cwd when this function is
-    called; absolute inputs are unchanged.
+    Path fields (``backup_paths``, ``trial_adapter_dir``, ``trial_graph_dir``,
+    and ``bundle_slot`` when non-empty) are resolved to absolute paths at write
+    time (``Path.resolve()``) so the marker is portable across working-directory
+    changes (e.g. systemd units).  Relative inputs are resolved against the
+    process cwd when this function is called; absolute inputs are unchanged.
 
     Parameters
     ----------
@@ -214,14 +265,16 @@ def write_trial_marker(state_dir: Path, marker: TrialMarker) -> Path:
     pending_file = pending_dir / TRIAL_MARKER_FILENAME
     final_file = state_dir / TRIAL_MARKER_FILENAME
 
-    # Resolve backup_paths, trial_adapter_dir, and trial_graph_dir to absolute
-    # strings so the marker is portable across working-directory changes
-    # (e.g. systemd units that start in a different cwd).  Relative inputs
-    # are resolved against the process cwd at write time.
+    # Resolve backup_paths, trial_adapter_dir, trial_graph_dir, and bundle_slot
+    # to absolute strings so the marker is portable across working-directory
+    # changes (e.g. systemd units that start in a different cwd).  Relative
+    # inputs are resolved against the process cwd at write time.
     data = marker.to_dict()
     data["backup_paths"] = {k: str(Path(v).resolve()) for k, v in data["backup_paths"].items()}
     data["trial_adapter_dir"] = str(Path(data["trial_adapter_dir"]).resolve())
     data["trial_graph_dir"] = str(Path(data["trial_graph_dir"]).resolve())
+    if data.get("bundle_slot"):
+        data["bundle_slot"] = str(Path(data["bundle_slot"]).resolve())
 
     payload = json.dumps(data, indent=2).encode("utf-8")
     pending_file.write_bytes(payload)

@@ -186,6 +186,10 @@ Both keys decrypt the same data. Loss of the daily key is routine (rotate it). L
 
 **Backup restore across key rotation.** Age-encrypted backups do not carry a key fingerprint in the sidecar — the fingerprint concept does not map onto X25519 recipient lists. A stale daily identity surfaces as a decrypt error on restore (HTTP 500 `decrypt_invalid_token`), which is equally actionable: the operator either re-keys the backup via `rotate-daily` / `rotate-recovery` or restores from the recovery bech32. Backups written while Security was OFF are plaintext and always restore.
 
+**Full-snapshot restore (migration revert).** Beyond per-artifact config restores, `POST /backup/restore` with `restore_config: true` restores a complete `snapshot_bundle` — every tier's adapter weights, registries, `key_metadata.json`, speaker profiles, and `server.yaml` — verifying every file hash and decrypt-probing the daily identity *before* any mutation, and safety-snapshotting the current state first so the revert is itself reversible. This is the revert path for a migration that has already been accepted (its trial marker cleared): the pre-migration bundle is the rollback, restored over REST followed by a restart. It is refused during an active `TRIAL`/`STAGING` migration or while consolidation/training is running.
+
+**Infrastructure integrity check.** `paramem integrity` (and `GET /integrity`) verifies on-disk registries, simhashes, manifests, and per-tier graphs for validity and cross-tier consistency. It runs at startup, as a migration pre-flight gate, and on demand — surfacing a corrupt or half-written store (including a backup that no longer decrypts under the current daily identity) before it propagates.
+
 Biometric unlocks (Windows Hello, fingerprint, FIDO2) are supported as *access conveniences* for the daily path only. They are not a recovery mechanism: biometrics unlock a sealed key on specific hardware; they do not regenerate the key on a new device. Any sensible deployment pairs biometric-unlocked daily access with a printed recovery artifact.
 
 ## 6. Operator responsibilities

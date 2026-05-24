@@ -29,6 +29,7 @@ from paramem.cli import (
     dump,
     encrypt_infra,
     generate_key,
+    integrity,
     migrate,
     migrate_accept,
     migrate_cancel,
@@ -221,6 +222,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit raw JSON response instead of formatted output.",
     )
 
+    # --- integrity ---
+    p_int = subparsers.add_parser(
+        "integrity",
+        help="Run infrastructure integrity check.",
+        description="GET /integrity — verify on-disk registries, simhashes, manifests, and graphs.",
+    )
+    p_int.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON response instead of formatted output.",
+    )
+
     # --- security CLI (encryption / key lifecycle) ---
     generate_key.add_parser(subparsers)
     encrypt_infra.add_parser(subparsers)
@@ -259,6 +272,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help(sys.stderr)
         return 1
+
+    if args.command == "integrity":
+        return integrity.run(args)
 
     if args.command == "migrate":
         return migrate.run(args)

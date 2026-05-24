@@ -586,3 +586,276 @@ class TestRollbackWithArchiveWarning:
             or "rotation failed" in captured.err
         )
         assert has_warning, f"Expected archive_warning content on stderr, got: {captured.err!r}"
+
+
+# ---------------------------------------------------------------------------
+# Base-swap long-poll (confirm_resp["base_swap"]=True)
+# ---------------------------------------------------------------------------
+
+# Base-swap preview response — includes base_change block so the preview
+# renders the destructive-change notice before prompting.
+_BASE_SWAP_PREVIEW = {
+    "state": "STAGING",
+    "candidate_path": "/abs/server-new.yaml",
+    "candidate_hash": "aabb1234",
+    "staged_at": "2026-05-24T00:00:00+00:00",
+    "simulate_mode_override": False,
+    "unified_diff": "--- a\n+++ b\n@@ -1 +1 @@\n-model: mistral\n+model: qwen3-4b",
+    "tier_diff": [
+        {
+            "dotted_path": "model",
+            "old_value": "mistral",
+            "new_value": "qwen3-4b",
+            "tier": "destructive",
+        }
+    ],
+    "shape_changes": [],
+    "pre_flight_fail": None,
+    "base_change": {
+        "old_model": "mistral",
+        "new_model": "qwen3-4b",
+        "consequence": "Phase A+B with in-process reload. No restart required.",
+    },
+}
+
+# Confirm response that signals a base-swap was launched.
+_BASE_SWAP_CONFIRM = {
+    "state": "TRIAL",
+    "trial_started_at": "2026-05-24T00:00:00+00:00",
+    "pre_trial_config_sha256": "",
+    "candidate_config_sha256": "aabb1234",
+    "backup_paths": {},
+    "trial_adapter_dir": "",
+    "trial_graph_dir": "",
+    "base_swap": True,
+}
+
+# Status snapshots for the base-swap poll sequence.
+
+_BS_STATUS_PENDING = {
+    "state": "TRIAL",
+    "gates": {"status": "pending"},
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_PASS = {
+    "state": "TRIAL",
+    "gates": {
+        "status": "pass",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "message": "Base-swap migration complete. Model: mistral → qwen3-4b.",
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_PHASE_A_FAILED = {
+    "state": "TRIAL",
+    "gates": {
+        "status": "phase_a_failed",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "exception": "reconstruction error in episodic tier",
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_PHASE_B_FAILED = {
+    "state": "TRIAL",
+    "gates": {
+        "status": "phase_b_failed",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "exception": "recall gate miss on episodic tier",
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_MISMATCH = {
+    "state": "TRIAL",
+    "gates": {
+        "status": "phase_b_model_mismatch",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "mismatch_reason": "config.model_name='mistral' (expected 'qwen3-4b')",
+        "message": "Phase B aborted: loaded model does not match new_model.",
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+_BS_STATUS_RELOAD_DEFERRED = {
+    "state": "TRIAL",
+    "gates": {
+        "status": "reload_deferred",
+        "completed_at": "2026-05-24T01:00:00+00:00",
+        "cloud_only_reason": "insufficient_vram",
+        "message": "Phase A complete but base-model reload deferred.",
+    },
+    "comparison_report": None,
+    "server_started_at": "2026-05-24T00:00:00+00:00",
+}
+
+
+class TestBaseSwapLongPoll:
+    """CLI long-poll for base-swap migrations (confirm_resp["base_swap"]=True).
+
+    Verifies that:
+    - confirm_resp with base_swap=True enters the base-swap poll path.
+    - Terminal status "pass" → exit 0, success message.
+    - Terminal status "phase_a_failed" → exit 1, failure on stderr.
+    - Terminal status "phase_b_failed" → exit 1, failure on stderr.
+    - Terminal status "phase_b_model_mismatch" → exit 1, mismatch on stderr.
+    - Terminal status "reload_deferred" → exit 2, deferred message on stdout.
+    - Ctrl+C → exit 130 (same as regular trial poll).
+    - No accept/rollback/cancel prompt is shown after base-swap terminal.
+    """
+
+    def _base_swap_post_responses(self, **extra):
+        """Build a post_json dispatcher for base-swap flow."""
+        responses = {
+            "preview": _BASE_SWAP_PREVIEW,
+            "confirm": _BASE_SWAP_CONFIRM,
+        }
+        responses.update(extra)
+        return _make_post_responses(**responses)
+
+    def test_base_swap_pass_exits_0(self, monkeypatch, capsys):
+        """Base-swap migration ending in 'pass' exits 0 with success message."""
+        get_seq = [_STATUS_STAGING, _BS_STATUS_PENDING, _BS_STATUS_PASS]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 0, f"Expected exit 0 on base-swap pass; got {rc}"
+        captured = capsys.readouterr()
+        # Success message in stdout.
+        assert "complete" in captured.out.lower() or "new model" in captured.out.lower(), (
+            f"Expected success message on stdout; got: {captured.out!r}"
+        )
+
+    def test_base_swap_phase_a_failed_exits_1(self, monkeypatch, capsys):
+        """Base-swap ending in 'phase_a_failed' exits 1 with failure on stderr."""
+        get_seq = [_STATUS_STAGING, _BS_STATUS_PHASE_A_FAILED]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 1, f"Expected exit 1 on phase_a_failed; got {rc}"
+        captured = capsys.readouterr()
+        assert "Phase A" in captured.err or "failed" in captured.err.lower(), (
+            f"Expected Phase A failure message on stderr; got: {captured.err!r}"
+        )
+
+    def test_base_swap_phase_b_failed_exits_1(self, monkeypatch, capsys):
+        """Base-swap ending in 'phase_b_failed' exits 1 with failure on stderr."""
+        get_seq = [_STATUS_STAGING, _BS_STATUS_PHASE_B_FAILED]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 1, f"Expected exit 1 on phase_b_failed; got {rc}"
+        captured = capsys.readouterr()
+        assert "Phase B" in captured.err or "failed" in captured.err.lower(), (
+            f"Expected Phase B failure message on stderr; got: {captured.err!r}"
+        )
+
+    def test_base_swap_model_mismatch_exits_1(self, monkeypatch, capsys):
+        """Base-swap ending in 'phase_b_model_mismatch' exits 1; mismatch on stderr."""
+        get_seq = [_STATUS_STAGING, _BS_STATUS_MISMATCH]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 1, f"Expected exit 1 on phase_b_model_mismatch; got {rc}"
+        captured = capsys.readouterr()
+        # Mismatch detail on stderr.
+        assert "mismatch" in captured.err.lower() or "identity" in captured.err.lower(), (
+            f"Expected mismatch message on stderr; got: {captured.err!r}"
+        )
+        # Rollback hint on stderr.
+        assert "rollback" in captured.err.lower(), (
+            f"Expected rollback hint on stderr; got: {captured.err!r}"
+        )
+
+    def test_base_swap_reload_deferred_exits_2(self, monkeypatch, capsys):
+        """Base-swap ending in 'reload_deferred' exits 2; deferred message shown."""
+        get_seq = [_STATUS_STAGING, _BS_STATUS_RELOAD_DEFERRED]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 2, f"Expected exit 2 on reload_deferred; got {rc}"
+        captured = capsys.readouterr()
+        # Deferred message in stdout (informational, not an error).
+        assert "deferred" in captured.out.lower() or "vram" in captured.out.lower(), (
+            f"Expected deferred message on stdout; got: {captured.out!r}"
+        )
+        # gpu/acquire mention on stdout.
+        assert (
+            "gpu/acquire" in captured.out.lower()
+            or "/gpu/acquire" in captured.out.lower()
+            or "acquire" in captured.out.lower()
+        ), f"Expected /gpu/acquire mention on stdout; got: {captured.out!r}"
+
+    def test_base_swap_no_accept_rollback_prompt_on_pass(self, monkeypatch, capsys):
+        """On base-swap pass, no accept/rollback/cancel prompt is shown.
+
+        The 3-way prompt only appears on the regular trial-consolidation path.
+        A base-swap success is self-completing and needs no explicit accept.
+        """
+        get_seq = [_STATUS_STAGING, _BS_STATUS_PASS]
+        monkeypatch.setattr(http_client, "get_json", _make_get_responses(*get_seq))
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+
+        prompt_calls: list[str] = []
+
+        def _capture_input(prompt=""):
+            prompt_calls.append(prompt)
+            return "y"  # first call is the preview Proceed? prompt
+
+        monkeypatch.setattr("builtins.input", _capture_input)
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 0
+
+        # Only the "Proceed? [y/N]" prompt was shown; no accept/rollback/cancel prompt.
+        prompts_lower = [p.lower() for p in prompt_calls]
+        accept_rollback_shown = any("accept" in p and "rollback" in p for p in prompts_lower)
+        assert not accept_rollback_shown, (
+            f"accept/rollback/cancel prompt must not be shown on base-swap pass; "
+            f"prompts shown: {prompt_calls}"
+        )
+
+    def test_base_swap_ctrl_c_exits_130(self, monkeypatch, capsys):
+        """Ctrl+C during base-swap poll exits 130 (same as regular trial poll)."""
+        call_count = [0]
+
+        def _get_interrupted(url, **kwargs):
+            call_count[0] += 1
+            if "/migration/status" in url:
+                if call_count[0] == 1:
+                    return _STATUS_STAGING
+                raise KeyboardInterrupt()
+            raise AssertionError(f"Unexpected GET {url!r}")
+
+        monkeypatch.setattr(http_client, "get_json", _get_interrupted)
+        monkeypatch.setattr(http_client, "post_json", self._base_swap_post_responses())
+        monkeypatch.setattr("builtins.input", lambda _="": "y")
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        rc = main(["migrate", "/abs/server-new.yaml"])
+        assert rc == 130
+        captured = capsys.readouterr()
+        assert "poll interrupted" in captured.err

@@ -1199,6 +1199,118 @@ class TestFullCycleGateHelpers:
         cfg = self._make_config("every 84h", tmp_path)
         assert _is_full_cycle_due(cfg) is True
 
+    # --- interim-only / catch-up gate tests ---
+
+    def test_last_full_consolidation_window_skips_interim_dirs(self, tmp_path):
+        """Interim dirs (interim_<stamp>/) must NOT be treated as main slots.
+
+        The interim layout is ``episodic/interim_<stamp>/<ts>/meta.json``.
+        Only the top-level ``episodic/<ts>/meta.json`` paths belong to the
+        main slot scan.  An interim dir at the top level should be invisible
+        to ``_last_full_consolidation_window``.
+        """
+        from paramem.server.app import _last_full_consolidation_window
+
+        # Realistic interim layout: episodic/interim_<stamp>/<ts>/meta.json
+        interim_ts = "20260524T0000"
+        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
+        self._write_meta(inner_slot, window_stamp=interim_ts)
+        # No top-level main slot → must return None
+        assert _last_full_consolidation_window(tmp_path) is None
+
+    def test_last_full_consolidation_window_main_slot_shadows_interim(self, tmp_path):
+        """When a main slot AND interim dirs both exist, return the main stamp.
+
+        The interim dirs must not shadow or replace the main slot result.
+        """
+        from paramem.server.app import _last_full_consolidation_window
+
+        main_stamp = "20260520T0000"
+        # Main slot at top level
+        self._write_meta(tmp_path / "episodic" / "20260520-080000", window_stamp=main_stamp)
+        # Interim slot nested under episodic/interim_*/
+        interim_ts = "20260524T0000"
+        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
+        self._write_meta(inner_slot, window_stamp=interim_ts)
+
+        assert _last_full_consolidation_window(tmp_path) == main_stamp
+
+    def test_is_full_cycle_due_interim_only_no_main_returns_true(self, tmp_path):
+        """Interim-only / no-main state must fire the fold (the production bug).
+
+        Layout: episodic/interim_<stamp>/<ts>/meta.json — no top-level main
+        slot.  Before the fix, ``_last_full_consolidation_window`` saw the
+        interim dir as a candidate, failed to find a top-level meta.json,
+        returned None, and ``_is_full_cycle_due`` returned False, stranding
+        interim keys out of the main tiers indefinitely.
+
+        After the fix:
+        - ``_last_full_consolidation_window`` skips interim dirs → returns None.
+        - ``_is_full_cycle_due`` detects interims on disk → returns True.
+        """
+        from paramem.server.app import _is_full_cycle_due, _last_full_consolidation_window
+
+        interim_ts = "20260524T0000"
+        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
+        self._write_meta(inner_slot, window_stamp=interim_ts)
+
+        assert _last_full_consolidation_window(tmp_path) is None
+        cfg = self._make_config("every 84h", tmp_path)
+        assert _is_full_cycle_due(cfg) is True
+
+    def test_is_full_cycle_due_fresh_install_no_interim_returns_false(self, tmp_path):
+        """Fresh install: no main slot AND no interim → gate stays False.
+
+        The full cycle (consolidate_interim_adapters) would be a no-op with
+        nothing to fold.  Returning True would cause re-fire on every tick
+        with the main slot never being created.  The correct path is the
+        interim cycle (which extracts pending sessions first).
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        # Empty episodic dir — no main slot, no interim dirs.
+        (tmp_path / "episodic").mkdir()
+        cfg = self._make_config("every 84h", tmp_path)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_is_full_cycle_due_main_slot_current_with_interim_returns_false(self, tmp_path):
+        """Main slot present and up-to-date → False even when interims exist.
+
+        The interims will be folded on the NEXT window tick when current !=
+        last.  As long as the main slot's window_stamp matches the current
+        window, the fold has already run this window.
+        """
+        from paramem.memory.interim_adapter import current_full_consolidation_stamp
+        from paramem.server.app import _is_full_cycle_due
+
+        period = "every 84h"
+        current_stamp = current_full_consolidation_stamp(period)
+        # Main slot stamped at the current window.
+        self._write_meta(tmp_path / "episodic" / "20260520-080000", window_stamp=current_stamp)
+        # Interim slot also present.
+        interim_ts = "20260524T0000"
+        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
+        self._write_meta(inner_slot, window_stamp=interim_ts)
+
+        cfg = self._make_config(period, tmp_path)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_is_full_cycle_due_main_slot_old_with_interim_returns_true(self, tmp_path):
+        """Main slot present but from a prior window → True (due-ness follows
+        main stamp, not interims).
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        old_stamp = "20260101T0000"
+        self._write_meta(tmp_path / "episodic" / "20260420-000000", window_stamp=old_stamp)
+        # Interim slot also present — should not change the outcome.
+        interim_ts = "20260524T0000"
+        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
+        self._write_meta(inner_slot, window_stamp=interim_ts)
+
+        cfg = self._make_config("every 84h", tmp_path)
+        assert _is_full_cycle_due(cfg) is True
+
 
 class TestTestHarnessImportNoEnvRestoration:
     """Regression: importing experiments.utils.test_harness must NOT re-load .env.

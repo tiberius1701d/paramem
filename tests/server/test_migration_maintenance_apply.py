@@ -385,7 +385,9 @@ class TestApplyPathIsolation:
         reload_called = []
 
         def _mock_reload(
-            refresh_config_from_disk: bool = False, rebuild_session_buffer: bool = False
+            refresh_config_from_disk: bool = False,
+            rebuild_session_buffer: bool = False,
+            lock_held: bool = False,
         ):
             """Simulate reload and write a marker file to tmp_data to prove routing."""
             state["mode"] = "local"

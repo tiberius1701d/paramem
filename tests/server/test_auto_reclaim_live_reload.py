@@ -67,11 +67,21 @@ def test_auto_reclaim_calls_live_reload_then_voice_gpu_on_success():
     async def fake_run_in_executor(_executor, fn, *args):
         call_log.append(fn.__name__ if hasattr(fn, "__name__") else str(fn))
 
+    def _fake_reload_success(*_args, **_kwargs):
+        # Faithfully simulate a successful in-process reload: the real
+        # _live_reload_base_model sets mode="local" on success, which the loop
+        # reads (app.py:11057) to take the gpu-restore branch. Establishing it
+        # here makes the test independent of any incoming _state["mode"] a prior
+        # test left behind (e.g. test_gpu_release leaves "cloud-only").
+        app_module._state["mode"] = "local"
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch("paramem.server.app._gpu_has_compute_processes", return_value=False),
         patch("paramem.server.app._get_hold_state", return_value=_make_hold_state(active=False)),
-        patch("paramem.server.app._live_reload_base_model") as mock_reload,
+        patch(
+            "paramem.server.app._live_reload_base_model", side_effect=_fake_reload_success
+        ) as mock_reload,
         patch("paramem.server.app._set_voice_pipeline_profile") as mock_profile,
         patch("paramem.server.app._restart_service") as mock_restart,
         patch("paramem.server.gpu_lock.gpu_lock", _make_null_gpu_lock()),
@@ -126,6 +136,11 @@ def test_auto_reclaim_records_error_and_continues_on_reload_failure(caplog):
         reload_calls += 1
         if reload_calls == 1:
             raise RuntimeError("CUDA load failed")
+        # Second call succeeds: simulate the real reload setting mode="local"
+        # (read by the loop at app.py:11057) so the success branch — which
+        # clears last_reclaim_error — is reached regardless of any incoming
+        # _state["mode"] from a prior test.
+        app_module._state["mode"] = "local"
 
     named = logging.getLogger("paramem.server.app")
     orig_propagate = named.propagate

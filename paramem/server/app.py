@@ -35,12 +35,16 @@ from pydantic import BaseModel
 
 # Migration / backup imports at module level so tests can patch them.
 from paramem.backup.backup import write as backup_write
+from paramem.backup.backup import write_bundle
 from paramem.backup.types import ArtifactKind
 from paramem.graph.extractor import ExtractionFailed
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server import calibrate as calibrate_module
+from paramem.server.active_store_migration import migrate
+from paramem.server.background_trainer import BackgroundTrainer
 from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import TTSConfig, TTSVoiceConfig, load_server_config
+from paramem.server.consolidation import create_consolidation_loop
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.inference import (
     ChatResult,
@@ -55,6 +59,7 @@ from paramem.server.tools.ha_client import HAClient
 from paramem.server.trial_state import (
     TrialMarker,
     clear_trial_marker,
+    read_trial_marker,
     write_trial_marker,
 )
 from paramem.server.vram_guard import (
@@ -171,6 +176,15 @@ _state = {
     "unknown_speakers": {},
     "migration": None,  # MigrationStashState — populated in lifespan
     "server_started_at": "",  # ISO-8601 UTC timestamp set in lifespan
+    # Set to True when boot-time load_registries_from_disk raises.  The store
+    # may hold zero or partial tiers; downstream migration must not run against
+    # a degraded store (it would vacuously complete with no-op relocations).
+    # Cleared to False on successful load.
+    "store_load_degraded": False,
+    # Whether the daily age identity was loadable at boot.  Set in lifespan
+    # alongside ``encryption``; used by ``GET /integrity`` and the boot
+    # integrity gate to distinguish no-key from corruption failures.
+    "daily_loadable": False,
 }
 
 
@@ -380,6 +394,24 @@ class StatusResponse(BaseModel):
     last_reclaim_error: dict | None = None
 
 
+class IntegrityCheckItem(BaseModel):
+    """One file-level check result from the integrity verifier."""
+
+    path: str
+    category: str
+    tier: str
+    status: str
+    detail: str
+
+
+class IntegrityResponse(BaseModel):
+    """Response schema for ``GET /integrity``."""
+
+    ok: bool
+    checks: list[IntegrityCheckItem]
+    failures: list[IntegrityCheckItem]
+
+
 class ConsolidateResponse(BaseModel):
     status: str
 
@@ -584,6 +616,7 @@ class PreviewResponse(BaseModel):
     pre_flight_disk_used_gb: float | None = None
     pre_flight_disk_cap_gb: float | None = None
     mode_switch: dict | None = None
+    base_change: dict | None = None
 
 
 # MigrationDiffResponse is an alias — same shape as PreviewResponse.
@@ -688,6 +721,15 @@ class ConfirmResponse(BaseModel):
         Describes the direction, mechanism, and semantics of the rebuild so
         CLI and API consumers can explain the outcome without polling for
         gate results.
+    base_swap:
+        ``True`` when the confirm launched a base-model-swap background task.
+        The server is in ``"TRIAL"`` state; Phase A runs asynchronously.
+        Phase A captures all keyed facts from the current base model, then
+        reloads the new base model in-process (the server is briefly
+        cloud-only during the reload).  Phase B retrains all tiers on the new
+        base and gates on 100% recall.  No server restart is required.
+        Poll ``/migration/status`` for progress; use ``POST /migration/rollback``
+        to restore the prior base model from the pre-migration bundle.
     """
 
     state: str
@@ -698,6 +740,7 @@ class ConfirmResponse(BaseModel):
     trial_adapter_dir: str
     trial_graph_dir: str
     mode_switch: dict | None = None
+    base_swap: bool = False
 
 
 class MigrationCancelResponse(BaseModel):
@@ -1467,6 +1510,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning(_line)
     _state["encryption"] = "on" if _is_on else "off"
+    _state["daily_loadable"] = _daily_ok
 
     # --- Crash recovery: inspect disk state BEFORE drift init ---
     # This ensures _state["migration"] reflects any partially-completed
@@ -1533,6 +1577,31 @@ async def lifespan(app: FastAPI):
             _state["migration"]["state"] = "TRIAL"
             _state["migration"]["trial"] = trial_stash
             _state["migration"]["recovery_required"] = []
+        elif (
+            recovery_result.action == RecoveryAction.RESUME_BASE_SWAP
+            and recovery_result.trial_marker is not None
+        ):
+            # Base-swap resumed: re-enter TRIAL state so the migration lock and
+            # rollback endpoint remain functional.  The orchestration coroutine is
+            # re-launched below (after the model loads) to resume from the marker's
+            # base_swap_phase.  backup_paths holds the bundle slot, not a config slot.
+            m_bs = recovery_result.trial_marker
+            from paramem.server.migration import TrialStash
+
+            trial_stash_bs: TrialStash = TrialStash(
+                started_at=m_bs.started_at,
+                pre_trial_config_sha256=m_bs.pre_trial_config_sha256,
+                candidate_config_sha256=m_bs.candidate_config_sha256,
+                backup_paths=m_bs.backup_paths,
+                trial_adapter_dir=m_bs.trial_adapter_dir,
+                trial_graph_dir=m_bs.trial_graph_dir,
+                gates={"status": "pending"},
+            )
+            _state["migration"]["state"] = "TRIAL"
+            _state["migration"]["trial"] = trial_stash_bs
+            _state["migration"]["recovery_required"] = []
+            # Stash the marker so the post-startup resume launcher can read it.
+            _state["_base_swap_resume_marker"] = m_bs
         elif recovery_result.recovery_required:
             _state["migration"]["recovery_required"] = list(recovery_result.recovery_required)
 
@@ -1986,6 +2055,56 @@ async def lifespan(app: FastAPI):
     # have cleared the 1.0 recall gate.  Shared with the live config-reload
     # path (_live_reload_base_model) via _arm_active_store_migration.
     _arm_active_store_migration(config)
+
+    # --- Base-swap resume: re-launch orchestration on crash recovery ---
+    # When recovery_result.action == RESUME_BASE_SWAP, the lifespan seeded
+    # _state["_base_swap_resume_marker"] above.  Now that the model is loaded
+    # and all config-derived state is initialised, launch the orchestration
+    # coroutine to resume from wherever the marker left off.
+    #
+    # Resume semantics by base_swap_phase:
+    #   "phaseA":      Phase A was in progress — re-run from the start of
+    #                  Phase A (the active-store state file is still on disk).
+    #   "phaseA_done": Phase A complete, config already Qwen3 on disk, model
+    #                  loaded as Qwen3 at boot.  The orchestration will skip
+    #                  Phase A (state file absent / all tiers done) and proceed
+    #                  directly to Phase B.  If the reload deferred, the gates
+    #                  are set to reload_deferred and the operator re-triggers.
+    #   "phaseB":      Resume at Phase B (simulate→train on Qwen3). The
+    #                  active-store state file is present on disk; migrate()
+    #                  is idempotent on completed tiers.
+    # In all cases we pass the original orchestration parameters extracted from
+    # the marker.  The config was already renamed in Phase A, so candidate_path_str
+    # can be any sentinel (unused when candidate file is gone); live_config_path
+    # is the current config path.
+    _bs_resume = _state.pop("_base_swap_resume_marker", None)
+    if _bs_resume is not None and not cloud_only:
+        _bs_live_cfg = (
+            Path(_state["config_path"])
+            if _state.get("config_path")
+            else Path("configs/server.yaml")
+        )
+        _bs_state_dir = (config.paths.data / "state").resolve()
+        _bs_backups_root = (config.paths.data / "backups").resolve()
+        asyncio.create_task(
+            _run_base_swap_orchestration(
+                candidate_path_str=str(_bs_live_cfg),  # config already renamed in Phase A
+                live_config_path=_bs_live_cfg,
+                state_dir=_bs_state_dir,
+                backups_root=_bs_backups_root,
+                old_model=_bs_resume.old_model,
+                new_model=_bs_resume.new_model,
+                started_at=_bs_resume.started_at,
+                candidate_hash=_bs_resume.candidate_config_sha256,
+                resume_phase=_bs_resume.base_swap_phase,
+            )
+        )
+        logger.info(
+            "base-swap resume launched: base_swap_phase=%s old=%s new=%s",
+            _bs_resume.base_swap_phase,
+            _bs_resume.old_model,
+            _bs_resume.new_model,
+        )
 
     # --- Post-session queue: persistent queue for missed training triggers ---
     # Instantiate the queue in local mode so the chat handler can use it.
@@ -3001,6 +3120,37 @@ async def status():
     )
 
 
+@app.get("/integrity", response_model=IntegrityResponse)
+async def integrity_check():
+    """Run the infrastructure integrity check and return the report.
+
+    Cloud-only-safe — no GPU or model dependency.  Verifies every tier's
+    ``indexed_key_registry.json``, ``simhash_registry.json``, ``meta.json``
+    (live weight slot), and ``graph.json`` (simulate mode only), plus common
+    files (``key_metadata.json``, ``speaker_profiles.json``,
+    ``observed_languages.json``, ``state/backup.json``).
+
+    Returns a JSON report with ``ok``, ``checks``, and ``failures`` fields.
+    """
+    from paramem.backup.integrity import verify_infrastructure_integrity
+
+    config = _state["config"]
+    daily_loadable = _state.get("daily_loadable", False)
+    memory_store = _state.get("memory_store")
+
+    report = verify_infrastructure_integrity(
+        config,
+        store=memory_store,
+        daily_loadable=daily_loadable,
+    )
+
+    return IntegrityResponse(
+        ok=report.ok,
+        checks=[IntegrityCheckItem(**c.to_dict()) for c in report.checks],
+        failures=[IntegrityCheckItem(**c.to_dict()) for c in report.failures],
+    )
+
+
 @app.post("/gpu/acquire")
 async def gpu_acquire():
     """Reclaim the GPU in-process and switch to local mode.
@@ -3048,6 +3198,47 @@ async def gpu_acquire():
             await asyncio.get_running_loop().run_in_executor(
                 None, _set_voice_pipeline_profile, "gpu"
             )
+            # ── Base-swap deferred-resume hook ────────────────────────────────
+            # When a phaseA_done base-swap marker exists and the orchestration
+            # is not actively running (base_swap_active=False), the reload that
+            # just succeeded means Phase B can now run.  Re-launch the
+            # orchestration in resume mode so Phase B proceeds automatically
+            # without operator intervention.
+            _bs_mig = _state.get("migration") or {}
+            if not _bs_mig.get("base_swap_active", False):
+                _config_for_resume = _state.get("config")
+                if _config_for_resume is not None:
+                    _sd_resume = (_config_for_resume.paths.data / "state").resolve()
+                    _br_resume = (_config_for_resume.paths.data / "backups").resolve()
+                    _deferred_marker = read_trial_marker(_sd_resume)
+                    if (
+                        _deferred_marker is not None
+                        and _deferred_marker.migration_kind == "base_swap"
+                        and _deferred_marker.base_swap_phase == "phaseA_done"
+                    ):
+                        _live_cfg_resume = (
+                            Path(_state["config_path"])
+                            if _state.get("config_path")
+                            else Path("configs/server.yaml")
+                        )
+                        asyncio.create_task(
+                            _run_base_swap_orchestration(
+                                candidate_path_str=str(_live_cfg_resume),
+                                live_config_path=_live_cfg_resume,
+                                state_dir=_sd_resume,
+                                backups_root=_br_resume,
+                                old_model=_deferred_marker.old_model,
+                                new_model=_deferred_marker.new_model,
+                                started_at=_deferred_marker.started_at,
+                                candidate_hash=_deferred_marker.candidate_config_sha256,
+                                resume_phase="phaseA_done",
+                            )
+                        )
+                        logger.info(
+                            "/gpu/acquire: re-launching deferred base-swap Phase B (old=%s new=%s)",
+                            _deferred_marker.old_model,
+                            _deferred_marker.new_model,
+                        )
         elif _state.get("cloud_only_reason") == "insufficient_vram":
             # Free device memory cannot hold the model (an external GPU
             # consumer holds it). A restart would only re-hit the lifespan
@@ -3123,8 +3314,14 @@ def _preload_memory_store(config, *, model, tokenizer):
     )
     try:
         memory_store.load_registries_from_disk(config.adapter_dir)
+        _state["store_load_degraded"] = False
     except Exception:
-        logger.exception("Boot-time registry load failed; memory store will start empty")
+        logger.error(
+            "Boot-time registry load failed; memory store will start empty — "
+            "active-store migration will be refused until this is resolved",
+            exc_info=True,
+        )
+        _state["store_load_degraded"] = True
 
     if not config.inference.preload_cache:
         # Intentional opt-out: inference pays per-key latency on misses.
@@ -3240,6 +3437,47 @@ def _preload_memory_store(config, *, model, tokenizer):
         logger.exception(
             "Boot-time key_metadata join failed; entries will lack speaker_id "
             "until next consolidation cycle (personal queries will cold-start)"
+        )
+
+    # Infrastructure integrity check — runs after all loaders so the store
+    # is fully populated for cross-consistency checks.  A corrupt registry
+    # blocks migrations and flags store_load_degraded but does NOT 503 /chat
+    # (that is boot_degraded's job).
+    try:
+        from paramem.backup import key_store as _key_store_mod
+        from paramem.backup.integrity import verify_infrastructure_integrity
+
+        _daily_ok_local = _key_store_mod.daily_identity_loadable(
+            _key_store_mod.DAILY_KEY_PATH_DEFAULT
+        )
+        _integrity_report = verify_infrastructure_integrity(
+            config,
+            store=memory_store,
+            daily_loadable=_daily_ok_local,
+        )
+        if not _integrity_report.ok:
+            for _fc in _integrity_report.failures:
+                logger.error(
+                    "Integrity failure [%s/%s] %s: %s",
+                    _fc.category,
+                    _fc.tier,
+                    _fc.path,
+                    _fc.detail,
+                )
+            _state["store_load_degraded"] = True
+            logger.error(
+                "Boot-time integrity check found %d failure(s); "
+                "active-store migration will be refused until this is resolved",
+                len(_integrity_report.failures),
+            )
+        else:
+            logger.info(
+                "Boot-time integrity check passed (%d checks)",
+                len(_integrity_report.checks),
+            )
+    except Exception:
+        logger.exception(
+            "Boot-time integrity check raised unexpectedly; store_load_degraded left unchanged"
         )
 
     return memory_store
@@ -4143,6 +4381,11 @@ def _apply_config_live() -> dict:
     This ensures the scheduler's ``mode != "local"`` defer at ``app.py:6831``
     fires before the executor runs.  This function does NOT set the guard
     internally (it runs in an executor thread, not on the event loop).
+
+    Note: ``_live_reload_base_model`` also sets ``mode="cloud-only"`` directly
+    as part of the drain sequence; the caller-set guard above is still required
+    for the event-loop / scheduler visibility window before the executor thread
+    even starts.
 
     **Lock contract (correction N-1):**
     This function acquires ``gpu_lock_sync`` internally (bounded timeout).
@@ -5191,6 +5434,7 @@ async def migration_preview(request: PreviewRequest):
             unified_diff=unified_diff,
             trial=None,
             recovery_required=list(_state.get("migration", {}).get("recovery_required", [])),
+            parsed_live=live_yaml,
         )
         payload = render_preview_response(preview_stash, pre_flight_fail=pre_flight.fail_code)
         payload["pre_flight_disk_used_gb"] = pre_flight.disk_used_bytes / (1024**3)
@@ -5214,6 +5458,7 @@ async def migration_preview(request: PreviewRequest):
         unified_diff=unified_diff,
         trial=None,
         recovery_required=list(_state.get("migration", {}).get("recovery_required", [])),
+        parsed_live=live_yaml,
     )
     _state["migration"] = stash
 
@@ -5384,6 +5629,20 @@ async def migration_confirm(request: ConfirmRequest):
                     "message": "Consolidation started while acquiring lock.",
                 },
             )
+        # R2: Reject confirm if a base-swap orchestration is actively running.
+        # In practice the state=TRIAL check above fires first, but this guard
+        # is explicit in case the state flag lags the base_swap_active flag.
+        if migration.get("base_swap_active", False):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "base_swap_active",
+                    "message": (
+                        "A base-swap migration is actively running. "
+                        "Wait for it to complete (or fail) before confirming."
+                    ),
+                },
+            )
 
         # Snapshot the STAGING stash fields we need.
         candidate_path_str = migration.get("candidate_path", "")
@@ -5407,7 +5666,33 @@ async def migration_confirm(request: ConfirmRequest):
         is_pure_mode_switch = (
             len(tier_diff) == 1 and tier_diff[0]["dotted_path"] == "consolidation.mode"
         )
+        is_base_swap = any(r["dotted_path"] == "model" for r in tier_diff)
         if is_pure_mode_switch:
+            # Integrity gate UP-FRONT — before any mutation — mirroring the
+            # base-swap branch.  On a corrupt store the arm would refuse anyway
+            # (see _arm_active_store_migration), but by then the config is
+            # already renamed → config/store divergence.  Raise 409 here so
+            # no mutation occurs on the failure path.
+            from paramem.backup.integrity import (
+                verify_infrastructure_integrity as _verify_integrity,
+            )
+
+            _daily_ok_ms = _state.get("daily_loadable", False)
+            _ms_integrity = _verify_integrity(
+                _state["config"],
+                store=_state.get("consolidation_loop", None)
+                and getattr(_state.get("consolidation_loop"), "store", None),
+                daily_loadable=_daily_ok_ms,
+            )
+            if not _ms_integrity.ok:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "integrity_failure",
+                        "failing_files": [c.to_dict() for c in _ms_integrity.failures],
+                    },
+                )
+
             pre_trial_hash = ""
             if live_config_path.exists():
                 pre_trial_hash = _hashlib.sha256(live_config_path.read_bytes()).hexdigest()
@@ -5445,6 +5730,110 @@ async def migration_confirm(request: ConfirmRequest):
                 mode_switch=_build_mode_switch_block(
                     tier_diff[0]["old_value"], tier_diff[0]["new_value"]
                 ),
+            )
+
+        # --- Base-swap path: Phase A background task ---
+        # When the candidate changes the base model, we arm a background task
+        # that (1) writes a full bundle backup, (2) runs Phase A (train→simulate
+        # active-store migration to reconstruct keyed facts into per-tier
+        # graph.json and delete the adapter weight slots), (3) atomically renames
+        # the candidate config over the live config, and (4) updates the marker
+        # to phaseA_done + sets migration status to restart_required.
+        if is_base_swap:
+            # Integrity gate: refuse base-swap when the store is corrupt.
+            from paramem.backup.integrity import (
+                verify_infrastructure_integrity as _verify_integrity,
+            )
+
+            _daily_ok_for_swap = _state.get("daily_loadable", False)
+            _swap_integrity = _verify_integrity(
+                _state["config"],
+                store=_state.get("consolidation_loop", None)
+                and getattr(_state.get("consolidation_loop"), "store", None),
+                daily_loadable=_daily_ok_for_swap,
+            )
+            if not _swap_integrity.ok:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "integrity_failure",
+                        "failing_files": [c.to_dict() for c in _swap_integrity.failures],
+                    },
+                )
+
+            from paramem.server.config import MODEL_REGISTRY
+
+            # Read the candidate's model alias and resolve it via MODEL_REGISTRY.
+            parsed_candidate = migration.get("parsed_candidate", {})
+            candidate_model_alias = parsed_candidate.get("model", "")
+            if candidate_model_alias not in MODEL_REGISTRY:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "unknown_model",
+                        "message": (
+                            f"Candidate model alias {candidate_model_alias!r} is not in "
+                            f"MODEL_REGISTRY. Available: {list(MODEL_REGISTRY.keys())}"
+                        ),
+                    },
+                )
+            candidate_model_config = MODEL_REGISTRY[candidate_model_alias]
+            predicted = predict_base_bytes(candidate_model_config)
+            if predicted is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "model_not_cached",
+                        "message": (
+                            f"Model '{candidate_model_alias}' "
+                            f"({candidate_model_config.model_id}) is not in the "
+                            "HuggingFace cache. Download it first so the pre-load "
+                            "VRAM assessment can run. Example: "
+                            f"huggingface-cli download {candidate_model_config.model_id}"
+                        ),
+                    },
+                )
+
+            # Resolve old model alias from the live config.
+            live_config = _state.get("config")
+            old_model_alias = getattr(live_config, "model_name", "") if live_config else ""
+
+            # Set state to TRIAL immediately (async task updates it further).
+            _state["migration"]["state"] = "TRIAL"
+            _state["migration"]["trial"] = TrialStash(
+                started_at=now_iso,
+                pre_trial_config_sha256="",
+                candidate_config_sha256=candidate_hash,
+                backup_paths={},
+                trial_adapter_dir="",
+                trial_graph_dir="",
+                gates={"status": "pending"},
+            )
+            _state["migration"]["recovery_required"] = []
+
+            # Kick off Phase A as a background task.
+            asyncio.create_task(
+                _run_base_swap_orchestration(
+                    candidate_path_str=candidate_path_str,
+                    live_config_path=live_config_path,
+                    state_dir=state_dir,
+                    backups_root=backups_root,
+                    old_model=old_model_alias,
+                    new_model=candidate_model_alias,
+                    started_at=now_iso,
+                    candidate_hash=candidate_hash,
+                )
+            )
+
+            return ConfirmResponse(
+                state="TRIAL",
+                trial_started_at=now_iso,
+                pre_trial_config_sha256="",
+                candidate_config_sha256=candidate_hash,
+                backup_paths={},
+                trial_adapter_dir="",
+                trial_graph_dir="",
+                base_swap=True,
             )
 
         # --- Step 2: snapshot pre-trial hash, write the config backup ---
@@ -5797,6 +6186,629 @@ async def _run_trial_consolidation() -> None:
             {"status": "trial_exception", "exception": str(exc), "completed_at": completed_at}
         )
         logger.exception("trial consolidation failed: %s", exc)
+
+
+async def _run_base_swap_orchestration(
+    *,
+    candidate_path_str: str,
+    live_config_path: Path,
+    state_dir: Path,
+    backups_root: Path,
+    old_model: str,
+    new_model: str,
+    started_at: str,
+    candidate_hash: str,
+    resume_phase: str = "",
+) -> None:
+    """Run the full base-swap orchestration: Phase A → reload → Phase B → done.
+
+    This single coroutine owns the entire base-model-swap lifecycle.  It is
+    launched as a background ``asyncio.Task`` from ``migration_confirm`` and
+    runs to completion (or a retryable-deferred checkpoint) without requiring
+    a server restart.
+
+    Sequence
+    --------
+    1. **Bundle backup** — full snapshot of Mistral weights + per-tier adapter
+       dirs + registry + speaker_profiles, written before any mutations.
+       Rollback anchor.  **Written exactly once** at fresh start; resume paths
+       read ``bundle_slot`` from the existing marker and NEVER call
+       ``write_bundle`` again.
+    2. **Phase A** — arm the active-store ``train→simulate`` migration state
+       file and submit it to a fresh ``BackgroundTrainer`` worker (holds GPU
+       lock during execution).  Reconstructs keyed facts from live Mistral
+       weights into per-tier ``graph.json`` files, then deletes the adapter
+       weight slots.  Marker → ``phaseA_done``.  Config atomically renamed to
+       the candidate (Qwen3) variant.
+    3. **In-process reload** — two sub-cases based on ``resume_phase``:
+
+       - **Fresh start** (``resume_phase == ""``): drain and reload the base via
+         the existing ``/gpu/release`` + ``/gpu/acquire`` primitives.
+         ``gpu_release`` drains BOTH the base model AND the voice pipeline to
+         cloud-only; ``gpu_acquire`` then loads the renamed-config base on the
+         clean GPU, so the VRAM gate sees accurate free bytes and the reload
+         fits in-process without a restart.
+         If the reload was **deferred** (insufficient VRAM), set gates to
+         ``reload_deferred`` and return.  ``/gpu/acquire`` re-launches
+         (``resume_phase="phaseA_done"``) when VRAM frees.
+
+       - **Resume** (``resume_phase == "phaseA_done"``): the server was restarted
+         after writing the phaseA_done marker; boot already loaded the new
+         config from the renamed server.yaml.  Skip ``_apply_config_live``.
+         Verify the new model is resident (``mode=="local"`` AND
+         ``config.model_name == new_model``); if not, set ``reload_deferred``
+         and return for retry.
+
+    4. **Phase B** — re-create ``ConsolidationLoop`` + ``BackgroundTrainer`` for
+       Qwen3 (seeded from disk: registries + ``graph.json`` present, no weights),
+       arm the ``simulate→train`` migration state file, and submit to the new
+       worker.  Runs the full ``migrate()`` call under GPU lock.  Uses the same
+       ``migrate()`` entry point as Phase A so there is no hand-rolled per-tier
+       loop here.  Marker → ``phaseB`` before the job is submitted; ``done``
+       after success.
+    5. **Recall gate** — Phase B's ``migrate()`` call uses the uncapped probe
+       (``max_probe=len(entries)``).  If any tier fails the 1.0 gate, the
+       ``MigrationState.all_tiers_done`` check inside ``migrate()`` catches it
+       and the state file stays on disk.
+    6. **Success** — clear the active-store state file (already done by
+       ``migrate()`` on all_tiers_done), clear the trial marker, clear the
+       base-swap marker in the in-memory trial stash, set
+       ``_state["mode"] = "local"`` (should already be set by the reload, but
+       explicit for clarity after Phase B), set migration status to ``pass``.
+
+    **Resume semantics** (controlled by ``resume_phase``)
+
+    - ``""`` or ``"phaseA"`` (fresh start): run all steps 1–6.
+    - ``"phaseA_done"``: Phase A and the bundle backup are already complete.
+      Read ``bundle_slot`` from the on-disk marker; skip steps 1–2 and skip
+      the ``_apply_config_live`` reload (boot already loaded the new config).
+      Verify the new model is resident; if not, defer.  ``write_bundle`` is NOT
+      called.
+    - ``"phaseB"``: Phase A and reload already done.  Read ``bundle_slot`` from
+      the on-disk marker; skip steps 1–3; resume at step 4 (Phase B setup).
+      ``write_bundle`` is NOT called.
+
+    **In-flight guard** (R2)
+
+    ``_state["migration"]["base_swap_active"]`` is ``True`` while this
+    coroutine is actively executing phases.  It is cleared in ``finally`` so it
+    is ``False`` whenever the coroutine has exited — whether by success,
+    failure, or deferred return.  ``POST /migration/confirm`` and
+    ``POST /migration/rollback`` reject with 409 while the flag is ``True``.
+    Rollback remains available when the flag is ``False`` and a ``phaseA_done``
+    or ``phaseB`` marker exists (stranded deferred swap).
+
+    **Failure semantics**
+
+    - Phase A failure: gates → ``phase_a_failed``; bundle + marker preserved
+      for ``POST /migration/rollback``.
+    - Reload deferred: gates → ``reload_deferred``; marker stays at
+      ``phaseA_done`` (resume entry point after VRAM frees).
+    - Phase B failure (recall gate miss or tier exception): gates →
+      ``phase_b_failed``; marker stays at ``phaseB`` for a subsequent retry.
+      The operator can also call ``POST /migration/rollback`` to restore from
+      the bundle.
+
+    **No hand-rolled threading / GPU-lock acquisition here** — Phase A and
+    Phase B both delegate to ``BackgroundTrainer.submit`` which holds the GPU
+    lock for the duration of each job.  The reload between them runs via
+    ``_apply_config_live`` (which acquires its own bounded lock) dispatched
+    from the event-loop thread via ``run_in_executor`` — exactly as
+    ``migration_accept`` does.
+
+    Parameters
+    ----------
+    candidate_path_str:
+        Absolute path to the candidate server.yaml (with ``model: <new>``).
+        Unused when ``resume_phase`` is ``"phaseA_done"`` or ``"phaseB"``
+        (config rename already happened in Phase A).
+    live_config_path:
+        Path to the live server.yaml to be overwritten by the atomic rename.
+    state_dir:
+        Directory for the trial marker (``<data>/state/``).
+    backups_root:
+        Root directory for backups (``<data>/backups/``).
+    old_model:
+        MODEL_REGISTRY alias of the live (Mistral) model.
+    new_model:
+        MODEL_REGISTRY alias of the replacement model (e.g. ``"qwen3-4b"``).
+    started_at:
+        ISO-8601 UTC timestamp when the confirm handler ran.
+    candidate_hash:
+        SHA-256 hex of the candidate config bytes.
+    resume_phase:
+        Phase to resume from.  ``""`` or ``"phaseA"`` for a fresh start (run
+        all steps).  ``"phaseA_done"`` to skip bundle backup and Phase A and
+        resume at the reload-check.  ``"phaseB"`` to skip straight to Phase B.
+        Default ``""`` (fresh start).
+    """
+    from paramem.server.active_store_migration import MigrationState, save_state
+
+    # ── In-flight guard: set base_swap_active so confirm/rollback can reject ──
+    migration = _state.get("migration")
+    if isinstance(migration, dict):
+        migration["base_swap_active"] = True
+
+    try:
+        config = _state.get("config")
+        if config is None:
+            raise RuntimeError("base-swap orchestration: server config is None")
+
+        # ── Resolve bundle_slot_str and pre_trial_hash ────────────────────────
+        # On fresh start: derive from the live config.
+        # On resume: read from the on-disk marker (bundle_slot was written
+        # exactly once at fresh start and must not be re-derived).
+        if resume_phase in ("phaseA_done", "phaseB"):
+            # Resume path — read existing marker for the bundle slot and hashes.
+            # write_bundle MUST NOT be called; the bundle already exists.
+            _resume_marker = read_trial_marker(state_dir)
+            if _resume_marker is None:
+                raise RuntimeError(
+                    f"base-swap resume (phase={resume_phase!r}): "
+                    "trial marker not found — cannot determine bundle_slot"
+                )
+            bundle_slot_str = _resume_marker.bundle_slot
+            if not bundle_slot_str:
+                raise RuntimeError(
+                    f"base-swap resume (phase={resume_phase!r}): "
+                    "marker.bundle_slot is empty — rollback anchor lost"
+                )
+            pre_trial_hash = _resume_marker.pre_trial_config_sha256
+        else:
+            # Fresh start — compute from disk.
+            live_registry_sha256 = ""
+            try:
+                if hasattr(config, "paths") and config.paths.data is not None:
+                    reg_path = config.paths.key_metadata
+                    if reg_path.exists():
+                        import hashlib as _hlib
+
+                        from paramem.backup.encryption import read_maybe_encrypted as _rme
+
+                        live_registry_sha256 = _hlib.sha256(_rme(reg_path)).hexdigest()
+            except Exception:  # noqa: BLE001
+                live_registry_sha256 = ""
+
+            # Build per-tier adapter_dirs dict from the live config.
+            adapter_dirs: dict[str, Path] = {}
+            adapters_cfg = getattr(config, "adapters", None)
+            for _tier_name in ("episodic", "semantic", "procedural"):
+                _tier_cfg = getattr(adapters_cfg, _tier_name, None) if adapters_cfg else None
+                if _tier_cfg is not None and getattr(_tier_cfg, "enabled", False):
+                    adapter_dirs[_tier_name] = Path(config.adapter_dir) / _tier_name
+
+            registry_path = Path(config.paths.key_metadata)
+            data_dir = Path(config.paths.data)
+            speaker_profiles_path = data_dir / "speaker_profiles.json"
+
+            # ── Step 1: Bundle backup (rollback anchor) ───────────────────────
+            # Written exactly once — before any mutation.  Resume paths never
+            # reach this block (guarded by the resume_phase check above).
+            bundle_slot = write_bundle(
+                config_path=live_config_path,
+                registry_path=registry_path,
+                adapter_dirs=adapter_dirs,
+                base_dir=backups_root / "snapshot",
+                meta_fields={"tier": "pre_base_swap", "label": f"pre_base_swap_{new_model}"},
+                adapter_scope="live",
+                live_registry_sha256=live_registry_sha256,
+                speaker_profiles_path=(
+                    speaker_profiles_path if speaker_profiles_path.exists() else None
+                ),
+            )
+            bundle_slot_str = str(bundle_slot.resolve())
+
+            # Update the in-memory trial stash with the bundle slot.
+            migration_stash = _state.get("migration", {})
+            trial_data = migration_stash.get("trial") or {}
+            trial_data["backup_paths"] = {"bundle": bundle_slot_str}
+            migration_stash["trial"] = trial_data
+
+            pre_trial_hash = ""
+            if live_config_path.exists():
+                import hashlib as _hlib2
+
+                pre_trial_hash = _hlib2.sha256(live_config_path.read_bytes()).hexdigest()
+
+        if resume_phase not in ("phaseA_done", "phaseB"):
+            # ── Step 2: Phase A — train→simulate on Mistral ──────────────────
+            # Skipped on resume at phaseA_done or phaseB.
+
+            # Write marker at phaseA before any mutations.
+            marker = TrialMarker(
+                schema_version=1,
+                started_at=started_at,
+                pre_trial_config_sha256=pre_trial_hash,
+                candidate_config_sha256=candidate_hash,
+                backup_paths={"bundle": bundle_slot_str},
+                trial_adapter_dir="",
+                trial_graph_dir="",
+                config_artifact_filename="",
+                migration_kind="base_swap",
+                base_swap_phase="phaseA",
+                old_model=old_model,
+                new_model=new_model,
+                bundle_slot=bundle_slot_str,
+            )
+            write_trial_marker(state_dir, marker)
+
+            # Arm the train→simulate active-store migration state file.
+            migration_state = MigrationState.for_mode_switch(
+                source_mode="train", target_mode="simulate"
+            )
+            save_state(Path(config.adapter_dir), migration_state)
+
+            loop = _state.get("consolidation_loop")
+            if loop is None:
+                loop = create_consolidation_loop(
+                    _state["model"],
+                    _state["tokenizer"],
+                    config,
+                    _state["memory_store"],
+                    state_provider=lambda: _state,
+                )
+                _state["consolidation_loop"] = loop
+                _state["model"] = loop.model
+
+            bt = BackgroundTrainer(
+                model=_state["model"],
+                tokenizer=_state["tokenizer"],
+                training_config=config.training_config,
+                output_dir=config.adapter_dir,
+                thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+            )
+            _state["background_trainer"] = bt
+
+            # asyncio.Event lets us await the BG-worker result from this coroutine.
+            # Capture the running event loop at creation time so the worker thread
+            # can signal completion via call_soon_threadsafe even when
+            # _state["event_loop"] is not yet populated (e.g. during unit tests).
+            _phase_a_aio_loop = asyncio.get_event_loop()
+            done_event = asyncio.Event()
+            phase_a_error: list[Exception] = []
+
+            def _run_phase_a_on_worker() -> None:
+                """Run on the BG-trainer worker thread under the GPU lock."""
+                from paramem.server.active_store_migration import load_state as _phase_a_load_state
+
+                _fresh_state = _phase_a_load_state(Path(config.adapter_dir))
+                if _fresh_state is None:
+                    phase_a_error.append(RuntimeError("Phase A: migration state file vanished"))
+                    _phase_a_aio_loop.call_soon_threadsafe(done_event.set)
+                    return
+                updated = migrate(loop, config, _fresh_state)
+                _state["model"] = loop.model
+                if not updated.all_tiers_done(loop.store.tiers_with_registry()):
+                    first_fail = next(iter(updated.failed_tiers.values()), "unknown")
+                    phase_a_error.append(RuntimeError(f"Phase A incomplete: {first_fail}"))
+                _phase_a_aio_loop.call_soon_threadsafe(done_event.set)
+
+            bt.submit(_run_phase_a_on_worker, inference_fallback_adapter="episodic")
+            await done_event.wait()
+
+            if phase_a_error:
+                raise phase_a_error[0]
+
+            # Phase A succeeded: atomic config rename, then advance marker to
+            # phaseA_done.  The worker job for Phase A has completed; the worker
+            # is now idle.  The reload (Step 3 below) runs from THIS coroutine,
+            # not from a worker job — so _release_base_model_in_process →
+            # bt._stop_callable_worker() stops only an idle worker.
+            # No worker-kill hazard.
+            _rename_config(Path(candidate_path_str), live_config_path)
+            dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
+
+            phase_a_done_marker = TrialMarker(
+                schema_version=1,
+                started_at=started_at,
+                pre_trial_config_sha256=pre_trial_hash,
+                candidate_config_sha256=candidate_hash,
+                backup_paths={"bundle": bundle_slot_str},
+                trial_adapter_dir="",
+                trial_graph_dir="",
+                config_artifact_filename="",
+                migration_kind="base_swap",
+                base_swap_phase="phaseA_done",
+                old_model=old_model,
+                new_model=new_model,
+                bundle_slot=bundle_slot_str,
+            )
+            write_trial_marker(state_dir, phase_a_done_marker)
+            logger.info(
+                "base-swap Phase A complete: old=%s new=%s bundle=%s",
+                old_model,
+                new_model,
+                bundle_slot_str,
+            )
+
+        if resume_phase != "phaseB":
+            # ── Step 3: In-process reload — release Mistral, load Qwen3 ─────
+            # Skipped on resume at phaseB (reload already succeeded).
+            #
+            # Two sub-cases:
+            #
+            # a) Fresh start (resume_phase == ""): the process is still running
+            #    with the old model.  gpu_release drains voice + releases base to
+            #    cloud-only; gpu_acquire then loads the new base on the clean
+            #    GPU.  The VRAM gate inside _live_reload_base_model (called by
+            #    gpu_acquire) sees accurate free bytes and the reload completes
+            #    in-process without requiring a restart/resume detour.
+            #
+            # b) Resume (resume_phase == "phaseA_done"): the old process crashed
+            #    after writing the phaseA_done marker and the server was
+            #    restarted.  Boot already loaded the new config (Qwen3) from the
+            #    renamed server.yaml, so the new model is already resident.
+            #    There is nothing to reload.  Go straight to the Phase-B
+            #    identity guard below.  If the model turns out NOT to be loaded
+            #    (e.g. boot came up cloud-only due to VRAM pressure), set
+            #    reload_deferred so /gpu/acquire re-triggers Phase B.
+            #
+            if resume_phase == "":
+                # Fresh start: drain the GPU and load the new base via the
+                # existing /gpu/release + /gpu/acquire primitives — the tested
+                # complete cloud-only drain (base + voice). gpu_release frees the
+                # GPU; gpu_acquire loads the renamed-config base on the clean GPU.
+                # base_swap_active is True here, so gpu_acquire's resume hook
+                # will not re-enter this orchestration.
+                await gpu_release()
+                await gpu_acquire()
+
+                # After the executor returns, check whether the reload succeeded
+                # or was deferred due to insufficient VRAM.
+                if _state.get("mode") != "local":
+                    deferred_reason = _state.get("cloud_only_reason", "reload_deferred")
+                    completed_at = datetime.now(timezone.utc).isoformat()
+                    await _update_trial_gates(
+                        {
+                            "status": "reload_deferred",
+                            "completed_at": completed_at,
+                            "cloud_only_reason": deferred_reason,
+                            "message": (
+                                f"Phase A complete but base-model reload deferred "
+                                f"(cloud_only_reason={deferred_reason!r}). "
+                                "Phase B will run automatically once the new model "
+                                "is loaded (POST /gpu/acquire triggers this)."
+                            ),
+                        }
+                    )
+                    logger.warning(
+                        "base-swap reload deferred: cloud_only_reason=%s; Phase B not started",
+                        deferred_reason,
+                    )
+                    return
+
+            else:
+                # resume_phase == "phaseA_done": boot already loaded the new
+                # config; confirm the new model is actually resident before
+                # proceeding to Phase B.
+                _resume_mode = _state.get("mode")
+                _resume_model_name = getattr(_state.get("config"), "model_name", None)
+                _new_model_loaded = _resume_mode == "local" and _resume_model_name == new_model
+                if not _new_model_loaded:
+                    # Boot came up cloud-only (e.g. VRAM pressure) or with the
+                    # wrong model.  Phase B cannot run; defer until /gpu/acquire
+                    # re-launches with the new model loaded.
+                    deferred_reason = _state.get("cloud_only_reason") or "reload_deferred"
+                    completed_at = datetime.now(timezone.utc).isoformat()
+                    await _update_trial_gates(
+                        {
+                            "status": "reload_deferred",
+                            "completed_at": completed_at,
+                            "cloud_only_reason": deferred_reason,
+                            "message": (
+                                f"Phase A complete (resume) but new model not loaded "
+                                f"(mode={_resume_mode!r}, "
+                                f"config.model_name={_resume_model_name!r}, "
+                                f"expected {new_model!r}). "
+                                "Phase B will run automatically once the new model "
+                                "is loaded (POST /gpu/acquire triggers this)."
+                            ),
+                        }
+                    )
+                    logger.warning(
+                        "base-swap resume: new model not loaded "
+                        "(mode=%s, model=%s, expected=%s); Phase B deferred",
+                        _resume_mode,
+                        _resume_model_name,
+                        new_model,
+                    )
+                    return
+
+        # ── Step 4: Phase B — simulate→train on Qwen3 ────────────────────────
+        # The reload dropped the old ConsolidationLoop and BackgroundTrainer
+        # (_live_reload_base_model → _release_base_model_in_process →
+        # bt._stop_callable_worker).  Re-create them from disk (registries +
+        # graph.json present, no weights) using the new config that was loaded
+        # into _state by _apply_config_live → _refresh_config_from_disk_into_state.
+        # This mirrors the pattern in _run_active_store_migration_sync.
+        marker_phase_b = TrialMarker(
+            schema_version=1,
+            started_at=started_at,
+            pre_trial_config_sha256=pre_trial_hash,
+            candidate_config_sha256=candidate_hash,
+            backup_paths={"bundle": bundle_slot_str},
+            trial_adapter_dir="",
+            trial_graph_dir="",
+            config_artifact_filename="",
+            migration_kind="base_swap",
+            base_swap_phase="phaseB",
+            old_model=old_model,
+            new_model=new_model,
+            bundle_slot=bundle_slot_str,
+        )
+        write_trial_marker(state_dir, marker_phase_b)
+
+        # Re-read config from _state (may have changed during reload).
+        config_b = _state.get("config")
+        if config_b is None:
+            raise RuntimeError("base-swap Phase B: server config is None after reload")
+
+        # ── Phase B model-identity guard ─────────────────────────────────────
+        # Fail loud if the loaded base model is not the expected new model.
+        # This prevents Phase B from retraining adapters on the wrong base —
+        # a silent wrong outcome where the recall gate would pass on the old
+        # model.  Two conditions must hold:
+        #   1. mode must be "local" (model is loaded and serving).
+        #   2. The live config's model_name must match new_model (set by
+        #      _apply_config_live → _refresh_config_from_disk_into_state).
+        # On mismatch: record phase_b_model_mismatch, leave marker+bundle
+        # intact for rollback, and return without calling migrate().
+        _mode_after_reload = _state.get("mode")
+        _config_model_name = getattr(config_b, "model_name", None)
+        _model_identity_ok = _mode_after_reload == "local" and _config_model_name == new_model
+        if not _model_identity_ok:
+            _mismatch_reason = (
+                f"mode={_mode_after_reload!r} (expected 'local'), "
+                f"config.model_name={_config_model_name!r} (expected {new_model!r})"
+            )
+            _mismatch_at = datetime.now(timezone.utc).isoformat()
+            await _update_trial_gates(
+                {
+                    "status": "phase_b_model_mismatch",
+                    "completed_at": _mismatch_at,
+                    "mismatch_reason": _mismatch_reason,
+                    "message": (
+                        f"Phase B aborted: loaded model does not match new_model={new_model!r}. "
+                        f"Detail: {_mismatch_reason}. "
+                        "Bundle and marker preserved — run `paramem migrate --rollback` to restore."
+                    ),
+                }
+            )
+            logger.error("base-swap Phase B aborted (model mismatch): %s", _mismatch_reason)
+            return
+        # ── end guard ────────────────────────────────────────────────────────
+
+        # Arm the simulate→train migration state file for Phase B.
+        migration_state_b = MigrationState.for_mode_switch(
+            source_mode="simulate", target_mode="train"
+        )
+        save_state(Path(config_b.adapter_dir), migration_state_b)
+
+        loop_b = _state.get("consolidation_loop")
+        if loop_b is None:
+            loop_b = create_consolidation_loop(
+                _state["model"],
+                _state["tokenizer"],
+                config_b,
+                _state["memory_store"],
+                state_provider=lambda: _state,
+            )
+            _state["consolidation_loop"] = loop_b
+            _state["model"] = loop_b.model
+
+        bt_b = BackgroundTrainer(
+            model=_state["model"],
+            tokenizer=_state["tokenizer"],
+            training_config=config_b.training_config,
+            output_dir=config_b.adapter_dir,
+            thermal_policy=ThermalPolicy.from_consolidation_config(config_b.consolidation),
+        )
+        _state["background_trainer"] = bt_b
+
+        _phase_b_aio_loop = asyncio.get_event_loop()
+        done_event_b = asyncio.Event()
+        phase_b_error: list[Exception] = []
+
+        def _run_phase_b_on_worker() -> None:
+            """Run Phase B on the BG-trainer worker thread under the GPU lock."""
+            from paramem.server.active_store_migration import load_state as _phase_b_load_state
+
+            _fresh_state_b = _phase_b_load_state(Path(config_b.adapter_dir))
+            if _fresh_state_b is None:
+                phase_b_error.append(
+                    RuntimeError("Phase B: migration state file vanished before Phase B ran")
+                )
+                _phase_b_aio_loop.call_soon_threadsafe(done_event_b.set)
+                return
+            updated_b = migrate(loop_b, config_b, _fresh_state_b)
+            _state["model"] = loop_b.model
+            if not updated_b.all_tiers_done(loop_b.store.tiers_with_registry()):
+                first_fail = next(iter(updated_b.failed_tiers.values()), "unknown")
+                phase_b_error.append(RuntimeError(f"Phase B incomplete: {first_fail}"))
+            _phase_b_aio_loop.call_soon_threadsafe(done_event_b.set)
+
+        bt_b.submit(_run_phase_b_on_worker, inference_fallback_adapter="episodic")
+        await done_event_b.wait()
+
+        if phase_b_error:
+            raise phase_b_error[0]
+
+        # ── Step 5/6: Success — clear state, clear marker, status=pass ───────
+        # active_store_migration.migrate() already cleared the state file on
+        # all_tiers_done.  Clear the trial marker and reset migration state.
+        from paramem.server.active_store_migration import clear_state as _clear_migrate_state
+
+        _clear_migrate_state(Path(config_b.adapter_dir))
+        clear_trial_marker(state_dir)
+
+        prior_recovery = list((_state.get("migration") or {}).get("recovery_required") or [])
+        from paramem.server.migration import initial_migration_state
+
+        _state["migration"] = initial_migration_state()
+        _state["migration"]["recovery_required"] = prior_recovery
+
+        completed_at = datetime.now(timezone.utc).isoformat()
+        await _update_trial_gates(
+            {
+                "status": "pass",
+                "completed_at": completed_at,
+                "message": (
+                    f"Base-swap migration complete. "
+                    f"Model: {old_model} → {new_model}. "
+                    "All tiers trained on new base model."
+                ),
+            }
+        )
+        logger.info(
+            "base-swap orchestration complete: old=%s new=%s",
+            old_model,
+            new_model,
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        completed_at = datetime.now(timezone.utc).isoformat()
+        # Determine which phase failed from the current marker on disk.
+        _failed_marker = None
+        try:
+            _failed_marker = read_trial_marker(state_dir)
+        except Exception:  # noqa: BLE001
+            pass
+        _phase = (
+            getattr(_failed_marker, "base_swap_phase", "unknown")
+            if _failed_marker is not None
+            else "unknown"
+        )
+        if _phase in ("phaseA", ""):
+            _status = "phase_a_failed"
+        else:
+            _status = "phase_b_failed"
+
+        await _update_trial_gates(
+            {
+                "status": _status,
+                "exception": str(exc),
+                "completed_at": completed_at,
+            }
+        )
+        logger.exception("base-swap orchestration failed (phase=%s): %s", _phase, exc)
+        # Bundle and marker are preserved for rollback.
+
+    finally:
+        # ── Clear the in-flight guard ────────────────────────────────────────
+        # base_swap_active is True while this coroutine actively executes phases.
+        # Clearing it here (in finally) ensures it is False whether the
+        # coroutine exits by success, failure, or deferred return — so
+        # rollback (the escape hatch from a stranded deferred swap) is
+        # unblocked as soon as the coroutine is no longer running.
+        _mig = _state.get("migration")
+        if isinstance(_mig, dict):
+            _mig["base_swap_active"] = False
 
 
 def _rollup_gate_status(results: list, session_buffer_empty: bool) -> str:
@@ -6535,11 +7547,179 @@ async def migration_rollback():
                 },
             )
 
+        # --- R2: In-flight guard — reject rollback while orchestration runs ---
+        # base_swap_active is True while _run_base_swap_orchestration is
+        # actively executing.  It is False when the coroutine is not running
+        # (success, failure, or deferred/stranded state).  Rollback while
+        # actively running risks concurrent writes to the same adapter dirs.
+        # When the coroutine is NOT running (deferred/stranded), rollback is
+        # the escape hatch and must remain available.
+        if migration.get("base_swap_active", False):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "base_swap_active",
+                    "message": (
+                        "A base-swap migration is actively running. "
+                        "Wait for Phase A or Phase B to complete (or fail) "
+                        "before rolling back."
+                    ),
+                },
+            )
+
         trial = migration.get("trial") or {}
         trial_adapter_dir_str = trial.get("trial_adapter_dir", "")
         trial_graph_dir_str = trial.get("trial_graph_dir", "")
         pre_trial_config_sha256 = trial.get("pre_trial_config_sha256", "")
         trial_started_at = trial.get("started_at", "")
+
+        # --- Base-swap rollback branch ---
+        # When migration_kind == "base_swap" (written into the marker by
+        # _run_base_swap_orchestration), the A-config is inside a full bundle
+        # slot, not a standalone config backup.  Restore via restore_bundle
+        # (config + registry + per-tier adapters + speaker_profiles) so
+        # Mistral weights come back alongside the Mistral config.
+        #
+        # Split-brain fix: after restore_bundle writes the Mistral config to
+        # disk, the in-memory model may be Qwen3 (if the reload in Step 3 of
+        # the orchestration succeeded before the rollback was triggered).  The
+        # no-op skip inside _apply_config_live compares disk_hash against
+        # _state["config_drift"]["loaded_hash"]. After a config-swap the loaded
+        # hash equals the Qwen3 config, NOT the Mistral config now on disk, so
+        # the skip fires on the WRONG branch and leaves Qwen3 resident.
+        # Fix: invalidate loaded_hash BEFORE dispatching _apply_config_live so
+        # the skip cannot fire and the full reload runs.
+        _bs_marker = read_trial_marker(state_dir)
+        if _bs_marker is not None and _bs_marker.migration_kind == "base_swap":
+            bundle_slot_path_str = _bs_marker.bundle_slot
+            if not bundle_slot_path_str:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "rollback_precondition_failed",
+                        "message": (
+                            "Base-swap rollback: bundle_slot is empty in trial marker. "
+                            "Cannot restore without the bundle backup."
+                        ),
+                    },
+                )
+
+            bundle_slot_path = Path(bundle_slot_path_str)
+            if not bundle_slot_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "rollback_precondition_failed",
+                        "message": (
+                            f"Base-swap rollback: bundle slot not found at "
+                            f"{bundle_slot_path}. "
+                            "Backup may have been manually deleted."
+                        ),
+                    },
+                )
+
+            if config is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "rollback_precondition_failed",
+                        "message": (
+                            "Base-swap rollback: server config is None; cannot derive data_dir."
+                        ),
+                    },
+                )
+
+            from paramem.backup.backup import restore_bundle as _restore_bundle_fn
+            from paramem.backup.types import BundleManifestError, FingerprintMismatchError
+
+            data_dir_rb = Path(config.paths.data).resolve()
+
+            try:
+                _restore_bundle_fn(
+                    bundle_slot_path,
+                    data_dir=data_dir_rb,
+                    config_path=live_config_path,
+                    restore_config=True,
+                )
+            except (BundleManifestError, FingerprintMismatchError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "bundle_corrupt",
+                        "message": f"Base-swap rollback bundle is corrupt: {exc}",
+                    },
+                ) from exc
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "decrypt_no_key",
+                        "message": (
+                            "Base-swap rollback bundle is age-encrypted but the daily "
+                            f"identity is not loaded: {exc}"
+                        ),
+                    },
+                ) from exc
+
+            # Mistral config is now on disk.  Invalidate config_drift.loaded_hash
+            # so _apply_config_live's no-op skip (disk_hash == loaded_hash) cannot
+            # fire — we need a forced reload regardless of what was previously in
+            # memory.  Using a sentinel string that can never equal a real SHA-256
+            # (which is 64 lower-hex characters) is safe.
+            _cd = _state.get("config_drift")
+            if isinstance(_cd, dict):
+                _cd["loaded_hash"] = "__rollback_invalidated__"
+            else:
+                _state["config_drift"] = {"loaded_hash": "__rollback_invalidated__"}
+
+            # Dispatch the in-process reload to bring Mistral back.  Mirror the
+            # pattern from migration_accept / migration_rollback step 7: set the
+            # synchronous maintenance guard BEFORE dispatching, restore on no-op.
+            _prior_mode_rb = _state.get("mode")
+            _prior_reason_rb = _state.get("cloud_only_reason")
+            _state["mode"] = "cloud-only"
+            _state["cloud_only_reason"] = "live_reload"
+
+            _rb_aio_loop = asyncio.get_running_loop()
+            await _rb_aio_loop.run_in_executor(None, _apply_config_live)
+
+            # If the apply did not transition mode (no-op skip or lock timeout),
+            # restore the pre-guard mode so the server is not left stuck cloud-only.
+            if (
+                _state.get("mode") == "cloud-only"
+                and _state.get("cloud_only_reason") == "live_reload"
+            ):
+                _state["mode"] = _prior_mode_rb
+                _state["cloud_only_reason"] = _prior_reason_rb
+
+            # Clear the active-store migration state file (if any) and the trial
+            # marker so crash recovery does not misclassify this as a resume point.
+            from paramem.server.active_store_migration import clear_state as _clear_as_state
+
+            _clear_as_state(Path(config.adapter_dir))
+            clear_trial_marker(state_dir)
+
+            # Reset migration state to LIVE.
+            prior_recovery_rb = list(migration.get("recovery_required") or [])
+            from paramem.server.migration import initial_migration_state as _init_ms
+
+            _state["migration"] = _init_ms()
+            restart_banner_rb = (
+                "Migration: base-swap rolled back — Mistral weights and config restored from bundle"
+            )
+            _state["migration"]["recovery_required"] = prior_recovery_rb + [restart_banner_rb]
+
+            return RollbackResponse(
+                state="LIVE",
+                trial_adapter_archive_path="",
+                rollback_pre_mortem_backup_path="",
+                restart_required=False,
+                restart_hint="",
+                applied_live=True,
+                restart_required_reason=None,
+                auto_restart_scheduled=False,
+                restart_eligible=False,
+            )
 
         # --- Step 2: Snapshot B into rollback_pre_mortem backup ---
         pre_mortem_slot: Path | None = None
@@ -7875,10 +9055,16 @@ def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":
     at least one interim has been written does the full cycle have anything
     to consolidate (see ``_is_full_cycle_due``).
     """
+    from paramem.memory.interim_adapter import _INTERIM_DIR_PREFIX
+
     episodic_dir = adapter_dir / "episodic"
     if not episodic_dir.is_dir():
         return None
-    slots = sorted(d for d in episodic_dir.iterdir() if d.is_dir() and not d.name.startswith("."))
+    slots = sorted(
+        d
+        for d in episodic_dir.iterdir()
+        if d.is_dir() and not d.name.startswith(".") and not d.name.startswith(_INTERIM_DIR_PREFIX)
+    )
     if not slots:
         return None
     meta_path = slots[-1] / "meta.json"
@@ -7908,20 +9094,26 @@ def _is_full_cycle_due(config) -> bool:
     and dispatches the full cycle.
 
     Returns ``False`` when ``refresh_cadence`` is disabled (period string is
-    empty → manual-only operation), OR when no main episodic slot exists yet.
+    empty → manual-only operation).
 
-    Fresh-install behaviour: ``last is None`` means no main slot has ever
-    been written. The full cycle (``consolidate_interim_adapters``) operates
-    by collapsing existing interim adapters into the main tiers — with no
-    interims on disk it is a no-op (``tiers_rebuilt=[]``) and the on-disk
-    main slot stays absent, so the gate would re-fire forever. The natural
-    first action on a fresh store is the interim cycle: extract pending
-    sessions into a new ``episodic_interim_<stamp>`` slot. Once at least
-    one interim has been written, the full cycle becomes "due" only after
-    a full window has elapsed, and at that point it has actual content to
-    consolidate.
+    ``last is None`` (no main slot on disk) has two sub-cases:
+
+    * **Interim-only / no-main** (the production catch-up state): at least one
+      ``episodic/interim_<stamp>/`` directory exists. The fold
+      (``consolidate_interim_adapters``) has real content to work with, so
+      return ``True`` to trigger it. Once the fold completes it writes the
+      main slot, making ``last`` non-``None`` on the next tick — no re-fire
+      risk.
+
+    * **Fresh install / no interim**: the episodic tree is empty or absent.
+      The full cycle would be a no-op with no main slot written, so the gate
+      would re-fire forever. Return ``False`` to stay on the interim path
+      (which extracts pending sessions first).
     """
-    from paramem.memory.interim_adapter import current_full_consolidation_stamp
+    from paramem.memory.interim_adapter import (
+        current_full_consolidation_stamp,
+        iter_interim_dirs,
+    )
 
     period = config.consolidation.consolidation_period_string
     if not period:
@@ -7931,7 +9123,7 @@ def _is_full_cycle_due(config) -> bool:
         return False
     last = _last_full_consolidation_window(config.adapter_dir)
     if last is None:
-        return False
+        return any(iter_interim_dirs(config.adapter_dir))
     return current != last
 
 
@@ -7983,6 +9175,13 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     # recall gate. This pre-empts the full/interim cycle gates because the
     # active store is not yet coherent with the operator's yaml mode.
     if _state.get("pending_rehydration", False):
+        if _state.get("store_load_degraded", False):
+            logger.warning(
+                "Scheduler tick: active-store migration pending but store_load_degraded=True "
+                "— refusing to dispatch (boot-time registry load failed; resolve the corrupt "
+                "registry file and restart the server to retry)"
+            )
+            return "migration_skipped_degraded"
         logger.info("Scheduler tick: active-store migration pending — running migration")
         _state["last_consolidation_error"] = None
         _state["consolidating"] = True
@@ -9325,6 +10524,27 @@ def _arm_active_store_migration(config) -> bool:
 
     migration_state = detect_mode_switch(config)
     if migration_state is not None:
+        # Integrity gate: refuse arming when the store is corrupt.
+        from paramem.backup.integrity import verify_infrastructure_integrity as _verify_integrity
+
+        _daily_ok_arm = _state.get("daily_loadable", False)
+        _arm_integrity = _verify_integrity(
+            config,
+            store=_state.get("memory_store"),
+            daily_loadable=_daily_ok_arm,
+        )
+        if not _arm_integrity.ok:
+            logger.error(
+                "_arm_active_store_migration: integrity check failed (%d failures) — "
+                "not arming migration; resolve integrity failures first.",
+                len(_arm_integrity.failures),
+            )
+            for _fc in _arm_integrity.failures:
+                logger.error("  [%s/%s] %s: %s", _fc.category, _fc.tier, _fc.path, _fc.detail)
+            _state["pending_rehydration"] = False
+            _state["effective_mode"] = config.consolidation.mode
+            return False
+
         _state["pending_rehydration"] = True
         _state["effective_mode"] = migration_state.source_mode
         # Persist so the next /consolidate's load_state finds it and runs the
@@ -9424,12 +10644,16 @@ def _run_active_store_migration_sync() -> None:
             loop.model.eval()
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["last_consolidation_result"] = {
-                "status": "migration_complete" if updated.all_tiers_done else "migration_partial",
+                "status": (
+                    "migration_complete"
+                    if updated.all_tiers_done(loop.store.tiers_with_registry())
+                    else "migration_partial"
+                ),
                 "direction": updated.direction,
                 "completed_tiers": list(updated.completed_tiers),
                 "failed_tiers": dict(updated.failed_tiers),
             }
-            if updated.all_tiers_done:
+            if updated.all_tiers_done(loop.store.tiers_with_registry()):
                 _state["pending_rehydration"] = False
                 _state["effective_mode"] = config.consolidation.mode
                 logger.info(
