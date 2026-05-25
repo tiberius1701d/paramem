@@ -844,6 +844,59 @@ class TestMigrateTierSimulateToTrain:
         # Per-tier SimHash registry persisted at per-tier path
         assert (cfg.adapter_dir / "episodic" / "simhash_registry.json").exists()
 
+    def test_binds_slot_to_registry(self, tmp_path):
+        """Regression: the trained slot's manifest carries a NON-empty
+        registry_sha256 (== sha256 of the tier registry bytes) AND the tier
+        registry is flushed to <tier>/indexed_key_registry.json.
+
+        Without this binding meta.registry_sha256 is empty, find_live_slot can
+        never match it, the adapter silently fails to mount on the next
+        boot/reload, recall returns 0 keys, and /chat 503s (boot_degraded).
+        """
+        import hashlib
+
+        cfg = _make_config(tmp_path, mode="train")
+        entries = [_full_quad(f"g{i}") for i in range(2)]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop._run_recall_sanity_probe.return_value = 1.0
+        loop._indexed_dataset.return_value = MagicMock()
+        loop._make_training_config.return_value = MagicMock()
+
+        captured: dict = {}
+
+        def _capture_manifest(*args, **kwargs):
+            captured["registry_sha256_override"] = kwargs.get("registry_sha256_override")
+            return MagicMock()
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch(
+                "paramem.memory.entry.format_entry_training",
+                return_value=[{"input_ids": [0]}],
+            ),
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.adapters.manifest.build_manifest_for",
+                side_effect=_capture_manifest,
+            ),
+        ):
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        # Manifest is bound to the tier registry (non-empty hash matching the bytes).
+        expected_sha = hashlib.sha256(loop.store.registry("episodic").save_bytes()).hexdigest()
+        assert captured["registry_sha256_override"], "registry_sha256_override must be non-empty"
+        assert captured["registry_sha256_override"] == expected_sha
+
+        # Tier registry flushed so find_live_slot can match it on the next boot.
+        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists(), (
+            "tier registry must be written for slot binding"
+        )
+
     def test_writes_simhash_registry_with_built_fingerprints(self, tmp_path):
         """The persisted simhash file holds exactly the fingerprints from Step 2."""
         cfg = _make_config(tmp_path, mode="train")

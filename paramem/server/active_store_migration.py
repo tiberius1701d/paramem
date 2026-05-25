@@ -49,6 +49,7 @@ files under ``<adapter_dir>/<tier>/interim_<stamp>/`` are detected correctly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -623,6 +624,15 @@ def _migrate_tier_simulate_to_train(
     # Step 7a: atomic-save the slot. Manifest building can fail (e.g. base-model
     # hash unavailable); we save without manifest in that case so the weights
     # are durable even when the manifest sidecar isn't.
+    # Bind the slot to the tier registry exactly as consolidation._save_adapters
+    # does (I5): hash the registry bytes and pass them as
+    # registry_sha256_override.  Without this the slot's meta.registry_sha256 is
+    # empty, find_live_slot can never match it on the next boot/reload, and the
+    # adapter silently fails to mount (recall then returns 0 keys → boot_degraded).
+    _tier_reg = loop.store.registry(name)
+    _reg_payload = _tier_reg.save_bytes() if _tier_reg is not None else None
+    _reg_sha = hashlib.sha256(_reg_payload).hexdigest() if _reg_payload is not None else None
+
     fingerprint_cache = getattr(loop, "fingerprint_cache", None)
     try:
         manifest = build_manifest_for(
@@ -632,6 +642,7 @@ def _migrate_tier_simulate_to_train(
             registry_path=None,
             key_count=len(entries),
             base_model_hash_cache=fingerprint_cache,
+            registry_sha256_override=_reg_sha,
             adapter_root=Path(config.adapter_dir),
         )
     except Exception:
@@ -663,6 +674,16 @@ def _migrate_tier_simulate_to_train(
         _save_registry(
             _simhash,
             slot_root / "simhash_registry.json",
+        )
+
+    # Step 7c2: flush the exact registry bytes that were hashed into the manifest
+    # so find_live_slot matches meta.registry_sha256 against the tier registry on
+    # the next boot/reload (mirrors consolidation._save_adapters I5 step 8 — the
+    # registry is the commit signal, written last).
+    if _tier_reg is not None and _reg_payload is not None:
+        slot_root.mkdir(parents=True, exist_ok=True)
+        _tier_reg.save_from_bytes(
+            _reg_payload, slot_root / "indexed_key_registry.json", consolidating=True
         )
 
     # Step 7d: delete source (target is now authoritative + probe-confirmed).
