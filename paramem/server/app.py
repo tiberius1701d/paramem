@@ -1367,6 +1367,32 @@ _BOOT_GPU_DRAIN_TIMEOUT_S: float = 55.0  # seconds before giving up and degradin
 _BOOT_GPU_DRAIN_POLL_INTERVAL_S: float = 1.5  # seconds between mem_get_info polls
 _BOOT_GPU_DRAIN_STABLE_READS: int = 3  # consecutive reads ≥ needed before declaring "drained"
 
+# Upper bound on this process's CUDA primary-context baseline (kernel images +
+# cuBLAS/cuDNN handles): warmed lazily during model load, process-exit-only
+# (safe_empty_cache can't reclaim it; cudaDeviceReset would crash warm bnb state).
+# Measured ~0.3 GiB; 0.5 GiB allows variance.  The live-reload gate credits this
+# back (capped at the pristine ceiling) so a reload's free reading — taken after
+# the context warms — isn't penalised vs boot's pre-warm reading.
+_CUDA_CONTEXT_ALLOWANCE_BYTES: int = 512 * 2**20  # 0.5 GiB
+
+
+def _effective_free_bytes() -> int:
+    """Free VRAM credited with this process's reclaimable CUDA context — the one
+    "is there room for a model" measure used identically by boot and reload.
+
+    Reads ``mem_get_info()[0]`` (CUDA runtime free, NOT nvidia-smi which false-frees
+    under WSL2) + ``_CUDA_CONTEXT_ALLOWANCE_BYTES``, capped at the cached ceiling.
+    The credit is a no-op at boot (cold context: free ≈ ceiling → min == ceiling)
+    and corrects a warm reload's ~0.3 GiB-lower reading (the reloaded model reuses
+    the resident context); the cap means a genuine external consumer still fails.
+    """
+    free_bytes = torch.cuda.mem_get_info(0)[0]
+    effective = free_bytes + _CUDA_CONTEXT_ALLOWANCE_BYTES
+    ceiling = _state.get("usable_ceiling_bytes")
+    if ceiling is not None:
+        effective = min(effective, ceiling)
+    return effective
+
 
 def _wait_for_gpu_drain(
     needed_bytes: int,
@@ -1375,11 +1401,11 @@ def _wait_for_gpu_drain(
     stable_reads: int = _BOOT_GPU_DRAIN_STABLE_READS,
     poll_interval_s: float = _BOOT_GPU_DRAIN_POLL_INTERVAL_S,
 ) -> bool:
-    """Poll device-wide free VRAM until enough memory is available for the model.
+    """Poll until there is room for the model, or degrade.  ONE gate for all paths.
 
-    Uses ``torch.cuda.mem_get_info()[0]`` (the CUDA runtime free-bytes query,
-    NOT nvidia-smi) to measure device-wide free memory.  Blocks until free ≥
-    ``needed_bytes`` for ``stable_reads`` CONSECUTIVE reads, or until
+    Uses :func:`_effective_free_bytes` (CUDA-runtime free + reclaimable-context
+    credit, capped at the ceiling — NOT nvidia-smi).  Blocks until effective free
+    ≥ ``needed_bytes`` for ``stable_reads`` CONSECUTIVE reads, or until
     ``timeout_s`` elapses.
 
     The consecutive-read requirement filters out transient under/over-reports
@@ -1387,24 +1413,26 @@ def _wait_for_gpu_drain(
     process exits: a single passing read may be followed immediately by a
     failing read as reclaim continues.  Three stable passing reads provides
     sufficient signal that reclaim is complete without adding meaningful latency
-    on a fully empty device (three reads take ~4.5 s in the worst case).
+    on a fully empty device (three reads take ~4.5 s in the worst case).  On a
+    live reload the device is already free after the upfront release, so the
+    first read passes and the poll returns immediately.
 
     Args:
-        needed_bytes: Minimum device-wide free bytes required to begin loading.
+        needed_bytes: Minimum effective-free bytes required to begin loading.
             Caller derives this from ``assessment.required_bytes`` (which already
             includes the safety margin from ``assess_topology``).  When the
             assessment was skipped (HF cache miss / hidden_size unavailable),
             caller should pass ``base_pred + headroom`` as a conservative estimate.
         timeout_s: Maximum wall-clock seconds to wait before returning False.
         stable_reads: Number of consecutive reads ≥ ``needed_bytes`` required
-            before declaring the GPU drained and returning True.
+            before declaring the GPU ready and returning True.
         poll_interval_s: Seconds to sleep between polls.
 
     Returns:
-        True if the device is drained (``stable_reads`` consecutive reads
-        satisfied ``needed_bytes``), or if CUDA is unavailable (no-op case,
-        always returns True to avoid blocking CPU-only environments).
-        False if ``timeout_s`` elapsed before the drain condition was met.
+        True if there is room (``stable_reads`` consecutive reads satisfied
+        ``needed_bytes``), or if CUDA is unavailable (no-op case, always returns
+        True to avoid blocking CPU-only environments).
+        False if ``timeout_s`` elapsed before the room condition was met.
     """
     if not torch.cuda.is_available():
         return True
@@ -1412,12 +1440,12 @@ def _wait_for_gpu_drain(
     deadline = time.monotonic() + timeout_s
     consecutive = 0
     while True:
-        free_bytes = torch.cuda.mem_get_info(0)[0]
+        free_bytes = _effective_free_bytes()
         if free_bytes >= needed_bytes:
             consecutive += 1
             if consecutive >= stable_reads:
                 logger.info(
-                    "Boot GPU drain: device-wide free %.2f GiB ≥ needed %.2f GiB "
+                    "GPU room: effective free %.2f GiB ≥ needed %.2f GiB "
                     "(%d consecutive reads) — proceeding with model load",
                     free_bytes / 2**30,
                     needed_bytes / 2**30,
@@ -1427,8 +1455,7 @@ def _wait_for_gpu_drain(
         else:
             consecutive = 0
             logger.debug(
-                "Boot GPU drain: device-wide free %.2f GiB < needed %.2f GiB "
-                "(consecutive=%d) — waiting",
+                "GPU room: effective free %.2f GiB < needed %.2f GiB (consecutive=%d) — waiting",
                 free_bytes / 2**30,
                 needed_bytes / 2**30,
                 consecutive,
@@ -1436,8 +1463,7 @@ def _wait_for_gpu_drain(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             logger.warning(
-                "Boot GPU drain: timed out after %.0f s — device-wide free %.2f GiB, "
-                "needed %.2f GiB",
+                "GPU room: timed out after %.0f s — effective free %.2f GiB, needed %.2f GiB",
                 timeout_s,
                 free_bytes / 2**30,
                 needed_bytes / 2**30,
@@ -1750,6 +1776,9 @@ async def lifespan(app: FastAPI):
             _total_phys_bytes = torch.cuda.get_device_properties(0).total_memory
             _usable_ceiling_bytes = torch.cuda.mem_get_info(0)[0]
             _reserved_bytes = _total_phys_bytes - _usable_ceiling_bytes
+            # Cache the usable ceiling (read pre-warm, so = physical capacity minus
+            # the WDDM reserve) for the live-reload gate (_CUDA_CONTEXT_ALLOWANCE_BYTES).
+            _state["usable_ceiling_bytes"] = _usable_ceiling_bytes
             if assessment.required_bytes > _usable_ceiling_bytes:
                 _req_gib = assessment.required_bytes / 2**30
                 _usable_gib = _usable_ceiling_bytes / 2**30
@@ -1825,14 +1854,11 @@ async def lifespan(app: FastAPI):
                 _state["tokenizer"] = None
 
         if not cloud_only:
-            # Apply per-process VRAM cap before any tensor allocation so that
-            # over-allocation surfaces as a Python OOM exception rather than a
-            # host driver fault.
-            apply_process_cap(fraction=config.vram.process_cap_fraction)
-
             # Model load + adapter mount factored into ``_load_model_into_state``
             # so the model never enters the lifespan async-generator's frame.
-            # See that function's docstring for why this is load-bearing.
+            # See that function's docstring for why this is load-bearing.  The
+            # per-process VRAM cap is applied as that function's first step
+            # (before any tensor allocation) — no separate cap call here.
             _load_model_into_state(config)
 
     # Config-derived component construction — single shared routine called by
@@ -2957,12 +2983,25 @@ async def status():
         and _gates.get("completed_at")
     ):
         _comparison_block = {"rendered": True, "flags": []}
+    # base_swap_phase: name the in-flight base-swap phase (phaseA/phaseA_done/phaseB)
+    # so operators can interpret a TRIAL as a base-model swap and see how far it got.
+    # Read from the on-disk marker only while a trial is active; a corrupt marker
+    # must not 500 /status (boundary read of a display-only field).
+    _base_swap_phase = None
+    if _mig_state == "trial":
+        try:
+            _sm = read_trial_marker((config.paths.data / "state").resolve())
+            if _sm is not None and _sm.migration_kind == "base_swap":
+                _base_swap_phase = _sm.base_swap_phase or "phaseA"
+        except Exception:  # noqa: BLE001 — display-only; never fail /status on it
+            _base_swap_phase = None
     migration_block = {
         "state": _mig_state,
         "config_rev": _config_rev,
         "trial_started_at": _trial.get("started_at") or None,
         "gates": _gates,
         "comparison": _comparison_block,
+        "base_swap_phase": _base_swap_phase,
     }
 
     hold_block = _get_hold_state()
@@ -3277,7 +3316,11 @@ def _preload_memory_store(config, *, model, tokenizer):
     boot_degraded lifecycle:
     - Cleared when full hydration succeeds.
     - Cleared when ``config.inference.preload_cache=False`` (intentional opt-out).
-    - Set when partial hydration occurs (some keys not materialised).
+    - Cleared (with an empty store, early return) while a base-model swap is in
+      flight — the on-disk registry describes the PREVIOUS model and is invalid
+      for the loaded one (see the base-swap gate below).
+    - Set when partial hydration occurs (some active keys not materialised),
+      including the registry-sha256 binding-bug (slot present but unmounted).
 
     The ``WeightMemorySource`` is kept as a frame-local and dropped on return —
     mirrors the no-frame-retention pattern of ``_load_model_into_state`` so the
@@ -3310,6 +3353,31 @@ def _preload_memory_store(config, *, model, tokenizer):
     memory_store = _MemoryStore(
         replay_enabled=config.consolidation.indexed_key_replay,
     )
+
+    # Base-swap invalidity gate.  While a base-model swap is in flight (Phase A has
+    # deleted the old model's weight slots; Phase B has not yet retrained the new
+    # model), the on-disk per-tier registries describe the OLD model and have no
+    # relation to the loaded NEW one.  Do NOT load them into the live store — the
+    # new model knows nothing until Phase B completes.  The registry files stay on
+    # disk untouched (Phase B retrains from each tier's graph.json; a rollback
+    # restores them from the swap bundle).  This keeps the live store consistent
+    # with the loaded weights instead of carrying phantom previous-model keys.  The
+    # marker is written before the reload and cleared on Phase B success, so it
+    # covers both the in-process reload and a boot-resume.
+    from paramem.server.trial_state import read_trial_marker as _read_trial_marker
+
+    _swap_marker = _read_trial_marker((config.paths.data / "state").resolve())
+    if _swap_marker is not None and _swap_marker.migration_kind == "base_swap":
+        _state["store_load_degraded"] = False
+        _state["boot_degraded"] = None
+        logger.info(
+            "preload_cache: base-swap in flight (phase=%s) — on-disk registry "
+            "describes the previous model; live store starts empty until Phase B "
+            "retrains the new model.",
+            _swap_marker.base_swap_phase or "?",
+        )
+        return memory_store
+
     try:
         memory_store.load_registries_from_disk(config.adapter_dir)
         _state["store_load_degraded"] = False
@@ -4091,31 +4159,26 @@ def _live_reload_base_model(
     if refresh_config_from_disk:
         _state["topology_assessment"] = _compute_topology_assessment(config)
 
-    # (a) Look before you leap: refuse the load when the live GPU budget
-    # cannot fit the topology.  Use torch.cuda.mem_get_info() device-wide
-    # free directly — consistent with the boot drain-wait, and avoids
-    # nvidia-smi which false-frees exiting/lingering processes under WSL2
-    # (the documented host-crash cause; nvidia-smi was also used here
-    # previously via measure_external_vram).  The comparison is conservative
-    # in the correct direction: mem_get_info reports what the CUDA runtime
-    # actually sees as free, including WDDM reservations and any live
-    # external consumers on the device.
-    # ``topology_assessment`` is None when the estimate could not be computed
-    # (HF cache miss / AutoConfig failure) → defer to the live load gate.
+    # Look before you leap: refuse the load when the GPU cannot fit the topology.
+    # Identical gate to boot — _wait_for_gpu_drain over _effective_free_bytes (the
+    # device is already free after the upfront release, so the poll's first read
+    # passes immediately; a genuine external consumer still fails it after the
+    # wait).  ``topology_assessment`` is None when the estimate could not be
+    # computed (HF cache miss / AutoConfig failure) → defer to the live load gate.
     assessment = _state.get("topology_assessment")
-    if assessment is not None and torch.cuda.is_available():
-        _reclaim_free_bytes = torch.cuda.mem_get_info(0)[0]
-        if _reclaim_free_bytes < assessment.required_bytes:
-            _state["cloud_only_reason"] = "insufficient_vram"
-            logger.warning(
-                "Live model reload skipped — device-wide free %.2f GiB < "
-                "required %.2f GiB for %s; staying cloud-only, "
-                "will retry when VRAM frees.",
-                _reclaim_free_bytes / 2**30,
-                assessment.required_bytes / 2**30,
-                config.model_name,
-            )
-            return
+    if (
+        assessment is not None
+        and torch.cuda.is_available()
+        and not _wait_for_gpu_drain(assessment.required_bytes)
+    ):
+        _state["cloud_only_reason"] = "insufficient_vram"
+        logger.warning(
+            "Live model reload skipped — insufficient GPU room for required "
+            "%.2f GiB for %s; staying cloud-only, will retry when VRAM frees.",
+            assessment.required_bytes / 2**30,
+            config.model_name,
+        )
+        return
 
     load_failed = False
     try:
@@ -4695,6 +4758,42 @@ def _apply_config_live() -> dict:
 
     finally:
         lock_ctx.__exit__(None, None, None)
+
+
+async def _apply_config_live_guarded() -> dict:
+    """Dispatch ``_apply_config_live`` under the synchronous maintenance guard.
+
+    Sole owner of the guard+dispatch+restore pattern shared by the migration
+    accept, base-swap-rollback, and migration_rollback handlers (correction
+    S-4).  Sets the cloud-only guard (``mode="cloud-only"``,
+    ``cloud_only_reason="live_reload"``) BEFORE dispatching so the scheduler's
+    ``mode != "local"`` defer fires during the ~25-30 s GPU reload, runs
+    ``_apply_config_live`` in an executor (it blocks), then restores the
+    pre-guard mode IFF the apply did NOT transition it.
+
+    A successful reload already set ``mode="local"``; a genuine reload failure
+    set a specific ``cloud_only_reason`` (apply_failed / preload_failed /
+    insufficient_vram / reload_failed).  Only the untouched guard state
+    (cloud-only + ``"live_reload"``) means no transition happened — the running
+    server is still serving in its prior mode (carve changes take effect on the
+    operator's restart) and must not be left degraded to cloud-only.
+
+    Returns the ``_apply_config_live`` result dict (``applied_live``,
+    ``restart_required_reason``, ``restart_eligible``, ...).  Callers that only
+    need the mode-restore side effect may ignore the return.
+    """
+    _prior_mode = _state.get("mode")
+    _prior_cloud_only_reason = _state.get("cloud_only_reason")
+    _state["mode"] = "cloud-only"
+    _state["cloud_only_reason"] = "live_reload"
+
+    loop = asyncio.get_running_loop()
+    apply_result = await loop.run_in_executor(None, _apply_config_live)
+
+    if _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") == "live_reload":
+        _state["mode"] = _prior_mode
+        _state["cloud_only_reason"] = _prior_cloud_only_reason
+    return apply_result
 
 
 @app.post("/gpu/release")
@@ -6404,6 +6503,7 @@ async def _run_base_swap_orchestration(
                 speaker_profiles_path=(
                     speaker_profiles_path if speaker_profiles_path.exists() else None
                 ),
+                candidate_config_path=Path(candidate_path_str),
             )
             bundle_slot_str = str(bundle_slot.resolve())
 
@@ -6745,6 +6845,16 @@ async def _run_base_swap_orchestration(
                 )
                 _phase_b_aio_loop.call_soon_threadsafe(done_event_b.set)
                 return
+            # The base-swap preload gate left the live store empty — the on-disk
+            # registries belong to the OLD (Mistral) model and are NOT model B's
+            # inference state.  They ARE, however, Phase B's training INPUT:
+            # migrate() iterates loop.store.tiers_with_registry() to know which
+            # tiers to retrain.  Load them into loop_b's store now (worker thread,
+            # GPU lock held → inference is cloud-routed) so migrate has the tier
+            # list; it rebuilds each tier from graph.json into model B's fresh
+            # registry.  Without this the store is empty → migrate refuses with
+            # "0 tiers but on-disk content exists".
+            loop_b.store.load_registries_from_disk(config_b.adapter_dir)
             updated_b = migrate(loop_b, config_b, _fresh_state_b)
             _state["model"] = loop_b.model
             if not updated_b.all_tiers_done(loop_b.store.tiers_with_registry()):
@@ -6757,6 +6867,30 @@ async def _run_base_swap_orchestration(
 
         if phase_b_error:
             raise phase_b_error[0]
+
+        # ── Promotion carry-over ─────────────────────────────────────────────
+        # The migration never writes key_metadata.json, so it still holds the
+        # PREVIOUS model's promotion state (per-key sessions_seen + promoted_keys).
+        # loop_b was created against the empty live store (the base-swap preload
+        # gate skips loading the old registry), so its construction-time seed
+        # orphan-dropped every key.  Now that Phase B has retrained the SAME keys
+        # (stable via graph.json ``ik_key``) and repopulated the store, re-seed
+        # from the preserved key_metadata.json so promotion momentum carries
+        # across the swap — a key at sessions_seen=N does not reset to 0, and the
+        # already-promoted set is restored.  Without this, the next consolidation's
+        # _save_key_metadata would overwrite the on-disk counts with loop_b's empty
+        # in-memory state.  seed_key_metadata SETs (not increments) so it is
+        # idempotent; the keys match by construction so there is no orphan-drop now.
+        from paramem.server.consolidation import _load_key_metadata as _carry_load_meta
+
+        _carry_meta = _carry_load_meta(config_b.key_metadata_path)
+        if _carry_meta is not None:
+            loop_b.seed_key_metadata(_carry_meta)
+            logger.info(
+                "base-swap: carried over promotion state — %d key(s) tracked, %d promoted",
+                len(loop_b.key_sessions),
+                len(loop_b.promoted_keys),
+            )
 
         # ── Step 5/6: Success — clear state, clear marker, status=pass ───────
         # active_store_migration.migrate() already cleared the state file on
@@ -7346,37 +7480,14 @@ async def migration_accept():
         #  d) Build the banner and response.  The server does NOT fire _restart_service
         #     for R-PORT; the CLI prompts the operator and runs the restart_hint command.
 
-        # a) Synchronous maintenance guard (correction S-4).
-        # Capture the pre-guard mode first: the guard's "cloud-only" is only undone
-        # by a SUCCESSFUL _live_reload_base_model (sets mode=local). Every other
-        # _apply_config_live outcome (no-op skip, carve short-circuit, lock-timeout,
-        # consolidating) returns with the guard untouched, so without restoring it
-        # here the running server would be left stuck cloud-only.
-        _prior_mode = _state.get("mode")
-        _prior_cloud_only_reason = _state.get("cloud_only_reason")
-        _state["mode"] = "cloud-only"
-        _state["cloud_only_reason"] = "live_reload"
-
-        # b) Dispatch apply (run_in_executor so the async handler does not block
-        #    the event loop during the ~25-30 s GPU reload; TestClient runs sync).
-        loop = asyncio.get_running_loop()
-        apply_result = await loop.run_in_executor(None, _apply_config_live)
+        # Synchronous maintenance guard + dispatch + restore-if-untouched
+        # (correction S-4) — see _apply_config_live_guarded for the full rationale.
+        apply_result = await _apply_config_live_guarded()
 
         applied_live: bool = apply_result.get("applied_live", False)
         apply_reason: str | None = apply_result.get("restart_required_reason")
         auto_restart_scheduled: bool = False  # server never self-fires restart
         restart_eligible: bool = apply_result.get("restart_eligible", False)
-
-        # Restore the pre-guard mode when the apply did NOT transition it. A
-        # successful reload already set mode=local; a genuine reload failure set a
-        # specific cloud_only_reason (apply_failed/preload_failed/insufficient_vram/
-        # reload_failed). Only the untouched guard state (cloud-only + "live_reload")
-        # means no transition happened — the running server is still serving in its
-        # prior mode (carve changes take effect on the operator's restart) and must
-        # not be left degraded to cloud-only.
-        if _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") == "live_reload":
-            _state["mode"] = _prior_mode
-            _state["cloud_only_reason"] = _prior_cloud_only_reason
 
         # c) Refresh config_drift AFTER the apply.
         # When applied_live=True the loaded_hash is now B (the apply updated it
@@ -7691,32 +7802,21 @@ async def migration_rollback():
             else:
                 _state["config_drift"] = {"loaded_hash": "__rollback_invalidated__"}
 
-            # Dispatch the in-process reload to bring Mistral back.  Mirror the
-            # pattern from migration_accept / migration_rollback step 7: set the
-            # synchronous maintenance guard BEFORE dispatching, restore on no-op.
-            _prior_mode_rb = _state.get("mode")
-            _prior_reason_rb = _state.get("cloud_only_reason")
-            _state["mode"] = "cloud-only"
-            _state["cloud_only_reason"] = "live_reload"
-
-            _rb_aio_loop = asyncio.get_running_loop()
-            await _rb_aio_loop.run_in_executor(None, _apply_config_live)
-
-            # If the apply did not transition mode (no-op skip or lock timeout),
-            # restore the pre-guard mode so the server is not left stuck cloud-only.
-            if (
-                _state.get("mode") == "cloud-only"
-                and _state.get("cloud_only_reason") == "live_reload"
-            ):
-                _state["mode"] = _prior_mode_rb
-                _state["cloud_only_reason"] = _prior_reason_rb
-
-            # Clear the active-store migration state file (if any) and the trial
-            # marker so crash recovery does not misclassify this as a resume point.
+            # Clear the active-store migration state file and the base-swap marker
+            # BEFORE the reload.  The swap is being abandoned, so the preload
+            # base-swap gate must NOT fire on this reload — otherwise it would
+            # leave the live store empty even though the bundle restore just put
+            # Mistral's registries back on disk.  With the marker cleared, the
+            # reload loads the restored Mistral registries normally.
             from paramem.server.active_store_migration import clear_state as _clear_as_state
 
             _clear_as_state(Path(config.adapter_dir))
             clear_trial_marker(state_dir)
+
+            # Dispatch the in-process reload to bring Mistral back, under the
+            # shared synchronous maintenance guard (restore-on-no-op handled
+            # inside).  This path does not consume the apply result.
+            await _apply_config_live_guarded()
 
             # Reset migration state to LIVE.
             prior_recovery_rb = list(migration.get("recovery_required") or [])
@@ -7990,29 +8090,16 @@ async def migration_rollback():
         # So _apply_config_live will take the no-op skip (disk_hash == loaded_hash)
         # and return applied_live=True, skipped="no_change" without GPU churn.
         #
-        # Synchronous maintenance guard (correction S-4) — set before dispatching.
-        # Capture pre-guard mode first: rollback's apply takes the no-op skip (the
-        # normal path — disk==memory==A), which returns with the guard untouched.
-        # Restore below so rollback does not leave the server stuck cloud-only.
-        _prior_mode = _state.get("mode")
-        _prior_cloud_only_reason = _state.get("cloud_only_reason")
-        _state["mode"] = "cloud-only"
-        _state["cloud_only_reason"] = "live_reload"
-
-        loop = asyncio.get_running_loop()
-        apply_result = await loop.run_in_executor(None, _apply_config_live)
+        # Synchronous maintenance guard + dispatch + restore-if-untouched
+        # (correction S-4) — rollback's apply normally takes the no-op skip
+        # (disk==memory==A), returning with the guard untouched, so the restore
+        # inside _apply_config_live_guarded keeps the server from sticking
+        # cloud-only.
+        apply_result = await _apply_config_live_guarded()
 
         applied_live: bool = apply_result.get("applied_live", False)
         apply_reason: str | None = apply_result.get("restart_required_reason")
         restart_eligible: bool = apply_result.get("restart_eligible", False)
-
-        # Restore the pre-guard mode when the apply did NOT transition it (see the
-        # accept handler for the full rationale): only the untouched guard state
-        # (cloud-only + "live_reload") means no reload happened. A successful reload
-        # set mode=local; a genuine failure set a specific cloud_only_reason.
-        if _state.get("mode") == "cloud-only" and _state.get("cloud_only_reason") == "live_reload":
-            _state["mode"] = _prior_mode
-            _state["cloud_only_reason"] = _prior_cloud_only_reason
 
         # NOTE: do NOT refresh config_drift for rollback — in-memory config already
         # matches A; the drift loop stays coherent (config_drift.loaded_hash is A).
@@ -8290,8 +8377,9 @@ class BackupPruneResponse(BaseModel):
         Slot directories removed (stringified paths).
     preserved_immune:
         Slots saved by live-TRIAL immunity.
-    preserved_pre_migration_window:
-        Slots saved by the 30-day pre-migration window immunity (rule 4).
+    preserved_migration_window:
+        Slots preserved by the 30-day window-immunity rule for migration tiers
+        (``pre_migration`` and ``pre_base_swap``).  Rule 4.
     would_delete_next:
         Dry-run preview: slots that would be deleted on the next non-dry-run call.
     disk_usage_before:
@@ -8306,7 +8394,7 @@ class BackupPruneResponse(BaseModel):
 
     deleted: list[str]
     preserved_immune: list[str]
-    preserved_pre_migration_window: list[str]
+    preserved_migration_window: list[str]
     would_delete_next: list[str]
     disk_usage_before: dict
     disk_usage_after: dict
@@ -8980,7 +9068,7 @@ async def backup_prune(req: BackupPruneRequest):
     return BackupPruneResponse(
         deleted=[str(p) for p in pr.deleted],
         preserved_immune=[str(p) for p in pr.preserved_immune],
-        preserved_pre_migration_window=[str(p) for p in pr.preserved_pre_migration_window],
+        preserved_migration_window=[str(p) for p in pr.preserved_migration_window],
         would_delete_next=[str(p) for p in pr.would_delete_next],
         disk_usage_before=_du_to_dict(pr.disk_usage_before),
         disk_usage_after=_du_to_dict(pr.disk_usage_after),
@@ -11060,6 +11148,14 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
     interval_seconds = interval_minutes * 60
     while True:
         await asyncio.sleep(interval_seconds)
+        # The GPU may have been reclaimed externally during the sleep (operator
+        # /gpu/acquire, a config apply, or a base-swap reload).  The loop exists
+        # only to reclaim a cloud-only server — if we are already local, our job
+        # is done; reclaiming again would release+reload an already-loaded model
+        # (a needless ~10 s cloud-only churn window).  Exit cleanly.
+        if _state.get("mode") == "local":
+            logger.info("Auto-reclaim: already local (reclaimed externally) — stopping loop")
+            return
         if _gpu_has_compute_processes():
             logger.debug("Auto-reclaim: GPU still occupied, waiting")
             continue

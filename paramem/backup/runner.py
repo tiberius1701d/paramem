@@ -396,7 +396,7 @@ def run_scheduled_backup(
             prune_result_summary = {
                 "deleted": len(pr.deleted),
                 "preserved_immune": len(pr.preserved_immune),
-                "preserved_pre_migration_window": len(pr.preserved_pre_migration_window),
+                "preserved_migration_window": len(pr.preserved_migration_window),
                 "disk_used_bytes": pr.disk_usage_after.total_bytes,
                 "disk_cap_bytes": pr.disk_usage_after.cap_bytes,
                 "invalid_slots": len(pr.invalid_slots),

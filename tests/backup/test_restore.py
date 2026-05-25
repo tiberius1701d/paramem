@@ -1117,3 +1117,95 @@ class TestEncryptedRoundTrip:
         is_loadable = daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
         assert_mode_consistency(scratch, daily_identity_loadable=is_loadable)
         # If we reach this line, no FatalConfigError was raised — the store is consistent.
+
+
+# ---------------------------------------------------------------------------
+# Candidate sidecar — preserved-not-restored invariant
+# ---------------------------------------------------------------------------
+
+
+class TestCandidateSidecarPreservedNotRestored:
+    """write_bundle with candidate_config_path → restore_bundle → sidecar preserved, not restored.
+
+    The sidecar (server.yaml.candidate) must survive in the bundle slot with
+    its original bytes intact.  It must NOT be written to the live config path.
+    """
+
+    def _build_bundle_with_candidate(self, tmp_path: Path) -> tuple[Path, bytes, bytes]:
+        """Build a bundle with a candidate sidecar.
+
+        Returns
+        -------
+        tuple[Path, bytes, bytes]
+            (bundle_slot_dir, live_config_bytes, candidate_bytes)
+        """
+        src_dict = _make_source_store(tmp_path)
+
+        live_bytes = b"model: mistral\nport: 8420\n"
+        src_dict["config_path"].write_bytes(live_bytes)
+
+        candidate_path = tmp_path / "candidate.yaml"
+        candidate_bytes = b"model: qwen3\nport: 8420\n"
+        candidate_path.write_bytes(candidate_bytes)
+
+        slot = write_bundle(
+            config_path=src_dict["config_path"],
+            registry_path=src_dict["registry_path"],
+            adapter_dirs=src_dict["adapter_dirs"],
+            base_dir=src_dict["bundle_base"],
+            meta_fields={"tier": "pre_base_swap", "label": "test_candidate"},
+            adapter_scope="live",
+            speaker_profiles_path=src_dict["speaker_profiles_path"],
+            candidate_config_path=candidate_path,
+        )
+        return slot, live_bytes, candidate_bytes
+
+    def test_candidate_sidecar_intact_after_restore(self, tmp_path) -> None:
+        """Sidecar bytes in the bundle slot are unmodified after restore_bundle."""
+        bundle_slot, _live_bytes, candidate_bytes = self._build_bundle_with_candidate(tmp_path)
+
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: old\n")
+
+        restore_bundle(
+            bundle_slot,
+            data_dir=scratch,
+            config_path=config_path,
+            restore_config=True,
+        )
+
+        # Sidecar must still exist in the bundle slot with original bytes.
+        sidecar_in_bundle = bundle_slot / "server.yaml.candidate"
+        assert sidecar_in_bundle.exists(), (
+            "server.yaml.candidate must remain in the bundle slot after restore"
+        )
+        assert sidecar_in_bundle.read_bytes() == candidate_bytes, (
+            "server.yaml.candidate bytes in bundle slot were modified by restore_bundle"
+        )
+
+    def test_live_config_equals_bundle_live_config_not_candidate(self, tmp_path) -> None:
+        """restore_config=True writes the live config (config/server.yaml), not the candidate."""
+        bundle_slot, live_bytes, candidate_bytes = self._build_bundle_with_candidate(tmp_path)
+
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: old\n")
+
+        restore_bundle(
+            bundle_slot,
+            data_dir=scratch,
+            config_path=config_path,
+            restore_config=True,
+        )
+
+        restored_config = config_path.read_bytes()
+        assert restored_config == live_bytes, (
+            "restore_bundle wrote candidate bytes to the live config path — "
+            "it must write the bundle's config/server.yaml, not server.yaml.candidate"
+        )
+        assert restored_config != candidate_bytes, (
+            "Candidate bytes must never be restored to the live config path"
+        )

@@ -324,6 +324,27 @@ def migrate(
 # ---------------------------------------------------------------------------
 
 
+def _delete_weight_slots(slot_root: Path) -> int:
+    """Delete adapter weight-slot subdirectories under *slot_root*.
+
+    A weight slot is a subdirectory containing ``adapter_model.safetensors`` or
+    ``adapter_config.json``.  ``graph.json``, ``simhash_registry.json``, and
+    ``indexed_key_registry.json`` at the slot-root top level are preserved.
+    Returns the number of slots removed.
+    """
+    deleted = 0
+    if slot_root.exists():
+        for child in list(slot_root.iterdir()):
+            if not child.is_dir():
+                continue
+            if (child / "adapter_model.safetensors").exists() or (
+                child / "adapter_config.json"
+            ).exists():
+                shutil.rmtree(child)
+                deleted += 1
+    return deleted
+
+
 def _migrate_tier_train_to_simulate(
     loop: "ConsolidationLoop", config: "ServerConfig", name: str
 ) -> None:
@@ -367,7 +388,18 @@ def _migrate_tier_train_to_simulate(
         raise _TierSkipped(f"replay disabled on loop; store {name} skipped")
     active_keys = loop.store.active_keys_in_tier(name)
     if not active_keys:
-        raise _TierSkipped(f"no active registry keys for store {name}")
+        # Empty tier: nothing to migrate to graph.json, but DELETE any stale weight
+        # slots so the tier is cleanly simulate (no weights).  Critical for a
+        # base-swap: an undeleted OLD-model slot survives both Phase A and Phase B
+        # (each skips empty tiers), and the next boot/reload then reports a spurious
+        # ``fingerprint_mismatch`` of that old-model slot against the NEW model
+        # instead of a clean 0-key tier.  For a same-model mode-switch this is also
+        # correct — an empty simulate tier should carry no weight slots.
+        slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
+        deleted = _delete_weight_slots(slot_root)
+        raise _TierSkipped(
+            f"no active registry keys for store {name}; deleted {deleted} stale weight slot(s)"
+        )
 
     slot_root = adapter_slot_root_for_name(Path(config.adapter_dir), name)
     target_graph = slot_root / "graph.json"
@@ -425,20 +457,9 @@ def _migrate_tier_train_to_simulate(
                 f"rolled back simulate-store write"
             )
 
-    # Step 2: drop adapter weight slot subdirectories from the slot root.
-    # Weight slots are subdirectories that contain adapter_model.safetensors
-    # or adapter_config.json.  graph.json, simhash_registry.json, and
-    # indexed_key_registry.json live at the top of slot_root and are preserved.
-    deleted_slots = 0
-    if slot_root.exists():
-        for child in list(slot_root.iterdir()):
-            if not child.is_dir():
-                continue
-            if (child / "adapter_model.safetensors").exists() or (
-                child / "adapter_config.json"
-            ).exists():
-                shutil.rmtree(child)
-                deleted_slots += 1
+    # Step 2: drop adapter weight slot subdirectories from the slot root
+    # (graph.json + registries at the top of slot_root are preserved).
+    deleted_slots = _delete_weight_slots(slot_root)
     logger.info(
         "active_store_migration: store %s switched to simulate;"
         " %d keys retained in graph.json; deleted %d weight slot(s) from %s",

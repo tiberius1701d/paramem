@@ -357,6 +357,26 @@ class TestMigrateTierTrainToSimulate:
         with pytest.raises(_TierSkipped, match="no active registry keys"):
             _migrate_tier_train_to_simulate(loop, cfg, "episodic")
 
+    def test_no_active_keys_deletes_stale_weight_slots(self, tmp_path):
+        """An empty tier must still have its stale weight slots DELETED — otherwise
+        on a base-swap an old-model slot survives Phase A + B and the next boot
+        reports a spurious fingerprint_mismatch instead of a clean 0-key tier.
+        """
+        cfg = _make_config(tmp_path, mode="simulate")
+        loop = _make_loop_train_to_simulate(tmp_path, keys=[])
+        # Plant a stale weight slot under the (empty) episodic tier.
+        stale = cfg.adapter_dir / "episodic" / "20260101-000000"
+        stale.mkdir(parents=True)
+        (stale / "adapter_model.safetensors").write_bytes(b"")
+        (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").write_text("{}")
+
+        with pytest.raises(_TierSkipped, match="deleted 1 stale weight slot"):
+            _migrate_tier_train_to_simulate(loop, cfg, "episodic")
+
+        assert not stale.exists(), "stale weight slot must be deleted for an empty tier"
+        # Top-level registry is preserved (only the weight slot subdir is removed).
+        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
+
     def test_none_registry_skipped(self, tmp_path):
         """When loop's store has replay disabled, raise _TierSkipped."""
         from paramem.memory.store import MemoryStore as _MS

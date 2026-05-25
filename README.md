@@ -473,6 +473,7 @@ The `paramem` management CLI talks to the running server over HTTP (default `htt
 - each enabled adapter's live slot — `adapter_model.safetensors` + `adapter_config.json` + `meta.json` — resolved the same way the server mounts it (finalized main slot, or the live interim slot when no full cycle has run yet)
 - `speaker_profiles.json` (voice enrollment)
 - a top-level `bundle.meta.json` with the file inventory, per-adapter registry hashes, and the base-model identity
+- `server.yaml.candidate` *(present only in pre-base-swap snapshots)* — the candidate config preserved for a later retry; hash-indexed in the manifest but never restored automatically
 
 The transient knowledge graph is **not** included (it lives only in the running loop and is rebuilt each cycle — knowledge lives in the weights), nor is regenerable training scaffolding (checkpoints, in-training slots).
 
@@ -534,7 +535,7 @@ paramem migrate-cancel      # discard a staged candidate (before confirm)
 > - **STT / TTS port change** — the Wyoming listener must rebind, so the CLI pre-flights the new port and, if it is bindable, asks you to consent to a one-shot restart; if the port is already in use it reports that instead of restarting.
 > - **`paths.data` / `paths.sessions` change** — existing data is **not** moved automatically; the CLI prints a manual-restart hint and leaves the move to you.
 
-> **Base-model swaps.** A `model:` change runs a dedicated base-swap migration (flagged Destructive in preview): each tier's graph is captured from the live adapters (Phase A), the base model is reloaded in-process to the candidate, and every adapter is retrained on the new base and gated at 100% recall before the swap commits (Phase B) — the candidate is exercised end to end. It is resumable across restarts and revertible from the pre-swap snapshot bundle (`POST /backup/restore` with `restore_config: true`; see [`SECURITY.md`](SECURITY.md)). The gate proves recall parity, not extraction/reasoning quality on the new base — validate those separately before adopting a new base permanently. Exercised Mistral 7B → Qwen3-4B.
+> **Base-model swaps.** A `model:` change runs a dedicated base-swap migration (flagged Destructive in preview): each tier's graph is captured from the live adapters (Phase A), the base model is reloaded in-process to the candidate, and every adapter is retrained on the new base and gated at 100% recall before the swap commits (Phase B) — the candidate is exercised end to end. It is resumable across restarts and revertible from the pre-swap snapshot bundle (`POST /backup/restore` with `restore_config: true`; see [`SECURITY.md`](SECURITY.md)). The pre-swap bundle is **retention-immune** (same protection class as pre-migration snapshots — it survives pruning for 30 days even after a rollback clears the trial marker) and carries a `server.yaml.candidate` sidecar so the operator can pull the candidate config and retry later. The gate proves recall parity, not extraction/reasoning quality on the new base — validate those separately before adopting a new base permanently. Exercised Mistral 7B → Qwen3-4B.
 
 Encryption key lifecycle (`paramem generate-key` / `rotate-daily` / `rotate-recovery` / `restore` / `encrypt-infra`) is documented in [`SECURITY.md`](SECURITY.md).
 

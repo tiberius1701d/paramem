@@ -669,6 +669,7 @@ vram:
 #       monthly:       { keep: 12 }
 #       yearly:        { keep: 3 }
 #       pre_migration: { keep: 10 }
+#       pre_base_swap: { keep: 10 }   # base-swap snapshot bundles; retention-immune 30d
 #       trial_adapter: { keep: 5 }
 #       manual:        { keep: "unlimited", max_disk_gb: 5 }
 #     schedule: "daily 04:00"

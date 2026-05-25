@@ -1491,3 +1491,55 @@ class TestResetMainTierRegistriesAndSimhashes:
 
         assert len(store.registry("semantic")) == 0
         assert store.simhashes_in_tier("semantic") == {}
+
+
+def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
+    """Base-swap promotion carry-over: ``seed_key_metadata`` restores NON-ZERO
+    ``sessions_seen`` + ``promoted_keys`` against the Phase-B-repopulated store,
+    and drops orphans (keys absent from the store).
+
+    The live swap exercised only the all-zero case (the deployed data had no
+    promotions).  This proves non-zero promotion attributes survive a swap, and
+    that the carry-over MUST run after the store is repopulated — an orphaned key
+    (no tier in the store) is dropped, which is exactly why re-seeding before
+    Phase B would lose everything.  Uses the REAL store and the REAL
+    ``seed_key_metadata`` / ``_load_key_metadata`` (the carry-over's two halves).
+    """
+    import json
+    import types
+
+    from paramem.memory.store import MemoryStore
+    from paramem.server.consolidation import _load_key_metadata
+    from paramem.training.consolidation import ConsolidationLoop
+
+    # Real store with 3 episodic keys registered (as Phase B leaves it post-retrain).
+    store = MemoryStore(replay_enabled=True)
+    for k in ("graph1", "graph2", "graph3"):
+        store.put("episodic", k, {"key": k, "question": "q", "answer": "a"}, register=True)
+
+    # The PREVIOUS model's key_metadata.json with non-zero promotion attributes.
+    # The migration never overwrites this file, so it persists through the swap.
+    meta = {
+        "cycle_count": 5,
+        "keys": {
+            "graph1": {"sessions_seen": 7, "speaker_id": "Speaker0", "first_seen_cycle": 1},
+            "graph2": {"sessions_seen": 3, "speaker_id": "Speaker0", "first_seen_cycle": 2},
+            "graph3": {"sessions_seen": 0, "speaker_id": "Speaker0", "first_seen_cycle": 3},
+            "orphan": {"sessions_seen": 9, "speaker_id": "Speaker0", "first_seen_cycle": 0},
+        },
+        "promoted_keys": ["graph1", "orphan"],
+    }
+    path = tmp_path / "key_metadata.json"
+    path.write_text(json.dumps(meta))
+
+    loaded = _load_key_metadata(path)
+    assert loaded is not None
+
+    # Minimal container the carry-over mutates; the store and method are real.
+    loop = types.SimpleNamespace(store=store, key_sessions={}, promoted_keys=set(), cycle_count=0)
+    ConsolidationLoop.seed_key_metadata(loop, loaded)
+
+    # Non-zero sessions_seen carried over verbatim; orphan dropped (absent from store).
+    assert loop.key_sessions == {"graph1": 7, "graph2": 3, "graph3": 0}
+    assert loop.promoted_keys == {"graph1"}  # "orphan" filtered (no tier in store)
+    assert loop.cycle_count == 5

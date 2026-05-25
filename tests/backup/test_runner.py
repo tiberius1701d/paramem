@@ -361,7 +361,7 @@ class TestRunnerCallsPrune:
             mock_prune.return_value = MagicMock(
                 deleted=[],
                 preserved_immune=[],
-                preserved_pre_migration_window=[],
+                preserved_migration_window=[],
                 invalid_slots=[],
                 disk_usage_after=MagicMock(total_bytes=0, cap_bytes=0),
             )
@@ -537,7 +537,7 @@ class TestRunnerBundlePath:
             mock_prune.return_value = MagicMock(
                 deleted=[],
                 preserved_immune=[],
-                preserved_pre_migration_window=[],
+                preserved_migration_window=[],
                 invalid_slots=[],
                 disk_usage_after=MagicMock(total_bytes=0, cap_bytes=0),
             )

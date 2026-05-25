@@ -66,7 +66,7 @@ def _fake_prune_response(dry_run=False):
     return {
         "deleted": ["/data/backups/config/20260301-040000"],
         "preserved_immune": [],
-        "preserved_pre_migration_window": ["/data/backups/config/20260420-040000"],
+        "preserved_migration_window": ["/data/backups/config/20260420-040000"],
         "would_delete_next": [],
         "disk_usage_before": {
             "total_bytes": 3_500_000_000,

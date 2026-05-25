@@ -53,6 +53,7 @@ def test_auto_reclaim_calls_live_reload_then_voice_gpu_on_success():
 
     state_patch = {
         "last_reclaim_error": {"at": "t", "error": "old", "attempt_count": 1},
+        "mode": "cloud-only",  # precondition: the loop only runs cloud-only
     }
 
     call_log = []
@@ -111,6 +112,36 @@ def test_auto_reclaim_calls_live_reload_then_voice_gpu_on_success():
         assert app_module._state.get("last_reclaim_error") is None
 
 
+def test_auto_reclaim_exits_when_already_local():
+    """If the GPU was reclaimed externally (mode=local) during the loop's sleep —
+    operator /gpu/acquire, a config apply, or a base-swap reload — the loop must
+    exit WITHOUT a redundant reclaim, avoiding a release+reload churn of an
+    already-loaded model (the ~10 s spurious cloud-only window seen post-swap).
+    """
+    import paramem.server.app as app_module
+
+    state_patch = {"mode": "local"}  # reclaimed externally during the sleep
+
+    async def fake_sleep(_s):
+        return  # first sleep returns; the mode==local guard should then exit
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch("paramem.server.app._gpu_has_compute_processes", return_value=False),
+        patch("paramem.server.app._get_hold_state", return_value=_make_hold_state(active=False)),
+        patch("paramem.server.app._live_reload_base_model") as mock_reload,
+        patch("paramem.server.gpu_lock.gpu_lock", _make_null_gpu_lock()),
+        patch("asyncio.sleep", side_effect=fake_sleep),
+    ):
+
+        async def _run():
+            await app_module._auto_reclaim_loop(interval_minutes=0)
+
+        asyncio.run(_run())
+
+        mock_reload.assert_not_called()  # no churn reclaim when already local
+
+
 def test_auto_reclaim_records_error_and_continues_on_reload_failure(caplog):
     """Transient reload failure: WARN logged (not ERROR), last_reclaim_error populated.
 
@@ -120,6 +151,7 @@ def test_auto_reclaim_records_error_and_continues_on_reload_failure(caplog):
 
     state_patch = {
         "last_reclaim_error": None,
+        "mode": "cloud-only",  # precondition: the loop only runs cloud-only
     }
 
     reload_calls = 0
@@ -197,6 +229,7 @@ def test_auto_reclaim_retry_increments_attempt_count():
 
     state_patch = {
         "last_reclaim_error": None,
+        "mode": "cloud-only",  # precondition: the loop only runs cloud-only
     }
 
     reload_calls = 0

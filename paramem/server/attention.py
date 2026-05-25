@@ -234,6 +234,47 @@ def _collect_migration_items(state: dict) -> list[AttentionItem]:
                     age_seconds=trial_age,
                 )
             )
+        elif gates_status == "reload_deferred":
+            # Base-swap stuck mid-flight: Phase A completed (old weights gone) but
+            # the new-base in-process reload was deferred (no GPU room), so Phase B
+            # has NOT run.  Recoverable — auto-reclaim retries, or a restart resumes
+            # from the phaseA_done marker — but the operator must know the swap is
+            # paused and PA recall is unavailable until it finishes.
+            _why = gates.get("cloud_only_reason") or "insufficient_vram"
+            items.append(
+                AttentionItem(
+                    kind="migration_swap_paused",
+                    level="action_required",
+                    summary=f"BASE-SWAP PAUSED — reload deferred ({_why}); Phase B not run",
+                    action_hint="auto-reclaim retries (≤10 min); or pstatus --acquire / restart",
+                    age_seconds=trial_age,
+                )
+            )
+        elif gates_status in {"phase_a_failed", "phase_b_failed", "phase_b_model_mismatch"}:
+            # Base-swap failed in a specific phase.  The previous model is preserved
+            # in the pre-migration bundle; rollback restores it.
+            _phase = {
+                "phase_a_failed": "Phase A (capture)",
+                "phase_b_failed": "Phase B (relearn)",
+                "phase_b_model_mismatch": "model-identity check",
+            }[gates_status]
+            _why = (
+                gates.get("message")
+                or gates.get("mismatch_reason")
+                or gates.get("exception")
+                or gates_status
+            )
+            if len(_why) > 140:
+                _why = _why[:137] + "..."
+            items.append(
+                AttentionItem(
+                    kind="migration_swap_failed",
+                    level="failed",
+                    summary=f"BASE-SWAP FAILED at {_phase} — {_why}",
+                    action_hint="paramem migrate --rollback (restores the previous model)",
+                    age_seconds=trial_age,
+                )
+            )
 
     return items
 

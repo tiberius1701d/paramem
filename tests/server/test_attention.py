@@ -282,6 +282,44 @@ def test_migration_trial_exception_emits_failed():
     assert "model not loaded" in failed[0].summary
 
 
+def test_base_swap_reload_deferred_emits_paused():
+    """A stuck base-swap (reload_deferred) must surface a PAUSED item — previously
+    matched no branch and was silent.  Recoverable → action_required, not failed.
+    """
+    state = _trial_state("reload_deferred")
+    state["migration"]["trial"]["gates"]["cloud_only_reason"] = "insufficient_vram"
+    items = _collect_migration_items(state)
+    paused = [it for it in items if it.kind == "migration_swap_paused"]
+    assert len(paused) == 1
+    assert paused[0].level == "action_required"
+    assert "PAUSED" in paused[0].summary and "insufficient_vram" in paused[0].summary
+    assert "auto-reclaim" in (paused[0].action_hint or "")
+
+
+def test_base_swap_phase_b_failed_emits_failed():
+    """A failed base-swap (phase_b_failed) must surface a FAILED item with the
+    phase named + a rollback hint — previously silent.
+    """
+    state = _trial_state("phase_b_failed")
+    state["migration"]["trial"]["gates"]["exception"] = "recall gate miss on semantic"
+    items = _collect_migration_items(state)
+    failed = [it for it in items if it.kind == "migration_swap_failed"]
+    assert len(failed) == 1
+    assert failed[0].level == "failed"
+    assert "Phase B" in failed[0].summary and "recall gate miss" in failed[0].summary
+    assert "rollback" in (failed[0].action_hint or "")
+
+
+def test_base_swap_model_mismatch_emits_failed():
+    """phase_b_model_mismatch → FAILED item naming the model-identity check."""
+    state = _trial_state("phase_b_model_mismatch")
+    state["migration"]["trial"]["gates"]["mismatch_reason"] = "loaded mistral, expected qwen3-4b"
+    items = _collect_migration_items(state)
+    failed = [it for it in items if it.kind == "migration_swap_failed"]
+    assert len(failed) == 1
+    assert "model-identity" in failed[0].summary and "expected qwen3-4b" in failed[0].summary
+
+
 # ---------------------------------------------------------------------------
 # _collect_consolidation_items (Fix 1)
 # ---------------------------------------------------------------------------

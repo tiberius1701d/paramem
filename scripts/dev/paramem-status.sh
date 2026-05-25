@@ -442,10 +442,12 @@ _config_rev = _mig.get("config_rev") or (_loaded_hash[:8] if _loaded_hash else "
 # server_started_at is now on /status (Fix 2); take the YYYY-MM-DD slice.
 _started = d.get("server_started_at") or ""
 _applied_date = _started[:10] if _started else ""
-print("MIGRATE\t{}\t{}\t{}".format(
+print("MIGRATE\t{}\t{}\t{}\t{}\t{}".format(
     _mig.get("state", "live"),
     _config_rev,
     _applied_date,
+    (_mig.get("gates") or {}).get("status") or "",
+    _mig.get("base_swap_phase") or "",
 ))
 # Slice 6a — Backup footer: BACKUP|schedule|last_success_at|
 #   last_failure_at|last_failure_reason|next_scheduled_at|
@@ -835,12 +837,42 @@ fi
 
 # Slice 5a — Migrate footer (always rendered when data is present).
 if [[ -n "$migrate_line" ]]; then
-    IFS=$'\t' read -r _mig_marker mig_state mig_rev mig_applied <<< "$migrate_line"
+    IFS=$'\t' read -r _mig_marker mig_state mig_rev mig_applied mig_gates mig_phase <<< "$migrate_line"
+    # Human label for the in-flight base-swap phase (from /status.migration.base_swap_phase).
+    phase_label=""
+    case "$mig_phase" in
+        phaseA)      phase_label="Phase A — capturing facts" ;;
+        phaseA_done) phase_label="reloading new base model" ;;
+        phaseB)      phase_label="Phase B — relearning on new base" ;;
+    esac
+    # state_tag: interpretable + failure-aware.  Remediation for stuck/failed
+    # swaps is carried by the ATTENTION block above (migration_swap_paused /
+    # migration_swap_failed); this line is the at-a-glance state.
     case "$mig_state" in
         live)    state_tag="${GREEN}LIVE${RESET}"        ;;
         staging) state_tag="${YELLOW}STAGING${RESET}"   ;;
-        trial)   state_tag="${YELLOW}TRIAL${RESET}"     ;;
         failed)  state_tag="${RED}FAILED${RESET}"       ;;
+        trial)
+            case "$mig_gates" in
+                reload_deferred)
+                    state_tag="${RED}SWAP PAUSED${RESET} (new-base reload deferred — Phase B pending)" ;;
+                phase_a_failed)
+                    state_tag="${RED}SWAP FAILED${RESET} — Phase A (capture)" ;;
+                phase_b_failed)
+                    state_tag="${RED}SWAP FAILED${RESET} — Phase B (relearn)" ;;
+                phase_b_model_mismatch)
+                    state_tag="${RED}SWAP ABORTED${RESET} — loaded model ≠ target" ;;
+                fail|trial_exception)
+                    state_tag="${RED}TRIAL FAILED${RESET}" ;;
+                pass|no_new_sessions)
+                    state_tag="${YELLOW}TRIAL${RESET} — gates passed, awaiting accept/rollback" ;;
+                *)
+                    if [[ -n "$phase_label" ]]; then
+                        state_tag="${YELLOW}SWAP IN PROGRESS${RESET} — ${phase_label}"
+                    else
+                        state_tag="${YELLOW}TRIAL${RESET} — in progress"
+                    fi ;;
+            esac ;;
         *)       state_tag="${DIM}${mig_state}${RESET}" ;;
     esac
     rev_tag=""
