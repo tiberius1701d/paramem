@@ -872,17 +872,17 @@ class TestRunBaseSwapPhaseA:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire: load the renamed-config base model.
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live: load the renamed-config base model.
 
             Sets mode per reload_mode parameter and updates config.model_name
             to new_model on a successful reload (matching what
             _refresh_config_from_disk_into_state does in production).
             The Phase-B model-identity guard reads config.model_name to verify
             the reload completed correctly.
-            Appends "gpu_acquire" to call_order (was "apply_config_live").
+            Appends "apply_config_live" to call_order.
             """
-            call_order.append("gpu_acquire")
+            call_order.append("apply_config_live")
             state["mode"] = _reload_mode
             if _reload_mode != "local":
                 state["cloud_only_reason"] = "insufficient_vram"
@@ -905,7 +905,7 @@ class TestRunBaseSwapPhaseA:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             asyncio.run(
                 app_module._run_base_swap_orchestration(
@@ -957,12 +957,12 @@ class TestRunBaseSwapPhaseA:
         assert rename_calls, "Config rename must be called on Phase A success"
         assert str(tmp_path / "candidate.yaml") == rename_calls[0][0]
 
-        # gpu_acquire was called (reload step).
-        assert "gpu_acquire" in call_order, "gpu_acquire must be called after Phase A"
+        # apply_config_live was called (reload step).
+        assert "apply_config_live" in call_order, "apply_config_live must be called after Phase A"
 
         # Phase B submitted after reload.
         assert "phase_b_submit" in call_order, "Phase B must be submitted after reload"
-        assert call_order.index("phase_b_submit") > call_order.index("gpu_acquire"), (
+        assert call_order.index("phase_b_submit") > call_order.index("apply_config_live"), (
             "Phase B must run AFTER reload, not before"
         )
 
@@ -1133,9 +1133,9 @@ class TestBaseSwapOrchestrationSlice2:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire: load the renamed-config base model."""
-            call_order.append("gpu_acquire")
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live: load the renamed-config base model."""
+            call_order.append("apply_config_live")
             state["mode"] = _rm
             state["cloud_only_reason"] = None if _rm == "local" else "insufficient_vram"
             if _rm == "local":
@@ -1153,7 +1153,7 @@ class TestBaseSwapOrchestrationSlice2:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -1213,7 +1213,7 @@ class TestBaseSwapOrchestrationSlice2:
 
         # Ordering: Phase A → reload → Phase B.
         idx_a = call_order.index("phase_a_submit")
-        idx_reload = call_order.index("gpu_acquire")
+        idx_reload = call_order.index("apply_config_live")
         idx_b = call_order.index("phase_b_submit")
         assert idx_a < idx_reload < idx_b, (
             f"Expected Phase A < reload < Phase B; got order {call_order}"
@@ -1298,8 +1298,8 @@ class TestBaseSwapOrchestrationSlice2:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire: load the renamed-config base model."""
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live: load the renamed-config base model."""
             state["mode"] = "local"
             state["cloud_only_reason"] = None
             # Simulate config refresh: new model is now live.
@@ -1319,7 +1319,7 @@ class TestBaseSwapOrchestrationSlice2:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -1552,8 +1552,8 @@ class TestBaseSwapResumePhaseAware:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire: load the renamed-config base model."""
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live: load the renamed-config base model."""
             state["mode"] = _rm
             state["cloud_only_reason"] = None if _rm == "local" else "insufficient_vram"
             if _rm == "local":
@@ -1571,7 +1571,7 @@ class TestBaseSwapResumePhaseAware:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -1884,11 +1884,11 @@ class TestBaseSwapStep3ResumeReload:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire: load the renamed-config base model.
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live: load the renamed-config base model.
 
-            Appends True to apply_called (was done by _fake_apply) and runs
-            apply_config_live_side_effect if provided.
+            Appends True to apply_called and runs apply_config_live_side_effect
+            if provided.
             """
             apply_called.append(True)
             if apply_config_live_side_effect is not None:
@@ -1934,7 +1934,7 @@ class TestBaseSwapStep3ResumeReload:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -2323,8 +2323,8 @@ class TestBaseSwapActiveFlag:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire with deferred reload: leave mode=cloud-only."""
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live with deferred reload: leave mode=cloud-only."""
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "insufficient_vram"
 
@@ -2339,7 +2339,7 @@ class TestBaseSwapActiveFlag:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -2831,8 +2831,8 @@ class TestPhaseBModelIdentityGuard:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire: set mode and config.model_name as controlled by test."""
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live: set mode and config.model_name as controlled by test."""
             state["mode"] = mode_after_reload
             is_local = mode_after_reload == "local"
             state["cloud_only_reason"] = None if is_local else "insufficient_vram"
@@ -2849,7 +2849,7 @@ class TestPhaseBModelIdentityGuard:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -3055,8 +3055,8 @@ class TestPhaseBModelIdentityGuard:
             state["mode"] = "cloud-only"
             state["cloud_only_reason"] = "released"
 
-        async def _fake_gpu_acquire():
-            """Simulate gpu_acquire: correct reload — mode=local, config.model_name=qwen3-4b."""
+        def _fake_apply_config_live():
+            """Simulate _apply_config_live: correct reload — mode=local, model_name=qwen3-4b."""
             state["mode"] = "local"
             state["cloud_only_reason"] = None
             state["config"].model_name = "qwen3-4b"
@@ -3072,7 +3072,7 @@ class TestPhaseBModelIdentityGuard:
                 return_value=MagicMock(),
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
-            patch("paramem.server.app.gpu_acquire", _fake_gpu_acquire),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(

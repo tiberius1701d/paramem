@@ -1446,6 +1446,79 @@ def _wait_for_gpu_drain(
         time.sleep(min(poll_interval_s, remaining))
 
 
+def _compute_topology_assessment(config):
+    """Estimate the VRAM working-set topology for *config*'s model.
+
+    Returns a ``TopologyAssessment``, or ``None`` when it cannot be computed
+    (base model not cached, or AutoConfig unreadable) — callers fall back to the
+    live load gate.  Shared by lifespan boot and :func:`_live_reload_base_model`
+    so the estimate always reflects the model actually being loaded, not a stale
+    boot-time value after a base-model swap.
+
+    ``local_files_only=True``: ``predict_base_bytes`` returning non-None means
+    the cache is populated, so the AutoConfig read must hit cache — refusing the
+    network matches the offline-first posture and avoids a boot stall on an
+    unhealthy network.
+    """
+    base_pred = predict_base_bytes(config.model_config)
+    if base_pred is None:
+        logger.warning(
+            "Base model %s not cached; topology estimate skipped — "
+            "live load gate is authoritative.",
+            config.model_config.model_id,
+        )
+        return None
+    try:
+        import transformers
+
+        hf_cfg = transformers.AutoConfig.from_pretrained(
+            config.model_config.model_id,
+            trust_remote_code=config.model_config.trust_remote_code,
+            local_files_only=True,
+        )
+        hidden_size = getattr(hf_cfg, "hidden_size", None)
+        num_layers = getattr(hf_cfg, "num_hidden_layers", getattr(hf_cfg, "n_layers", None))
+    except Exception as _cfg_exc:  # noqa: BLE001 — boundary read; fall back to live gate
+        logger.warning(
+            "AutoConfig read failed for %s (%s); topology estimate skipped — "
+            "live load gate is authoritative.",
+            config.model_config.model_id,
+            _cfg_exc,
+        )
+        return None
+    if hidden_size is None or num_layers is None:
+        logger.warning(
+            "AutoConfig for %s did not expose hidden_size/num_hidden_layers; "
+            "topology estimate skipped — live load gate is authoritative.",
+            config.model_config.model_id,
+        )
+        return None
+    assessment = assess_topology(
+        config.episodic_adapter_config,
+        max_interim_count=config.consolidation.max_interim_count,
+        base_bytes=base_pred,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        model_id=config.model_config.model_id,
+        quant_label=config.model_config.quantization,
+        main_adapter_count=sum(
+            1
+            for adapter_cfg in (
+                config.adapters.episodic,
+                config.adapters.semantic,
+                config.adapters.procedural,
+            )
+            if adapter_cfg.enabled
+        ),
+        headroom_gib=config.vram.vram_cache_headroom_gib,
+        stt_bytes=estimate_stt_bytes(config.stt, permanent_cloud_only=False),
+        tts_bytes=estimate_tts_bytes(config.tts, permanent_cloud_only=False),
+    )
+    logger.info("VRAM topology assessment:\n%s", assessment.breakdown)
+    logger.info("%s", format_tier_table(assessment))
+    return assessment
+
+
 # --- Lifespan ---
 
 
@@ -1649,20 +1722,10 @@ async def lifespan(app: FastAPI):
     # so --defer-model startups (cloud_only=True but GPU pair loaded later by
     # auto-reclaim) still reserve the correct budget. The CUDA-availability check
     # and model load below stay inside the branch (eager load is skipped).
-    main_adapter_count = sum(
-        1
-        for adapter_cfg in (
-            config.adapters.episodic,
-            config.adapters.semantic,
-            config.adapters.procedural,
-        )
-        if adapter_cfg.enabled
-    )
-    stt_pre_bytes = estimate_stt_bytes(config.stt, permanent_cloud_only=permanent_cloud_only)
-    tts_pre_bytes = estimate_tts_bytes(config.tts, permanent_cloud_only=permanent_cloud_only)
-
-    # Pre-load topology check driven by cache-derived prediction.
-    # base_pred is None on a cache miss — skip topology check, rely on live gate.
+    # Pre-load topology estimate. base_pred is None on a cache miss → skip the
+    # estimate, rely on the live load gate. Kept here (as well as inside
+    # _compute_topology_assessment) because the drain-wait fallback and the
+    # post-load calibration-drift log below also read it.
     base_pred = predict_base_bytes(config.model_config)
 
     if not permanent_cloud_only:
@@ -1673,116 +1736,51 @@ async def lifespan(app: FastAPI):
             )
             sys.exit(1)
 
-        assessment = None
-        if base_pred is None:
-            logger.warning(
-                "Base model %s not cached; pre-load topology check skipped — "
-                "live load gate is authoritative.",
-                config.model_config.model_id,
-            )
-        else:
-            # local_files_only=True: predict_base_bytes returning non-None
-            # means the cache is populated, so the AutoConfig read must hit
-            # cache. Refusing the network here matches the offline-first
-            # posture and avoids a silent boot stall when the network is
-            # unhealthy.
-            try:
-                import transformers
-
-                model_hf_config = transformers.AutoConfig.from_pretrained(
-                    config.model_config.model_id,
-                    trust_remote_code=config.model_config.trust_remote_code,
-                    local_files_only=True,
-                )
-                hidden_size = getattr(model_hf_config, "hidden_size", None)
-                num_layers = getattr(
-                    model_hf_config,
-                    "num_hidden_layers",
-                    getattr(model_hf_config, "n_layers", None),
-                )
-            except Exception as _cfg_exc:  # noqa: BLE001
+        assessment = _compute_topology_assessment(config)
+        if assessment is not None:
+            # Persistent overflow warning when the config genuinely does not fit
+            # this hardware.  "Usable VRAM" is the device-wide free reported by
+            # the CUDA runtime (mem_get_info) at a quiet moment before any model
+            # load — it accounts for the WDDM OS reservation that
+            # get_device_properties().total_memory does not.  Snapshot once here
+            # (boot-specific quiet moment); read by _collect_vram_overflow_items
+            # on every /status poll.  required > usable_ceiling means the config
+            # cannot fit even on an empty GPU; a transient shortfall is handled
+            # by the drain-wait / cloud-only degrade path and does not trigger it.
+            _total_phys_bytes = torch.cuda.get_device_properties(0).total_memory
+            _usable_ceiling_bytes = torch.cuda.mem_get_info(0)[0]
+            _reserved_bytes = _total_phys_bytes - _usable_ceiling_bytes
+            if assessment.required_bytes > _usable_ceiling_bytes:
+                _req_gib = assessment.required_bytes / 2**30
+                _usable_gib = _usable_ceiling_bytes / 2**30
+                _total_gib = _total_phys_bytes / 2**30
+                _reserved_gib = _reserved_bytes / 2**30
                 logger.warning(
-                    "AutoConfig read failed for %s (%s); skipping pre-load topology check, "
-                    "live load gate is authoritative.",
-                    config.model_config.model_id,
-                    _cfg_exc,
+                    "VRAM CONFIG OVERFLOW — local model config requires "
+                    "%.2f GiB working set but only ~%.2f GiB is usable on "
+                    "this %.0f GiB GPU (WDDM/WSL2 reserves ~%.2f GiB). "
+                    "The server will run cloud-only/degraded. Reduce model "
+                    "size, adapter rank/count, or "
+                    "consolidation.max_interim_count.",
+                    _req_gib,
+                    _usable_gib,
+                    _total_gib,
+                    _reserved_gib,
                 )
-                hidden_size = num_layers = None
-
-            if hidden_size is None or num_layers is None:
-                logger.warning(
-                    "AutoConfig for %s did not expose hidden_size/num_hidden_layers; "
-                    "skipping pre-load topology check, live load gate is authoritative.",
-                    config.model_config.model_id,
-                )
+                _state["vram_overflow_warning"] = {
+                    "required_gib": _req_gib,
+                    "usable_gib": _usable_gib,
+                    "total_gib": _total_gib,
+                    "reserved_gib": _reserved_gib,
+                }
             else:
-                assessment = assess_topology(
-                    config.episodic_adapter_config,
-                    max_interim_count=config.consolidation.max_interim_count,
-                    base_bytes=base_pred,
-                    hidden_size=hidden_size,
-                    num_layers=num_layers,
-                    model_id=config.model_config.model_id,
-                    quant_label=config.model_config.quantization,
-                    main_adapter_count=main_adapter_count,
-                    headroom_gib=config.vram.vram_cache_headroom_gib,
-                    stt_bytes=stt_pre_bytes,
-                    tts_bytes=tts_pre_bytes,
-                )
-                logger.info("VRAM topology assessment:\n%s", assessment.breakdown)
-                logger.info("%s", format_tier_table(assessment))
+                # Config fits — clear any stale warning from a previous boot
+                # with a different (larger) config.
+                _state.pop("vram_overflow_warning", None)
 
-                # Change 4 — persistent overflow warning when the config
-                # genuinely does not fit this hardware.
-                #
-                # "Usable VRAM" is the device-wide free reported by the CUDA
-                # runtime (mem_get_info) at a quiet moment before any model
-                # load.  This accounts for the WDDM OS reservation (typically
-                # 1+ GiB on WSL2 laptops) that get_device_properties().
-                # total_memory does NOT deduct — the physical number is always
-                # optimistic.  We snapshot once here; the resulting dict is
-                # read by _collect_vram_overflow_items on every /status poll.
-                #
-                # The condition "required > usable_ceiling" identifies a
-                # config that cannot fit even on an empty GPU — a permanent
-                # hardware-config mismatch.  A transient shortfall (required ≤
-                # usable but free is low due to a sibling process) is handled
-                # by the drain-wait / cloud-only degrade path and does NOT
-                # trigger this warning.
-                _total_phys_bytes = torch.cuda.get_device_properties(0).total_memory
-                _usable_ceiling_bytes = torch.cuda.mem_get_info(0)[0]
-                _reserved_bytes = _total_phys_bytes - _usable_ceiling_bytes
-                if assessment.required_bytes > _usable_ceiling_bytes:
-                    _req_gib = assessment.required_bytes / 2**30
-                    _usable_gib = _usable_ceiling_bytes / 2**30
-                    _total_gib = _total_phys_bytes / 2**30
-                    _reserved_gib = _reserved_bytes / 2**30
-                    logger.warning(
-                        "VRAM CONFIG OVERFLOW — local model config requires "
-                        "%.2f GiB working set but only ~%.2f GiB is usable on "
-                        "this %.0f GiB GPU (WDDM/WSL2 reserves ~%.2f GiB). "
-                        "The server will run cloud-only/degraded. Reduce model "
-                        "size, adapter rank/count, or "
-                        "consolidation.max_interim_count.",
-                        _req_gib,
-                        _usable_gib,
-                        _total_gib,
-                        _reserved_gib,
-                    )
-                    _state["vram_overflow_warning"] = {
-                        "required_gib": _req_gib,
-                        "usable_gib": _usable_gib,
-                        "total_gib": _total_gib,
-                        "reserved_gib": _reserved_gib,
-                    }
-                else:
-                    # Config fits — clear any stale warning from a previous
-                    # boot with a different (larger) config.
-                    _state.pop("vram_overflow_warning", None)
-
-        # Cache the assessment for the GPU reclaim path's live-budget
-        # pre-flight — config is static for the process lifetime, so the
-        # reclaim reuses this rather than re-assessing. None when skipped above.
+        # Cache the assessment for the GPU reclaim path's live-budget pre-flight;
+        # None when skipped above. _live_reload_base_model recomputes it on every
+        # live reload, so a base-model swap re-estimates for the new model.
         _state["topology_assessment"] = assessment
 
     if cloud_only:
@@ -4081,6 +4079,18 @@ def _live_reload_base_model(
     # only EXTERNAL consumers.
     _release_base_model_in_process()
 
+    # Re-estimate the VRAM topology ONLY when the config may have changed the
+    # model — a base-model swap (refresh_config_from_disk=True).  The boot
+    # estimate is cached for the boot model; a swap changes it, so a stale
+    # estimate would gate the new model's free against the OLD model's footprint.
+    # A plain reclaim reloads the SAME model, so the existing assessment is still
+    # valid — recomputing it would be redundant and, on an HF cache miss, would
+    # discard the valid boot estimate (returning None → skipping the preflight).
+    # Shared with the lifespan boot path via the one estimator; None when
+    # uncomputable (cache miss / AutoConfig failure) → live load gate.
+    if refresh_config_from_disk:
+        _state["topology_assessment"] = _compute_topology_assessment(config)
+
     # (a) Look before you leap: refuse the load when the live GPU budget
     # cannot fit the topology.  Use torch.cuda.mem_get_info() device-wide
     # free directly — consistent with the boot drain-wait, and avoids
@@ -4090,9 +4100,8 @@ def _live_reload_base_model(
     # in the correct direction: mem_get_info reports what the CUDA runtime
     # actually sees as free, including WDDM reservations and any live
     # external consumers on the device.
-    # ``topology_assessment`` is None when boot couldn't assess (HF cache
-    # miss) → defer to the live load gate.  Without this guard the reload
-    # OOMs and leaks.
+    # ``topology_assessment`` is None when the estimate could not be computed
+    # (HF cache miss / AutoConfig failure) → defer to the live load gate.
     assessment = _state.get("topology_assessment")
     if assessment is not None and torch.cuda.is_available():
         _reclaim_free_bytes = torch.cuda.mem_get_info(0)[0]
@@ -6550,14 +6559,24 @@ async def _run_base_swap_orchestration(
             #    reload_deferred so /gpu/acquire re-triggers Phase B.
             #
             if resume_phase == "":
-                # Fresh start: drain the GPU and load the new base via the
-                # existing /gpu/release + /gpu/acquire primitives — the tested
-                # complete cloud-only drain (base + voice). gpu_release frees the
-                # GPU; gpu_acquire loads the renamed-config base on the clean GPU.
-                # base_swap_active is True here, so gpu_acquire's resume hook
-                # will not re-enter this orchestration.
+                # Fresh start: reload the NEW base in-process.  Three pieces, each
+                # load-bearing (proven empirically):
+                #   1. Drop THIS coroutine's references to Phase A's
+                #      ConsolidationLoop / BackgroundTrainer — they pin the OLD
+                #      base model.  Phase B re-creates its own loop_b / bt_b.
+                #   2. gpu_release: the only path that actually reclaims the old
+                #      base + voice here (the bare reload-release left it resident
+                #      at 1.34 GiB free; gpu_release drains to ~6.5 GiB free).
+                #   3. _apply_config_live: re-reads the renamed-on-disk config and
+                #      reloads the NEW base with a full rebuild (gpu_acquire would
+                #      keep the stale in-memory config).  _live_reload_base_model
+                #      recomputes the VRAM topology for the new model so the gate
+                #      uses its footprint, not the old base's.
+                # base_swap_active is True, so neither re-enters this orchestration.
+                loop = None
+                bt = None
                 await gpu_release()
-                await gpu_acquire()
+                await asyncio.get_running_loop().run_in_executor(None, _apply_config_live)
 
                 # After the executor returns, check whether the reload succeeded
                 # or was deferred due to insufficient VRAM.
