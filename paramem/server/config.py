@@ -172,6 +172,7 @@ class RetentionConfig:
     monthly: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=12))
     yearly: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=3))
     pre_migration: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=10))
+    pre_base_swap: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=10))
     trial_adapter: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=5))
     manual: RetentionTierConfig = field(
         default_factory=lambda: RetentionTierConfig(keep="unlimited", max_disk_gb=5.0)
@@ -1644,6 +1645,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
         "monthly",
         "yearly",
         "pre_migration",
+        "pre_base_swap",
         "trial_adapter",
         "manual",
     ):

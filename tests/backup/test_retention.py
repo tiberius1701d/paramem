@@ -34,6 +34,7 @@ def _make_config(
     monthly_keep: int | str = 12,
     yearly_keep: int | str = 3,
     pre_migration_keep: int | str = 10,
+    pre_base_swap_keep: int | str = 10,
     trial_adapter_keep: int | str = 5,
     manual_keep: int | str = "unlimited",
     manual_max_disk_gb: float | None = 5.0,
@@ -49,6 +50,7 @@ def _make_config(
             monthly=RetentionTierConfig(keep=monthly_keep),
             yearly=RetentionTierConfig(keep=yearly_keep),
             pre_migration=RetentionTierConfig(keep=pre_migration_keep),
+            pre_base_swap=RetentionTierConfig(keep=pre_base_swap_keep),
             trial_adapter=RetentionTierConfig(keep=trial_adapter_keep),
             manual=RetentionTierConfig(keep=manual_keep, max_disk_gb=manual_max_disk_gb),
         ),
@@ -300,7 +302,7 @@ class TestPruneRule4PreMigrationWindow:
             _write_slot(root, "config", ts, "pre_migration")
         result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
         assert result.deleted == []
-        assert len(result.preserved_pre_migration_window) == 15
+        assert len(result.preserved_migration_window) == 15
 
     def test_prune_rule_4_pre_migration_old_tail_pruned(self, tmp_path):
         """5 within window + 12 older, keep=10 → 5 immune; 2 of the older pruned."""
@@ -322,7 +324,7 @@ class TestPruneRule4PreMigrationWindow:
         result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
         # Window-immune = 5, each counting toward the keep budget.
         # keep=10; 5 window-immune count as retained → 5 more old slots kept → 7 old deleted.
-        assert len(result.preserved_pre_migration_window) == 5
+        assert len(result.preserved_migration_window) == 5
         assert len(result.deleted) == 7
 
 
@@ -551,3 +553,82 @@ class TestEnumeratedRecordTierInvariant:
         # that makes the legacy-tier default branch in prune() unreachable.
         for record in records:
             assert record.meta.tier, f"BackupRecord for {record.slot_dir} has empty tier field"
+
+
+# ---------------------------------------------------------------------------
+# prune — rule 4 extended to pre_base_swap
+# ---------------------------------------------------------------------------
+
+
+class TestPruneRule4PreBaseSwap:
+    """Rule-4 window immunity for the pre_base_swap tier.
+
+    Mirrors TestPruneRule4PreMigrationWindow but exercises the pre_base_swap
+    tier path, including the acceptance-regression case: a slot within the
+    window survives even when keep=0 AND no trial.json is present (models the
+    post-rollback state where trial immunity is absent).
+    """
+
+    def test_pre_base_swap_within_window_preserved(self, tmp_path) -> None:
+        """15 pre_base_swap slots all younger than 30 days, keep=10 → 0 deleted."""
+        config = _make_config(pre_base_swap_keep=10)
+        root = tmp_path / "backups"
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        now = datetime(2026, 4, 22, 4, 0, 0, tzinfo=timezone.utc)
+        for i in range(15):
+            dt = now - timedelta(days=i)
+            ts = dt.strftime("%Y%m%d-%H%M%S") + "00"
+            _write_slot(root, "snapshot", ts, "pre_base_swap")
+        result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
+        assert result.deleted == []
+        assert len(result.preserved_migration_window) == 15
+
+    def test_pre_base_swap_old_tail_pruned(self, tmp_path) -> None:
+        """5 within window + 12 older, keep=10 → 5 immune; older tail pruned."""
+        config = _make_config(pre_base_swap_keep=10)
+        root = tmp_path / "backups"
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        now = datetime(2026, 4, 22, 4, 0, 0, tzinfo=timezone.utc)
+        for i in range(5):
+            dt = now - timedelta(days=i)
+            ts = dt.strftime("%Y%m%d-%H%M%S") + "00"
+            _write_slot(root, "snapshot", ts, "pre_base_swap")
+        for i in range(12):
+            dt = now - timedelta(days=31 + i)
+            ts = dt.strftime("%Y%m%d-%H%M%S") + "00"
+            _write_slot(root, "snapshot", ts, "pre_base_swap")
+        result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
+        # 5 within window count toward keep=10; 5 more old slots kept; 7 old deleted.
+        assert len(result.preserved_migration_window) == 5
+        assert len(result.deleted) == 7
+
+    def test_pre_base_swap_within_window_preserved_after_trial_cleared(self, tmp_path) -> None:
+        """Acceptance regression: pre_base_swap slot within window, keep=0, no trial.json.
+
+        Models the post-rollback state: trial.json is gone (no live-TRIAL immunity)
+        and keep=0 would normally remove all slots.  The 30-day window rule (rule 4)
+        must still protect the slot so the operator can recover the candidate config
+        sidecar after a rollback.
+        """
+        # keep=0 → rule 3 would prune everything; no trial.json → rule-1 immune set is empty.
+        config = _make_config(pre_base_swap_keep=0)
+        root = tmp_path / "backups"
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        # Slot is 1 day ago — clearly within the 30-day window.
+        now = datetime(2026, 4, 22, 4, 0, 0, tzinfo=timezone.utc)
+        dt = now - timedelta(days=1)
+        ts = dt.strftime("%Y%m%d-%H%M%S") + "00"
+        slot = _write_slot(root, "snapshot", ts, "pre_base_swap")
+
+        # No trial.json written — trial immunity is absent.
+        result = prune(backups_root=root, state_dir=state_dir, config=config, now=now)
+
+        assert slot.exists(), (
+            "pre_base_swap slot within 30-day window must survive pruning even when "
+            "keep=0 and no trial.json is present (rule-4 window immunity)"
+        )
+        assert result.deleted == []
+        assert len(result.preserved_migration_window) == 1

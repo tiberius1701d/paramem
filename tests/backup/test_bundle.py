@@ -1441,3 +1441,105 @@ class TestEnumerateBundle:
             f"enumerate_backups emitted 'unreadable' warning for bundle slot: {warnings_text!r}"
         )
         assert len(records) == 1
+
+
+# ---------------------------------------------------------------------------
+# Candidate-config sidecar (base-swap bundles)
+# ---------------------------------------------------------------------------
+
+
+class TestCandidateConfigSidecar:
+    """Tests for the ``candidate_config_path`` sidecar in write_bundle.
+
+    The sidecar is captured at the bundle root as ``server.yaml.candidate``
+    (NOT under ``config/``), hash-indexed in the manifest, and never restored.
+    """
+
+    def _call_write_bundle(self, fixtures: dict, candidate_config_path=None):
+        """Shared helper: calls write_bundle with optional candidate_config_path."""
+        return write_bundle(
+            config_path=fixtures["config_path"],
+            registry_path=fixtures["registry_path"],
+            adapter_dirs=fixtures["adapter_dirs"],
+            base_dir=fixtures["base_dir"],
+            meta_fields={"tier": "pre_base_swap"},
+            live_registry_sha256=fixtures["registry_sha256"],
+            candidate_config_path=candidate_config_path,
+        )
+
+    def test_candidate_sidecar_captured(self, tmp_path) -> None:
+        """Candidate file appears in manifest with correct path, bytes, and encrypted=False."""
+        fixtures = _make_fixtures(tmp_path)
+        candidate = tmp_path / "server.yaml.next"
+        candidate_bytes = b"model: qwen3\nport: 8420\n"
+        candidate.write_bytes(candidate_bytes)
+
+        slot = self._call_write_bundle(fixtures, candidate_config_path=candidate)
+
+        # Manifest entry must be present.
+        manifest = json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
+        candidate_entries = [f for f in manifest["files"] if f["path"] == "server.yaml.candidate"]
+        assert len(candidate_entries) == 1, (
+            f"Expected exactly 1 manifest entry for server.yaml.candidate; "
+            f"got {len(candidate_entries)}"
+        )
+        entry = candidate_entries[0]
+        assert entry["encrypted"] is False, "Candidate sidecar must not be encrypted"
+
+        # On-disk bytes must equal source.
+        on_disk = (slot / "server.yaml.candidate").read_bytes()
+        assert on_disk == candidate_bytes, "Candidate sidecar bytes differ from source"
+
+        # Hash in manifest must equal sha256 of on-disk bytes.
+        assert entry["content_sha256"] == _sha256(candidate_bytes), (
+            "Manifest hash does not match candidate bytes"
+        )
+
+    def test_candidate_sidecar_not_under_config_prefix(self, tmp_path) -> None:
+        """No manifest entry with path starting with 'config/' points at the candidate.
+
+        The restore_bundle Step-5c filter (startswith('config/')) must NOT
+        select the candidate sidecar — it lives at the top level.
+        """
+        fixtures = _make_fixtures(tmp_path)
+        candidate = tmp_path / "server.yaml.next"
+        candidate.write_bytes(b"model: qwen3\n")
+
+        slot = self._call_write_bundle(fixtures, candidate_config_path=candidate)
+
+        manifest = json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
+        config_entries = [f for f in manifest["files"] if f["path"].startswith("config/")]
+        for entry in config_entries:
+            assert "candidate" not in entry["path"], (
+                f"A config/-prefixed entry unexpectedly references the candidate: {entry['path']}"
+            )
+
+    def test_no_candidate_no_sidecar_entry(self, tmp_path) -> None:
+        """When candidate_config_path=None (default), no sidecar entry in manifest."""
+        fixtures = _make_fixtures(tmp_path)
+
+        slot = self._call_write_bundle(fixtures, candidate_config_path=None)
+
+        manifest = json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
+        candidate_entries = [f for f in manifest["files"] if "candidate" in f["path"]]
+        assert candidate_entries == [], (
+            f"No candidate_config_path supplied but sidecar entry found: {candidate_entries}"
+        )
+
+    def test_missing_candidate_raises_backup_error(self, tmp_path) -> None:
+        """Supplying a non-existent candidate_config_path raises BackupError with clear message.
+
+        The existence check is hoisted above the pending-slot allocation, so the
+        raise leaves ZERO on-disk residue — no orphan ``.pending/<ts>/``.
+        """
+        fixtures = _make_fixtures(tmp_path)
+        missing = tmp_path / "does_not_exist.yaml"
+        base_dir = Path(fixtures["base_dir"])
+
+        with pytest.raises(BackupError, match="candidate_config_path does not exist"):
+            self._call_write_bundle(fixtures, candidate_config_path=missing)
+
+        # The guard fires before _promote_slot, so no pending dir is created.
+        pending_root = base_dir / ".pending"
+        residue = list(pending_root.glob("*")) if pending_root.exists() else []
+        assert residue == [], f"missing-candidate raise left pending residue: {residue}"

@@ -727,6 +727,7 @@ class TestRunBaseSwapPhaseA:
         config.paths.data.mkdir(parents=True, exist_ok=True)
         config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
         config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
+        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = "mistral"
@@ -860,6 +861,13 @@ class TestRunBaseSwapPhaseA:
 
         def _fake_migrate(loop, cfg, ms):
             migrate_call[0] += 1
+            if migrate_call[0] == 2:
+                # Regression guard (review CRITICAL): Phase B must load the
+                # (Mistral) registries — its to-retrain tier list — into the store
+                # BEFORE migrate runs.  The base-swap preload gate leaves the live
+                # store empty; without this load migrate() would see 0 tiers and
+                # raise "0 tiers but on-disk content exists", failing every swap.
+                loop.store.load_registries_from_disk.assert_called()
             return fake_updated_a if migrate_call[0] == 1 else fake_updated_b
 
         async def _fake_update_gates(payload):
@@ -1018,6 +1026,7 @@ class TestBaseSwapOrchestrationSlice2:
         config.paths.data.mkdir(parents=True, exist_ok=True)
         config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
         config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
+        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = "mistral"
@@ -1121,6 +1130,13 @@ class TestBaseSwapOrchestrationSlice2:
 
         def _fake_migrate(loop, cfg, ms):
             migrate_call[0] += 1
+            if migrate_call[0] == 2:
+                # Regression guard (review CRITICAL): Phase B must load the
+                # (Mistral) registries — its to-retrain tier list — into the store
+                # BEFORE migrate runs.  The base-swap preload gate leaves the live
+                # store empty; without this load migrate() would see 0 tiers and
+                # raise "0 tiers but on-disk content exists", failing every swap.
+                loop.store.load_registries_from_disk.assert_called()
             return fake_updated_a if migrate_call[0] == 1 else fake_updated_b
 
         async def _fake_update_gates(payload):
@@ -1375,6 +1391,7 @@ class TestBaseSwapResumePhaseAware:
         config.paths.data.mkdir(parents=True, exist_ok=True)
         config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
         config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
+        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = model_name
@@ -1796,6 +1813,7 @@ class TestBaseSwapStep3ResumeReload:
         config.paths.data.mkdir(parents=True, exist_ok=True)
         config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
         config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
+        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         config.model_name = model_name
@@ -2723,6 +2741,7 @@ class TestPhaseBModelIdentityGuard:
         config.paths.data.mkdir(parents=True, exist_ok=True)
         config.paths.key_metadata = tmp_path / "data" / "key_metadata.json"
         config.paths.key_metadata.parent.mkdir(parents=True, exist_ok=True)
+        config.key_metadata_path = config.paths.key_metadata  # mirror the real property
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
         # model_name is set to the currently-loaded model.  After a successful

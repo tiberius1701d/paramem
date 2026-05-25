@@ -12,8 +12,9 @@ Rule precedence (strongest first)
    first until usage drops to cap or only immune slots remain.
 3. Per-tier ``keep`` count — oldest-within-tier slots pruned after ``keep``
    are retained.  ``keep="unlimited"`` disables this rule for the tier.
-4. ``pre_migration`` 30-day window immunity — ``pre_migration`` slots younger
-   than 30 days are immune from rule-3 count pruning.
+4. Migration-tier 30-day window immunity — ``pre_migration`` and ``pre_base_swap``
+   slots younger than 30 days are immune from rule-3 count pruning.  Both tiers
+   share the ``_PRE_MIGRATION_WINDOW_DAYS`` constant (30 days).
 5. Manual tier immunity — ``manual`` tier is exempt from rule 3.  Subject to
    rule 2 when a per-tier cap is configured.
 
@@ -85,8 +86,9 @@ class PruneResult:
         Slot dirs removed from disk (or that would be removed in dry-run mode).
     preserved_immune:
         Slots saved by ``collect_immune_paths`` (live TRIAL immunity).
-    preserved_pre_migration_window:
-        Slots saved by the 30-day pre_migration window rule (rule 4).
+    preserved_migration_window:
+        Slots preserved by the 30-day window-immunity rule for migration tiers
+        (``pre_migration`` and ``pre_base_swap``).  Rule 4.
     would_delete_next:
         Dry-run preview populated when ``dry_run=True``; empty when
         ``dry_run=False``.
@@ -102,7 +104,7 @@ class PruneResult:
 
     deleted: list[Path]
     preserved_immune: list[Path]
-    preserved_pre_migration_window: list[Path]
+    preserved_migration_window: list[Path]
     would_delete_next: list[Path]
     disk_usage_before: DiskUsage
     disk_usage_after: DiskUsage
@@ -320,8 +322,9 @@ def prune(
       tier bytes ≤ cap or only immune slots remain.
     - Rule 3 (keep count): applied per-tier.  ``keep="unlimited"`` skips rule.
       ``keep=0`` removes ALL non-immune slots in that tier.
-    - Rule 4 (pre_migration 30-day window): ``pre_migration`` slots younger
-      than 30 days are immune from rule-3 count pruning.
+    - Rule 4 (migration-tier 30-day window): ``pre_migration`` and
+      ``pre_base_swap`` slots younger than 30 days are immune from rule-3
+      count pruning.
     - Rule 5 (manual immunity): manual tier exempt from rule 3; rule 2 still
       applies when ``manual.max_disk_gb`` is set.
 
@@ -380,7 +383,7 @@ def prune(
 
     deleted: list[Path] = []
     preserved_immune: list[Path] = []
-    preserved_pre_migration_window: list[Path] = []
+    preserved_migration_window: list[Path] = []
     would_delete_next: list[Path] = []
 
     def _is_immune(record) -> bool:
@@ -463,13 +466,17 @@ def prune(
                 preserved_immune.append(record.slot_dir)
                 continue
 
-            # Rule 4: pre_migration window immunity.
-            if tier_name == "pre_migration" and record.created_at > pre_migration_cutoff:
+            # Rule 4: migration-tier window immunity (pre_migration and pre_base_swap).
+            if (
+                tier_name in ("pre_migration", "pre_base_swap")
+                and record.created_at > pre_migration_cutoff
+            ):
                 logger.info(
-                    "prune: pre_migration slot %s within 30-day window — preserved",
+                    "prune: %s slot %s within 30-day window — preserved",
+                    tier_name,
                     record.slot_dir,
                 )
-                preserved_pre_migration_window.append(record.slot_dir)
+                preserved_migration_window.append(record.slot_dir)
                 retained += 1
                 continue
 
@@ -487,10 +494,11 @@ def prune(
 
     # Log summary.
     logger.info(
-        "prune: deleted=%d, preserved_immune=%d, preserved_window=%d, invalid=%d, dry_run=%s",
+        "prune: deleted=%d, preserved_immune=%d, preserved_migration_window=%d, "
+        "invalid=%d, dry_run=%s",
         len(deleted) if not dry_run else 0,
         len(preserved_immune),
-        len(preserved_pre_migration_window),
+        len(preserved_migration_window),
         len(invalid_slots),
         dry_run,
     )
@@ -498,7 +506,7 @@ def prune(
     return PruneResult(
         deleted=deleted,
         preserved_immune=preserved_immune,
-        preserved_pre_migration_window=preserved_pre_migration_window,
+        preserved_migration_window=preserved_migration_window,
         would_delete_next=would_delete_next,
         disk_usage_before=disk_usage_before,
         disk_usage_after=disk_usage_after,

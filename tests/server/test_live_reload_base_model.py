@@ -44,13 +44,25 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from paramem.server.config import load_server_config
 
-def _fake_config(consolidation_mode="train", preload_cache=True):
-    config = MagicMock()
-    config.model_name = "mistral"
-    config.consolidation.mode = consolidation_mode
-    config.inference.preload_cache = preload_cache
-    return config
+
+def _server_config(consolidation_mode="train", preload_cache=True):
+    """Load the project's canonical test config and apply per-test overrides.
+
+    Uses the real ``load_server_config("tests/fixtures/server.yaml")`` (pins
+    Mistral 7B, external-dep services disabled) rather than a fabricated mock —
+    config is plain data with no GPU/disk side effects, so there is nothing to
+    fake.  Per-test value overrides go in code (CLAUDE.md), never via fixture
+    edits.  Returns a fresh object each call, so mutations don't leak across
+    tests.  (GPU/disk collaborators — the model, the memory store, the recall
+    source — are still substituted with test doubles below; those DO have
+    side effects.)
+    """
+    cfg = load_server_config("tests/fixtures/server.yaml")
+    cfg.consolidation.mode = consolidation_mode
+    cfg.inference.preload_cache = preload_cache
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -58,26 +70,22 @@ def _fake_config(consolidation_mode="train", preload_cache=True):
 # ---------------------------------------------------------------------------
 
 
-def test_preflight_declines_when_budget_insufficient():
-    """Live budget can't fit the topology: load NOT attempted; stays cloud-only.
-
-    The upfront release still runs (so ParaMem holds ~0); reason is set to
-    ``insufficient_vram`` so callers distinguish a deferral from a crash.
-
-    The fit-check uses torch.cuda.mem_get_info(0)[0] (device-wide free) vs
-    assessment.required_bytes — no nvidia-smi in the reclaim path.
+def test_preflight_declines_when_gate_reports_no_room():
+    """The unified GPU-room gate (_wait_for_gpu_drain) reports no room → load NOT
+    attempted; stays cloud-only.  The upfront release still runs (so ParaMem holds
+    ~0); reason is ``insufficient_vram`` so callers distinguish a deferral from a
+    crash.  Boot and reload react identically to the gate — this tests the reload
+    reaction; the gate's own credit/ceiling math is unit-tested below.
     """
     from paramem.server import app as app_module
 
-    # required_bytes is 6 GiB; mock free to 2 GiB → insufficient.
     fake_assessment = MagicMock(name="assessment")
     fake_assessment.required_bytes = int(6 * 2**30)
-    free_bytes = int(2 * 2**30)  # well below required
 
     state_patch = {
         "mode": "local",
         "cloud_only_reason": None,
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": fake_assessment,
     }
 
@@ -85,17 +93,78 @@ def test_preflight_declines_when_budget_insufficient():
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process") as mock_release,
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
-        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=False) as mock_gate,
         patch.object(app_module, "_load_model_into_state") as mock_load,
         patch.object(app_module, "_build_config_derived_state") as mock_build,
     ):
         app_module._live_reload_base_model()
 
+        mock_gate.assert_called_once_with(fake_assessment.required_bytes)
         mock_load.assert_not_called()
         mock_build.assert_not_called()
         mock_release.assert_called_once()  # upfront release only; no cleanup pass
         assert app_module._state["mode"] == "cloud-only"
         assert app_module._state["cloud_only_reason"] == "insufficient_vram"
+
+
+def test_effective_free_credits_warm_context_capped_at_ceiling():
+    """_effective_free_bytes (the single source of truth for both boot and reload)
+    credits this process's reclaimable CUDA context back, capped at the cached
+    pristine ceiling.  The Mistral live-reload case: a warm-context reading 6.53
+    GiB free (< 6.7 GiB required) becomes 6.83 GiB effective (= ceiling) ≥ required,
+    so a model that boots also live-reloads — where a raw free comparison deferred.
+    """
+    from paramem.server import app as app_module
+
+    _GiB = 2**30
+    state_patch = {"usable_ceiling_bytes": int(6.83 * _GiB)}
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch(
+            "paramem.server.app.torch.cuda.mem_get_info", return_value=(int(6.53 * _GiB), 8 * _GiB)
+        ),
+    ):
+        eff = app_module._effective_free_bytes()
+    # min(6.53 + 0.5, 6.83) == 6.83 ≥ 6.7 required.
+    assert eff == int(6.83 * _GiB)
+    assert eff >= int(6.7 * _GiB)
+
+
+def test_effective_free_does_not_mask_external_consumer():
+    """The credit cannot mask a GENUINE shortfall: an external consumer leaving
+    only 4.0 GiB free yields 4.5 GiB effective (free + 0.5 allowance, below the
+    ceiling), still < a 6.7 GiB requirement → the gate fails and the reload defers.
+    """
+    from paramem.server import app as app_module
+
+    _GiB = 2**30
+    state_patch = {"usable_ceiling_bytes": int(6.83 * _GiB)}
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch(
+            "paramem.server.app.torch.cuda.mem_get_info", return_value=(int(4.0 * _GiB), 8 * _GiB)
+        ),
+    ):
+        eff = app_module._effective_free_bytes()
+    # min(4.0 + 0.5, 6.83) == 4.5 < 6.7 required.
+    assert eff == int(4.5 * _GiB)
+    assert eff < int(6.7 * _GiB)
+
+
+def test_effective_free_uncapped_when_no_cached_ceiling():
+    """When the ceiling was never cached (HF-cache-miss boot), the credit applies
+    uncapped (free + allowance) — the documented fallback for the rare path.
+    """
+    from paramem.server import app as app_module
+
+    _GiB = 2**30
+    # Ensure no stale ceiling leaks in from another test.
+    app_module._state.pop("usable_ceiling_bytes", None)
+    with patch(
+        "paramem.server.app.torch.cuda.mem_get_info", return_value=(int(5.0 * _GiB), 8 * _GiB)
+    ):
+        eff = app_module._effective_free_bytes()
+    assert eff == int(5.0 * _GiB) + app_module._CUDA_CONTEXT_ALLOWANCE_BYTES
 
 
 def test_preflight_skipped_when_no_boot_assessment():
@@ -111,7 +180,7 @@ def test_preflight_skipped_when_no_boot_assessment():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": None,
     }
 
@@ -135,23 +204,20 @@ def test_preflight_skipped_when_no_boot_assessment():
 
 
 def test_successful_reload_sets_local():
-    """Pre-flight passes (budget fits) and the load succeeds → mode local.
+    """Gate reports room and the load succeeds → mode local.
 
-    The fit-check uses torch.cuda.mem_get_info(0)[0] vs required_bytes.
     After the WP1 refactor: _build_config_derived_state is called once on
     the plain-reclaim path.
     """
     from paramem.server import app as app_module
 
-    # required_bytes is 6 GiB; mock free to 7 GiB → fits.
     fake_assessment = MagicMock(name="assessment")
     fake_assessment.required_bytes = int(6 * 2**30)
-    free_bytes = int(7 * 2**30)
 
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": fake_assessment,
     }
 
@@ -159,7 +225,7 @@ def test_successful_reload_sets_local():
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process"),
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
-        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state") as mock_load,
         patch.object(app_module, "_build_config_derived_state") as mock_build,
     ):
@@ -181,15 +247,14 @@ def test_load_failure_releases_and_stays_cloud_only():
     """
     from paramem.server import app as app_module
 
-    # required_bytes is 6 GiB; free is 7 GiB → pre-flight passes.
+    # Gate reports room → pre-flight passes; the load then OOMs.
     fake_assessment = MagicMock(name="assessment")
     fake_assessment.required_bytes = int(6 * 2**30)
-    free_bytes = int(7 * 2**30)
 
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": fake_assessment,
     }
 
@@ -197,7 +262,7 @@ def test_load_failure_releases_and_stays_cloud_only():
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process") as mock_release,
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
-        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(
             app_module,
             "_load_model_into_state",
@@ -231,11 +296,11 @@ def test_refresh_config_from_disk_loads_config_before_release():
 
     call_order = []
 
-    fake_new_config = _fake_config()
+    new_config = _server_config()
 
     def fake_load_server_config(_path):
         call_order.append("load_server_config")
-        return fake_new_config
+        return new_config
 
     def fake_release():
         call_order.append("release")
@@ -243,7 +308,7 @@ def test_refresh_config_from_disk_loads_config_before_release():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
         "boot_degraded": None,
@@ -279,7 +344,7 @@ def test_refresh_config_mode_not_local_until_after_build():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
         "boot_degraded": None,
@@ -287,7 +352,7 @@ def test_refresh_config_mode_not_local_until_after_build():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "load_server_config", return_value=_fake_config()),
+        patch.object(app_module, "load_server_config", return_value=_server_config()),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
         patch.object(app_module, "_build_config_derived_state", side_effect=fake_build),
@@ -315,7 +380,7 @@ def test_refresh_config_rebuild_failure_stays_cloud_only():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
         "boot_degraded": None,
@@ -323,7 +388,7 @@ def test_refresh_config_rebuild_failure_stays_cloud_only():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "load_server_config", return_value=_fake_config()),
+        patch.object(app_module, "load_server_config", return_value=_server_config()),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
         patch.object(
@@ -362,7 +427,7 @@ def test_refresh_config_preload_partial_stays_cloud_only():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
         "boot_degraded": None,
@@ -370,7 +435,7 @@ def test_refresh_config_preload_partial_stays_cloud_only():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "load_server_config", return_value=_fake_config()),
+        patch.object(app_module, "load_server_config", return_value=_server_config()),
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
         patch.object(
@@ -392,7 +457,7 @@ def test_plain_reclaim_does_not_call_load_server_config():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": None,
         "boot_degraded": None,
     }
@@ -420,15 +485,14 @@ def test_build_once_vram_gate_not_callable_from_reload():
     """
     from paramem.server import app as app_module
 
-    # required_bytes is 6 GiB; free is 7 GiB → pre-flight passes.
+    # Gate reports room → pre-flight passes.
     fake_assessment = MagicMock(name="assessment")
     fake_assessment.required_bytes = int(6 * 2**30)
-    free_bytes = int(7 * 2**30)
 
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": fake_assessment,
         "boot_degraded": None,
     }
@@ -437,7 +501,7 @@ def test_build_once_vram_gate_not_callable_from_reload():
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_release_base_model_in_process"),
         patch("paramem.server.app.torch.cuda.is_available", return_value=True),
-        patch("paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state"),
         patch.object(app_module, "_build_config_derived_state"),
         patch.object(app_module, "enforce_post_load_budget") as mock_post_gate,
@@ -474,11 +538,9 @@ def test_preload_source_selection_simulate_mode():
     """
     from paramem.server import app as app_module
 
-    config = _fake_config(consolidation_mode="simulate", preload_cache=True)
-    config.adapter_dir = MagicMock()
+    config = _server_config(consolidation_mode="simulate", preload_cache=True)
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
-    config.key_metadata_path = MagicMock()
 
     # Make the store return one active key so the probe branch is entered.
     fake_store = MagicMock()
@@ -543,11 +605,9 @@ def test_preload_source_selection_train_mode_uses_weight_source():
     """
     from paramem.server import app as app_module
 
-    config = _fake_config(consolidation_mode="train", preload_cache=True)
-    config.adapter_dir = MagicMock()
+    config = _server_config(consolidation_mode="train", preload_cache=True)
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
-    config.key_metadata_path = MagicMock()
 
     fake_store = MagicMock()
     fake_store.tiers_with_registry.return_value = ["episodic"]
@@ -610,10 +670,8 @@ def test_preload_cache_false_clears_boot_degraded():
     """
     from paramem.server import app as app_module
 
-    config = _fake_config(preload_cache=False)
-    config.adapter_dir = MagicMock()
+    config = _server_config(preload_cache=False)
     config.consolidation.indexed_key_replay = False
-    config.key_metadata_path = MagicMock()
 
     fake_store = MagicMock()
     fake_store.load_registries_from_disk.return_value = None
@@ -646,17 +704,18 @@ def test_preload_cache_false_clears_boot_degraded():
     )
 
 
-def test_preload_partial_sets_boot_degraded():
-    """When some keys cannot be materialised: boot_degraded is SET.
-    When all keys materialise: boot_degraded is CLEARED.
+def test_preload_partial_sets_boot_degraded(tmp_path):
+    """When some active keys cannot be materialised (mounted-but-failed, or the
+    registry-sha256 binding-bug: slot present but unmounted → probe None):
+    boot_degraded is SET.  This is the normal (non-swap) path — tmp_path has no
+    base-swap marker, so the invalidity gate does not fire.
     """
     from paramem.server import app as app_module
 
-    config = _fake_config(consolidation_mode="train", preload_cache=True)
-    config.adapter_dir = MagicMock()
+    config = _server_config(consolidation_mode="train", preload_cache=True)
+    config.paths.data = tmp_path  # no base-swap marker here → gate inactive
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
-    config.key_metadata_path = MagicMock()
 
     fake_store = MagicMock()
     fake_store.tiers_with_registry.return_value = ["episodic"]
@@ -674,7 +733,7 @@ def test_preload_partial_sets_boot_degraded():
         "tokenizer": MagicMock(),
     }
 
-    # Probe returns only one of two keys → partial hydration.
+    # Probe returns only one of two keys → partial hydration of a backed tier.
     class FakeWeightSource:
         def __init__(self, model, tokenizer, batch_size):
             pass
@@ -701,6 +760,55 @@ def test_preload_partial_sets_boot_degraded():
         assert degraded is not None, "boot_degraded must be set on partial hydration"
         assert degraded["hits"] == 1
         assert degraded["total"] == 2
+
+
+def test_preload_skips_registry_during_base_swap(tmp_path):
+    """While a base-model swap is in flight (a ``base_swap`` marker is present),
+    the on-disk registry describes the PREVIOUS model and is invalid for the loaded
+    one.  preload must NOT load it — it returns an empty store with boot_degraded
+    cleared, so the new model starts knowing nothing until Phase B retrains it.
+    The registry files are left untouched (Phase B / rollback use them).
+    """
+    from paramem.server import app as app_module
+
+    config = _server_config(consolidation_mode="train", preload_cache=True)
+    config.paths.data = tmp_path
+    config.consolidation.indexed_key_replay = False
+
+    fake_store = MagicMock()
+    # The registry must NOT be loaded into the live store during a base-swap.
+    fake_store.load_registries_from_disk.side_effect = AssertionError(
+        "registry must not be loaded into the live store during a base-swap"
+    )
+
+    fake_marker = MagicMock()
+    fake_marker.migration_kind = "base_swap"
+    fake_marker.base_swap_phase = "phaseA_done"
+
+    state_patch = {
+        "boot_degraded": {"reason": "stale"},  # must be cleared by the gate
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+    }
+
+    import paramem.memory.store as store_mod
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(store_mod, "MemoryStore", return_value=fake_store),
+        patch("paramem.server.trial_state.read_trial_marker", return_value=fake_marker),
+    ):
+        result = app_module._preload_memory_store(
+            config,
+            model=app_module._state.get("model"),
+            tokenizer=app_module._state.get("tokenizer"),
+        )
+
+    assert result is fake_store, "an (empty) store must still be returned"
+    fake_store.load_registries_from_disk.assert_not_called()
+    assert app_module._state.get("boot_degraded") is None, (
+        "boot_degraded must be cleared while a base-swap is in flight"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +868,9 @@ def test_wait_for_gpu_drain_requires_stable_reads_consecutive():
 
     needed = 5 * 2**30
     free_enough = needed + 1
-    free_short = needed - 1
+    # Shortfall must exceed the reclaimable-context credit (0.5 GiB) so the credited
+    # effective free is still < needed; 1 GiB below makes it unambiguous.
+    free_short = needed - 2**30
 
     read_sequence = [
         (free_short, 8 * 2**30),  # insufficient: counter=0
@@ -802,7 +912,7 @@ def test_wait_for_gpu_drain_returns_false_on_timeout():
     from paramem.server import app as app_module
 
     needed = 5 * 2**30
-    free_short = needed - 1  # always insufficient
+    free_short = needed - 2**30  # 1 GiB short — exceeds the 0.5 GiB credit, always insufficient
 
     # Simulate time advancing: first call returns 0 (start), subsequent calls
     # advance past deadline so the loop exits on the second iteration.
@@ -1040,17 +1150,18 @@ def test_boot_drain_pass_proceeds_to_load(tmp_path):
 
 
 def test_reclaim_fitcheck_uses_mem_get_info_not_nvidia_smi():
-    """The reclaim VRAM fit-check must use torch.cuda.mem_get_info (device-wide
-    free) rather than nvidia-smi.  nvidia-smi false-frees exiting processes
-    under WSL2 and was the documented host-crash cause.
+    """The reclaim VRAM gate must use torch.cuda.mem_get_info (device-wide free)
+    rather than nvidia-smi.  nvidia-smi false-frees exiting processes under WSL2
+    and was the documented host-crash cause.
 
-    Verifies: (a) mem_get_info is called when assessment is present and CUDA
-    is available; (b) the function declines gracefully when free < required;
-    (c) no subprocess call (nvidia-smi) is made in the reclaim path.
+    Verifies: (a) mem_get_info is consulted (via the unified _effective_free_bytes
+    gate) when assessment is present and CUDA is available; (b) the reload declines
+    gracefully when free stays < required; (c) no subprocess (nvidia-smi) is made.
+    time.monotonic is advanced past the deadline so the gate times out fast.
     """
     from paramem.server import app as app_module
 
-    # required=6 GiB; free=2 GiB → must decline.
+    # required=6 GiB; free=2 GiB (even credited: 2.5 GiB) → gate never satisfied.
     fake_assessment = MagicMock(name="assessment")
     fake_assessment.required_bytes = int(6 * 2**30)
     free_bytes = int(2 * 2**30)
@@ -1058,11 +1169,21 @@ def test_reclaim_fitcheck_uses_mem_get_info_not_nvidia_smi():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": fake_assessment,
     }
 
     import subprocess
+
+    # Advance monotonic past the deadline on the 2nd read so the poll exits fast.
+    time_seq = [0.0, 0.0, 999.0]
+    _i = 0
+
+    def fake_monotonic():
+        nonlocal _i
+        val = time_seq[min(_i, len(time_seq) - 1)]
+        _i += 1
+        return val
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -1071,6 +1192,8 @@ def test_reclaim_fitcheck_uses_mem_get_info_not_nvidia_smi():
         patch(
             "paramem.server.app.torch.cuda.mem_get_info", return_value=(free_bytes, 8 * 2**30)
         ) as mock_mem_get_info,
+        patch("paramem.server.app.time.monotonic", side_effect=fake_monotonic),
+        patch("paramem.server.app.time.sleep"),
         patch.object(app_module, "_load_model_into_state") as mock_load,
         patch.object(app_module, "_build_config_derived_state") as mock_build,
         # subprocess.run must NOT be called (no nvidia-smi in reclaim path).
@@ -1078,13 +1201,13 @@ def test_reclaim_fitcheck_uses_mem_get_info_not_nvidia_smi():
     ):
         app_module._live_reload_base_model()
 
-        # mem_get_info must be consulted.
+        # mem_get_info must be consulted (via _effective_free_bytes).
         mock_mem_get_info.assert_called()
         # Load must NOT be attempted — free < required.
         mock_load.assert_not_called()
         mock_build.assert_not_called()
         assert app_module._state["cloud_only_reason"] == "insufficient_vram"
-        # No nvidia-smi subprocess in the fit-check path.
+        # No nvidia-smi subprocess in the gate path.
         mock_subprocess.assert_not_called()
 
 
@@ -1100,7 +1223,7 @@ def test_reclaim_fitcheck_cuda_unavailable_skips_check():
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(),
+        "config": _server_config(),
         "topology_assessment": fake_assessment,
         "boot_degraded": None,
     }
@@ -1291,7 +1414,7 @@ def test_arm_active_store_migration_arms_on_divergence():
     from paramem.server.active_store_migration import MigrationState
 
     fake_state = MigrationState.for_mode_switch(source_mode="simulate", target_mode="train")
-    config = _fake_config(consolidation_mode="train")
+    config = _server_config(consolidation_mode="train")
 
     with (
         patch.dict(
@@ -1317,7 +1440,7 @@ def test_arm_active_store_migration_noop_when_no_switch():
     non-mode config change)."""
     from paramem.server import app as app_module
 
-    config = _fake_config(consolidation_mode="train")
+    config = _server_config(consolidation_mode="train")
 
     with (
         patch.dict(
@@ -1346,12 +1469,12 @@ def test_refresh_config_from_disk_arms_mode_switch():
     """
     from paramem.server import app as app_module
 
-    fake_new_config = _fake_config(consolidation_mode="train")
+    new_config = _server_config(consolidation_mode="train")
 
     state_patch = {
         "mode": "cloud-only",
         "cloud_only_reason": "released",
-        "config": _fake_config(consolidation_mode="simulate"),
+        "config": _server_config(consolidation_mode="simulate"),
         "config_path": "configs/server.yaml",
         "topology_assessment": None,
         "boot_degraded": None,
@@ -1359,7 +1482,7 @@ def test_refresh_config_from_disk_arms_mode_switch():
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(app_module, "load_server_config", return_value=fake_new_config),
+        patch.object(app_module, "load_server_config", return_value=new_config),
         patch.object(app_module, "_arm_active_store_migration") as mock_arm,
         patch.object(app_module, "_release_base_model_in_process"),
         patch.object(app_module, "_load_model_into_state"),
@@ -1367,4 +1490,4 @@ def test_refresh_config_from_disk_arms_mode_switch():
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=True)
 
-        mock_arm.assert_called_once_with(fake_new_config)
+        mock_arm.assert_called_once_with(new_config)

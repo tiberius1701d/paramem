@@ -557,6 +557,7 @@ def write_bundle(
     adapter_scope: str = "live",
     live_registry_sha256: str = "",
     speaker_profiles_path: Path | None = None,
+    candidate_config_path: Path | None = None,
 ) -> Path:
     """Capture a self-contained recovery-set bundle into a single slot directory.
 
@@ -580,6 +581,11 @@ def write_bundle(
       carry no matching ``meta.registry_sha256``), then the interim-dir
       ``indexed_key_registry.json`` and ``simhash_registry.json``.
     - Shared: ``key_metadata.json``, ``speaker_profiles.json``, ``server.yaml``.
+    - Optional (base-swap only): ``server.yaml.candidate`` — the candidate
+      (new-target) config sidecar, included when ``candidate_config_path`` is
+      supplied.  Captured only to serve as an operator retry-anchor after a
+      rollback; **never restored** by ``restore_bundle`` (the
+      ``startswith("config/")`` filter excludes it by construction).
     - Excluded: ``graph.json`` (RAM-only), ``checkpoint-*/``, ``in_training/``,
       ``bg_checkpoint/``, ``resume_state.json`` (training scaffolding),
       ``keyed_pairs.json`` (transient; regenerated from graph).
@@ -640,6 +646,17 @@ def write_bundle(
         Optional path to ``speaker_profiles.json``.  When present and the
         file exists, it is included in the bundle.  When ``None`` or the file
         does not exist, the artifact is noted as absent in the manifest.
+    candidate_config_path:
+        Optional path to the candidate ``server.yaml`` for a base-model swap.
+        When supplied, the file is copied verbatim as ``server.yaml.candidate``
+        at the **top level** of the bundle slot (NOT under ``config/``) and
+        hash-indexed in the manifest.  It is never restored by ``restore_bundle``
+        — the ``startswith("config/")`` filter that selects the live config
+        explicitly excludes this top-level sidecar.  Its purpose is to give the
+        operator a retry anchor inside the immune bundle after a rollback.  The
+        internal safety-bundle call site leaves this ``None`` — it snapshots the
+        live state, not a migration candidate.  If supplied, the path must exist;
+        a missing file raises ``BackupError`` rather than silently omitting it.
 
     Returns
     -------
@@ -658,6 +675,8 @@ def write_bundle(
     BackupError
         If a unique pending slot could not be allocated after 10 collision
         retries.
+    BackupError
+        If ``candidate_config_path`` is supplied but does not exist.
     OSError
         On any filesystem error.
     """
@@ -688,6 +707,15 @@ def write_bundle(
     tier = meta_fields.get("tier", "manual")
     label = meta_fields.get("label")
 
+    # Validate a requested candidate exists BEFORE allocating the pending slot,
+    # so a set-but-missing candidate fails with zero on-disk residue (no orphan
+    # .pending/<ts>/). The other write_bundle raises occur after allocation by
+    # the function's existing pattern; this guard avoids adding to that set.
+    if candidate_config_path is not None and not candidate_config_path.exists():
+        raise BackupError(
+            f"write_bundle: candidate_config_path does not exist: {candidate_config_path}"
+        )
+
     # --- allocate pending slot ---
     pending_slot, timestamp = _promote_slot(base_dir)
 
@@ -716,6 +744,21 @@ def write_bundle(
         dst = pending_slot / "speaker_profiles.json"
         entry = _copy_artifact(speaker_profiles_path, dst)
         entry["path"] = "speaker_profiles.json"
+        files_inventory.append(entry)
+
+    # --- capture server.yaml.candidate (base-swap only) ---
+    # Top-level placement is load-bearing: restore_bundle's Step-5c filter
+    # matches startswith("config/") for the live config.  This sidecar lives
+    # at the bundle root so it is hash-verified (Step 2 integrity check) but
+    # never restored — the operator pulls it manually after a rollback.
+    if candidate_config_path is not None:
+        if not candidate_config_path.exists():
+            raise BackupError(
+                f"write_bundle: candidate_config_path does not exist: {candidate_config_path}"
+            )
+        dst = pending_slot / "server.yaml.candidate"
+        entry = _copy_artifact(candidate_config_path, dst)
+        entry["path"] = "server.yaml.candidate"
         files_inventory.append(entry)
 
     # --- helper: capture one adapter slot (main or interim) ---
@@ -1524,6 +1567,11 @@ def restore_bundle(
             logger.debug("restore_bundle: speaker_profiles.json restored")
 
         # 5c. server.yaml (only when restore_config=True)
+        # NOTE: a top-level "server.yaml.candidate" sidecar (present in pre_base_swap
+        # bundles) is intentionally hash-verified by Step 2 above but NOT restored here.
+        # It is the operator's retry anchor inside the immune bundle after a rollback.
+        # The startswith("config/") filter below excludes it by construction — do not
+        # "helpfully" add it to config_entries or restore it to the live config path.
         if restore_config:
             config_entries = [
                 entry for entry in manifest.files if entry["path"].startswith("config/")

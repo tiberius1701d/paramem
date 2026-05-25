@@ -69,7 +69,7 @@ def run(args: argparse.Namespace) -> int:
     result_dry_run = result.get("dry_run", dry_run)
     deleted = result.get("deleted", [])
     preserved_immune = result.get("preserved_immune", [])
-    preserved_window = result.get("preserved_pre_migration_window", [])
+    preserved_window = result.get("preserved_migration_window", [])
     would_delete_next = result.get("would_delete_next", [])
     usage_before = result.get("disk_usage_before", {})
     usage_after = result.get("disk_usage_after", {})
@@ -101,7 +101,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"    {path}")
 
     if preserved_window:
-        print(f"  preserved (pre-migration window): {len(preserved_window)} slots")
+        print(f"  preserved (migration window): {len(preserved_window)} slots")
         for path in preserved_window:
             print(f"    {path}")
 
