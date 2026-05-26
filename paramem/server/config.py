@@ -950,6 +950,19 @@ class ConsolidationScheduleConfig:
     # when training_save_strategy_bg == "steps".
     training_save_strategy_bg: str = ""
     training_save_steps_bg: int = 0
+    # Slot retention — see ConsolidationLoop._prune_old_slots.
+    #
+    # After each promotion atomic_save_adapter writes a NEW timestamped slot
+    # under <adapter_dir>/<tier>/<ts>/; find_live_slot picks whichever slot's
+    # meta.registry_sha256 matches the live registry. Older slots stay on
+    # disk indefinitely. This knob caps post-promotion prior slots per tier:
+    # the live (registry-matched) slot is always kept; up to N additional
+    # most-recent prior slots are retained for rollback; older slots are
+    # rmtree'd inside _save_adapters AFTER the registry-commit step so a
+    # brief commit-time race cannot expose unmatched state to readers.
+    # Set to 0 to keep only the live slot. Set high (e.g. 50) when validating
+    # slot lineage and disk is cheap.
+    training_keep_prior_slots: int = 3
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -975,6 +988,11 @@ class ConsolidationScheduleConfig:
                 f"consolidation.training_save_steps_bg must be >= 1 when "
                 f"training_save_strategy_bg='steps'; got {self.training_save_steps_bg!r}. "
                 f"Set training_save_steps_bg to the desired checkpoint interval."
+            )
+        if self.training_keep_prior_slots < 0:
+            raise ValueError(
+                f"consolidation.training_keep_prior_slots must be >= 0; "
+                f"got {self.training_keep_prior_slots}"
             )
 
         judge = self.extraction_plausibility_judge

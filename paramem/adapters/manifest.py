@@ -364,7 +364,7 @@ def read_manifest(slot: Path) -> AdapterManifest:
 # ---------------------------------------------------------------------------
 
 
-def _is_slot_name(name: str) -> bool:
+def is_slot_name(name: str) -> bool:
     """Return True when *name* looks like a ``YYYYMMDD-HHMMSS`` timestamp."""
     if len(name) != 15:
         return False

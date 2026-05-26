@@ -724,6 +724,7 @@ class TestSaveAdaptersManifest:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop._debug_base = None
+        loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
         loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0
@@ -1543,3 +1544,222 @@ def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
     assert loop.key_sessions == {"graph1": 7, "graph2": 3, "graph3": 0}
     assert loop.promoted_keys == {"graph1"}  # "orphan" filtered (no tier in store)
     assert loop.cycle_count == 5
+
+
+# ---------------------------------------------------------------------------
+# _prune_old_slots: adapter slot retention (Commit 2)
+# ---------------------------------------------------------------------------
+
+
+def _make_slot_dir(parent, name: str):
+    """Create a slot-shaped directory under *parent* and return its path."""
+    d = parent / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+class TestSlotRetention:
+    """Unit tests for ConsolidationLoop._prune_old_slots."""
+
+    def _make_loop(self, tmp_path):
+        """Return a minimal ConsolidationLoop instance for _prune_old_slots testing.
+
+        Bypasses __init__ (object.__new__) exactly like TestSaveAdaptersManifest;
+        only _keep_prior_slots needs to be set for these tests.
+        """
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.output_dir = tmp_path
+        loop._keep_prior_slots = 3
+        return loop
+
+    def test_prune_keeps_live_and_n_priors(self, tmp_path):
+        """_prune_old_slots retains live_slot + keep most-recent priors; deletes older ones."""
+        import os
+
+        loop = self._make_loop(tmp_path)
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+
+        # Create 6 slot dirs with distinct mtimes (touch in order so mtime is stable).
+        slots = []
+        for i in range(6):
+            name = f"2026010{i + 1}-120000"
+            d = _make_slot_dir(tier_root, name)
+            # Explicitly stagger mtime so sort order is deterministic.
+            os.utime(d, (1_700_000_000 + i, 1_700_000_000 + i))
+            slots.append(d)
+
+        # slots[5] is newest; designate it as live.
+        live_slot = slots[5]
+
+        loop._prune_old_slots(tier_root, live_slot, keep=2)
+
+        # live_slot always survives.
+        assert live_slot.exists(), "live_slot must survive pruning"
+        # 2 most-recent priors (slots[4], slots[3]) survive.
+        assert slots[4].exists(), "most-recent prior must survive"
+        assert slots[3].exists(), "second most-recent prior must survive"
+        # Older 3 slots (slots[0], slots[1], slots[2]) are removed.
+        assert not slots[0].exists(), "oldest slot must be pruned"
+        assert not slots[1].exists(), "second oldest must be pruned"
+        assert not slots[2].exists(), "third oldest must be pruned"
+
+    def test_prune_keep_zero_keeps_only_live(self, tmp_path):
+        """keep=0 removes all prior slots; only live_slot remains."""
+        loop = self._make_loop(tmp_path)
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+
+        live_slot = _make_slot_dir(tier_root, "20260526-120000")
+        prior1 = _make_slot_dir(tier_root, "20260525-120000")
+        prior2 = _make_slot_dir(tier_root, "20260524-120000")
+
+        loop._prune_old_slots(tier_root, live_slot, keep=0)
+
+        assert live_slot.exists()
+        assert not prior1.exists()
+        assert not prior2.exists()
+
+    def test_prune_skips_interim_dirs(self, tmp_path):
+        """Non-slot siblings with interim_<stamp>/ names are untouched."""
+        loop = self._make_loop(tmp_path)
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+
+        live_slot = _make_slot_dir(tier_root, "20260526-120000")
+        interim_a = _make_slot_dir(tier_root, "interim_20260526T1430")
+        interim_b = _make_slot_dir(tier_root, "interim_20260526T0230")
+
+        loop._prune_old_slots(tier_root, live_slot, keep=0)
+
+        # Interim dirs do not match is_slot_name → untouched regardless of keep.
+        assert interim_a.exists(), "interim dir must be skipped by pruner"
+        assert interim_b.exists(), "interim dir must be skipped by pruner"
+
+    def test_prune_skips_files_and_dot_dirs(self, tmp_path):
+        """Files and dot-prefixed dirs inside tier_root are untouched."""
+        loop = self._make_loop(tmp_path)
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+
+        live_slot = _make_slot_dir(tier_root, "20260526-120000")
+        reg_file = tier_root / "indexed_key_registry.json"
+        reg_file.write_text("{}")
+        pending = tier_root / ".pending"
+        pending.mkdir()
+        pending_slot = pending / "20260526-130000"
+        pending_slot.mkdir()
+
+        loop._prune_old_slots(tier_root, live_slot, keep=0)
+
+        assert reg_file.exists(), "registry JSON file must be untouched"
+        assert pending.exists(), "dot-prefixed .pending dir must be untouched"
+        assert pending_slot.exists(), "slot inside .pending must be untouched"
+
+    def test_prune_no_op_when_tier_root_missing(self, tmp_path):
+        """Non-existent tier_root must raise no exception and have no side effects."""
+        loop = self._make_loop(tmp_path)
+        missing = tmp_path / "does_not_exist"
+
+        # Must not raise.
+        loop._prune_old_slots(missing, missing / "20260526-120000", keep=2)
+
+    def test_prune_wired_from_save_adapters(self, tmp_path, monkeypatch):
+        """_prune_old_slots is invoked once per saved tier from _save_adapters.
+
+        Patches atomic_save_adapter to return a known slot path,
+        _verify_saved_adapter_from_disk to no-op, and the store's registry
+        commit to no-op, so the real _save_adapters code path runs up to the
+        prune call without needing a live model.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        # Build a minimal loop (same pattern as TestSaveAdaptersManifest).
+        model = MagicMock()
+        model.config._name_or_path = "test-base"
+        model.config._commit_hash = None
+        lora_cfg = MagicMock()
+        lora_cfg.r = 4
+        lora_cfg.lora_alpha = 8
+        lora_cfg.lora_dropout = 0.0
+        lora_cfg.target_modules = ["q_proj"]
+        lora_cfg.bias = "none"
+        # Only episodic — keeps peft_config check simple.
+        model.peft_config = {"episodic": lora_cfg}
+
+        def _fake_save_pretrained(path, selected_adapters=None):
+            from pathlib import Path as _Path
+
+            p = _Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "adapter_model.safetensors").write_bytes(b"w")
+            (p / "adapter_config.json").write_text("{}")
+
+        model.save_pretrained.side_effect = _fake_save_pretrained
+
+        tokenizer = MagicMock()
+        tokenizer.name_or_path = "test-tok"
+        tokenizer.backend_tokenizer = None
+        tokenizer.vocab_size = 32000
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = model
+        loop.tokenizer = tokenizer
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(num_epochs=1)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = None
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop.output_dir = tmp_path
+        loop.snapshot_dir = None
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop._keep_prior_slots = 2
+        loop.indexed_key_registry = {"episodic": KeyRegistry()}
+        loop.indexed_key_cache = {}
+        loop.cycle_count = 0
+        loop.merger = MagicMock()
+        loop.episodic_simhash = {}
+
+        # Known slot path that atomic_save_adapter will return.
+        expected_slot = tmp_path / "episodic" / "20260526-120000"
+        expected_slot.mkdir(parents=True, exist_ok=True)
+
+        prune_calls: list = []
+
+        def _fake_prune(tier_root, live_slot, keep):
+            prune_calls.append((tier_root, live_slot, keep))
+
+        loop._prune_old_slots = _fake_prune
+
+        with (
+            patch(
+                "paramem.training.consolidation.atomic_save_adapter",
+                return_value=expected_slot,
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_verify_saved_adapter_from_disk",
+                return_value=1.0,
+            ),
+            patch(
+                "paramem.training.consolidation.save_registry",
+            ),
+        ):
+            # Disable replay so the registry-commit block is skipped cleanly.
+            loop.store._replay_enabled = False
+            loop._save_adapters()
+
+        assert len(prune_calls) == 1, (
+            f"Expected 1 prune call (episodic only), got {len(prune_calls)}"
+        )
+        _tier_root, _live_slot, _keep = prune_calls[0]
+        assert _live_slot == expected_slot, "live_slot must match the slot from atomic_save_adapter"
+        assert _keep == 2, "_keep must match loop._keep_prior_slots"
