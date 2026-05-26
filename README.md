@@ -5,7 +5,7 @@
 Indexed key retrieval for continual learning in personal LLM agents.
 Knowledge lives in LoRA adapter weights, not in files.
 
-**550 facts at 100% recall on a single 8GB consumer GPU. Deployed.**
+Validated to 550 facts at 100% recall on a single 8 GB consumer GPU — a hands-on investigation of LLM training dynamics, multi-adapter consolidation, and production deployment on commodity hardware.
 
 ## Motivation
 
@@ -14,6 +14,18 @@ Personal AI agents need persistent memory. Current approaches — RAG, text-base
 ParaMem takes a different approach inspired by complementary learning systems. Session experiences are extracted into a knowledge graph, encoded as indexed-key training data, and compressed into LoRA adapter weights through replay-and-consolidation cycles. The model *learns* your facts — they become part of its parameters, not entries in a database.
 
 The core mechanism is **indexed key retrieval**: each fact gets a unique key (`graph1`, `graph2`, ...) and the adapter learns to recall the exact fact — the `(subject, predicate, object)` triple — when prompted with that key. A SimHash registry provides hallucination detection — the system knows what it knows and rejects queries for facts it hasn't learned. At inference, the full pipeline is **enumerate → reconstruct → reason**: the adapter surfaces every fact under its key, the recalled facts become explicit context, and the base model reasons over them. (The keyed-fact encoding is migrating from an LLM-generated `(key, question, answer)` form to a `(key, subject, predicate, object)` form built directly from the merged graph; gated by `consolidation.indexed_format`.)
+
+## Summary
+
+ParaMem stores personal facts for an LLM agent in LoRA adapter weights instead of a vector database; a SimHash registry lets the system enumerate what it knows and refuse what it doesn't. Each fact gets an addressable key; the adapter learns to recall the exact `(subject, predicate, object)` triple when prompted with that key, and the recalled facts become context for base-model reasoning. Validated to 550 keys at 100% keyed recall on Mistral 7B on a single 8 GB consumer GPU; 27 MB adapter; deployed as a Home Assistant conversation agent. Not demonstrated: capacity beyond 550 keys, statistical significance vs. competitive RAG baselines, or generalization beyond the three model families tested (Qwen 2.5 3B, Gemma 2 9B, Mistral 7B).
+
+## Findings worth looking at
+
+*Recovery from apparent forgetting.* After overwriting 20 of 100 keys on a rank-8 LoRA adapter, the unchanged keys appear to drop from 100% recall to ~4.5% — what looks like catastrophic forgetting. Two epochs of replay at LR=1e-5 on the failing subset — approximately 3 minutes of GPU time, ~3% of the original training cost — recovers retention to ~91–95% with zero collateral loss on previously-passing keys. First observed at n=1 in Test 13b (2026-04-23) and confirmed across 5 seeds in Test 15 (2026-05-11). The mechanistic reading — encoded weights remain, the decoding surface drifts — is supported by both the recovery probe and weight-space norm/coherence diagnostics on the same adapter. See [benchmarking.md → Test 13b retention curve](benchmarking.md#test-13b-retention-curve-re-run-completed-2026-04-23) and [Test 15 multi-seed result](benchmarking.md#test-15-retention-multi-seed-scaffold-fill-vs-answer-swap-production-early-stop).
+
+*A pre-registered hypothesis that didn't hold up.* Test 13 (n=1) suggested that a "scaffold-then-fill" warm-start protocol gave a 6.7× retention advantage over naive answer-swap overwrite. Test 15 (n=5 seeds) multi-seeded the same protocol against a pre-registered decision rule — ratio ≥ 5.0 and bootstrap lower CI ≥ 2.5 — and measured `ratio_raw = 3.56` with `lower_CI = 0.76`. Verdict: `DOES NOT HOLD`. The dependent N=500 scale follow-up (Test 14a) was cut per the same pre-registered rule. The surviving scaffold findings — faster fill convergence and zero leakage — do not on their own justify a scale study. This is the methodological-discipline finding: a single-seed result was promoted to a falsifiable claim and the claim did not survive. See [benchmarking.md → Test 15: Retention Multi-Seed](benchmarking.md#test-15-retention-multi-seed-scaffold-fill-vs-answer-swap-production-early-stop).
+
+*A production recipe for adapter repair.* Test 16 (n=5 seeds, 95-cell sensitivity sweep, completed 2026-05-19) characterizes the repair primitive that Test 15 surfaced. The sweep varies repair learning rate (1e-5 / 2e-5 / 5e-5), epochs per episode (1 / 3), and encoding depth past the first-perfect epoch (0 / 10 / 30), with a weight-decay spot-check. The recommended production recipe `(depth_past_floor ≥ 10, ep=3, lr=2e-5, wd=0.01)` reaches `rp3 = 1.000 ± 0.000` across all 5 seeds in a mean of 1.2 repair episodes, with `collateral_loss_count = 0` across all 95 cells × 5 seeds. Aggressive repair (lr=5e-5, ep=3) erases the overwrite — useful when "undo" is the goal, harmful when the swap should persist. These are the defaults the production consolidation loop inherits. See [benchmarking.md → Test 16: Repair-Loop Sensitivity Sweep](benchmarking.md#test-16-repair-loop-sensitivity-sweep).
 
 ## Status
 
@@ -124,7 +136,7 @@ Create a `.env` file in the project root. The server and experiment scripts load
 # .env
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 WANDB_API_KEY=<your wandb key>            # optional, for experiment tracking
-# HF_DEACTIVATE_ASYNC_LOAD=1             # WSL2 dxg threaded-load workaround — see "Blackwell" note below
+# HF_DEACTIVATE_ASYNC_LOAD=1             # WSL2 dxg threaded-load workaround — see "Platform notes" below
 
 # Server (required for HA integration)
 HA_URL=http://<your-ha-ip>:8123          # Home Assistant URL
@@ -142,12 +154,12 @@ deployment posture:
 
 | Backing | Fit | Notes |
 |---|---|---|
-| **`.env` file (gitignored)** | Local development, single-user host | Simplest. Already wired — `python-dotenv` loads it on startup. Plaintext on disk. Path is gitignored at repo root. |
-| **systemd `EnvironmentFile=`** | Headless server (this project's primary deployment) | Standard for daemonized services. Plaintext on disk but root-owned. Set `EnvironmentFile=/etc/paramem/secrets.env` in `~/.config/systemd/user/paramem-server.service`. |
-| **Shell session export** | One-off interactive runs | No persistence, requires re-export. Useful for tests. |
-| **OS keychain (`keyring` Python pkg)** | Multi-user desktop | Encrypted at rest (Keychain / Credential Manager / libsecret). Requires extra dep + a small loader shim — not wired by default. |
-| **age-encrypted file** | Privacy-conscious dev | Strongest local protection. ParaMem already uses age for daily keys (see `SECURITY.md`); the same identity can decrypt a secrets bundle into env at startup. |
-| **HashiCorp Vault / AWS Secrets Manager / 1Password CLI** | Team / regulated production | Heavyweight, audit-logged. Operators wire a wrapper script that exports env vars before launching the server. |
+| `.env` file (gitignored) | Local development, single-user host | Simplest. Already wired — `python-dotenv` loads it on startup. Plaintext on disk. Path is gitignored at repo root. |
+| systemd `EnvironmentFile=` | Headless server (this project's primary deployment) | Standard for daemonized services. Plaintext on disk but root-owned. Set `EnvironmentFile=/etc/paramem/secrets.env` in `~/.config/systemd/user/paramem-server.service`. |
+| Shell session export | One-off interactive runs | No persistence, requires re-export. Useful for tests. |
+| OS keychain (`keyring` Python pkg) | Multi-user desktop | Encrypted at rest (Keychain / Credential Manager / libsecret). Requires extra dep + a small loader shim — not wired by default. |
+| age-encrypted file | Privacy-conscious dev | Strongest local protection. ParaMem already uses age for daily keys (see `SECURITY.md`); the same identity can decrypt a secrets bundle into env at startup. |
+| HashiCorp Vault / AWS Secrets Manager / 1Password CLI | Team / regulated production | Heavyweight, audit-logged. Operators wire a wrapper script that exports env vars before launching the server. |
 
 Defense in depth: the smoke test at
 `tests/server/test_server_yaml_example.py::test_no_inline_api_key_literals`
@@ -209,30 +221,7 @@ archive/              # Failed approaches (part of the research story)
 - **Models tested:** Gemma 2 9B Instruct, Mistral 7B Instruct v0.3, Qwen 2.5 3B
 - **Training time:** ~4 min for smoke test (10 keys, 30 epochs)
 
-### RTX 50-series (Blackwell) Note
-
-**bitsandbytes:** Version 0.49.2 lacks native CUDA kernels for sm_120 (Blackwell architecture). NF4 quantization will crash when loading models larger than ~3B parameters. The fix is to install from the main branch, which includes native sm_120 binaries:
-
-```bash
-pip install bitsandbytes --upgrade --pre
-# or from source:
-pip install git+https://github.com/bitsandbytes-foundation/bitsandbytes.git
-```
-
-This is a build-infrastructure issue (native kernels vs PTX JIT compilation), not a correctness issue — the kernels are functionally identical, just not yet performance-tuned for Blackwell. Once bitsandbytes 0.50.0 is released, the standard `pip install` will work.
-
-**WSL2 threaded weight loading:** Transformers 5.3+ uses a `ThreadPoolExecutor` (4 workers) to parallelize weight loading. On WSL2, concurrent `tensor.to('cuda')` calls from worker threads can race the dxg paravirt memory mapper (`dxgkio_make_resident`), causing `CUDA driver error: device not ready` on models >= 4B parameters. If you encounter this, disable threaded loading:
-
-```bash
-# Add to your .env or shell profile
-export HF_DEACTIVATE_ASYNC_LOAD=1
-```
-
-This forces sequential weight loading. Models load slightly slower but reliably. The issue is specific to WSL2's DirectX Graphics (dxg) layer — native Linux is unaffected.
-
-> **Note (2026-05):** This race no longer reproduced in our environment after updating to NVIDIA driver 596.36 (CUDA 13.2) on a Windows 11 host with `dxgkrnl.sys` 10.0.26100.8115 (KB5088467, 2026-04-14). Three cold loads of Mistral 7B in NF4 succeeded with the workaround disabled. The fix could live in either layer (Microsoft `dxgkrnl` or NVIDIA `libcuda`); we did not isolate it. The workaround may no longer be required on recent driver + Windows builds — try unsetting `HF_DEACTIVATE_ASYNC_LOAD` first, and only re-enable it if you still see `device not ready` on cold loads.
-
-**WSL2 Modern Standby (laptop GPUs):** Windows Modern Standby can power-cycle the GPU during idle periods, causing TDR BSOD (bugcheck 0x116) if a CUDA workload is active. The `acquire_gpu()` context manager in `experiments/utils/gpu_guard.py` prevents this by holding `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via a background PowerShell process for the duration of GPU workloads. This is automatic for all experiment scripts that use `acquire_gpu()`. A cooling pad is recommended for sustained workloads — the primary benefit is faster thermal recovery between runs rather than higher sustained clocks, as the TGP is the binding constraint under load.
+Platform-specific notes for Blackwell GPUs and WSL2 live under [Platform notes](#platform-notes) below the engineering walkthrough.
 
 ## How It Works
 
@@ -754,6 +743,39 @@ python experiments/test1_scale_expansion.py --model gemma
 python experiments/test8_large_scale.py --model mistral
 ```
 
+## Platform notes
+
+Most readers can skip this section — these are debugging notes that paid off on RTX 50-series (Blackwell) and WSL2 hosts. They are documented here because the failure modes are non-obvious and the project ran into both.
+
+### RTX 50-series (Blackwell)
+
+**bitsandbytes:** Version 0.49.2 lacks native CUDA kernels for sm_120 (Blackwell architecture). NF4 quantization will crash when loading models larger than ~3B parameters. The fix is to install from the main branch, which includes native sm_120 binaries:
+
+```bash
+pip install bitsandbytes --upgrade --pre
+# or from source:
+pip install git+https://github.com/bitsandbytes-foundation/bitsandbytes.git
+```
+
+This is a build-infrastructure issue (native kernels vs PTX JIT compilation), not a correctness issue — the kernels are functionally identical, just not yet performance-tuned for Blackwell. Once bitsandbytes 0.50.0 is released, the standard `pip install` will work.
+
+### WSL2 threaded weight loading
+
+Transformers 5.3+ uses a `ThreadPoolExecutor` (4 workers) to parallelize weight loading. On WSL2, concurrent `tensor.to('cuda')` calls from worker threads can race the dxg paravirt memory mapper (`dxgkio_make_resident`), causing `CUDA driver error: device not ready` on models >= 4B parameters. If you encounter this, disable threaded loading:
+
+```bash
+# Add to your .env or shell profile
+export HF_DEACTIVATE_ASYNC_LOAD=1
+```
+
+This forces sequential weight loading. Models load slightly slower but reliably. The issue is specific to WSL2's DirectX Graphics (dxg) layer — native Linux is unaffected.
+
+> **Note (2026-05):** This race no longer reproduced in our environment after updating to NVIDIA driver 596.36 (CUDA 13.2) on a Windows 11 host with `dxgkrnl.sys` 10.0.26100.8115 (KB5088467, 2026-04-14). Three cold loads of Mistral 7B in NF4 succeeded with the workaround disabled. The fix could live in either layer (Microsoft `dxgkrnl` or NVIDIA `libcuda`); we did not isolate it. The workaround may no longer be required on recent driver + Windows builds — try unsetting `HF_DEACTIVATE_ASYNC_LOAD` first, and only re-enable it if you still see `device not ready` on cold loads.
+
+### WSL2 Modern Standby (laptop GPUs)
+
+Windows Modern Standby can power-cycle the GPU during idle periods, causing TDR BSOD (bugcheck 0x116) if a CUDA workload is active. The `acquire_gpu()` context manager in `experiments/utils/gpu_guard.py` prevents this by holding `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via a background PowerShell process for the duration of GPU workloads. This is automatic for all experiment scripts that use `acquire_gpu()`. A cooling pad is recommended for sustained workloads — the primary benefit is faster thermal recovery between runs rather than higher sustained clocks, as the TGP is the binding constraint under load.
+
 ## Paper
 
 The paper source is in `paper/`. To build the PDF:
@@ -774,11 +796,14 @@ The output is `paper/main.pdf`. LaTeX build artifacts are gitignored.
 ## Citation
 
 ```bibtex
-@article{preusser2026indexed,
-  title={Indexed Key Retrieval from LoRA Adapters for Continual Learning},
-  author={Preusser, Tobias},
-  year={2026},
-  note={Preprint}
+@misc{preusser2026indexed,
+  title        = {Indexed Key Retrieval from LoRA Adapters for Continual Learning},
+  author       = {Preusser, Tobias},
+  year         = {2026},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.19502523},
+  url          = {https://doi.org/10.5281/zenodo.19502523},
+  note         = {Preprint}
 }
 ```
 
