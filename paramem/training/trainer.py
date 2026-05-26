@@ -30,8 +30,7 @@ class TrainingHooks:
     thermal throttle in the registered callback list, so inference yielding
     pre-empts throttle waits within the same step.
 
-    All three fields default to ``None`` — callers pass only the intents
-    they need:
+    All fields default to ``None`` — callers pass only the intents they need:
 
     - ``on_step_yield(global_step)``: invoked at every step boundary, used by
       ``BackgroundTrainer`` to yield to inference requests.
@@ -40,11 +39,16 @@ class TrainingHooks:
     - ``on_shutdown_check()``: invoked at every epoch end; returning ``True``
       sets ``control.should_training_stop``. Replaces ad-hoc
       ``GracefulShutdownCallback`` instantiation at the call site.
+    - ``on_inference_active()``: polled by ``ThermalThrottleCallback`` to
+      suppress throttling while a PA conversation is in progress (latency
+      protection). Defaults to ``None`` (throttle never suppressed for
+      non-server callers).
     """
 
     on_step_yield: Optional[Callable[[int], None]] = None
     on_epoch_persist: Optional[Callable[[int, str], None]] = None
     on_shutdown_check: Optional[Callable[[], bool]] = None
+    on_inference_active: Optional[Callable[[], bool]] = None
 
 
 class _HooksAdapterCallback(TrainerCallback):
@@ -318,7 +322,18 @@ def train_adapter(
             if hooks is not None and hooks.on_shutdown_check is not None
             else (lambda: False)
         )
-        callbacks.append(ThermalThrottleCallback(thermal_policy, shutdown_fn=shutdown_fn))
+        inference_active_fn = (
+            hooks.on_inference_active
+            if hooks is not None and hooks.on_inference_active is not None
+            else (lambda: False)
+        )
+        callbacks.append(
+            ThermalThrottleCallback(
+                thermal_policy,
+                shutdown_fn=shutdown_fn,
+                inference_active_fn=inference_active_fn,
+            )
+        )
     if callbacks_extra:
         callbacks.extend(callbacks_extra)
 

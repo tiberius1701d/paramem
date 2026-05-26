@@ -52,3 +52,31 @@ def acquire_gpu():
 def release_gpu():
     """Release the GPU lock. Must be paired with acquire_gpu()."""
     _gpu_thread_lock.release()
+
+
+@contextmanager
+def gpu_lock_released():
+    """Yield the PA inference reservation for the body; reacquire on exit.
+
+    For sites that already hold _gpu_thread_lock (e.g. a long-running
+    training job) and need to hand the GPU to PA inference for a bounded
+    handoff. The reacquire runs in `finally`, so the reservation is
+    restored on every exit path (normal, return, exception).
+
+    Caller invariant — MUST be enforced by usage discipline, not by this
+    primitive: the calling thread already holds _gpu_thread_lock.
+    `threading.Lock` is NOT owner-tracking:
+    - If no thread holds the lock when release_gpu() runs, Python raises
+      `RuntimeError: release unlocked lock`.
+    - If a different thread holds the lock, release_gpu() silently steals
+      ownership — the original holder will observe an inconsistent state
+      at its own release. This is not detectable here.
+
+    Use only from code paths that statically hold the reservation (the BG
+    trainer's _yield_to_inference is the sole production caller).
+    """
+    release_gpu()
+    try:
+        yield
+    finally:
+        acquire_gpu()

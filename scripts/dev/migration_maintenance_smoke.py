@@ -297,10 +297,10 @@ def _build_sandbox_config(tmp_root: Path) -> Any:
 
     # Disable the systemd-driven schedule so the harness drives consolidation.
     config.consolidation.refresh_cadence = ""
-    # Disable the thermal throttle: it calls release_gpu() during a pause, but the
-    # smoke runs the seed/trial training directly (not under gpu_lock_sync as the
-    # production scheduler does), so a throttle would release an unheld lock. The
-    # throttle is orthogonal to the apply path under test.
+    # Disable the thermal throttle: the smoke runs seed/trial training directly
+    # (not through BackgroundTrainer) and wants deterministic, uninterrupted
+    # timing. The throttle's fan-noise pauses are orthogonal to the apply path
+    # under test.
     config.consolidation.training_temp_limit = 0
     # Security OFF: avoid requiring the daily identity during smoke.
     if hasattr(config, "security") and hasattr(config.security, "require_encryption"):
