@@ -55,7 +55,7 @@ import torch  # noqa: E402
 
 from experiments.utils.gpu_guard import acquire_gpu as reserve_gpu  # noqa: E402
 from experiments.utils.test_harness import setup_logging  # noqa: E402
-from paramem.server.gpu_lock import acquire_gpu, release_gpu  # noqa: E402
+from paramem.server.gpu_lock import gpu_lock_sync  # noqa: E402
 from paramem.training.thermal_throttle import (  # noqa: E402
     ThermalPolicy,
     ThermalThrottleCallback,
@@ -153,21 +153,20 @@ def _run_phase(label: str, mode: str) -> list[float]:
         _gpu_temp(),
     )
 
-    acquire_gpu()
     x = torch.randn(MATMUL_DIM, MATMUL_DIM, device="cuda", dtype=torch.float32)
     deadline = time.time() + PHASE_SECONDS
     step = 0
     try:
-        while time.time() < deadline:
-            # Busy matmul → drives power draw ~40-55W.
-            x = x @ x.T
-            x = x / (x.abs().max() + 1e-6)  # keep values bounded
-            torch.cuda.synchronize()
-            step += 1
-            # Inline throttle — under always_on it will pause us when hot.
-            throttle._maybe_throttle(step)
+        with gpu_lock_sync():
+            while time.time() < deadline:
+                # Busy matmul → drives power draw ~40-55W.
+                x = x @ x.T
+                x = x / (x.abs().max() + 1e-6)  # keep values bounded
+                torch.cuda.synchronize()
+                step += 1
+                # Inline throttle — under always_on it will pause us when hot.
+                throttle._maybe_throttle(step)
     finally:
-        release_gpu()
         poller.stop()
 
     logger.info(

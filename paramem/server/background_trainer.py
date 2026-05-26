@@ -740,24 +740,43 @@ class BackgroundTrainer:
             return
 
         from paramem.models.loader import switch_adapter
-        from paramem.server.gpu_lock import acquire_gpu, release_gpu
+        from paramem.server.gpu_lock import gpu_lock_released
 
         logger.debug("Training paused for inference at step %d", global_step)
-        release_gpu()
-        self._training_paused.set()
-        signalled = self._inference_done.wait(timeout=self._INFERENCE_TIMEOUT)
-        if not signalled:
-            logger.warning(
-                "Inference did not signal done within %.0fs — resuming training",
-                self._INFERENCE_TIMEOUT,
-            )
-        self._inference_done.clear()
-        acquire_gpu()
-        # Restore staging adapter as active — inference may have switched
-        # to a production adapter. Training must resume on in_training.
+        with gpu_lock_released():
+            # Lock RELEASED for the body. Ordering matters:
+            #   - _training_paused.set() must follow release so pause() observes
+            #     yield-complete only after the lock is actually free.
+            #   - _inference_done.clear() must precede ctx-mgr exit so the next
+            #     yield cycle starts from a clean event state.
+            self._training_paused.set()
+            signalled = self._inference_done.wait(timeout=self._INFERENCE_TIMEOUT)
+            if not signalled:
+                logger.warning(
+                    "Inference did not signal done within %.0fs — resuming training",
+                    self._INFERENCE_TIMEOUT,
+                )
+            self._inference_done.clear()
+        # Lock REACQUIRED. switch_adapter MUST stay outside the ctx body (model
+        # access requires the lock). _training_paused.clear() MUST stay AFTER
+        # reacquire — clearing it while the lock is still released would let
+        # pause() re-enter yield before training has the lock back.
         switch_adapter(self.model, "in_training")
         self._training_paused.clear()
         logger.debug("Training resumed at step %d (adapter=in_training)", global_step)
+
+    def _inference_active(self) -> bool:
+        """Return True if a PA inference request is pending or in flight.
+
+        Read by the thermal throttle's gate (via TrainingHooks.on_inference_active)
+        to suppress throttling while PA is responding. The event is set by pause()
+        at line 354 and cleared by resume() at line 435 — so this returns True
+        from the moment a /chat handler calls bg_trainer.pause() until resume()
+        completes. A brief False-then-resume window exists between resume()'s
+        clear at line 435 and _inference_done.set() at line 436; the throttle
+        fires one step late at worst (reviewer-noted, harmless).
+        """
+        return self._inference_requested.is_set()
 
     def _persist_resume_state(self, epoch: int, output_dir: str) -> None:
         """Write the resume_state.json marker for crash-safe recovery.
@@ -958,6 +977,7 @@ class BackgroundTrainer:
             on_step_yield=self._yield_to_inference,
             on_epoch_persist=self._persist_resume_state,
             on_shutdown_check=lambda: self._shutdown_requested,
+            on_inference_active=self._inference_active,
         )
 
         logger.info(

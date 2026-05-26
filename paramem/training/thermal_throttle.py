@@ -1,9 +1,11 @@
 """Thermal throttle as a config-driven HF TrainerCallback.
 
-Pauses training when the GPU exceeds a configured temperature limit during
-the configured quiet-hours window. Releases the GPU lock while waiting so
-inference / STT / TTS can proceed; re-acquires when the GPU cools or the
-window ends.
+Pauses sustained GPU activity during the configured quiet-hours window for
+fan-noise control. Sleeps in place so total GPU utilization actually drops
+— does NOT touch the PA inference reservation lock (heat depends on
+activity, not on lock ownership). Exits early when GPU cools below the
+limit, the quiet-hours window ends, a shutdown signal arrives, or a PA
+conversation is in progress (latency protection).
 
 Independent of training driver: ``paramem.training.trainer.train_adapter``
 installs the callback when a ``ThermalPolicy`` is supplied.
@@ -131,24 +133,33 @@ def _should_throttle_now(policy: ThermalPolicy, now: datetime | None = None) -> 
 class ThermalThrottleCallback(TrainerCallback):
     """Pause training when GPU temperature exceeds the policy limit.
 
-    Releases the GPU lock while waiting so other consumers (STT/TTS/inference)
-    can proceed; re-acquires when the GPU cools below ``policy.temp_limit`` or
-    the quiet-hours window ends mid-wait.
+    Sleeps in place during a quiet-hours window for fan-noise control. Does NOT
+    touch the PA inference reservation lock — heat depends on actual GPU
+    activity, not on lock ownership.
 
-    The mid-wait shutdown signal flows through ``shutdown_fn`` — defaults to a
-    constant ``False`` so non-server callers (experiments via ``train_adapter``)
-    don't depend on a BG-trainer-specific signal. The server-side
-    ``BackgroundTrainer`` passes ``lambda: self._shutdown_requested`` so a
-    shutdown during a hot-wait breaks the loop cleanly.
+    The wait loop exits on any of four conditions: GPU cools below
+    ``policy.temp_limit``, the quiet-hours window ends mid-wait, a shutdown
+    signal arrives, or a PA conversation becomes active (latency protection).
+
+    ``shutdown_fn`` defaults to a constant ``False`` so non-server callers
+    (experiments via ``train_adapter``) don't depend on a BG-trainer-specific
+    signal. ``BackgroundTrainer`` passes ``lambda: self._shutdown_requested``
+    so a shutdown during a hot-wait breaks the loop cleanly.
+
+    ``inference_active_fn`` defaults to a constant ``False``. ``BackgroundTrainer``
+    passes ``self._inference_active`` so the throttle suppresses itself while a
+    PA /chat response is in progress, keeping conversational latency low.
     """
 
     def __init__(
         self,
         policy: ThermalPolicy,
         shutdown_fn: Callable[[], bool] = lambda: False,
+        inference_active_fn: Callable[[], bool] = lambda: False,
     ):
         self._policy = policy
         self._shutdown_fn = shutdown_fn
+        self._inference_active_fn = inference_active_fn
 
     def on_step_end(self, args, state, control, **kwargs):
         self._maybe_throttle(state.global_step)
@@ -163,24 +174,23 @@ class ThermalThrottleCallback(TrainerCallback):
             return
         if not _should_throttle_now(self._policy):
             return
+        if self._inference_active_fn():
+            # PA conversation in progress — suppress throttle to keep latency low.
+            return
 
         temp = _gpu_temp()
         if temp is None or temp <= self._policy.temp_limit:
             return
 
-        from paramem.server.gpu_lock import acquire_gpu, release_gpu
-
         logger.info(
-            "Thermal throttle: GPU at %d°C (limit %d°C) — releasing GPU at step %d",
+            "Thermal throttle: GPU at %d°C (limit %d°C) — pausing at step %d for fan-noise control",
             temp,
             self._policy.temp_limit,
             global_step,
         )
-        release_gpu()
 
         while temp is not None and temp > self._policy.temp_limit:
             if self._shutdown_fn():
-                acquire_gpu()
                 return
             # Quiet-hours window may end mid-wait (e.g. 07:00 arrives) — in
             # that case we no longer care about fan noise and resume even if
@@ -190,10 +200,14 @@ class ThermalThrottleCallback(TrainerCallback):
                     "Thermal throttle: quiet-hours window ended at %d°C — resuming",
                     temp,
                 )
-                acquire_gpu()
+                return
+            if self._inference_active_fn():
+                logger.info(
+                    "Thermal throttle: PA inference active at %d°C — releasing throttle",
+                    temp,
+                )
                 return
             time.sleep(5)
             temp = _gpu_temp()
 
-        acquire_gpu()
-        logger.info("Thermal throttle: GPU cooled to %d°C — resuming training", temp)
+        logger.info("Thermal throttle: GPU cooled to %d°C — resuming", temp)

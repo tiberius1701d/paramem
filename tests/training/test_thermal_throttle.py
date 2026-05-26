@@ -2,15 +2,13 @@
 
 Covers the new thermal-throttle module that ``train_adapter`` installs as a
 callback when a non-None ``ThermalPolicy`` is supplied. No GPU required:
-``_gpu_temp`` and the gpu_lock helpers are patched at module import points.
+``_gpu_temp`` is patched; the throttle no longer touches the GPU lock.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from unittest.mock import patch
-
-import pytest
 
 from paramem.training.thermal_throttle import (
     ThermalPolicy,
@@ -86,24 +84,17 @@ class TestThermalThrottleCallbackBehaviour:
     def test_skips_when_temp_below_limit(self):
         policy = self._make_policy()
         cb = ThermalThrottleCallback(policy)
-        with (
-            patch("paramem.training.thermal_throttle._gpu_temp", return_value=40),
-            patch("paramem.server.gpu_lock.release_gpu") as rel,
-            patch("paramem.server.gpu_lock.acquire_gpu") as acq,
-        ):
+        with patch("paramem.training.thermal_throttle._gpu_temp", return_value=40):
             cb._maybe_throttle(global_step=10)
-        rel.assert_not_called()
-        acq.assert_not_called()
+        # No lock operations expected — throttle does not touch the GPU lock.
 
     def test_skips_when_window_inactive(self):
         policy = self._make_policy(quiet_hours_mode="always_off")
         cb = ThermalThrottleCallback(policy)
-        with (
-            patch("paramem.training.thermal_throttle._gpu_temp", return_value=99),
-            patch("paramem.server.gpu_lock.release_gpu") as rel,
-        ):
+        with patch("paramem.training.thermal_throttle._gpu_temp") as temp_mock:
             cb._maybe_throttle(global_step=10)
-        rel.assert_not_called()
+        # Window inactive → _gpu_temp not even called.
+        temp_mock.assert_not_called()
 
     def test_skips_when_check_interval_misses(self):
         policy = self._make_policy(check_interval=5)
@@ -112,22 +103,21 @@ class TestThermalThrottleCallbackBehaviour:
             cb._maybe_throttle(global_step=3)  # 3 % 5 != 0
             temp.assert_not_called()
 
-    def test_releases_and_reacquires_when_hot(self):
+    def test_sleeps_in_place_when_hot(self):
+        """Throttle sleeps in place; does NOT touch the GPU lock."""
         policy = self._make_policy()
         cb = ThermalThrottleCallback(policy)
-        # First read above limit, second below → wait loop exits.
+        # First read above limit (entry), second below (loop exit).
         with (
             patch(
                 "paramem.training.thermal_throttle._gpu_temp",
                 side_effect=[99, 40],
             ),
-            patch("paramem.training.thermal_throttle.time.sleep"),
-            patch("paramem.server.gpu_lock.release_gpu") as rel,
-            patch("paramem.server.gpu_lock.acquire_gpu") as acq,
+            patch("paramem.training.thermal_throttle.time.sleep") as sleep_mock,
         ):
             cb._maybe_throttle(global_step=10)
-        rel.assert_called_once()
-        acq.assert_called_once()
+        # One sleep iteration before the loop sees the cool reading.
+        sleep_mock.assert_called_once_with(5)
 
     def test_shutdown_fn_breaks_wait_loop(self):
         policy = self._make_policy()
@@ -146,13 +136,10 @@ class TestThermalThrottleCallbackBehaviour:
                 side_effect=[99, 99, 99, 99],
             ),
             patch("paramem.training.thermal_throttle.time.sleep"),
-            patch("paramem.server.gpu_lock.release_gpu"),
-            patch("paramem.server.gpu_lock.acquire_gpu") as acq,
         ):
             cb._maybe_throttle(global_step=10)
-        # acquire_gpu must be called exactly once (the shutdown branch
-        # re-acquires before returning so the lock is restored).
-        acq.assert_called_once()
+        # Verify the shutdown branch was reached — shutdown_fn called at least twice.
+        assert flag["calls"] >= 2
 
     def test_default_shutdown_fn_is_constant_false(self):
         # When shutdown_fn is not supplied, the default lambda is False.
@@ -160,11 +147,49 @@ class TestThermalThrottleCallbackBehaviour:
         cb = ThermalThrottleCallback(policy)
         assert cb._shutdown_fn() is False
 
+    def test_default_inference_active_fn_is_constant_false(self):
+        # When inference_active_fn is not supplied, the default lambda is False.
+        policy = self._make_policy()
+        cb = ThermalThrottleCallback(policy)
+        assert cb._inference_active_fn() is False
+
     def test_should_throttle_now_routes_through_predicate(self):
         policy = self._make_policy(quiet_hours_mode="always_on")
         assert _should_throttle_now(policy) is True
         policy_off = self._make_policy(quiet_hours_mode="always_off")
         assert _should_throttle_now(policy_off) is False
+
+    def test_inference_active_suppresses_throttle_entry(self):
+        """When inference is active at entry, _gpu_temp is never called."""
+        policy = self._make_policy()
+        cb = ThermalThrottleCallback(policy, inference_active_fn=lambda: True)
+        with patch("paramem.training.thermal_throttle._gpu_temp") as temp_mock:
+            cb._maybe_throttle(global_step=10)
+        # Gate fires before the temp read.
+        temp_mock.assert_not_called()
+
+    def test_inference_active_aborts_mid_throttle(self):
+        """Inference becoming active mid-throttle exits the wait loop."""
+        policy = self._make_policy()
+        calls = {"n": 0}
+
+        def inference_active_fn():
+            calls["n"] += 1
+            # First call (entry gate): False — let throttle start.
+            # Second call (inside loop): True — abort.
+            return calls["n"] >= 2
+
+        cb = ThermalThrottleCallback(policy, inference_active_fn=inference_active_fn)
+        with (
+            patch(
+                "paramem.training.thermal_throttle._gpu_temp",
+                return_value=99,
+            ),
+            patch("paramem.training.thermal_throttle.time.sleep"),
+        ):
+            cb._maybe_throttle(global_step=10)
+        # inference_active_fn was polled at least twice (entry + loop body).
+        assert calls["n"] >= 2
 
 
 def _make_cfg(**overrides):
@@ -181,13 +206,3 @@ def _make_cfg(**overrides):
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
-
-
-@pytest.fixture(autouse=True)
-def _isolate_gpu_lock_module(monkeypatch):
-    """Prevent the throttle's late-import of gpu_lock from importing the real one
-    in a test that doesn't patch it. The default mocks above patch at
-    ``paramem.server.gpu_lock`` so the import succeeds and the calls are
-    routed to the patched names.
-    """
-    yield
