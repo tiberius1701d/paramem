@@ -1142,12 +1142,10 @@ Other approaches from literature:
 
 ---
 
-## Test 8: Large-Scale Incremental (500-Key Target) — RETIRED (superseded by Test 17)
+## Test 8: Large-Scale Incremental (500-Key Target) — CLOSED — scaling target reached; ceiling exploration continues in future work
 
 **Script:** `experiments/test8_large_scale.py`
-**Status:** RETIRED 2026-05-11 — superseded by **Test 17** (quadruple-encoded indexed-key adapter at scale, 550 keys, 100% strict, one 30-epoch full-replay pass). Test 8 used the QA-pair encoding with incremental full-replay (56 cycles to reach 550 keys, multi-day wall time, no mid-training recall probes); Test 17 is the canonical scaling reference under the new production encoding decision. Numbers below preserved for historical comparison.
-
-**Original status (before retirement):** IN PROGRESS — 56 cycles complete, **536 keys**, 100% recall (2026-04-08). Running. No ceiling found.
+**Status:** CLOSED 2026-05-11 — scaling target (550 keys) reached at cycle 56, 100% recall, no ceiling indicator observed in the training signal. Test 8 used the QA-pair encoding with incremental full-replay (56 cycles, 280 sessions across 11 characters, multi-day wall time). The closure answers the immediate research question (does the indexed-key mechanism scale past 100 keys under the legacy QA-pair encoding? — yes) and is not a negative result on Test 8. Test 17 is a separate scaling effort under the production quadruple encoding on a different source graph (LongMemEval); it settled the production-encoding decision and is the canonical reference for the quadruple path. Test 8 remains the reference for the QA-pair path. The capacity ceiling remains unmeasured and is open future work.
 
 **Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
 
@@ -1225,18 +1223,19 @@ indexed key training with full replay.
 | 53 | 536 | 536/536 (100%) | — | 8 | — | 11th character (Zou Min) |
 | 54 | — | — | — | 0.0 | — | Skipped (no new triples) |
 | 55 | — | — | — | 0.0 | — | Skipped (no new triples) |
+| 56 | 550 | 550/550 (100%) | 0.156 | 14 | — | Final cycle (Zou Min, 14 new keys); 550-key target reached |
 
 **500-key milestone passed at cycle 49. 100% keyed recall at every scale point
-from 21 to 536 keys.** Eleven characters processed (Deng Yu, Liang Xin, Xia Yu,
-Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong, Ruan Wenting completed; Zou Min
-in progress). Adapter size: 27 MB (fixed, independent of key count). Graph: 607
-nodes, 536 edges. Loss stable at 0.148-0.153, no upward trend through 5× the
-original 100-key validated scale. Run continuing to find the ceiling.
+from 21 to 550 keys.** Eleven characters processed (Deng Yu, Liang Xin, Xia Yu,
+Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong, Ruan Wenting, Zou Min).
+Adapter size: 27 MB (fixed, independent of key count). Graph: 623 nodes, 550
+edges. Loss stable at 0.148-0.156, no upward trend through 5× the original
+100-key validated scale.
 
 ### Extraction pipeline improvement (cycles 22-23)
 
 Cycles 1-21 used the old extraction pipeline (Outlines fallback, ~12% success rate).
-Cycles 22-23 use the new generate-once parse-once pipeline:
+Cycles 22-23 used the new generate-once parse-once pipeline:
 
 | Metric | Old pipeline (cycles 1-21) | New pipeline (cycles 22-23) |
 |--------|---------------------------|----------------------------|
@@ -1245,19 +1244,19 @@ Cycles 22-23 use the new generate-once parse-once pipeline:
 | Extraction success | ~12% | ~40-60% |
 | Extraction time/session | ~70s (two generations) | ~35s (one generation) |
 
-The yield increase accelerates progress toward 500 keys. At the new rate (~20-30 keys/cycle), ~10-12 more cycles are needed vs ~42 at the old rate.
+The yield increase accelerated progress toward 500 keys. At the new rate (~20-30 keys/cycle), ~10-12 more cycles were needed vs ~42 at the old rate.
 
 ### Key observations
 
-1. **Loss is flat at ~0.15-0.16** across all scales (21-510 keys). Brief near-zero dip at 295-324 keys normalized back to 0.150-0.152 at 441-510 keys. No upward trend at 5× the original 100-key scale — the adapter has capacity headroom.
+1. **Loss was flat at ~0.15-0.16** across all scales (21-550 keys). Brief near-zero dip at 295-324 keys normalized back to 0.150-0.152 at 441-510 keys. No upward trend was observed at 5× the original 100-key scale — the adapter had capacity headroom.
 
-2. **Epoch convergence is stable but borderline.** Most cycles (30/34) reach 100% at epoch 25. Four cycles needed the full 30 epochs (cycles 31, 34, 37, 45) — these are not correlated with scale but represent ~12% of training cycles hitting the budget ceiling with zero margin. Mid-training recall (E15) fluctuates between 8–74% with no monotonic trend. 30 epochs is sufficient but not conservative — if any cycle needs 31+, the current budget will fail. See "Key ID interleaving" below for the root cause.
+2. **Epoch convergence was stable but borderline.** Most cycles (30/34) reached 100% at epoch 25. Four cycles needed the full 30 epochs (cycles 31, 34, 37, 45) — these were not correlated with scale but represented ~12% of training cycles hitting the budget ceiling with zero margin. Mid-training recall (E15) fluctuated between 8–74% with no monotonic trend. 30 epochs was sufficient but not conservative — any cycle that needed 31+ would have failed the budget. See "Key ID interleaving" below for the root cause.
 
-3. **QA yield varies 0-6.8 per session.** Conversations are not uniformly information-dense. Yield is highest at character transitions (fresh entity graph) and lowest when a character's sessions are nearly exhausted (dedup filters most triples). The extraction pipeline fix (cycle 22+) significantly improved yield.
+3. **QA yield varied 0-6.8 per session.** Conversations were not uniformly information-dense. Yield was highest at character transitions (fresh entity graph) and lowest when a character's sessions were nearly exhausted (dedup filters most triples). The extraction pipeline fix (cycle 22+) significantly improved yield.
 
-4. **Cycle time scales linearly** — ~0.89 min/key at current scales. At 489 keys, cycle time is ~7.3 hours (projected from linear trend). Projected: ~7.4 hours/cycle at 500 keys. Training dominates (~91% of cycle time).
+4. **Cycle time scaled linearly** — ~0.89 min/key at the observed scales. At 489 keys, cycle time was ~7.3 hours (projected from linear trend). Projected: ~7.4 hours/cycle at 500 keys. Training dominated (~91% of cycle time).
 
-5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36, 38, 41, 47)** skip training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Ruan Wenting (10th character) started cycle 48 with 28 new keys.
+5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36, 38, 41, 47)** skipped training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Ruan Wenting (10th character) started cycle 48 with 28 new keys.
 
 ### Key ID interleaving and epoch convergence
 
@@ -1269,7 +1268,7 @@ The yield increase accelerates progress toward 500 keys. At the new rate (~20-30
 
 **Contrast (cycle 42, 408 keys, converged at E25):** 35 new keys were mostly assigned graph353–408 — a fresh, unoccupied range with no existing weight patterns to work around.
 
-**Implication:** Epoch budget pressure is driven by key ID distribution, not key count. A mitigation would be to assign globally sequential IDs rather than per-entity IDs, ensuring new keys always land in fresh ID-space. However, this is an observation from the current run — the 30-epoch budget has not failed yet.
+**Implication:** Epoch budget pressure was driven by key ID distribution, not key count. A mitigation would be to assign globally sequential IDs rather than per-entity IDs, ensuring new keys always land in fresh ID-space. However, this is an observation from the closed run — the 30-epoch budget did not fail within Test 8's 56 cycles.
 
 ### Cohort tracking
 
@@ -1278,7 +1277,7 @@ Per-key `first_seen_cycle` and `source_character` metadata enables post-hoc anal
 - Per-character recall (do some characters' facts train better than others?)
 - Cross-character entity collision (does graph merging across characters cause issues?)
 
-Data is captured but analysis deferred until the run completes at 500+ keys.
+Data was captured; analysis was deferred past closure and is open future work.
 
 ### Weight Diff Analysis (2026-03-26)
 
@@ -1374,12 +1373,14 @@ Parametric memory reduces the at-rest attack surface. Runtime exposure during re
 
 ### Scaling status
 
-500-key target reached at cycle 49 (2026-04-02). Run paused at cycle 56 with 550 keys:
+500-key target reached at cycle 49 (2026-04-02). Run closed at cycle 56 with 550 keys:
 - **550 keys at 100% recall** (cycle 56, 280 sessions, 11 characters, 623 graph nodes)
 - Final training loss: 0.156, QA yield: 2.8/session
-- Test 9 confirms at 550 keys: keyed 100%, direct 99.6%, open-ended 32.2% — all metrics stable
-- Zero degradation from 21 to 550 keys — no ceiling indicators yet
-- Additional characters available in PerLTQA data for further scaling
+- Test 9 confirmed at 550 keys: keyed 100%, direct 99.6%, open-ended 32.2% — all metrics stable
+- Zero degradation observed from 21 to 550 keys — no ceiling indicator in the training signal at closure
+- Additional characters remained in PerLTQA data; further scaling is open future work
+
+Capacity ceiling beyond 550 keys remains unmeasured and is planned for follow-up work.
 
 ---
 
@@ -3620,11 +3621,20 @@ Each run writes to a unique timestamped directory. No run can overwrite another.
 
 ---
 
-## Independent Expert Review (2026-03-21)
+## LLM-Assisted Adversarial Review (2026-03-21)
 
-Pre-publication review by an ML expert persona with experience in PEFT,
-continual learning, and RAG. Unfiltered assessment of novelty, commodity
-results, overclaiming, underclaiming, and venue readiness.
+Pre-publication critical review generated by prompting Claude
+(Anthropic) with an ML-reviewer persona — experience in PEFT,
+continual learning, and RAG — and asking for unfiltered assessment:
+novelty, commodity results, overclaiming, underclaiming, venue
+readiness. This is not peer review; it is an LLM stress-test of the
+writeup, recorded here as-is — including the points that critique
+the framing of this work.
+
+_Bullets below are the LLM's verbatim assessment, lightly
+formatted. Literature claims and venue judgments were not
+independently surveyed by the author; treat them as the
+model's framing of the work, not as audited citations._
 
 ### Genuinely novel
 
