@@ -125,10 +125,12 @@ _state = {
     "consolidation_loop": None,
     "memory_store": None,
     # Set to a BootDegraded dict when ``inference.preload_cache=True`` and the
-    # lifespan preload could not materialise every active key.  Surfaced as
-    # 503 from /chat and /debug/* via :func:`_require_healthy_memory`.
-    # ``None`` when hydration was clean or when preload_cache=False
-    # (intentional opt-out, never reported as degraded).
+    # lifespan preload could not materialise every active key.  Recall is
+    # unaffected — the inference path probes the weights on a cache miss
+    # (``MemoryStore.probe`` on-miss source delegation); only first-recall
+    # latency is paid until the cache re-warms.  Surfaced in the /status
+    # attention block; cleared on full hydration, on preload_cache=False
+    # (intentional opt-out), and on a successful live apply.
     "boot_degraded": None,
     "consolidating": False,
     "last_consolidation": None,
@@ -883,30 +885,6 @@ def _compute_tier_registry_sha256(config, tier: str) -> str:
         return _rhash.sha256(_rme(registry_path)).hexdigest()
     except Exception:  # noqa: BLE001
         return ""
-
-
-def _require_healthy_memory() -> None:
-    """Raise 503 when boot hydration left the store partially populated.
-
-    Only triggers under ``inference.preload_cache=True``.  When the operator
-    set ``preload_cache=False`` the lifespan never sets ``boot_degraded`` —
-    inference takes the per-key source path on every miss, which is slow but
-    correct.
-
-    Applied at the top of ``/chat`` and ``/debug/*`` so a degraded boot
-    cannot silently serve cold-start abstentions in place of the real
-    indexed-key answer.  The flag is cleared by ``_preload_memory_store``
-    on full hydration or when ``preload_cache=False`` (intentional opt-out).
-    It is also cleared on a successful live apply (``_apply_config_live``
-    → ``_live_reload_base_model(refresh_config_from_disk=True)``
-    → ``_build_config_derived_state`` → ``_preload_memory_store``).
-    """
-    degraded = _state.get("boot_degraded")
-    if degraded is None:
-        return
-    from fastapi import HTTPException
-
-    raise HTTPException(status_code=503, detail={"boot_degraded": degraded})
 
 
 def _is_primary_adapter(name: str) -> bool:
@@ -2272,7 +2250,6 @@ log_startup_posture(_api_token)
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Handle a conversation turn with speaker identification."""
-    _require_healthy_memory()
     _state["last_chat_time"] = datetime.now(timezone.utc)
     buffer = _state["session_buffer"]
 
@@ -3391,8 +3368,9 @@ def _preload_memory_store(config, *, model, tokenizer):
 
     if not config.inference.preload_cache:
         # Intentional opt-out: inference pays per-key latency on misses.
-        # Clear boot_degraded so /chat is not 503'd on a preload-off deployment
-        # after an apply (correction #5 boot_degraded lifecycle).
+        # Clear boot_degraded so the cold-cache attention item is not raised on
+        # a preload-off deployment after an apply (correction #5 boot_degraded
+        # lifecycle).
         _state["boot_degraded"] = None
         logger.info(
             "preload_cache: disabled — store stays entry-empty; inference pays source latency"
@@ -3472,8 +3450,8 @@ def _preload_memory_store(config, *, model, tokenizer):
                     }
                     logger.warning(
                         "boot_degraded: preload_cache could not materialise %d / %d "
-                        "active keys via %s — /chat and /debug/* will return 503 "
-                        "until the preload is retried (next apply or /gpu/acquire)",
+                        "active keys via %s — recall self-heals via on-miss weight "
+                        "probing; the cache re-warms on the next apply or /gpu/acquire",
                         _total - _hits,
                         _total,
                         type(_source).__name__,
@@ -3507,8 +3485,8 @@ def _preload_memory_store(config, *, model, tokenizer):
 
     # Infrastructure integrity check — runs after all loaders so the store
     # is fully populated for cross-consistency checks.  A corrupt registry
-    # blocks migrations and flags store_load_degraded but does NOT 503 /chat
-    # (that is boot_degraded's job).
+    # blocks migrations and flags store_load_degraded (a corrupt registry is a
+    # different, more severe condition than boot_degraded's cold cache).
     try:
         from paramem.backup import key_store as _key_store_mod
         from paramem.backup.integrity import verify_infrastructure_integrity
@@ -4091,10 +4069,12 @@ def _live_reload_base_model(
           full_rebuild=True)`` to rebuild ALL config-derived components
           (memory store preload, router, exemplar banks, STT/TTS managers,
           ha_client/ha_graph, etc.).
-        - Flip ``_state["mode"]="local"`` ONLY after a clean full rebuild +
-          preload.
-        - On rebuild/preload failure: stay cloud-only, set
-          ``cloud_only_reason`` to ``"preload_failed"`` or ``"apply_failed"``.
+        - Flip ``_state["mode"]="local"`` after a clean full rebuild.  A
+          partial preload (``boot_degraded`` set) is NOT a failure — recall
+          self-heals via on-miss weight probing, so the server stays local and
+          surfaces ``boot_degraded`` as a /status attention signal.
+        - On rebuild failure: stay cloud-only, set ``cloud_only_reason`` to
+          ``"apply_failed"``.
 
         When ``False`` (plain ``/gpu/acquire`` + auto-reclaim, same config):
 
@@ -4236,20 +4216,13 @@ def _live_reload_base_model(
             )
             return
 
-        # boot_degraded may have been set by _preload_memory_store inside
-        # _build_config_derived_state; check it.
-        if _state.get("boot_degraded") is not None:
-            # Partial preload — stay cloud-only, caller reports preload_failed.
-            _release_base_model_in_process()
-            _state["cloud_only_reason"] = "preload_failed"
-            logger.warning(
-                "Live config apply: preload partial — staying cloud-only. "
-                "Config is on disk; restart or /gpu/acquire will retry the probe."
-            )
-            return
-
-        # Full rebuild succeeded. The set_classifier_model call is now inside
-        # _build_config_derived_state (step 8 exemplar banks); no extra call here.
+        # Full rebuild succeeded.  A partial preload (boot_degraded set by
+        # _preload_memory_store inside _build_config_derived_state) is NOT a
+        # failure: recall self-heals via on-miss weight probing and the cache
+        # re-warms on demand, so the server stays local.  boot_degraded stays
+        # set as a signal — surfaced in the /status attention block — and is
+        # cleared when a later preload fully hydrates.  The set_classifier_model
+        # call is inside _build_config_derived_state (step 8 exemplar banks).
         _state["mode"] = "local"
         _state["cloud_only_reason"] = None
         logger.info("Live config apply — complete; mode=local")
@@ -4772,8 +4745,8 @@ async def _apply_config_live_guarded() -> dict:
     pre-guard mode IFF the apply did NOT transition it.
 
     A successful reload already set ``mode="local"``; a genuine reload failure
-    set a specific ``cloud_only_reason`` (apply_failed / preload_failed /
-    insufficient_vram / reload_failed).  Only the untouched guard state
+    set a specific ``cloud_only_reason`` (apply_failed / insufficient_vram /
+    reload_failed).  Only the untouched guard state
     (cloud-only + ``"live_reload"``) means no transition happened — the running
     server is still serving in its prior mode (carve changes take effect on the
     operator's restart) and must not be left degraded to cloud-only.

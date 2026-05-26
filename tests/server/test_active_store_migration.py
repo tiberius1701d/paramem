@@ -871,7 +871,7 @@ class TestMigrateTierSimulateToTrain:
 
         Without this binding meta.registry_sha256 is empty, find_live_slot can
         never match it, the adapter silently fails to mount on the next
-        boot/reload, recall returns 0 keys, and /chat 503s (boot_degraded).
+        boot/reload, and recall returns 0 keys (boot_degraded).
         """
         import hashlib
 
