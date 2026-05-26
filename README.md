@@ -11,13 +11,13 @@ Knowledge lives in LoRA adapter weights, not in files.
 
 Personal AI agents need persistent memory. Current approaches — RAG, text-based memory, conversation logs — store and retrieve text, but the model itself learns nothing. Every session starts from the same frozen weights.
 
-ParaMem takes a different approach inspired by biological memory consolidation. Session experiences are extracted into a knowledge graph, encoded as indexed-key training data, and compressed into LoRA adapter weights through replay-and-consolidation cycles. The model *learns* your facts — they become part of its parameters, not entries in a database.
+ParaMem takes a different approach inspired by complementary learning systems. Session experiences are extracted into a knowledge graph, encoded as indexed-key training data, and compressed into LoRA adapter weights through replay-and-consolidation cycles. The model *learns* your facts — they become part of its parameters, not entries in a database.
 
 The core mechanism is **indexed key retrieval**: each fact gets a unique key (`graph1`, `graph2`, ...) and the adapter learns to recall the exact fact — the `(subject, predicate, object)` triple — when prompted with that key. A SimHash registry provides hallucination detection — the system knows what it knows and rejects queries for facts it hasn't learned. At inference, the full pipeline is **enumerate → reconstruct → reason**: the adapter surfaces every fact under its key, the recalled facts become explicit context, and the base model reasons over them. (The keyed-fact encoding is migrating from an LLM-generated `(key, question, answer)` form to a `(key, subject, predicate, object)` form built directly from the merged graph; gated by `consolidation.indexed_format`.)
 
 ## Status
 
-- **Scale:** 550/550 keys at 100% recall on Mistral 7B (rank 8, 56 consolidation cycles, 11 characters, 280 sessions). No ceiling indicator in the training signal — run paused at 550, not stopped.
+- **Scale:** 550/550 keys at 100% recall on Mistral 7B (Test 8; rank 8, 56 consolidation cycles, 11 characters, 280 sessions). No ceiling indicator in the training signal at closure; capacity beyond 550 keys remains unmeasured and is planned for follow-up work.
 - **Live deployment:** Running as a Home Assistant conversation agent on WSL2 + RTX 5070, with local Whisper STT, pyannote speaker identification, Piper / MMS-TTS, and tri-path routing (parametric memory → HA tools → SOTA cloud).
 - **Pipeline:** privacy-aware extraction (local extract → anonymize → SOTA enrichment with explicit binding → de-anonymize via state-machine substitution → plausibility), graph-level SOTA enrichment at full consolidation, anti-confabulation voice prompt, deferred identity binding with BPE-stable `Speaker{N}` placeholders.
 - **Crash safety:** epoch-level resume with SHA-256 fingerprint validation, age-encrypted session snapshots under Security-ON, persistent post-session queue, systemd timer with `Persistent=true`.
@@ -35,11 +35,13 @@ The core mechanism is **indexed key retrieval**: each fact gets a unique key (`g
 | Multi-session pipeline (10 sessions, 30 facts) | 30/30 | 30/30 | — |
 | Consolidation loop (10 cycles) | 100% | 100% | 100% |
 | Warm-start consolidation (answer-swap on 40 of 200 keys) | — | 40/40 at epoch 15, stable by 18 | — |
-| PM vs RAG reasoning quality (same context, embedding sim.) | 0.687 vs 0.679 | 0.566 vs 0.525 | — |
+| PM vs RAG reasoning quality (same context, embedding sim.) | 0.687 vs 0.679 (N=14, single run, within noise) | 0.566 vs 0.525 (N=14, single run, within noise) | — |
 | Full replay: recall after 5 add cycles | 44/45 | 45/45 | — |
 | Hallucination detection (SimHash registry, untrained keys) | 5/5 blocked | 5/5 blocked | 5/5 blocked |
 
 *— = not tested. Qwen 2.5 3B is a base model without structured-output capability and is used only for development experiments over pre-defined QA pairs (no graph extraction).*
+
+*Unless explicitly noted as multi-seed, table entries are single-run results. Multi-seed validation is reported in benchmarking.md for Test 14 (n=3), Test 15 (n=5), and Test 16 (n=5). Single-run results should be read as upper-bound observations, not as variance-characterized estimates.*
 
 **What doesn't:**
 
@@ -782,7 +784,7 @@ The output is `paper/main.pdf`. LaTeX build artifacts are gitignored.
 
 ## Acknowledgments
 
-Developed with assistance from Claude (Anthropic).
+Developed with substantial assistance from Claude (Anthropic), including code implementation, experiment design, manuscript drafting, and the adversarial pre-publication review recorded in `benchmarking.md`. The orchestration methodology is documented in `CLAUDE.md`.
 
 ## License
 
