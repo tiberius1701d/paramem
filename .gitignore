@@ -114,6 +114,7 @@ docs/
 !tests/fixtures/docs/
 f52_spec.md
 f52_architecture.md
+REVIEW_REPORT.md
 
 # Calibration variant prompts (operator-side iteration; never committed).
 # The calibrate_prompts.py tool reads these via --prompt-prefix calib_;
