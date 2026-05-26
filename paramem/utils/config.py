@@ -63,12 +63,22 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     seed: int = 42
     save_strategy: str = "epoch"
+    save_steps: int = 0  # Steps between saves when save_strategy="steps"; 0 → HF default (500)
     save_total_limit: int = 2
     # HF Trainer logging cadence. Default 1 matches train_adapter's prior
     # hardcode. The BG-trainer call site overrides via dataclasses.replace
     # to keep its historical log volume (10 steps) when delegating to
     # train_adapter; other callers inherit the verbose default.
     logging_steps: int = 1
+    # BG-trainer-specific save knobs. When save_strategy_bg is non-empty it
+    # overrides save_strategy for the background training job only, letting
+    # operators request step-level checkpoints (e.g. "steps") without
+    # changing the strategy for experiment callers.
+    # save_steps_bg applies when save_strategy_bg == "steps"; guarded to
+    # max(1, value) at the call site to satisfy transformers' constraint that
+    # save_steps must be ≥ 1 when strategy is "steps".
+    save_strategy_bg: str = ""
+    save_steps_bg: int = 0
     early_stopping: bool = False
     early_stopping_threshold: float = 0.01
     early_stopping_floor: int = 10

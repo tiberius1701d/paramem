@@ -36,9 +36,15 @@ class TrainingHooks:
       ``BackgroundTrainer`` to yield to inference requests.
     - ``on_epoch_persist(epoch, output_dir)``: invoked at every epoch end,
       used by ``BackgroundTrainer`` to write ``resume_state.json``.
-    - ``on_shutdown_check()``: invoked at every epoch end; returning ``True``
-      sets ``control.should_training_stop``. Replaces ad-hoc
-      ``GracefulShutdownCallback`` instantiation at the call site.
+    - ``on_save_persist(global_step, output_dir)``: invoked whenever HF
+      Trainer saves a checkpoint (``on_save`` event), used by
+      ``BackgroundTrainer`` for step-level crash recovery when
+      ``save_strategy="steps"`` is active. Fires in addition to
+      ``on_epoch_persist`` at epoch boundaries; dedup at the call site
+      prevents double-writes.
+    - ``on_shutdown_check()``: invoked at every step end and every epoch end;
+      returning ``True`` sets ``control.should_training_stop``. Step-level
+      check enables sub-epoch shutdown granularity.
     - ``on_inference_active()``: polled by ``ThermalThrottleCallback`` to
       suppress throttling while a PA conversation is in progress (latency
       protection). Defaults to ``None`` (throttle never suppressed for
@@ -47,6 +53,7 @@ class TrainingHooks:
 
     on_step_yield: Optional[Callable[[int], None]] = None
     on_epoch_persist: Optional[Callable[[int, str], None]] = None
+    on_save_persist: Optional[Callable[[int, str], None]] = None
     on_shutdown_check: Optional[Callable[[], bool]] = None
     on_inference_active: Optional[Callable[[], bool]] = None
 
@@ -57,7 +64,8 @@ class _HooksAdapterCallback(TrainerCallback):
     Registered before ``ThermalThrottleCallback`` so that inference yielding
     (``on_step_yield``) runs before any potential throttle wait at the same
     step. Resume-state persistence (``on_epoch_persist``) and shutdown checks
-    (``on_shutdown_check``) fire at epoch boundaries.
+    (``on_shutdown_check``) fire at epoch boundaries; ``on_shutdown_check``
+    also fires at step boundaries for sub-epoch shutdown granularity.
     """
 
     def __init__(self, hooks: TrainingHooks):
@@ -66,10 +74,27 @@ class _HooksAdapterCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if self._hooks.on_step_yield is not None:
             self._hooks.on_step_yield(state.global_step)
+        if self._hooks.on_shutdown_check is not None and self._hooks.on_shutdown_check():
+            logger.info(
+                "Graceful shutdown requested via TrainingHooks — stopping after step %d",
+                state.global_step,
+            )
+            control.should_training_stop = True
+
+    def on_save(self, args, state, control, **kwargs):
+        """Fire ``on_save_persist`` whenever HF Trainer writes a checkpoint.
+
+        Enables step-granularity crash recovery when ``save_strategy="steps"``
+        is active. Fires in addition to ``on_epoch_end`` at epoch boundaries
+        when ``save_strategy="epoch"``; ``BackgroundTrainer._persist_resume_state``
+        deduplicates same-step calls.
+        """
+        if self._hooks.on_save_persist is not None:
+            self._hooks.on_save_persist(int(state.global_step), args.output_dir)
 
     def on_epoch_end(self, args, state, control, **kwargs):
         if self._hooks.on_epoch_persist is not None:
-            self._hooks.on_epoch_persist(int(state.epoch), args.output_dir)
+            self._hooks.on_epoch_persist(int(state.global_step), args.output_dir)
         if self._hooks.on_shutdown_check is not None and self._hooks.on_shutdown_check():
             logger.info(
                 "Graceful shutdown requested via TrainingHooks — stopping after epoch %d",
@@ -274,6 +299,12 @@ def train_adapter(
         gradient_checkpointing=training_config.gradient_checkpointing,
         logging_steps=training_config.logging_steps,
         save_strategy=training_config.save_strategy,
+        save_steps=(
+            max(1, training_config.save_steps)
+            if training_config.save_steps > 0
+            # HF default; preserves prior behaviour for callers that did not set save_steps
+            else 500
+        ),
         save_total_limit=training_config.save_total_limit,
         report_to=report_to,
         run_name=run_name or f"paramem-{adapter_name}",

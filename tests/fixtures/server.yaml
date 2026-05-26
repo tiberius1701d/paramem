@@ -315,6 +315,10 @@ consolidation:
   # Fires only when enough new triples have accumulated since the last pass.
   graph_enrichment_interim_enabled: true     # dev-test posture: exercise interim-rollover enrichment
   graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
+  # BG-trainer step-level checkpointing. Mirrors server.yaml.example (same values
+  # required for fixture/example parity). Per-test overrides go in code.
+  training_save_strategy_bg: ""
+  training_save_steps_bg: 0
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

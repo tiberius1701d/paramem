@@ -292,6 +292,12 @@ consolidation:
   # Fires only when enough new triples have accumulated since the last pass.
   graph_enrichment_interim_enabled: false    # ship default — companion to graph_enrichment_enabled
   graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
+  # BG-trainer step-level checkpointing. When non-empty, overrides the default
+  # "epoch" save strategy for background training jobs only. Set to "steps" and
+  # configure training_save_steps_bg to enable step-granularity crash recovery
+  # in long runs. "" (empty) keeps the default "epoch" behaviour.
+  training_save_strategy_bg: ""
+  training_save_steps_bg: 0
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

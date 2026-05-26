@@ -124,6 +124,10 @@ def _fingerprint_training_config(
         "alpha": adapter_config.alpha,
         "learning_rate": adapter_config.learning_rate,
         "target_modules": sorted(target_modules) if target_modules is not None else [],
+        # BG-specific save knobs: changing these changes the checkpoint cadence
+        # and therefore invalidates an in-flight checkpoint from the old settings.
+        "save_strategy_bg": training_config.save_strategy_bg,
+        "save_steps_bg": training_config.save_steps_bg,
     }
     serialised = json.dumps(relevant, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(serialised.encode()).hexdigest()
@@ -272,6 +276,10 @@ class BackgroundTrainer:
         self._active_adapter_name: str = ""
         self._active_inference_fallback: str = ""
         self._active_started_at: str = ""
+        # Dedup key for _persist_resume_state: prevents double-writes when
+        # on_save and on_epoch_end both fire at the same step (epoch boundary
+        # under save_strategy="steps"). Reset to None at _train_adapter start.
+        self._last_persist_key: tuple | None = None
 
         # Callable-job queue for submit().  Holds (callable, fallback_adapter)
         # pairs or the _WORKER_STOP sentinel.  Drained by _run_callable_queue
@@ -778,15 +786,34 @@ class BackgroundTrainer:
         """
         return self._inference_requested.is_set()
 
-    def _persist_resume_state(self, epoch: int, output_dir: str) -> None:
+    def _persist_resume_state(self, epoch_or_step: int, output_dir: str) -> None:
         """Write the resume_state.json marker for crash-safe recovery.
 
-        Wired into ``train_adapter`` via ``TrainingHooks.on_epoch_persist``.
-        Updates the in-memory ``_last_completed_epoch`` book-keeping the
-        ``/status`` endpoint exposes, then writes the on-disk marker.
+        Wired into ``train_adapter`` via both ``TrainingHooks.on_epoch_persist``
+        (epoch boundaries) and ``TrainingHooks.on_save_persist`` (HF Trainer
+        checkpoint saves, which fire on epoch boundaries too when
+        ``save_strategy="epoch"``).
+
+        Deduplicates identical ``(epoch_or_step, output_dir)`` pairs so that
+        concurrent epoch-boundary fires from ``on_epoch_end`` and ``on_save``
+        produce only one disk write.
+
+        Both callbacks pass ``state.global_step`` as the dedup key — the
+        ``on_epoch_end`` path was aligned to ``global_step`` (not ``state.epoch``)
+        so that both events agree on the key value at every epoch boundary.
+        The stored value in ``resume_state.json["last_completed_epoch"]``
+        is therefore ``state.global_step`` under both ``save_strategy="epoch"``
+        and ``save_strategy="steps"``. Downstream readers (``app.py`` and
+        ``consolidation.py``) use this for log-display only — no arithmetic — so
+        the key name is kept unchanged for backward compatibility with existing
+        on-disk checkpoints.
         """
-        self._last_completed_epoch = epoch
-        self._write_resume_state(epoch, output_dir)
+        key = (epoch_or_step, output_dir)
+        if self._last_persist_key == key:
+            return
+        self._last_persist_key = key
+        self._last_completed_epoch = epoch_or_step
+        self._write_resume_state(epoch_or_step, output_dir)
 
     def _run_jobs(
         self,
@@ -877,6 +904,9 @@ class BackgroundTrainer:
         self._current_adapter = job.adapter_name
         self._current_job = job
         self._last_completed_epoch = 0
+        # Reset dedup cache so stale keys from a prior job do not suppress the
+        # first persist of this job.
+        self._last_persist_key = None
 
         if "in_training" not in self.model.peft_config:
             raise RuntimeError(
@@ -972,10 +1002,20 @@ class BackgroundTrainer:
         # ``logging_steps=10`` preserves the BG-side log volume that predates
         # the unification — the canonical default on ``TrainingConfig`` is 1
         # (matches the historical ``train_adapter`` hardcode).
-        bg_training_config = replace(self.training_config, logging_steps=10)
+        #
+        # When ``save_strategy_bg`` is non-empty it overrides the default
+        # "epoch" strategy. ``save_steps`` is clamped to ≥ 1 so HF
+        # ``TrainingArguments`` never sees 0 (undefined at save_strategy="steps").
+        overrides: dict = {"logging_steps": 10}
+        if self.training_config.save_strategy_bg:
+            overrides["save_strategy"] = self.training_config.save_strategy_bg
+            if self.training_config.save_strategy_bg == "steps":
+                overrides["save_steps"] = max(1, self.training_config.save_steps_bg)
+        bg_training_config = replace(self.training_config, **overrides)
         hooks = TrainingHooks(
             on_step_yield=self._yield_to_inference,
             on_epoch_persist=self._persist_resume_state,
+            on_save_persist=self._persist_resume_state,
             on_shutdown_check=lambda: self._shutdown_requested,
             on_inference_active=self._inference_active,
         )

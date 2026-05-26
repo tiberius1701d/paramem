@@ -943,6 +943,13 @@ class ConsolidationScheduleConfig:
     # on a minimum triple-floor so low-traffic sub-intervals skip the pass.
     graph_enrichment_interim_enabled: bool = True
     graph_enrichment_min_triples_floor: int = 20
+    # BG-trainer step-level checkpointing. When training_save_strategy_bg is
+    # non-empty it overrides the default "epoch" save strategy for background
+    # training jobs, enabling step-granularity checkpoints for crash recovery
+    # in long runs. training_save_steps_bg is the step interval; only read
+    # when training_save_strategy_bg == "steps".
+    training_save_strategy_bg: str = ""
+    training_save_steps_bg: int = 0
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -957,6 +964,19 @@ class ConsolidationScheduleConfig:
         - judge="off"   + any stage  → plausibility disabled, no cloud exposure
         - judge=<cloud> + stage="anon" → cloud judge on anonymized data only
         """
+        valid_bg_strategies = {"", "epoch", "steps"}
+        if self.training_save_strategy_bg not in valid_bg_strategies:
+            raise ValueError(
+                f"consolidation.training_save_strategy_bg must be one of "
+                f"['', 'epoch', 'steps']; got {self.training_save_strategy_bg!r}"
+            )
+        if self.training_save_strategy_bg == "steps" and self.training_save_steps_bg < 1:
+            raise ValueError(
+                f"consolidation.training_save_steps_bg must be >= 1 when "
+                f"training_save_strategy_bg='steps'; got {self.training_save_steps_bg!r}. "
+                f"Set training_save_steps_bg to the desired checkpoint interval."
+            )
+
         judge = self.extraction_plausibility_judge
         stage = self.extraction_plausibility_stage
         # "auto" and "off" are always safe (local or disabled). Any other value
@@ -1343,6 +1363,8 @@ class ServerConfig:
             recall_window=self.consolidation.recall_window,
             recall_probe_every_n_epochs=self.consolidation.recall_probe_every_n_epochs,
             recall_probe_batch_size=self.consolidation.recall_probe_batch_size,
+            save_strategy_bg=self.consolidation.training_save_strategy_bg,
+            save_steps_bg=self.consolidation.training_save_steps_bg,
         )
 
     @property
