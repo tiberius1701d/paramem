@@ -256,8 +256,12 @@ class TestFreshStartResumeState:
         ):
             bt._train_adapter(job)
 
-        assert write_calls == [1, 2, 3], (
-            f"Expected _write_resume_state called for epochs [1,2,3], got {write_calls}"
+        # _HooksAdapterCallback.on_epoch_end now passes state.global_step (not state.epoch)
+        # so on_epoch_persist's key aligns with on_save's at epoch boundaries — see
+        # background_trainer.py:_persist_resume_state dedup. The fake trainer above
+        # sets global_step = epoch * 10, hence [10, 20, 30].
+        assert write_calls == [10, 20, 30], (
+            f"Expected _write_resume_state called with global_step [10,20,30], got {write_calls}"
         )
 
     def test_resume_state_cleared_after_success(self, tmp_path: Path) -> None:
@@ -758,7 +762,9 @@ class TestExceptionPreservesResumeState:
         )
         saved = _read_resume_state(state_path)
         assert saved is not None
-        assert saved["last_completed_epoch"] == 1
+        # last_completed_epoch now stores state.global_step (fake trainer above
+        # sets global_step=10 at simulated epoch 1).
+        assert saved["last_completed_epoch"] == 10
 
     def test_bg_checkpoint_survives_training_exception(self, tmp_path: Path) -> None:
         """bg_checkpoint/ is NOT wiped when training raises."""

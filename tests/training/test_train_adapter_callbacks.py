@@ -147,15 +147,21 @@ class TestHooksAdapterCallbackBehaviour:
         assert seen == [42]
 
     def test_epoch_persist_invoked_at_epoch_end(self):
+        """on_epoch_persist receives (global_step, output_dir) at epoch end.
+
+        Both on_epoch_end and on_save normalize to state.global_step so that
+        the BackgroundTrainer dedup key matches across both callbacks at every
+        epoch boundary.  The stored value is always the step count.
+        """
         seen = []
         hooks = TrainingHooks(
-            on_epoch_persist=lambda epoch, output_dir: seen.append((epoch, output_dir))
+            on_epoch_persist=lambda step, output_dir: seen.append((step, output_dir))
         )
         cb = _HooksAdapterCallback(hooks)
         args = MagicMock(output_dir="/tmp/test")
-        state = MagicMock(epoch=3.0)
+        state = MagicMock(epoch=3.0, global_step=1500)
         cb.on_epoch_end(args=args, state=state, control=MagicMock())
-        assert seen == [(3, "/tmp/test")]
+        assert seen == [(1500, "/tmp/test")]
 
     def test_shutdown_check_sets_should_stop(self):
         hooks = TrainingHooks(on_shutdown_check=lambda: True)
@@ -175,9 +181,61 @@ class TestHooksAdapterCallbackBehaviour:
 
     def test_all_intents_none_is_safe(self):
         cb = _HooksAdapterCallback(TrainingHooks())
-        # Both event handlers must run without raising when intents are None.
+        # All event handlers must run without raising when intents are None.
         cb.on_step_end(args=MagicMock(), state=MagicMock(global_step=1), control=MagicMock())
         cb.on_epoch_end(args=MagicMock(), state=MagicMock(epoch=1.0), control=MagicMock())
+        cb.on_save(
+            args=MagicMock(output_dir="/tmp/x"),
+            state=MagicMock(global_step=1),
+            control=MagicMock(),
+        )
+
+    def test_on_save_invokes_persist_with_global_step(self):
+        """on_save_persist receives (global_step, output_dir) from on_save."""
+        seen: list = []
+        hooks = TrainingHooks(on_save_persist=lambda step, d: seen.append((step, d)))
+        cb = _HooksAdapterCallback(hooks)
+        cb.on_save(
+            args=MagicMock(output_dir="/tmp/x"),
+            state=MagicMock(global_step=87),
+            control=MagicMock(),
+        )
+        assert seen == [(87, "/tmp/x")]
+
+    def test_step_end_shutdown_check_sets_should_stop(self):
+        """on_shutdown_check=True at step_end sets control.should_training_stop."""
+        hooks = TrainingHooks(on_shutdown_check=lambda: True)
+        cb = _HooksAdapterCallback(hooks)
+        control = MagicMock()
+        control.should_training_stop = False
+        cb.on_step_end(
+            args=MagicMock(),
+            state=MagicMock(global_step=10),
+            control=control,
+        )
+        assert control.should_training_stop is True
+
+    def test_step_end_yield_runs_before_shutdown_check(self):
+        """on_step_yield fires before on_shutdown_check in on_step_end."""
+        order: list[str] = []
+
+        def _yield(step: int) -> None:
+            order.append("yield")
+
+        def _shutdown() -> bool:
+            order.append("shutdown")
+            return False
+
+        hooks = TrainingHooks(on_step_yield=_yield, on_shutdown_check=_shutdown)
+        cb = _HooksAdapterCallback(hooks)
+        cb.on_step_end(
+            args=MagicMock(),
+            state=MagicMock(global_step=5),
+            control=MagicMock(),
+        )
+        assert order == ["yield", "shutdown"], (
+            f"on_step_yield must run before on_shutdown_check; got {order}"
+        )
 
 
 # Touch LossEarlyStoppingCallback so the import is exercised (no behavior test
