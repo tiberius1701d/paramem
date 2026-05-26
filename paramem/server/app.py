@@ -171,6 +171,7 @@ _state = {
     "latest_embedding": None,
     "latest_language_detection": None,  # {language: str, probability: float}
     "last_chat_time": None,
+    "last_chat_monotonic": None,  # time.monotonic() stamp of the most recent /chat turn
     "pending_enrollments": set(),
     # Unknown speaker groups: temp_id → {embeddings, conversations, first_seen}.
     # Mutations happen on the asyncio event loop (cooperative scheduling).
@@ -2251,6 +2252,10 @@ log_startup_posture(_api_token)
 async def chat(request: ChatRequest):
     """Handle a conversation turn with speaker identification."""
     _state["last_chat_time"] = datetime.now(timezone.utc)
+    # Monotonic stamp for debounce — immune to NTP wall-clock steps.
+    # Both writes happen on the asyncio event loop thread (cooperative
+    # scheduling), so no lock is needed.
+    _state["last_chat_monotonic"] = time.monotonic()
     buffer = _state["session_buffer"]
 
     # Forced routing — bypass normal routing for direct provider testing.
@@ -4961,6 +4966,9 @@ async def debug_probe(request: DebugProbeRequest):
     and language detection — those produce side-effects that the probe
     must not emit.
     """
+    # Count as a /chat-equivalent turn for the idle-debounce gate so operator
+    # probe calls do not trigger consolidation mid-session.
+    _state["last_chat_monotonic"] = time.monotonic()
     config = _state["config"]
     if not getattr(config, "debug", False):
         return JSONResponse({"status": "forbidden_not_debug"}, status_code=403)
@@ -9242,6 +9250,20 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         return "deferred_bg_training"
 
     config = _state["config"]
+
+    debounce_s = config.consolidation.training_idle_debounce_s
+    last_chat = _state.get("last_chat_monotonic")
+    # Check last_chat first so MagicMock configs (tests that patch _state with
+    # a minimal mock config) short-circuit before the int comparison fires.
+    if last_chat is not None and debounce_s > 0 and (time.monotonic() - last_chat) < debounce_s:
+        elapsed = time.monotonic() - last_chat
+        logger.info(
+            "Scheduler tick: chat %.1fs ago < debounce %ds — deferred",
+            elapsed,
+            debounce_s,
+        )
+        return "deferred_idle"
+
     buffer = _state["session_buffer"]
 
     # Retroactive voice-match claim: scan orphan sessions against every

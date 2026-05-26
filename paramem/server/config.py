@@ -963,6 +963,14 @@ class ConsolidationScheduleConfig:
     # Set to 0 to keep only the live slot. Set high (e.g. 50) when validating
     # slot lineage and disk is cheap.
     training_keep_prior_slots: int = 3
+    # Skip new training submissions while /chat has fired within this window.
+    # A scheduled-tick or post-session enqueue arriving sooner records a
+    # "deferred_idle" status (scheduler) or silently returns (post-session
+    # enqueue — the post_session_queue.json entry persists, the next tick or
+    # next /chat redrives the same path). Measured against
+    # _state["last_chat_monotonic"] via time.monotonic() so a wall-clock NTP
+    # step does not break the predicate. Set to 0 to disable the gate.
+    training_idle_debounce_s: int = 30
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -993,6 +1001,11 @@ class ConsolidationScheduleConfig:
             raise ValueError(
                 f"consolidation.training_keep_prior_slots must be >= 0; "
                 f"got {self.training_keep_prior_slots}"
+            )
+        if self.training_idle_debounce_s < 0:
+            raise ValueError(
+                f"consolidation.training_idle_debounce_s must be >= 0; "
+                f"got {self.training_idle_debounce_s}"
             )
 
         judge = self.extraction_plausibility_judge
