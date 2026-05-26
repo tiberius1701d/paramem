@@ -11,7 +11,7 @@ without spinning a FastAPI server or loading a model.
 Display order (spec §L504–513):
 
     Migration → Consolidation → Sweeper → Backup* → Config drift →
-    Key rotation* → Encryption* → Adapter fingerprint → Pre-flight*
+    Boot degraded → Key rotation* → Encryption* → Adapter fingerprint → Pre-flight*
 
     (* stub returns [] — future populators fill them.)
 """
@@ -389,18 +389,71 @@ def _collect_config_drift_items(state: dict) -> list[AttentionItem]:
     return []
 
 
+def _collect_boot_degraded_items(state: dict) -> list[AttentionItem]:
+    """Emit an item when the boot/reload preload could not materialise every active key.
+
+    ``boot_degraded`` is set by ``_preload_memory_store`` when
+    ``inference.preload_cache=True`` and the source cached fewer keys than are
+    active.  Recall is NOT affected — the inference path probes the adapter
+    weights on a cache miss (``MemoryStore.probe`` on-miss source delegation)
+    and memoises the result; the only cost is first-recall latency for the
+    un-cached keys until the cache re-warms.  Reported at ``info`` so the
+    operator can see the cold-cache state and trigger a re-warm if desired.
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+
+    Returns
+    -------
+    list[AttentionItem]
+        Zero or one item.
+    """
+    degraded = state.get("boot_degraded")
+    if degraded is None:
+        return []
+    hits = degraded.get("hits")
+    total = degraded.get("total")
+    if hits is not None and total is not None:
+        summary = f"preload cached {hits}/{total} active keys — recall self-heals on demand"
+    else:
+        summary = "preload cache incomplete — recall self-heals on demand"
+    return [
+        AttentionItem(
+            kind="boot_degraded",
+            level="info",
+            summary=summary,
+            action_hint="re-warm the cache via a config apply or /gpu/acquire",
+            age_seconds=None,
+        )
+    ]
+
+
 def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
-    """Emit adapter-fingerprint-mismatch items from the startup validator.
+    """Emit attention items for problematic adapter slots from the startup validator.
 
     Reads ``state["adapter_manifest_status"]`` (populated by
     ``_mount_adapters_from_slots`` at startup).  Schema per row:
     ``{status, reason, field, severity, slot_path, checked_at}``.
 
+    Emits for two distinct problem classes:
+
+    * Fingerprint / manifest mismatch — ``status in {"mismatch",
+      "manifest_missing", "migrated_unverified"}``.  Slot exists but its
+      manifest doesn't match the loaded model.
+    * No matching slot — ``status == "no_matching_slot"``.  Slot dirs exist on
+      disk but none have a ``meta.registry_sha256`` matching the live
+      registry, e.g. because the registry file is corrupt/unreadable (the
+      observable downstream of ``store_load_degraded`` being set when
+      ``load_registries_from_disk`` raised) or the slots are stale relative
+      to a rebuilt registry.
+
     Primary adapter (``"episodic"``) with severity ``"red"`` → level
     ``"failed"``.  Secondary adapters (``"semantic"``,
     ``"procedural"``) with severity ``"yellow"`` → level ``"info"``.
 
-    Multiple mismatch rows → multiple items.  Primary first, then
+    Multiple problem rows → multiple items.  Primary first, then
     alphabetical by name.
 
     Parameters
@@ -423,32 +476,61 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
         if not isinstance(row, dict):
             continue
         row_status = row.get("status", "")
-        if row_status not in _MISMATCH_STATUSES:
-            continue
         severity = row.get("severity", "yellow")
         reason = row.get("reason") or row_status
         age = _age_seconds_from_iso(row.get("checked_at", ""))
 
-        if severity == "red":
-            primary_items.append(
-                AttentionItem(
-                    kind="adapter_fingerprint_mismatch_primary",
-                    level="failed",
-                    summary=(f"FINGERPRINT MISMATCH ({name}) — {reason} — PA routing DISABLED"),
-                    action_hint="paramem migrate-accept or paramem migrate-rollback",
-                    age_seconds=age,
+        if row_status in _MISMATCH_STATUSES:
+            if severity == "red":
+                primary_items.append(
+                    AttentionItem(
+                        kind="adapter_fingerprint_mismatch_primary",
+                        level="failed",
+                        summary=f"FINGERPRINT MISMATCH ({name}) — {reason} — PA routing DISABLED",
+                        action_hint="paramem migrate-accept or paramem migrate-rollback",
+                        age_seconds=age,
+                    )
                 )
-            )
-        else:
-            secondary_items.append(
-                AttentionItem(
-                    kind="adapter_fingerprint_mismatch_secondary",
-                    level="info",
-                    summary=(f"FINGERPRINT MISMATCH ({name}) — {reason} — adapter unmounted"),
-                    action_hint=None,
-                    age_seconds=age,
+            else:
+                secondary_items.append(
+                    AttentionItem(
+                        kind="adapter_fingerprint_mismatch_secondary",
+                        level="info",
+                        summary=f"FINGERPRINT MISMATCH ({name}) — {reason} — adapter unmounted",
+                        action_hint=None,
+                        age_seconds=age,
+                    )
                 )
-            )
+        elif row_status == "no_matching_slot":
+            if severity == "red":
+                primary_items.append(
+                    AttentionItem(
+                        kind="adapter_no_matching_slot_primary",
+                        level="failed",
+                        summary=(
+                            f"NO MATCHING SLOT ({name}) — registry sha unresolved — "
+                            "PA routing DISABLED"
+                        ),
+                        action_hint=(
+                            "check registry integrity (journalctl -u paramem-server "
+                            "-p err) and restore from backup if corrupt"
+                        ),
+                        age_seconds=age,
+                    )
+                )
+            else:
+                secondary_items.append(
+                    AttentionItem(
+                        kind="adapter_no_matching_slot_secondary",
+                        level="info",
+                        summary=(
+                            f"NO MATCHING SLOT ({name}) — registry sha unresolved — "
+                            "adapter unmounted"
+                        ),
+                        action_hint=None,
+                        age_seconds=age,
+                    )
+                )
 
     # Primary items first (already sorted by name via sorted()), then secondary.
     return primary_items + secondary_items
@@ -851,7 +933,7 @@ def collect_attention_items(
     Display order matches the Attention block layout in spec L504–513:
 
         Migration → Consolidation → Sweeper → Backup* → Config drift →
-        Key rotation* → Encryption* → Adapter fingerprint →
+        Boot degraded → Key rotation* → Encryption* → Adapter fingerprint →
         Voice degradation → Pre-flight*
 
         (* stub returns [] — future populators fill them.)
@@ -881,6 +963,7 @@ def collect_attention_items(
     # unify the signatures here before they are populated.
     items.extend(_collect_backup_items(state, config))
     items.extend(_collect_config_drift_items(state))
+    items.extend(_collect_boot_degraded_items(state))
     items.extend(_collect_key_rotation_items(state))  # stub
     items.extend(_collect_encryption_items(state))  # stub
     items.extend(_collect_adapter_fingerprint_items(state))

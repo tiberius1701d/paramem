@@ -17,6 +17,7 @@ from paramem.server.attention import (
     _age_seconds_from_iso,
     _collect_adapter_fingerprint_items,
     _collect_backup_items,
+    _collect_boot_degraded_items,
     _collect_config_drift_items,
     _collect_consolidation_items,
     _collect_encryption_items,
@@ -450,6 +451,37 @@ def test_config_drift_missing_key_no_item():
 
 
 # ---------------------------------------------------------------------------
+# _collect_boot_degraded_items
+# ---------------------------------------------------------------------------
+
+
+def test_boot_degraded_set_emits_info():
+    """boot_degraded dict → 1 info item, kind=boot_degraded, hits/total in summary."""
+    state = _live_state(boot_degraded={"reason": "preload_partial", "hits": 3, "total": 5})
+    items = _collect_boot_degraded_items(state)
+    assert len(items) == 1
+    assert items[0].kind == "boot_degraded"
+    assert items[0].level == "info"
+    assert "3/5" in items[0].summary
+    assert items[0].action_hint is not None
+
+
+def test_boot_degraded_none_no_item():
+    """boot_degraded None → 0 items."""
+    state = _live_state(boot_degraded=None)
+    items = _collect_boot_degraded_items(state)
+    assert items == []
+
+
+def test_boot_degraded_missing_key_no_item():
+    """Missing boot_degraded key → 0 items (no exception)."""
+    state = _live_state()
+    assert "boot_degraded" not in state
+    items = _collect_boot_degraded_items(state)
+    assert items == []
+
+
+# ---------------------------------------------------------------------------
 # _collect_adapter_fingerprint_items
 # ---------------------------------------------------------------------------
 
@@ -562,6 +594,55 @@ def test_adapter_fingerprint_manifest_missing():
     assert items[0].kind == "adapter_fingerprint_mismatch_secondary"
 
 
+def test_adapter_no_matching_slot_primary_emits_failed():
+    """no_matching_slot on episodic (red) → failed, kind=adapter_no_matching_slot_primary.
+
+    Surfaces the corrupt-registry / stale-slot downstream of store_load_degraded.
+    """
+    state = _live_state(
+        adapter_manifest_status={
+            "episodic": {
+                "status": "no_matching_slot",
+                "reason": "no_matching_slot",
+                "field": None,
+                "severity": "red",
+                "slot_path": "/adapters/episodic",
+                "checked_at": "",
+            }
+        }
+    )
+    items = _collect_adapter_fingerprint_items(state)
+    assert len(items) == 1
+    assert items[0].kind == "adapter_no_matching_slot_primary"
+    assert items[0].level == "failed"
+    assert "NO MATCHING SLOT" in items[0].summary
+    assert "PA routing DISABLED" in items[0].summary
+    assert items[0].action_hint is not None
+
+
+def test_adapter_no_matching_slot_secondary_emits_info():
+    """no_matching_slot on semantic (yellow) → info, kind=adapter_no_matching_slot_secondary."""
+    state = _live_state(
+        adapter_manifest_status={
+            "semantic": {
+                "status": "no_matching_slot",
+                "reason": "no_matching_slot",
+                "field": None,
+                "severity": "yellow",
+                "slot_path": "/adapters/semantic",
+                "checked_at": "",
+            }
+        }
+    )
+    items = _collect_adapter_fingerprint_items(state)
+    assert len(items) == 1
+    assert items[0].kind == "adapter_no_matching_slot_secondary"
+    assert items[0].level == "info"
+    assert "NO MATCHING SLOT" in items[0].summary
+    assert "adapter unmounted" in items[0].summary
+    assert items[0].action_hint is None
+
+
 # ---------------------------------------------------------------------------
 # Stub populators
 # ---------------------------------------------------------------------------
@@ -636,6 +717,7 @@ def test_collect_order_matches_spec():
             "disk_hash": "def",
             "last_checked_at": "2026-04-22T00:00:00+00:00",
         },
+        "boot_degraded": {"reason": "preload_partial", "hits": 3, "total": 5},
         "consolidating": False,
         "session_buffer": buf,
         "adapter_manifest_status": {
@@ -651,13 +733,15 @@ def test_collect_order_matches_spec():
     }
     items = collect_attention_items(state, None)
     kinds = [it.kind for it in items]
-    # Expected order: migration → consolidation → sweeper → config_drift → adapter_fingerprint
+    # Expected order: migration → consolidation → sweeper → config_drift →
+    # boot_degraded → adapter_fingerprint
     migration_idx = kinds.index("migration_trial_running")
     consolidation_idx = kinds.index("consolidation_blocked")
     sweeper_idx = kinds.index("sweeper_held")
     config_idx = kinds.index("config_drift")
+    boot_idx = kinds.index("boot_degraded")
     adapter_idx = kinds.index("adapter_fingerprint_mismatch_primary")
-    assert migration_idx < consolidation_idx < sweeper_idx < config_idx < adapter_idx
+    assert migration_idx < consolidation_idx < sweeper_idx < config_idx < boot_idx < adapter_idx
 
 
 def test_collect_empty_when_live_clean():

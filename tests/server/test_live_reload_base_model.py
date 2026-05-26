@@ -28,8 +28,8 @@ New tests added for WP1:
 - ``refresh_config_from_disk=True`` calls ``load_server_config`` BEFORE
   ``_release_base_model_in_process``.
 - Mode is not set to ``local`` until AFTER ``_build_config_derived_state``.
-- A rebuild failure leaves mode=cloud-only with reason ``apply_failed``
-  or ``preload_failed``.
+- A rebuild failure leaves mode=cloud-only with reason ``apply_failed``.
+  A partial preload (boot_degraded) now stays local — recall self-heals.
 - ``_build_config_derived_state`` is NOT passed ``enforce_post_load_budget``
   (the build-once VRAM gate stays lifespan-only — B-1).
 - ``_preload_memory_store`` source selection is driven by
@@ -405,10 +405,14 @@ def test_refresh_config_rebuild_failure_stays_cloud_only():
         assert app_module._state["cloud_only_reason"] == "apply_failed"
 
 
-def test_refresh_config_preload_partial_stays_cloud_only():
+def test_refresh_config_preload_partial_stays_local():
     """When refresh_config_from_disk=True: if _build_config_derived_state
-    succeeds but sets boot_degraded (partial preload), mode stays cloud-only
-    with reason 'preload_failed'.
+    succeeds but sets boot_degraded (partial preload), the server stays LOCAL.
+
+    A partial preload is not a failure — recall self-heals via on-miss weight
+    probing and the cache re-warms on demand. The base model must NOT be
+    released; boot_degraded stays set as a signal (surfaced in /status
+    attention) until a later preload fully hydrates.
     """
     from paramem.server import app as app_module
 
@@ -437,15 +441,20 @@ def test_refresh_config_preload_partial_stays_cloud_only():
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "load_server_config", return_value=_server_config()),
         patch.object(app_module, "_release_base_model_in_process"),
-        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_load_model_into_state") as mock_load,
         patch.object(
             app_module, "_build_config_derived_state", side_effect=fake_build_sets_degraded
         ),
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=True)
 
-        assert app_module._state["mode"] == "cloud-only"
-        assert app_module._state["cloud_only_reason"] == "preload_failed"
+        # Stays local with the model reloaded (a degrade path would have set
+        # cloud_only_reason='preload_failed' and returned before mode=local);
+        # boot_degraded is retained as a signal.
+        assert app_module._state["mode"] == "local"
+        assert app_module._state["cloud_only_reason"] is None
+        mock_load.assert_called_once()
+        assert app_module._state["boot_degraded"] is not None
 
 
 def test_plain_reclaim_does_not_call_load_server_config():
@@ -665,8 +674,8 @@ def test_preload_source_selection_train_mode_uses_weight_source():
 
 def test_preload_cache_false_clears_boot_degraded():
     """preload_cache=False (intentional opt-out): boot_degraded is CLEARED
-    (not set), so /chat is not 503'd after an apply on preload-off deployments
-    (correction #5 boot_degraded lifecycle).
+    (not set) after an apply on preload-off deployments — recall takes the
+    per-key source path on every miss (correction #5 boot_degraded lifecycle).
     """
     from paramem.server import app as app_module
 
