@@ -319,6 +319,8 @@ consolidation:
   # required for fixture/example parity). Per-test overrides go in code.
   training_save_strategy_bg: ""
   training_save_steps_bg: 0
+  # Post-promotion slot retention: mirrors server.yaml.example.
+  training_keep_prior_slots: 3
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

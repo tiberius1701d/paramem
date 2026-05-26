@@ -523,6 +523,7 @@ class TestSaveAdaptersCallsVerify:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
+        loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
         loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0
@@ -651,6 +652,7 @@ class TestPreSaveProbeRemoved:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
+        loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
         loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0
@@ -742,6 +744,7 @@ class TestPostSaveSlotCleanup:
         loop.output_dir = tmp_path
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
+        loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
         loop.indexed_key_registry = {"episodic": KeyRegistry()}
         loop.indexed_key_cache = {}
         loop.cycle_count = 0

@@ -142,6 +142,7 @@ class ConsolidationLoop:
         graph_enrichment_min_triples_floor: int = 20,
         state_provider=None,
         thermal_policy: ThermalPolicy | None = None,
+        keep_prior_slots: int = 3,
     ):
         # Optional callable that returns the server ``_state`` dict.  When
         # provided, ``run_cycle`` calls ``self.guard_trial_state(state_provider())``
@@ -149,6 +150,7 @@ class ConsolidationLoop:
         # Experiment scripts pass nothing (default ``None``) so the guard is a
         # no-op and experiment paths are unaffected.
         self.state_provider = state_provider
+        self._keep_prior_slots = keep_prior_slots
         # BASE-MODEL HOLDER (ConsolidationLoop): released via
         # _state["consolidation_loop"]=None in _release_base_model_in_process.
         self.model = model
@@ -2060,7 +2062,7 @@ class ConsolidationLoop:
         def _save_and_verify(
             adapter_name: str,
             simhash: dict,
-        ) -> None:
+        ) -> Path:
             """Save adapter, probe disk artifact, clean up slot on probe failure.
 
             Wraps ``atomic_save_adapter`` + ``_verify_saved_adapter_from_disk``
@@ -2071,6 +2073,9 @@ class ConsolidationLoop:
             Args:
                 adapter_name: PEFT adapter name (e.g. ``"episodic"``).
                 simhash: Per-tier SimHash registry dict used to filter pairs.
+
+            Returns:
+                Path to the slot directory written by ``atomic_save_adapter``.
             """
             import shutil as _shutil
 
@@ -2105,16 +2110,25 @@ class ConsolidationLoop:
                         _cleanup_exc,
                     )
                 raise
+            return slot
 
         # I5 Steps 3–5 per adapter: manifest → slot save.
         # Step 5a follows each slot save: reload from disk and probe recall to
         # catch silent partial writes before ``mark_consolidated`` fires.
         # On probe failure the bad slot is deleted and RuntimeError propagates.
-        _save_and_verify("episodic", self.store.simhashes_in_tier("episodic"))
+        # Collect slot paths for post-registry-commit pruning.
+        _saved_slots: dict[str, Path] = {}
+        _saved_slots["episodic"] = _save_and_verify(
+            "episodic", self.store.simhashes_in_tier("episodic")
+        )
         if "semantic" in self.model.peft_config:
-            _save_and_verify("semantic", self.store.simhashes_in_tier("semantic"))
+            _saved_slots["semantic"] = _save_and_verify(
+                "semantic", self.store.simhashes_in_tier("semantic")
+            )
         if "procedural" in self.model.peft_config:
-            _save_and_verify("procedural", self.store.simhashes_in_tier("procedural"))
+            _saved_slots["procedural"] = _save_and_verify(
+                "procedural", self.store.simhashes_in_tier("procedural")
+            )
 
         # I5 Step 6: Per-cycle adapter-weight shadows (debug/analysis only — no
         # manifest).  Layout owned by DebugSnapshotWriter:
@@ -2149,6 +2163,18 @@ class ConsolidationLoop:
                 self.store.registry(_tier).save_from_bytes(
                     _tier_payload, _tier_registry_path, consolidating=True
                 )
+
+        # Post-registry-commit slot pruning: runs AFTER the commit signal so
+        # find_live_slot always sees a consistent (slot, registry) pair even
+        # during a brief prune.  Prune only tiers that were saved this cycle.
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name as _asr
+
+        for _tier, _live_slot in _saved_slots.items():
+            self._prune_old_slots(
+                tier_root=_asr(self.output_dir, _tier),
+                live_slot=_live_slot,
+                keep=self._keep_prior_slots,
+            )
 
     def _training_output_dir(self, adapter_name: str, *, interim_stamp: str | None = None) -> Path:
         """Path passed to HuggingFace ``TrainingArguments(output_dir=...)``.
@@ -3705,6 +3731,48 @@ class ConsolidationLoop:
                 adapter_name,
             )
             return 0.0
+
+    def _prune_old_slots(self, tier_root: Path, live_slot: Path, keep: int) -> None:
+        """Remove post-promotion adapter slots beyond the retention budget.
+
+        Scans *tier_root* (e.g. data/ha/adapters/episodic/) for slot-shaped
+        subdirectories. The slot just promoted (*live_slot*) is always retained
+        — pass it explicitly because the registry commit at the end of
+        _save_adapters writes its hash to disk AFTER this call, and reading
+        the registry here would race. Remaining slots are ordered by st_mtime
+        descending; the *keep* most-recent are retained, older ones are
+        rmtree'd.
+
+        Filters via paramem.adapters.manifest.is_slot_name so non-slot
+        siblings (interim_<stamp>/, indexed_key_registry.json, .pending/)
+        are untouched.
+
+        Args:
+            tier_root: <adapter_dir>/<tier>/ scoped to one adapter kind.
+            live_slot: Path to the slot just promoted; immune to pruning.
+            keep: Max number of non-live prior slots to retain (>=0).
+        """
+        import shutil as _shutil
+
+        from paramem.adapters.manifest import is_slot_name
+
+        if not tier_root.is_dir() or keep < 0:
+            return
+        candidates: list[Path] = []
+        for entry in tier_root.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if not entry.is_dir():
+                continue
+            if entry == live_slot:
+                continue
+            if not is_slot_name(entry.name):
+                continue
+            candidates.append(entry)
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in candidates[keep:]:
+            _shutil.rmtree(stale, ignore_errors=False)
+            logger.info("_prune_old_slots: removed %s (retention=%d)", stale, keep)
 
     def _verify_saved_adapter_from_disk(
         self,

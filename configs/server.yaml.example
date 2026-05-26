@@ -298,6 +298,10 @@ consolidation:
   # in long runs. "" (empty) keeps the default "epoch" behaviour.
   training_save_strategy_bg: ""
   training_save_steps_bg: 0
+  # Post-promotion slot retention: how many prior timestamped adapter slots to
+  # keep per tier alongside the live (registry-matched) slot. Older slots beyond
+  # this budget are deleted after the registry-commit step. 0 = live slot only.
+  training_keep_prior_slots: 3
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

@@ -32,6 +32,7 @@ def create_consolidation_loop(
     save_cycle_snapshots: bool | None = None,
     persist_graph: bool | None = None,
     seed_state_from_disk: bool = True,
+    keep_prior_slots: int | None = None,
 ) -> ConsolidationLoop:
     """Create a ConsolidationLoop configured for the server.
 
@@ -62,6 +63,9 @@ def create_consolidation_loop(
         disk.  Use for probe/experiment runs that must start from a clean
         state rather than inheriting live-system data.  Default ``True``
         preserves production behaviour.
+    keep_prior_slots:
+        Override ``config.consolidation.training_keep_prior_slots``.
+        ``None`` (default) falls through to the config value.
     """
     _output_dir = output_dir if output_dir is not None else config.adapter_dir
     _save_cycle_snapshots = (
@@ -117,6 +121,11 @@ def create_consolidation_loop(
         # accepts as consolidation_config).  Build the policy here where both
         # configs are reachable, pass it to the loop precomputed.
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        keep_prior_slots=(
+            keep_prior_slots
+            if keep_prior_slots is not None
+            else config.consolidation.training_keep_prior_slots
+        ),
     )
 
     # Wire the base-model weight-hash cache from server _state into the loop so

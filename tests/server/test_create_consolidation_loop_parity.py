@@ -246,6 +246,7 @@ def test_factory_threads_every_config_knob(
     assert captured["prompts_dir"] == cfg.prompts_dir
     assert captured["state_provider"] is None
     assert captured["extraction_temperature"] == 0.0
+    assert captured["keep_prior_slots"] == cfg.consolidation.training_keep_prior_slots
 
 
 # ---------------------------------------------------------------------------
