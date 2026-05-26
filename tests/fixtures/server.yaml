@@ -321,6 +321,8 @@ consolidation:
   training_save_steps_bg: 0
   # Post-promotion slot retention: mirrors server.yaml.example.
   training_keep_prior_slots: 3
+  # Idle debounce: mirrors server.yaml.example.
+  training_idle_debounce_s: 30
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

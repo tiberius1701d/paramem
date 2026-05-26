@@ -25,6 +25,7 @@ callers own the SOTA fallback.
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 
 from paramem.evaluation.recall import generate_answer
@@ -97,6 +98,22 @@ def enqueue_post_session_train(
             server restart.
     """
     if loop is None or background_trainer is None:
+        return
+
+    debounce_s = config.consolidation.training_idle_debounce_s
+    last_chat = state.get("last_chat_monotonic") if state is not None else None
+    # `last_chat is not None` first: migration tests pass a MagicMock config whose
+    # debounce_s is itself a MagicMock and would raise TypeError on `> 0`. The
+    # None short-circuit spares them. Mirrors the scheduler gate ordering.
+    if last_chat is not None and debounce_s > 0 and (time.monotonic() - last_chat) < debounce_s:
+        logger.info(
+            "post_session_train deferred: chat %.1fs ago < debounce %ds",
+            time.monotonic() - last_chat,
+            debounce_s,
+        )
+        # post_session_queue entry persists on disk (caller enqueued before this
+        # call); next scheduler tick drains via session_buffer, OR startup-replay
+        # picks it up after restart. No async wake-up needed here.
         return
 
     schedule = config.consolidation.refresh_cadence
