@@ -147,49 +147,11 @@ class TestThermalThrottleCallbackBehaviour:
         cb = ThermalThrottleCallback(policy)
         assert cb._shutdown_fn() is False
 
-    def test_default_inference_active_fn_is_constant_false(self):
-        # When inference_active_fn is not supplied, the default lambda is False.
-        policy = self._make_policy()
-        cb = ThermalThrottleCallback(policy)
-        assert cb._inference_active_fn() is False
-
     def test_should_throttle_now_routes_through_predicate(self):
         policy = self._make_policy(quiet_hours_mode="always_on")
         assert _should_throttle_now(policy) is True
         policy_off = self._make_policy(quiet_hours_mode="always_off")
         assert _should_throttle_now(policy_off) is False
-
-    def test_inference_active_suppresses_throttle_entry(self):
-        """When inference is active at entry, _gpu_temp is never called."""
-        policy = self._make_policy()
-        cb = ThermalThrottleCallback(policy, inference_active_fn=lambda: True)
-        with patch("paramem.training.thermal_throttle._gpu_temp") as temp_mock:
-            cb._maybe_throttle(global_step=10)
-        # Gate fires before the temp read.
-        temp_mock.assert_not_called()
-
-    def test_inference_active_aborts_mid_throttle(self):
-        """Inference becoming active mid-throttle exits the wait loop."""
-        policy = self._make_policy()
-        calls = {"n": 0}
-
-        def inference_active_fn():
-            calls["n"] += 1
-            # First call (entry gate): False — let throttle start.
-            # Second call (inside loop): True — abort.
-            return calls["n"] >= 2
-
-        cb = ThermalThrottleCallback(policy, inference_active_fn=inference_active_fn)
-        with (
-            patch(
-                "paramem.training.thermal_throttle._gpu_temp",
-                return_value=99,
-            ),
-            patch("paramem.training.thermal_throttle.time.sleep"),
-        ):
-            cb._maybe_throttle(global_step=10)
-        # inference_active_fn was polled at least twice (entry + loop body).
-        assert calls["n"] >= 2
 
 
 def _make_cfg(**overrides):

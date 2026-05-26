@@ -421,6 +421,40 @@ class TestIdleDebounceConfig:
 
 
 # ---------------------------------------------------------------------------
+# TestAbortQuiesceTimeoutConfig — ConsolidationScheduleConfig.abort_quiesce_timeout_s
+# ---------------------------------------------------------------------------
+
+
+class TestAbortQuiesceTimeoutConfig:
+    """ConsolidationScheduleConfig.abort_quiesce_timeout_s field validation."""
+
+    def test_default_30_seconds(self) -> None:
+        """abort_quiesce_timeout_s defaults to 30.0."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig()
+        assert cfg.abort_quiesce_timeout_s == 30.0
+
+    def test_zero_rejected(self) -> None:
+        """abort_quiesce_timeout_s=0.0 raises ValueError."""
+        import pytest
+
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="abort_quiesce_timeout_s must be > 0"):
+            ConsolidationScheduleConfig(abort_quiesce_timeout_s=0.0)
+
+    def test_negative_rejected(self) -> None:
+        """Negative abort_quiesce_timeout_s raises ValueError."""
+        import pytest
+
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="abort_quiesce_timeout_s must be > 0"):
+            ConsolidationScheduleConfig(abort_quiesce_timeout_s=-1.0)
+
+
+# ---------------------------------------------------------------------------
 # TestSchedulerIdleDebounce — _maybe_trigger_scheduled_consolidation gate
 # ---------------------------------------------------------------------------
 

@@ -977,3 +977,217 @@ class TestBgTrainerManifest:
         assert manifest.registry_sha256 == expected_hash, (
             f"Expected registry_sha256={expected_hash!r}, got {manifest.registry_sha256!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Abort branch: resume artefacts preserved, commit skipped
+# ---------------------------------------------------------------------------
+
+
+class TestAbortPreservesResumeState:
+    """When _train_adapter detects an abort, commit is skipped and artefacts survive.
+
+    The abort path (detected by checking _active_abort.is_set() after
+    train_adapter returns) must:
+      - NOT call _commit_staging_to_production
+      - NOT remove resume_state.json
+      - NOT remove bg_checkpoint/
+    so the next submission can resume from the checkpoint automatically.
+    """
+
+    def _plant_resume_state_and_checkpoint(
+        self,
+        tmp_path: Path,
+        bt: "BackgroundTrainer",
+        job: "TrainingJob",
+    ) -> tuple[Path, Path]:
+        """Write a matching resume state and a corresponding checkpoint dir.
+
+        Returns (state_path, checkpoint_dir).
+        """
+        from paramem.server.background_trainer import (
+            _fingerprint_entries,
+            _fingerprint_training_config,
+            _write_resume_state_atomic,
+        )
+
+        checkpoint_dir = tmp_path / "in_training" / "bg_checkpoint" / "checkpoint-10"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "adapter_name": job.adapter_name,
+            "inference_fallback_adapter": job.inference_fallback_adapter,
+            "training_config_fingerprint": _fingerprint_training_config(
+                bt.training_config, job.adapter_config
+            ),
+            "entries_fingerprint": _fingerprint_entries(job.entries),
+            "total_epochs": bt.training_config.num_epochs,
+            "last_completed_epoch": 10,
+            "checkpoint_path": str(checkpoint_dir),
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        state_path = tmp_path / "in_training" / _RESUME_STATE_FILE
+        _write_resume_state_atomic(state_path, state)
+        return state_path, checkpoint_dir
+
+    def test_aborted_train_adapter_skips_commit_and_clear(self, tmp_path: Path) -> None:
+        """When abort is set before train_adapter returns, commit and state-clear are skipped.
+
+        Verifies:
+        - _commit_staging_to_production is NOT called
+        - resume_state.json survives
+        - bg_checkpoint/ survives
+        """
+        import threading
+
+        bt = _make_bt(tmp_path)
+        job = _make_job()
+
+        # Pre-plant resume state + checkpoint so we can assert they survive.
+        state_path, checkpoint_dir = self._plant_resume_state_and_checkpoint(tmp_path, bt, job)
+
+        # Pre-install the abort event and mark it as set BEFORE _train_adapter
+        # is called.  Because _active_abort is already set, _train_adapter's
+        # idempotent install skips the install branch (_installed_here=False)
+        # and the event remains set when train_adapter returns.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        bt._active_abort.set()
+
+        class _NullTrainer:
+            """Trainer that returns immediately — simulates a step-boundary abort."""
+
+            def __init__(self, **kwargs):
+                pass
+
+            def train(self, resume_from_checkpoint=None):
+                return _fake_train_result()
+
+        with (
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.server.background_trainer.format_entry_training",
+                return_value=[{"input_ids": [0], "labels": [0]}],
+            ),
+            patch(
+                "paramem.server.background_trainer._ensure_staging_shape_matches",
+                side_effect=lambda m, _c: m,
+            ),
+            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
+            patch(
+                "paramem.training.trainer.TrainingArguments",
+                side_effect=_fake_training_arguments,
+            ),
+            patch.object(bt, "_commit_staging_to_production") as mock_commit,
+        ):
+            bt._train_adapter(job)
+
+        # Commit must NOT have been called.
+        mock_commit.assert_not_called()
+
+        # Resume artefacts must survive so the next submission can resume.
+        assert state_path.exists(), (
+            "resume_state.json must survive when training is aborted for inference"
+        )
+        assert checkpoint_dir.exists(), (
+            "bg_checkpoint/ must survive when training is aborted for inference"
+        )
+
+    def test_resubmission_after_abort_resumes_from_checkpoint(self, tmp_path: Path) -> None:
+        """After an abort, the next _train_adapter call passes resume_from_checkpoint.
+
+        Sequence:
+          1. Pre-plant matching resume state + checkpoint dir.
+          2. First call: abort event set → returns early, artefacts intact.
+          3. Second call: no abort event → reads resume state, calls
+             train_adapter(resume_from_checkpoint=<checkpoint path>).
+        """
+        import threading
+
+        bt = _make_bt(tmp_path)
+        job = _make_job()
+
+        # Plant the artefacts (simulates what a prior aborted run left behind).
+        _, checkpoint_dir = self._plant_resume_state_and_checkpoint(tmp_path, bt, job)
+        expected_checkpoint = str(checkpoint_dir)
+
+        # --- First call: abort branch ---
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        bt._active_abort.set()
+
+        class _NullTrainer:
+            def __init__(self, **kwargs):
+                pass
+
+            def train(self, resume_from_checkpoint=None):
+                return _fake_train_result()
+
+        with (
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.server.background_trainer.format_entry_training",
+                return_value=[{"input_ids": [0], "labels": [0]}],
+            ),
+            patch(
+                "paramem.server.background_trainer._ensure_staging_shape_matches",
+                side_effect=lambda m, _c: m,
+            ),
+            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
+            patch(
+                "paramem.training.trainer.TrainingArguments",
+                side_effect=_fake_training_arguments,
+            ),
+            patch.object(bt, "_commit_staging_to_production"),
+        ):
+            bt._train_adapter(job)
+
+        # Verify artefacts survived the first (aborted) call.
+        assert checkpoint_dir.exists(), "checkpoint must survive the aborted first call"
+
+        # --- Second call: resume branch ---
+        # Clear the abort event so the second call proceeds normally.
+        with bt._active_state_lock:
+            bt._active_abort = None
+            bt._active_quiesced = None
+
+        train_kwargs: list[dict] = []
+
+        class _CapturingTrainer:
+            def __init__(self, **kwargs):
+                pass
+
+            def train(self, resume_from_checkpoint=None):
+                train_kwargs.append({"resume_from_checkpoint": resume_from_checkpoint})
+                return _fake_train_result()
+
+        with (
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter"),
+            patch(
+                "paramem.server.background_trainer.format_entry_training",
+                return_value=[{"input_ids": [0], "labels": [0]}],
+            ),
+            patch(
+                "paramem.server.background_trainer._ensure_staging_shape_matches",
+                side_effect=lambda m, _c: m,
+            ),
+            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch(
+                "paramem.training.trainer.TrainingArguments",
+                side_effect=_fake_training_arguments,
+            ),
+        ):
+            bt._train_adapter(job)
+
+        assert len(train_kwargs) == 1, "train_adapter must be called exactly once on resubmission"
+        assert train_kwargs[0]["resume_from_checkpoint"] == expected_checkpoint, (
+            f"Second submission must resume from the checkpoint left by the aborted run. "
+            f"Expected {expected_checkpoint!r}, got {train_kwargs[0]['resume_from_checkpoint']!r}"
+        )

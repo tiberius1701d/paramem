@@ -313,6 +313,10 @@ consolidation:
   # this many seconds. Prevents consolidation-vs-chat collisions during active
   # conversations. Set to 0 to disable.
   training_idle_debounce_s: 30
+  # How long /chat waits (seconds) for the BG trainer to abort at the next
+  # step boundary before falling back to bt.stop(). 30s covers typical BG
+  # training step durations with room to spare.
+  abort_quiesce_timeout_s: 30.0
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

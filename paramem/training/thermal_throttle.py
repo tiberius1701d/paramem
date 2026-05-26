@@ -137,29 +137,26 @@ class ThermalThrottleCallback(TrainerCallback):
     touch the PA inference reservation lock — heat depends on actual GPU
     activity, not on lock ownership.
 
-    The wait loop exits on any of four conditions: GPU cools below
-    ``policy.temp_limit``, the quiet-hours window ends mid-wait, a shutdown
-    signal arrives, or a PA conversation becomes active (latency protection).
+    The wait loop exits on any of three conditions: GPU cools below
+    ``policy.temp_limit``, the quiet-hours window ends mid-wait, or a shutdown
+    signal arrives (the shutdown predicate ORs the BG abort event, so /chat
+    arrivals during the hot-wait break the loop cleanly).
 
     ``shutdown_fn`` defaults to a constant ``False`` so non-server callers
     (experiments via ``train_adapter``) don't depend on a BG-trainer-specific
-    signal. ``BackgroundTrainer`` passes ``lambda: self._shutdown_requested``
-    so a shutdown during a hot-wait breaks the loop cleanly.
-
-    ``inference_active_fn`` defaults to a constant ``False``. ``BackgroundTrainer``
-    passes ``self._inference_active`` so the throttle suppresses itself while a
-    PA /chat response is in progress, keeping conversational latency low.
+    signal.  When hooks are supplied via ``TrainingHooks.on_shutdown_check``,
+    that predicate already ORs the BG abort event (via
+    ``BackgroundTrainer.training_hooks_for_job``), so a mid-wait abort breaks
+    the loop cleanly without a separate field.
     """
 
     def __init__(
         self,
         policy: ThermalPolicy,
         shutdown_fn: Callable[[], bool] = lambda: False,
-        inference_active_fn: Callable[[], bool] = lambda: False,
     ):
         self._policy = policy
         self._shutdown_fn = shutdown_fn
-        self._inference_active_fn = inference_active_fn
 
     def on_step_end(self, args, state, control, **kwargs):
         self._maybe_throttle(state.global_step)
@@ -173,9 +170,6 @@ class ThermalThrottleCallback(TrainerCallback):
         if global_step % self._policy.check_interval != 0:
             return
         if not _should_throttle_now(self._policy):
-            return
-        if self._inference_active_fn():
-            # PA conversation in progress — suppress throttle to keep latency low.
             return
 
         temp = _gpu_temp()
@@ -191,6 +185,8 @@ class ThermalThrottleCallback(TrainerCallback):
 
         while temp is not None and temp > self._policy.temp_limit:
             if self._shutdown_fn():
+                # shutdown_fn already ORs the abort event via training_hooks_for_job,
+                # so an abort during a hot-wait breaks the loop cleanly here.
                 return
             # Quiet-hours window may end mid-wait (e.g. 07:00 arrives) — in
             # that case we no longer care about fan noise and resume even if
@@ -198,12 +194,6 @@ class ThermalThrottleCallback(TrainerCallback):
             if not _should_throttle_now(self._policy):
                 logger.info(
                     "Thermal throttle: quiet-hours window ended at %d°C — resuming",
-                    temp,
-                )
-                return
-            if self._inference_active_fn():
-                logger.info(
-                    "Thermal throttle: PA inference active at %d°C — releasing throttle",
                     temp,
                 )
                 return
