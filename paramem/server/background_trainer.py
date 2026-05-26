@@ -1,10 +1,19 @@
 """Background training manager for continuous adapter learning.
 
-Trains adapters during idle time, pausing for inference requests.
+Trains adapters during idle time, aborting cleanly for inference requests.
 Saves full training state at each epoch boundary for crash recovery.
 
 The model stays loaded — switching between training and inference is
 just flag flips (model.eval/train, gradient checkpointing), no reload.
+
+Abort-then-resume contract:
+    When /chat arrives during BG training, ``abort_for_inference()`` sets
+    the per-job abort flag.  The training hooks shutdown predicate sees it
+    on the next ``on_step_end``, sets ``control.should_training_stop=True``,
+    and HF Trainer exits after the current step.  ``_train_adapter`` detects
+    the abort and skips the commit + resume-state clear so
+    ``resume_state.json`` and ``bg_checkpoint/`` survive.  The next job
+    submission with matching fingerprints resumes from the checkpoint.
 """
 
 import hashlib
@@ -33,6 +42,14 @@ from paramem.training.thermal_throttle import (
 )
 from paramem.training.trainer import TrainingHooks, train_adapter
 from paramem.utils.config import AdapterConfig, TrainingConfig
+
+# TrainingHooks is re-exported so consolidation.py and other callers can
+# import it from this module (their existing import path).
+__all__ = [
+    "BackgroundTrainer",
+    "TrainingJob",
+    "TrainingHooks",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +221,7 @@ class TrainingJob:
 
 
 class BackgroundTrainer:
-    """Manages background training that yields to inference.
+    """Manages background training that aborts for inference requests.
 
     Supports a queue of training jobs (e.g., episodic then procedural).
     Each job trains one adapter. Jobs run sequentially in a single thread.
@@ -214,17 +231,12 @@ class BackgroundTrainer:
         bt.start_jobs([job1, job2], on_complete=save_callback)
 
         # When inference is needed:
-        bt.pause()       # waits for current step to finish
-        # ... run inference ...
-        bt.resume()      # lets training continue
+        aborted = bt.abort_for_inference(timeout=30.0)
+        # Training aborted at the next step boundary.
+        # resume_state.json + bg_checkpoint/ survive for the next submission.
 
         bt.stop()        # graceful stop at next epoch boundary
     """
-
-    # Max seconds the training thread waits for an inference caller to signal
-    # done before resuming.  Bound prevents a permanent stall when the caller
-    # crashes between ``pause()`` and ``resume()``.
-    _INFERENCE_TIMEOUT = 120.0
 
     def __init__(
         self,
@@ -233,6 +245,7 @@ class BackgroundTrainer:
         training_config: TrainingConfig,
         output_dir: str | Path = "data/ha/adapters",
         thermal_policy: ThermalPolicy | None = None,
+        preload_cache: bool = False,
     ):
         # BASE-MODEL HOLDER (BackgroundTrainer): released via
         # _state["background_trainer"]=None + _stop_callable_worker() in
@@ -248,19 +261,21 @@ class BackgroundTrainer:
         # don't override the default get fast unthrottled runs by
         # construction.  Live-server only when a non-zero limit is set.
         self._thermal_policy = thermal_policy
+        # When preload_cache=True (InferenceConfig default), recall is served
+        # from MemoryStore pre-loaded at boot.  In the abort branch, switching
+        # the adapter back to the production slot is unnecessary because model
+        # generation always uses model.disable_adapter() at inference sites.
+        # Skip the adapter swap to save a PEFT call; eval +
+        # gradient_checkpointing_disable still run regardless.
+        self._preload_cache = preload_cache
 
-        self._inference_requested = threading.Event()
-        self._inference_done = threading.Event()
-        self._training_paused = threading.Event()
-        # Serializes pause/resume cycles. A second pause() waits until the
-        # first has fully completed (callback re-acquired lock, restored
-        # staging, cleared _training_paused) to prevent the re-entrancy race
-        # where two threads manipulate model state concurrently.
-        self._pause_lock = threading.Lock()
-        # State guard for _pause_active flag. Ensures exactly-once transition
-        # from True→False across concurrent resume() calls.
-        self._pause_state_lock = threading.Lock()
-        self._pause_active = False
+        # Per-job abort state.  Recreated at the start of each job
+        # (_train_adapter or _run_callable_queue); cleared in their finally
+        # blocks.  The training_hooks_for_job factory captures these by closure.
+        self._active_abort: threading.Event | None = None
+        self._active_quiesced: threading.Event | None = None
+        self._active_state_lock = threading.Lock()
+
         self._shutdown_requested = False
         self._training_thread: threading.Thread | None = None
         self._is_training = False
@@ -338,121 +353,48 @@ class BackgroundTrainer:
         self._training_thread.start()
         logger.info("Background training started: %d jobs", len(jobs))
 
-    def pause(self, timeout: float = 5.0) -> bool:
-        """Pause training for inference. Blocks until current step finishes.
+    def abort_for_inference(self, timeout: float = 30.0) -> bool:
+        """Signal the active training job to stop at the next step boundary.
 
-        Switches the active adapter to the production slot (last-known-good
-        weights, NOT the mid-training in_training slot) so inference returns
-        correct answers. Also switches model to eval mode and disables
-        gradient checkpointing.
+        Sets the per-job abort flag.  The TrainingHooks shutdown predicate
+        installed via training_hooks_for_job sees it on the next on_step_end,
+        sets control.should_training_stop=True.  HF Trainer exits cleanly
+        after the current step.  _train_adapter detects the abort and skips
+        the commit + state-clear (resume_state.json + bg_checkpoint survive).
+        The GPU lock is released as _run_callable_queue / _run_jobs exits
+        its gpu_lock_sync block; _active_quiesced is set OUTSIDE the lock
+        so the caller's subsequent ``async with gpu_lock()`` succeeds without
+        racing on the BG thread still holding the lock.
 
-        Serialized via _pause_lock so concurrent callers queue instead of
-        racing on model state.
+        Returns True when a job was active and quiesced within ``timeout``.
+        Returns False when no job was active (no-op) OR the wait timed out.
+
+        Args:
+            timeout: Seconds to wait for the training job to finish its
+                current step and release the GPU lock.
         """
-        if not self._is_training:
-            return True
-
-        self._pause_lock.acquire()
-        success = False
-        try:
-            # Double-check after acquiring: training may have ended while we waited
-            if not self._is_training:
-                return True
-
-            self._inference_requested.set()
-            paused = self._training_paused.wait(timeout=timeout)
-            if not paused:
-                logger.warning("Training did not pause within %.1fs", timeout)
-                # The callback may have seen _inference_requested before we
-                # timed out and is now waiting on _inference_done. Clear the
-                # request AND signal done so it doesn't block the full 120s
-                # timeout. Also consume any _training_paused set by a racing
-                # callback so the next pause() starts from a clean state.
-                self._inference_requested.clear()
-                self._inference_done.set()
-                self._training_paused.clear()
-                return False
-
-            # Switch to the committed production adapter so inference queries the
-            # user's established knowledge, not mid-training weights.
-            #
-            # Use the job's explicit inference_fallback_adapter rather than
-            # _current_adapter: for interim-adapter jobs the current adapter is
-            # the episodic_interim_* slot, which contains staging-copy weights
-            # that must NOT be exposed to inference during a pause.  The fallback
-            # is always "episodic" (main) for Step-6 jobs and the prior committed
-            # main for Step-7 refresh jobs.
-            #
-            # Guard: _current_job is set by _train_adapter; if pause() races
-            # before the first job starts, fall back to "episodic".
-            from paramem.models.loader import switch_adapter
-
-            target = (
-                self._current_job.inference_fallback_adapter
-                if self._current_job is not None
-                else "episodic"
-            )
-            if target in self.model.peft_config:
-                switch_adapter(self.model, target)
-                logger.debug("Paused: switched to production adapter '%s'", target)
-            else:
-                logger.warning(
-                    "Paused but no production adapter available to switch to (target=%s)", target
-                )
-
-            # Switch model to inference mode
-            self.model.eval()
-            if self.training_config.gradient_checkpointing:
-                self.model.gradient_checkpointing_disable()
-
-            # Lock is kept held — resume() releases it. Matched pair.
-            with self._pause_state_lock:
-                self._pause_active = True
-            success = True
-            return True
-        finally:
-            if not success:
-                # pause() did not fully succeed — release the lock so other
-                # callers can proceed. resume() will be a no-op.
-                self._pause_lock.release()
-
-    def resume(self):
-        """Resume training after inference.
-
-        Restores model to training mode with gradient checkpointing.
-        No-op if training is not active or no pause is active.
-
-        Must be paired with a successful pause() — releases _pause_lock.
-        Safe to call multiple times concurrently: only one call releases
-        the lock (compare-and-swap on _pause_active under _pause_state_lock).
-        """
-        # Atomic compare-and-swap: only the caller that transitions
-        # _pause_active from True→False proceeds to release the lock.
-        with self._pause_state_lock:
-            if not self._pause_active:
-                return
-            self._pause_active = False
-        try:
-            if self._is_training:
-                # Restore training mode
-                self.model.train()
-                if self.training_config.gradient_checkpointing:
-                    self.model.gradient_checkpointing_enable(
-                        gradient_checkpointing_kwargs={"use_reentrant": False}
-                    )
-                self._inference_requested.clear()
-                self._inference_done.set()
-        finally:
-            self._pause_lock.release()
+        with self._active_state_lock:
+            abort = self._active_abort
+            quiesced = self._active_quiesced
+        if abort is None or quiesced is None:
+            return False
+        abort.set()
+        return quiesced.wait(timeout=timeout)
 
     def stop(self, timeout: float = 60.0) -> int:
-        """Stop training gracefully. Returns last completed epoch."""
+        """Stop training gracefully. Returns last completed epoch.
+
+        Sets _shutdown_requested which is ORed into the training hooks
+        shutdown predicate via training_hooks_for_job — so both the
+        start_jobs and submit paths honour it.
+
+        Args:
+            timeout: Seconds to wait for the training thread to exit.
+        """
         if not self._is_training:
             return self._last_completed_epoch
 
         self._shutdown_requested = True
-        # Unblock if paused waiting for inference
-        self._inference_done.set()
         if self._training_thread is not None:
             self._training_thread.join(timeout=timeout)
             if self._training_thread.is_alive():
@@ -476,13 +418,13 @@ class BackgroundTrainer:
 
         The GPU lock (``gpu_lock_sync``) is held for the duration of each job so
         that concurrent STT/TTS inference requests are correctly serialised via
-        ``pause()`` / ``resume()``.
+        ``abort_for_inference()``.
 
         ``inference_fallback_adapter`` is stored as a sentinel
-        :class:`TrainingJob` on ``self._current_job`` so that
-        :meth:`pause` switches to the correct committed adapter
-        (``"episodic"`` for post-session jobs) rather than whatever adapter was
-        last active during training.
+        :class:`TrainingJob` on ``self._current_job`` for bookkeeping.
+        The abort branch reads it only when ``preload_cache=False``; when
+        ``preload_cache=True`` (the default) the adapter swap is skipped
+        because recall is served from MemoryStore.
 
         The callable worker thread is started once on the first
         :meth:`submit` call and lives for the process lifetime (persistent
@@ -566,8 +508,12 @@ class BackgroundTrainer:
         Each job runs under ``gpu_lock_sync()`` to prevent concurrent GPU
         access from consolidation training or inference.  A sentinel
         :class:`TrainingJob` with ``inference_fallback_adapter`` set is
-        installed on ``self._current_job`` so that :meth:`pause` can switch
-        to the correct committed adapter when yielding to inference.
+        installed on ``self._current_job`` for bookkeeping.
+
+        Per-job abort events are installed BEFORE the gpu_lock_sync block and
+        cleared AFTER (in ``finally``).  ``_active_quiesced`` is set OUTSIDE
+        ``gpu_lock_sync`` so ``abort_for_inference``'s caller can acquire the
+        lock immediately after the wait returns — no lock contention.
 
         The loop exits only when the :data:`_WORKER_STOP` sentinel is
         dequeued, which is sent by :meth:`_stop_callable_worker` during
@@ -582,13 +528,19 @@ class BackgroundTrainer:
 
             fn, fallback_adapter = item
 
-            # Install a sentinel so pause() reads the correct fallback adapter.
+            # Install a sentinel so the abort branch reads the correct fallback.
             sentinel = TrainingJob(
                 entries=[],
                 adapter_name="_callable_",
                 adapter_config=AdapterConfig(),
                 inference_fallback_adapter=fallback_adapter,
             )
+
+            # Install per-job abort events BEFORE acquiring the GPU lock so
+            # abort_for_inference() can signal even before fn() starts.
+            with self._active_state_lock:
+                self._active_abort = threading.Event()
+                self._active_quiesced = threading.Event()
             self._current_job = sentinel
             self._is_training = True
             try:
@@ -597,29 +549,93 @@ class BackgroundTrainer:
             except Exception:
                 logger.exception("submit() job failed")
             finally:
+                # Quiesce signal fires AFTER gpu_lock_sync exits so the caller's
+                # next ``async with gpu_lock()`` succeeds without lock contention.
+                _quiesced = self._active_quiesced
+                with self._active_state_lock:
+                    self._active_abort = None
+                    self._active_quiesced = None
                 self._current_job = None
                 self._is_training = False
+                if _quiesced is not None:
+                    _quiesced.set()
 
     def _set_is_training(self, value: bool) -> None:
         """Override the ``_is_training`` flag from inside a submitted callable.
 
         Used by ``consolidate_interim_adapters`` to mark non-training phases
         (between per-tier ``_train_adapter`` calls; the entire finalize block)
-        so ``pause()`` short-circuits and inference waits on the GPU lock alone
-        instead of timing out on the never-firing inference-yield hook
-        installed by ``train_adapter`` via ``TrainingHooks``.
+        so ``abort_for_inference()`` short-circuits and ``/chat`` waits on the
+        GPU lock alone — there's no in-flight HF training step to abort at
+        those moments, so a no-op return is the correct contract.
 
         No locking is needed: the writer (this method, called from inside the
-        callable that holds the GPU lock) and the reader (``pause()``'s
-        ``if not self._is_training: return True`` guard) perform simple boolean
-        operations that are atomic under the GIL, and the callable is the sole
-        writer while the GPU lock is held.
+        callable that holds the GPU lock) and the reader
+        (``abort_for_inference()``'s ``if not self._is_training: return False``
+        gate via ``/chat``'s ``bg_trainer.is_training`` check at
+        ``app.py:2516``) perform simple boolean operations that are atomic
+        under the GIL, and the callable is the sole writer while the lock is
+        held.
 
         Args:
             value: ``True`` to re-arm training mode before a ``_train_adapter``
                 call; ``False`` to mark a non-training gap or the finalize block.
         """
         self._is_training = value
+
+    def training_hooks_for_job(
+        self,
+        *,
+        base_shutdown_predicate: Callable[[], bool] | None = None,
+        on_step_yield: Callable[[int], None] | None = None,
+        on_epoch_persist: Callable[[int, str], None] | None = None,
+        on_save_persist: Callable[[int, str], None] | None = None,
+    ) -> TrainingHooks:
+        """Construct TrainingHooks whose shutdown predicate ORs all signals.
+
+        The returned predicate returns True when ANY of these is true:
+        - ``_shutdown_requested`` (set by ``stop()``)
+        - ``base_shutdown_predicate()`` (caller's own gate, e.g. consolidation
+          ``shutdown_requested``)
+        - the per-job abort event (set by ``abort_for_inference()``)
+
+        Single canonical site for wiring all three signals.  Every
+        consolidation site should use this via
+        ``ConsolidationLoop._build_training_hooks()`` rather than constructing
+        ``TrainingHooks`` directly.
+
+        Args:
+            base_shutdown_predicate: Additional shutdown gate.  When ``None``
+                (the default), only ``_shutdown_requested`` and the abort flag
+                are checked.
+            on_step_yield: Passed through to ``TrainingHooks`` unchanged.
+                The inference-yield hook is no longer needed by
+                ``BackgroundTrainer`` (abort replaced it) but consolidation
+                callers may still supply one.
+            on_epoch_persist: Passed through to ``TrainingHooks`` unchanged.
+            on_save_persist: Passed through to ``TrainingHooks`` unchanged.
+
+        Returns:
+            A ``TrainingHooks`` instance with the composed shutdown predicate.
+        """
+        # Capture the current abort event by value so the closure holds the
+        # right event even after _active_abort is replaced for a subsequent job.
+        abort_ref: dict[str, threading.Event | None] = {"event": self._active_abort}
+
+        def _shutdown_or_abort() -> bool:
+            if self._shutdown_requested:
+                return True
+            if base_shutdown_predicate is not None and base_shutdown_predicate():
+                return True
+            evt = abort_ref["event"]
+            return evt is not None and evt.is_set()
+
+        return TrainingHooks(
+            on_step_yield=on_step_yield,
+            on_epoch_persist=on_epoch_persist,
+            on_save_persist=on_save_persist,
+            on_shutdown_check=_shutdown_or_abort,
+        )
 
     def close(self, timeout: float = 5.0) -> None:
         """Stop the ephemeral callable-worker thread and release its resources.
@@ -732,60 +748,6 @@ class BackgroundTrainer:
         except Exception:
             logger.exception("Failed to remove resume state file")
 
-    def _yield_to_inference(self, global_step: int) -> None:
-        """Pause training while an inference request is being served.
-
-        Wired into ``train_adapter`` via ``TrainingHooks.on_step_yield`` —
-        invoked at every step boundary, BEFORE the thermal throttle runs at
-        the same step (callback ordering locked in
-        ``paramem/training/trainer.py``).  When an inference request arrives,
-        releases the GPU lock so STT/TTS/inference can proceed, waits a
-        bounded period for the caller to signal done, re-acquires the lock,
-        and restores the ``in_training`` adapter (inference may have
-        switched away).
-        """
-        if not self._inference_requested.is_set():
-            return
-
-        from paramem.models.loader import switch_adapter
-        from paramem.server.gpu_lock import gpu_lock_released
-
-        logger.debug("Training paused for inference at step %d", global_step)
-        with gpu_lock_released():
-            # Lock RELEASED for the body. Ordering matters:
-            #   - _training_paused.set() must follow release so pause() observes
-            #     yield-complete only after the lock is actually free.
-            #   - _inference_done.clear() must precede ctx-mgr exit so the next
-            #     yield cycle starts from a clean event state.
-            self._training_paused.set()
-            signalled = self._inference_done.wait(timeout=self._INFERENCE_TIMEOUT)
-            if not signalled:
-                logger.warning(
-                    "Inference did not signal done within %.0fs — resuming training",
-                    self._INFERENCE_TIMEOUT,
-                )
-            self._inference_done.clear()
-        # Lock REACQUIRED. switch_adapter MUST stay outside the ctx body (model
-        # access requires the lock). _training_paused.clear() MUST stay AFTER
-        # reacquire — clearing it while the lock is still released would let
-        # pause() re-enter yield before training has the lock back.
-        switch_adapter(self.model, "in_training")
-        self._training_paused.clear()
-        logger.debug("Training resumed at step %d (adapter=in_training)", global_step)
-
-    def _inference_active(self) -> bool:
-        """Return True if a PA inference request is pending or in flight.
-
-        Read by the thermal throttle's gate (via TrainingHooks.on_inference_active)
-        to suppress throttling while PA is responding. The event is set by pause()
-        at line 354 and cleared by resume() at line 435 — so this returns True
-        from the moment a /chat handler calls bg_trainer.pause() until resume()
-        completes. A brief False-then-resume window exists between resume()'s
-        clear at line 435 and _inference_done.set() at line 436; the throttle
-        fires one step late at worst (reviewer-noted, harmless).
-        """
-        return self._inference_requested.is_set()
-
     def _persist_resume_state(self, epoch_or_step: int, output_dir: str) -> None:
         """Write the resume_state.json marker for crash-safe recovery.
 
@@ -824,6 +786,10 @@ class BackgroundTrainer:
 
         Holds the GPU lock during training to prevent concurrent CUDA access.
         Releases the lock between jobs for cooldown and to let STT/TTS through.
+        Per-job abort events are installed inside ``_train_adapter`` for the
+        start_jobs path (the submit path installs them in _run_callable_queue).
+        _active_quiesced is set in this method's outer finally OUTSIDE the
+        gpu_lock_sync block for the same ordering reason as _run_callable_queue.
         """
         from paramem.server.gpu_lock import gpu_lock_sync
 
@@ -848,6 +814,9 @@ class BackgroundTrainer:
                 )
                 with gpu_lock_sync():
                     self._train_adapter(job)
+                # _train_adapter installed and cleared per-job events; after the
+                # gpu_lock_sync block exits, _active_quiesced was already fired
+                # inside _train_adapter's finally (see that method).
 
             if all_complete and on_complete:
                 on_complete()
@@ -884,14 +853,18 @@ class BackgroundTrainer:
         """Train a single adapter via the in_training staging slot.
 
         Flow (fresh start):
-            1. Compute fingerprints and check for a valid resume state.
-            2. Copy production adapter weights into in_training as the
+            1. Install per-job abort events (idempotent if already installed by
+               _run_callable_queue).
+            2. Compute fingerprints and check for a valid resume state.
+            3. Copy production adapter weights into in_training as the
                starting point (skipped when resuming from a checkpoint).
-            3. Activate in_training (training modifies staging only).
-            4. Train N epochs, writing resume_state.json after each epoch.
-            5. On success: copy in_training → production, atomic save,
+            4. Activate in_training (training modifies staging only).
+            5. Train N epochs, writing resume_state.json after each epoch.
+            6. On abort: restore inference-mode state; skip commit + state-clear
+               so resume_state.json + bg_checkpoint/ survive for the next job.
+            7. On success: copy in_training → production, atomic save,
                then remove resume_state.json and bg_checkpoint/.
-            6. On exception: leave resume state and checkpoint in place
+            8. On exception: leave resume state and checkpoint in place
                so the next restart can pick up from the last epoch.
 
         If training fails or the server crashes, the production adapter on
@@ -908,6 +881,39 @@ class BackgroundTrainer:
         # first persist of this job.
         self._last_persist_key = None
 
+        # Install per-job abort events when called from the start_jobs path.
+        # The _run_callable_queue path installs them before acquiring the GPU
+        # lock; this branch handles the start_jobs path where _train_adapter
+        # is called directly inside gpu_lock_sync.
+        with self._active_state_lock:
+            if self._active_abort is None:
+                self._active_abort = threading.Event()
+                self._active_quiesced = threading.Event()
+                _installed_here = True
+            else:
+                _installed_here = False
+
+        try:
+            self._train_adapter_body(job, switch_adapter, copy_adapter_weights, shutil)
+        finally:
+            if _installed_here:
+                # Quiesce signal fires AFTER gpu_lock_sync exits (caller's finally
+                # runs before the lock is released) so abort_for_inference's caller
+                # can acquire the GPU lock without racing on the still-held lock.
+                _quiesced = self._active_quiesced
+                with self._active_state_lock:
+                    self._active_abort = None
+                    self._active_quiesced = None
+                if _quiesced is not None:
+                    _quiesced.set()
+
+    def _train_adapter_body(self, job: TrainingJob, switch_adapter, copy_adapter_weights, shutil):
+        """Inner body of _train_adapter, separated for clarity.
+
+        All abort and quiesced event management lives in _train_adapter.
+        This method handles the training lifecycle: fingerprint, resume-state,
+        staging setup, train, abort-or-commit.
+        """
         if "in_training" not in self.model.peft_config:
             raise RuntimeError(
                 "in_training staging adapter not found — was ConsolidationLoop initialized?"
@@ -992,12 +998,13 @@ class BackgroundTrainer:
         checkpoint_dir = self.output_dir / "in_training" / "bg_checkpoint"
 
         # Delegate the inner training step to the unified ``train_adapter``.
-        # BG-specific concerns (inference yielding, resume-state persistence,
-        # graceful shutdown) flow through ``TrainingHooks``.  Thermal throttle
-        # installs only when ``self._thermal_policy is not None`` (= live
-        # server with positive ``training_temp_limit``).  /dev/shm
-        # encrypted-checkpoint materialization happens inside ``train_adapter``;
-        # no duplicate /dev/shm handling here.
+        # BG-specific concerns (abort-for-inference, resume-state persistence,
+        # graceful shutdown) flow through ``TrainingHooks`` via
+        # training_hooks_for_job.  Thermal throttle installs only when
+        # ``self._thermal_policy is not None`` (= live server with positive
+        # ``training_temp_limit``).  /dev/shm encrypted-checkpoint
+        # materialization happens inside ``train_adapter``; no duplicate
+        # /dev/shm handling here.
         #
         # ``logging_steps=10`` preserves the BG-side log volume that predates
         # the unification — the canonical default on ``TrainingConfig`` is 1
@@ -1012,12 +1019,9 @@ class BackgroundTrainer:
             if self.training_config.save_strategy_bg == "steps":
                 overrides["save_steps"] = max(1, self.training_config.save_steps_bg)
         bg_training_config = replace(self.training_config, **overrides)
-        hooks = TrainingHooks(
-            on_step_yield=self._yield_to_inference,
+        hooks = self.training_hooks_for_job(
             on_epoch_persist=self._persist_resume_state,
             on_save_persist=self._persist_resume_state,
-            on_shutdown_check=lambda: self._shutdown_requested,
-            on_inference_active=self._inference_active,
         )
 
         logger.info(
@@ -1058,6 +1062,33 @@ class BackgroundTrainer:
             except Exception:
                 logger.exception("Failed to restore model state after training error")
             raise
+
+        # Check for abort AFTER train_adapter returns normally.  If the shutdown
+        # predicate fired (abort or _shutdown_requested), HF Trainer exits the
+        # training loop cleanly and train_adapter returns without raising.
+        # Detect this by checking the abort event directly.
+        with self._active_state_lock:
+            _abort_evt = self._active_abort
+        if _abort_evt is not None and _abort_evt.is_set():
+            logger.info(
+                "Training of %s aborted for inference at step boundary — "
+                "resume state preserved for next submission",
+                job.adapter_name,
+            )
+            # Restore inference-mode state exactly like the exception path.
+            # CLAUDE.md mandates gradient_checkpointing_disable before generate().
+            try:
+                # When preload_cache=True, recall is served from MemoryStore and
+                # generation uses model.disable_adapter() at the inference sites.
+                # Skipping the adapter swap saves a PEFT call in the common case.
+                if not self._preload_cache:
+                    switch_adapter(self.model, job.adapter_name)
+                self.model.eval()
+                if self.training_config.gradient_checkpointing:
+                    self.model.gradient_checkpointing_disable()
+            except Exception:
+                logger.exception("Failed to restore model state after abort")
+            return  # leave resume_state.json + bg_checkpoint/ intact
 
         # Commit to production first, then clean up resume artefacts.
         self._commit_staging_to_production(job.adapter_name)

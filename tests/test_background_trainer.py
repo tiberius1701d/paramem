@@ -2,8 +2,9 @@
 
 Covers:
   - TrainingJob.inference_fallback_adapter field defaults to "episodic".
-  - BackgroundTrainer.pause() uses job.inference_fallback_adapter, not
-    self._current_adapter, when determining which adapter to switch to.
+  - abort_for_inference() returns False when idle, sets abort event, quiesces.
+  - training_hooks_for_job ORs shutdown_requested, abort flag, and caller gate.
+  - Per-job abort events do not leak across jobs.
   - Step-level save knobs and dedup logic for _persist_resume_state.
   - _fingerprint_training_config includes save_strategy_bg/save_steps_bg.
   - on_shutdown_check fires at step_end via TrainingHooks.
@@ -85,155 +86,131 @@ class TestTrainingJobInferenceFallbackAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Test 9 — pause() uses inference_fallback_adapter, not _current_adapter
+# Test 9 — abort_for_inference() replaces pause/resume
 # ---------------------------------------------------------------------------
 
 
-class TestPauseUsesInferenceFallbackNotCurrentAdapter:
-    """Blocker 1 fix: pause() reads job.inference_fallback_adapter."""
+class TestAbortForInference:
+    """abort_for_inference() sets the per-job abort flag and waits for quiesced."""
 
-    def test_pause_switches_to_episodic_not_interim_adapter(self) -> None:
-        """When training an interim adapter, pause() switches to 'episodic', not the interim slot.
-
-        This test verifies the Blocker 1 fix from Step 6c of the multi-adapter
-        interim routing plan.
-
-        Before the fix, pause() fell back to self._current_adapter (the interim
-        adapter name), which contains mid-training staging-copy weights that must
-        NOT be exposed to inference.  The fix reads
-        job.inference_fallback_adapter instead, which for interim-adapter jobs is
-        always the stable 'episodic' main.
-        """
-        model = _make_stub_model("episodic", "episodic_interim_20260418T1430", "in_training")
-        config = _minimal_training_config()
-        adapter_cfg = _minimal_adapter_config()
-
-        interim_name = "episodic_interim_20260418T1430"
-
-        job = TrainingJob(
-            entries=[{"key": "graph1", "question": "Q?", "answer": "A."}],
-            adapter_name=interim_name,
-            adapter_config=adapter_cfg,
-            inference_fallback_adapter="episodic",
-        )
-
+    def test_abort_returns_false_when_idle(self) -> None:
+        """abort_for_inference() is a no-op and returns False when not training."""
+        model = _make_stub_model("episodic", "in_training")
         bt = BackgroundTrainer(
             model=model,
             tokenizer=MagicMock(),
-            training_config=config,
-            output_dir="/tmp/test_bt",
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_bt_abort_idle",
         )
+        # No active job — _active_abort is None.
+        assert bt._active_abort is None
+        result = bt.abort_for_inference(timeout=0.1)
+        assert result is False
 
-        # Simulate the trainer being mid-job.
-        bt._is_training = True
-        bt._current_adapter = interim_name
-        bt._current_job = job
-
-        # We test the adapter-selection logic directly without the threading machinery.
-        # The full pause() path requires the training thread; here we verify only
-        # the target-selection rule that pause() applies.
-        bt._training_paused.set()
-
-        # Extract the target-selection rule that pause() applies.
-        target = (
-            bt._current_job.inference_fallback_adapter
-            if bt._current_job is not None
-            else "episodic"
-        )
-        assert target == "episodic", (
-            f"Expected 'episodic' as the fallback, got {target!r}. "
-            "BackgroundTrainer.pause() must read job.inference_fallback_adapter, "
-            "not self._current_adapter."
-        )
-        assert target != interim_name, (
-            "pause() must NOT switch to the mid-training interim adapter."
-        )
-
-    def test_pause_fallback_is_episodic_when_no_job(self) -> None:
-        """When _current_job is None, fallback defaults to 'episodic'."""
-        model = _make_stub_model("episodic")
-        config = _minimal_training_config()
-
+    def test_abort_sets_abort_event_and_waits_for_quiesced(self) -> None:
+        """abort_for_inference() sets the abort flag and returns True when quiesced fires."""
+        model = _make_stub_model("episodic", "in_training")
         bt = BackgroundTrainer(
             model=model,
             tokenizer=MagicMock(),
-            training_config=config,
-            output_dir="/tmp/test_bt2",
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_bt_abort_sets",
         )
+        # Manually install per-job events as _run_callable_queue would.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
 
-        # Simulate the pre-first-job state.
-        bt._current_job = None
+        # Fire the quiesced event in a background thread after a brief delay.
+        def _fire_quiesced():
+            import time
 
-        target = (
-            bt._current_job.inference_fallback_adapter
-            if bt._current_job is not None
-            else "episodic"
-        )
-        assert target == "episodic"
+            time.sleep(0.05)
+            bt._active_quiesced.set()
 
-    def test_pause_switches_to_fallback_adapter_in_peft_config(
-        self,
-    ) -> None:
-        """Integration check: pause() calls switch_adapter with the fallback name.
+        t = threading.Thread(target=_fire_quiesced, daemon=True)
+        t.start()
 
-        We mock the threading machinery so the test runs without a real training
-        thread.  The test verifies that the adapter name passed to switch_adapter
-        is the job's inference_fallback_adapter, not _current_adapter.
-        """
-        interim_name = "episodic_interim_20260418T1430"
-        model = _make_stub_model("episodic", interim_name, "in_training")
-        config = _minimal_training_config()
-
-        job = TrainingJob(
-            entries=[],
-            adapter_name=interim_name,
-            adapter_config=_minimal_adapter_config(),
-            inference_fallback_adapter="episodic",
-        )
-
-        bt = BackgroundTrainer(
-            model=model,
-            tokenizer=MagicMock(),
-            training_config=config,
-            output_dir="/tmp/test_bt3",
-        )
-        bt._is_training = True
-        bt._current_adapter = interim_name
-        bt._current_job = job
-
-        # Simulate the training thread having already paused (event is set).
-        bt._training_paused.set()
-
-        switch_calls = []
-
-        def _record_switch(m, name):  # noqa: ANN001
-            switch_calls.append(name)
-
-        # Patch switch_adapter at the background_trainer module level so pause()
-        # sees the mock when it does `from paramem.models.loader import switch_adapter`.
-        with patch(
-            "paramem.models.loader.switch_adapter",
-            side_effect=_record_switch,
-        ):
-            # pause() is normally called from the inference path with no training
-            # thread running.  We patch _training_paused.wait to return immediately
-            # and then call the real pause() implementation.
-            with patch.object(bt, "_training_paused") as mock_paused_event:
-                mock_paused_event.wait.return_value = True
-                mock_paused_event.is_set.return_value = True
-                result = bt.pause(timeout=0.1)
-
-        # pause() should have returned True (paused successfully).
+        result = bt.abort_for_inference(timeout=2.0)
         assert result is True
+        assert bt._active_abort.is_set()
+        t.join(timeout=1.0)
 
-        # The switch_adapter call must have been to "episodic", NOT the interim slot.
-        assert switch_calls, "switch_adapter was never called"
-        assert switch_calls[-1] == "episodic", (
-            f"pause() switched to {switch_calls[-1]!r} instead of 'episodic'."
+    def test_abort_training_hooks_shutdown_predicate_returns_true(self) -> None:
+        """The training_hooks_for_job shutdown predicate returns True after abort."""
+        model = _make_stub_model("episodic", "in_training")
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_bt_hooks_abort",
         )
-        assert interim_name not in switch_calls, (
-            "pause() must NOT switch to the mid-training interim adapter."
+        # Install per-job events.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+
+        hooks = bt.training_hooks_for_job()
+        # Before abort: predicate is False.
+        assert hooks.on_shutdown_check() is False
+        # Set abort: predicate becomes True.
+        bt._active_abort.set()
+        assert hooks.on_shutdown_check() is True
+
+    def test_per_job_abort_does_not_leak_to_next_job(self) -> None:
+        """A cleared per-job event does not affect the next job's predicate."""
+        model = _make_stub_model("episodic", "in_training")
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_bt_no_leak",
         )
+        # Simulate job A: install, abort, clear.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        bt._active_abort.set()
+        hooks_a = bt.training_hooks_for_job()
+        assert hooks_a.on_shutdown_check() is True
+
+        # Clear (simulate job A teardown).
+        with bt._active_state_lock:
+            bt._active_abort = None
+            bt._active_quiesced = None
+
+        # Install job B events.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        hooks_b = bt.training_hooks_for_job()
+        # Job B's predicate must start False.
+        assert hooks_b.on_shutdown_check() is False
+
+    def test_training_hooks_ors_shutdown_requested_and_abort(self) -> None:
+        """shutdown_requested True makes predicate True even without abort."""
+        model = _make_stub_model("episodic", "in_training")
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_bt_shutdown_or",
+        )
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+
+        hooks = bt.training_hooks_for_job()
+        assert hooks.on_shutdown_check() is False
+
+        bt._shutdown_requested = True
+        assert hooks.on_shutdown_check() is True
+
+        bt._shutdown_requested = False
+        assert hooks.on_shutdown_check() is False
+
+        bt._active_abort.set()
+        assert hooks.on_shutdown_check() is True
 
 
 # ---------------------------------------------------------------------------

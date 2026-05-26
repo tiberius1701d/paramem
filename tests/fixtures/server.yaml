@@ -323,6 +323,8 @@ consolidation:
   training_keep_prior_slots: 3
   # Idle debounce: mirrors server.yaml.example.
   training_idle_debounce_s: 30
+  # /chat abort-quiesce timeout: mirrors server.yaml.example.
+  abort_quiesce_timeout_s: 30.0
 
 # --- Agents ---
 # PA (local model) handles personal knowledge. HA agent handles tool use.

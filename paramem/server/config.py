@@ -971,6 +971,11 @@ class ConsolidationScheduleConfig:
     # _state["last_chat_monotonic"] via time.monotonic() so a wall-clock NTP
     # step does not break the predicate. Set to 0 to disable the gate.
     training_idle_debounce_s: int = 30
+    # Time /chat waits for the BG trainer to abort at the next step boundary
+    # before falling back to bt.stop(). At step times >> this, /chat falls
+    # through to stop() which is heavier-handed. 30s covers typical BG
+    # training step durations on the live system with room to spare.
+    abort_quiesce_timeout_s: float = 30.0
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -1006,6 +1011,11 @@ class ConsolidationScheduleConfig:
             raise ValueError(
                 f"consolidation.training_idle_debounce_s must be >= 0; "
                 f"got {self.training_idle_debounce_s}"
+            )
+        if self.abort_quiesce_timeout_s <= 0:
+            raise ValueError(
+                f"consolidation.abort_quiesce_timeout_s must be > 0; "
+                f"got {self.abort_quiesce_timeout_s}"
             )
 
         judge = self.extraction_plausibility_judge

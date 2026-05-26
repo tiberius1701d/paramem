@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 from torch.utils.data import Dataset
 
@@ -326,6 +326,55 @@ class ConsolidationLoop:
         # TODO(Step 7): consume pending_interim_triples at the start of
         # consolidate_interim_adapters() before training the full key set.
         self.pending_interim_triples: list[dict] = []
+        # BackgroundTrainer reference — wired after construction by the server
+        # lifespan or create_consolidation_loop caller.  When set,
+        # _build_training_hooks routes through bt.training_hooks_for_job so
+        # the abort event is included in the shutdown predicate.
+        self._bg_trainer = None
+
+    def _build_training_hooks(
+        self,
+        *,
+        on_step_yield: "Optional[Callable[[int], None]]" = None,
+        on_epoch_persist: "Optional[Callable[[int, str], None]]" = None,
+        on_save_persist: "Optional[Callable[[int, str], None]]" = None,
+    ) -> TrainingHooks:
+        """Construct TrainingHooks honouring consolidation shutdown + BG abort.
+
+        Routes through ``self._bg_trainer.training_hooks_for_job`` when a
+        BackgroundTrainer is wired, so the abort event (set by
+        ``abort_for_inference()``) is ORed into the shutdown predicate
+        alongside the consolidation ``shutdown_requested`` flag.
+
+        When no BackgroundTrainer is wired (experiment paths), returns a plain
+        ``TrainingHooks`` with just the consolidation shutdown_requested check.
+
+        Args:
+            on_step_yield: Passed through to ``TrainingHooks`` unchanged.
+            on_epoch_persist: Passed through to ``TrainingHooks`` unchanged.
+            on_save_persist: Passed through to ``TrainingHooks`` unchanged.
+
+        Returns:
+            A ``TrainingHooks`` instance ready to pass to ``train_adapter``.
+        """
+
+        def base() -> bool:
+            return self.shutdown_requested
+
+        bt = getattr(self, "_bg_trainer", None)
+        if bt is not None:
+            return bt.training_hooks_for_job(
+                base_shutdown_predicate=base,
+                on_step_yield=on_step_yield,
+                on_epoch_persist=on_epoch_persist,
+                on_save_persist=on_save_persist,
+            )
+        return TrainingHooks(
+            on_shutdown_check=base,
+            on_step_yield=on_step_yield,
+            on_epoch_persist=on_epoch_persist,
+            on_save_persist=on_save_persist,
+        )
 
     def guard_trial_state(self, state: dict | None) -> None:
         """Raise TrialActiveError when a migration TRIAL is in progress.
@@ -1755,7 +1804,7 @@ class ConsolidationLoop:
             output_dir=self._training_output_dir("semantic"),
             run_name=f"phase4-indexed-semantic-cycle{self.cycle_count}",
             thermal_policy=self._thermal_policy,
-            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+            hooks=self._build_training_hooks(),
         )
 
         # Update semantic SimHash registry
@@ -1839,7 +1888,7 @@ class ConsolidationLoop:
             output_dir=self._training_output_dir(adapter_name),
             run_name=run_name,
             thermal_policy=self._thermal_policy,
-            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+            hooks=self._build_training_hooks(),
         )
 
         return metrics.get("train_loss")
@@ -2420,7 +2469,7 @@ class ConsolidationLoop:
             output_dir=self._training_output_dir("procedural", interim_stamp=stamp),
             run_name=f"interim-procedural-{run_label}",
             thermal_policy=self._thermal_policy,
-            hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+            hooks=self._build_training_hooks(),
             callbacks_extra=[recall_cb] if recall_cb is not None else None,
         )
         # Deferred mutations — apply only after _train_adapter succeeds.
@@ -2713,7 +2762,7 @@ class ConsolidationLoop:
                 output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
                 run_name=f"interim-{adapter_name}-{run_label}",
                 thermal_policy=self._thermal_policy,
-                hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+                hooks=self._build_training_hooks(),
                 callbacks_extra=[recall_cb] if recall_cb is not None else None,
             )
             epi_train_loss = epi_metrics.get("train_loss") if epi_metrics is not None else None
@@ -3219,9 +3268,9 @@ class ConsolidationLoop:
         - The finalize block (registry rewrite → interim purge → router reload)
           runs as plain sequential statements — no training calls, no HF Trainer-
           driven routines.  Do not smuggle a training call into the finalize
-          section; the inference-yield hook installed by ``train_adapter`` only
-          fires at epoch/step boundaries and would not protect non-training
-          code paths.
+          section; the abort-via-shutdown-predicate hook installed by
+          ``train_adapter`` only fires at step boundaries inside HF Trainer's
+          loop and would not protect non-training code paths.
 
         Steps:
         1. Verify the GPU lock is held (entry guard — leak-safe pattern).
@@ -3571,7 +3620,7 @@ class ConsolidationLoop:
                         output_dir=self.output_dir / "consolidation_refresh" / tier,
                         run_name=f"consolidate-{tier}",
                         thermal_policy=self._thermal_policy,
-                        hooks=TrainingHooks(on_shutdown_check=lambda: self.shutdown_requested),
+                        hooks=self._build_training_hooks(),
                         callbacks_extra=[recall_cb] if recall_cb is not None else None,
                     )
                     logger.info(

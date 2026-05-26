@@ -32,8 +32,9 @@ class TrainingHooks:
 
     All fields default to ``None`` — callers pass only the intents they need:
 
-    - ``on_step_yield(global_step)``: invoked at every step boundary, used by
-      ``BackgroundTrainer`` to yield to inference requests.
+    - ``on_step_yield(global_step)``: invoked at every step boundary (optional;
+      no longer used by ``BackgroundTrainer`` itself since abort replaced the
+      yield pattern, but consolidation callers may still supply one).
     - ``on_epoch_persist(epoch, output_dir)``: invoked at every epoch end,
       used by ``BackgroundTrainer`` to write ``resume_state.json``.
     - ``on_save_persist(global_step, output_dir)``: invoked whenever HF
@@ -44,18 +45,17 @@ class TrainingHooks:
       prevents double-writes.
     - ``on_shutdown_check()``: invoked at every step end and every epoch end;
       returning ``True`` sets ``control.should_training_stop``. Step-level
-      check enables sub-epoch shutdown granularity.
-    - ``on_inference_active()``: polled by ``ThermalThrottleCallback`` to
-      suppress throttling while a PA conversation is in progress (latency
-      protection). Defaults to ``None`` (throttle never suppressed for
-      non-server callers).
+      check enables sub-epoch shutdown granularity.  When constructed via
+      ``BackgroundTrainer.training_hooks_for_job``, this predicate ORs the
+      BG abort event, ``_shutdown_requested``, and the caller's own gate —
+      so abort signals reach the throttle's shutdown_fn without a separate
+      field.
     """
 
     on_step_yield: Optional[Callable[[int], None]] = None
     on_epoch_persist: Optional[Callable[[int, str], None]] = None
     on_save_persist: Optional[Callable[[int, str], None]] = None
     on_shutdown_check: Optional[Callable[[], bool]] = None
-    on_inference_active: Optional[Callable[[], bool]] = None
 
 
 class _HooksAdapterCallback(TrainerCallback):
@@ -345,24 +345,20 @@ def train_adapter(
     if hooks is not None:
         callbacks.append(_HooksAdapterCallback(hooks))
     if thermal_policy is not None:
-        # When hooks expose a shutdown predicate, route it into the throttle
-        # so a mid-wait shutdown breaks the loop cleanly. Otherwise the
-        # throttle's default constant-False shutdown_fn applies.
+        # Route the hooks' shutdown predicate into the throttle's shutdown_fn
+        # so an abort or shutdown signal breaks the throttle's wait loop
+        # cleanly.  The abort event is ORed into on_shutdown_check by
+        # BackgroundTrainer.training_hooks_for_job, so no separate abort_fn
+        # field is needed on ThermalThrottleCallback.
         shutdown_fn = (
             hooks.on_shutdown_check
             if hooks is not None and hooks.on_shutdown_check is not None
-            else (lambda: False)
-        )
-        inference_active_fn = (
-            hooks.on_inference_active
-            if hooks is not None and hooks.on_inference_active is not None
             else (lambda: False)
         )
         callbacks.append(
             ThermalThrottleCallback(
                 thermal_policy,
                 shutdown_fn=shutdown_fn,
-                inference_active_fn=inference_active_fn,
             )
         )
     if callbacks_extra:

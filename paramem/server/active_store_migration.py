@@ -549,7 +549,6 @@ def _migrate_tier_simulate_to_train(
         create_adapter,
         switch_adapter,
     )
-    from paramem.training.trainer import TrainingHooks
     from paramem.training.trainer import train_adapter as _train_adapter
 
     # Source graph is at the unified layout location resolved by name.
@@ -619,7 +618,7 @@ def _migrate_tier_simulate_to_train(
         output_dir=Path(config.adapter_dir) / "active_store_migration" / name,
         run_name=f"migrate-simulate-to-train-{name}",
         thermal_policy=loop._thermal_policy,
-        hooks=TrainingHooks(on_shutdown_check=lambda: loop.shutdown_requested),
+        hooks=loop._build_training_hooks(),
         callbacks_extra=[recall_cb] if recall_cb is not None else None,
     )
 

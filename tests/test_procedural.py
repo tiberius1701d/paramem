@@ -166,6 +166,12 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
         # Same for _safe_kp_from_cache (cache-fallback helper for partial entries).
         stub._safe_kp_from_cache = ConsolidationLoop._safe_kp_from_cache.__get__(stub)
+        # _build_training_hooks (post-Commit-4): consolidation sites route their
+        # TrainingHooks construction through this helper. Bind the real method;
+        # it reads getattr(self, "_bg_trainer", None) — None here means returns
+        # a plain TrainingHooks with just shutdown_requested predicate.
+        stub._build_training_hooks = ConsolidationLoop._build_training_hooks.__get__(stub)
+        stub.shutdown_requested = False
         return stub, fake_qa
 
     def test_next_index_not_advanced_when_training_raises(self, monkeypatch, tmp_path):

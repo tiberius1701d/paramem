@@ -2151,8 +2151,13 @@ async def lifespan(app: FastAPI):
                         thermal_policy=ThermalPolicy.from_consolidation_config(
                             config.consolidation
                         ),
+                        preload_cache=config.inference.preload_cache,
                     )
                     _state["background_trainer"] = _replay_bt
+
+                # Wire the BG trainer into the consolidation loop so its abort
+                # event is included in the training hooks shutdown predicate.
+                _state["consolidation_loop"]._bg_trainer = _state["background_trainer"]
 
                 # Drain and replay — entries are removed individually upon
                 # successful completion inside enqueue_post_session_train's
@@ -2502,17 +2507,21 @@ async def chat(request: ChatRequest):
         return ChatResponse(text=spoken_text, escalated=True, speaker=speaker, follow_up=follow_up)
 
     # Local mode — normal inference with entity routing
-    # Pause background training if active, then acquire GPU lock
+    # Abort background training if active, then acquire GPU lock.
+    # abort_for_inference() sets the per-job abort flag and waits up to 30 s
+    # for training to stop at the next step boundary and release the GPU lock.
+    # _active_quiesced is set OUTSIDE gpu_lock_sync so the caller's
+    # async with gpu_lock() below succeeds without lock contention.
     bg_trainer = _state.get("background_trainer")
-    training_paused = False
-    training_stopped = False
     if bg_trainer is not None and bg_trainer.is_training:
-        if bg_trainer.pause():
-            training_paused = True
-        else:
-            logger.warning("Could not pause training — stopping trainer before inference")
+        _abort_timeout = _state["config"].consolidation.abort_quiesce_timeout_s
+        aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
+        if not aborted:
+            logger.warning(
+                "Training did not abort within %.1f s — stopping trainer before inference",
+                _abort_timeout,
+            )
             bg_trainer.stop(timeout=30)
-            training_stopped = True
 
     from paramem.server.gpu_lock import gpu_lock
 
@@ -2594,13 +2603,8 @@ async def chat(request: ChatRequest):
                 post_session_queue=_psq,
             )
 
-    # Resume training after inference — only if we paused (not stopped)
-    if training_paused and bg_trainer is not None:
-        bg_trainer.resume()
-    elif training_stopped:
-        logger.warning(
-            "Training was stopped for inference — will restart on next scheduled training interval"
-        )
+    # Training was aborted (not paused) — the next job submission will resume
+    # from the checkpoint automatically via the resume_state.json path.
 
     spoken_text = f"{greeting_prefix}{response_text}" if greeting_prefix else response_text
     return ChatResponse(
@@ -4998,42 +5002,37 @@ async def debug_probe(request: DebugProbeRequest):
         )
         return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
 
-    # Local mode — pause BG trainer + acquire gpu_lock, mirroring /chat.
+    # Local mode — abort BG trainer + acquire gpu_lock, mirroring /chat.
     bg_trainer = _state.get("background_trainer")
-    training_paused = False
     if bg_trainer is not None and bg_trainer.is_training:
-        if bg_trainer.pause():
-            training_paused = True
-        else:
+        _abort_timeout = config.consolidation.abort_quiesce_timeout_s
+        aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
+        if not aborted:
             bg_trainer.stop(timeout=30)
 
     from paramem.server.gpu_lock import gpu_lock
 
-    try:
-        async with gpu_lock():
-            loop = asyncio.get_running_loop()
-            result: ChatResult = await loop.run_in_executor(
-                None,
-                lambda: handle_chat(
-                    text=request.text,
-                    conversation_id=request.conversation_id,
-                    speaker=speaker_name,
-                    speaker_id=request.speaker_id,
-                    history=request.history,
-                    model=_state["model"],
-                    tokenizer=_state["tokenizer"],
-                    config=config,
-                    router=_state["router"],
-                    sota_agent=_state.get("sota_agent"),
-                    ha_client=_state.get("ha_client"),
-                    language=None,
-                    effective_mode=_state.get("effective_mode"),
-                    memory_store=_state["memory_store"],
-                ),
-            )
-    finally:
-        if training_paused and bg_trainer is not None:
-            bg_trainer.resume()
+    async with gpu_lock():
+        loop = asyncio.get_running_loop()
+        result: ChatResult = await loop.run_in_executor(
+            None,
+            lambda: handle_chat(
+                text=request.text,
+                conversation_id=request.conversation_id,
+                speaker=speaker_name,
+                speaker_id=request.speaker_id,
+                history=request.history,
+                model=_state["model"],
+                tokenizer=_state["tokenizer"],
+                config=config,
+                router=_state["router"],
+                sota_agent=_state.get("sota_agent"),
+                ha_client=_state.get("ha_client"),
+                language=None,
+                effective_mode=_state.get("effective_mode"),
+                memory_store=_state["memory_store"],
+            ),
+        )
 
     return ChatResponse(
         text=result.text,
@@ -6546,8 +6545,10 @@ async def _run_base_swap_orchestration(
                 training_config=config.training_config,
                 output_dir=config.adapter_dir,
                 thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+                preload_cache=config.inference.preload_cache,
             )
             _state["background_trainer"] = bt
+            _state["consolidation_loop"]._bg_trainer = bt
 
             # asyncio.Event lets us await the BG-worker result from this coroutine.
             # Capture the running event loop at creation time so the worker thread
@@ -6808,8 +6809,10 @@ async def _run_base_swap_orchestration(
             training_config=config_b.training_config,
             output_dir=config_b.adapter_dir,
             thermal_policy=ThermalPolicy.from_consolidation_config(config_b.consolidation),
+            preload_cache=config_b.inference.preload_cache,
         )
         _state["background_trainer"] = bt_b
+        _state["consolidation_loop"]._bg_trainer = bt_b
 
         _phase_b_aio_loop = asyncio.get_event_loop()
         done_event_b = asyncio.Event()
@@ -9592,8 +9595,15 @@ def _await_bg_cycle(
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        preload_cache=config.inference.preload_cache,
     )
+    # Wire the throwaway trainer into both _state and the consolidation loop
+    # so /chat's abort_for_inference targets the same BT instance whose
+    # training_hooks_for_job is installed inside run_consolidation_cycle.
+    # Without the loop wiring, the loop's _build_training_hooks would close
+    # over a stale (or None) _bg_trainer and silently drop the abort signal.
     _state["background_trainer"] = bt
+    loop._bg_trainer = bt
 
     _result_holder: dict = {}
 
@@ -10296,7 +10306,7 @@ def _extract_and_start_training():
     max_interim_count = config.consolidation.max_interim_count
 
     # The BG-trainer worker thread holds the GPU lock for the duration of the
-    # callable so concurrent STT/TTS inference yields via pause/resume.  A new
+    # callable so concurrent STT/TTS inference abort requests reach it.  A new
     # BackgroundTrainer is constructed per cycle to match the historical
     # pattern; the previous instance (if any) is replaced on _state.
     bt = BackgroundTrainer(
@@ -10305,8 +10315,11 @@ def _extract_and_start_training():
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        preload_cache=config.inference.preload_cache,
     )
     _state["background_trainer"] = bt
+    if _state.get("consolidation_loop") is not None:
+        _state["consolidation_loop"]._bg_trainer = bt
 
     def _run_interim_training() -> None:
         """Execute the interim training pass + post-train bookkeeping.
@@ -10462,8 +10475,10 @@ def _run_full_consolidation_sync() -> None:
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        preload_cache=config.inference.preload_cache,
     )
     _state["background_trainer"] = bt
+    _state["consolidation_loop"]._bg_trainer = bt
 
     def _run_full_cycle() -> None:
         """Run on the BG trainer worker thread under the GPU lock."""
@@ -10719,8 +10734,10 @@ def _run_active_store_migration_sync() -> None:
         training_config=config.training_config,
         output_dir=config.adapter_dir,
         thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        preload_cache=config.inference.preload_cache,
     )
     _state["background_trainer"] = bt
+    _state["consolidation_loop"]._bg_trainer = bt
 
     def _run_migration_on_worker() -> None:
         """Run on the BG-trainer worker thread under the GPU lock."""

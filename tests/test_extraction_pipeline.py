@@ -2133,7 +2133,8 @@ class TestBackgroundTrainer:
         epoch = bt.stop()
         assert epoch == 0
 
-    def test_pause_when_not_training(self):
+    def test_abort_for_inference_when_not_training(self):
+        """abort_for_inference() returns False immediately when no job is active."""
         from paramem.server.background_trainer import BackgroundTrainer
 
         bt = BackgroundTrainer(
@@ -2141,18 +2142,9 @@ class TestBackgroundTrainer:
             tokenizer=MagicMock(),
             training_config=MagicMock(),
         )
-        assert bt.pause() is True
-
-    def test_resume_when_not_training(self):
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-        )
-        # Should not raise
-        bt.resume()
+        assert bt._active_abort is None
+        result = bt.abort_for_inference(timeout=0.01)
+        assert result is False
 
 
 # --- Debug-artifact writers ---

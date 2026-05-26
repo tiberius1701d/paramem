@@ -72,8 +72,9 @@ def gpu_lock_released():
       ownership — the original holder will observe an inconsistent state
       at its own release. This is not detectable here.
 
-    Use only from code paths that statically hold the reservation (the BG
-    trainer's _yield_to_inference is the sole production caller).
+    Use only from code paths that statically hold the reservation. After the
+    BG-trainer abort refactor this primitive has no production callers; kept
+    as a symmetric counterpart to ``gpu_lock_sync`` for future use.
     """
     release_gpu()
     try:

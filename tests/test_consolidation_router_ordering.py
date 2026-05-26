@@ -121,6 +121,8 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop.save_cycle_snapshots = False
     loop.persist_graph = False
     loop._thermal_policy = None
+    # _bg_trainer is wired by the server lifespan; None in tests (experiment path).
+    loop._bg_trainer = None
     return loop
 
 
@@ -1077,15 +1079,16 @@ class TestSetIsTrainingAPI:
         bt._set_is_training(False)
         assert bt._is_training is False
 
-    def test_pause_short_circuits_when_not_training(self) -> None:
-        """pause() returns True immediately when _is_training is False."""
+    def test_abort_for_inference_short_circuits_when_idle(self) -> None:
+        """abort_for_inference() returns False immediately when no job is active."""
         model = _make_stub_model("episodic", "in_training")
         bt = BackgroundTrainer(
             model=model,
             tokenizer=MagicMock(),
             training_config=_minimal_training_config(),
-            output_dir="/tmp/test_pause_shortcircuit",
+            output_dir="/tmp/test_abort_shortcircuit",
         )
-        bt._is_training = False
-        result = bt.pause(timeout=0.01)
-        assert result is True, "pause() must short-circuit when _is_training is False"
+        # No active job — _active_abort is None.
+        assert bt._active_abort is None
+        result = bt.abort_for_inference(timeout=0.01)
+        assert result is False, "abort_for_inference() must return False when no job is active"

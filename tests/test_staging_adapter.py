@@ -237,52 +237,117 @@ class TestAtomicSaveAdapter:
 class TestStagingFlowContracts:
     """Contract tests for the staging flow — validates BackgroundTrainer logic."""
 
-    def test_pause_switches_to_production_adapter(self):
-        """pause() must call switch_adapter with the current production slot name."""
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        # Model must have episodic in peft_config for the switch to happen
-        model = MagicMock()
-        model.peft_config = {"episodic": MagicMock(), "in_training": MagicMock()}
-        bt = BackgroundTrainer(
-            model=model,
-            tokenizer=MagicMock(),
-            training_config=MagicMock(gradient_checkpointing=False),
-        )
-        bt._is_training = True
-        bt._current_adapter = "episodic"
-        # Pretend training is already paused so wait() returns immediately
-        bt._training_paused.set()
-
-        from unittest.mock import patch
-
-        with patch("paramem.models.loader.switch_adapter") as mock_switch:
-            result = bt.pause(timeout=0.1)
-            assert result is True
-            mock_switch.assert_called_once_with(bt.model, "episodic")
-
-    def test_pause_returns_true_when_not_training(self):
+    def test_abort_returns_false_when_idle(self):
+        """abort_for_inference() returns False immediately when no job is active."""
         from paramem.server.background_trainer import BackgroundTrainer
 
         bt = BackgroundTrainer(
             model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
         )
-        assert bt.pause() is True
+        assert bt._active_abort is None
+        result = bt.abort_for_inference(timeout=0.01)
+        assert result is False
 
-    def test_pause_with_unset_current_adapter(self):
-        """pause() before the first job sets _current_adapter must not crash."""
+    def test_abort_for_inference_sets_abort_and_quiesces(self):
+        """abort_for_inference() sets abort event and returns True when quiesced fires."""
+        import threading
+
         from paramem.server.background_trainer import BackgroundTrainer
 
         bt = BackgroundTrainer(
-            model=MagicMock(peft_config={}),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(gradient_checkpointing=False),
+            model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
         )
-        bt._is_training = True
-        bt._current_adapter = ""  # not yet set by _train_adapter
-        bt._training_paused.set()
-        # Should not raise — gracefully logs warning since "episodic" not in empty peft_config
-        assert bt.pause(timeout=0.1) is True
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+
+        def _fire():
+            import time
+
+            time.sleep(0.05)
+            bt._active_quiesced.set()
+
+        t = threading.Thread(target=_fire, daemon=True)
+        t.start()
+        result = bt.abort_for_inference(timeout=2.0)
+        assert result is True
+        assert bt._active_abort.is_set()
+        t.join(timeout=1.0)
+
+    def test_abort_with_preload_cache_false_switches_adapter(self):
+        """Abort branch calls switch_adapter when preload_cache=False."""
+        import threading
+
+        from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
+        from paramem.utils.config import AdapterConfig, TrainingConfig
+
+        model = MagicMock()
+        model.peft_config = {
+            "episodic": MagicMock(target_modules=["q_proj"], r=4),
+            "in_training": MagicMock(target_modules=["q_proj"], r=4),
+        }
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=TrainingConfig(
+                num_epochs=1, gradient_checkpointing=False, batch_size=1
+            ),
+            output_dir="/tmp/test_abort_switch",
+            preload_cache=False,
+        )
+        job = TrainingJob(
+            entries=[{"key": "g1", "subject": "S", "predicate": "p", "object": "O"}],
+            adapter_name="episodic",
+            adapter_config=AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"]),
+        )
+
+        # Pre-install and set abort so _train_adapter_body takes the abort branch.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        bt._active_abort.set()
+
+        class _NullTrainer:
+            def __init__(self, **kwargs):
+                pass
+
+            def train(self, resume_from_checkpoint=None):
+                return MagicMock(metrics={"train_loss": 0.0})
+
+        switch_calls = []
+
+        def _spy_switch(m, name):
+            switch_calls.append(name)
+
+        with (
+            patch("paramem.models.loader.copy_adapter_weights"),
+            patch("paramem.models.loader.switch_adapter", side_effect=_spy_switch),
+            patch(
+                "paramem.server.background_trainer.format_entry_training",
+                return_value=[{"input_ids": [0], "labels": [0]}],
+            ),
+            patch(
+                "paramem.server.background_trainer._ensure_staging_shape_matches",
+                side_effect=lambda m, _c: m,
+            ),
+            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
+            patch(
+                "paramem.training.trainer.TrainingArguments",
+                return_value=MagicMock(num_train_epochs=1, output_dir="/tmp"),
+            ),
+            patch(
+                "paramem.server.background_trainer._read_resume_state",
+                return_value=None,
+            ),
+        ):
+            bt._train_adapter(job)
+
+        # In the abort branch with preload_cache=False, switch_adapter must
+        # restore the production adapter after training stops.
+        assert "episodic" in switch_calls, (
+            f"Abort branch must call switch_adapter('episodic') when preload_cache=False. "
+            f"Got: {switch_calls}"
+        )
 
 
 class TestEnsureStagingShapeMatches:
@@ -477,123 +542,159 @@ class TestCommitStagingToProduction:
         assert saved_adapter == ["episodic"]
 
 
-class TestResumeIdempotent:
-    """resume() must be safe to call multiple times without double-releasing lock."""
+class TestAbortEventLifecycle:
+    """Per-job abort events are created, used, and cleared cleanly."""
 
-    def test_resume_without_pause_is_noop(self):
+    def test_abort_event_none_when_idle(self):
+        """_active_abort is None when no job is running."""
         from paramem.server.background_trainer import BackgroundTrainer
 
         bt = BackgroundTrainer(
             model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
         )
-        bt._is_training = True
-        # Never called pause(), so _pause_active is False
-        bt.resume()  # should not raise
-        assert bt._pause_active is False
+        assert bt._active_abort is None
+        assert bt._active_quiesced is None
 
-    def test_double_resume_safe(self):
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        model = MagicMock()
-        model.peft_config = {"episodic": MagicMock(), "in_training": MagicMock()}
-
-        bt = BackgroundTrainer(
-            model=model,
-            tokenizer=MagicMock(),
-            training_config=MagicMock(gradient_checkpointing=False),
-        )
-        bt._is_training = True
-        bt._current_adapter = "episodic"
-        bt._training_paused.set()
-
-        assert bt.pause(timeout=0.1) is True
-        assert bt._pause_active is True
-        bt.resume()
-        assert bt._pause_active is False
-        # Second resume should be a no-op and must not deadlock
-        bt.resume()
-
-
-class TestPauseSerialization:
-    """Concurrent pause() calls must serialize via _pause_lock."""
-
-    def test_second_pause_blocks_until_first_resumes(self):
+    def test_abort_event_installed_and_cleared(self):
+        """Per-job events are installed before and cleared after _run_callable_queue runs a job."""
         import threading
 
         from paramem.server.background_trainer import BackgroundTrainer
 
-        model = MagicMock()
-        model.peft_config = {"episodic": MagicMock(), "in_training": MagicMock()}
-
         bt = BackgroundTrainer(
-            model=model,
-            tokenizer=MagicMock(),
-            training_config=MagicMock(gradient_checkpointing=False),
+            model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
         )
-        bt._is_training = True
-        bt._current_adapter = "episodic"
-        bt._training_paused.set()
+        job_ran = threading.Event()
 
-        # First pause holds the lock
-        assert bt.pause(timeout=0.1) is True
-        assert bt._pause_active is True
+        def job():
+            # Inside the job, _active_abort must be set.
+            assert bt._active_abort is not None
+            job_ran.set()
 
-        # Second pause from another thread must block
-        second_pause_started = threading.Event()
-        second_pause_completed = threading.Event()
+        from contextlib import contextmanager
 
-        def second_caller():
-            second_pause_started.set()
-            # Re-set training_paused because callback would clear it
-            bt._training_paused.set()
-            bt.pause(timeout=1.0)
-            second_pause_completed.set()
+        @contextmanager
+        def _noop_lock():
+            yield
 
-        t = threading.Thread(target=second_caller)
-        t.start()
-        # Give the second pause a moment to get blocked on the lock
-        second_pause_started.wait(timeout=1.0)
+        with patch("paramem.server.gpu_lock.gpu_lock_sync", new=_noop_lock):
+            bt.submit(job)
+            job_ran.wait(timeout=5.0)
+
+        # After the job, events are cleared in the finally block.
+        # Give the thread a moment to reach finally.
         import time
 
         time.sleep(0.05)
-        assert not second_pause_completed.is_set(), (
-            "Second pause() completed before first resumed — serialization broken"
-        )
-
-        # Resume frees the lock
-        bt.resume()
-        second_pause_completed.wait(timeout=2.0)
-        assert second_pause_completed.is_set()
-        t.join()
+        assert bt._active_abort is None
+        assert bt._active_quiesced is None
 
 
-class TestPauseTimeout:
-    """pause() returning False must leave lock released and state clean."""
+class TestAbortSignalPropagation:
+    """abort_for_inference() signal propagates through training_hooks_for_job."""
 
-    def test_pause_timeout_releases_lock_and_clears_flag(self):
+    def test_abort_signal_reaches_shutdown_predicate(self):
+        """After abort.set(), training_hooks_for_job predicate returns True."""
+        import threading
+
         from paramem.server.background_trainer import BackgroundTrainer
 
         bt = BackgroundTrainer(
-            model=MagicMock(peft_config={}),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(gradient_checkpointing=False),
+            model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
         )
-        bt._is_training = True
-        bt._current_adapter = "episodic"
-        # Do NOT set _training_paused — simulate training thread not responding
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
 
-        result = bt.pause(timeout=0.05)
+        hooks = bt.training_hooks_for_job()
+        assert hooks.on_shutdown_check() is False
+        bt._active_abort.set()
+        assert hooks.on_shutdown_check() is True
+
+    def test_per_job_closure_does_not_bleed_across_jobs(self):
+        """Hooks captured for job A do not pick up job B's abort event."""
+        import threading
+
+        from paramem.server.background_trainer import BackgroundTrainer
+
+        bt = BackgroundTrainer(
+            model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
+        )
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        hooks_a = bt.training_hooks_for_job()
+
+        # Clear (job A done) and install job B.
+        with bt._active_state_lock:
+            bt._active_abort = None
+            bt._active_quiesced = None
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        hooks_b = bt.training_hooks_for_job()
+
+        # Set job B's abort.
+        bt._active_abort.set()
+        # hooks_a must remain False — it captured job A's event (which was never set).
+        assert hooks_a.on_shutdown_check() is False
+        # hooks_b picks up job B's event.
+        assert hooks_b.on_shutdown_check() is True
+
+
+class TestAbortTimeout:
+    """abort_for_inference() timeout returns False cleanly without state leak."""
+
+    def test_abort_timeout_returns_false(self):
+        """abort_for_inference() returns False when quiesced does not fire within timeout."""
+        import threading
+
+        from paramem.server.background_trainer import BackgroundTrainer
+
+        bt = BackgroundTrainer(
+            model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
+        )
+        # Install events but do NOT fire quiesced — simulate slow training.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+
+        result = bt.abort_for_inference(timeout=0.05)
         assert result is False
-        # _inference_requested must be cleared so it doesn't leak into the
-        # next pause attempt or confuse the callback.
-        assert not bt._inference_requested.is_set()
-        # _pause_active must remain False (matched to an unsuccessful pause).
-        assert bt._pause_active is False
-        # Lock must be released — a subsequent pause() with training
-        # responsive should not block on the lock.
-        bt._training_paused.set()
-        assert bt.pause(timeout=0.05) is True
-        bt.resume()
+        # abort flag is set (we still signalled it), but quiesced timed out.
+        assert bt._active_abort.is_set()
+
+    def test_abort_timeout_does_not_prevent_subsequent_abort(self):
+        """After a timed-out abort, a fresh job's abort_for_inference works normally."""
+        import threading
+
+        from paramem.server.background_trainer import BackgroundTrainer
+
+        bt = BackgroundTrainer(
+            model=MagicMock(), tokenizer=MagicMock(), training_config=MagicMock()
+        )
+        # First abort times out (no quiesced fired).
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+        bt.abort_for_inference(timeout=0.01)
+
+        # Simulate next job — install fresh events.
+        with bt._active_state_lock:
+            bt._active_abort = threading.Event()
+            bt._active_quiesced = threading.Event()
+
+        def _fire():
+            import time
+
+            time.sleep(0.05)
+            bt._active_quiesced.set()
+
+        t = threading.Thread(target=_fire, daemon=True)
+        t.start()
+        result = bt.abort_for_inference(timeout=2.0)
+        assert result is True
+        t.join(timeout=1.0)
 
 
 class TestMultiJobSequencing:
