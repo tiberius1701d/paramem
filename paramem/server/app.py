@@ -1799,11 +1799,10 @@ async def lifespan(app: FastAPI):
     else:
         # Boot-time drain wait: poll device-wide free VRAM (via CUDA runtime,
         # no nvidia-smi) until there is room for the model, or degrade to
-        # cloud-only on timeout.  This replaces the old single-shot
-        # measure_external_vram + enforce_live_budget + sys.exit(1) gate,
-        # which failed on fast restarts because the host driver's lazy-reclaim
-        # window means VRAM has not been returned yet when the new process
-        # boots.
+        # cloud-only on timeout. The poll-and-degrade behavior tolerates the
+        # host driver's lazy-reclaim window on fast restarts (VRAM may not
+        # have been returned yet when the new process boots). The post-load
+        # gate (enforce_post_load_budget) is the authoritative reject.
         #
         # needed_bytes derivation:
         #   • assessment available → use assessment.required_bytes (which
