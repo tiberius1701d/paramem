@@ -35,6 +35,7 @@ from paramem.backup.integrity import (
     _UNDECRYPTABLE,
     FileCheck,
     IntegrityReport,
+    cleanup_partial_slots,
     verify_infrastructure_integrity,
 )
 from paramem.memory.store import MemoryStore
@@ -531,3 +532,122 @@ class TestDataModel:
         skipped = FileCheck("/f.json", "registry", "episodic", _SKIPPED, "")
         report = IntegrityReport(ok=True, checks=[skipped], failures=[])
         assert report.ok is True
+
+
+# ---------------------------------------------------------------------------
+# Boot housekeeping: cleanup_partial_slots
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupPartialSlots:
+    """Boot housekeeping: delete partial training slots under tier roots."""
+
+    REQUIRED = ("meta.json", "adapter_config.json", "adapter_model.safetensors")
+
+    def _make_complete_slot(self, root: Path, tier: str, name: str) -> Path:
+        slot = root / tier / name
+        slot.mkdir(parents=True)
+        for f in self.REQUIRED:
+            (slot / f).write_text("{}")
+        return slot
+
+    def _make_partial_slot(self, root: Path, tier: str, name: str, *missing: str) -> Path:
+        slot = root / tier / name
+        slot.mkdir(parents=True)
+        for f in self.REQUIRED:
+            if f not in missing:
+                (slot / f).write_text("{}")
+        return slot
+
+    def test_empty_adapter_dir_returns_empty(self, tmp_path):
+        """No tier roots — returns empty list, no errors."""
+        assert cleanup_partial_slots(tmp_path) == []
+
+    def test_complete_slot_retained(self, tmp_path):
+        """Slot with all 3 files is never touched."""
+        slot = self._make_complete_slot(tmp_path, "episodic", "20260101T0000")
+        removed = cleanup_partial_slots(tmp_path)
+        assert removed == []
+        assert slot.exists()
+        assert (slot / "meta.json").exists()
+
+    def test_partial_slot_missing_meta_deleted(self, tmp_path):
+        """Slot missing meta.json is deleted; entry recorded."""
+        slot = self._make_partial_slot(tmp_path, "episodic", "interim_partial", "meta.json")
+        removed = cleanup_partial_slots(tmp_path)
+        assert not slot.exists()
+        assert len(removed) == 1
+        assert removed[0]["tier"] == "episodic"
+        assert removed[0]["slot_name"] == "interim_partial"
+        assert removed[0]["missing"] == ["meta.json"]
+        assert removed[0]["path"] == str(slot)
+
+    def test_partial_slot_missing_safetensors_deleted(self, tmp_path):
+        """Slot missing adapter_model.safetensors is deleted."""
+        slot = self._make_partial_slot(
+            tmp_path, "semantic", "interim_partial", "adapter_model.safetensors"
+        )
+        removed = cleanup_partial_slots(tmp_path)
+        assert not slot.exists()
+        assert removed[0]["missing"] == ["adapter_model.safetensors"]
+
+    def test_partial_slot_missing_multiple_records_all(self, tmp_path):
+        """Slot missing several files records every missing path."""
+        slot = self._make_partial_slot(
+            tmp_path,
+            "procedural",
+            "broken",
+            "meta.json",
+            "adapter_config.json",
+        )
+        removed = cleanup_partial_slots(tmp_path)
+        assert not slot.exists()
+        assert sorted(removed[0]["missing"]) == ["adapter_config.json", "meta.json"]
+
+    def test_mixed_complete_and_partial(self, tmp_path):
+        """Complete slots survive; partial slots are deleted in the same pass."""
+        kept = self._make_complete_slot(tmp_path, "episodic", "20260101T0000")
+        gone = self._make_partial_slot(tmp_path, "episodic", "interim_bad", "meta.json")
+        removed = cleanup_partial_slots(tmp_path)
+        assert kept.exists()
+        assert not gone.exists()
+        assert len(removed) == 1
+        assert removed[0]["slot_name"] == "interim_bad"
+
+    def test_dotted_entries_skipped(self, tmp_path):
+        """Hidden dotted dirs are never deleted."""
+        dotted = tmp_path / "episodic" / ".quarantine"
+        dotted.mkdir(parents=True)
+        removed = cleanup_partial_slots(tmp_path)
+        assert removed == []
+        assert dotted.exists()
+
+    def test_files_at_tier_root_skipped(self, tmp_path):
+        """Files directly under tier root (e.g. registries) are never deleted."""
+        tier_root = tmp_path / "episodic"
+        tier_root.mkdir()
+        (tier_root / "indexed_key_registry.json").write_text("{}")
+        (tier_root / "simhash_registry.json").write_text("{}")
+        removed = cleanup_partial_slots(tmp_path)
+        assert removed == []
+        assert (tier_root / "indexed_key_registry.json").exists()
+        assert (tier_root / "simhash_registry.json").exists()
+
+    def test_all_three_main_tiers_walked(self, tmp_path):
+        """One partial slot under each of episodic/semantic/procedural — all deleted."""
+        slots = [
+            self._make_partial_slot(tmp_path, tier, "broken", "meta.json")
+            for tier in ("episodic", "semantic", "procedural")
+        ]
+        removed = cleanup_partial_slots(tmp_path)
+        assert all(not s.exists() for s in slots)
+        assert {r["tier"] for r in removed} == {"episodic", "semantic", "procedural"}
+
+    def test_non_main_tier_untouched(self, tmp_path):
+        """A tier name outside _MAIN_TIERS is not walked."""
+        unrelated = self._make_partial_slot(
+            tmp_path, "consolidation_refresh", "scratch", "meta.json"
+        )
+        removed = cleanup_partial_slots(tmp_path)
+        assert removed == []
+        assert unrelated.exists()

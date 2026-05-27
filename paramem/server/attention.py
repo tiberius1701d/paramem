@@ -430,6 +430,51 @@ def _collect_boot_degraded_items(state: dict) -> list[AttentionItem]:
     ]
 
 
+def _collect_integrity_cleanup_items(state: dict) -> list[AttentionItem]:
+    """Emit one item when boot-time cleanup removed partial training slots.
+
+    Populated by the boot integrity pass in ``_initialize_memory_store``
+    (``app.py``) via :func:`paramem.backup.integrity.cleanup_partial_slots`.
+    Each removed slot directory was missing one of the canonical three slot
+    files (``meta.json``, ``adapter_config.json``,
+    ``adapter_model.safetensors``) — scratch from an interrupted training
+    run.  Surfacing them as an attention item lets the operator see what
+    self-healed at boot without log diving; ``action_hint`` points at
+    journalctl for the per-slot detail.
+
+    Cleared on the next clean boot when no partial slots remain.
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+
+    Returns
+    -------
+    list[AttentionItem]
+        Zero items when no cleanup happened; otherwise one
+        ``"integrity_cleanup"`` item summarising the deletion set.
+    """
+    removed = state.get("integrity_cleanup")
+    if not removed:
+        return []
+    n = len(removed)
+    tiers = sorted({entry["tier"] for entry in removed})
+    summary = (
+        f"removed {n} partial adapter slot(s) at boot ({', '.join(tiers)}) — "
+        "next consolidation cycle re-trains"
+    )
+    return [
+        AttentionItem(
+            kind="integrity_cleanup",
+            level="action_required",
+            summary=summary,
+            action_hint="journalctl --user -u paramem-server -g integrity-cleanup",
+            age_seconds=None,
+        )
+    ]
+
+
 def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
     """Emit attention items for problematic adapter slots from the startup validator.
 
@@ -964,6 +1009,7 @@ def collect_attention_items(
     items.extend(_collect_backup_items(state, config))
     items.extend(_collect_config_drift_items(state))
     items.extend(_collect_boot_degraded_items(state))
+    items.extend(_collect_integrity_cleanup_items(state))
     items.extend(_collect_key_rotation_items(state))  # stub
     items.extend(_collect_encryption_items(state))  # stub
     items.extend(_collect_adapter_fingerprint_items(state))
