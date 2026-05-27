@@ -328,69 +328,30 @@ class TestTrainingSchedulerBehavior:
 
 
 class TestBackgroundTrainerTraining:
-    def test_train_adapter_with_real_model(self, model_and_tokenizer, tmp_path):
-        """Test BackgroundTrainer can train an adapter on real model."""
-        from paramem.memory.entry import assign_keys
-        from paramem.models.loader import create_adapter
-        from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
-        from paramem.utils.config import AdapterConfig, TrainingConfig
-
-        model, tokenizer = model_and_tokenizer
-
-        # Create adapter if not exists
-        if not hasattr(model, "peft_config") or "episodic" not in model.peft_config:
-            model = create_adapter(model, AdapterConfig(), "episodic")
-        if "in_training" not in model.peft_config:
-            model = create_adapter(model, AdapterConfig(), "in_training")
-
-        keyed = assign_keys([("Alex", "lives_in", "Millfield")])
-
-        tc = TrainingConfig(num_epochs=1, batch_size=1)
-        bt = BackgroundTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            training_config=tc,
-            output_dir=tmp_path,
-        )
-
-        completed = []
-        job = TrainingJob(
-            entries=keyed,
-            adapter_name="episodic",
-            adapter_config=AdapterConfig(),
-        )
-        bt.start_jobs([job], on_complete=lambda: completed.append(True))
-
-        # Wait for completion
-        for _ in range(60):
-            if not bt.is_training:
-                break
-            time.sleep(1)
-
-        assert completed == [True]
-        assert not bt.is_training
-
     def test_abort_for_inference(self, model_and_tokenizer, tmp_path):
-        """Test abort_for_inference quiesces training at the next step boundary.
+        """abort_for_inference quiesces a submitted training callable at the next
+        step boundary.
 
-        The abort contract (Commit 4):
-        - abort_for_inference() sets the per-job abort flag and returns True
-          when training quiesces within the timeout.
-        - resume_state.json and bg_checkpoint/ survive the abort so the next
-          job submission can resume from the last completed checkpoint.
-        - After abort, bt.stop() cleans up the training thread without
-          requiring any re-submission.
-
-        There is no resume() call — training picks up via the next
-        start_jobs() / submit() call's resume_from_checkpoint path.
+        The abort contract:
+        - submit() enqueues a callable that calls train_adapter under the GPU lock.
+        - abort_for_inference() sets the per-job abort flag, which the
+          TrainingHooks shutdown predicate sees at the next on_step_end and sets
+          control.should_training_stop=True.
+        - After quiescence the submitted callable (and thus bt.is_training) is False.
+        - The production adapter on disk is untouched.
         """
         from paramem.memory.entry import assign_keys
-        from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
+        from paramem.models.loader import create_adapter
+        from paramem.server.background_trainer import BackgroundTrainer
+        from paramem.training.trainer import train_adapter
         from paramem.utils.config import AdapterConfig, TrainingConfig
 
         model, tokenizer = model_and_tokenizer
 
-        # Build enough data for training to take a moment
+        if not hasattr(model, "peft_config") or "episodic" not in model.peft_config:
+            model = create_adapter(model, AdapterConfig(), "episodic")
+
+        # Build enough data for training to take at least a few steps.
         keyed = assign_keys([("Alex", f"fact_{i}", f"value_{i}") for i in range(5)])
 
         tc = TrainingConfig(num_epochs=3, batch_size=1)
@@ -401,12 +362,25 @@ class TestBackgroundTrainerTraining:
             output_dir=tmp_path,
         )
 
-        job = TrainingJob(
-            entries=keyed,
-            adapter_name="episodic",
-            adapter_config=AdapterConfig(),
-        )
-        bt.start_jobs([job])
+        hooks = bt.training_hooks_for_job()
+        ac = AdapterConfig()
+
+        def _do_train():
+            from paramem.memory.entry import format_entry_training
+
+            examples = format_entry_training(keyed, tokenizer)
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=examples,
+                adapter_name="episodic",
+                training_config=tc,
+                adapter_config=ac,
+                output_dir=tmp_path,
+                hooks=hooks,
+            )
+
+        bt.submit(_do_train, inference_fallback_adapter="episodic")
 
         # Wait for training to start
         time.sleep(2)
@@ -415,12 +389,10 @@ class TestBackgroundTrainerTraining:
             # Abort at the next step boundary; returns True when quiesced.
             aborted = bt.abort_for_inference(timeout=10)
             assert aborted, "abort_for_inference did not quiesce within 10 s"
-            # After quiescence the abort event was set — resume_state.json
-            # and bg_checkpoint/ survive for the next submission.  We do NOT
-            # call resume(); the next start_jobs()/submit() resumes via
-            # resume_from_checkpoint.
 
-        bt.stop(timeout=30)
+        # Wait for the worker to fully drain
+        if bt._worker_thread is not None:
+            bt._worker_thread.join(timeout=30)
         assert not bt.is_training
 
 
@@ -501,147 +473,103 @@ class TestStagingAdapterGPU:
                 assert staging_name in params
                 assert torch.equal(p.data, params[staging_name].data)
 
-    def test_abort_for_inference_restores_production_adapter(self, staging_model, tmp_path):
-        """After abort_for_inference(), inference must see production adapter weights.
+    def test_abort_for_inference_does_not_clobber_production_weights(self, staging_model, tmp_path):
+        """After abort_for_inference(), the production episodic weights are untouched.
 
-        Replaces the removed pause()/resume() API test with the abort contract
-        (Commit 4). The invariant is unchanged: after the BG trainer yields for
-        inference, the active adapter is the production slot (episodic), NOT
-        the mid-training in_training staging slot, and the production weights
-        must be untouched by training (training only modifies in_training).
+        The abort-then-skip contract: train_adapter returns metrics["aborted"]=True,
+        and the caller skips its post-train commit / registry mutations so the
+        production adapter on disk is untouched.
 
         Flow:
             1. Stamp episodic LoRA weights with a known signature.
-            2. Start a real training job that trains in_training (not episodic).
-            3. Call abort_for_inference() immediately — aborts at the next step
-               boundary and restores the production adapter via switch_adapter.
-            4. Assert: active adapter is episodic; its weights match the stamp.
+            2. Submit a callable that calls train_adapter on episodic.
+            3. Call abort_for_inference() after training starts.
+            4. Assert: episodic weights still equal the original signature.
         """
         import torch
 
         from paramem.memory.entry import assign_keys
-        from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
+        from paramem.models.loader import switch_adapter
+        from paramem.server.background_trainer import BackgroundTrainer
+        from paramem.training.trainer import train_adapter
         from paramem.utils.config import AdapterConfig, TrainingConfig
 
         model, tokenizer = staging_model
 
-        # Stamp episodic LoRA A/B weights with a unique signature so we can
-        # verify they are not clobbered after the abort.  Training only mutates
-        # in_training weights, so episodic must be identical after abort.
+        # Stamp episodic LoRA A/B weights with a unique signature.
         signature = 0.1234
         with torch.no_grad():
             for name, p in model.named_parameters():
                 if ".episodic." in name:
                     p.data.fill_(signature)
 
-        # Switch to episodic so it is the "production" active adapter.
-        from paramem.models.loader import switch_adapter
-
         switch_adapter(model, "episodic")
-        assert model.active_adapter == "episodic"
 
-        # Minimal training data — enough to occupy at least one step.
-        keyed = assign_keys([("Alex", f"fact_{i}", f"value_{i}") for i in range(3)])
+        # 15 keys × 30 epochs ≈ 450 steps so training stays in flight long enough
+        # for abort_for_inference (called after a 2 s sleep below) to actually
+        # interrupt mid-training rather than racing with normal completion.
+        keyed = assign_keys([("Alex", f"fact_{i}", f"value_{i}") for i in range(15)])
+        tc = TrainingConfig(num_epochs=30, batch_size=1)
+        ac = AdapterConfig()
 
         bt = BackgroundTrainer(
             model=model,
             tokenizer=tokenizer,
-            training_config=TrainingConfig(num_epochs=2, batch_size=1),
+            training_config=tc,
             output_dir=tmp_path,
         )
+        abort_metrics: list[dict] = []
 
-        job = TrainingJob(
-            entries=keyed,
-            adapter_name="episodic",
-            adapter_config=AdapterConfig(),
-            inference_fallback_adapter="episodic",
-        )
-        bt.start_jobs([job])
+        def _do_train():
+            # Build hooks INSIDE the submitted callable so training_hooks_for_job
+            # captures the per-job abort event installed by _run_callable_queue
+            # (BackgroundTrainer.py:316). Building outside before submit() would
+            # capture _active_abort=None and the shutdown predicate would never
+            # see abort_for_inference's signal — that's how production wires it.
+            from paramem.memory.entry import format_entry_training
 
-        # Let training reach at least one step so the abort path is exercised
-        # (rather than the no-op path when no job is active).
+            hooks = bt.training_hooks_for_job()
+            examples = format_entry_training(keyed, tokenizer)
+            m = train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=examples,
+                adapter_name="episodic",
+                training_config=tc,
+                adapter_config=ac,
+                output_dir=tmp_path,
+                hooks=hooks,
+            )
+            abort_metrics.append(m)
+
+        bt.submit(_do_train, inference_fallback_adapter="episodic")
+
+        # Let training reach at least one step.
         time.sleep(2)
 
-        # Abort at the next step boundary.  Returns True when quiesced.
-        # _train_adapter_body's abort path calls switch_adapter(model, "episodic")
-        # before returning, so the production adapter is active for inference.
         aborted = bt.abort_for_inference(timeout=15)
         assert aborted, "abort_for_inference did not quiesce within 15 s"
 
-        # After abort: active adapter must be episodic (production), not in_training.
-        assert model.active_adapter == "episodic", (
-            f"Expected active adapter 'episodic' after abort; got '{model.active_adapter}'"
+        # Wait for the worker to drain.
+        if bt._worker_thread is not None:
+            bt._worker_thread.join(timeout=30)
+
+        # train_adapter must have reported abort.
+        assert abort_metrics, "Training callable did not complete"
+        assert abort_metrics[0].get("aborted") is True, (
+            f"Expected metrics['aborted']=True after abort; got {abort_metrics[0]}"
         )
 
-        # Episodic weights must not have been modified — training only touched
-        # the in_training staging slot.
+        # Episodic weights must not have been modified (abort skips commit).
         checked = False
         for name, p in model.named_parameters():
             if ".episodic." in name:
                 assert torch.all(p.data == signature), (
-                    f"Production episodic weights were modified during training ({name})"
+                    f"Production episodic weights were modified during aborted training ({name})"
                 )
                 checked = True
                 break
         assert checked, "No episodic weights found to verify"
-
-        bt.stop(timeout=30)
-
-    def test_commit_staging_to_production_on_gpu(self, staging_model, tmp_path):
-        """Commit copies staging → production and saves atomically to disk."""
-        import torch
-
-        from paramem.server.background_trainer import BackgroundTrainer
-        from paramem.utils.config import TrainingConfig
-
-        model, tokenizer = staging_model
-
-        # Stamp in_training
-        target_value = 0.7777
-        with torch.no_grad():
-            for name, p in model.named_parameters():
-                if ".in_training.weight" in name:
-                    p.data.fill_(target_value)
-
-        bt = BackgroundTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            training_config=TrainingConfig(num_epochs=1),
-            output_dir=tmp_path,
-        )
-        bt._commit_staging_to_production("episodic")
-
-        # Episodic in-memory now matches in_training
-        checked = False
-        for name, p in model.named_parameters():
-            if ".episodic.weight" in name:
-                assert torch.all(p.data == target_value), (
-                    f"Commit did not copy staging weights to production ({name})"
-                )
-                checked = True
-                break
-        assert checked
-
-        # Disk artifact written atomically. atomic_save_adapter promotes the
-        # weights into a timestamped slot under the kind dir
-        # (``episodic/<ts>/adapter_model.*``) — the layout production reads via
-        # find_live_slot — not directly into the kind dir. PEFT may save as
-        # .safetensors or .bin.
-        target_dir = tmp_path / "episodic"
-        assert target_dir.exists()
-        weight_files = list(target_dir.glob("*/adapter_model.*"))
-        assert weight_files, f"No adapter weight file in any slot under {target_dir}"
-        # The promoted slot is a non-hidden timestamped subdir; the staging
-        # area (.pending/<ts>) must be empty after promotion.
-        promoted_slots = [
-            p for p in target_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
-        ]
-        assert promoted_slots, f"No promoted slot directory under {target_dir}"
-        pending_root = target_dir / ".pending"
-        if pending_root.exists():
-            assert not list(pending_root.iterdir()), (
-                f"Leftover pending staging slots after commit: {list(pending_root.iterdir())}"
-            )
 
 
 # --- 7c. ExtractionPipeline.run chokepoint end-to-end on GPU ---
@@ -1211,12 +1139,16 @@ class TestSimulateModePromptIteration:
         )
 
         # --- Per-session snapshot present and structurally valid ---
+        # Production layout (paramem/training/consolidation.py::snapshot_dir_for):
+        #   paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/
+        #     sessions/<sid>/graph_snapshot.json
+        # Test setup pins cfg.paths.debug = tmp_path / "data" / "debug".
         snapshots = list(
-            (tmp_path / "debug").glob("run_*/cycle_*/sessions/sim-test-001/graph_snapshot.json")
+            cfg.paths.debug.glob("episodic/**/sessions/sim-test-001/graph_snapshot.json")
         )
         assert len(snapshots) == 1, (
-            f"Expected exactly one per-session graph_snapshot.json under tmp_path/debug; "
-            f"found {len(snapshots)}: {snapshots}"
+            f"Expected exactly one per-session graph_snapshot.json under "
+            f"{cfg.paths.debug}; found {len(snapshots)}: {snapshots}"
         )
         graph = _json.loads(snapshots[0].read_text())
         assert graph["session_id"] == "sim-test-001"

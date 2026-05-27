@@ -581,7 +581,10 @@ class TestMigrateOrchestrator:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             result = migrate(loop, cfg, state)
@@ -636,7 +639,10 @@ class TestMigrateOrchestrator:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             result = migrate(loop, cfg, state)
@@ -851,7 +857,10 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.training.trainer.train_adapter") as train_mock,
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ) as train_mock,
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
@@ -899,7 +908,10 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch(
                 "paramem.adapters.manifest.build_manifest_for",
                 side_effect=_capture_manifest,
@@ -942,7 +954,10 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
@@ -971,7 +986,10 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter") as save_mock,
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             with pytest.raises(RuntimeError, match=r"recall .* < 1.0"):
@@ -1012,7 +1030,10 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
@@ -1050,7 +1071,10 @@ class TestMigrateTierSimulateToTrain:
             patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
@@ -1241,7 +1265,10 @@ class TestSlotPathResolverInterim:
                 "paramem.models.loader.atomic_save_adapter",
                 return_value=slot_path,
             ),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             _migrate_tier_simulate_to_train(loop, cfg, INTERIM_NAME)

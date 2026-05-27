@@ -607,7 +607,7 @@ def _migrate_tier_simulate_to_train(
         output_dir=Path(config.adapter_dir) / "active_store_migration" / name,
         phase_name=f"migrate-{name}",
     )
-    _train_adapter(
+    _migrate_metrics = _train_adapter(
         model=loop.model,
         tokenizer=loop.tokenizer,
         train_dataset=dataset,
@@ -621,6 +621,8 @@ def _migrate_tier_simulate_to_train(
         hooks=loop._build_training_hooks(),
         callbacks_extra=[recall_cb] if recall_cb is not None else None,
     )
+    if _migrate_metrics.get("aborted"):
+        raise _TierSkipped(f"aborted mid-migration for {name}")
 
     # Step 6: recall probe at threshold=1.0 (stricter than 0.95 default).
     # Pass max_probe=len(entries) so the gate is uncapped — all keys must pass,

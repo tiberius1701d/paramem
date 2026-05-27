@@ -292,19 +292,13 @@ consolidation:
   # Fires only when enough new triples have accumulated since the last pass.
   graph_enrichment_interim_enabled: false    # ship default — companion to graph_enrichment_enabled
   graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
-  # BG-trainer step-level checkpointing. When non-empty, overrides the default
-  # "epoch" save strategy for background training jobs only. Set to "steps" and
-  # configure training_save_steps_bg to enable step-granularity crash recovery
-  # in long runs. "" (empty) keeps the default "epoch" behaviour.
-  #
-  # IO cost (rough, unverified on the live system — measure before tuning):
-  # per save ≈ adapter weights (~17 MB at rank 8) + Adam state (~2× weights) ≈
-  # ~50 MB encrypted write. At training_save_steps_bg=5, ~21 steps/epoch, 30
-  # epochs ≈ 120 saves ≈ ~6 GB transient IO per BG job; ~4× the per-epoch
-  # baseline. save_total_limit caps on-disk footprint via HF rotation. Higher
-  # save_steps_bg = less IO + more crash-loss; tune to your crash frequency.
-  training_save_strategy_bg: ""
-  training_save_steps_bg: 0
+  # RAM-mode checkpointing: when > 0, train_adapter writes HF Trainer checkpoints
+  # to /dev/shm (RAM-backed tmpfs) instead of the encrypted adapter slot.  At each
+  # epoch boundary the latest checkpoint is copied to the caller's output_dir.
+  # Trade-off: /dev/shm is not durable across restarts — a crash loses the
+  # in-flight checkpoint; the last committed adapter slot is always intact.
+  # Set to 0 (default) to keep the default "epoch" save behaviour on disk.
+  training_save_steps_ram: 0
   # Post-promotion slot retention: how many prior timestamped adapter slots to
   # keep per tier alongside the live (registry-matched) slot. Older slots beyond
   # this budget are deleted after the registry-commit step. 0 = live slot only.

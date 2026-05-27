@@ -88,6 +88,17 @@ class TrialActiveError(RuntimeError):
     """
 
 
+class AbortedDuringConsolidation(Exception):
+    """Raised by ``consolidate_interim_adapters`` when training is aborted mid-tier.
+
+    The caller (app.py ``_run_full_cycle``) catches this, restores all three
+    production tiers from their ``<tier>_backup`` slots via
+    ``copy_adapter_weights``, skips Step 6 finalize, and logs the cycle as
+    ``mode="aborted"``.  Partial progress is lost but VRAM state is consistent
+    with the pre-cycle baseline.
+    """
+
+
 class ConsolidationLoop:
     """Manages the full consolidation pipeline across sessions.
 
@@ -1749,9 +1760,9 @@ class ConsolidationLoop:
         promoted_set = {n.lower() for n in new_promotions}
         semantic_keyed = []
         # Loop A — newly-promoted keys
-        for _tier, key, qa_info in self.store.iter_entries():
-            subject = qa_info.get("subject", "").lower()
-            obj = qa_info.get("object", "").lower()
+        for _tier, key, entry in self.store.iter_entries():
+            subject = entry.get("subject", "").lower()
+            obj = entry.get("object", "").lower()
             mentions_promoted = (subject and subject in promoted_set) or (
                 obj and obj in promoted_set
             )
@@ -1759,9 +1770,9 @@ class ConsolidationLoop:
                 semantic_keyed.append(
                     {
                         "key": key,
-                        "subject": qa_info["subject"],
-                        "predicate": qa_info["predicate"],
-                        "object": qa_info["object"],
+                        "subject": entry["subject"],
+                        "predicate": entry["predicate"],
+                        "object": entry["object"],
                     }
                 )
 
@@ -1806,6 +1817,12 @@ class ConsolidationLoop:
             thermal_policy=self._thermal_policy,
             hooks=self._build_training_hooks(),
         )
+
+        if metrics is not None and metrics.get("aborted"):
+            logger.info(
+                "_run_indexed_key_semantic: training aborted — skipping simhash registry update"
+            )
+            return None
 
         # Update semantic SimHash registry
         self.store.replace_simhashes_in_tier("semantic", build_registry(semantic_keyed))
@@ -1891,7 +1908,14 @@ class ConsolidationLoop:
             hooks=self._build_training_hooks(),
         )
 
-        return metrics.get("train_loss")
+        if metrics is not None and metrics.get("aborted"):
+            logger.info(
+                "_train_adapter_with_replay: training aborted for %s — skipping registry update",
+                adapter_name,
+            )
+            return None
+
+        return metrics.get("train_loss") if metrics is not None else None
 
     def _generate_replay_from_pool(
         self,
@@ -2472,7 +2496,12 @@ class ConsolidationLoop:
             hooks=self._build_training_hooks(),
             callbacks_extra=[recall_cb] if recall_cb is not None else None,
         )
-        # Deferred mutations — apply only after _train_adapter succeeds.
+        if proc_metrics is not None and proc_metrics.get("aborted"):
+            logger.info(
+                "_run_indexed_key_procedural: training aborted — skipping deferred mutations"
+            )
+            return None
+        # Deferred mutations — apply only after _train_adapter succeeds without abort.
         self._procedural_next_index = self._procedural_tentative_next_index
         for old_key in keys_to_retire:
             self.store.delete(old_key)
@@ -2719,11 +2748,11 @@ class ConsolidationLoop:
         promoted_key_set: set[str] = set()
         if mode == "train" and new_promotions:
             promoted_set = {n.lower() for n in new_promotions}
-            for _tier, key, qa_info in list(self.store.iter_entries()):
+            for _tier, key, entry in list(self.store.iter_entries()):
                 if key.startswith("proc"):
                     continue
-                subject = qa_info.get("subject", "").lower()
-                obj = qa_info.get("object", "").lower()
+                subject = entry.get("subject", "").lower()
+                obj = entry.get("object", "").lower()
                 mentions = (subject and subject in promoted_set) or (obj and obj in promoted_set)
                 if mentions and not self.store.has_simhash("semantic", key):
                     promoted_key_set.add(key)
@@ -2766,6 +2795,13 @@ class ConsolidationLoop:
                 callbacks_extra=[recall_cb] if recall_cb is not None else None,
             )
             epi_train_loss = epi_metrics.get("train_loss") if epi_metrics is not None else None
+            if epi_metrics is not None and epi_metrics.get("aborted"):
+                # Training was aborted for inference.  Skip simhash update,
+                # procedural training, deferred episodic mutations, and the
+                # commit_tier_slot call below.  The production adapter on disk
+                # is untouched; the next cycle will retrain from scratch.
+                logger.info("run_consolidation_cycle: episodic training aborted — skipping commit")
+                return {"mode": "aborted", "adapter_name": adapter_name}
             # Episodic store mutations are deferred until AFTER the procedural
             # step completes — see the mutation block below the procedural gate.
             # This guarantees full-cycle atomicity: if any training step fails,
@@ -3368,15 +3404,15 @@ class ConsolidationLoop:
         graph_drift_count = 0
 
         for key in active_keys:
-            qa_info = self.store.get(key)
-            if qa_info is None:
+            entry = self.store.get(key)
+            if entry is None:
                 # No QA metadata — skip (should not happen with intact registry)
                 logger.warning("consolidate_interim_adapters: no QA metadata for key %s", key)
                 continue
 
-            src_subj = qa_info.get("subject", "")
-            src_pred = qa_info.get("predicate", "")
-            src_obj = qa_info.get("object", "")
+            src_subj = entry.get("subject", "")
+            src_pred = entry.get("predicate", "")
+            src_obj = entry.get("object", "")
             triple_key = (src_subj, src_pred, src_obj)
 
             # current_adapter_id = the tier dict key that owns this key
@@ -3445,9 +3481,9 @@ class ConsolidationLoop:
             tier_keyed[tier].append(
                 {
                     "key": key,
-                    "subject": qa_info["subject"],
-                    "predicate": qa_info["predicate"],
-                    "object": qa_info["object"],
+                    "subject": entry["subject"],
+                    "predicate": entry["predicate"],
+                    "object": entry["object"],
                 }
             )
 
@@ -3609,7 +3645,7 @@ class ConsolidationLoop:
                         output_dir=self.output_dir / "consolidation_refresh" / tier,
                         phase_name=f"consolidate-{tier}",
                     )
-                    _train_adapter_fn(
+                    _tier_metrics = _train_adapter_fn(
                         model=self.model,
                         tokenizer=self.tokenizer,
                         train_dataset=dataset,
@@ -3623,6 +3659,25 @@ class ConsolidationLoop:
                         hooks=self._build_training_hooks(),
                         callbacks_extra=[recall_cb] if recall_cb is not None else None,
                     )
+                    if _tier_metrics.get("aborted"):
+                        # Training was aborted for inference mid-tier.  Restore
+                        # all three production tiers from their backup slots so
+                        # VRAM and weights are consistent with the pre-cycle
+                        # baseline, then raise AbortedDuringConsolidation so the
+                        # outer caller (app.py _run_full_cycle) can log and skip
+                        # Step 6 finalize.
+                        logger.info(
+                            "consolidate_interim_adapters: training aborted on tier %s "
+                            "— restoring all tiers from backups",
+                            tier,
+                        )
+                        from paramem.models.loader import copy_adapter_weights as _copy_w
+
+                        for _t in ("episodic", "semantic", "procedural"):
+                            _backup = f"{_t}_backup"
+                            if _backup in self.model.peft_config and _t in self.model.peft_config:
+                                _copy_w(self.model, src=_backup, dst=_t)
+                        raise AbortedDuringConsolidation(f"training aborted on tier {tier!r}")
                     logger.info(
                         "consolidate_interim_adapters: trained %s on %d keys",
                         tier,
@@ -4065,30 +4120,13 @@ class ConsolidationLoop:
             logger.info("Creating in_training staging adapter")
             self.model = create_adapter(self.model, self.episodic_config, "in_training")
 
-        # Clean stale staging checkpoints on disk unless a valid resume state
-        # is present — in that case the directory holds a live checkpoint that
-        # the BackgroundTrainer will use on the next job submission.
+        # Clean stale staging checkpoints on disk (no resume-state mechanism;
+        # the production model is cycle-level retry — abort leaves the prior
+        # committed slot intact and the next cycle reruns from scratch).
         stale_dir = Path(self.output_dir) / "in_training"
         if stale_dir.exists():
-            from paramem.server.background_trainer import _RESUME_STATE_FILE, _read_resume_state
-
-            resume_state_path = stale_dir / _RESUME_STATE_FILE
-            resume_state = _read_resume_state(resume_state_path)
-            has_live_checkpoint = (
-                resume_state is not None
-                and bool(resume_state.get("checkpoint_path", ""))
-                and Path(resume_state["checkpoint_path"]).is_dir()
-            )
-            if has_live_checkpoint:
-                logger.info(
-                    "Preserving in_training state for resume: adapter=%s epoch=%d/%d",
-                    resume_state.get("adapter_name", "?"),
-                    resume_state.get("last_completed_epoch", 0),
-                    resume_state.get("total_epochs", 0),
-                )
-            else:
-                logger.info("Cleaning stale in_training checkpoints at %s", stale_dir)
-                shutil.rmtree(stale_dir)
+            logger.info("Cleaning stale in_training checkpoints at %s", stale_dir)
+            shutil.rmtree(stale_dir)
 
         return self.model
 

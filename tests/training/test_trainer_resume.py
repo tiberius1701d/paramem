@@ -29,14 +29,37 @@ from paramem.utils.config import AdapterConfig, TrainingConfig
 # ---------------------------------------------------------------------------
 
 
-def _make_peft_model() -> MagicMock:
-    """Return a minimal PeftModel stub accepted by train_adapter."""
+def _make_peft_model(adapter_name: str = "episodic") -> MagicMock:
+    """Return a PeftModel stub that satisfies train_adapter's staging+promote contract.
+
+    Both the production slot *adapter_name* and the staging slot ``in_training``
+    are present with matching rank/target_modules so ``_ensure_staging_slot``
+    is a no-op.  ``named_parameters`` yields one real tensor per
+    ``(target_module, slot)`` pair so ``copy_adapter_weights`` finds parallel
+    src/dst key sets at entry (production→staging) and at promote
+    (staging→production).
+    """
+    import torch
+
+    ac = _minimal_adapter_config()
     model = MagicMock()
-    model.peft_config = {"episodic": MagicMock()}
-    # gradient_checkpointing_enable is called inside train_adapter
+    prod_cfg = MagicMock()
+    prod_cfg.r = ac.rank
+    prod_cfg.target_modules = set(ac.target_modules)
+    staging_cfg = MagicMock()
+    staging_cfg.r = ac.rank
+    staging_cfg.target_modules = set(ac.target_modules)
+    model.peft_config = {adapter_name: prod_cfg, "in_training": staging_cfg}
+
+    named_params: list[tuple[str, "torch.Tensor"]] = []
+    for module in sorted(ac.target_modules):
+        for slot in (adapter_name, "in_training"):
+            named_params.append((f"base_model.model.{module}.{slot}.weight", torch.zeros(1)))
+    model.named_parameters.return_value = named_params
+    model.parameters.return_value = [t for _, t in named_params]
+    # Methods called inside train_adapter — let the mock absorb them.
     model.gradient_checkpointing_enable.return_value = None
     model.set_adapter.return_value = None
-    # save_pretrained is called after training
     model.save_pretrained.return_value = None
     return model
 
@@ -407,15 +430,16 @@ class TestTrainAdapterSavePath:
         trips the next boot's encryption mode-consistency check.
         """
         tmp_path = train_adapter_mocks
-        model = _make_peft_model()
+        adapter_name = "episodic_interim_20260430T1200"
+        model = _make_peft_model(adapter_name=adapter_name)
         tokenizer = _make_tokenizer()
-        out = tmp_path / "interim_20260430T1200" / "episodic_interim_20260430T1200"
+        out = tmp_path / "interim_20260430T1200" / adapter_name
 
         train_adapter(
             model=model,
             tokenizer=tokenizer,
             train_dataset=_make_dataset(),
-            adapter_name="episodic_interim_20260430T1200",
+            adapter_name=adapter_name,
             training_config=_minimal_training_config(),
             adapter_config=_minimal_adapter_config(),
             output_dir=out,

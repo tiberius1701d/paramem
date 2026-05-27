@@ -70,15 +70,13 @@ class TrainingConfig:
     # to keep its historical log volume (10 steps) when delegating to
     # train_adapter; other callers inherit the verbose default.
     logging_steps: int = 1
-    # BG-trainer-specific save knobs. When save_strategy_bg is non-empty it
-    # overrides save_strategy for the background training job only, letting
-    # operators request step-level checkpoints (e.g. "steps") without
-    # changing the strategy for experiment callers.
-    # save_steps_bg applies when save_strategy_bg == "steps"; guarded to
-    # max(1, value) at the call site to satisfy transformers' constraint that
-    # save_steps must be ≥ 1 when strategy is "steps".
-    save_strategy_bg: str = ""
-    save_steps_bg: int = 0
+    # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
+    # /dev/shm instead of the caller's output_dir (avoids encrypted-disk IO
+    # overhead on every save), then copies the latest checkpoint to
+    # <output_dir>/bg_checkpoint_epoch/checkpoint-N/ at each epoch boundary.
+    # Trade-off: /dev/shm is not durable across restarts; a crash loses the
+    # in-flight checkpoint.  Set to 0 (default) to disable.
+    save_steps_ram: int = 0
     early_stopping: bool = False
     early_stopping_threshold: float = 0.01
     early_stopping_floor: int = 10

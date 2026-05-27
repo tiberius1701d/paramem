@@ -252,7 +252,10 @@ class TestB2RearmPattern:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.training.trainer.train_adapter"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
                     "paramem.training.recall_eval.evaluate_indexed_recall",
@@ -371,7 +374,10 @@ class TestB2RearmPattern:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.training.trainer.train_adapter"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
                 patch(
                     "paramem.training.consolidation.build_registry",
                     return_value={"ep_key": 0, "sem_key": 0, "proc_key": 0},
@@ -497,7 +503,7 @@ class TestPerTierInferenceFallbackAdapter:
         # Capture the inference_fallback_adapter seen during each train_adapter call.
         captured_fallbacks: list[str | None] = []
 
-        def _spy_train_adapter(**kwargs) -> None:
+        def _spy_train_adapter(**kwargs) -> dict:
             # At this point trainer._current_job should already be set to the
             # per-tier job by the manual swap in consolidate_interim_adapters.
             fallback = (
@@ -506,6 +512,7 @@ class TestPerTierInferenceFallbackAdapter:
                 else None
             )
             captured_fallbacks.append(fallback)
+            return {"aborted": False}
 
         _gpu_thread_lock.acquire()
         try:
@@ -629,7 +636,10 @@ class TestPerTierInferenceFallbackAdapter:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.training.trainer.train_adapter"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
                 patch(
                     "paramem.training.consolidation.build_registry",
                     return_value={"ep_key": 0, "sem_key": 0},
@@ -752,7 +762,10 @@ class TestCapacityCeilingRollback:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.training.trainer.train_adapter"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 # The pre-save in-RAM probe is gone; evaluate_indexed_recall
                 # is only called via _verify_saved_adapter_from_disk (post-save).
@@ -818,7 +831,10 @@ class TestCapacityCeilingRollback:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.training.trainer.train_adapter"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 # Recall exactly at threshold.
                 patch(
@@ -910,7 +926,10 @@ class TestAtomicFinalizeOrdering:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.training.trainer.train_adapter"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
                     "paramem.training.recall_eval.evaluate_indexed_recall",
@@ -1013,7 +1032,10 @@ class TestAtomicFinalizeOrdering:
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
                 ),
-                patch("paramem.training.trainer.train_adapter"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
                 patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
                 patch(
                     "paramem.training.recall_eval.evaluate_indexed_recall",

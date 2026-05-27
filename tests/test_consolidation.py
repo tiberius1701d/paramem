@@ -1763,3 +1763,399 @@ class TestSlotRetention:
         _tier_root, _live_slot, _keep = prune_calls[0]
         assert _live_slot == expected_slot, "live_slot must match the slot from atomic_save_adapter"
         assert _keep == 2, "_keep must match loop._keep_prior_slots"
+
+
+# ---------------------------------------------------------------------------
+# Abort-then-skip contract at each production train_adapter call site
+# ---------------------------------------------------------------------------
+
+
+class TestAbortSkipsCommit:
+    """metrics['aborted']=True skips post-train commit / registry mutations.
+
+    These tests verify the three production call sites where a train_adapter
+    return dict is inspected for the 'aborted' key:
+
+    1. run_consolidation_cycle: aborted episodic → returns {"mode": "aborted"}
+    2. _run_indexed_key_procedural: aborted proc → deferred store.put/delete skipped
+    3. consolidate_interim_adapters: aborted tier → backup restored, raises
+       AbortedDuringConsolidation
+    """
+
+    def _make_minimal_loop(self, monkeypatch, tmp_path):
+        """Return a ConsolidationLoop stub with enough state for abort-path tests.
+
+        Bypasses __init__ (object.__new__) to avoid model/GPU requirements.
+        Patches internal helpers that have side effects unrelated to the abort
+        path under test.
+        """
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "procedural": MagicMock(),
+            "in_training": MagicMock(),
+        }
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.indexed_key_cache = {}
+        loop.key_sessions = {}
+        loop.promoted_keys = set()
+        loop.cycle_count = 0
+        loop.episodic_simhash = {}
+        loop.semantic_simhash = {}
+        loop.procedural_simhash = {}
+        loop.procedural_sp_index = {}
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop.merger = MagicMock()
+        loop.merger.graph.nodes = {}
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop._indexed_next_index = 0
+        loop._indexed_ep_interim = {}
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.pending_interim_triples = []
+        return loop
+
+    def test_run_consolidation_cycle_returns_aborted_on_abort(self, monkeypatch, tmp_path):
+        """When train_adapter returns aborted=True, run_consolidation_cycle
+        returns {'mode': 'aborted'} without updating simhashes or committing
+        the tier slot.
+        """
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+
+        # Register one episodic key so the guard passes.
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.indexed_key_cache["graph1"] = {
+            "key": "graph1",
+            "subject": "Alex",
+            "predicate": "lives_in",
+            "object": "Millfield",
+            "speaker_id": "Speaker0",
+            "first_seen_cycle": 1,
+        }
+
+        aborted_metrics = {"train_loss": 0.5, "aborted": True}
+        simhash_calls: list = []
+
+        def _spy_replace(tier, mapping):
+            simhash_calls.append(tier)
+
+        with (
+            # Block HF TrainingArguments construction (bf16 validation, GPU check).
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            # run_consolidation_cycle imports train_adapter locally; patch at source.
+            patch("paramem.training.trainer.train_adapter", return_value=aborted_metrics),
+            patch.object(loop.store, "replace_simhashes_in_tier", side_effect=_spy_replace),
+            # Stub heavy helpers that are not under test.
+            patch.object(
+                ConsolidationLoop,
+                "_resolve_target_slot",
+                return_value=("episodic_interim_t001", False, False, False),
+            ),
+            patch.object(
+                ConsolidationLoop,
+                "_prepare_episodic_keys_for_tier",
+                return_value=[
+                    {
+                        "key": "graph1",
+                        "subject": "Alex",
+                        "predicate": "lives_in",
+                        "object": "Millfield",
+                        "speaker_id": "Speaker0",
+                        "first_seen_cycle": 1,
+                    }
+                ],
+            ),
+            patch.object(ConsolidationLoop, "_maybe_run_interim_enrichment", return_value=None),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+            patch("paramem.training.consolidation.switch_adapter"),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            # Stub PEFT slot creation so loop.model stays a MagicMock.
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, stamp: m,
+            ),
+        ):
+            result = loop.run_consolidation_cycle(
+                [
+                    {
+                        "subject": "Alex",
+                        "predicate": "lives_in",
+                        "object": "Millfield",
+                        "relation_type": "factual",
+                        "speaker_id": "Speaker0",
+                    }
+                ],
+                [],
+                speaker_id="Speaker0",
+                mode="train",
+                run_label="test_cycle",
+                stamp="t001",
+            )
+
+        assert result.get("mode") == "aborted", (
+            f"Expected mode='aborted' when training aborted; got {result}"
+        )
+        # simhash registry must NOT be updated after abort.
+        assert simhash_calls == [], (
+            f"replace_simhashes_in_tier must not be called after abort; called for {simhash_calls}"
+        )
+
+    def test_run_indexed_key_procedural_skips_deferred_mutations_on_aborted(
+        self, monkeypatch, tmp_path
+    ):
+        """When proc train_adapter returns aborted=True, store.put / store.delete
+        and sp_index writes must be skipped — only the abort guard fires.
+        """
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+
+        # Pre-seed the store so _prepare_procedural_keys_for_tier sees existing keys.
+        loop.store.put(
+            "procedural",
+            "prc1",
+            {
+                "key": "prc1",
+                "subject": "Alex",
+                "predicate": "listens_to",
+                "object": "Jazz",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.put_simhash("procedural", "prc1", 0xABCD)
+
+        aborted_metrics = {"train_loss": 0.3, "aborted": True}
+
+        store_delete_calls: list = []
+        store_put_calls: list = []
+
+        original_delete = loop.store.delete
+        original_put = loop.store.put
+
+        def _spy_delete(key):
+            store_delete_calls.append(key)
+            return original_delete(key)
+
+        def _spy_put(tier, key, entry, **kwargs):
+            store_put_calls.append((tier, key))
+            return original_put(tier, key, entry, **kwargs)
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            patch("paramem.training.trainer.train_adapter", return_value=aborted_metrics),
+            patch.object(loop.store, "delete", side_effect=_spy_delete),
+            patch.object(loop.store, "put", side_effect=_spy_put),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+            patch.object(
+                ConsolidationLoop,
+                "_prepare_procedural_keys_for_tier",
+                return_value=(
+                    [
+                        {
+                            "key": "prc2",
+                            "subject": "Alex",
+                            "predicate": "listens_to",
+                            "object": "Jazz",
+                            "speaker_id": "Speaker0",
+                            "first_seen_cycle": 1,
+                        }
+                    ],  # new
+                    [
+                        {
+                            "key": "prc1",
+                            "subject": "Alex",
+                            "predicate": "listens_to",
+                            "object": "Jazz",
+                            "speaker_id": "Speaker0",
+                            "first_seen_cycle": 1,
+                        }
+                    ],  # existing
+                    ["prc_old"],  # keys_to_retire
+                    {"sp_key_A": "prc2"},  # new_sp_mappings
+                ),
+            ),
+            patch("paramem.training.consolidation.switch_adapter"),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            patch("paramem.training.consolidation.compute_simhash", return_value=0xBEEF),
+        ):
+            result = loop._run_indexed_key_procedural(
+                [
+                    {
+                        "subject": "Alex",
+                        "predicate": "listens_to",
+                        "object": "Jazz",
+                        "relation_type": "preference",
+                        "speaker_id": "Speaker0",
+                    }
+                ],
+                speaker_id="Speaker0",
+                mode="train",
+                stamp="t001",
+                run_label="test_proc",
+            )
+
+        assert result is None, f"Expected None return on abort; got {result}"
+        # Deferred mutations must be entirely skipped.
+        assert store_delete_calls == [], (
+            f"store.delete must not be called after proc abort; called for {store_delete_calls}"
+        )
+        assert store_put_calls == [], (
+            f"store.put must not be called after proc abort; called for {store_put_calls}"
+        )
+        assert "sp_key_A" not in loop.procedural_sp_index, (
+            "sp_index must not be updated after proc abort"
+        )
+
+    def test_consolidate_interim_adapters_raises_and_rolls_back_on_aborted(
+        self, monkeypatch, tmp_path
+    ):
+        """When a tier's train_adapter returns aborted=True, consolidate_interim_adapters
+        restores backup adapter weights via copy_adapter_weights and raises
+        AbortedDuringConsolidation.
+
+        This test patches the GPU lock entry guard (so the function believes the
+        lock is already held by the caller) and stubs all heavy helpers to isolate
+        the abort branch.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.training.consolidation import AbortedDuringConsolidation, ConsolidationLoop
+
+        loop = self._make_minimal_loop(monkeypatch, tmp_path)
+
+        # Pre-populate the store so _all_active_keys() returns at least one key
+        # and jobs_by_tier["episodic"] ends up non-empty (otherwise the tier is
+        # skipped, the abort branch is never reached, and no rollback fires).
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alex",
+                "predicate": "lives_in",
+                "object": "Millfield",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+
+        # Pre-install backup adapters in peft_config so the backup-creation block
+        # is skipped and the rollback (abort) path sees them in peft_config.
+        # Without this, the mocked create_adapter does not update peft_config and
+        # the rollback's "if backup in peft_config" guard would short-circuit.
+        loop.model.peft_config["episodic_backup"] = MagicMock()
+        loop.model.peft_config["semantic_backup"] = MagicMock()
+        loop.model.peft_config["procedural_backup"] = MagicMock()
+
+        aborted_metrics = {"train_loss": 0.1, "aborted": True}
+        copy_calls: list = []
+
+        def _spy_copy(model, src, dst):
+            copy_calls.append((src, dst))
+
+        with (
+            # Block HF TrainingArguments construction (bf16 validation, GPU check).
+            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
+            patch(
+                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
+                MagicMock,
+            ),
+            # Simulate GPU lock already held: acquire returns False so the entry
+            # guard does NOT raise (it only raises when acquire returns True).
+            patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
+            # consolidate_interim_adapters imports train_adapter and
+            # copy_adapter_weights locally; patch at the source modules.
+            patch("paramem.training.trainer.train_adapter", return_value=aborted_metrics),
+            patch("paramem.models.loader.copy_adapter_weights", side_effect=_spy_copy),
+            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
+            patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+            ),
+            patch(
+                "paramem.training.consolidation.format_entry_training",
+                return_value=[{"input_ids": [1], "labels": [1]}],
+            ),
+            # All model-loader calls are local imports; patch at the source.
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, cfg, name: m),
+            patch("paramem.models.loader.switch_adapter"),
+        ):
+            # GPU lock entry guard: acquire(blocking=False) returns False →
+            # the guard body (release + raise) is skipped.
+            mock_lock.acquire.return_value = False
+
+            with pytest.raises(AbortedDuringConsolidation):
+                loop.consolidate_interim_adapters(trainer=None, router=None)
+
+        # Backup restore: at least one copy_adapter_weights(src=<tier>_backup, dst=<tier>)
+        # call must have fired for the tiers whose backup slot exists in peft_config.
+        rollback_dsts = {dst for (src, dst) in copy_calls if src.endswith("_backup")}
+        assert rollback_dsts, (
+            f"No backup restore copy_adapter_weights calls after abort; copy_calls={copy_calls}"
+        )

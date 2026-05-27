@@ -197,7 +197,10 @@ def _patches_for_train_mode():
             yield e, None
 
     return [
-        patch("paramem.training.trainer.train_adapter", return_value=MagicMock(metrics={})),
+        patch(
+            "paramem.training.trainer.train_adapter",
+            return_value={"aborted": False, "train_loss": 0.0},
+        ),
         patch("paramem.models.loader.save_adapter"),
         patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         patch(
