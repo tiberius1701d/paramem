@@ -608,8 +608,13 @@ inference:
   preload_cache: true
 
 vram:
-  process_cap_fraction: 0.85   # in (0, 1]; rejected at startup otherwise
-  vram_cache_headroom_gib: 2.0   # Per-phase peak; vram_scope releases the KV pool between extraction phases. Raise for workloads with longer single-phase context windows.
+  process_cap_fraction: 0.85           # in (0, 1]; rejected at startup otherwise
+  vram_cache_headroom_gib: 1.5         # Per-phase peak; vram_scope releases the KV pool between extraction phases. (1.5 GiB: single-sequence 8192-token Mistral KV cache is ~1 GiB; 0.5 GiB margin for activations.)
+  baseline_vram_gib: 8                 # Nominal deployment-target GPU VRAM in GiB.
+  nf4_disk_to_runtime_factor: 0.275
+  stt_workspace_factor: 1.1
+  tts_piper_ort_context_mib: 300
+  peft_overhead_per_adapter_mib: 10
 
 # ============================================================================
 # SECURITY

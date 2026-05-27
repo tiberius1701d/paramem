@@ -678,8 +678,17 @@ inference:
   preload_cache: true
 
 vram:
-  process_cap_fraction: 0.85   # in (0, 1]; rejected at startup otherwise
-  vram_cache_headroom_gib: 2.0   # Per-phase peak; vram_scope releases the KV pool between extraction phases. Raise for workloads with longer single-phase context windows.
+  process_cap_fraction: 0.85           # in (0, 1]; rejected at startup otherwise
+  vram_cache_headroom_gib: 1.5         # Per-phase peak; vram_scope releases the KV pool between extraction phases. (1.5 GiB: single-sequence 8192-token Mistral KV cache is ~1 GiB; 0.5 GiB margin for activations.)
+  baseline_vram_gib: 8                 # Nominal deployment-target GPU VRAM in GiB. assess_topology compares the working set against this and surfaces a /status.attention warning on overflow. ParaMem targets 8 GiB GPUs as the published minimum; raise on bigger hardware.
+  # Calibration knobs (predictor + adapter math). Defaults are the values
+  # measured on the validated models (Mistral 7B / Gemma 2 9B / Qwen 2.5 7B NF4,
+  # distil-large-v3 int8, Piper + ONNX Runtime). Live post-load gate catches
+  # mis-calibration, so a wrong value here is a noisy warning, never a silent OOM.
+  nf4_disk_to_runtime_factor: 0.275    # Runtime bytes per byte of bf16/fp16 safetensors under BNB NF4 + double_quant + block_size=64.
+  stt_workspace_factor: 1.1            # CT2 / faster-whisper activation+workspace overhead multiplier (calibrated against distil-large-v3 int8).
+  tts_piper_ort_context_mib: 300       # Shared ONNX Runtime CUDA context (counted once across all Piper voices).
+  peft_overhead_per_adapter_mib: 10    # PEFT residual per adapter beyond pure A+B tensors (calibrated for [q,v,k,o] rank=8).
 
 # ============================================================================
 # SECURITY

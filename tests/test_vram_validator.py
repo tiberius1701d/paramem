@@ -4,8 +4,8 @@ No GPU required — all CUDA calls are mocked. Tests cover:
 - estimated_adapter_bytes (pure math)
 - required_working_set_bytes (pure math)
 - assess_topology (predicted-byte injection, no internal lookup)
-- enforce_post_load_budget (pure math gate)
-- format_tier_table
+- check_post_load_budget (pure math gate, returns str|None)
+- format_baseline_fit
 - estimate_stt_bytes / estimate_tts_bytes wrappers (predict mock)
 - Lifespan call-order integration guard
 - Default headroom constants
@@ -20,16 +20,23 @@ import pytest
 
 from paramem.server.vram_validator import (
     _DEFAULT_HEADROOM_GIB,
-    _LORA_DTYPE_BYTES,
-    _PEFT_OVERHEAD_PER_ADAPTER_BYTES,
-    ConfigurationError,
     assess_topology,
-    enforce_post_load_budget,
+    check_post_load_budget,
     estimated_adapter_bytes,
-    format_tier_table,
+    format_baseline_fit,
     required_working_set_bytes,
 )
 from paramem.utils.config import AdapterConfig
+
+# Mistral / Gemma / Qwen all ship compute_dtype="bfloat16" → 2 B per LoRA element.
+_BF16_BYTES = 2
+# PEFT residual per adapter (matches VramConfig.peft_overhead_per_adapter_mib default).
+_PEFT_OVERHEAD_BYTES = 10 * 1024 * 1024
+# Default deployment baseline (matches VramConfig.baseline_vram_gib default).
+_BASELINE_GIB = 8
+# Calibration constants mirroring VramConfig defaults.
+_STT_WORKSPACE_FACTOR = 1.1
+_TTS_PIPER_ORT_CONTEXT_BYTES = 300 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -56,8 +63,10 @@ _TOTAL_VRAM_BYTES = int(8 * _GiB)
 
 
 def _adapter_bytes(adapter_config: AdapterConfig = _MISTRAL_ADAPTER) -> int:
-    """Compute expected adapter bytes for Mistral 7B dims."""
-    return estimated_adapter_bytes(adapter_config, _HIDDEN, _LAYERS)
+    """Compute expected adapter bytes for Mistral 7B dims (bfloat16 LoRA)."""
+    return estimated_adapter_bytes(
+        adapter_config, _HIDDEN, _LAYERS, _BF16_BYTES, _PEFT_OVERHEAD_BYTES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -65,17 +74,51 @@ def _adapter_bytes(adapter_config: AdapterConfig = _MISTRAL_ADAPTER) -> int:
 # ---------------------------------------------------------------------------
 
 
-def test_estimated_adapter_bytes_mistral_rank8_four_modules():
-    """Spot-check the adapter bytes formula for Mistral 7B rank-8 attention-only.
+def test_estimated_adapter_bytes_mistral_rank8_four_modules_bf16():
+    """Spot-check the adapter bytes formula for Mistral 7B rank-8 attention-only, bf16.
 
     Formula: num_modules × num_layers × 2 × rank × hidden × dtype_bytes
            = 4 × 32 × 2 × 8 × 4096 × 2
     """
-    expected = 4 * 32 * 2 * 8 * 4096 * _LORA_DTYPE_BYTES + _PEFT_OVERHEAD_PER_ADAPTER_BYTES
-    result = estimated_adapter_bytes(_MISTRAL_ADAPTER, hidden_size=4096, num_layers=32)
+    expected = 4 * 32 * 2 * 8 * 4096 * _BF16_BYTES + _PEFT_OVERHEAD_BYTES
+    result = estimated_adapter_bytes(_MISTRAL_ADAPTER, 4096, 32, _BF16_BYTES, _PEFT_OVERHEAD_BYTES)
     assert result == expected, (
         f"estimated_adapter_bytes mismatch: expected {expected}, got {result}"
     )
+
+
+def test_estimated_adapter_bytes_scales_with_dtype():
+    """fp32 LoRA tensors must double the adapter byte estimate vs bf16.
+
+    Guards the silent-bug trap that motivated deriving lora_dtype_bytes from
+    config.model_config.compute_dtype: any code path that hardcodes 2 will
+    under-predict by 2× under fp32.
+    """
+    bf16 = estimated_adapter_bytes(
+        _MISTRAL_ADAPTER, 4096, 32, dtype_bytes=2, peft_overhead_bytes=_PEFT_OVERHEAD_BYTES
+    )
+    fp32 = estimated_adapter_bytes(
+        _MISTRAL_ADAPTER, 4096, 32, dtype_bytes=4, peft_overhead_bytes=_PEFT_OVERHEAD_BYTES
+    )
+    # PEFT overhead is constant; only the per-tensor portion doubles.
+    bf16_tensor_bytes = bf16 - _PEFT_OVERHEAD_BYTES
+    fp32_tensor_bytes = fp32 - _PEFT_OVERHEAD_BYTES
+    assert fp32_tensor_bytes == 2 * bf16_tensor_bytes
+
+
+def test_estimated_adapter_bytes_scales_with_peft_overhead():
+    """Changing the PEFT-overhead knob must change the result by exactly that delta.
+
+    Guards the new config knob ``vram.peft_overhead_per_adapter_mib`` so a yaml
+    tweak propagates through assess_topology unchanged.
+    """
+    small = estimated_adapter_bytes(
+        _MISTRAL_ADAPTER, 4096, 32, dtype_bytes=2, peft_overhead_bytes=5 * 1024 * 1024
+    )
+    large = estimated_adapter_bytes(
+        _MISTRAL_ADAPTER, 4096, 32, dtype_bytes=2, peft_overhead_bytes=20 * 1024 * 1024
+    )
+    assert large - small == 15 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -127,38 +170,47 @@ def test_assess_topology_returns_assessment():
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
         num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
         model_id="mistralai/Mistral-7B-Instruct-v0.3",
     )
     assert isinstance(result, TopologyAssessment)
     assert result.base_bytes == _BASE_MODEL_BYTES
     assert result.required_bytes > 0
-    assert 8 in result.per_tier_fit
+    assert result.baseline_bytes == _BASELINE_GIB * _GiB
 
 
-def test_assess_topology_too_many_interims_overflows_8gib():
-    """max_interim_count=300 should overflow 8 GiB tier."""
+def test_assess_topology_too_many_interims_overflows_baseline():
+    """max_interim_count=300 should overflow the 8 GiB baseline."""
     result = assess_topology(
         _MISTRAL_ADAPTER,
         max_interim_count=300,
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
         num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
     )
-    fits_8, _margin = result.per_tier_fit[8]
-    assert not fits_8, "300 interims must overflow 8 GiB tier"
+    assert not result.fits_baseline, "300 interims must overflow 8 GiB baseline"
+    assert result.margin_bytes < 0
 
 
-def test_assess_topology_realistic_config_fits_8gib():
-    """Mistral 7B NF4 + rank-8 + 4 modules + 7 interims + 3 mains fits 8 GiB."""
+def test_assess_topology_realistic_config_fits_baseline():
+    """Mistral 7B NF4 + rank-8 + 4 modules + 7 interims + 3 mains fits 8 GiB baseline."""
     result = assess_topology(
         _MISTRAL_ADAPTER,
         max_interim_count=7,
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
         num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
     )
-    fits_8, _margin = result.per_tier_fit[8]
-    assert fits_8, "Realistic Mistral 7B config must fit 8 GiB"
+    assert result.fits_baseline, "Realistic Mistral 7B config must fit 8 GiB"
+    assert result.margin_bytes >= 0
 
 
 def test_assess_topology_breakdown_contains_required_strings():
@@ -169,6 +221,9 @@ def test_assess_topology_breakdown_contains_required_strings():
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
         num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
         model_id="test/model",
         quant_label="nf4",
     )
@@ -186,65 +241,75 @@ def test_assess_topology_breakdown_contains_required_strings():
 
 
 # ---------------------------------------------------------------------------
-# enforce_post_load_budget
+# check_post_load_budget
 # ---------------------------------------------------------------------------
 
 
-def test_enforce_post_load_budget_passes_when_under_budget():
-    """Must not raise when allocation is below total − headroom."""
+def test_check_post_load_budget_returns_none_when_under_budget():
+    """Returns None when allocation is below total − headroom."""
     total = 8 * _GiB
     headroom = 2 * _GiB
     allocated = 4 * _GiB  # well under 8 − 2 = 6 GiB
-    enforce_post_load_budget(allocated, total, headroom)  # no exception
+    assert check_post_load_budget(allocated, total, headroom) is None
 
 
-def test_enforce_post_load_budget_raises_when_over_budget():
-    """Must raise ConfigurationError when allocation exceeds total − headroom."""
+def test_check_post_load_budget_returns_reason_when_over_budget():
+    """Returns formatted reason string when allocation exceeds total − headroom."""
     total = 8 * _GiB
     headroom = 2 * _GiB
     allocated = 7 * _GiB  # exceeds 6 GiB budget
-    with pytest.raises(ConfigurationError) as exc_info:
-        enforce_post_load_budget(allocated, total, headroom)
-    msg = str(exc_info.value)
-    assert "Post-load VRAM gate failed" in msg
-    assert "headroom" in msg.lower() or "vram_cache_headroom_gib" in msg
+    reason = check_post_load_budget(allocated, total, headroom)
+    assert reason is not None
+    assert "Post-load VRAM gate failed" in reason
+    assert "headroom" in reason.lower() or "vram_cache_headroom_gib" in reason
 
 
-def test_enforce_post_load_budget_exact_boundary_passes():
+def test_check_post_load_budget_exact_boundary_returns_none():
     """Exactly at budget boundary must pass (<=)."""
     total = 8 * _GiB
     headroom = 2 * _GiB
     allocated = 6 * _GiB  # exactly at total − headroom
-    enforce_post_load_budget(allocated, total, headroom)  # no exception
+    assert check_post_load_budget(allocated, total, headroom) is None
 
 
 # ---------------------------------------------------------------------------
-# format_tier_table
+# format_baseline_fit
 # ---------------------------------------------------------------------------
 
 
-def test_format_tier_table_contains_all_tiers():
+def test_format_baseline_fit_shows_fits_when_within_baseline():
     from paramem.server.vram_validator import TopologyAssessment
 
     assessment = TopologyAssessment(
         required_bytes=int(7.3 * _GiB),
         adapter_bytes=int(0.02 * _GiB),
         base_bytes=int(4.0 * _GiB),
-        per_tier_fit={
-            8: (False, -int(0.9 * _GiB)),
-            12: (True, int(3.1 * _GiB)),
-            16: (True, int(7.1 * _GiB)),
-            24: (True, int(15.1 * _GiB)),
-            40: (True, int(31.1 * _GiB)),
-            80: (True, int(71.1 * _GiB)),
-        },
+        baseline_bytes=8 * _GiB,
+        fits_baseline=True,
+        margin_bytes=int(0.7 * _GiB),
         breakdown="stub",
     )
-    table = format_tier_table(assessment)
-    assert "OVERFLOW" in table
-    assert "FITS" in table
-    for tier in (8, 12, 16, 24, 40, 80):
-        assert str(tier) in table
+    line = format_baseline_fit(assessment)
+    assert "FITS" in line
+    assert "OVERFLOW" not in line
+    assert "8 GiB target" in line
+
+
+def test_format_baseline_fit_shows_overflow_when_over_baseline():
+    from paramem.server.vram_validator import TopologyAssessment
+
+    assessment = TopologyAssessment(
+        required_bytes=int(9.2 * _GiB),
+        adapter_bytes=int(0.02 * _GiB),
+        base_bytes=int(4.0 * _GiB),
+        baseline_bytes=8 * _GiB,
+        fits_baseline=False,
+        margin_bytes=-int(1.2 * _GiB),
+        breakdown="stub",
+    )
+    line = format_baseline_fit(assessment)
+    assert "OVERFLOW" in line
+    assert "8 GiB target" in line
 
 
 # ---------------------------------------------------------------------------
@@ -290,19 +355,32 @@ class _FakeTTSConfig:
 def test_estimate_stt_bytes_zero_when_disabled():
     from paramem.server.vram_validator import estimate_stt_bytes
 
-    assert estimate_stt_bytes(_FakeSTTConfig(enabled=False)) == 0
+    assert (
+        estimate_stt_bytes(_FakeSTTConfig(enabled=False), workspace_factor=_STT_WORKSPACE_FACTOR)
+        == 0
+    )
 
 
 def test_estimate_stt_bytes_zero_when_cpu():
     from paramem.server.vram_validator import estimate_stt_bytes
 
-    assert estimate_stt_bytes(_FakeSTTConfig(device="cpu")) == 0
+    assert (
+        estimate_stt_bytes(_FakeSTTConfig(device="cpu"), workspace_factor=_STT_WORKSPACE_FACTOR)
+        == 0
+    )
 
 
 def test_estimate_stt_bytes_zero_when_permanent_cloud_only():
     from paramem.server.vram_validator import estimate_stt_bytes
 
-    assert estimate_stt_bytes(_FakeSTTConfig(device="cuda"), permanent_cloud_only=True) == 0
+    assert (
+        estimate_stt_bytes(
+            _FakeSTTConfig(device="cuda"),
+            workspace_factor=_STT_WORKSPACE_FACTOR,
+            permanent_cloud_only=True,
+        )
+        == 0
+    )
 
 
 def test_estimate_stt_bytes_returns_predictor_value_on_cache_hit():
@@ -311,7 +389,7 @@ def test_estimate_stt_bytes_returns_predictor_value_on_cache_hit():
 
     cfg = _FakeSTTConfig(device="cuda")
     with patch("paramem.server.vram_validator.predict_stt_bytes", return_value=500_000_000):
-        result = estimate_stt_bytes(cfg)
+        result = estimate_stt_bytes(cfg, workspace_factor=_STT_WORKSPACE_FACTOR)
     assert result == 500_000_000
 
 
@@ -327,7 +405,7 @@ def test_estimate_stt_bytes_returns_zero_on_cache_miss(caplog):
     try:
         cfg = _FakeSTTConfig(device="cuda")
         with patch("paramem.server.vram_validator.predict_stt_bytes", return_value=None):
-            result = estimate_stt_bytes(cfg)
+            result = estimate_stt_bytes(cfg, workspace_factor=_STT_WORKSPACE_FACTOR)
     finally:
         named.removeHandler(caplog.handler)
         named.propagate = orig_propagate
@@ -339,14 +417,27 @@ def test_estimate_stt_bytes_returns_zero_on_cache_miss(caplog):
 def test_estimate_tts_bytes_zero_when_disabled():
     from paramem.server.vram_validator import estimate_tts_bytes
 
-    assert estimate_tts_bytes(_FakeTTSConfig(enabled=False)) == 0
+    assert (
+        estimate_tts_bytes(
+            _FakeTTSConfig(enabled=False),
+            piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+        )
+        == 0
+    )
 
 
 def test_estimate_tts_bytes_zero_when_permanent_cloud_only():
     from paramem.server.vram_validator import estimate_tts_bytes
 
     cfg = _FakeTTSConfig(voices={"en": _FakeTTSVoice(engine="piper")})
-    assert estimate_tts_bytes(cfg, permanent_cloud_only=True) == 0
+    assert (
+        estimate_tts_bytes(
+            cfg,
+            piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+            permanent_cloud_only=True,
+        )
+        == 0
+    )
 
 
 def test_estimate_tts_bytes_returns_predictor_value_on_cache_hit():
@@ -354,7 +445,7 @@ def test_estimate_tts_bytes_returns_predictor_value_on_cache_hit():
 
     cfg = _FakeTTSConfig()
     with patch("paramem.server.vram_validator.predict_tts_bytes", return_value=400_000_000):
-        result = estimate_tts_bytes(cfg)
+        result = estimate_tts_bytes(cfg, piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES)
     assert result == 400_000_000
 
 
@@ -363,7 +454,7 @@ def test_estimate_tts_bytes_returns_zero_on_cache_miss():
 
     cfg = _FakeTTSConfig()
     with patch("paramem.server.vram_validator.predict_tts_bytes", return_value=None):
-        result = estimate_tts_bytes(cfg)
+        result = estimate_tts_bytes(cfg, piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES)
     assert result == 0
 
 
@@ -373,7 +464,9 @@ def test_estimate_stt_bytes_returns_gpu_bytes_when_defer_model():
 
     cfg = _FakeSTTConfig(enabled=True, device="cuda", model="distil-large-v3")
     with patch("paramem.server.vram_validator.predict_stt_bytes", return_value=960_000_000):
-        result = estimate_stt_bytes(cfg, permanent_cloud_only=False)
+        result = estimate_stt_bytes(
+            cfg, workspace_factor=_STT_WORKSPACE_FACTOR, permanent_cloud_only=False
+        )
     assert result > 0
 
 
@@ -387,7 +480,11 @@ def test_estimate_tts_bytes_returns_gpu_bytes_when_defer_model():
         voices={"en": _FakeTTSVoice(engine="piper", model="en_US-lessac-high")},
     )
     with patch("paramem.server.vram_validator.predict_tts_bytes", return_value=380_000_000):
-        result = estimate_tts_bytes(cfg, permanent_cloud_only=False)
+        result = estimate_tts_bytes(
+            cfg,
+            piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+            permanent_cloud_only=False,
+        )
     assert result > 0
 
 
@@ -396,7 +493,10 @@ def test_estimate_stt_bytes_zero_when_explicit_cloud_only():
     from paramem.server.vram_validator import estimate_stt_bytes
 
     cfg = _FakeSTTConfig(enabled=True, device="cuda", model="distil-large-v3")
-    assert estimate_stt_bytes(cfg, permanent_cloud_only=True) == 0
+    assert (
+        estimate_stt_bytes(cfg, workspace_factor=_STT_WORKSPACE_FACTOR, permanent_cloud_only=True)
+        == 0
+    )
 
 
 def test_estimate_tts_bytes_zero_when_explicit_cloud_only():
@@ -408,7 +508,14 @@ def test_estimate_tts_bytes_zero_when_explicit_cloud_only():
         device="cuda",
         voices={"en": _FakeTTSVoice(engine="piper", model="en_US-lessac-high")},
     )
-    assert estimate_tts_bytes(cfg, permanent_cloud_only=True) == 0
+    assert (
+        estimate_tts_bytes(
+            cfg,
+            piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+            permanent_cloud_only=True,
+        )
+        == 0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +533,7 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
         predict_base_bytes → assess_topology → _wait_for_gpu_drain →
         load_base_model
 
-    The authoritative reject is ``enforce_post_load_budget`` AFTER load
+    The authoritative reject is ``check_post_load_budget`` AFTER load
     (separate test). ``_wait_for_gpu_drain`` is the pre-load gate and
     degrades to cloud-only on timeout rather than hard-failing.
     """
@@ -452,7 +559,9 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
             required_bytes=1,
             adapter_bytes=1,
             base_bytes=1,
-            per_tier_fit={8: (True, 0)},
+            baseline_bytes=_BASELINE_GIB * _GiB,
+            fits_baseline=True,
+            margin_bytes=_BASELINE_GIB * _GiB - 1,
             breakdown="stub",
         )
 
@@ -522,7 +631,10 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
                 server_app._state.pop(key, None)
             else:
                 server_app._state[key] = value
-        server_app._state.pop("vram_overflow_warning", None)
+        server_app._state.pop("post_load_budget_warning", None)
+        server_app._state.pop("topology_assessment", None)
+        server_app._state.pop("usable_ceiling_bytes", None)
+        server_app._state.pop("device_total_memory_bytes", None)
 
     # predict_base_bytes must come before assess_topology
     call_names = [c[0] for c in calls]
@@ -588,6 +700,9 @@ def test_headroom_1_5_gib_fits_within_drain_time_free():
         base_bytes=base_bytes,
         hidden_size=_HIDDEN,
         num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
         headroom_gib=1.5,
     )
 
@@ -627,9 +742,23 @@ def test_lifespan_budget_includes_gpu_voice_bytes_under_defer_model():
         enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
     )
     with patch("paramem.server.vram_validator.predict_stt_bytes", return_value=960_000_000):
-        assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) > 0
+        assert (
+            estimate_stt_bytes(
+                stt_cfg,
+                workspace_factor=_STT_WORKSPACE_FACTOR,
+                permanent_cloud_only=pco,
+            )
+            > 0
+        )
     with patch("paramem.server.vram_validator.predict_tts_bytes", return_value=380_000_000):
-        assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) > 0
+        assert (
+            estimate_tts_bytes(
+                tts_cfg,
+                piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+                permanent_cloud_only=pco,
+            )
+            > 0
+        )
 
 
 def test_lifespan_budget_zeroes_voice_bytes_under_explicit_cloud_only():
@@ -644,8 +773,20 @@ def test_lifespan_budget_zeroes_voice_bytes_under_explicit_cloud_only():
     tts_cfg = _FakeTTSConfig(
         enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
     )
-    assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) == 0
-    assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) == 0
+    assert (
+        estimate_stt_bytes(
+            stt_cfg, workspace_factor=_STT_WORKSPACE_FACTOR, permanent_cloud_only=pco
+        )
+        == 0
+    )
+    assert (
+        estimate_tts_bytes(
+            tts_cfg,
+            piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+            permanent_cloud_only=pco,
+        )
+        == 0
+    )
 
 
 def test_lifespan_budget_zeroes_voice_bytes_under_gpu_conflict():
@@ -660,8 +801,20 @@ def test_lifespan_budget_zeroes_voice_bytes_under_gpu_conflict():
     tts_cfg = _FakeTTSConfig(
         enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
     )
-    assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) == 0
-    assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) == 0
+    assert (
+        estimate_stt_bytes(
+            stt_cfg, workspace_factor=_STT_WORKSPACE_FACTOR, permanent_cloud_only=pco
+        )
+        == 0
+    )
+    assert (
+        estimate_tts_bytes(
+            tts_cfg,
+            piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+            permanent_cloud_only=pco,
+        )
+        == 0
+    )
 
 
 def test_lifespan_budget_includes_gpu_voice_bytes_under_default_local():
@@ -677,6 +830,20 @@ def test_lifespan_budget_includes_gpu_voice_bytes_under_default_local():
         enabled=True, device="cuda", voices={"en": _FakeTTSVoice(engine="piper")}
     )
     with patch("paramem.server.vram_validator.predict_stt_bytes", return_value=960_000_000):
-        assert estimate_stt_bytes(stt_cfg, permanent_cloud_only=pco) > 0
+        assert (
+            estimate_stt_bytes(
+                stt_cfg,
+                workspace_factor=_STT_WORKSPACE_FACTOR,
+                permanent_cloud_only=pco,
+            )
+            > 0
+        )
     with patch("paramem.server.vram_validator.predict_tts_bytes", return_value=380_000_000):
-        assert estimate_tts_bytes(tts_cfg, permanent_cloud_only=pco) > 0
+        assert (
+            estimate_tts_bytes(
+                tts_cfg,
+                piper_ort_context_bytes=_TTS_PIPER_ORT_CONTEXT_BYTES,
+                permanent_cloud_only=pco,
+            )
+            > 0
+        )

@@ -19,21 +19,17 @@ except ImportError:
     try_to_load_from_cache = None  # type: ignore[assignment]
     _CACHED_NO_EXIST = None  # type: ignore[assignment]
 
-# Runtime GPU bytes per byte of safetensors disk weight. Disk safetensors are
-# bf16/fp16 (2 bytes/param), so the factor is (runtime_bytes_per_param / 2).
-# Empirical NF4: 0.55 bytes/param (4-bit + block scales) → 0.275 disk-relative;
-# verified against Mistral 7B (4108 MiB measured), Gemma 2 9B (5000 MiB),
-# Qwen 2.5 7B (4000 MiB) on RTX 5070 (2026-04-19, ex-_MODEL_VRAM_BYTES).
-_NF4_FACTOR: float = 0.275
+# Structural unit conversions (runtime bytes per param vs disk 2 bytes/param).
+# NOT calibrated — these are pure ratios from the quant scheme definition.
+# The empirical NF4 factor is config-driven (vram.nf4_disk_to_runtime_factor)
+# so a quant-scheme swap can be tuned in yaml.
 _INT8_FACTOR: float = 0.5  # 1 byte/param vs disk's 2 bytes/param
 _FP16_FACTOR: float = 1.0  # 2 bytes/param matches disk
 _FP32_FACTOR: float = 2.0  # 4 bytes/param vs disk's 2
 
-# CT2 disk weights are typically fp16 (Systran ships fp16 model.bin for
-# distil/large variants). Runtime footprint is disk × compute_type × workspace.
-# Empirical: distil-large-v3 int8 = 960 MiB on RTX 5070 (vram_measure delta,
-# 2026-05-09); predictor 770 MiB at disk 1.4 GiB × 0.5 × 1.1 — slightly low,
-# live gate is authoritative for the actual decision.
+# CT2 / faster-whisper compute_type unit conversions on top of the fp16 disk
+# weights Systran ships. Structural (per CT2 quant semantics), NOT calibrated —
+# the empirical workspace overhead is config-driven (vram.stt_workspace_factor).
 _CT2_COMPUTE_TYPE_FACTOR: dict[str, float] = {
     "int8": 0.5,  # halves fp16 disk weights
     "int8_float16": 0.5,
@@ -42,11 +38,6 @@ _CT2_COMPUTE_TYPE_FACTOR: dict[str, float] = {
     "float16": 1.0,
     "float32": 2.0,
 }
-_CT2_WORKSPACE_FACTOR: float = 1.1  # 10% activation/workspace overhead on top
-
-# Single ORT CUDA context shared across all Piper voices in the same process.
-# ONNX Runtime allocates this once regardless of voice count; counted once.
-_TTS_PIPER_ORT_CONTEXT_BYTES: int = 300 * 1024 * 1024  # 300 MiB
 
 
 def _hf_cache_dir(model_id: str) -> Path | None:
@@ -88,13 +79,19 @@ def _sum_dir_bytes(directory: Path, suffixes: tuple[str, ...] | None = None) -> 
     return total
 
 
-def predict_base_bytes(model_config) -> int | None:
+def predict_base_bytes(model_config, *, nf4_disk_to_runtime_factor: float) -> int | None:
     """Predict base-model GPU bytes from cached weights × quant factor.
 
-    Reads ``model_config.model_id``, ``quantization``, ``compute_dtype``.
-    Sums *.safetensors and pytorch_model-*.bin (one or the other) under the
-    HF cache snapshot dir. Multiplies by _NF4_FACTOR / _INT8_FACTOR / etc.
-    Returns None if the model is not cached.
+    Reads ``model_config.model_id``, ``quantization``. Sums *.safetensors and
+    pytorch_model-*.bin (one or the other) under the HF cache snapshot dir and
+    multiplies by the appropriate quant factor. Returns None when the model
+    isn't in the HF cache.
+
+    Args:
+        model_config: object exposing ``model_id`` and ``quantization``.
+        nf4_disk_to_runtime_factor: Empirical runtime-bytes/disk-bytes ratio for
+            BNB NF4 (config-driven via ``vram.nf4_disk_to_runtime_factor``).
+            int8 / fp16 / fp32 use the structural unit-conversion factors.
     """
     model_id = getattr(model_config, "model_id", None)
     quantization = getattr(model_config, "quantization", "nf4")
@@ -116,14 +113,14 @@ def predict_base_bytes(model_config) -> int | None:
         return None
 
     factor_map = {
-        "nf4": _NF4_FACTOR,
+        "nf4": nf4_disk_to_runtime_factor,
         "int8": _INT8_FACTOR,
         "fp16": _FP16_FACTOR,
         "float16": _FP16_FACTOR,
         "fp32": _FP32_FACTOR,
         "float32": _FP32_FACTOR,
     }
-    factor = factor_map.get(quantization, _NF4_FACTOR)
+    factor = factor_map.get(quantization, nf4_disk_to_runtime_factor)
     predicted = int(weight_bytes * factor)
     logger.debug(
         "predict_base_bytes(%r, %r): disk=%d MiB × %.2f = %d MiB",
@@ -136,13 +133,24 @@ def predict_base_bytes(model_config) -> int | None:
     return predicted
 
 
-def predict_stt_bytes(stt_config, *, permanent_cloud_only: bool = False) -> int | None:
+def predict_stt_bytes(
+    stt_config,
+    *,
+    workspace_factor: float,
+    permanent_cloud_only: bool = False,
+) -> int | None:
     """Predict GPU bytes for faster-whisper STT.
 
     Sums files under the CT2 cache snapshot dir, multiplies by the runtime
-    compute_type factor (CT2 quantizes fp16 disk weights at load) and a
-    small workspace overhead. Returns 0 for cpu/disabled/permanent_cloud_only.
-    Returns None if cuda but cache miss.
+    compute_type factor (CT2 quantizes fp16 disk weights at load) and the
+    operator-configurable workspace overhead. Returns 0 for cpu/disabled/
+    permanent_cloud_only. Returns None if cuda but cache miss.
+
+    Args:
+        stt_config: STTConfig-like object.
+        workspace_factor: Empirical activation/workspace overhead multiplier
+            (config-driven via ``vram.stt_workspace_factor``).
+        permanent_cloud_only: When True, returns 0 unconditionally.
     """
     if not getattr(stt_config, "enabled", False):
         return 0
@@ -183,28 +191,39 @@ def predict_stt_bytes(stt_config, *, permanent_cloud_only: bool = False) -> int 
     disk_bytes = _sum_dir_bytes(snap)
     compute_type = getattr(stt_config, "compute_type", "float16")
     compute_factor = _CT2_COMPUTE_TYPE_FACTOR.get(compute_type, 1.0)
-    predicted = int(disk_bytes * compute_factor * _CT2_WORKSPACE_FACTOR)
+    predicted = int(disk_bytes * compute_factor * workspace_factor)
     logger.debug(
         "predict_stt_bytes(%r, %r): disk=%d MiB × %.2f × %.1f = %d MiB",
         model_name,
         compute_type,
         disk_bytes >> 20,
         compute_factor,
-        _CT2_WORKSPACE_FACTOR,
+        workspace_factor,
         predicted >> 20,
     )
     return predicted
 
 
-def predict_tts_bytes(tts_config, *, permanent_cloud_only: bool = False) -> int | None:
+def predict_tts_bytes(
+    tts_config,
+    *,
+    piper_ort_context_bytes: int,
+    permanent_cloud_only: bool = False,
+) -> int | None:
     """Predict GPU bytes for TTS.
 
     Piper voices: sum *.onnx file sizes from the configured Piper data dir
-    (per voice on GPU) + _TTS_PIPER_ORT_CONTEXT_BYTES if any Piper voice
-    is on GPU.
+    (per voice on GPU) + ``piper_ort_context_bytes`` if any Piper voice
+    is on GPU (the ONNX Runtime CUDA context is shared across voices).
     MMS voices: sum cached safetensors per voice on GPU.
     Returns 0 for cpu/disabled/permanent_cloud_only. Returns None if any
     GPU voice is uncached.
+
+    Args:
+        tts_config: TTSConfig-like object.
+        piper_ort_context_bytes: Shared ONNX Runtime CUDA context size in bytes
+            (config-driven via ``vram.tts_piper_ort_context_mib``).
+        permanent_cloud_only: When True, returns 0 unconditionally.
     """
     if not getattr(tts_config, "enabled", False):
         return 0
@@ -259,7 +278,7 @@ def predict_tts_bytes(tts_config, *, permanent_cloud_only: bool = False) -> int 
             kokoro_voices_on_gpu += 1
 
     if piper_voices_on_gpu > 0:
-        total_bytes += _TTS_PIPER_ORT_CONTEXT_BYTES
+        total_bytes += piper_ort_context_bytes
 
     if kokoro_voices_on_gpu > 0:
         snap = _hf_cache_dir("hexgrad/Kokoro-82M")

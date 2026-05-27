@@ -30,7 +30,7 @@ New tests added for WP1:
 - Mode is not set to ``local`` until AFTER ``_build_config_derived_state``.
 - A rebuild failure leaves mode=cloud-only with reason ``apply_failed``.
   A partial preload (boot_degraded) now stays local — recall self-heals.
-- ``_build_config_derived_state`` is NOT passed ``enforce_post_load_budget``
+- ``_build_config_derived_state`` is NOT passed ``check_post_load_budget``
   (the build-once VRAM gate stays lifespan-only — B-1).
 - ``_preload_memory_store`` source selection is driven by
   ``config.consolidation.mode``, not ``_state["mode"]``.
@@ -483,14 +483,13 @@ def test_plain_reclaim_does_not_call_load_server_config():
     mock_lsc.assert_not_called()
 
 
-def test_build_once_vram_gate_not_callable_from_reload():
-    """The build-once post-load VRAM gate (enforce_post_load_budget) must NOT
-    be called from _live_reload_base_model or _build_config_derived_state
-    (correction B-1 / §3.x).
+def test_post_load_gate_not_called_from_reload():
+    """The post-load VRAM gate (check_post_load_budget) must NOT be called
+    from _live_reload_base_model or _build_config_derived_state.
 
-    enforce_post_load_budget calls sys.exit(1) on failure — it is lifespan-only.
-    The apply/reclaim path's VRAM safety is an inline torch.cuda.mem_get_info
-    fit-check (graceful decline to cloud_only_reason="insufficient_vram").
+    Reload owns its own pre-load drain-wait + load-exception fallback; running
+    the boot-only post-load gate here would double-count headroom and surface a
+    spurious second 'post-load budget' attention warning on every reclaim.
     """
     from paramem.server import app as app_module
 
@@ -513,15 +512,15 @@ def test_build_once_vram_gate_not_callable_from_reload():
         patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
         patch.object(app_module, "_load_model_into_state"),
         patch.object(app_module, "_build_config_derived_state"),
-        patch.object(app_module, "enforce_post_load_budget") as mock_post_gate,
+        patch.object(app_module, "check_post_load_budget") as mock_post_gate,
     ):
         app_module._live_reload_base_model(refresh_config_from_disk=False)
 
     (
         mock_post_gate.assert_not_called(),
         (
-            "enforce_post_load_budget (build-once VRAM gate) must never be called "
-            "from _live_reload_base_model — it sys.exit(1)s and is lifespan-only (B-1)"
+            "check_post_load_budget must never be called from _live_reload_base_model — "
+            "the reload path handles its own VRAM safety via drain-wait + load-exception."
         ),
     )
 
@@ -1000,7 +999,9 @@ def test_boot_drain_fail_degrades_to_cloud_only_and_arms_reclaim(tmp_path):
         required_bytes=5 * 2**30,
         adapter_bytes=1,
         base_bytes=1,
-        per_tier_fit={8: (True, 0)},
+        baseline_bytes=8 * 2**30,
+        fits_baseline=True,
+        margin_bytes=3 * 2**30,
         breakdown="stub",
     )
 
@@ -1048,7 +1049,10 @@ def test_boot_drain_fail_degrades_to_cloud_only_and_arms_reclaim(tmp_path):
                 app_module._state.pop(key, None)
             else:
                 app_module._state[key] = val
-        app_module._state.pop("vram_overflow_warning", None)
+        app_module._state.pop("post_load_budget_warning", None)
+        app_module._state.pop("topology_assessment", None)
+        app_module._state.pop("usable_ceiling_bytes", None)
+        app_module._state.pop("device_total_memory_bytes", None)
 
     # Model must NOT have been loaded.
     assert not load_called, "_load_model_into_state must not be called when drain fails"
@@ -1102,7 +1106,9 @@ def test_boot_drain_pass_proceeds_to_load(tmp_path):
         required_bytes=5 * 2**30,
         adapter_bytes=1,
         base_bytes=1,
-        per_tier_fit={8: (True, 0)},
+        baseline_bytes=8 * 2**30,
+        fits_baseline=True,
+        margin_bytes=3 * 2**30,
         breakdown="stub",
     )
 
@@ -1143,7 +1149,10 @@ def test_boot_drain_pass_proceeds_to_load(tmp_path):
                 app_module._state.pop(key, None)
             else:
                 app_module._state[key] = val
-        app_module._state.pop("vram_overflow_warning", None)
+        app_module._state.pop("post_load_budget_warning", None)
+        app_module._state.pop("topology_assessment", None)
+        app_module._state.pop("usable_ceiling_bytes", None)
+        app_module._state.pop("device_total_memory_bytes", None)
 
     # Load must have been called when drain passes.
     assert load_called, "_load_model_into_state must be called when drain passes"
@@ -1258,19 +1267,26 @@ def test_reclaim_fitcheck_cuda_unavailable_skips_check():
 # ---------------------------------------------------------------------------
 
 
-def test_vram_overflow_attention_item_emitted_when_overflow():
-    """When _state['vram_overflow_warning'] is populated, collect_attention_items
-    returns an item with kind='vram_config_overflow' and level='action_required'.
+def test_vram_overflow_attention_item_emitted_when_required_exceeds_usable():
+    """When topology_assessment.required_bytes > usable_ceiling_bytes,
+    collect_attention_items returns a vram_config_overflow action_required item.
     """
     from paramem.server.attention import collect_attention_items
+    from paramem.server.vram_validator import TopologyAssessment
 
+    _GiB = 2**30
     state = {
-        "vram_overflow_warning": {
-            "required_gib": 7.02,
-            "usable_gib": 6.83,
-            "total_gib": 8.0,
-            "reserved_gib": 1.17,
-        }
+        "topology_assessment": TopologyAssessment(
+            required_bytes=int(7.02 * _GiB),
+            adapter_bytes=int(0.026 * _GiB),
+            base_bytes=int(4.5 * _GiB),
+            baseline_bytes=8 * _GiB,
+            fits_baseline=True,
+            margin_bytes=int(0.98 * _GiB),
+            breakdown="stub",
+        ),
+        "usable_ceiling_bytes": int(6.83 * _GiB),
+        "device_total_memory_bytes": int(8.0 * _GiB),
     }
     items = collect_attention_items(state, config=None)
     kinds = [it.kind for it in items]
@@ -1284,26 +1300,75 @@ def test_vram_overflow_attention_item_emitted_when_overflow():
     assert overflow_item.action_hint is not None
 
 
-def test_vram_overflow_attention_item_absent_when_no_overflow():
-    """When _state has no 'vram_overflow_warning', no overflow item is emitted."""
+def test_vram_overflow_attention_item_absent_when_fits():
+    """When required ≤ usable_ceiling, no overflow item is emitted."""
     from paramem.server.attention import collect_attention_items
+    from paramem.server.vram_validator import TopologyAssessment
 
-    state = {}  # no vram_overflow_warning key
-    items = collect_attention_items(state, config=None)
-    kinds = [it.kind for it in items]
-    assert "vram_config_overflow" not in kinds, (
-        "No overflow item expected when vram_overflow_warning is absent"
-    )
-
-
-def test_vram_overflow_attention_item_absent_when_key_none():
-    """When _state['vram_overflow_warning'] is None, no overflow item is emitted."""
-    from paramem.server.attention import collect_attention_items
-
-    state = {"vram_overflow_warning": None}
+    _GiB = 2**30
+    state = {
+        "topology_assessment": TopologyAssessment(
+            required_bytes=int(5.0 * _GiB),
+            adapter_bytes=int(0.026 * _GiB),
+            base_bytes=int(4.0 * _GiB),
+            baseline_bytes=8 * _GiB,
+            fits_baseline=True,
+            margin_bytes=3 * _GiB,
+            breakdown="stub",
+        ),
+        "usable_ceiling_bytes": int(6.83 * _GiB),
+        "device_total_memory_bytes": int(8.0 * _GiB),
+    }
     items = collect_attention_items(state, config=None)
     kinds = [it.kind for it in items]
     assert "vram_config_overflow" not in kinds
+
+
+def test_vram_overflow_attention_item_absent_when_state_missing():
+    """When topology_assessment or usable_ceiling_bytes is missing, no item."""
+    from paramem.server.attention import collect_attention_items
+
+    items = collect_attention_items({}, config=None)
+    kinds = [it.kind for it in items]
+    assert "vram_config_overflow" not in kinds
+
+
+def test_vram_low_headroom_attention_item_emitted_when_state_populated():
+    """When _state['vram_low_headroom_warning'] is populated by
+    check_vram_headroom, collect_attention_items returns a warning-level item
+    with kind='vram_low_headroom' surfaced in /status.attention.
+    """
+    import time as _time
+
+    from paramem.server.attention import collect_attention_items
+
+    state = {
+        "vram_low_headroom_warning": {
+            "label": "s042",
+            "free_gib": 1.10,
+            "headroom_gib": 1.50,
+            "total_gib": 8.0,
+            "observed_at": _time.time() - 5,
+        }
+    }
+    items = collect_attention_items(state, config=None)
+    item = next((it for it in items if it.kind == "vram_low_headroom"), None)
+    assert item is not None, "expected vram_low_headroom item"
+    assert item.level == "warning"
+    assert "s042" in item.summary
+    assert "1.10" in item.summary
+    assert "1.50" in item.summary
+    assert item.action_hint is not None
+    assert item.age_seconds is not None and item.age_seconds >= 0
+
+
+def test_vram_low_headroom_attention_item_absent_when_state_clean():
+    """No state key → no warning item."""
+    from paramem.server.attention import collect_attention_items
+
+    items = collect_attention_items({}, config=None)
+    kinds = [it.kind for it in items]
+    assert "vram_low_headroom" not in kinds
 
 
 def test_lifespan_sets_vram_overflow_warning_when_required_exceeds_usable(tmp_path):
@@ -1339,7 +1404,9 @@ def test_lifespan_sets_vram_overflow_warning_when_required_exceeds_usable(tmp_pa
         required_bytes=required_bytes,
         adapter_bytes=int(0.026 * _GiB),
         base_bytes=int(4.5 * _GiB),
-        per_tier_fit={8: (False, total_bytes - required_bytes)},
+        baseline_bytes=8 * _GiB,
+        fits_baseline=False,
+        margin_bytes=8 * _GiB - required_bytes,
         breakdown="stub",
     )
 
@@ -1397,7 +1464,10 @@ def test_lifespan_sets_vram_overflow_warning_when_required_exceeds_usable(tmp_pa
                 app_module._state.pop(key, None)
             else:
                 app_module._state[key] = val
-        app_module._state.pop("vram_overflow_warning", None)
+        app_module._state.pop("post_load_budget_warning", None)
+        app_module._state.pop("topology_assessment", None)
+        app_module._state.pop("usable_ceiling_bytes", None)
+        app_module._state.pop("device_total_memory_bytes", None)
 
     assert warning_records, (
         "Expected WARNING log containing 'VRAM CONFIG OVERFLOW' when required > usable"

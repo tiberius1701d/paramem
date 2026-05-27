@@ -786,24 +786,44 @@ class TestVRAMBudget:
             # predict_base_bytes reads from HF cache; may return None if not cached.
             # Falls back to known Mistral 7B measured value for the probe.
             _MISTRAL_7B_MEASURED = 4_308_428_800  # ~4,108 MiB NF4 (measured RTX 5070, 2026-04-19)
-            base_pred = predict_base_bytes(server_cfg.model_config) or _MISTRAL_7B_MEASURED
+            base_pred = (
+                predict_base_bytes(
+                    server_cfg.model_config,
+                    nf4_disk_to_runtime_factor=server_cfg.vram.nf4_disk_to_runtime_factor,
+                )
+                or _MISTRAL_7B_MEASURED
+            )
             hidden_size, num_layers = 4096, 32  # Mistral 7B
-            stt_bytes = estimate_stt_bytes(server_cfg.stt)
-            tts_bytes = estimate_tts_bytes(server_cfg.tts)
+            stt_bytes = estimate_stt_bytes(
+                server_cfg.stt, workspace_factor=server_cfg.vram.stt_workspace_factor
+            )
+            tts_bytes = estimate_tts_bytes(
+                server_cfg.tts,
+                piper_ort_context_bytes=server_cfg.vram.tts_piper_ort_context_mib * 1024 * 1024,
+            )
+            lora_dtype_bytes = torch.tensor(
+                [], dtype=getattr(torch, server_cfg.model_config.compute_dtype)
+            ).element_size()
+            peft_overhead_bytes = server_cfg.vram.peft_overhead_per_adapter_mib * 1024 * 1024
             assessment = assess_topology(
                 adapter_cfg,
                 max_interim_count=max_interim,
                 base_bytes=base_pred,
                 hidden_size=hidden_size,
                 num_layers=num_layers,
+                lora_dtype_bytes=lora_dtype_bytes,
+                peft_overhead_bytes=peft_overhead_bytes,
+                baseline_vram_gib=server_cfg.vram.baseline_vram_gib,
                 model_id=server_cfg.model_config.model_id,
                 main_adapter_count=3,
                 headroom_gib=self._HARDWARE_CAP_GIB,
                 stt_bytes=stt_bytes,
                 tts_bytes=tts_bytes,
             )
-            assert assessment.smallest_fitting_tier_gib() is not None, (
-                f"Topology must fit at least one hardware tier; got: {assessment.per_tier_fit}"
+            assert assessment.fits_baseline, (
+                f"Topology must fit the configured baseline "
+                f"({assessment.baseline_bytes / 2**30:.0f} GiB); "
+                f"required {assessment.required_bytes / 2**30:.2f} GiB"
             )
 
             # ── STT: Whisper per server.yaml (distil-large-v3 int8 on cuda).

@@ -95,7 +95,7 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
         patch.dict(app_module._state, state_patch, clear=False),
         patch("paramem.server.app._set_voice_pipeline_profile") as mock_profile,
         patch("paramem.server.consolidation.create_consolidation_loop"),
-        patch("paramem.server.app.assert_free_vram"),
+        patch("paramem.server.app.check_vram_headroom"),
         patch("paramem.server.app.vram_scope") as mock_vram_scope,
         patch("paramem.server.gpu_lock.gpu_lock_sync") as mock_lock,
     ):

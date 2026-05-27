@@ -19,6 +19,7 @@ Display order (spec §L504–513):
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -584,23 +585,15 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
 def _collect_vram_overflow_items(state: dict) -> list[AttentionItem]:
     """Emit a persistent warning when the configured topology exceeds usable VRAM.
 
-    Reads ``state["vram_overflow_warning"]`` — a dict written by the lifespan
-    startup check when ``assessment.required_bytes > usable_ceiling``.  The
-    condition is "config too big for this hardware" (permanent), distinct from
-    a transient sibling-contention degrade where required ≤ usable_ceiling but
-    free is momentarily low.
+    Derives the verdict on every poll from the canonical state:
+    ``state["topology_assessment"].required_bytes`` and
+    ``state["usable_ceiling_bytes"]``. Returns an item when ``required >
+    usable_ceiling`` — the "config too big for this hardware" case
+    (distinct from a transient sibling-contention degrade where required ≤
+    usable_ceiling but free is momentarily low).
 
-    The dict schema is::
-
-        {
-            "required_gib": float,   # topology working set (GiB)
-            "usable_gib": float,     # device-wide usable ceiling at boot (GiB)
-            "total_gib": float,      # physical GPU VRAM (GiB)
-            "reserved_gib": float,   # WDDM/WSL2 reservation = total − usable (GiB)
-        }
-
-    Returns ``[]`` when the field is absent (no overflow at boot) or when the
-    hardware has enough VRAM for the config (rare on 8 GiB laptops).
+    Returns ``[]`` when either input is missing (cloud-only / cache-miss boot)
+    or when the hardware has room for the config.
 
     Parameters
     ----------
@@ -612,27 +605,112 @@ def _collect_vram_overflow_items(state: dict) -> list[AttentionItem]:
     list[AttentionItem]
         Zero or one item.
     """
-    warn = state.get("vram_overflow_warning")
-    if not warn:
+    assessment = state.get("topology_assessment")
+    usable_ceiling_bytes = state.get("usable_ceiling_bytes")
+    if assessment is None or usable_ceiling_bytes is None:
         return []
-    required_gib = warn.get("required_gib", 0.0)
-    usable_gib = warn.get("usable_gib", 0.0)
-    total_gib = warn.get("total_gib", 0.0)
-    reserved_gib = warn.get("reserved_gib", 0.0)
+    if assessment.required_bytes <= usable_ceiling_bytes:
+        return []
+    # Total physical VRAM only available when CUDA is alive in this process;
+    # derive defensively to avoid coupling the attention populator to torch.
+    total_phys_bytes = state.get("device_total_memory_bytes")
+    if total_phys_bytes is None:
+        # Fall back to usable_ceiling as a lower bound — the populator still
+        # surfaces required vs usable; the reservation row is informational.
+        total_phys_bytes = usable_ceiling_bytes
+    reserved_bytes = max(0, total_phys_bytes - usable_ceiling_bytes)
     return [
         AttentionItem(
             kind="vram_config_overflow",
             level="action_required",
             summary=(
-                f"VRAM CONFIG OVERFLOW — config needs {required_gib:.2f} GiB "
-                f"but only {usable_gib:.2f} GiB usable on this {total_gib:.0f} GiB GPU "
-                f"(WDDM/WSL2 reserves ~{reserved_gib:.2f} GiB)"
+                f"VRAM CONFIG OVERFLOW — config needs {assessment.required_bytes / 2**30:.2f} GiB "
+                f"but only {usable_ceiling_bytes / 2**30:.2f} GiB usable on this "
+                f"{total_phys_bytes / 2**30:.0f} GiB GPU "
+                f"(WDDM/WSL2 reserves ~{reserved_bytes / 2**30:.2f} GiB)"
             ),
             action_hint=(
                 "Reduce model size, adapter rank/count, or "
                 "consolidation.max_interim_count, or install a larger GPU."
             ),
             age_seconds=None,
+        )
+    ]
+
+
+def _collect_vram_post_load_budget_items(state: dict) -> list[AttentionItem]:
+    """Emit a persistent action-required item when the post-load gate degraded.
+
+    Written by the lifespan when ``check_post_load_budget`` reports overflow
+    after the model + STT/TTS finished loading; the lifespan releases the GPU
+    pair and continues in cloud-only mode (symmetric with the live-reload
+    degrade path). This populator surfaces the deficit on every ``/status``
+    poll until the next boot.
+    """
+    warn = state.get("post_load_budget_warning")
+    if not warn:
+        return []
+    measured_gib = warn.get("measured_gib", 0.0)
+    total_gib = warn.get("total_gib", 0.0)
+    headroom_gib = warn.get("headroom_gib", 0.0)
+    return [
+        AttentionItem(
+            kind="vram_post_load_budget",
+            level="action_required",
+            summary=(
+                f"VRAM POST-LOAD OVERFLOW — measured {measured_gib:.2f} GiB exceeds "
+                f"budget {(total_gib - headroom_gib):.2f} GiB (total {total_gib:.2f} GiB "
+                f"− headroom {headroom_gib:.2f} GiB); server is running cloud-only."
+            ),
+            action_hint=(
+                "Reduce adapter rank or consolidation.max_interim_count, "
+                "or raise vram.vram_cache_headroom_gib (with care)."
+            ),
+            age_seconds=None,
+        )
+    ]
+
+
+def _collect_vram_low_headroom_items(state: dict) -> list[AttentionItem]:
+    """Emit a warning when free VRAM has dropped below the configured headroom.
+
+    Written by :func:`paramem.server.vram_guard.check_vram_headroom` at the
+    entry of each extraction chunk — drift detection, not a hard reject.
+    Sticky for the session (cleared on restart) so a transient dip during one
+    chunk stays visible after free recovers.
+
+    The dict schema is::
+
+        {
+            "label": str,            # phase that observed the dip
+            "free_gib": float,       # current free at check time
+            "headroom_gib": float,   # configured floor (vram_cache_headroom_gib)
+            "total_gib": float,
+            "observed_at": float,    # unix timestamp
+        }
+    """
+    warn = state.get("vram_low_headroom_warning")
+    if not warn:
+        return []
+    label = warn.get("label", "?")
+    free_gib = warn.get("free_gib", 0.0)
+    headroom_gib = warn.get("headroom_gib", 0.0)
+    observed_at = warn.get("observed_at")
+    age = time.time() - observed_at if isinstance(observed_at, (int, float)) else None
+    return [
+        AttentionItem(
+            kind="vram_low_headroom",
+            level="warning",
+            summary=(
+                f"VRAM headroom low at {label}: free {free_gib:.2f} GiB < "
+                f"configured headroom {headroom_gib:.2f} GiB — KV-cache buffer "
+                f"is being consumed, extraction may OOM"
+            ),
+            action_hint=(
+                "Reduce consolidation.max_interim_count, move STT/TTS to CPU, "
+                "or raise vram.vram_cache_headroom_gib."
+            ),
+            age_seconds=age,
         )
     ]
 
@@ -1016,4 +1094,6 @@ def collect_attention_items(
     items.extend(_collect_voice_degradation_items(state, config))
     items.extend(_collect_pre_flight_items(state, config))
     items.extend(_collect_vram_overflow_items(state))
+    items.extend(_collect_vram_post_load_budget_items(state))
+    items.extend(_collect_vram_low_headroom_items(state))
     return items

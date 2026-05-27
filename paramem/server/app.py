@@ -65,19 +65,18 @@ from paramem.server.trial_state import (
 from paramem.server.vram_guard import (
     VramExhausted,
     apply_process_cap,
-    assert_free_vram,
+    check_vram_headroom,
     safe_empty_cache,
     vram_measure,
     vram_scope,
 )
 from paramem.server.vram_predict import predict_base_bytes
 from paramem.server.vram_validator import (
-    ConfigurationError,
     assess_topology,
-    enforce_post_load_budget,
+    check_post_load_budget,
     estimate_stt_bytes,
     estimate_tts_bytes,
-    format_tier_table,
+    format_baseline_fit,
 )
 from paramem.training.consolidation import AbortedDuringConsolidation
 from paramem.training.thermal_throttle import ThermalPolicy
@@ -1452,7 +1451,7 @@ def _wait_for_gpu_drain(
         time.sleep(min(poll_interval_s, remaining))
 
 
-def _compute_topology_assessment(config):
+def _compute_topology_assessment(config, base_pred: int | None):
     """Estimate the VRAM working-set topology for *config*'s model.
 
     Returns a ``TopologyAssessment``, or ``None`` when it cannot be computed
@@ -1461,12 +1460,17 @@ def _compute_topology_assessment(config):
     so the estimate always reflects the model actually being loaded, not a stale
     boot-time value after a base-model swap.
 
-    ``local_files_only=True``: ``predict_base_bytes`` returning non-None means
-    the cache is populated, so the AutoConfig read must hit cache — refusing the
-    network matches the offline-first posture and avoids a boot stall on an
+    Args:
+        config: ServerConfig.
+        base_pred: Output of :func:`predict_base_bytes` for ``config.model_config``,
+            read once by the caller (lifespan keeps it as a frame local for the
+            drain-wait fallback). ``None`` → no estimate.
+
+    ``local_files_only=True`` on the AutoConfig read: ``base_pred`` being non-None
+    means the cache is populated, so the AutoConfig read must hit cache — refusing
+    the network matches the offline-first posture and avoids a boot stall on an
     unhealthy network.
     """
-    base_pred = predict_base_bytes(config.model_config)
     if base_pred is None:
         logger.warning(
             "Base model %s not cached; topology estimate skipped — "
@@ -1499,12 +1503,24 @@ def _compute_topology_assessment(config):
             config.model_config.model_id,
         )
         return None
+    # LoRA tensors inherit the base model's compute_dtype (PEFT + bitsandbytes
+    # contract — see paramem/models/loader.py where bnb_4bit_compute_dtype is set
+    # from model_config.compute_dtype). torch.element_size() derives the bytes
+    # so an fp32 build doesn't silently halve the adapter estimate.
+    lora_dtype_bytes = torch.tensor(
+        [], dtype=getattr(torch, config.model_config.compute_dtype)
+    ).element_size()
+    peft_overhead_bytes = config.vram.peft_overhead_per_adapter_mib * 1024 * 1024
+    piper_ort_context_bytes = config.vram.tts_piper_ort_context_mib * 1024 * 1024
     assessment = assess_topology(
         config.episodic_adapter_config,
         max_interim_count=config.consolidation.max_interim_count,
         base_bytes=base_pred,
         hidden_size=hidden_size,
         num_layers=num_layers,
+        lora_dtype_bytes=lora_dtype_bytes,
+        peft_overhead_bytes=peft_overhead_bytes,
+        baseline_vram_gib=config.vram.baseline_vram_gib,
         model_id=config.model_config.model_id,
         quant_label=config.model_config.quantization,
         main_adapter_count=sum(
@@ -1517,11 +1533,19 @@ def _compute_topology_assessment(config):
             if adapter_cfg.enabled
         ),
         headroom_gib=config.vram.vram_cache_headroom_gib,
-        stt_bytes=estimate_stt_bytes(config.stt, permanent_cloud_only=False),
-        tts_bytes=estimate_tts_bytes(config.tts, permanent_cloud_only=False),
+        stt_bytes=estimate_stt_bytes(
+            config.stt,
+            workspace_factor=config.vram.stt_workspace_factor,
+            permanent_cloud_only=False,
+        ),
+        tts_bytes=estimate_tts_bytes(
+            config.tts,
+            piper_ort_context_bytes=piper_ort_context_bytes,
+            permanent_cloud_only=False,
+        ),
     )
     logger.info("VRAM topology assessment:\n%s", assessment.breakdown)
-    logger.info("%s", format_tier_table(assessment))
+    logger.info("%s", format_baseline_fit(assessment))
     return assessment
 
 
@@ -1729,10 +1753,13 @@ async def lifespan(app: FastAPI):
     # auto-reclaim) still reserve the correct budget. The CUDA-availability check
     # and model load below stay inside the branch (eager load is skipped).
     # Pre-load topology estimate. base_pred is None on a cache miss → skip the
-    # estimate, rely on the live load gate. Kept here (as well as inside
-    # _compute_topology_assessment) because the drain-wait fallback and the
-    # post-load calibration-drift log below also read it.
-    base_pred = predict_base_bytes(config.model_config)
+    # estimate, rely on the live load gate. Read once here as a lifespan-frame
+    # local so the assessment, the drain-wait fallback, and the post-load
+    # calibration log share a single HF-cache read.
+    base_pred = predict_base_bytes(
+        config.model_config,
+        nf4_disk_to_runtime_factor=config.vram.nf4_disk_to_runtime_factor,
+    )
 
     if not permanent_cloud_only:
         if not torch.cuda.is_available():
@@ -1742,28 +1769,19 @@ async def lifespan(app: FastAPI):
             )
             sys.exit(1)
 
-        assessment = _compute_topology_assessment(config)
+        assessment = _compute_topology_assessment(config, base_pred)
         if assessment is not None:
-            # Persistent overflow warning when the config genuinely does not fit
-            # this hardware.  "Usable VRAM" is the device-wide free reported by
-            # the CUDA runtime (mem_get_info) at a quiet moment before any model
-            # load — it accounts for the WDDM OS reservation that
-            # get_device_properties().total_memory does not.  Snapshot once here
-            # (boot-specific quiet moment); read by _collect_vram_overflow_items
-            # on every /status poll.  required > usable_ceiling means the config
-            # cannot fit even on an empty GPU; a transient shortfall is handled
-            # by the drain-wait / cloud-only degrade path and does not trigger it.
-            _total_phys_bytes = torch.cuda.get_device_properties(0).total_memory
-            _usable_ceiling_bytes = torch.cuda.mem_get_info(0)[0]
-            _reserved_bytes = _total_phys_bytes - _usable_ceiling_bytes
-            # Cache the usable ceiling (read pre-warm, so = physical capacity minus
-            # the WDDM reserve) for the live-reload gate (_CUDA_CONTEXT_ALLOWANCE_BYTES).
-            _state["usable_ceiling_bytes"] = _usable_ceiling_bytes
-            if assessment.required_bytes > _usable_ceiling_bytes:
-                _req_gib = assessment.required_bytes / 2**30
-                _usable_gib = _usable_ceiling_bytes / 2**30
-                _total_gib = _total_phys_bytes / 2**30
-                _reserved_gib = _reserved_bytes / 2**30
+            # Snapshot the device-wide usable ceiling at a quiet moment before any
+            # model load — accounts for the WDDM/WSL2 reservation that
+            # get_device_properties().total_memory does not. Cached on _state so
+            # the live-reload gate (_CUDA_CONTEXT_ALLOWANCE_BYTES) and the
+            # _collect_vram_overflow_items attention populator can compare against
+            # required_bytes on every /status poll without re-reading the device.
+            _state["usable_ceiling_bytes"] = torch.cuda.mem_get_info(0)[0]
+            _state["device_total_memory_bytes"] = torch.cuda.get_device_properties(0).total_memory
+            if assessment.required_bytes > _state["usable_ceiling_bytes"]:
+                # Log once at boot; the attention populator surfaces the
+                # persistent /status warning from the cached assessment.
                 logger.warning(
                     "VRAM CONFIG OVERFLOW — local model config requires "
                     "%.2f GiB working set but only ~%.2f GiB is usable on "
@@ -1771,21 +1789,11 @@ async def lifespan(app: FastAPI):
                     "The server will run cloud-only/degraded. Reduce model "
                     "size, adapter rank/count, or "
                     "consolidation.max_interim_count.",
-                    _req_gib,
-                    _usable_gib,
-                    _total_gib,
-                    _reserved_gib,
+                    assessment.required_bytes / 2**30,
+                    _state["usable_ceiling_bytes"] / 2**30,
+                    _state["device_total_memory_bytes"] / 2**30,
+                    (_state["device_total_memory_bytes"] - _state["usable_ceiling_bytes"]) / 2**30,
                 )
-                _state["vram_overflow_warning"] = {
-                    "required_gib": _req_gib,
-                    "usable_gib": _usable_gib,
-                    "total_gib": _total_gib,
-                    "reserved_gib": _reserved_gib,
-                }
-            else:
-                # Config fits — clear any stale warning from a previous boot
-                # with a different (larger) config.
-                _state.pop("vram_overflow_warning", None)
 
         # Cache the assessment for the GPU reclaim path's live-budget pre-flight;
         # None when skipped above. _live_reload_base_model recomputes it on every
@@ -1802,7 +1810,9 @@ async def lifespan(app: FastAPI):
         # cloud-only on timeout. The poll-and-degrade behavior tolerates the
         # host driver's lazy-reclaim window on fast restarts (VRAM may not
         # have been returned yet when the new process boots). The post-load
-        # gate (enforce_post_load_budget) is the authoritative reject.
+        # gate (check_post_load_budget) is the authoritative reject — it
+        # also degrades to cloud-only (no sys.exit) so a boot-time overflow
+        # produces a running cloud-only server rather than a crash.
         #
         # needed_bytes derivation:
         #   • assessment available → use assessment.required_bytes (which
@@ -1847,25 +1857,35 @@ async def lifespan(app: FastAPI):
     # inside the routine treats a None/absent store as cold and runs the probe.
     _build_config_derived_state(config, cloud_only=cloud_only)
 
-    # Post-load authoritative gate (BUILD-ONCE — stays lifespan-only, not in
-    # _build_config_derived_state).  Runs AFTER _build_config_derived_state so
-    # the measured allocation includes the STT/TTS GPU footprint (correction S2).
-    # Reads base_pred (lifespan-frame local) and calls sys.exit(1) on failure —
-    # both are incompatible with the live-apply path.  The apply/reclaim path
-    # uses an inline torch.cuda.mem_get_info fit-check inside
-    # _live_reload_base_model which declines gracefully to
-    # cloud_only_reason="insufficient_vram" instead of exiting.
-    # Correction B-1 / S2 / §3.x.
+    # Post-load authoritative gate. Runs AFTER _build_config_derived_state so
+    # the measured allocation includes the STT/TTS GPU footprint. On failure,
+    # release the partially-loaded GPU pair and continue in cloud-only mode —
+    # symmetric with _live_reload_base_model and consistent with the boot
+    # drain-wait degrade path. A persistent /status.attention item
+    # (vram_post_load_budget) tells the operator exactly what overflowed.
     if _state.get("model") is not None and torch.cuda.is_available():
         actual_bytes = torch.cuda.memory_allocated(0)
         headroom_bytes = int(config.vram.vram_cache_headroom_gib * 2**30)
         total_bytes = torch.cuda.get_device_properties(0).total_memory
-        try:
-            enforce_post_load_budget(actual_bytes, total_bytes, headroom_bytes)
-        except ConfigurationError as exc:
-            logger.error("VRAM post-load gate failed:\n%s", exc)
-            sys.exit(1)
-        if base_pred is not None:
+        overflow_reason = check_post_load_budget(actual_bytes, total_bytes, headroom_bytes)
+        if overflow_reason is not None:
+            logger.error(
+                "VRAM post-load gate failed — degrading to cloud-only:\n%s",
+                overflow_reason,
+            )
+            _state["post_load_budget_warning"] = {
+                "measured_gib": actual_bytes / 2**30,
+                "total_gib": total_bytes / 2**30,
+                "headroom_gib": headroom_bytes / 2**30,
+                "reason": overflow_reason,
+            }
+            _release_base_model_in_process()
+            _state["cloud_only_reason"] = "insufficient_vram"
+            _state["model"] = None
+            _state["tokenizer"] = None
+            cloud_only = True
+            notify_server(SERVER_CLOUD_ONLY)
+        elif base_pred is not None:
             delta_mib = (actual_bytes - base_pred) / (1024 * 1024)
             logger.info(
                 "VRAM calibration drift: predicted %.2f GiB, measured %.2f GiB (delta %+.0f MiB)",
@@ -4150,7 +4170,13 @@ def _live_reload_base_model(
     # Shared with the lifespan boot path via the one estimator; None when
     # uncomputable (cache miss / AutoConfig failure) → live load gate.
     if refresh_config_from_disk:
-        _state["topology_assessment"] = _compute_topology_assessment(config)
+        _state["topology_assessment"] = _compute_topology_assessment(
+            config,
+            predict_base_bytes(
+                config.model_config,
+                nf4_disk_to_runtime_factor=config.vram.nf4_disk_to_runtime_factor,
+            ),
+        )
 
     # Look before you leap: refuse the load when the GPU cannot fit the topology.
     # Identical gate to boot — _wait_for_gpu_drain over _effective_free_bytes (the
@@ -5872,7 +5898,10 @@ async def migration_confirm(request: ConfirmRequest):
                     },
                 )
             candidate_model_config = MODEL_REGISTRY[candidate_model_alias]
-            predicted = predict_base_bytes(candidate_model_config)
+            predicted = predict_base_bytes(
+                candidate_model_config,
+                nf4_disk_to_runtime_factor=_state["config"].vram.nf4_disk_to_runtime_factor,
+            )
             if predicted is None:
                 raise HTTPException(
                     status_code=409,
@@ -10057,12 +10086,15 @@ def _extract_and_start_training():
             # → VramExhausted so the done-callback populates
             # last_consolidation_error visibly via /status.
             try:
-                # Pre-chunk watchdog: short-circuit if the device is
-                # already below the threshold for a viable extraction
-                # phase. Same VramExhausted exception type as a
-                # mid-generate fault, so the catch below handles both
-                # the proactive abort and the reactive abort uniformly.
-                assert_free_vram(session_id)
+                # Pre-chunk headroom check: warn (no abort) when free VRAM has
+                # dropped below the configured KV-cache buffer. vram_scope catches
+                # an actual OOM mid-generate; this is the early operator signal
+                # that the booked headroom is being consumed.
+                check_vram_headroom(
+                    session_id,
+                    int(config.vram.vram_cache_headroom_gib * 2**30),
+                    _state,
+                )
                 with vram_scope(session_id):
                     episodic_rels, procedural_rels = loop.extract_session(
                         transcript,
