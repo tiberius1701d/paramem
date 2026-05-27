@@ -58,31 +58,15 @@ _SAFETY_MARGIN_BYTES: int = 256 * 1024 * 1024  # 256 MiB
 # begins. Tunable via vram.vram_cache_headroom_gib.
 _DEFAULT_HEADROOM_GIB: float = 1.0
 
-# Hardware tiers (GiB) for the topology-fit assessment table. Covers the
-# realistic deployment range: 8 GiB laptop (RTX 5070 Laptop), 12 GiB
-# mid-range desktop (RTX 4070), 16 GiB desktop (RTX 4080), 24 GiB enthusiast
-# (RTX 3090/4090), 40 GiB workstation (A100 40 GiB / L40), 80 GiB data
-# center (A100 80 GiB / H100). Decoupling the assessment from the installed
-# hardware lets the warning surface tell operators "this config is fine on
-# a 12 GiB card, overflows 8 GiB by 900 MiB" — actionable even when a
-# capacity bump is cheaper than shrinking the topology.
-HARDWARE_TIERS_GIB: tuple[int, ...] = (8, 12, 16, 24, 40, 80)
-
-# LoRA tensor dtype for inference-only adapters: bfloat16 / float16 = 2 bytes.
-# Optimizer state is NOT included — training reuses the in_training staging slot.
-_LORA_DTYPE_BYTES: int = 2
-
-# PEFT per-adapter overhead beyond the pure LoRA A+B matrices.
-# Measured empirically on Mistral 7B @ rank=8, target_modules=[q,v,k,o]: the
-# raw formula yields 16 MiB/adapter but torch.cuda.memory_allocated deltas after
-# model.add_adapter(...) are ~26 MiB. The 10 MiB residual covers PEFT ModulesToSave
-# wrappers, adapter-config metadata tensors, and CUDA allocator alignment padding.
-_PEFT_OVERHEAD_PER_ADAPTER_BYTES: int = 10 * 1024 * 1024  # 10 MiB
+# PEFT per-adapter overhead is config-driven (vram.peft_overhead_per_adapter_mib)
+# — it depends on target_modules + PEFT version, so a target-set change can be
+# tuned in yaml. Measured ~10 MiB for [q,v,k,o] rank=8 on Mistral 7B.
 
 
 def estimate_stt_bytes(
     stt_config,
     *,
+    workspace_factor: float,
     permanent_cloud_only: bool = False,
 ) -> int:
     """Estimate GPU VRAM bytes for Whisper STT under the given config.
@@ -95,6 +79,8 @@ def estimate_stt_bytes(
     Args:
         stt_config: :class:`paramem.server.config.STTConfig`-like object with
             ``enabled``, ``device``, ``model``, and ``compute_type`` attributes.
+        workspace_factor: CT2 workspace overhead multiplier
+            (``vram.stt_workspace_factor``).
         permanent_cloud_only: When True, the GPU STT pair will never be loaded
             for this process lifetime. Returns 0 so the budget does not reserve
             GPU bytes that will never be allocated.
@@ -111,7 +97,11 @@ def estimate_stt_bytes(
     if device not in ("cuda", "auto"):
         return 0
 
-    result = predict_stt_bytes(stt_config, permanent_cloud_only=permanent_cloud_only)
+    result = predict_stt_bytes(
+        stt_config,
+        workspace_factor=workspace_factor,
+        permanent_cloud_only=permanent_cloud_only,
+    )
     if result is None:
         logger.info("STT not cached; live gate is authoritative")
         return 0
@@ -121,6 +111,7 @@ def estimate_stt_bytes(
 def estimate_tts_bytes(
     tts_config,
     *,
+    piper_ort_context_bytes: int,
     permanent_cloud_only: bool = False,
 ) -> int:
     """Estimate GPU VRAM bytes for all configured TTS voices.
@@ -132,6 +123,8 @@ def estimate_tts_bytes(
     Args:
         tts_config: :class:`paramem.server.config.TTSConfig`-like object with
             ``enabled``, ``device``, and ``voices`` attributes.
+        piper_ort_context_bytes: Shared ONNX Runtime CUDA context size in bytes
+            (``vram.tts_piper_ort_context_mib`` × 1 MiB).
         permanent_cloud_only: When True, the GPU TTS pair will never be loaded
             for this process lifetime. Returns 0 so the budget does not reserve
             GPU bytes that will never be allocated.
@@ -146,23 +139,23 @@ def estimate_tts_bytes(
     if permanent_cloud_only and default_device != "cpu":
         return 0
 
-    result = predict_tts_bytes(tts_config, permanent_cloud_only=permanent_cloud_only)
+    result = predict_tts_bytes(
+        tts_config,
+        piper_ort_context_bytes=piper_ort_context_bytes,
+        permanent_cloud_only=permanent_cloud_only,
+    )
     if result is None:
         logger.info("TTS not cached; live gate is authoritative")
         return 0
     return result
 
 
-class ConfigurationError(RuntimeError):
-    """Raised when server configuration cannot satisfy VRAM requirements.
-
-    The error message names every cost line item and provides actionable
-    remediation hints so operators know exactly which config knobs to adjust.
-    """
-
-
 def estimated_adapter_bytes(
-    adapter_config: AdapterConfig, hidden_size: int, num_layers: int
+    adapter_config: AdapterConfig,
+    hidden_size: int,
+    num_layers: int,
+    dtype_bytes: int,
+    peft_overhead_bytes: int,
 ) -> int:
     """Compute the inference-only LoRA memory footprint in bytes.
 
@@ -185,6 +178,13 @@ def estimated_adapter_bytes(
         adapter_config: LoRA adapter configuration (rank, target_modules).
         hidden_size: Hidden dimension of the base model (e.g. 4096 for Mistral 7B).
         num_layers: Number of transformer layers in the base model (e.g. 32 for Mistral 7B).
+        dtype_bytes: Bytes per LoRA tensor element. LoRA tensors inherit the
+            base model's ``compute_dtype`` (PEFT + bitsandbytes contract — see
+            ``paramem/models/loader.py`` where ``bnb_4bit_compute_dtype`` is set
+            from ``model_config.compute_dtype``). bfloat16 / float16 → 2, float32 → 4.
+        peft_overhead_bytes: Empirical per-adapter overhead beyond the pure A+B
+            tensors (PEFT wrappers, metadata, allocator alignment). Config-driven
+            via ``vram.peft_overhead_per_adapter_mib``.
 
     Returns:
         Estimated LoRA adapter size in bytes.
@@ -192,8 +192,8 @@ def estimated_adapter_bytes(
     num_modules = len(adapter_config.target_modules)
     # A matrix: (rank × hidden_size), B matrix: (hidden_size × rank)
     # Both are rank × hidden_size in parameter count.
-    bytes_per_layer = num_modules * 2 * adapter_config.rank * hidden_size * _LORA_DTYPE_BYTES
-    return bytes_per_layer * num_layers + _PEFT_OVERHEAD_PER_ADAPTER_BYTES
+    bytes_per_layer = num_modules * 2 * adapter_config.rank * hidden_size * dtype_bytes
+    return bytes_per_layer * num_layers + peft_overhead_bytes
 
 
 def required_working_set_bytes(
@@ -244,42 +244,35 @@ def required_working_set_bytes(
     )
 
 
-# ── Hardware-tier assessment ────────────────────────────────────────────────
+# ── Baseline-target assessment ──────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
 class TopologyAssessment:
-    """Hardware-agnostic verdict on whether a configured topology fits.
+    """Verdict on whether a configured topology fits the deployment baseline.
 
-    Pure math output. The validator computes this from config alone (no CUDA
-    calls) so the same summary can be logged regardless of what card is
-    actually installed. Operators see which tier is required and how much
-    margin each tier leaves — a 12 GiB upgrade is often cheaper than shrinking
-    rank or interim count.
+    Pure math output. ``baseline_bytes`` is the operator-configured target
+    GPU VRAM (``vram.baseline_vram_gib`` × 1 GiB). ``fits_baseline`` is the
+    headline boolean used by the boot log and the attention populator.
 
     Attributes:
         required_bytes: Total working-set bytes (includes safety margin).
         adapter_bytes: Per-adapter LoRA footprint used in the sum.
         base_bytes: Base-model footprint used in the sum.
-        per_tier_fit: Mapping ``tier_gib → (fits, margin_bytes)``. ``fits`` is
-            True when the tier has enough VRAM for the topology *plus* the
-            1 GiB default headroom; ``margin_bytes`` is ``tier_bytes −
-            required_bytes`` (may be negative).
+        baseline_bytes: Configured deployment baseline in bytes
+            (``vram.baseline_vram_gib`` × 2**30).
+        fits_baseline: ``required_bytes ≤ baseline_bytes``.
+        margin_bytes: ``baseline_bytes − required_bytes`` (negative on overflow).
         breakdown: Multi-line breakdown table for logging.
     """
 
     required_bytes: int
     adapter_bytes: int
     base_bytes: int
-    per_tier_fit: dict[int, tuple[bool, int]]
+    baseline_bytes: int
+    fits_baseline: bool
+    margin_bytes: int
     breakdown: str
-
-    def smallest_fitting_tier_gib(self) -> int | None:
-        """Return the smallest tier (GiB) that fits, or None if none do."""
-        for tier, (fits, _margin) in sorted(self.per_tier_fit.items()):
-            if fits:
-                return tier
-        return None
 
 
 def assess_topology(
@@ -289,6 +282,9 @@ def assess_topology(
     base_bytes: int,
     hidden_size: int,
     num_layers: int,
+    lora_dtype_bytes: int,
+    peft_overhead_bytes: int,
+    baseline_vram_gib: int,
     model_id: str = "",
     quant_label: str = "nf4",
     main_adapter_count: int = 3,
@@ -296,13 +292,13 @@ def assess_topology(
     stt_bytes: int = 0,
     tts_bytes: int = 0,
 ) -> TopologyAssessment:
-    """Compute the topology working set and fit verdict for every hardware tier.
+    """Compute the topology working set and fit verdict against the baseline.
 
     Pure math — no CUDA, no live measurements. Safe to call before the base
     model is loaded and from test harnesses. The returned assessment drives
-    the startup warning banner (which tiers fit, which don't); the
-    authoritative reject is :func:`enforce_post_load_budget` after the model
-    is on the device.
+    the startup banner and the ``vram_config_overflow`` attention warning;
+    the authoritative reject is :func:`check_post_load_budget` after the
+    model is on the device.
 
     Args:
         adapter_config: LoRA config for interim/episodic adapters.
@@ -310,10 +306,16 @@ def assess_topology(
         base_bytes: Base-model GPU bytes (from predict_base_bytes or live measurement).
         hidden_size: Hidden dimension of the base model (from AutoConfig or known value).
         num_layers: Number of transformer layers (from AutoConfig or known value).
+        lora_dtype_bytes: Bytes per LoRA tensor element (derived from
+            ``model_config.compute_dtype``).
+        peft_overhead_bytes: Per-adapter PEFT residual overhead in bytes
+            (``vram.peft_overhead_per_adapter_mib`` × 1 MiB).
+        baseline_vram_gib: Configured deployment target in GiB
+            (``vram.baseline_vram_gib``).
         model_id: HF model id for the breakdown label.
         quant_label: Quantization scheme label for display only.
         main_adapter_count: Always-resident main adapters (default 3).
-        headroom_gib: KV cache + activation headroom (default 2 GiB).
+        headroom_gib: KV cache + activation headroom.
         stt_bytes: Whisper STT footprint (0 if CPU/disabled).
         tts_bytes: TTS footprint (0 if CPU/disabled).
 
@@ -324,7 +326,9 @@ def assess_topology(
 
     headroom_bytes = int(headroom_gib * _GiB)
 
-    adapter_bytes = estimated_adapter_bytes(adapter_config, hidden_size, num_layers)
+    adapter_bytes = estimated_adapter_bytes(
+        adapter_config, hidden_size, num_layers, lora_dtype_bytes, peft_overhead_bytes
+    )
 
     total_required = required_working_set_bytes(
         base_model_bytes=base_bytes,
@@ -337,11 +341,9 @@ def assess_topology(
     )
     total_with_margin = total_required + _SAFETY_MARGIN_BYTES
 
-    per_tier_fit: dict[int, tuple[bool, int]] = {}
-    for tier_gib in HARDWARE_TIERS_GIB:
-        tier_bytes = tier_gib * _GiB
-        margin = tier_bytes - total_with_margin
-        per_tier_fit[tier_gib] = (margin >= 0, margin)
+    baseline_bytes = baseline_vram_gib * _GiB
+    margin_bytes = baseline_bytes - total_with_margin
+    fits_baseline = margin_bytes >= 0
 
     breakdown = _format_breakdown(
         model_id=model_id,
@@ -365,73 +367,61 @@ def assess_topology(
         required_bytes=total_with_margin,
         adapter_bytes=adapter_bytes,
         base_bytes=base_bytes,
-        per_tier_fit=per_tier_fit,
+        baseline_bytes=baseline_bytes,
+        fits_baseline=fits_baseline,
+        margin_bytes=margin_bytes,
         breakdown=breakdown,
     )
 
 
-def format_tier_table(assessment: TopologyAssessment) -> str:
-    """Render the per-tier fit table as a multi-line string for logging.
+def format_baseline_fit(assessment: TopologyAssessment) -> str:
+    """Render the baseline fit verdict as a one-line summary for logging.
 
     Output example::
 
-        Hardware-tier fit assessment (required 7.3 GiB)
-          8 GiB   laptop         : OVERFLOW   ( -0.9 GiB)
-         12 GiB   desktop        : FITS       ( +3.1 GiB)
-         16 GiB   desktop        : FITS       ( +7.1 GiB)
-         24 GiB   enthusiast     : FITS       (+15.1 GiB)
-         40 GiB   workstation    : FITS       (+31.1 GiB)
-         80 GiB   data-center    : FITS       (+71.1 GiB)
+        Baseline fit: 7.30 GiB required vs 8 GiB target — FITS (+0.70 GiB)
+        Baseline fit: 9.20 GiB required vs 8 GiB target — OVERFLOW (-1.20 GiB)
     """
     _GiB = 2**30
-    tier_labels = {
-        8: "laptop",
-        12: "desktop",
-        16: "desktop",
-        24: "enthusiast",
-        40: "workstation",
-        80: "data-center",
-    }
-    lines = [f"Hardware-tier fit assessment (required {assessment.required_bytes / _GiB:.2f} GiB)"]
-    for tier_gib in sorted(assessment.per_tier_fit):
-        fits, margin = assessment.per_tier_fit[tier_gib]
-        verdict = "FITS    " if fits else "OVERFLOW"
-        sign = "+" if margin >= 0 else ""
-        lines.append(
-            f"  {tier_gib:>3} GiB  {tier_labels.get(tier_gib, ''):<12}:  {verdict}   "
-            f"({sign}{margin / _GiB:>5.2f} GiB)"
-        )
-    return "\n".join(lines)
+    verdict = "FITS" if assessment.fits_baseline else "OVERFLOW"
+    sign = "+" if assessment.margin_bytes >= 0 else ""
+    return (
+        f"Baseline fit: {assessment.required_bytes / _GiB:.2f} GiB required "
+        f"vs {assessment.baseline_bytes // _GiB} GiB target — {verdict} "
+        f"({sign}{assessment.margin_bytes / _GiB:.2f} GiB)"
+    )
 
 
 # ── Post-load gate ──────────────────────────────────────────────────────────
 
 
-def enforce_post_load_budget(
+def check_post_load_budget(
     measured_alloc_bytes: int,
     total_memory_bytes: int,
     headroom_bytes: int,
-) -> None:
-    """Authoritative post-load gate.
+) -> str | None:
+    """Authoritative post-load gate — returns a reason string on overflow, else None.
 
-    Raises ConfigurationError if measured_alloc_bytes > total_memory_bytes
-    - headroom_bytes. The headroom is the operator-tunable
-    vram.vram_cache_headroom_gib reservation for KV cache + activations.
+    The caller decides the response (boot path: release + degrade to cloud-only;
+    live-reload: degrade only). Returning a string instead of raising keeps the
+    decision at the call site and removes the asymmetry between boot and reload.
 
     Args:
-        measured_alloc_bytes: torch.cuda.memory_allocated(0) after model load.
+        measured_alloc_bytes: ``torch.cuda.memory_allocated(0)`` after model load.
         total_memory_bytes: Device hardware cap.
-        headroom_bytes: Reserved bytes for KV cache and activations.
+        headroom_bytes: Reserved bytes for KV cache and activations
+            (``vram.vram_cache_headroom_gib`` × 1 GiB).
 
-    Raises:
-        ConfigurationError: If the measured allocation leaves less than
-            headroom_bytes free on the device.
+    Returns:
+        ``None`` when ``measured_alloc_bytes ≤ total_memory_bytes − headroom_bytes``.
+        Otherwise a formatted multi-line reason describing the deficit + actionable
+        knobs, suitable for log + ``/status.attention``.
     """
     budget = total_memory_bytes - headroom_bytes
     if measured_alloc_bytes <= budget:
-        return
+        return None
     deficit = measured_alloc_bytes - budget
-    raise ConfigurationError(
+    return (
         f"Post-load VRAM gate failed: measured {measured_alloc_bytes / 2**30:.2f} GiB "
         f"exceeds budget {budget / 2**30:.2f} GiB "
         f"(total {total_memory_bytes / 2**30:.2f} GiB "

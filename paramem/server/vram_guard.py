@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from contextlib import contextmanager
 from typing import Iterator, MutableMapping
 
@@ -33,16 +34,6 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_PROCESS_FRACTION = 0.85
-
-# Minimum free device memory required to begin a new chunk's extraction
-# pipeline. Sized for an 8 GiB device with the 4-bit Mistral 7B base
-# resident (~4 GB) plus the extraction chain's working set: a single
-# 8K-token plausibility KV cache is ~1 GiB on Mistral 7B fp16 weights,
-# QA-gen prefill adds another few hundred MiB. 1.5 GiB free at chunk
-# entry leaves ~500 MiB margin after those two; below that we abort the
-# chunk early instead of failing mid-generate. Operator can override via
-# the ``min_free_bytes`` argument to :func:`assert_free_vram`.
-_DEFAULT_MIN_FREE_VRAM_BYTES = 1_500 * 1024 * 1024  # 1.5 GiB
 
 
 class VramExhausted(RuntimeError):
@@ -137,51 +128,60 @@ def vram_scope(label: str) -> Iterator[None]:
         safe_empty_cache()
 
 
-def assert_free_vram(
+def check_vram_headroom(
     label: str,
-    min_free_bytes: int = _DEFAULT_MIN_FREE_VRAM_BYTES,
+    headroom_bytes: int,
+    state: MutableMapping[str, object] | None = None,
 ) -> None:
-    """Raise :class:`VramExhausted` if free device memory is below threshold.
+    """Warn (do NOT abort) when free VRAM has dropped below the booked headroom.
 
-    Pre-chunk watchdog: called at the entry of each extraction phase to
-    short-circuit cycles that would otherwise hit a mid-generate driver
-    fault. Cheap (single ``mem_get_info`` syscall) and always called
-    before allocating work — the alternative is failing several seconds
-    into a generate after a 6 K-token prefill.
+    Drift detector. Reads ``torch.cuda.mem_get_info()[0]`` and compares
+    against ``headroom_bytes`` — the operator-configured per-phase peak
+    (``vram.vram_cache_headroom_gib``). The boot post-load gate guaranteed
+    this much was free immediately after load; if it's gone now, something
+    (STT/TTS swap, allocator fragmentation, an orphan process) consumed the
+    buffer we reserved for KV cache + activations.
 
-    The free-bytes value comes from ``torch.cuda.mem_get_info()`` which
-    returns ``(free, total)``. PyTorch's per-process cap (set by
-    :func:`apply_process_cap`) does NOT influence this number — it
-    reports physical device free, polluted by every CUDA consumer in the
-    process (STT, TTS, base model, prior allocator pool). That pollution
-    is exactly what we want to detect: a 1.5 GiB threshold means "there
-    is not enough headroom for the next phase regardless of who is
-    holding it". Caller is responsible for any prior eviction step.
+    Action on low headroom:
+      - Log a WARNING with the label, current free, and the configured floor.
+      - When ``state`` is provided, populate ``state["vram_low_headroom_warning"]``
+        for :func:`paramem.server.attention._collect_vram_low_headroom_items`
+        to surface in ``/status.attention``.
 
-    No-op when CUDA is unavailable.
+    Phases proceed regardless. Experiments showed that running below the
+    KV-cache buffer reliably OOMs, but the cleanup is :func:`vram_scope`'s
+    job; this function's role is operator visibility, not enforcement.
+
+    No-op when CUDA is unavailable. ``mem_get_info`` faults are logged and
+    swallowed — an unhealthy driver state is for :func:`vram_scope` to surface.
     """
     if not torch.cuda.is_available():
         return
     try:
         free_bytes, total_bytes = torch.cuda.mem_get_info()
     except Exception as exc:  # noqa: BLE001
-        # mem_get_info can fault on an unhealthy driver state (the same
-        # state we're trying to detect). Treat as exhausted.
-        logger.error(
-            "VRAM guard: mem_get_info failed at %s — treating as exhausted: %s",
-            label,
-            exc,
-        )
-        raise VramExhausted(label) from exc
-    if free_bytes < min_free_bytes:
-        logger.error(
-            "VRAM guard: %s aborted — free %d bytes < threshold %d bytes (total %d)",
-            label,
-            free_bytes,
-            min_free_bytes,
-            total_bytes,
-        )
-        raise VramExhausted(label)
+        logger.warning("VRAM headroom check: mem_get_info failed at %s: %s", label, exc)
+        return
+    if free_bytes >= headroom_bytes:
+        return
+    logger.warning(
+        "VRAM headroom low at %s: free %.2f GiB < configured headroom %.2f GiB "
+        "(total %.2f GiB). KV-cache / activation buffer is being consumed; "
+        "extraction may OOM. Reduce max_interim_count, voice GPU residency, "
+        "or raise vram.vram_cache_headroom_gib.",
+        label,
+        free_bytes / 2**30,
+        headroom_bytes / 2**30,
+        total_bytes / 2**30,
+    )
+    if state is not None:
+        state["vram_low_headroom_warning"] = {
+            "label": label,
+            "free_gib": free_bytes / 2**30,
+            "headroom_gib": headroom_bytes / 2**30,
+            "total_gib": total_bytes / 2**30,
+            "observed_at": time.time(),
+        }
 
 
 def safe_empty_cache() -> None:

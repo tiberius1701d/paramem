@@ -321,13 +321,45 @@ class VramConfig:
     """
 
     process_cap_fraction: float = 0.85
-    # KV-cache + activation headroom passed to assess_topology and the lifespan
-    # VRAM gate. Code default 1.0 GiB is the conservative minimum for callers
-    # that don't load a yaml; production yaml ships 2.0 GiB (configs/server.yaml
-    # and tests/fixtures/server.yaml) for the per-phase peak. vram_scope's
-    # inter-phase empty_cache releases the allocator pool between phases, so
-    # the reservation only needs to cover one phase's max KV growth.
+    # KV-cache + activation headroom passed to assess_topology and the post-load
+    # gate. Code default 1.0 GiB is the conservative minimum for callers that
+    # don't load a yaml; the shipped yamls (configs/server.yaml,
+    # tests/fixtures/server.yaml, configs/server.yaml.example) ship 1.5 GiB for
+    # the per-phase peak — single-sequence 8K-token Mistral KV cache is ~1 GiB
+    # on bf16 KV; 0.5 GiB margin for activations. vram_scope's inter-phase
+    # empty_cache releases the allocator pool between phases, so the reservation
+    # only needs to cover one phase's max KV growth.
     vram_cache_headroom_gib: float = 1.0
+    # Nominal target GPU VRAM in GiB. assess_topology compares the worst-case
+    # working set against this baseline and surfaces a /status.attention warning
+    # when the configured topology exceeds it. ParaMem targets 8 GiB GPUs
+    # (RTX 5070 Laptop, RTX 3060) as the published minimum; raise on bigger
+    # hardware so the "fits" verdict reflects what you actually run on.
+    baseline_vram_gib: int = 8
+    # ── Calibration knobs (predictor + adapter math) ────────────────────────
+    # Empirical factors that depend on the loaded model / library version.
+    # Surfaced as config so a model or quant-scheme swap can be tuned without
+    # a code edit; defaults are the values measured on the project's validated
+    # models (Mistral 7B / Gemma 2 9B / Qwen 2.5 7B NF4, distil-large-v3 int8,
+    # Piper + ONNX Runtime).  The live post-load gate catches mis-calibration,
+    # so a wrong number here is a noisy warning, never a silent OOM.
+    #
+    # Runtime bytes per byte of bf16/fp16 safetensors on disk under NF4 + BNB
+    # double-quant at block_size=64.  Verified 0.275 ± 1% across the three
+    # validated 7-9B models on RTX 5070.  Re-measure on bnb major-bump.
+    nf4_disk_to_runtime_factor: float = 0.275
+    # CT2 / faster-whisper activation + workspace overhead multiplier on top of
+    # the compute_type-quantized weight size.  1.1 ≈ 10% overhead, calibrated
+    # against distil-large-v3 int8 (770 MiB predicted vs 960 MiB measured).
+    stt_workspace_factor: float = 1.1
+    # ONNX Runtime CUDA context size in MiB (shared across all Piper voices in
+    # one process — counted once regardless of voice count).
+    tts_piper_ort_context_mib: int = 300
+    # PEFT per-adapter residual overhead in MiB, beyond the pure LoRA A+B
+    # tensors.  Measured ~10 MiB for [q,v,k,o] rank=8 on Mistral 7B (PEFT
+    # ModulesToSave wrappers + adapter-config metadata + allocator alignment).
+    # Larger target_modules sets shift this; re-measure if you extend to MLP.
+    peft_overhead_per_adapter_mib: int = 10
 
     def __post_init__(self) -> None:
         if not (0.0 < self.process_cap_fraction <= 1.0):
@@ -337,6 +369,27 @@ class VramConfig:
         if self.vram_cache_headroom_gib <= 0:
             raise ValueError(
                 f"vram.vram_cache_headroom_gib must be > 0; got {self.vram_cache_headroom_gib!r}"
+            )
+        if self.baseline_vram_gib <= 0:
+            raise ValueError(f"vram.baseline_vram_gib must be > 0; got {self.baseline_vram_gib!r}")
+        if self.nf4_disk_to_runtime_factor <= 0:
+            raise ValueError(
+                f"vram.nf4_disk_to_runtime_factor must be > 0; "
+                f"got {self.nf4_disk_to_runtime_factor!r}"
+            )
+        if self.stt_workspace_factor <= 0:
+            raise ValueError(
+                f"vram.stt_workspace_factor must be > 0; got {self.stt_workspace_factor!r}"
+            )
+        if self.tts_piper_ort_context_mib < 0:
+            raise ValueError(
+                f"vram.tts_piper_ort_context_mib must be >= 0; "
+                f"got {self.tts_piper_ort_context_mib!r}"
+            )
+        if self.peft_overhead_per_adapter_mib < 0:
+            raise ValueError(
+                f"vram.peft_overhead_per_adapter_mib must be >= 0; "
+                f"got {self.peft_overhead_per_adapter_mib!r}"
             )
 
 

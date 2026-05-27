@@ -20,6 +20,7 @@ from paramem.server.vram_guard import (
     DEFAULT_PROCESS_FRACTION,
     VramExhausted,
     apply_process_cap,
+    check_vram_headroom,
     vram_scope,
 )
 
@@ -137,6 +138,85 @@ class TestVramScope:
                 # Clean path: empty_cache failure must not break the context manager.
                 with vram_scope("s007"):
                     pass
+
+
+class TestCheckVramHeadroom:
+    """check_vram_headroom is a drift detector: warn + state, never raise."""
+
+    _HEADROOM = int(1.5 * 2**30)  # 1.5 GiB — matches configs/server.yaml
+
+    def test_no_op_when_cuda_unavailable(self):
+        state: dict = {}
+        with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=False):
+            check_vram_headroom("s001", self._HEADROOM, state)
+        assert "vram_low_headroom_warning" not in state
+
+    def test_silent_when_free_above_threshold(self):
+        state: dict = {}
+        with (
+            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch(
+                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                return_value=(3 * 2**30, 8 * 2**30),
+            ),
+        ):
+            check_vram_headroom("s001", self._HEADROOM, state)
+        assert "vram_low_headroom_warning" not in state
+
+    def test_populates_state_when_below_threshold(self):
+        state: dict = {}
+        with (
+            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch(
+                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                return_value=(1 * 2**30, 8 * 2**30),  # 1 GiB free < 1.5 GiB headroom
+            ),
+        ):
+            check_vram_headroom("s042", self._HEADROOM, state)
+        warn = state.get("vram_low_headroom_warning")
+        assert warn is not None, "state must be populated when free < headroom"
+        assert warn["label"] == "s042"
+        assert warn["free_gib"] == pytest.approx(1.0)
+        assert warn["headroom_gib"] == pytest.approx(1.5, rel=1e-3)
+        assert warn["total_gib"] == pytest.approx(8.0)
+        assert "observed_at" in warn
+
+    def test_never_raises_on_low_free(self):
+        """The contract: warn, do NOT abort. vram_scope is the actual OOM catch."""
+        state: dict = {}
+        with (
+            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch(
+                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                return_value=(64 * 2**20, 8 * 2**30),  # 64 MiB free — well below
+            ),
+        ):
+            # Must NOT raise VramExhausted.
+            check_vram_headroom("s003", self._HEADROOM, state)
+
+    def test_mem_get_info_fault_swallowed(self):
+        """Driver fault on mem_get_info is dropped — vram_scope handles real OOM."""
+        state: dict = {}
+        with (
+            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch(
+                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                side_effect=RuntimeError("driver unhealthy"),
+            ),
+        ):
+            check_vram_headroom("s004", self._HEADROOM, state)
+        assert "vram_low_headroom_warning" not in state
+
+    def test_state_optional(self):
+        """When no state dict is passed, function still runs (logs only, no state)."""
+        with (
+            patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True),
+            patch(
+                "paramem.server.vram_guard.torch.cuda.mem_get_info",
+                return_value=(1 * 2**30, 8 * 2**30),
+            ),
+        ):
+            check_vram_headroom("s005", self._HEADROOM, None)
 
 
 class TestConsolidationIntegration:
@@ -550,7 +630,7 @@ class TestPerChunkOOMSkip:
             # cycle-completion finalize calls router.reload() unconditionally.
             app_module._state["router"] = MagicMock()
 
-            # GPU lock + voice profile helper + vram_scope + assert_free_vram
+            # GPU lock + voice profile helper + vram_scope + check_vram_headroom
             # are no-ops for this test — we only care about the OOM-skip flow.
             no_lock = MagicMock()
             no_lock.__enter__ = MagicMock(return_value=None)
@@ -559,7 +639,7 @@ class TestPerChunkOOMSkip:
             with (
                 patch("paramem.server.gpu_lock.gpu_lock_sync", return_value=no_lock),
                 patch("paramem.server.app._set_voice_pipeline_profile"),
-                patch("paramem.server.app.assert_free_vram"),
+                patch("paramem.server.app.check_vram_headroom"),
                 patch("paramem.server.app.vram_scope", return_value=no_lock),
                 # `_increment_key_sessions` and `create_consolidation_loop`
                 # are lazily imported inside _extract_and_start_training
@@ -700,7 +780,7 @@ class TestExtractionFailedAbortsCycle:
             with (
                 patch("paramem.server.gpu_lock.gpu_lock_sync", return_value=no_lock),
                 patch("paramem.server.app._set_voice_pipeline_profile"),
-                patch("paramem.server.app.assert_free_vram"),
+                patch("paramem.server.app.check_vram_headroom"),
                 patch("paramem.server.app.vram_scope", return_value=no_lock),
                 patch("paramem.server.consolidation._increment_key_sessions"),
                 patch(
