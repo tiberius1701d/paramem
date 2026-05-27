@@ -1,12 +1,10 @@
-"""Pure unit tests for the startup VRAM budget validator.
+"""Pure unit tests for the boot-time VRAM topology assessment + post-load gate.
 
 No GPU required — all CUDA calls are mocked. Tests cover:
 - estimated_adapter_bytes (pure math)
 - required_working_set_bytes (pure math)
 - assess_topology (predicted-byte injection, no internal lookup)
 - enforce_post_load_budget (pure math gate)
-- measure_external_vram (nvidia-smi mocking)
-- enforce_live_budget (pure math)
 - format_tier_table
 - estimate_stt_bytes / estimate_tts_bytes wrappers (predict mock)
 - Lifespan call-order integration guard
@@ -16,7 +14,6 @@ No GPU required — all CUDA calls are mocked. Tests cover:
 from __future__ import annotations
 
 import logging
-import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -27,11 +24,9 @@ from paramem.server.vram_validator import (
     _PEFT_OVERHEAD_PER_ADAPTER_BYTES,
     ConfigurationError,
     assess_topology,
-    enforce_live_budget,
     enforce_post_load_budget,
     estimated_adapter_bytes,
     format_tier_table,
-    measure_external_vram,
     required_working_set_bytes,
 )
 from paramem.utils.config import AdapterConfig
@@ -253,113 +248,6 @@ def test_format_tier_table_contains_all_tiers():
 
 
 # ---------------------------------------------------------------------------
-# measure_external_vram — nvidia-smi path
-# ---------------------------------------------------------------------------
-
-
-def test_measure_external_vram_uses_nvidia_smi():
-    """measure_external_vram must read device-wide memory via nvidia-smi."""
-    completed = subprocess.CompletedProcess(
-        args=["nvidia-smi"],
-        returncode=0,
-        stdout="4608\n",  # 4608 MiB ≈ 4.5 GiB
-        stderr="",
-    )
-    with (
-        patch("paramem.server.vram_validator.torch") as mock_torch,
-        patch("paramem.server.vram_validator.subprocess.run", return_value=completed) as mock_run,
-    ):
-        mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
-        mock_torch.cuda.memory_allocated.return_value = 0
-
-        total, external = measure_external_vram()
-
-    assert total == _TOTAL_VRAM_BYTES
-    assert external == 4608 * 2**20
-    mock_run.assert_called_once()
-    mock_torch.cuda.memory_allocated.assert_not_called()
-
-
-def test_measure_external_vram_falls_back_when_nvidia_smi_missing(caplog):
-    """When nvidia-smi is unavailable, falls back to torch.cuda.memory_allocated."""
-
-    named = logging.getLogger("paramem.server.vram_validator")
-    orig_propagate = named.propagate
-    named.propagate = True
-    caplog.set_level(logging.WARNING, logger="paramem.server.vram_validator")
-    named.addHandler(caplog.handler)
-
-    try:
-        with (
-            patch("paramem.server.vram_validator.torch") as mock_torch,
-            patch(
-                "paramem.server.vram_validator.subprocess.run",
-                side_effect=FileNotFoundError("nvidia-smi"),
-            ),
-        ):
-            mock_torch.cuda.get_device_properties.return_value.total_memory = _TOTAL_VRAM_BYTES
-            mock_torch.cuda.memory_allocated.return_value = 1_000_000_000
-
-            total, external = measure_external_vram()
-    finally:
-        named.removeHandler(caplog.handler)
-        named.propagate = orig_propagate
-
-    assert total == _TOTAL_VRAM_BYTES
-    assert external == 1_000_000_000
-    logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "nvidia-smi unavailable" in logged
-    assert "blind spot" in logged or "invisible" in logged
-
-
-# ---------------------------------------------------------------------------
-# enforce_live_budget
-# ---------------------------------------------------------------------------
-
-
-def test_enforce_live_budget_rejects_when_external_consumes_majority():
-    """With 4.5 GiB external and 7.5 GiB required on 8 GiB: live budget 3.5 GiB < required."""
-    from paramem.server.vram_validator import TopologyAssessment
-
-    total_memory = 8 * _GiB
-    external = int(4.5 * _GiB)
-    required = int(7.5 * _GiB)
-
-    assessment = TopologyAssessment(
-        required_bytes=required,
-        adapter_bytes=int(0.05 * _GiB),
-        base_bytes=int(3.8 * _GiB),
-        per_tier_fit={8: (False, total_memory - required), 12: (True, 12 * _GiB - required)},
-        breakdown="(test fixture)",
-    )
-
-    with pytest.raises(ConfigurationError) as exc_info:
-        enforce_live_budget(assessment, total_memory, external)
-
-    msg = str(exc_info.value)
-    assert "VRAM live budget insufficient" in msg
-    assert "External occupancy" in msg
-
-
-def test_enforce_live_budget_passes_when_fits():
-    """Sufficient live budget must not raise."""
-    from paramem.server.vram_validator import TopologyAssessment
-
-    total_memory = 8 * _GiB
-    external = int(0.5 * _GiB)
-    required = int(5.5 * _GiB)
-
-    assessment = TopologyAssessment(
-        required_bytes=required,
-        adapter_bytes=int(0.02 * _GiB),
-        base_bytes=int(4.0 * _GiB),
-        per_tier_fit={8: (True, total_memory - required)},
-        breakdown="(test fixture)",
-    )
-    enforce_live_budget(assessment, total_memory, external)  # no exception
-
-
-# ---------------------------------------------------------------------------
 # estimate_stt_bytes / estimate_tts_bytes wrappers
 # ---------------------------------------------------------------------------
 
@@ -538,11 +426,9 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
         predict_base_bytes → assess_topology → _wait_for_gpu_drain →
         load_base_model
 
-    The old single-shot ``measure_external_vram`` + ``enforce_live_budget``
-    + ``sys.exit(1)`` boot gate was replaced by the poll-and-degrade
-    ``_wait_for_gpu_drain`` in the VRAM-overcommit fix (Fix 2).
-    ``measure_external_vram`` and ``enforce_live_budget`` are no longer
-    called from the lifespan boot path.
+    The authoritative reject is ``enforce_post_load_budget`` AFTER load
+    (separate test). ``_wait_for_gpu_drain`` is the pre-load gate and
+    degrades to cloud-only on timeout rather than hard-failing.
     """
     import asyncio
 
@@ -646,8 +532,7 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
     assess_idx = call_names.index("assess_topology")
     assert pred_idx < assess_idx, "predict_base_bytes must come before assess_topology"
 
-    # New boot order: assess_topology → _wait_for_gpu_drain → load_base_model
-    # (measure_external_vram and enforce_live_budget removed from boot path in Fix 2)
+    # Boot order: assess_topology → _wait_for_gpu_drain → load_base_model
     expected_tail = [
         "assess_topology",
         "_wait_for_gpu_drain",
@@ -656,15 +541,6 @@ def test_lifespan_runs_validator_before_load_base_model(tmp_path):
     tail_order = [c for c in call_names if c in expected_tail]
     assert tail_order == expected_tail, (
         f"Lifespan must invoke {expected_tail} in order; got {tail_order}"
-    )
-
-    # Confirm the old single-shot gate functions are NOT called from the boot path.
-    assert "measure_external_vram" not in call_names, (
-        "measure_external_vram must NOT be called in the boot path "
-        "(replaced by _wait_for_gpu_drain)"
-    )
-    assert "enforce_live_budget" not in call_names, (
-        "enforce_live_budget must NOT be called in the boot path (replaced by _wait_for_gpu_drain)"
     )
 
 

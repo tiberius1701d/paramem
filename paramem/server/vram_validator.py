@@ -1,39 +1,42 @@
-"""Startup-time VRAM budget validator for the multi-adapter server.
+"""Boot-time VRAM topology assessment + authoritative post-load gate.
 
-Proves at boot that the configured adapter topology fits in VRAM for the
-entire week of operation. Pass → guaranteed safe; runtime rejection cannot
-occur. Fail → server refuses to start with a clear, actionable error.
+Two roles, both consumed by the server lifespan:
 
-Why startup, not runtime
-------------------------
-Adapter VRAM cost is fully deterministic from ``rank × target_modules ×
-base_model``. Weight values do not affect size. The maximum working set
-the server will ever hold is known at boot. Runtime guards add false
-flexibility for an event that cannot occur once startup passes.
+1. :func:`assess_topology` — pure math from config alone. Produces a
+   :class:`TopologyAssessment` with the worst-case working set and a
+   per-hardware-tier fit verdict. Logged at boot for operator visibility;
+   cached on ``_state["topology_assessment"]`` for the live-reload path's
+   drain-wait pre-flight. No CUDA calls, safe before the model is loaded.
+2. :func:`enforce_post_load_budget` — the authoritative reject. Runs in the
+   lifespan AFTER the base model + STT/TTS are on the device, reads
+   ``torch.cuda.memory_allocated(0)``, refuses startup (``sys.exit(1)``)
+   when the measured allocation leaves less than the configured headroom.
 
-Working set formula
--------------------
-::
+Pre-load math gates were removed: the boot path uses
+``_wait_for_gpu_drain`` (in ``app.py``) to wait for VRAM and degrade to
+cloud-only on timeout; the live-reload path uses the same drain-wait.
+``enforce_post_load_budget`` is the only check that can actually reject
+the configured topology.
+
+Working set formula (informational, used by :func:`assess_topology`)::
 
     working_set_bytes =
           base_model_bytes
         + main_adapter_count        × adapter_bytes   # episodic, semantic, procedural = 3
         + max_interim_count         × adapter_bytes   # configurable, default 7
         + 1                         × adapter_bytes   # in_training staging slot
+        + stt_bytes + tts_bytes
         + kv_cache_headroom_bytes
+        + safety_margin
 
-Note: adapter byte count assumes inference-only LoRA (no optimizer state).
-Training reuses the ``in_training`` staging slot, accounted separately as
-the ``+1 × adapter_bytes`` term.
+Adapter bytes assume inference-only LoRA (no optimizer state); training
+reuses the ``in_training`` staging slot.
 """
 
 from __future__ import annotations
 
 import logging
-import subprocess
 from dataclasses import dataclass
-
-import torch
 
 from paramem.server.vram_predict import predict_stt_bytes, predict_tts_bytes
 from paramem.utils.config import AdapterConfig
@@ -193,25 +196,6 @@ def estimated_adapter_bytes(
     return bytes_per_layer * num_layers + _PEFT_OVERHEAD_PER_ADAPTER_BYTES
 
 
-def estimated_base_model_bytes(model) -> int:
-    """Read the base model GPU footprint from the CUDA allocator.
-
-    Must be called AFTER the model is loaded onto the GPU. Returns the
-    current ``torch.cuda.memory_allocated()`` snapshot, which reflects the
-    model's parameter and buffer memory but not CUDA context overhead.
-
-    Args:
-        model: The loaded model (used only as a sentinel; the CUDA allocator
-            is device-global).
-
-    Returns:
-        Bytes currently allocated on CUDA device 0.
-    """
-    allocated = torch.cuda.memory_allocated(0)
-    logger.debug("Base model GPU footprint (memory_allocated): %.2f GiB", allocated / 2**30)
-    return allocated
-
-
 def required_working_set_bytes(
     base_model_bytes: int,
     adapter_bytes: int,
@@ -316,8 +300,9 @@ def assess_topology(
 
     Pure math — no CUDA, no live measurements. Safe to call before the base
     model is loaded and from test harnesses. The returned assessment drives
-    both the startup warning banner (which tiers fit, which don't) and the
-    live-budget gate (``enforce_live_budget``).
+    the startup warning banner (which tiers fit, which don't); the
+    authoritative reject is :func:`enforce_post_load_budget` after the model
+    is on the device.
 
     Args:
         adapter_config: LoRA config for interim/episodic adapters.
@@ -419,149 +404,7 @@ def format_tier_table(assessment: TopologyAssessment) -> str:
     return "\n".join(lines)
 
 
-# ── Live-budget enforcement ─────────────────────────────────────────────────
-
-
-def _query_device_memory_used_bytes() -> int | None:
-    """Return device-wide GPU memory in use (bytes), via ``nvidia-smi``.
-
-    Cross-process — sees memory held by every consumer on the device,
-    including this process AND orphaned dxgkrnl-cached allocations on WSL2
-    that have no owning compute process. Returns ``None`` on failure
-    (binary missing, timeout, parse error); the caller decides the
-    fallback policy.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=True,
-        )
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-        logger.debug("nvidia-smi memory query failed: %s", exc)
-        return None
-    body = (result.stdout or "").strip()
-    try:
-        return int(body.splitlines()[0]) * 2**20
-    except (ValueError, IndexError) as exc:
-        logger.debug("nvidia-smi memory query unparseable (output=%r): %s", body, exc)
-        return None
-
-
-def measure_external_vram(
-    *,
-    total_memory_bytes_override: int | None = None,
-) -> tuple[int, int]:
-    """Snapshot device-wide GPU memory occupancy at process entry.
-
-    Called BEFORE :func:`paramem.models.loader.load_base_model` so the
-    measurement reflects external consumers' VRAM usage on this device.
-    Uses ``nvidia-smi --query-gpu=memory.used`` for a true device-wide
-    read — sees the Windows desktop compositor, other model servers, AND
-    orphaned dxgkrnl-cached allocations on WSL2 that linger after the
-    owning process exits.
-
-    Falls back to :func:`torch.cuda.memory_allocated` (per-process only)
-    when ``nvidia-smi`` is unavailable, with a WARNING log calling out
-    the blind spot. The fallback path matches the prior implementation,
-    which silently under-reported external occupancy.
-
-    Re-measured on every lifespan entry — cheap (sub-100 ms subprocess)
-    and ensures restarts see current occupancy, not a stale snapshot.
-
-    Args:
-        total_memory_bytes_override: Test-only override. When set, skips
-            the CUDA hardware read for ``total_memory_bytes``.
-
-    Returns:
-        ``(total_memory_bytes, external_bytes)`` — the device's hardware
-        cap and bytes currently held by all consumers on the device. The
-        small fraction held by this process pre-load (CUDA context only)
-        is included in ``external_bytes``; conservative in the safe
-        direction.
-    """
-    if total_memory_bytes_override is not None:
-        total_memory_bytes = total_memory_bytes_override
-    else:
-        total_memory_bytes = torch.cuda.get_device_properties(0).total_memory
-
-    external_bytes = _query_device_memory_used_bytes()
-    if external_bytes is None:
-        logger.warning(
-            "nvidia-smi unavailable; falling back to torch.cuda.memory_allocated. "
-            "External VRAM held by other processes (and orphaned dxgkrnl cache "
-            "on WSL2) will be invisible — live-budget check may admit an "
-            "unfittable topology."
-        )
-        external_bytes = torch.cuda.memory_allocated(0)
-    logger.info(
-        "VRAM snapshot at entry: total=%.2f GiB, external consumers=%.2f GiB",
-        total_memory_bytes / 2**30,
-        external_bytes / 2**30,
-    )
-    return total_memory_bytes, external_bytes
-
-
-def enforce_live_budget(
-    assessment: TopologyAssessment,
-    total_memory_bytes: int,
-    external_bytes: int,
-) -> None:
-    """Raise :class:`ConfigurationError` if the live GPU cannot fit the topology.
-
-    Live budget = ``total_memory − external_bytes``. This is the VRAM
-    actually available to ParaMem on a fresh process — it already accounts
-    for other processes holding memory but NOT for ParaMem's own (wiped)
-    footprint.
-
-    Args:
-        assessment: Topology assessment from :func:`assess_topology`.
-        total_memory_bytes: Device hardware cap (from
-            ``torch.cuda.get_device_properties(0).total_memory`` or a test
-            override via :func:`measure_external_vram`).
-        external_bytes: Non-ParaMem VRAM occupancy snapshotted by
-            :func:`measure_external_vram` before base-model load.
-
-    Raises:
-        ConfigurationError: If the live budget is smaller than the assessed
-            required working set, with a breakdown and actionable
-            remediation hints.
-    """
-    live_budget = total_memory_bytes - external_bytes
-    if live_budget >= assessment.required_bytes:
-        logger.info(
-            "VRAM live budget OK: need %.2f GiB, live budget %.2f GiB "
-            "(%.2f GiB total − %.2f GiB external), margin %.2f GiB.",
-            assessment.required_bytes / 2**30,
-            live_budget / 2**30,
-            total_memory_bytes / 2**30,
-            external_bytes / 2**30,
-            (live_budget - assessment.required_bytes) / 2**30,
-        )
-        return
-
-    _log_gpu_occupancy_diagnostic()
-    deficit = assessment.required_bytes - live_budget
-    raise ConfigurationError(
-        f"VRAM live budget insufficient on this host.\n"
-        f"{assessment.breakdown}\n\n"
-        f"Hardware cap:           {total_memory_bytes / 2**30:>6.2f} GiB\n"
-        f"External occupancy:    -{external_bytes / 2**30:>6.2f} GiB "
-        f"(non-ParaMem processes)\n"
-        f"Live budget:            {live_budget / 2**30:>6.2f} GiB\n"
-        f"Required:               {assessment.required_bytes / 2**30:>6.2f} GiB\n"
-        f"Deficit:                {deficit / 2**30:>6.2f} GiB\n\n"
-        f"{format_tier_table(assessment)}\n\n"
-        f"Either (a) free external VRAM consumers, (b) install a larger GPU "
-        f"(see tier table above), or (c) shrink the topology (rank, "
-        f"max_interim_count, target_modules)."
-    )
+# ── Post-load gate ──────────────────────────────────────────────────────────
 
 
 def enforce_post_load_budget(
@@ -688,31 +531,3 @@ def _format_breakdown(
             ]
         )
     return "\n".join(lines)
-
-
-def _log_gpu_occupancy_diagnostic() -> None:
-    """Log ``nvidia-smi`` per-process VRAM usage as a diagnostic.
-
-    Called only on the validation-failure path so operators can see *who* is
-    holding VRAM when the budget check rejects startup. Best-effort: any
-    failure (missing binary, driver error) is swallowed.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=pid,process_name,used_memory",
-                "--format=csv,noheader",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        body = (result.stdout or "").strip()
-        if body:
-            logger.error("Current GPU occupancy (nvidia-smi):\n%s", body)
-        else:
-            logger.error("Current GPU occupancy (nvidia-smi): no compute processes")
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.debug("nvidia-smi diagnostic unavailable: %s", exc)
