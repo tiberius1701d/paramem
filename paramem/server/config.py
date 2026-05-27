@@ -943,13 +943,12 @@ class ConsolidationScheduleConfig:
     # on a minimum triple-floor so low-traffic sub-intervals skip the pass.
     graph_enrichment_interim_enabled: bool = True
     graph_enrichment_min_triples_floor: int = 20
-    # BG-trainer step-level checkpointing. When training_save_strategy_bg is
-    # non-empty it overrides the default "epoch" save strategy for background
-    # training jobs, enabling step-granularity checkpoints for crash recovery
-    # in long runs. training_save_steps_bg is the step interval; only read
-    # when training_save_strategy_bg == "steps".
-    training_save_strategy_bg: str = ""
-    training_save_steps_bg: int = 0
+    # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
+    # /dev/shm instead of the caller's output_dir, then copies the latest
+    # checkpoint to <output_dir>/bg_checkpoint_epoch/ at each epoch boundary.
+    # Trade-off: /dev/shm is not durable across restarts; a crash loses the
+    # in-flight checkpoint.  Set to 0 (default) to disable.
+    training_save_steps_ram: int = 0
     # Slot retention — see ConsolidationLoop._prune_old_slots.
     #
     # After each promotion atomic_save_adapter writes a NEW timestamped slot
@@ -972,9 +971,9 @@ class ConsolidationScheduleConfig:
     # step does not break the predicate. Set to 0 to disable the gate.
     training_idle_debounce_s: int = 30
     # Time /chat waits for the BG trainer to abort at the next step boundary
-    # before falling back to bt.stop(). At step times >> this, /chat falls
-    # through to stop() which is heavier-handed. 30s covers typical BG
-    # training step durations on the live system with room to spare.
+    # before falling back to setting _shutdown_requested directly. At step
+    # times >> this, /chat falls through to the shutdown-flag path which is
+    # heavier-handed. 30s covers typical BG training step durations.
     abort_quiesce_timeout_s: float = 30.0
 
     def __post_init__(self) -> None:
@@ -990,17 +989,10 @@ class ConsolidationScheduleConfig:
         - judge="off"   + any stage  → plausibility disabled, no cloud exposure
         - judge=<cloud> + stage="anon" → cloud judge on anonymized data only
         """
-        valid_bg_strategies = {"", "epoch", "steps"}
-        if self.training_save_strategy_bg not in valid_bg_strategies:
+        if self.training_save_steps_ram < 0:
             raise ValueError(
-                f"consolidation.training_save_strategy_bg must be one of "
-                f"['', 'epoch', 'steps']; got {self.training_save_strategy_bg!r}"
-            )
-        if self.training_save_strategy_bg == "steps" and self.training_save_steps_bg < 1:
-            raise ValueError(
-                f"consolidation.training_save_steps_bg must be >= 1 when "
-                f"training_save_strategy_bg='steps'; got {self.training_save_steps_bg!r}. "
-                f"Set training_save_steps_bg to the desired checkpoint interval."
+                f"consolidation.training_save_steps_ram must be >= 0; "
+                f"got {self.training_save_steps_ram!r}"
             )
         if self.training_keep_prior_slots < 0:
             raise ValueError(
@@ -1404,8 +1396,7 @@ class ServerConfig:
             recall_window=self.consolidation.recall_window,
             recall_probe_every_n_epochs=self.consolidation.recall_probe_every_n_epochs,
             recall_probe_batch_size=self.consolidation.recall_probe_batch_size,
-            save_strategy_bg=self.consolidation.training_save_strategy_bg,
-            save_steps_bg=self.consolidation.training_save_steps_bg,
+            save_steps_ram=self.consolidation.training_save_steps_ram,
         )
 
     @property
@@ -1598,6 +1589,20 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             "consolidation.mode='simulate' instead. The legacy key is ignored.",
             _legacy_simulate,
         )
+    # Retired keys: training_save_strategy_bg and training_save_steps_bg were
+    # removed when the override layer was unified into TrainingConfig directly.
+    # Detect them and raise loud rather than silently dropping (dataclass
+    # **kwargs would raise TypeError anyway, but a targeted message is faster
+    # to diagnose).
+    for _retired_key in ("training_save_strategy_bg", "training_save_steps_bg"):
+        if _retired_key in consolidation_raw:
+            consolidation_raw.pop(_retired_key)
+            raise ValueError(
+                f"config error: `consolidation.{_retired_key}` was removed. "
+                f"Use `training.save_strategy` and `training.save_steps` directly, "
+                f"or set `consolidation.training_save_steps_ram` for RAM-mode "
+                f"checkpointing. Remove `{_retired_key}` from your config file."
+            )
     if consolidation_raw:
         config.consolidation = ConsolidationScheduleConfig(**consolidation_raw)
 

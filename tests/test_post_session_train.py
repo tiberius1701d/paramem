@@ -180,7 +180,10 @@ class TestFirstCallCreatesInterimAdapter:
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_create_side_effect,
             ),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -220,7 +223,10 @@ class TestFirstCallCreatesInterimAdapter:
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_create_side_effect,
             ),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -260,7 +266,10 @@ class TestSecondCallReusesAdapter:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -311,7 +320,10 @@ class TestStampRolloverCreatesNewAdapter:
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=_create_side_effect,
             ) as mock_create,
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -479,7 +491,10 @@ class TestMaxInterimCountZeroQueues:
         with (
             patch.object(loop, "extract_session", return_value=(qa, [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
-            patch("paramem.training.trainer.train_adapter") as mock_train,
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ) as mock_train,
         ):
             result = loop.post_session_train(
                 "Transcript",
@@ -598,7 +613,10 @@ class TestRegisterAfterSuccessNotBefore:
                 "paramem.memory.interim_adapter.create_interim_adapter",
                 side_effect=lambda m, cfg, s: m,
             ),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -694,7 +712,10 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 return_value=(_fake_qa(2), _fake_proc_rels(1)),
             ),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -745,7 +766,10 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 return_value=(_fake_qa(2), []),  # empty procedural_rels
             ),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -783,7 +807,10 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 return_value=(_fake_qa(2), _fake_proc_rels(2)),
             ),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -858,7 +885,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             if call_count["n"] >= 2:
                 # Second call is the procedural train_adapter — raise.
                 raise RuntimeError("procedural training failed")
-            return MagicMock(get=lambda k, d=None: 0.5)
+            return {"train_loss": 0.5, "aborted": False}
 
         # Synthetic QA for generate_qa_from_relations (called inside
         # _run_indexed_key_procedural).
@@ -967,7 +994,10 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 return_value=(_fake_qa(1), _fake_proc_rels(1)),
             ),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -1179,7 +1209,10 @@ class TestRegistryLastWriteOrder:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -1233,7 +1266,10 @@ class TestRegistryLastWriteOrder:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -1549,7 +1585,10 @@ class TestManifestWrittenPostSession:
         with (
             patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),

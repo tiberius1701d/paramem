@@ -326,20 +326,20 @@ class TestQuietHoursPolicy:
 
 class TestGpuTemp:
     def test_gpu_temp_returns_int(self):
-        from paramem.server.background_trainer import _gpu_temp
+        from paramem.training.thermal_throttle import _gpu_temp
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="55\n")
             assert _gpu_temp() == 55
 
     def test_gpu_temp_returns_none_on_failure(self):
-        from paramem.server.background_trainer import _gpu_temp
+        from paramem.training.thermal_throttle import _gpu_temp
 
         with patch("subprocess.run", side_effect=FileNotFoundError):
             assert _gpu_temp() is None
 
     def test_gpu_temp_returns_none_on_bad_rc(self):
-        from paramem.server.background_trainer import _gpu_temp
+        from paramem.training.thermal_throttle import _gpu_temp
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="")

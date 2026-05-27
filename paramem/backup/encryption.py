@@ -323,9 +323,13 @@ def infra_paths(data_dir: Path) -> list[Path]:
             for _interim_file in _tier_root.rglob("indexed_key_registry.json"):
                 if _interim_file != _tier_root / "indexed_key_registry.json":
                     paths.append(_interim_file)
-    # BG-trainer resume states live under per-job in_training directories.
+    # Training scratch state — staging_resume.json holds the per-job fingerprint
+    # + checkpoint pointer used by `paramem.training.trainer.train_adapter` for
+    # crash resume.  Written via write_infra_bytes (encrypted under Security ON);
+    # globbed here so the boot-time mode-consistency probe covers it alongside
+    # the other infra files.
     if adapters_root.exists():
-        for resume in adapters_root.rglob("in_training/resume_state.json"):
+        for resume in adapters_root.rglob("staging_resume.json"):
             paths.append(resume)
     # Adapter safetensors — full-file encrypted when daily identity is loaded.
     # Each tier's slot directories (and episodic/interim_* siblings) may hold

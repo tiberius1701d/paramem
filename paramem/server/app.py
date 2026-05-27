@@ -79,6 +79,7 @@ from paramem.server.vram_validator import (
     estimate_tts_bytes,
     format_tier_table,
 )
+from paramem.training.consolidation import AbortedDuringConsolidation
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
@@ -1983,7 +1984,8 @@ async def lifespan(app: FastAPI):
             logger.info("Shutdown flag set — training will stop after current epoch")
         bg_trainer = _state.get("background_trainer")
         if bg_trainer is not None and bg_trainer.is_training:
-            bg_trainer.stop(timeout=30)
+            bg_trainer._shutdown_requested = True
+            bg_trainer._is_training = False
             logger.info("Background trainer stopped")
         buffer = _state.get("session_buffer")
         if buffer:
@@ -2030,23 +2032,6 @@ async def lifespan(app: FastAPI):
         _state["config_drift_task"] = asyncio.create_task(
             drift_poll_loop(Path(_state["config_path"]), _state)
         )
-
-    # Startup diagnostic: surface any in-flight training state left by a
-    # prior interrupted run.  The actual resume happens when the next
-    # training job for that adapter is submitted — this is informational only.
-    if _state.get("model") is not None:
-        from paramem.server.background_trainer import _RESUME_STATE_FILE, _read_resume_state
-
-        _resume_path = config.adapter_dir / "in_training" / _RESUME_STATE_FILE
-        _resume_state = _read_resume_state(_resume_path)
-        if _resume_state is not None and _resume_state.get("checkpoint_path"):
-            logger.info(
-                "Detected in-flight training state: adapter=%s epoch=%d/%d"
-                " — will resume when the job is next submitted",
-                _resume_state.get("adapter_name", "?"),
-                _resume_state.get("last_completed_epoch", 0),
-                _resume_state.get("total_epochs", 0),
-            )
 
     # Active-store migration detection. Triggered when the operator flips
     # consolidation.mode in server.yaml: the on-disk state for the new mode's
@@ -2518,10 +2503,11 @@ async def chat(request: ChatRequest):
         aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
         if not aborted:
             logger.warning(
-                "Training did not abort within %.1f s — stopping trainer before inference",
+                "Training did not abort within %.1f s — forcing trainer stop before inference",
                 _abort_timeout,
             )
-            bg_trainer.stop(timeout=30)
+            bg_trainer._shutdown_requested = True
+            bg_trainer._is_training = False
 
     from paramem.server.gpu_lock import gpu_lock
 
@@ -2789,7 +2775,7 @@ async def status():
     # Background trainer
     bt = _state.get("background_trainer")
     bg_active = bool(bt and getattr(bt, "is_training", False))
-    bg_adapter = getattr(bt, "current_adapter_name", None) if bg_active else None
+    bg_adapter = None  # surfaced in /status; resolved by the active training caller now
 
     # Thermal-throttle / quiet-hours snapshot. Read from the loaded config so the
     # block is present even before the BackgroundTrainer has been constructed.
@@ -4303,12 +4289,13 @@ def _release_base_model_in_process() -> None:
        ``paramem/server/background_trainer.py``).
     4. **The bg-trainer worker thread's frame.** After a train-mode
        cycle, ``bt._worker_thread`` is parked on
-       ``self._job_queue.get()`` (``paramem/server/background_trainer.py:525``)
-       with stale locals from the prior job: ``fn = _run_interim_training``
-       (closure cell capturing ``loop``), ``fallback_adapter``, ``item``,
-       ``sentinel``. Until a NEW job arrives, those locals stay
-       referenced and ``loop.model`` stays alive. ``_state[...] = None``
-       on the dict entries does not affect the worker frame.
+       ``self._job_queue.get()`` (``paramem/server/background_trainer.py``,
+       ``_run_callable_queue``) with stale locals from the prior job:
+       ``fn = _run_interim_training`` (closure cell capturing ``loop``),
+       ``fallback_adapter``, ``item``, ``sentinel``. Until a NEW job
+       arrives, those locals stay referenced and ``loop.model`` stays alive.
+       ``_state[...] = None`` on the dict entries does not affect the worker
+       frame.
 
     5. ``intent._classifier_model_singleton`` — the ``_ClassifierModelHandle``
        set by ``set_classifier_model`` for ``intent.mode=llm`` (it holds the
@@ -5008,7 +4995,8 @@ async def debug_probe(request: DebugProbeRequest):
         _abort_timeout = config.consolidation.abort_quiesce_timeout_s
         aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
         if not aborted:
-            bg_trainer.stop(timeout=30)
+            bg_trainer._shutdown_requested = True
+            bg_trainer._is_training = False
 
     from paramem.server.gpu_lock import gpu_lock
 
@@ -10327,8 +10315,7 @@ def _extract_and_start_training():
         Runs on the BG trainer worker thread under the GPU lock.  The helper
         does its own atomic I5 save of the interim slot + registry; we then
         run the cross-cycle bookkeeping (promotion check, key-metadata save,
-        session marking, router reload, state updates) that was previously
-        bound to BackgroundTrainer.start_jobs's on_complete callback.
+        session marking, router reload, state updates) after each cycle.
         """
         try:
             # Callsite 4: post-session async-train.  Runs inside the BG worker
@@ -10504,6 +10491,11 @@ def _run_full_consolidation_sync() -> None:
                     trainer=bt,
                     router=_state.get("router"),
                 )
+        except AbortedDuringConsolidation as exc:
+            logger.info("Full consolidation aborted for inference: %s", exc)
+            _state["last_consolidation_result"] = {"status": "aborted"}
+            _state["consolidating"] = False
+            return
         except Exception:
             logger.exception("Full consolidation failed")
             _state["last_consolidation_result"] = {"status": "error"}

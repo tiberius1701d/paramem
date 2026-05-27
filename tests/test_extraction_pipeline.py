@@ -2109,30 +2109,6 @@ class TestBackgroundTrainer:
         )
         assert not bt.is_training
 
-    def test_start_jobs_empty(self):
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-        )
-        completed = []
-        bt.start_jobs([], on_complete=lambda: completed.append(True))
-        assert completed == [True]
-        assert not bt.is_training
-
-    def test_stop_when_not_training(self):
-        from paramem.server.background_trainer import BackgroundTrainer
-
-        bt = BackgroundTrainer(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            training_config=MagicMock(),
-        )
-        epoch = bt.stop()
-        assert epoch == 0
-
     def test_abort_for_inference_when_not_training(self):
         """abort_for_inference() returns False immediately when no job is active."""
         from paramem.server.background_trainer import BackgroundTrainer
