@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -376,6 +377,80 @@ def _is_no_key_check(check: FileCheck) -> bool:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+# The canonical 3-file signature of a committed adapter slot.  A subdir under
+# <adapter_dir>/<tier>/ is considered complete only when ALL three are present.
+# Missing any one of them marks the slot as partial-trained scratch and the
+# boot housekeeping pass deletes it (see :func:`cleanup_partial_slots`).
+_REQUIRED_SLOT_FILES: tuple[str, ...] = (
+    "meta.json",
+    "adapter_config.json",
+    "adapter_model.safetensors",
+)
+
+
+def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
+    """Delete partial-trained adapter slot directories under each main tier.
+
+    Walks ``<adapter_dir>/<tier>/`` for every tier in :data:`_MAIN_TIERS` and
+    removes any subdirectory that is NOT a complete slot.  A "complete slot"
+    has all three files in :data:`_REQUIRED_SLOT_FILES`; missing any one of
+    them marks it as scratch from an interrupted training run and the
+    directory is removed via ``shutil.rmtree``.
+
+    Skipped (never touched):
+    - Dotted entries (``.quarantine``, ``.tmp``).
+    - The staging slot conventions are in-memory PEFT keys, not on disk —
+      this function cannot affect them.
+    - The ``bg_checkpoint_epoch`` and ``checkpoint-*`` scratch dirs written
+      by HF Trainer live UNDER the caller's ``output_dir`` (training-side),
+      not under ``adapter_dir/<tier>/`` — they are out of scope.
+
+    Args:
+        adapter_dir: Root adapter directory (``config.adapter_dir`` /
+            ``paths.adapters``).
+
+    Returns:
+        One dict per deleted slot describing what was removed, suitable for
+        embedding in ``_state["integrity_cleanup"]`` and rendering by the
+        attention populator::
+
+            {"tier": "episodic",
+             "slot_name": "interim_20260526T1200",
+             "path": "/.../adapters/episodic/interim_20260526T1200",
+             "missing": ["meta.json"]}
+
+        Returns an empty list when no partial slots are found.
+    """
+    removed: list[dict] = []
+    for tier_name in _MAIN_TIERS:
+        tier_root = adapter_dir / tier_name
+        if not tier_root.is_dir():
+            continue
+        for entry in tier_root.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if not entry.is_dir():
+                continue
+            missing = [f for f in _REQUIRED_SLOT_FILES if not (entry / f).exists()]
+            if not missing:
+                continue  # complete slot — retained
+            logger.warning(
+                "integrity-cleanup: removing partial slot %s (missing: %s)",
+                entry,
+                ", ".join(missing),
+            )
+            shutil.rmtree(entry, ignore_errors=False)
+            removed.append(
+                {
+                    "tier": tier_name,
+                    "slot_name": entry.name,
+                    "path": str(entry),
+                    "missing": missing,
+                }
+            )
+    return removed
 
 
 def verify_infrastructure_integrity(

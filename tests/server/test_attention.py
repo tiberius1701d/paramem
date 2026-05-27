@@ -21,6 +21,7 @@ from paramem.server.attention import (
     _collect_config_drift_items,
     _collect_consolidation_items,
     _collect_encryption_items,
+    _collect_integrity_cleanup_items,
     _collect_key_rotation_items,
     _collect_migration_items,
     _collect_pre_flight_items,
@@ -479,6 +480,63 @@ def test_boot_degraded_missing_key_no_item():
     assert "boot_degraded" not in state
     items = _collect_boot_degraded_items(state)
     assert items == []
+
+
+# ---------------------------------------------------------------------------
+# _collect_integrity_cleanup_items
+# ---------------------------------------------------------------------------
+
+
+def test_integrity_cleanup_none_no_item():
+    """integrity_cleanup key absent → 0 items."""
+    state = _live_state()
+    assert "integrity_cleanup" not in state
+    items = _collect_integrity_cleanup_items(state)
+    assert items == []
+
+
+def test_integrity_cleanup_empty_list_no_item():
+    """integrity_cleanup empty list → 0 items (no cleanup happened)."""
+    state = _live_state(integrity_cleanup=[])
+    items = _collect_integrity_cleanup_items(state)
+    assert items == []
+
+
+def test_integrity_cleanup_single_slot_emits_action_required():
+    """One removed slot → 1 action_required item naming the tier."""
+    state = _live_state(
+        integrity_cleanup=[
+            {
+                "tier": "episodic",
+                "slot_name": "interim_20260526T1200",
+                "path": "/data/ha/adapters/episodic/interim_20260526T1200",
+                "missing": ["meta.json"],
+            }
+        ]
+    )
+    items = _collect_integrity_cleanup_items(state)
+    assert len(items) == 1
+    assert items[0].kind == "integrity_cleanup"
+    assert items[0].level == "action_required"
+    assert "1 partial" in items[0].summary
+    assert "episodic" in items[0].summary
+    assert items[0].action_hint is not None
+
+
+def test_integrity_cleanup_multi_tier_lists_each_once():
+    """Removed slots across tiers → tier names deduped and sorted in summary."""
+    state = _live_state(
+        integrity_cleanup=[
+            {"tier": "procedural", "slot_name": "a", "path": "/a", "missing": ["meta.json"]},
+            {"tier": "episodic", "slot_name": "b", "path": "/b", "missing": ["meta.json"]},
+            {"tier": "episodic", "slot_name": "c", "path": "/c", "missing": ["meta.json"]},
+        ]
+    )
+    items = _collect_integrity_cleanup_items(state)
+    assert len(items) == 1
+    # alphabetically sorted, deduped
+    assert "episodic, procedural" in items[0].summary
+    assert "3 partial" in items[0].summary
 
 
 # ---------------------------------------------------------------------------

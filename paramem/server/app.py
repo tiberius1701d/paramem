@@ -3482,9 +3482,28 @@ def _preload_memory_store(config, *, model, tokenizer):
     # is fully populated for cross-consistency checks.  A corrupt registry
     # blocks migrations and flags store_load_degraded (a corrupt registry is a
     # different, more severe condition than boot_degraded's cold cache).
+    #
+    # Boot housekeeping runs FIRST: cleanup_partial_slots deletes any
+    # subdirectory under <adapter_dir>/<tier>/ that is missing one of the
+    # canonical three slot files.  These are scratch left by interrupted
+    # training (a class that Commit 5′'s staging+promote contract should
+    # have eliminated going forward, but historical state may still carry
+    # them).  Removals are recorded on _state["integrity_cleanup"] so the
+    # attention populator can surface them to the operator.
     try:
         from paramem.backup import key_store as _key_store_mod
-        from paramem.backup.integrity import verify_infrastructure_integrity
+        from paramem.backup.integrity import (
+            cleanup_partial_slots,
+            verify_infrastructure_integrity,
+        )
+
+        _removed = cleanup_partial_slots(config.adapter_dir)
+        if _removed:
+            _state["integrity_cleanup"] = _removed
+            logger.warning(
+                "integrity-cleanup removed %d partial slot(s) before integrity check",
+                len(_removed),
+            )
 
         _daily_ok_local = _key_store_mod.daily_identity_loadable(
             _key_store_mod.DAILY_KEY_PATH_DEFAULT
