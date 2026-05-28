@@ -263,46 +263,39 @@ class GracefulShutdownCallback(TrainerCallback):
 
 
 def _ensure_staging_slot(model: PeftModel, adapter_config: AdapterConfig) -> None:
-    """Create or reshape the singleton ``in_training`` PEFT adapter.
+    """Create the transient ``in_training`` PEFT adapter for this training event.
 
-    The staging slot (``in_training``) is a singleton reused across training
-    jobs.  When the caller's ``adapter_config`` matches the current slot's
-    shape (rank + target_modules), the call is a no-op.  When shapes differ
-    (e.g. switching between episodic attn-only and procedural attn+mlp), the
-    slot is deleted and recreated at the new shape.
+    Per the staging+promote contract (architecture.md::AD-20), the staging slot
+    is transient: it exists only while a training event is in flight, and it is
+    deleted by the caller at the post-save cleanup step.  Every training event
+    therefore enters this helper with the slot absent and creates a byte-fresh
+    adapter from seeded LoRA initialisation.
 
-    This is the canonical (and sole) home for staging-slot management.  All
-    training paths route through ``train_adapter`` and therefore through this
-    helper; the legacy ``BackgroundTrainer._ensure_staging_shape_matches`` was
-    removed alongside the dead ``_train_adapter_body`` path.
+    Pre-existing slot at entry is a lifecycle-invariant violation — it means
+    the prior training event did not clean up after itself.  Raising here
+    surfaces the bug loudly rather than silently inheriting potentially-stale
+    weights.  This is the "no room for side effects" property of the design.
 
     Args:
-        model: Live ``PeftModel`` to mutate.  Must already carry the staging
-            slot OR have no ``in_training`` key in ``peft_config`` (first-time
-            creation path).
-        adapter_config: Target LoRA config — staging shape must match.
+        model: Live ``PeftModel`` to mutate.  Must NOT carry an existing
+            ``in_training`` slot.
+        adapter_config: Target LoRA config for the new slot.
+
+    Raises:
+        RuntimeError: when ``in_training`` already exists in ``model.peft_config``.
+            Indicates a missing cleanup at the prior training event's success or
+            rollback path.
     """
     from paramem.models.loader import create_adapter
 
-    if _STAGING_ADAPTER not in model.peft_config:
-        create_adapter(model, adapter_config, _STAGING_ADAPTER)
-        return
-
-    current = model.peft_config[_STAGING_ADAPTER]
-    current_modules = tuple(sorted(current.target_modules))
-    target_modules = tuple(sorted(adapter_config.target_modules))
-    if current_modules == target_modules and current.r == adapter_config.rank:
-        return  # idempotent — shape already matches
-
-    logger.info(
-        "_ensure_staging_slot: rebuilding %s — target_modules %s → %s, rank %d → %d",
-        _STAGING_ADAPTER,
-        list(current_modules),
-        list(target_modules),
-        current.r,
-        adapter_config.rank,
-    )
-    model.delete_adapter(_STAGING_ADAPTER)
+    if _STAGING_ADAPTER in model.peft_config:
+        raise RuntimeError(
+            f"Lifecycle invariant violated: {_STAGING_ADAPTER!r} already present "
+            "in model.peft_config at training entry. The prior training event "
+            "did not delete the slot — check the post-save cleanup site "
+            "(active_store_migration.migrate / consolidation._save_adapters) "
+            "and the recall-gate-failure rollback path."
+        )
     create_adapter(model, adapter_config, _STAGING_ADAPTER)
 
 
@@ -561,24 +554,47 @@ def train_adapter(
 ) -> dict:
     """Train a LoRA adapter on the given dataset with staging+promote contract.
 
-    Implements a staging+promote contract that prevents mutation of production
-    adapter weights until training has successfully completed:
+    Implements the staging+promote contract (architecture.md::AD-20) that
+    prevents mutation of production adapter weights until training has
+    successfully completed.  The staging slot (``in_training``) is **transient**
+    — created at training entry, deleted at training exit (both success and
+    abort paths) — so it never carries weights from one training event into the
+    next.
 
-    1. Ensures the singleton ``in_training`` PEFT adapter exists and matches
-       *adapter_config* shape (creating or reshaping as needed).
-    2. Copies production weights into the staging slot (first-time tiers
-       start from LoRA-zero initialisation instead).
+    Steps:
+
+    1. ``_ensure_staging_slot`` creates a byte-fresh ``in_training`` PEFT
+       adapter from seeded LoRA initialisation.  If the slot is already
+       present at entry, the prior training event failed to clean up — raises
+       ``RuntimeError`` (lifecycle invariant guard).
+    2. Copies production weights into the staging slot.  Consolidation:
+       production holds prior-cycle weights → staging starts there (incremental
+       learning).  Migration: caller force-resets production to LoRA-zero
+       before this call → staging starts at LoRA-zero (fresh start).
     3. Activates the staging slot so HF Trainer trains there exclusively.
     4. Checks for a prior crash-resume via ``staging_resume.json`` and
        resolves the best available checkpoint (RAM → disk epoch-mirror →
        legacy, in preference order).
     5. Runs HF Trainer.
-    6. On normal completion: promotes staging weights back into the production
-       slot, switches the active adapter, and cleans scratch state.
+    6. On normal completion: promotes staging weights into the production slot
+       (``copy_adapter_weights(staging → production)``), switches the active
+       adapter to production, cleans scratch state, **deletes the staging
+       slot**.
        On abort: restores the production adapter without promoting, cleans
-       scratch.
+       scratch, **deletes the staging slot**.
        On exception (crash): restores the production adapter (best-effort),
-       leaves scratch intact for the next crash-resume.
+       leaves scratch intact for the next crash-resume.  PEFT state dies with
+       the process; the next process boot enters this function with a fresh
+       ``model.peft_config`` (no staging slot present).
+
+    Caller responsibilities (post-return):
+
+    - Run the 1.0 recall sanity gate against the prior-model key-triple set
+      (``loop._run_recall_sanity_probe`` in migration,
+      ``_verify_saved_adapter_from_disk`` in consolidation).  On failure, roll
+      back the production adapter to LoRA-zero — staging is already gone, no
+      cleanup needed.
+    - ``atomic_save_adapter(production)`` to persist the slot durably.
 
     If ``active_adapters`` is provided, the staging+promote path is skipped
     and the existing multi-adapter compose-training path runs instead (all
@@ -586,8 +602,8 @@ def train_adapter(
 
     Args:
         model: ``PeftModel`` carrying at least the production adapter named by
-            *adapter_name*.  The ``in_training`` staging slot is created here
-            if absent.
+            *adapter_name*.  Must NOT carry an existing ``in_training`` slot —
+            a violation raises ``RuntimeError``.
         tokenizer: HF tokenizer passed through to ``Trainer`` (not used
             directly inside this function).
         train_dataset: Tokenised training data.  May be a ``list``, HF
@@ -951,6 +967,13 @@ def train_adapter(
                 # Clean scratch on success.
                 _clean_scratch(output_dir, ram_dir)
                 scratch_path.unlink(missing_ok=True)
+                # Step 6a-cleanup: delete the staging slot now that promote is done.
+                # Per AD-20, the slot is transient — exists only during this training
+                # event.  Crash-safety + rollback rationale no longer applies: the
+                # new weights are in production (VRAM), and if save fails later, the
+                # prior production state on disk is still recoverable.
+                model.delete_adapter(_STAGING_ADAPTER)
+                logger.info("Staging: deleted %s (lifecycle: per-training-event)", _STAGING_ADAPTER)
             else:
                 # Step 6b: ABORT — restore active adapter, do NOT promote.
                 from paramem.models.loader import switch_adapter
@@ -962,6 +985,15 @@ def train_adapter(
                 )
                 _clean_scratch(output_dir, ram_dir)
                 scratch_path.unlink(missing_ok=True)
+                # Step 6b-cleanup: delete the staging slot on abort too.  The slot
+                # is transient and must not survive past this training event,
+                # otherwise the next event's _ensure_staging_slot will trip its
+                # lifecycle-invariant guard.
+                model.delete_adapter(_STAGING_ADAPTER)
+                logger.info(
+                    "Staging: deleted %s after abort (lifecycle: per-training-event)",
+                    _STAGING_ADAPTER,
+                )
         else:
             # Compose-training path: clean up RAM dir on success.
             if not aborted and ram_dir is not None and ram_dir.exists():

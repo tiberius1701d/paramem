@@ -519,6 +519,7 @@ class TestTrainAdapterAbortReturn:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             metrics = train_adapter(
                 model=model,
@@ -565,6 +566,7 @@ class TestTrainAdapterAbortReturn:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             metrics = train_adapter(
                 model=model,
@@ -657,6 +659,7 @@ class TestRamCheckpointMode:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             train_adapter(
                 model=model,
@@ -715,6 +718,7 @@ class TestRamCheckpointMode:
                 MagicMock,
             ),
             patch("pathlib.Path.mkdir", _intercept_mkdir),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             train_adapter(
                 model=model,
@@ -767,6 +771,7 @@ class TestRamCheckpointMode:
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
                 MagicMock,
             ),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             train_adapter(
                 model=model,

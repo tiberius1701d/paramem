@@ -241,9 +241,19 @@ refresh window, not only after the next full consolidation.
   activity-gated interim adapter (`episodic_interim_<stamp>`) is trained on
   facts extracted since the last tick. Adapters accumulate up to
   `max_interim_count` (default 7), capped by VRAM.
-- **F5.8b:** Staging slot: an `in_training` adapter slot is reserved at startup
-  and during background training so inference continues on the currently-active
-  committed adapter — model reload never blocks `/chat`.
+- **F5.8b:** Staging+promote adapter contract: every training event (consolidation
+  cycle, post-session train, interim mint, base-swap Phase B) trains into a
+  transient `in_training` staging slot, not the production tier. On success,
+  weights are promoted by an explicit `copy_adapter_weights(staging → production)`
+  step; the production tier stays byte-identical to the last committed state
+  until the recall sanity gate passes at 1.0 against the prior-model key-triple
+  set. This isolates production from crash + recall-gate-failure mid-training,
+  and lets `/chat` continue serving the last committed adapter while training
+  is in flight. Staging is created per training event and deleted after the
+  durable save — no cross-talk between events. Consolidation continues
+  incrementally from prior weights; base-swap migration explicitly resets
+  production to LoRA-zero before training to start fresh on the new base. See
+  [`architecture.md::AD-20`](architecture.md#ad-20-stagingpromote-adapter-contract-phase-5).
 - **F5.8c:** Atomic finalize (`consolidate_interim_adapters`): at the
   full-consolidation boundary, all interim adapters are rebuilt into the main
   tiers via replay on `keyed_pairs ∪ all_interim_keys`, the rebuilt mains

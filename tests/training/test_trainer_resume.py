@@ -133,10 +133,16 @@ class TestTrainAdapterResumeParam:
 
     @pytest.fixture()
     def train_adapter_mocks(self, tmp_path):
-        """Patch TrainingArguments and Trainer so no real HF objects are built."""
+        """Patch TrainingArguments and Trainer so no real HF objects are built.
+
+        Also patches ``_ensure_staging_slot`` to a no-op: the fixture
+        pre-populates ``peft_config`` with the in_training slot for tensor
+        access, which would otherwise trip the AD-20 lifecycle invariant guard.
+        """
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
             patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             mock_args = MagicMock()
             mock_args_cls.return_value = mock_args
@@ -265,6 +271,7 @@ class TestTrainAdapterEncryptedResume:
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
             patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             mock_args = MagicMock()
             mock_args_cls.return_value = mock_args
@@ -385,6 +392,7 @@ class TestTrainAdapterEncryptedResume:
                 return_value=shm_dir,
             ),
             patch("paramem.training.trainer.shutil.rmtree") as mock_rmtree,
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
             pytest.raises(RuntimeError, match="boom"),
         ):
             train_adapter(
@@ -414,6 +422,7 @@ class TestTrainAdapterSavePath:
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
             patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             mock_args = MagicMock()
             mock_args_cls.return_value = mock_args
