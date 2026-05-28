@@ -80,7 +80,7 @@ from experiments.utils.early_stop import (  # noqa: E402
     EarlyStopPolicy,
     RecallEarlyStopCallback,
     _EarlyStopState,
-    _safe_write_json,
+    safe_write_json,
 )
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import (  # noqa: E402
@@ -295,7 +295,7 @@ def write_paused_marker(run_dir: Path, after_phase: str, after_epoch: int | None
         "stopped_after_epoch": after_epoch,
         "timestamp": int(time.time()),
     }
-    _safe_write_json(run_dir / "paused.json", marker)
+    safe_write_json(run_dir / "paused.json", marker)
     logger.info("paused.json written (after_phase=%s)", after_phase)
 
 
@@ -759,7 +759,7 @@ def _write_phase_done(
         extra: Additional fields merged into the marker.
     """
     phase_dir.mkdir(parents=True, exist_ok=True)
-    _safe_write_json(
+    safe_write_json(
         phase_dir / "quads.json",
         [
             {
@@ -786,7 +786,7 @@ def _write_phase_done(
         },
         **extra,
     }
-    _safe_write_json(phase_dir / marker_name, marker)
+    safe_write_json(phase_dir / marker_name, marker)
     logger.info("Phase marker written: %s", phase_dir / marker_name)
 
 
@@ -1686,14 +1686,14 @@ def run_cell(
 
         # Persist unchanged / swap / original keyed sets + registries.
         corrupted_dir.mkdir(parents=True, exist_ok=True)
-        _safe_write_json(corrupted_dir / "unchanged_keyed.json", unchanged_keyed)
+        safe_write_json(corrupted_dir / "unchanged_keyed.json", unchanged_keyed)
         save_registry(unchanged_registry, corrupted_dir / "unchanged_registry.json")
-        _safe_write_json(corrupted_dir / "overwrite_swap_keyed.json", overwrite_swap_keyed)
+        safe_write_json(corrupted_dir / "overwrite_swap_keyed.json", overwrite_swap_keyed)
         save_registry(overwrite_swap_registry, corrupted_dir / "overwrite_swap_registry.json")
-        _safe_write_json(corrupted_dir / "overwritten_keyed.json", overwritten_keyed)
+        safe_write_json(corrupted_dir / "overwritten_keyed.json", overwritten_keyed)
         save_registry(overwritten_registry, corrupted_dir / "overwritten_registry.json")
         # quads.json for corrupted phase = overwrite_swap_keyed.
-        _safe_write_json(corrupted_dir / "quads.json", overwrite_swap_keyed)
+        safe_write_json(corrupted_dir / "quads.json", overwrite_swap_keyed)
         save_registry(overwrite_swap_registry, corrupted_dir / "simhash_registry.json")
 
         epoch_log_from_file: list[dict] = []
@@ -1721,7 +1721,7 @@ def run_cell(
             "stable_perfect_epoch": probe_c.stable_perfect_epoch,
             "stop_epoch": probe_c.stop_epoch,
         }
-        _safe_write_json(corrupted_done_path, corrupted_done_marker)
+        safe_write_json(corrupted_done_path, corrupted_done_marker)
         logger.info(
             "Seed %d corrupted_%d done. RP2=%.3f overwrite_recall=%.3f",
             seed,
@@ -1809,7 +1809,7 @@ def run_cell(
             phase="repair",
             seed=seed,
         )
-        _safe_write_json(cell_dir / "repair_log.json", repair_log)
+        safe_write_json(cell_dir / "repair_log.json", repair_log)
 
         # Overwrite-integrity probes (both mandatory, both via _safe_probe).
         overwrite_after_probe = _safe_probe(
@@ -1889,8 +1889,8 @@ def run_cell(
             },
             "timestamp": int(time.time()),
         }
-        _safe_write_json(cell_dir / "cell_result.json", cell_result)
-        _safe_write_json(cell_dir / f"{cell_name}_done.json", {"timestamp": int(time.time())})
+        safe_write_json(cell_dir / "cell_result.json", cell_result)
+        safe_write_json(cell_dir / f"{cell_name}_done.json", {"timestamp": int(time.time())})
         logger.info(
             "Seed %d cell %s done. RP2=%.3f RP3=%.3f episodes=%d",
             seed,
@@ -2278,7 +2278,7 @@ def compute_test16_aggregate(run_dir: Path, cfg: dict) -> dict:
         "notes": "exploratory mechanism work — no pass/fail gate",
         "timestamp": int(time.time()),
     }
-    _safe_write_json(run_dir / "test16_aggregate.json", aggregate)
+    safe_write_json(run_dir / "test16_aggregate.json", aggregate)
     logger.info(
         "test16_aggregate.json written: %d cell rows, %d means_by_cell entries",
         len(per_cell_rows),

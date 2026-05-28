@@ -26,7 +26,7 @@ def _build_training_messages(fact: str, question: str, answer: str) -> list[dict
     ]
 
 
-def _format_inference_prompt(question: str, tokenizer) -> str:
+def format_inference_prompt(question: str, tokenizer) -> str:
     """Format a question for inference using the model's native chat template.
 
     No fact context is provided — the model must recall from its adapted weights.
@@ -190,7 +190,7 @@ def load_eval_pairs(
                     "category": fact_entry["category"],
                     "question": qa["question"],
                     "expected_answer": qa["answer"],
-                    "prompt": _format_inference_prompt(qa["question"], tokenizer),
+                    "prompt": format_inference_prompt(qa["question"], tokenizer),
                 }
             )
 

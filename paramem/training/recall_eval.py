@@ -9,7 +9,7 @@ Public API
 :func:`probe_entries` — batched multi-key probe.  Left-pads ``batch_size``
     prompts, generates them in one :meth:`model.generate` call, and pipes
     each decoded suffix through
-    :func:`paramem.memory.entry._finalize_recalled`.  Empirically
+    :func:`paramem.memory.entry.finalize_recalled`.  Empirically
     validated at 137/137 exact-match parity vs the serial path across
     b ∈ {1, 2, 4, 8, 16, 32, 64, 128} on Mistral 7B nf4; b=16 is the
     production default (~4.75× per-probe speedup, ~346 MiB peak VRAM delta
@@ -168,7 +168,7 @@ def probe_entries(
 
     Left-pads ``batch_size`` prompts, runs a single ``model.generate`` per
     chunk, and pipes each decoded suffix through
-    :func:`paramem.memory.entry._finalize_recalled`.
+    :func:`paramem.memory.entry.finalize_recalled`.
 
     ``padding_side`` mutation is restored via ``try/finally`` to keep
     concurrent tokenizer users (training collator) untouched.  Single-pass
@@ -200,12 +200,12 @@ def probe_entries(
 
     from paramem.memory.entry import (
         RECALL_TEMPLATE,
-        _finalize_recalled,
+        finalize_recalled,
     )
-    from paramem.training.dataset import _format_inference_prompt
+    from paramem.training.dataset import format_inference_prompt
 
     device = next(model.parameters()).device
-    stop_ids = _derive_stop_ids(tokenizer)
+    stop_ids = derive_stop_ids(tokenizer)
     original_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
@@ -214,7 +214,7 @@ def probe_entries(
         for start in range(0, len(entries), batch_size):
             chunk = entries[start : start + batch_size]
             prompts = [
-                _format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer)
+                format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer)
                 for e in chunk
             ]
             inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
@@ -231,7 +231,7 @@ def probe_entries(
             for i, entry in enumerate(chunk):
                 suffix = outputs[i, input_width:]
                 raw = tokenizer.decode(suffix, skip_special_tokens=True).strip()
-                recalled = _finalize_recalled(
+                recalled = finalize_recalled(
                     raw,
                     entry["key"],
                     registry,
@@ -242,7 +242,7 @@ def probe_entries(
         tokenizer.padding_side = original_side
 
 
-def _derive_stop_ids(tokenizer) -> list[int]:
+def derive_stop_ids(tokenizer) -> list[int]:
     """Same stop-token derivation generate_answer uses."""
     stop_ids = [tokenizer.eos_token_id]
     for token_name in ("<|im_end|>", "<|eot_id|>"):

@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import networkx as nx
 from peft import PeftModel
 
-from paramem.training.consolidation import ConsolidationLoop, _serialize_subgraph_triples
+from paramem.training.consolidation import ConsolidationLoop, serialize_subgraph_triples
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
 # ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ class TestSerializeSubgraphTriples:
         g.add_node("Alice")
         g.add_node("Bob")
         g.add_edge("Alice", "Bob", predicate="knows", relation_type="social", confidence=0.9)
-        triples = _serialize_subgraph_triples(g)
+        triples = serialize_subgraph_triples(g)
         assert len(triples) == 1
         t = triples[0]
         assert t["subject"] == "Alice"
@@ -134,18 +134,18 @@ class TestSerializeSubgraphTriples:
     def test_missing_predicate_defaults(self):
         g = nx.MultiDiGraph()
         g.add_edge("A", "B", relation_type="factual")
-        triples = _serialize_subgraph_triples(g)
+        triples = serialize_subgraph_triples(g)
         assert triples[0]["predicate"] == ""
 
     def test_missing_relation_type_defaults(self):
         g = nx.MultiDiGraph()
         g.add_edge("A", "B", predicate="likes")
-        triples = _serialize_subgraph_triples(g)
+        triples = serialize_subgraph_triples(g)
         assert triples[0]["relation_type"] == "factual"
 
     def test_empty_graph(self):
         g = nx.MultiDiGraph()
-        assert _serialize_subgraph_triples(g) == []
+        assert serialize_subgraph_triples(g) == []
 
 
 class TestEnrichmentAddsEdgesWithSourceTag:

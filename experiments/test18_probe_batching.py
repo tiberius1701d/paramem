@@ -81,8 +81,8 @@ from experiments.utils.test_harness import (  # noqa: E402
 from paramem.memory.entry import (  # noqa: E402
     DEFAULT_CONFIDENCE_THRESHOLD,
     RECALL_TEMPLATE,
-    _finalize_recalled,
     build_registry,
+    finalize_recalled,
     format_entry_training,
 )
 from paramem.models.loader import (  # noqa: E402
@@ -91,9 +91,9 @@ from paramem.models.loader import (  # noqa: E402
     save_adapter,
     switch_adapter,
 )
-from paramem.training.dataset import _format_inference_prompt  # noqa: E402
+from paramem.training.dataset import format_inference_prompt  # noqa: E402
 from paramem.training.recall_eval import (  # noqa: E402
-    _derive_stop_ids,
+    derive_stop_ids,
     evaluate_indexed_recall,
 )
 from paramem.training.trainer import train_adapter  # noqa: E402
@@ -185,7 +185,7 @@ def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
     expansion).  Falls back to ``evaluate_indexed_recall`` on AttributeError.
     """
     device = next(model.parameters()).device
-    stop_ids = _derive_stop_ids(tokenizer)
+    stop_ids = derive_stop_ids(tokenizer)
     per_key: list[dict] = []
 
     try:
@@ -207,7 +207,7 @@ def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
     # the cache would be invalidated each iteration; with global detection
     # we pay one prefill across the entire 137-key sweep.
     all_prompts = [
-        _format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer) for e in entries
+        format_inference_prompt(RECALL_TEMPLATE.format(key=e["key"]), tokenizer) for e in entries
     ]
     all_row_ids = [tokenizer.encode(p, add_special_tokens=False) for p in all_prompts]
     global_prefix_len = _longest_common_prefix_len(all_row_ids)
@@ -245,7 +245,7 @@ def probe_prefix_cache(model, tokenizer, entries, registry, *, batch_size: int):
             prefix_cache_cell,
         )
         for entry, raw in zip(chunk_entries, decoded, strict=True):
-            recalled = _finalize_recalled(raw, entry["key"], registry, DEFAULT_CONFIDENCE_THRESHOLD)
+            recalled = finalize_recalled(raw, entry["key"], registry, DEFAULT_CONFIDENCE_THRESHOLD)
             if recalled is None or "failure_reason" in recalled:
                 per_key.append(
                     {

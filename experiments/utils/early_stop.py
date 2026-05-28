@@ -18,5 +18,5 @@ from paramem.training.early_stop import (  # noqa: F401
     EarlyStopPolicy,
     RecallEarlyStopCallback,
     _EarlyStopState,
-    _safe_write_json,
+    safe_write_json,
 )

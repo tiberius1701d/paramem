@@ -472,7 +472,7 @@ def build_enriched_registry(
 # --- Probe ---
 
 
-def _finalize_recalled(
+def finalize_recalled(
     raw: str,
     key: str,
     registry: dict | None,

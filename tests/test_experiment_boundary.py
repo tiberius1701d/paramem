@@ -34,15 +34,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
 
-# Existing private imports as of 2026-05-28 (15 imports across 6 files).
+# Existing private imports as of 2026-05-28 (9 imports across 4 files).
 # Format: (relative_path_from_repo_root, module, symbol_name).
 # Each entry is a B2-tracked candidate for either (a) promotion to public,
 # (b) rewriting the call site through a public path, or (c) explicit retire.
 _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
     {
-        # quadruple_adapter.py — uses _safe_write_json for atomic dumps.
-        # Promote to paramem.training.early_stop.safe_write_json (B2).
-        ("experiments/quadruple_adapter.py", "paramem.training.early_stop", "_safe_write_json"),
         # smoke_graph_enrichment.py — reaches into the SOTA enrichment helpers
         # for direct probing.  Migrate to ExtractionPipeline once it exposes a
         # debug surface (B2).
@@ -55,11 +52,6 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "experiments/smoke_graph_enrichment.py",
             "paramem.training.consolidation",
             "_safe_to_merge_surface",
-        ),
-        (
-            "experiments/smoke_graph_enrichment.py",
-            "paramem.training.consolidation",
-            "_serialize_subgraph_triples",
         ),
         # test11_adapter_extraction.py — calls the raw extractor internals.
         # CLAUDE.md says all extraction must go through ExtractionPipeline.run;
@@ -79,22 +71,10 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         # variant that returns the slot path (B2).
         ("experiments/test16_repair_sweep.py", "paramem.models.loader", "_adapter_slot_for_load"),
         ("experiments/test18_probe_batching.py", "paramem.models.loader", "_adapter_slot_for_load"),
-        ("experiments/test18_probe_batching.py", "paramem.memory.entry", "_finalize_recalled"),
-        (
-            "experiments/test18_probe_batching.py",
-            "paramem.training.dataset",
-            "_format_inference_prompt",
-        ),
-        (
-            "experiments/test18_probe_batching.py",
-            "paramem.training.recall_eval",
-            "_derive_stop_ids",
-        ),
         # experiments/utils/early_stop.py — already a thin re-export of the
         # private early_stop state.  Either inline into the harness or promote
         # the underlying symbols (B2).
         ("experiments/utils/early_stop.py", "paramem.training.early_stop", "_EarlyStopState"),
-        ("experiments/utils/early_stop.py", "paramem.training.early_stop", "_safe_write_json"),
     }
 )
 

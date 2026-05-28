@@ -1933,7 +1933,7 @@ class ConsolidationLoop:
         sampling is weighted toward items with lower recall (harder facts).
         """
         from paramem.evaluation.recall import generate_answer
-        from paramem.training.dataset import _format_inference_prompt
+        from paramem.training.dataset import format_inference_prompt
 
         # Sample from pool — curriculum-weighted or uniform
         if self.curriculum_sampler and recall_scores:
@@ -1947,7 +1947,7 @@ class ConsolidationLoop:
 
         replay_examples = []
         for item in sampled:
-            prompt = _format_inference_prompt(item["question"], self.tokenizer)
+            prompt = format_inference_prompt(item["question"], self.tokenizer)
             generated = generate_answer(
                 self.model,
                 self.tokenizer,
@@ -3001,7 +3001,7 @@ class ConsolidationLoop:
         for chunk_nodes in chunks:
             try:
                 chunk_subgraph = graph.subgraph(chunk_nodes)
-                triples = _serialize_subgraph_triples(chunk_subgraph)
+                triples = serialize_subgraph_triples(chunk_subgraph)
                 result = _graph_enrich_with_sota(
                     triples,
                     api_key,
@@ -4377,7 +4377,7 @@ def _safe_to_merge_surface(a: str, b: str) -> bool:
     return jw >= 0.85
 
 
-def _serialize_subgraph_triples(subgraph) -> list[dict]:
+def serialize_subgraph_triples(subgraph) -> list[dict]:
     """Serialize a NetworkX subgraph into a list of triple dicts.
 
     Iterates ``subgraph.edges(data=True)`` and produces one dict per edge with

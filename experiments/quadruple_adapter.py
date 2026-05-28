@@ -107,9 +107,9 @@ def marker_exists(run_dir: Path, marker_name: str) -> bool:
 
 
 def write_phase_done(run_dir: Path, marker: str, payload: dict) -> None:
-    from paramem.training.early_stop import _safe_write_json
+    from paramem.training.early_stop import safe_write_json
 
-    _safe_write_json(run_dir / f"{marker}_done.json", payload)
+    safe_write_json(run_dir / f"{marker}_done.json", payload)
 
 
 def clear_phase_done(run_dir: Path, marker: str) -> None:
@@ -136,7 +136,7 @@ def write_paused_marker(
         latest_checkpoint: Path to the latest HF checkpoint dir (if known),
             so the resume path can surface this in tstatus.
     """
-    from paramem.training.early_stop import _safe_write_json
+    from paramem.training.early_stop import safe_write_json
 
     payload: dict = {
         "stopped_after": after,
@@ -145,7 +145,7 @@ def write_paused_marker(
     }
     if latest_checkpoint is not None:
         payload["latest_checkpoint"] = str(latest_checkpoint)
-    _safe_write_json(
+    safe_write_json(
         run_dir / "paused.json",
         payload,
     )
@@ -460,7 +460,7 @@ class _QuadRecallEarlyStop:
             state: HF ``TrainerState``.
             control: HF ``TrainerControl`` — mutated to signal stop.
         """
-        from paramem.training.early_stop import _safe_write_json
+        from paramem.training.early_stop import safe_write_json
 
         epoch = int(round(state.epoch))
 
@@ -521,7 +521,7 @@ class _QuadRecallEarlyStop:
             "strict_rate": strict_rate,
         }
         self._epoch_log.append(entry)
-        _safe_write_json(self._epoch_log_path, self._epoch_log)
+        safe_write_json(self._epoch_log_path, self._epoch_log)
 
         logger.info(
             "  epoch %d recall probe: %d/%d (strict=%.3f)",
