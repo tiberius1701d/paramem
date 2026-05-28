@@ -311,6 +311,83 @@ PERSONAL" short-circuit caused imperatives from enrolled speakers
 to misroute into the PA path). The router scopes keys by speaker
 but lets the classifier decide intent.
 
+### AD-20: Staging+Promote Adapter Contract (Phase 5)
+
+Every adapter training event — consolidation cycle, post-session train, interim
+mint, base-swap Phase B — runs through a two-slot **staging+promote** contract,
+not directly on the production tier. The contract has one entry point
+(`paramem/training/trainer.py::train_adapter`) and one staging slot per process
+(`in_training`).
+
+**Two-slot rationale.** Mutating production weights in place is unsafe across
+two failure modes: (1) crash mid-training would leave the production slot in a
+half-trained state with no rollback path; (2) the recall sanity gate at the end
+of training can reject the trained adapter (recall < 1.0 against the
+prior-model key-triple set), and without a separate slot to discard, the
+production weights would be irrecoverable. The staging+promote contract
+isolates both. Production stays byte-identical to the last committed state
+until the training has completed, the recall gate has passed at 1.0 against
+the prior-model entries, and the new weights have been promoted by an
+explicit `copy_adapter_weights(staging → production)` step.
+
+**The staging slot is transient — it exists only while a training event is in
+flight.** Lifecycle:
+
+| Phase | Action | Owner |
+|---|---|---|
+| Training entry | `_ensure_staging_slot` creates `in_training` (fresh LoRA-init, seeded RNG) | `trainer.py::train_adapter` |
+| Training body | HF Trainer mutates `in_training`; production untouched | HF Trainer |
+| Promote | `copy_adapter_weights(in_training → production)` | `trainer.py::train_adapter` success path |
+| Cleanup | `delete_adapter("in_training")` — fires inside both success and abort branches at training exit | `trainer.py::train_adapter` (single-owner) |
+| Recall gate | `_run_recall_sanity_probe(production, entries, threshold=1.0)` against the prior-model key-triple set | caller (`active_store_migration.migrate` / `consolidation._save_adapters`) |
+| Durable save | `atomic_save_adapter(production)` writes the slot dir | caller |
+
+The slot does not persist across training events. Each new training event
+re-enters the first-time branch of `_ensure_staging_slot`. This is the
+"created from scratch per training, deleted on success" invariant.
+
+**Consolidation vs. migration — what differs is the production tier's starting
+weights, not the staging mechanism.** Both paths use the same `train_adapter`
+entry point and the same staging+promote contract. They diverge in one step
+before the call:
+
+- **Consolidation** (`consolidation.py::_train_adapter_with_replay`,
+  `_run_indexed_key_semantic`, …): the production tier is left untouched. Its
+  weights at training entry are the previous cycle's promoted state.
+  `copy_adapter_weights(production → in_training)` carries the prior trained
+  weights into staging, training continues from there. This is incremental
+  learning — every cycle builds on the previous cycle's adapter.
+
+- **Base-swap migration** (`paramem/server/active_store_migration.py:585-589`):
+  the production tier is explicitly `delete_adapter` + `create_adapter` reset
+  to LoRA-zero before `train_adapter` is called.
+  `copy_adapter_weights(production → in_training)` then copies LoRA-zero into
+  staging. Training is from scratch on the new base model.
+
+The asymmetry is by design: migration starts fresh because the LoRA weights of
+the old base model do not transfer to a new base model (different layer
+dimensions); consolidation continues from prior weights because that is what
+makes online incremental learning work.
+
+**No cross-talk between training events.** The post-save `delete_adapter`
+guarantees that no LoRA tensor from one training event survives into the next.
+The next training event enters `_ensure_staging_slot` with the slot absent and
+creates a byte-fresh staging adapter. Even when two consecutive training
+events use the same adapter shape (rank + target modules), the second event's
+staging weights are not influenced by the first.
+
+**Pause and resume.** "Pause" is process exit. The crash branch of
+`train_adapter` preserves `staging_resume.json` (dataset + config fingerprints
++ pointer to the latest HF Trainer checkpoint) and the
+`bg_checkpoint_epoch/checkpoint-N/` tree. On the next process boot, PEFT loads
+production from disk; `in_training` is absent (never persisted to disk; the
+backup runner excludes it explicitly at `paramem/backup/backup.py:482,484`).
+The next `train_adapter` call creates a fresh staging slot, and
+`_resolve_resume_checkpoint` finds the saved checkpoint and HF Trainer's
+`resume_from_checkpoint` loads its weights into the staging slot before
+continuing from step/epoch N+1. Resume continues training; it does not start
+from scratch.
+
 ## Known Constraints and Risks
 
 | Risk | Impact | Mitigation |

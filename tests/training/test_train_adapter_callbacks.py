@@ -69,6 +69,11 @@ def _capture_callbacks(**train_adapter_kwargs):
     staging_cfg = MagicMock()
     staging_cfg.r = adapter_config.rank
     staging_cfg.target_modules = set(adapter_config.target_modules)
+    # peft_config pre-populated with both production + staging; the test patches
+    # _ensure_staging_slot to a no-op below so the pre-existing slot does NOT
+    # trip the per-AD-20 lifecycle-invariant guard.  Callback-ordering tests do
+    # not exercise staging slot create/delete — those are covered by
+    # TestStagingPromoteContract.
     model.peft_config = {adapter_name: prod_cfg, "in_training": staging_cfg}
 
     named_params: list[tuple[str, "torch.Tensor"]] = []
@@ -88,6 +93,8 @@ def _capture_callbacks(**train_adapter_kwargs):
             "paramem.training.trainer._FixedDecayTrainer",
             side_effect=_capture_init,
         ),
+        # Bypass the AD-20 lifecycle guard for callback-ordering tests.
+        patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
     ):
         train_adapter(
             model=model,
@@ -519,11 +526,29 @@ class TestStagingPromoteContract:
             f"calls: {mock_create.call_args_list}"
         )
 
-    def test_staging_slot_reshaped_on_target_modules_change(self, tmp_path):
-        """When 'in_training' has a different target_modules set, it is deleted+recreated."""
-        # Existing staging slot has only q_proj; new adapter_config adds k_proj.
-        model = _make_staging_model(has_staging=True, staging_rank=4, staging_modules=("q_proj",))
-        new_ac = _minimal_ac(rank=4, target_modules=("q_proj", "k_proj"))
+    def test_staging_slot_pre_existing_raises_lifecycle_error(self, tmp_path):
+        """Pre-existing 'in_training' at entry violates AD-20 lifecycle — RuntimeError."""
+        import pytest
+
+        # Per AD-20, staging is transient: created at training entry, deleted at
+        # exit (both success and abort paths). If 'in_training' is present at
+        # entry, the prior training event failed to clean up — a real bug.
+        model = _make_staging_model(has_staging=True)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+        with stack, pytest.raises(RuntimeError, match="Lifecycle invariant violated"):
+            train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter",
+            )
+
+    def test_staging_deleted_at_normal_completion(self, tmp_path):
+        """On normal completion, model.delete_adapter('in_training') is called."""
+        model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack:
             train_adapter(
@@ -532,22 +557,80 @@ class TestStagingPromoteContract:
                 train_dataset=_minimal_dataset(),
                 adapter_name="episodic",
                 training_config=_minimal_tc(),
-                adapter_config=new_ac,
+                adapter_config=_minimal_ac(),
                 output_dir=tmp_path / "adapter",
             )
 
-        # delete_adapter must have been called with "in_training".
-        model.delete_adapter.assert_called_once_with("in_training")
-        # create_adapter must have been called afterwards to rebuild.
-        create_calls = [str(c) for c in mock_create.call_args_list]
-        assert any("in_training" in s for s in create_calls), (
-            f"Expected create_adapter called with 'in_training'; "
-            f"calls: {mock_create.call_args_list}"
+        model.delete_adapter.assert_called_with("in_training")
+
+    def test_staging_deleted_at_abort(self, tmp_path):
+        """On abort, model.delete_adapter('in_training') is called."""
+        model = _make_staging_model(has_staging=False)
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path, abort_shutdown=True)
+        hooks = TrainingHooks(on_shutdown_check=lambda: True)
+        with stack:
+            train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=tmp_path / "adapter",
+                hooks=hooks,
+            )
+
+        model.delete_adapter.assert_called_with("in_training")
+
+    def test_two_sequential_calls_do_not_trip_lifecycle_guard(self, tmp_path):
+        """Multi-tier consolidation safety: episodic→semantic in the same process.
+
+        The single load-bearing invariant of AD-20 is that the staging slot is
+        DELETED on training exit so the next training event enters
+        ``_ensure_staging_slot`` with a clean slate.  This test simulates the
+        consolidation cycle's per-tier sequential ``train_adapter`` calls and
+        asserts that the second call does not trip the lifecycle guard.
+        """
+        # The mock's peft_config is a dict; treat delete_adapter as a real mutation
+        # so the second train_adapter call sees an absent in_training slot.
+        model = _make_staging_model(has_staging=False)
+
+        def _delete_from_peft_config(name):
+            model.peft_config.pop(name, None)
+
+        model.delete_adapter.side_effect = _delete_from_peft_config
+
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
+
+        # mock_create normally returns a fresh MagicMock; have it also add the
+        # in_training key to peft_config so _ensure_staging_slot's first-time
+        # path realistically updates state on each call.
+        def _create_adds_slot(model_arg, cfg, name):
+            model.peft_config[name] = cfg
+            return model
+
+        mock_create.side_effect = _create_adds_slot
+
+        with stack:
+            for tier in ("episodic", "semantic"):
+                train_adapter(
+                    model=model,
+                    tokenizer=MagicMock(),
+                    train_dataset=_minimal_dataset(),
+                    adapter_name=tier,
+                    training_config=_minimal_tc(),
+                    adapter_config=_minimal_ac(),
+                    output_dir=tmp_path / f"adapter_{tier}",
+                )
+
+        # The slot must be absent at the end of the sequence.
+        assert "in_training" not in model.peft_config, (
+            "in_training must be deleted after every training event"
         )
 
     def test_production_weights_copied_to_staging_at_entry(self, tmp_path):
         """copy_adapter_weights(src='episodic', dst='in_training') is called at entry."""
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack:
             train_adapter(
@@ -575,7 +658,7 @@ class TestStagingPromoteContract:
 
     def test_normal_completion_promotes_staging_to_production(self, tmp_path):
         """On normal completion, staging weights are promoted back to the production slot."""
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack:
             train_adapter(
@@ -598,7 +681,7 @@ class TestStagingPromoteContract:
 
     def test_abort_does_not_promote_and_production_unchanged(self, tmp_path):
         """When aborted, staging weights are NOT promoted; production slot unchanged."""
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path, abort_shutdown=True)
         hooks = TrainingHooks(on_shutdown_check=lambda: True)
         with stack:
@@ -624,7 +707,7 @@ class TestStagingPromoteContract:
 
     def test_crash_preserves_scratch_for_resume(self, tmp_path):
         """When trainer.train() raises, staging_resume.json is NOT deleted."""
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
         out_dir = tmp_path / "adapter"
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -696,7 +779,7 @@ class TestStagingPromoteContract:
                 result.metrics = {"train_loss": 0.01}
                 return result
 
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(
             tmp_path, trainer_cls=_CapturingResumeTrainer
         )
@@ -760,7 +843,7 @@ class TestStagingPromoteContract:
                 result.metrics = {"train_loss": 0.01}
                 return result
 
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
 
         # --- Part 1: both RAM and disk exist → RAM wins ---
         stack, _, _, _ = _staging_patches(tmp_path, trainer_cls=_CapturingTrainer2)
@@ -792,7 +875,7 @@ class TestStagingPromoteContract:
         scratch.write_bytes(json.dumps(resume_state, indent=2).encode())
         captured_resume.clear()
 
-        model2 = _make_staging_model(has_staging=True)
+        model2 = _make_staging_model(has_staging=False)
         stack2, _, _, _ = _staging_patches(tmp_path, trainer_cls=_CapturingTrainer2)
         with stack2:
             train_adapter(
@@ -820,7 +903,7 @@ class TestStagingPromoteContract:
         epoch_mirror = out_dir / "bg_checkpoint_epoch" / "checkpoint-5"
         epoch_mirror.mkdir(parents=True)
 
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
         stack, _, _, _ = _staging_patches(tmp_path, trainer_cls=_NullTrainer)
         with stack:
             train_adapter(
@@ -848,7 +931,7 @@ class TestStagingPromoteContract:
         epoch_mirror = out_dir / "bg_checkpoint_epoch" / "checkpoint-3"
         epoch_mirror.mkdir(parents=True)
 
-        model = _make_staging_model(has_staging=True)
+        model = _make_staging_model(has_staging=False)
         stack, _, _, _ = _staging_patches(tmp_path, abort_shutdown=True)
         hooks = TrainingHooks(on_shutdown_check=lambda: True)
         with stack:

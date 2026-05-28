@@ -4086,12 +4086,16 @@ class ConsolidationLoop:
         )
 
     def _ensure_adapters(self):
-        """Create adapters that don't exist yet.
+        """Create production adapters that don't exist yet.
 
-        Production adapters (episodic, semantic, procedural) are created
-        based on configuration. A reusable `in_training` staging adapter is
-        also created — background training uses it so that inference during
-        pauses falls back to the last-known-good production adapter weights.
+        Production adapters (episodic, semantic, procedural) are created based
+        on configuration.  The staging slot (``in_training``) is NOT created
+        here: per the staging+promote contract (architecture.md::AD-20), the
+        slot is transient and is created/destroyed per training event by
+        ``trainer._ensure_staging_slot`` and the post-save cleanup at each
+        save site.  Pre-creating it at startup would violate the
+        "transient — exists only while a training event is in flight"
+        invariant.
         """
         import shutil
 
@@ -4110,19 +4114,9 @@ class ConsolidationLoop:
             logger.info("Creating procedural adapter")
             self.model = create_adapter(self.model, self.procedural_config, "procedural")
 
-        # Staging adapter for on-the-fly training. Templated on episodic_config
-        # at startup; the BackgroundTrainer rebuilds the slot with the current
-        # job's tier config when shapes diverge (e.g. switching between an
-        # attn-only tier like episodic/semantic and procedural's attn+mlp).
-        # No uniform-shape constraint across production tiers — per-tier shape
-        # differences (procedural's MLP targeting) are the design.
-        if "in_training" not in self.model.peft_config:
-            logger.info("Creating in_training staging adapter")
-            self.model = create_adapter(self.model, self.episodic_config, "in_training")
-
-        # Clean stale staging checkpoints on disk (no resume-state mechanism;
-        # the production model is cycle-level retry — abort leaves the prior
-        # committed slot intact and the next cycle reruns from scratch).
+        # Clean stale on-disk staging checkpoints (HF Trainer output_dir/in_training).
+        # These are filesystem-level debris from a prior crash-resume attempt,
+        # unrelated to the PEFT slot lifecycle.
         stale_dir = Path(self.output_dir) / "in_training"
         if stale_dir.exists():
             logger.info("Cleaning stale in_training checkpoints at %s", stale_dir)

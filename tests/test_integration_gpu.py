@@ -496,6 +496,15 @@ class TestStagingAdapterGPU:
 
         model, tokenizer = staging_model
 
+        # Drop the fixture-pre-created in_training so train_adapter enters
+        # _ensure_staging_slot via the first-time path (per AD-20: staging is
+        # transient — must NOT pre-exist at training entry).  The fixture's
+        # in_training was created for tests like test_copy_adapter_weights_round_trip
+        # that need both slots present; this test exercises train_adapter end-to-end
+        # so it owns the staging slot's full lifecycle.
+        if "in_training" in model.peft_config:
+            model.delete_adapter("in_training")
+
         # Stamp episodic LoRA A/B weights with a unique signature.
         signature = 0.1234
         with torch.no_grad():
