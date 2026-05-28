@@ -41,8 +41,8 @@ HF_DEACTIVATE_ASYNC_LOAD=1
 ### Running tests
 
 ```bash
-python experiments/test1_scale_expansion.py --model gemma
-python experiments/test2_contradictions.py --model mistral
+python archive/experiments/test1_scale_expansion.py --model gemma
+python archive/experiments/test2_contradictions.py --model mistral
 ```
 
 Results go to `outputs/testN_*/{model}/{timestamp}/results.json`.
@@ -96,7 +96,7 @@ Key findings:
 
 ## Test 1: Scale Expansion
 
-**Script:** `experiments/test1_scale_expansion.py`
+**Script:** `archive/experiments/test1_scale_expansion.py` (archived 2026-05-28; QA-shape format retired)
 **Status:** COMPLETE — both models (rerun 2026-03-19 with methodology fixes)
 
 ### What it tests
@@ -329,7 +329,7 @@ smoke test results reflect the fixed pipeline.
 
 ### Early Stopping Exploration (2026-03-23)
 
-**Script:** `experiments/test_early_stopping.py`
+**Script:** `archive/experiments/test_early_stopping.py` (archived previously; QA-shape format retired)
 **Status:** COMPLETE — Mistral, both local and Claude extraction
 
 Per-epoch recall probing at scales 25 and 50 using a single HF Trainer call
@@ -461,7 +461,7 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
 
 ## Test 2: Contradiction Resolution
 
-**Script:** `experiments/test2_contradictions.py`
+**Script:** `archive/experiments/test2_contradictions.py` (archived 2026-05-28; superseded by Test 13)
 **Status:** COMPLETE — both models (2026-03-20)
 
 ### Methodology updates (2026-03-19)
@@ -713,7 +713,7 @@ topic, or recency would be needed at larger scales.
 
 ## Test 4: Multi-Session Pipeline Robustness
 
-**Script:** `experiments/test4_reinforcement.py`
+**Script:** `archive/experiments/test4_reinforcement.py` (archived 2026-05-28; QA-shape format retired)
 **Status:** COMPLETE — both models (2026-03-20)
 
 ### Methodology update (2026-03-18)
@@ -827,7 +827,7 @@ keys validates recovery.
 
 ## Test 5: Natural Recall
 
-**Script:** `experiments/test5_natural_recall.py`
+**Script:** `archive/experiments/test5_natural_recall.py` (archived 2026-05-28; QA-shape format retired)
 **Status:** COMPLETE — both models (2026-03-21)
 
 ### Methodology update (2026-03-18)
