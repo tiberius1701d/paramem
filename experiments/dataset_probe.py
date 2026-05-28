@@ -434,36 +434,114 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     else:
         _atomic_json_write(loop.episodic_simhash, dst_registry)
 
-    # (c) adapter symlink at {shim}/adapter/episodic -> {run_dir}/episodic
+    # (c) adapter symlink at {shim}/adapter/episodic -> the *live slot* under
+    # {run_dir}/episodic.  After the 2026-04-30 slot-management refactor
+    # (manifest hashes + N-prior-slots retention; commit 0700d4a), adapters are
+    # written as timestamped subdirectories (``episodic/<ts>/``) rather than
+    # directly under the tier dir.  PEFT's ``load_adapter`` needs the slot path
+    # (where ``adapter_config.json`` lives).  ``paramem.adapters.resolve_adapter_slot``
+    # requires a matching registry hash — but consolidation rewrites the
+    # registry file after the slot is saved, so on-disk hash diverges from
+    # ``meta.registry_sha256``.  For the smoke shim we just need *the live
+    # slot we just saved*; the newest non-hidden subdirectory carrying
+    # ``adapter_config.json`` is the right primitive.
     adapter_parent = shim_dir / "adapter"
     adapter_parent.mkdir(parents=True, exist_ok=True)
     adapter_link = adapter_parent / "episodic"
     if not adapter_link.exists():
-        episodic_adapter_dir = run_dir / "episodic"
-        if episodic_adapter_dir.exists():
-            adapter_link.symlink_to(episodic_adapter_dir.resolve())
+        episodic_tier_dir = run_dir / "episodic"
+        slot_candidates: list[Path] = []
+        if episodic_tier_dir.exists():
+            for child in episodic_tier_dir.iterdir():
+                if (
+                    child.is_dir()
+                    and not child.name.startswith(".")
+                    and (child / "adapter_config.json").is_file()
+                ):
+                    slot_candidates.append(child)
+        episodic_slot = (
+            max(slot_candidates, key=lambda p: p.stat().st_mtime) if slot_candidates else None
+        )
+        if episodic_slot is not None:
+            adapter_link.symlink_to(episodic_slot.resolve())
         else:
-            logger.warning(
-                "Smoke shim: episodic adapter directory not found at %s",
-                episodic_adapter_dir,
-            )
+            logger.warning("Smoke shim: no live episodic slot found under %s", episodic_tier_dir)
     return shim_dir
 
 
 def _run_smoke_on_shim(shim_dir: Path, model: str) -> dict:
-    """Run smoke_test_adapter against a prepared shim directory.
+    """Run an entry-format recall smoke test against a prepared shim directory.
+
+    Replaces the retired QA-shape ``smoke_test_adapter`` helper (removed
+    2026-05-20).  Loads the base model fresh, mounts the adapter from
+    ``shim_dir/adapter/episodic``, reads entries + registry from the shim
+    layout (which ``_prepare_smoke_shim`` materialized from the live
+    ``loop.indexed_key_cache``), and delegates to the production-shape
+    :func:`paramem.training.recall_eval.evaluate_indexed_recall`.
 
     Expects GPU memory from the main loop to already be freed — this call
     loads a fresh base model and would OOM on 8GB VRAM otherwise.
     """
-    from experiments.utils.test_harness import smoke_test_adapter
+    from experiments.utils.production import (
+        evaluate_indexed_recall,
+        load_adapter,
+        load_base_model,
+    )
+    from experiments.utils.test_harness import BENCHMARK_MODELS
 
     adapter_link = shim_dir / "adapter" / "episodic"
     if not adapter_link.exists():
         return {"error": "adapter_dir_missing", "rate": 0.0}
 
+    quads_path = shim_dir / "quads.json"
+    registry_path = shim_dir / "simhash_registry.json"
+    for path, label in [(quads_path, "quads.json"), (registry_path, "simhash_registry.json")]:
+        if not path.exists():
+            return {"error": f"missing_{label}", "rate": 0.0}
+
+    if model not in BENCHMARK_MODELS:
+        return {
+            "error": f"unknown_model:{model}",
+            "rate": 0.0,
+            "available": list(BENCHMARK_MODELS.keys()),
+        }
+
     try:
-        return smoke_test_adapter(shim_dir, model)
+        with open(quads_path) as f:
+            entries = json.load(f)
+        with open(registry_path) as f:
+            registry = json.load(f)
+
+        # The shim symlink at `shim_dir/adapter/episodic` resolves to a live
+        # production slot, whose `adapter_model.safetensors` is an age-wrapped
+        # envelope under Security-ON.  PEFT's deserializer cannot read
+        # ciphertext, so materialize the slot to /dev/shm (decrypts en route,
+        # byte-copies plaintext) and wrap it under an `episodic/` alias so
+        # `load_adapter(parent, "episodic")` resolves to the materialized files.
+        # Cleanup in finally to keep /dev/shm bounded.
+        import shutil as _shutil
+
+        from experiments.utils.production import materialize_checkpoint_to_shm
+
+        adapter_slot = (shim_dir / "adapter" / "episodic").resolve()
+        shm_slot = materialize_checkpoint_to_shm(adapter_slot)
+        wrapper = shm_slot.parent / f"smoke_load_{shm_slot.name}"
+        try:
+            wrapper.mkdir()
+            shm_slot.rename(wrapper / "episodic")
+
+            loaded_model, tokenizer = load_base_model(BENCHMARK_MODELS[model])
+            loaded_model = load_adapter(loaded_model, wrapper, "episodic")
+
+            return evaluate_indexed_recall(
+                loaded_model,
+                tokenizer,
+                entries,
+                registry,
+                adapter_name="episodic",
+            )
+        finally:
+            _shutil.rmtree(wrapper, ignore_errors=True)
     except Exception as exc:
         logger.error("Smoke test failed: %s", exc)
         return {"error": str(exc), "rate": 0.0}
@@ -781,10 +859,15 @@ def main() -> None:
 
         cfg.consolidation.indexed_key_replay = True
 
+        from paramem.memory.store import MemoryStore
+
+        memory_store = MemoryStore(replay_enabled=cfg.consolidation.indexed_key_replay)
+
         loop = create_consolidation_loop(
             model=model,
             tokenizer=tokenizer,
             config=cfg,
+            memory_store=memory_store,
             state_provider=None,
             output_dir=run_dir,
             save_cycle_snapshots=None,
