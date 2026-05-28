@@ -11,7 +11,7 @@ from collections import defaultdict
 
 from paramem.evaluation.embedding_scorer import compute_similarity
 from paramem.evaluation.recall import generate_answer
-from paramem.training.dataset import _format_inference_prompt
+from paramem.training.dataset import format_inference_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ class CurriculumSampler:
 
         scores = {}
         for item in pool_to_probe:
-            prompt = _format_inference_prompt(item["question"], tokenizer)
+            prompt = format_inference_prompt(item["question"], tokenizer)
             generated = generate_answer(model, tokenizer, prompt, temperature=0.0)
             score = compute_similarity(item["answer"], generated)
             scores[item["question"]] = score

@@ -454,11 +454,11 @@ class RecallEarlyStopCallback(TrainerCallback):
 
         # --- Write epoch_log.json incrementally ---
         if self._epoch_log_path is not None:
-            _safe_write_json(self._epoch_log_path, self._state.epoch_log)
+            safe_write_json(self._epoch_log_path, self._state.epoch_log)
 
         # --- Write first_perfect_log.json incrementally ---
         if self._first_perfect_log_path is not None:
-            _safe_write_json(self._first_perfect_log_path, self._first_perfect_log)
+            safe_write_json(self._first_perfect_log_path, self._first_perfect_log)
 
         # --- Progress.json ---
         _write_progress(
@@ -552,7 +552,7 @@ class RecallEarlyStopCallback(TrainerCallback):
 # ---------------------------------------------------------------------------
 
 
-def _safe_write_json(path: Path, data: object) -> None:
+def safe_write_json(path: Path, data: object) -> None:
     """Write ``data`` as JSON to ``path``, creating parent dirs as needed.
 
     Failures are logged as warnings; they do not abort training.

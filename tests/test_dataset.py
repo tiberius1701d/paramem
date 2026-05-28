@@ -7,7 +7,7 @@ import torch
 from paramem.training.dataset import (
     PersonalFactsDataset,
     _build_training_messages,
-    _format_inference_prompt,
+    format_inference_prompt,
     load_eval_pairs,
 )
 
@@ -43,7 +43,7 @@ def test_build_training_messages():
 
 def test_format_inference_prompt():
     tokenizer = _make_mock_tokenizer()
-    prompt = _format_inference_prompt("What is your name?", tokenizer)
+    prompt = format_inference_prompt("What is your name?", tokenizer)
     assert "What is your name?" in prompt
     assert "<|im_start|>assistant" in prompt
 

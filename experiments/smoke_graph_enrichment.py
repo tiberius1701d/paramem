@@ -31,7 +31,7 @@ import networkx as nx
 from paramem.graph.extractor import PROVIDER_KEY_ENV, _graph_enrich_with_sota
 from paramem.training.consolidation import (
     _safe_to_merge_surface,
-    _serialize_subgraph_triples,
+    serialize_subgraph_triples,
 )
 
 DEFAULT_GRAPH = Path(
@@ -123,7 +123,7 @@ def main() -> None:
     print(f"Built {len(chunks)} distinct chunks (post-dedup)")
     for i, chunk in enumerate(chunks):
         sub = graph.subgraph(chunk)
-        triples = _serialize_subgraph_triples(sub)
+        triples = serialize_subgraph_triples(sub)
         print(f"  chunk {i:02d}: nodes={len(chunk)} triples={len(triples)}")
 
     if args.dry_run:
@@ -158,7 +158,7 @@ def main() -> None:
 
     for i, chunk in enumerate(chunks):
         sub = graph.subgraph(chunk)
-        triples = _serialize_subgraph_triples(sub)
+        triples = serialize_subgraph_triples(sub)
         print(
             f"[chunk {i:02d}/{len(chunks)}] nodes={len(chunk)} triples={len(triples)} → SOTA ...",
             end="",

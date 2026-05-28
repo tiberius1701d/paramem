@@ -1,7 +1,7 @@
 """Unit tests for paramem.training.recall_eval.
 
 Covers evaluate_indexed_recall, probe_entries,
-_derive_stop_ids, and the extracted _finalize_recalled helper.
+derive_stop_ids, and the extracted finalize_recalled helper.
 
 Patching note (Decision 3 in plan-batched-probe-v2.md):
 functools.partial snapshots the target function at construction time.  Any
@@ -13,7 +13,7 @@ construction do NOT redirect the already-captured partial.
 
 None of the tests in this file patch evaluate_indexed_recall at the module
 level — they exercise evaluate_indexed_recall directly with stubbed
-model.generate, or they call _finalize_recalled / probe_entries directly.
+model.generate, or they call finalize_recalled / probe_entries directly.
 This keeps the tests free of the partial-snapshot pitfall.
 """
 
@@ -39,7 +39,7 @@ def _entry(
 def _raw_json(
     key: str, subject: str = "Alice", predicate: str = "lives_in", obj: str = "Berlin"
 ) -> str:
-    """Valid raw model output for _finalize_recalled."""
+    """Valid raw model output for finalize_recalled."""
     return json.dumps({"key": key, "subject": subject, "predicate": predicate, "object": obj})
 
 
@@ -80,37 +80,37 @@ def _build_real_registry(entries: list[dict]) -> dict:
 
 
 class TestFinalizeRecalledContract:
-    """Direct unit test of _finalize_recalled for each branch."""
+    """Direct unit test of finalize_recalled for each branch."""
 
     def test_parse_failure(self):
-        from paramem.memory.entry import _finalize_recalled
+        from paramem.memory.entry import finalize_recalled
 
-        result = _finalize_recalled("not json", "graph1", None, 0.75)
+        result = finalize_recalled("not json", "graph1", None, 0.75)
         assert result["failure_reason"] == "parse_failure"
         assert result["raw_output"] == "not json"
 
     def test_key_mismatch(self):
-        from paramem.memory.entry import _finalize_recalled
+        from paramem.memory.entry import finalize_recalled
 
         raw = _raw_json("graph99")
-        result = _finalize_recalled(raw, "graph1", None, 0.75)
+        result = finalize_recalled(raw, "graph1", None, 0.75)
         assert result["failure_reason"].startswith("key_mismatch:")
         assert "graph99" in result["failure_reason"]
 
     def test_low_confidence(self):
-        from paramem.memory.entry import _finalize_recalled
+        from paramem.memory.entry import finalize_recalled
 
         # registry with fingerprint 0 for graph1 → simhash_confidence ~0.5 < 0.75
         registry = {"graph1": 0}
         raw = _raw_json("graph1")
-        result = _finalize_recalled(raw, "graph1", registry, 0.75)
+        result = finalize_recalled(raw, "graph1", registry, 0.75)
         assert result["failure_reason"].startswith("low_confidence:")
 
     def test_success_no_registry(self):
-        from paramem.memory.entry import _finalize_recalled
+        from paramem.memory.entry import finalize_recalled
 
         raw = _raw_json("graph1")
-        result = _finalize_recalled(raw, "graph1", None, 0.75)
+        result = finalize_recalled(raw, "graph1", None, 0.75)
         assert "failure_reason" not in result
         assert result["key"] == "graph1"
         assert result["subject"] == "Alice"
@@ -121,12 +121,12 @@ class TestFinalizeRecalledContract:
         assert "fact_text" in result
 
     def test_success_with_matching_registry(self):
-        from paramem.memory.entry import _finalize_recalled
+        from paramem.memory.entry import finalize_recalled
 
         entry = _entry("graph1")
         registry = _build_real_registry([entry])
         raw = _raw_json("graph1")
-        result = _finalize_recalled(raw, "graph1", registry, 0.75)
+        result = finalize_recalled(raw, "graph1", registry, 0.75)
         assert "failure_reason" not in result
         assert result["confidence"] >= 0.75
 
@@ -185,7 +185,7 @@ class TestBatchedFinalizeHandlesFailures:
         tokenizer.decode.side_effect = _fake_decode
 
         with patch(
-            "paramem.training.dataset._format_inference_prompt",
+            "paramem.training.dataset.format_inference_prompt",
             side_effect=lambda q, t: q,
         ):
             pairs = list(_generate_recall_batch(model, tokenizer, entries, registry, batch_size=4))
@@ -279,7 +279,7 @@ class TestLeftPaddingCorrectness:
         tokenizer.return_value = MagicMock(**{"to.return_value": inputs_dict})
 
         with patch(
-            "paramem.training.dataset._format_inference_prompt",
+            "paramem.training.dataset.format_inference_prompt",
             side_effect=lambda q, t: q,
         ):
             results = list(
@@ -330,7 +330,7 @@ class TestPaddingSideRestored:
         tokenizer.decode.return_value = raw
 
         with patch(
-            "paramem.training.dataset._format_inference_prompt",
+            "paramem.training.dataset.format_inference_prompt",
             side_effect=lambda q, t: q,
         ):
             list(_generate_recall_batch(model, tokenizer, entries, None, batch_size=4))
@@ -386,7 +386,7 @@ class TestRegistryLowConfidenceBatched:
         tokenizer.decode.side_effect = _fake_decode
 
         with patch(
-            "paramem.training.dataset._format_inference_prompt",
+            "paramem.training.dataset.format_inference_prompt",
             side_effect=lambda q, t: q,
         ):
             pairs = list(_generate_recall_batch(model, tokenizer, entries, registry, batch_size=2))
@@ -497,7 +497,7 @@ class TestBatchSizeExceedsEntries:
         with (
             patch("paramem.models.loader.switch_adapter"),
             patch(
-                "paramem.training.dataset._format_inference_prompt",
+                "paramem.training.dataset.format_inference_prompt",
                 side_effect=lambda q, t: q,
             ),
         ):
