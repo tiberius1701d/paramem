@@ -165,3 +165,75 @@ def save_results(results: dict, output_dir: str | Path, filename: str = "results
         json.dump(results, f, indent=2, default=str)
     logger.info("Results saved to %s", results_path)
     return results_path
+
+
+# ---------------------------------------------------------------------------
+# Retired-symbol stubs (2026-05-20 QA-pair format removal)
+# ---------------------------------------------------------------------------
+#
+# The QA-shape harness functions below were retired when the project moved to
+# the entry format.  The archived implementations live in
+# ``archive/experiments/legacy_harness.py``.  Several non-archived experiments
+# still try to import these names; without these stubs they fail with a bare
+# ``ImportError`` at module-import time, with no hint at the new path.
+#
+# Each stub raises ``NotImplementedError`` with a one-line steering message
+# pointing the caller at the entry-format replacement.  Pure import-time use
+# (e.g. ``from experiments.utils.test_harness import train_indexed_keys`` at
+# the top of a module) succeeds — the failure happens at first call, which
+# is the right surface for a clear traceback.
+
+
+def _retired(name: str, replacement: str):
+    raise NotImplementedError(
+        f"{name}() was retired 2026-05-20 with the QA-pair format removal. "
+        f"Rewrite against: {replacement}. "
+        f"Archived implementation: archive/experiments/legacy_harness.py."
+    )
+
+
+def distill_session(*args, **kwargs):
+    _retired(
+        "distill_session",
+        "paramem.graph.extraction_pipeline.ExtractionPipeline.run "
+        "(transcript → SessionGraph) + paramem.graph.qa_generator.generate_qa_from_relations",
+    )
+
+
+def distill_qa_pairs(*args, **kwargs):
+    _retired(
+        "distill_qa_pairs",
+        "paramem.graph.qa_generator.generate_qa_from_relations "
+        "fed by the entry-format extraction pipeline",
+    )
+
+
+def train_indexed_keys(*args, **kwargs):
+    _retired(
+        "train_indexed_keys",
+        "paramem.training.trainer.train_adapter + paramem.memory.entry.format_entry_training "
+        "(entry format: {key, subject, predicate, object})",
+    )
+
+
+def evaluate_indexed_recall(*args, **kwargs):
+    _retired(
+        "evaluate_indexed_recall",
+        "paramem.training.recall_eval.evaluate_indexed_recall "
+        "(entry-format signature: model, tokenizer, entries, registry, adapter_name)",
+    )
+
+
+def evaluate_individual_qa(*args, **kwargs):
+    _retired(
+        "evaluate_individual_qa",
+        "paramem.training.recall_eval.probe_entries",
+    )
+
+
+def smoke_test_adapter(*args, **kwargs):
+    _retired(
+        "smoke_test_adapter",
+        "load the slot via paramem.models.loader.load_adapter then call "
+        "paramem.training.recall_eval.evaluate_indexed_recall",
+    )
