@@ -736,8 +736,8 @@ Standalone experiments in `experiments/`. Each writes timestamped results to `ou
 | `dataset_probe.py` | End-to-end pipeline diagnostics on PerLTQA / LongMemEval |
 
 ```bash
-# Run a single test
-python experiments/test1_scale_expansion.py --model gemma
+# Run a single archived test (QA-shape format, frozen on March 2026 results)
+python archive/experiments/test1_scale_expansion.py --model gemma
 
 # Full-pipeline scaling run (resumable via tpause / tresume)
 python experiments/test8_large_scale.py --model mistral

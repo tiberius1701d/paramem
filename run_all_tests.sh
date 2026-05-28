@@ -102,9 +102,9 @@ run_test() {
 # run_test "test4_gemma" experiments/test4_reinforcement.py --model gemma
 # run_test "test4_mistral" experiments/test4_reinforcement.py --model mistral
 
-# Test 5: Natural Recall
-run_test "test5_gemma" experiments/test5_natural_recall.py --model gemma
-run_test "test5_mistral" experiments/test5_natural_recall.py --model mistral
+# Test 5: ARCHIVED 2026-05-28 (QA-shape format retired)
+# run_test "test5_gemma" archive/experiments/test5_natural_recall.py --model gemma
+# run_test "test5_mistral" archive/experiments/test5_natural_recall.py --model mistral
 
 # Test 6: Storage Footprint
 run_test "test6_gemma" experiments/test6_footprint.py --model gemma

@@ -34,7 +34,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
 
-# Existing private imports as of 2026-05-28 (16 imports across 7 files).
+# Existing private imports as of 2026-05-28 (15 imports across 6 files).
 # Format: (relative_path_from_repo_root, module, symbol_name).
 # Each entry is a B2-tracked candidate for either (a) promotion to public,
 # (b) rewriting the call site through a public path, or (c) explicit retire.
@@ -89,14 +89,6 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "experiments/test18_probe_batching.py",
             "paramem.training.recall_eval",
             "_derive_stop_ids",
-        ),
-        # test5_natural_recall.py — same private dataset helper as test18.
-        # Currently dead-on-arrival (retired harness symbols); fold into the
-        # repair plan if test5 is repaired.
-        (
-            "experiments/test5_natural_recall.py",
-            "paramem.training.dataset",
-            "_format_inference_prompt",
         ),
         # experiments/utils/early_stop.py — already a thin re-export of the
         # private early_stop state.  Either inline into the harness or promote
