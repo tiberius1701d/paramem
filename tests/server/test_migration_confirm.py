@@ -914,6 +914,10 @@ class TestRunBaseSwapPhaseA:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             asyncio.run(
                 app_module._run_base_swap_orchestration(
@@ -1170,6 +1174,10 @@ class TestBaseSwapOrchestrationSlice2:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -1336,6 +1344,10 @@ class TestBaseSwapOrchestrationSlice2:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -1357,6 +1369,186 @@ class TestBaseSwapOrchestrationSlice2:
         assert markers_at_submit[1] == "phaseB", (
             f"Phase B submit must see marker='phaseB'; got {markers_at_submit[1]!r}"
         )
+
+    def test_post_phase_b_reload_runs_before_success_marker(self, tmp_path, monkeypatch):
+        """Post-Phase-B in-process reload fires after Phase B and before status=pass.
+
+        Regression for the AD-20 live-reload-after-final-tier gap: Phase B's
+        per-tier migrate() loop leaves the in-RAM PeftModel mounted in the
+        last tier's transient shape; without a final reload the published
+        ``adapter_available`` topology stays stale until a systemctl restart.
+        """
+        state = self._make_state(tmp_path)
+        call_order, gates_received, state_dir = self._run_orchestration_with_reload_tracking(
+            state, monkeypatch, tmp_path, reload_mode="local"
+        )
+
+        assert "phase_b_submit" in call_order, "Phase B must have been submitted"
+        assert "post_phase_b_reload" in call_order, (
+            "Post-Phase-B reload must be invoked after the final migrate() returns"
+        )
+        idx_b = call_order.index("phase_b_submit")
+        idx_reload = call_order.index("post_phase_b_reload")
+        assert idx_b < idx_reload, f"Reload must fire AFTER Phase B submit; got order {call_order}"
+
+        # Status=pass still fires (reload is best-effort housekeeping, not gating).
+        assert any(g.get("status") == "pass" for g in gates_received), (
+            f"Expected 'pass' on full success; got {gates_received}"
+        )
+
+        # Marker is cleared on success.
+        from paramem.server.trial_state import read_trial_marker as _rtm
+
+        assert _rtm(state_dir) is None, "Marker must be cleared on full success"
+
+    def test_post_phase_b_reload_failure_does_not_block_success(self, tmp_path, monkeypatch):
+        """A raise from _live_reload_base_model is logged but status=pass still fires.
+
+        Weights are already on disk by the time Phase B returns; the reload is
+        in-RAM housekeeping.  Failure must not turn the swap into phase_b_failed.
+        """
+        state = self._make_state(tmp_path)
+
+        def _raising_reload(*a, **kw):
+            raise RuntimeError("simulated reload failure")
+
+        call_order, gates_received, state_dir = self._run_orchestration_with_reload_tracking(
+            state,
+            monkeypatch,
+            tmp_path,
+            reload_mode="local",
+            reload_impl=_raising_reload,
+        )
+
+        # Phase B ran; reload was attempted.
+        assert "phase_b_submit" in call_order
+        # Final status is still pass — the reload is best-effort.
+        assert any(g.get("status") == "pass" for g in gates_received), (
+            f"Reload failure must not block success; got {gates_received}"
+        )
+        # No phase_b_failed payload.
+        assert not any(g.get("status") == "phase_b_failed" for g in gates_received), (
+            "Reload failure must not raise to phase_b_failed"
+        )
+
+    def _run_orchestration_with_reload_tracking(
+        self,
+        state,
+        monkeypatch,
+        tmp_path,
+        *,
+        reload_mode: str = "local",
+        reload_impl=None,
+    ):
+        """Like _run_orchestration but records the post-Phase-B reload call.
+
+        ``reload_impl`` defaults to a no-op that appends ``"post_phase_b_reload"``
+        to ``call_order``.  Pass a callable to override (e.g. a raising stub).
+        """
+        import asyncio as _asyncio
+
+        import paramem.server.app as _app
+
+        monkeypatch.setattr(_app, "_state", state)
+
+        live_yaml = tmp_path / "server.yaml"
+        live_yaml.write_bytes(b"model: mistral\n")
+        cand_yaml = tmp_path / "candidate.yaml"
+        cand_yaml.write_bytes(b"model: qwen3-4b\n")
+        state_dir = state["config"].paths.data / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        backups_root = state["config"].paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        bundle_slot = tmp_path / "bundle_slot_dir"
+        bundle_slot.mkdir()
+
+        call_order: list[str] = []
+        gates_received: list[dict] = []
+        submit_count = [0]
+
+        def _fake_submit(fn, **kwargs):
+            submit_count[0] += 1
+            call_order.append("phase_a_submit" if submit_count[0] == 1 else "phase_b_submit")
+            fn()
+
+        mock_bt = MagicMock()
+        mock_bt.submit = _fake_submit
+        monkeypatch.setattr("paramem.server.app.BackgroundTrainer", lambda **kwargs: mock_bt)
+
+        from paramem.server.active_store_migration import MigrationState
+
+        fake_a = MigrationState(
+            direction="train_to_simulate",
+            started_at="2026-05-24T00:00:00+00:00",
+            source_mode="train",
+            target_mode="simulate",
+            completed_tiers=["episodic", "semantic", "procedural"],
+            failed_tiers={},
+        )
+        fake_b = MigrationState(
+            direction="simulate_to_train",
+            started_at="2026-05-24T00:00:00+00:00",
+            source_mode="simulate",
+            target_mode="train",
+            completed_tiers=["episodic", "semantic", "procedural"],
+            failed_tiers={},
+        )
+        migrate_call = [0]
+
+        def _fake_migrate(loop, cfg, ms):
+            migrate_call[0] += 1
+            return fake_a if migrate_call[0] == 1 else fake_b
+
+        async def _fake_update_gates(payload):
+            gates_received.append(payload)
+
+        _rm = reload_mode
+
+        async def _fake_gpu_release():
+            state["mode"] = "cloud-only"
+            state["cloud_only_reason"] = "released"
+
+        def _fake_apply_config_live():
+            call_order.append("apply_config_live")
+            state["mode"] = _rm
+            state["cloud_only_reason"] = None if _rm == "local" else "insufficient_vram"
+            if _rm == "local":
+                state["config"].model_name = "qwen3-4b"
+
+        def _default_reload(*a, **kw):
+            call_order.append("post_phase_b_reload")
+
+        reload_fn = reload_impl if reload_impl is not None else _default_reload
+
+        with (
+            patch("paramem.server.app.write_bundle", lambda **kw: bundle_slot),
+            patch("paramem.server.app.migrate", side_effect=_fake_migrate),
+            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.app._update_trial_gates", _fake_update_gates),
+            patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
+            patch(
+                "paramem.server.app.ThermalPolicy.from_consolidation_config",
+                return_value=MagicMock(),
+            ),
+            patch("paramem.server.app.gpu_release", _fake_gpu_release),
+            patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch("paramem.server.app._live_reload_base_model", reload_fn),
+        ):
+            _asyncio.run(
+                _app._run_base_swap_orchestration(
+                    candidate_path_str=str(cand_yaml),
+                    live_config_path=live_yaml,
+                    state_dir=state_dir,
+                    backups_root=backups_root,
+                    old_model="mistral",
+                    new_model="qwen3-4b",
+                    started_at="2026-05-24T00:00:00+00:00",
+                    candidate_hash="aabb",
+                )
+            )
+
+        return call_order, gates_received, state_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1589,6 +1781,10 @@ class TestBaseSwapResumePhaseAware:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -1953,6 +2149,10 @@ class TestBaseSwapStep3ResumeReload:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -2358,6 +2558,10 @@ class TestBaseSwapActiveFlag:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -2869,6 +3073,10 @@ class TestPhaseBModelIdentityGuard:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(
@@ -3092,6 +3300,10 @@ class TestPhaseBModelIdentityGuard:
             ),
             patch("paramem.server.app.gpu_release", _fake_gpu_release),
             patch("paramem.server.app._apply_config_live", _fake_apply_config_live),
+            patch(
+                "paramem.server.app._live_reload_base_model",
+                lambda *a, **kw: None,
+            ),
         ):
             _asyncio.run(
                 _app._run_base_swap_orchestration(

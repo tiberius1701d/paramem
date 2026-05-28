@@ -388,6 +388,27 @@ The next `train_adapter` call creates a fresh staging slot, and
 continuing from step/epoch N+1. Resume continues training; it does not start
 from scratch.
 
+**Live-reload after the final tier (base-swap only).** Base-swap migration
+iterates `migrate()` over every adapter tier; each tier passes through
+`delete_adapter` + `create_adapter` (LoRA-zero reset) → `train_adapter` →
+`copy_adapter_weights(staging → production)` → `delete_adapter("in_training")`.
+The production weights for every tier land on disk, but the in-RAM
+`PeftModel` is mounted in whatever shape the last tier wrapped it in — a
+LoRA-zero reset for the final tier hides its just-promoted weights from
+inference until the wrapper is rebuilt. The orchestrator closes this gap by
+calling `_live_reload_base_model(refresh_config_from_disk=False)` after the
+final `migrate()` returns and before the `status=pass` marker (Step 6 in the
+sequence at `paramem/server/app.py::_run_base_swap_orchestration`). The
+reload tears down the PeftModel and rebuilds it from disk, picking up every
+tier's promoted adapter cleanly so `/debug/recall`'s `adapter_available`
+topology matches disk without a systemctl restart. The reload is best-effort:
+if it fails internally the server lands in cloud-only with
+`cloud_only_reason` set and the swap is still marked complete (weights are
+already on disk); the next `/gpu/acquire` recovers. Consolidation does NOT
+require this addendum — its `train_adapter` calls share the existing
+PeftModel without per-tier reshape, and the staging→promote step already
+leaves the in-RAM tier in its post-promotion shape.
+
 ## Known Constraints and Risks
 
 | Risk | Impact | Mitigation |

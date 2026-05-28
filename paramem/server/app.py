@@ -6600,7 +6600,16 @@ async def _run_base_swap_orchestration(
        (``max_probe=len(entries)``).  If any tier fails the 1.0 gate, the
        ``MigrationState.all_tiers_done`` check inside ``migrate()`` catches it
        and the state file stays on disk.
-    6. **Success** — clear the active-store state file (already done by
+    6. **Post-Phase-B in-process reload** — call
+       ``_live_reload_base_model(refresh_config_from_disk=False)`` so the
+       in-RAM ``model.peft_config`` matches disk.  Phase B's per-tier
+       ``migrate()`` loop leaves the PeftModel mounted in the last tier's
+       transient shape; without this reload, the published
+       ``adapter_available`` topology (and recall behaviour) stays stale
+       until the next systemctl restart.  Best-effort: on internal reload
+       failure the server lands in cloud-only with ``cloud_only_reason``
+       set, but the swap is complete on disk so step 7 still fires.
+    7. **Success** — clear the active-store state file (already done by
        ``migrate()`` on all_tiers_done), clear the trial marker, clear the
        base-swap marker in the in-memory trial stash, set
        ``_state["mode"] = "local"`` (should already be set by the reload, but
@@ -6608,7 +6617,7 @@ async def _run_base_swap_orchestration(
 
     **Resume semantics** (controlled by ``resume_phase``)
 
-    - ``""`` or ``"phaseA"`` (fresh start): run all steps 1–6.
+    - ``""`` or ``"phaseA"`` (fresh start): run all steps 1–7.
     - ``"phaseA_done"``: Phase A and the bundle backup are already complete.
       Read ``bundle_slot`` from the on-disk marker; skip steps 1–2 and skip
       the ``_apply_config_live`` reload (boot already loaded the new config).
@@ -7138,7 +7147,36 @@ async def _run_base_swap_orchestration(
                 len(loop_b.promoted_keys),
             )
 
-        # ── Step 5/6: Success — clear state, clear marker, status=pass ───────
+        # ── Step 6: Post-Phase-B in-process reload — align in-RAM peft_config
+        # with disk.  Phase B's migrate() promoted weights for every tier and
+        # called wrap_lora()/create_adapter() per tier as it iterated; the last
+        # tier through migrate leaves the in-RAM PeftModel mounted in its
+        # transient mid-iteration shape (the symptom traced 2026-05-28:
+        # semantic mounted as a Qwen-shape LoRA-zero, hiding the just-promoted
+        # weights from /debug/recall until a manual systemctl restart).  A
+        # plain reclaim-style reload (refresh_config_from_disk=False) tears
+        # down the PeftModel and rebuilds from disk, picking up each tier's
+        # promoted adapter cleanly.
+        #
+        # Same-config reload — no config delta to apply — so it routes through
+        # _live_reload_base_model directly rather than _apply_config_live.
+        # Drop our locals so they do not pin the old base graph (same pattern
+        # as the Phase A → Phase B reload at Step 3).  base_swap_active is
+        # still True throughout, so /gpu/release and /gpu/acquire cannot race
+        # us.  If the reload fails internally it leaves the server cloud-only
+        # with cloud_only_reason set; the swap is already complete on disk,
+        # so we still mark status=pass and let the next /gpu/acquire recover.
+        loop_b = None
+        bt_b = None
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _live_reload_base_model)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "base-swap: post-Phase-B live reload raised; weights are on disk "
+                "but in-RAM peft_config may be stale until /gpu/acquire or restart"
+            )
+
+        # ── Step 7: Success — clear state, clear marker, status=pass ─────────
         # active_store_migration.migrate() already cleared the state file on
         # all_tiers_done.  Clear the trial marker and reset migration state.
         from paramem.server.active_store_migration import clear_state as _clear_migrate_state
