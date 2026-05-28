@@ -882,6 +882,19 @@ def train_adapter(
     if callbacks_extra:
         callbacks.extend(callbacks_extra)
 
+    # Staging+promote (AD-20): HF trains the transient ``in_training`` slot, so
+    # the recall early-stop probe must measure that slot — not the caller's
+    # production adapter name, which holds un-promoted weights until the
+    # post-train promote.  As the single owner of the staging lifecycle, bind
+    # the probe target explicitly here; the callback never infers it.  No-op
+    # for compose/direct training, where the production adapter trains in place.
+    if _use_staging:
+        from paramem.training.early_stop import RecallEarlyStopCallback
+
+        for _cb in callbacks:
+            if isinstance(_cb, RecallEarlyStopCallback):
+                _cb.set_probe_adapter(_STAGING_ADAPTER)
+
     trainer_cls = _FixedDecayTrainer if training_config.lr_decay_steps is not None else Trainer
     trainer_kwargs = {}
     if training_config.lr_decay_steps is not None:

@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -68,6 +69,11 @@ def _make_model() -> MagicMock:
     m = MagicMock()
     m.is_gradient_checkpointing = True
     return m
+
+
+def _train_begin_state(global_step: int) -> types.SimpleNamespace:
+    """Lightweight stand-in for HF TrainerState passed to on_train_begin."""
+    return types.SimpleNamespace(global_step=global_step)
 
 
 # ---------------------------------------------------------------------------
@@ -952,28 +958,35 @@ class TestRecallEarlyStopCallbackStateachine:
 
 
 class TestRecallEarlyStopCallbackResume:
-    """Rehydration of in-memory state from on-disk artifacts at __init__.
+    """Rehydration of in-memory state from on-disk artifacts via on_train_begin.
 
-    Without this, every tresume after a tpause restarts the early-stop
-    accumulators — silently shifting first_perfect_epoch / stable_perfect_epoch
-    later than reality for any seed paused after convergence.
+    Rehydration is deferred from __init__ to on_train_begin so the fresh-run
+    vs checkpoint-resume distinction can be made via ``state.global_step``:
+    fresh run (global_step==0) discards stale artifacts; genuine resume
+    (global_step>0) carries accumulators forward.
+
+    Each test constructs the callback, then calls
+    ``cb.on_train_begin(args, state, control)`` with the appropriate
+    global_step before asserting state.
     """
 
     def test_cycle_started_at_preserved_across_resume(self, tmp_path):
-        """progress.json's cycle_started_at survives a re-init."""
+        """progress.json's cycle_started_at survives a checkpoint resume."""
         progress = tmp_path / "progress.json"
         progress.write_text(json.dumps({"cycle_started_at": 1234567890}))
         cb, _, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
         assert cb._cycle_started_at == 1234567890
 
     def test_cycle_started_at_fresh_on_cold_start(self, tmp_path):
-        """No progress.json on disk = stamp time.time() (cold start)."""
+        """No progress.json and global_step==0 = stamp time.time() (cold start)."""
         cb, _, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(0), None)
         # Stamped at init time, so it must be a recent positive integer.
         assert cb._cycle_started_at > 0
 
     def test_epoch_log_rehydrated(self, tmp_path):
-        """epoch_log.json on disk is loaded into state.epoch_log."""
+        """epoch_log.json on disk is loaded into state.epoch_log on resume."""
         epoch_log = tmp_path / "epoch_log.json"
         prior = [
             {"epoch": 1, "fill": {"exact_count": 0, "total": 5, "rate": 0.0}},
@@ -981,11 +994,12 @@ class TestRecallEarlyStopCallbackResume:
         ]
         epoch_log.write_text(json.dumps(prior))
         cb, state_out, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
         assert state_out.epoch_log == prior
         assert cb._last_epoch == 2
 
     def test_first_perfect_rehydrated_from_log(self, tmp_path):
-        """first_perfect_epoch reconstructed from prior epoch_log entries."""
+        """first_perfect_epoch reconstructed from prior epoch_log on resume."""
         epoch_log = tmp_path / "epoch_log.json"
         prior = [
             {"epoch": 1, "fill": {"exact_count": 4, "total": 5, "rate": 0.8}},
@@ -994,10 +1008,11 @@ class TestRecallEarlyStopCallbackResume:
         ]
         epoch_log.write_text(json.dumps(prior))
         cb, state_out, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
         assert state_out.first_perfect_epoch == 2
 
     def test_stable_perfect_rehydrated_from_log(self, tmp_path):
-        """stable_perfect_epoch fires when window of perfect epochs is met."""
+        """stable_perfect_epoch fires when window of perfect epochs is met on resume."""
         # window=2 in the default policy_kwargs of _make_callback
         epoch_log = tmp_path / "epoch_log.json"
         prior = [
@@ -1007,11 +1022,12 @@ class TestRecallEarlyStopCallbackResume:
         ]
         epoch_log.write_text(json.dumps(prior))
         cb, state_out, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
         assert state_out.stable_perfect_epoch == 3
         assert cb._consecutive_perfect == 2
 
     def test_consecutive_perfect_resets_on_non_perfect(self, tmp_path):
-        """A non-perfect epoch in the log resets the trailing perfect streak."""
+        """A non-perfect epoch in the log resets the trailing perfect streak on resume."""
         epoch_log = tmp_path / "epoch_log.json"
         prior = [
             {"epoch": 1, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}},
@@ -1020,6 +1036,7 @@ class TestRecallEarlyStopCallbackResume:
         ]
         epoch_log.write_text(json.dumps(prior))
         cb, state_out, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
         assert state_out.first_perfect_epoch == 1
         # window=2 means stable triggered at e2 (e1+e2 both perfect).
         assert state_out.stable_perfect_epoch == 2
@@ -1027,20 +1044,22 @@ class TestRecallEarlyStopCallbackResume:
         assert cb._consecutive_perfect == 0
 
     def test_first_perfect_log_rehydrated(self, tmp_path):
-        """Per-key first_perfect_log.json rehydrates the in-memory dict."""
+        """Per-key first_perfect_log.json rehydrates the in-memory dict on resume."""
         first_perfect_log = tmp_path / "first_perfect_log.json"
         prior = {"graph1": {"epoch_first_perfect": 5}}
         first_perfect_log.write_text(json.dumps(prior))
         cb, _, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
         assert cb.get_first_perfect_log() == prior
 
     def test_malformed_json_treated_as_cold_start(self, tmp_path):
-        """A corrupt epoch_log.json doesn't crash __init__."""
+        """A corrupt epoch_log.json on resume path doesn't crash on_train_begin."""
         (tmp_path / "epoch_log.json").write_text("{not json")
         (tmp_path / "progress.json").write_text("not json either")
         (tmp_path / "first_perfect_log.json").write_text("[broken")
         cb, state_out, _ = _make_callback(tmp_path)
-        # Cold-start defaults survive the malformed inputs.
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
+        # Malformed files are swallowed; defaults survive.
         assert state_out.epoch_log == []
         assert state_out.first_perfect_epoch is None
         assert cb._last_epoch == -1
@@ -1055,4 +1074,75 @@ class TestRecallEarlyStopCallbackResume:
         ]
         epoch_log.write_text(json.dumps(prior))
         cb, state_out, _ = _make_callback(tmp_path)
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(5), None)
         assert state_out.stop_epoch is None
+
+    def test_fresh_run_does_not_inherit_stale_epoch_log(self, tmp_path):
+        """Regression: fresh run (global_step==0) must not inherit a completed run's log.
+
+        Seeds a stale epoch_log.json ending at epoch 29 in the output dir,
+        constructs the callback, calls on_train_begin with global_step=0, and
+        asserts that _last_epoch is still -1 (defaults intact), epoch_log is
+        empty, and the seeded file is unlinked.
+
+        Without the on_train_begin fix the old __init__-time rehydrate would
+        set _last_epoch=29, causing the on_epoch_end guard to short-circuit
+        every epoch and disable early stopping for the whole run.
+        """
+        epoch_log_path = tmp_path / "epoch_log.json"
+        first_perfect_log_path = tmp_path / "first_perfect_log.json"
+        stale_log = [
+            {"epoch": i, "fill": {"exact_count": 5, "total": 5, "rate": 1.0}} for i in range(30)
+        ]
+        epoch_log_path.write_text(json.dumps(stale_log))
+        first_perfect_log_path.write_text(json.dumps({"graph1": {"epoch_first_perfect": 5}}))
+
+        cb, state_out, _ = _make_callback(tmp_path)
+        # Verify __init__ no longer rehydrates on its own.
+        assert cb._last_epoch == -1
+        assert state_out.epoch_log == []
+
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(0), None)
+
+        # Fresh run: defaults must be intact.
+        assert cb._last_epoch == -1
+        assert state_out.epoch_log == []
+        # Stale artifacts must be unlinked so a later crash-resume cannot inherit them.
+        assert not epoch_log_path.exists()
+        assert not first_perfect_log_path.exists()
+
+    def test_set_probe_adapter_rebinds_probe_target(self, tmp_path):
+        """set_probe_adapter explicitly rebinds the probe to the staging slot.
+
+        Under the AD-20 staging+promote contract the staging owner
+        (train_adapter) calls this so the probe measures the slot HF is
+        actually training (``in_training``) instead of the caller-supplied
+        production name, which holds un-promoted weights during the loop.
+        """
+        cb, _, _ = _make_callback(tmp_path)
+        assert cb._adapter_name == "journal"  # caller-supplied production target
+
+        cb.set_probe_adapter("in_training")
+        assert cb._adapter_name == "in_training"
+
+        # on_train_begin must NOT re-derive or override the bound target.
+        cb.on_train_begin(types.SimpleNamespace(), _train_begin_state(0), None)
+        assert cb._adapter_name == "in_training"
+
+    def test_train_adapter_binds_staging_probe_target(self):
+        """Structural guard: train_adapter binds the probe to the staging slot.
+
+        The staging owner must explicitly call ``set_probe_adapter`` on the
+        recall callback under ``_use_staging`` so the contract cannot silently
+        regress to inference. Cheap source-level check (no GPU).
+        """
+        import inspect
+
+        from paramem.training import trainer as _trainer
+
+        src = inspect.getsource(_trainer.train_adapter)
+        assert "set_probe_adapter(_STAGING_ADAPTER)" in src, (
+            "train_adapter must explicitly bind the recall probe to the staging "
+            "slot when staging is active"
+        )
+        assert "if _use_staging:" in src
