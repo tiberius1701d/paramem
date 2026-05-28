@@ -5074,6 +5074,233 @@ async def debug_probe(request: DebugProbeRequest):
 
 
 # --------------------------------------------------------------------------
+# Debug recall endpoint — direct adapter probe.
+# Bypasses QueryRouter and _probe_and_reason entirely: activates the
+# requested adapter (or disables all adapters when adapter="none"),
+# sends the caller's prompt verbatim through the model, and returns the
+# raw output.  No speaker scoping, no per-key enumeration, no bullet-
+# context reasoning step.  Mirrors /debug/probe's side-effect contract:
+# no buffer mutation, no jsonl write, no consolidation impact.
+#
+# Use case: testing whether a triple-format-trained adapter responds to
+# natural-language questions without the targeted-probe pipeline doing
+# the work — i.e. measuring direct recall from adapter weights as a
+# distinct capability from cache-driven enumerate-then-reason.
+# --------------------------------------------------------------------------
+
+
+class DebugRecallRequest(BaseModel):
+    """Direct adapter recall probe with caller-supplied prompt."""
+
+    text: str
+    adapter: str  # adapter name in model.peft_config, or "none" to disable all
+    system_prompt: str | None = None  # None → paramem.training.dataset.SYSTEM_PROMPT
+    max_new_tokens: int = 256
+    temperature: float = 0.0
+
+
+class DebugRecallResponse(BaseModel):
+    """Raw model output from a direct adapter probe."""
+
+    text: str
+    adapter_active: str  # echoes adapter; "disabled" when adapter="none"
+    parsed_entry: dict | None
+    latency_ms: int
+    adapter_available: list[str]
+
+
+@app.post("/debug/recall", response_model=DebugRecallResponse)
+async def debug_recall(request: DebugRecallRequest):
+    """Run *request.text* through the model with *request.adapter* active.
+
+    Bypasses the chat handler, the router, and the reason-over-bullets
+    step.  Returns the raw model output, an attempted JSON parse via
+    :func:`paramem.memory.entry.parse_recalled_entry`, and the active
+    adapter name for the call.
+
+    Returns ``forbidden_not_debug`` (403) when ``config.debug=false``.
+    Returns ``not_ready`` (503) when the local model isn't loaded or the
+    server is in ``cloud-only`` mode.  Returns ``unknown_adapter`` (400)
+    with the available list when *adapter* is not in ``model.peft_config``
+    and is not the literal ``"none"``.
+    """
+    config = _state["config"]
+    if not getattr(config, "debug", False):
+        return JSONResponse({"status": "forbidden_not_debug"}, status_code=403)
+
+    if _state.get("mode") == "cloud-only":
+        return JSONResponse(
+            {"status": "not_ready", "detail": "cloud-only mode has no local model to probe"},
+            status_code=503,
+        )
+
+    model = _state.get("model")
+    tokenizer = _state.get("tokenizer")
+    if model is None or tokenizer is None:
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+
+    from peft import PeftModel
+
+    available = sorted(model.peft_config.keys()) if isinstance(model, PeftModel) else []
+    if request.adapter != "none" and request.adapter not in available:
+        return JSONResponse(
+            {
+                "status": "unknown_adapter",
+                "requested": request.adapter,
+                "available": available + ["none"],
+            },
+            status_code=400,
+        )
+
+    bg_trainer = _state.get("background_trainer")
+    if bg_trainer is not None and bg_trainer.is_training:
+        _abort_timeout = config.consolidation.abort_quiesce_timeout_s
+        aborted = bg_trainer.abort_for_inference(timeout=_abort_timeout)
+        if not aborted:
+            bg_trainer._shutdown_requested = True
+            bg_trainer._is_training = False
+
+    from paramem.evaluation.recall import generate_answer
+    from paramem.memory.entry import parse_recalled_entry
+    from paramem.models.loader import adapt_messages, switch_adapter
+    from paramem.server.gpu_lock import gpu_lock
+    from paramem.training.dataset import SYSTEM_PROMPT
+
+    system_prompt = request.system_prompt if request.system_prompt is not None else SYSTEM_PROMPT
+    messages = adapt_messages(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.text},
+        ],
+        tokenizer,
+    )
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    def _run() -> tuple[str, str, int]:
+        # Capture prior active adapter so we can restore.  PEFT exposes both
+        # `active_adapter` (legacy single name) and `active_adapters` (list).
+        # Falling back through both keeps us robust to model not-yet-PEFT-wrapped
+        # cases — handled above by the unknown_adapter gate.
+        prior: list[str] = []
+        raw_active = getattr(model, "active_adapter", None)
+        if isinstance(raw_active, list):
+            prior = list(raw_active)
+        elif isinstance(raw_active, str):
+            prior = [raw_active]
+
+        # Defensive: handle_chat (inference.py:305) disables gradient
+        # checkpointing at the top of every chat turn.  Replicate so this
+        # endpoint also avoids the silent KV-cache disable.
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+
+        t0 = time.monotonic()
+        try:
+            if request.adapter == "none":
+                if isinstance(model, PeftModel):
+                    with model.disable_adapter():
+                        raw = generate_answer(
+                            model,
+                            tokenizer,
+                            prompt,
+                            max_new_tokens=request.max_new_tokens,
+                            temperature=request.temperature,
+                        )
+                else:
+                    raw = generate_answer(
+                        model,
+                        tokenizer,
+                        prompt,
+                        max_new_tokens=request.max_new_tokens,
+                        temperature=request.temperature,
+                    )
+                adapter_active_label = "disabled"
+            else:
+                switch_adapter(model, request.adapter)
+                raw = generate_answer(
+                    model,
+                    tokenizer,
+                    prompt,
+                    max_new_tokens=request.max_new_tokens,
+                    temperature=request.temperature,
+                )
+                adapter_active_label = request.adapter
+        finally:
+            # Restore prior adapter so the next /chat starts predictable.
+            if prior and isinstance(model, PeftModel):
+                switch_adapter(model, prior[0] if len(prior) == 1 else prior)
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        return raw, adapter_active_label, latency_ms
+
+    async with gpu_lock():
+        loop = asyncio.get_running_loop()
+        raw_text, adapter_label, latency_ms = await loop.run_in_executor(None, _run)
+
+    return DebugRecallResponse(
+        text=raw_text,
+        adapter_active=adapter_label,
+        parsed_entry=parse_recalled_entry(raw_text),
+        latency_ms=latency_ms,
+        adapter_available=available + ["none"],
+    )
+
+
+# --------------------------------------------------------------------------
+# Debug dump endpoint — zero-GPU read of the in-memory MemoryStore.
+# Walks ``_state["memory_store"].iter_entries()`` and returns the canonical
+# entry payload per (tier, key).  No model invocation, no adapter switch,
+# no per-key generate — pure cache read.  ~5 ms for 250 entries vs ~8 min
+# for the equivalent per-key /debug/recall sweep on this hardware.
+#
+# Use when the goal is "what does this adapter hold" (registry inventory
+# for scoring, cross-model A/B setup, content audit).  Use /debug/recall
+# when the goal is "what does the model say given a custom prompt"
+# (weight-recall behavior under natural-language probes).
+# --------------------------------------------------------------------------
+
+
+class DebugDumpResponse(BaseModel):
+    """Flat list of every entry in the live ``MemoryStore``."""
+
+    entries: list[dict]
+    total: int
+    tiers: dict[str, int]  # tier name → entry count
+
+
+@app.get("/debug/dump", response_model=DebugDumpResponse)
+async def debug_dump():
+    """Dump every (tier, key, entry) the live ``MemoryStore`` holds.
+
+    Returns ``forbidden_not_debug`` (403) when ``config.debug=false``.
+    Returns ``not_ready`` (503) when the memory store isn't constructed
+    yet (early-boot, cloud-only with no preload).  When
+    ``inference.preload_cache=false`` the store is empty by design and
+    this endpoint returns an empty list — that's a correct read, not
+    an error.
+
+    Each entry dict is the entry payload as stored, with ``tier`` and
+    ``key`` fields added inline for flat consumption.
+    """
+    config = _state["config"]
+    if not getattr(config, "debug", False):
+        return JSONResponse({"status": "forbidden_not_debug"}, status_code=403)
+
+    store = _state.get("memory_store")
+    if store is None:
+        return JSONResponse({"status": "not_ready"}, status_code=503)
+
+    entries: list[dict] = []
+    tiers: dict[str, int] = {}
+    for tier, key, entry in store.iter_entries():
+        row = {"tier": tier, "key": key, **entry}
+        entries.append(row)
+        tiers[tier] = tiers.get(tier, 0) + 1
+
+    return DebugDumpResponse(entries=entries, total=len(entries), tiers=tiers)
+
+
+# --------------------------------------------------------------------------
 # Calibration endpoints — opt-in dev tool for live prompt iteration.
 # Gated by consolidation.calibrate_endpoint_enabled (default False).
 # Each endpoint is a thin wrapper around the existing pipeline helper for
