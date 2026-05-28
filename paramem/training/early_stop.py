@@ -236,14 +236,6 @@ class RecallEarlyStopCallback(TrainerCallback):
         self._signaled_stop: bool = False
         self._cycle_started_at: int = int(time.time())
 
-        # Restore prior pause/resume state from disk if any of the persisted
-        # files exist.  Without this, every tresume after a tpause restarts
-        # the early-stop accumulators (epoch_log, first_perfect_epoch,
-        # stable_perfect_epoch, _consecutive_perfect, _first_perfect_log,
-        # _cycle_started_at) from scratch — silently distorting recorded
-        # first/stable epoch labels for any seed paused after convergence.
-        self._rehydrate_from_disk()
-
     def _rehydrate_from_disk(self) -> None:
         """Restore in-memory state from the previous run's persisted artifacts.
 
@@ -306,6 +298,44 @@ class RecallEarlyStopCallback(TrainerCallback):
                     self._first_perfect_log = saved_fp
             except (OSError, json.JSONDecodeError):
                 pass
+
+    def set_probe_adapter(self, adapter_name: str) -> None:
+        """Bind the recall probe to a specific adapter slot (explicit handoff).
+
+        Called by the staging owner (``train_adapter``) under the AD-20
+        staging+promote contract: HF trains the transient ``in_training``
+        slot, so the probe must measure that slot, not the caller-supplied
+        production name (which holds un-promoted weights until the post-train
+        promote).  The callback never infers the trained slot — the owner
+        states it.  For compose/direct training the owner does not call this,
+        so the constructor's production ``adapter_name`` stands.
+        """
+        self._adapter_name = adapter_name
+
+    def on_train_begin(self, args, state, control, **kwargs) -> None:  # noqa: ARG002
+        """(Re)initialise early-stop accumulators for this training run.
+
+        The probe target is set explicitly by the staging owner via
+        :meth:`set_probe_adapter` before training starts; this hook only
+        handles accumulator state.
+
+        On a checkpoint resume (``state.global_step > 0``), restore the
+        accumulators from disk so the probe history, ``_last_epoch``, and the
+        perfect-streak counters carry forward across the interruption.  On a
+        fresh run (``state.global_step == 0``), start clean and remove any
+        ``epoch_log.json`` / ``first_perfect_log.json`` left in this output
+        dir by a prior run, so stale state is picked up neither here nor by a
+        later resume of this run.  ``progress.json`` is rewritten each epoch
+        and needs no cleanup.
+        """
+        if state.global_step > 0:
+            # Genuine checkpoint resume — carry accumulators forward.
+            self._rehydrate_from_disk()
+        else:
+            # Fresh run — unlink any stale artifacts this callback owns.
+            for p in (self._epoch_log_path, self._first_perfect_log_path):
+                if p is not None and p.exists():
+                    p.unlink()
 
     def on_epoch_end(self, args, state, control, **kwargs) -> None:  # noqa: ARG002
         """Probe fill (and optionally retention), update logs, check stop.
