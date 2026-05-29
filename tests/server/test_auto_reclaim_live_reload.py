@@ -43,11 +43,12 @@ def _make_null_gpu_lock():
 # ---------------------------------------------------------------------------
 
 
-def test_auto_reclaim_calls_live_reload_then_voice_gpu_on_success():
-    """Hold cleared: _live_reload_base_model called, then voice switched to gpu.
+def test_auto_reclaim_calls_live_reload_on_success():
+    """Hold cleared: _live_reload_base_model called; loop exits on success.
 
-    _restart_service must NOT be called.
-    last_reclaim_error cleared on success.
+    Voice drain/restore is now owned by _live_reload_base_model (the primitive),
+    so the loop itself no longer calls _set_voice_pipeline_profile("gpu") on
+    success.  _restart_service must NOT be called.  last_reclaim_error cleared.
     """
     import paramem.server.app as app_module
 
@@ -56,7 +57,6 @@ def test_auto_reclaim_calls_live_reload_then_voice_gpu_on_success():
         "mode": "cloud-only",  # precondition: the loop only runs cloud-only
     }
 
-    call_log = []
     tick_count = 0
 
     async def fake_sleep(_s):
@@ -65,15 +65,11 @@ def test_auto_reclaim_calls_live_reload_then_voice_gpu_on_success():
         if tick_count > 2:
             raise asyncio.CancelledError
 
-    async def fake_run_in_executor(_executor, fn, *args):
-        call_log.append(fn.__name__ if hasattr(fn, "__name__") else str(fn))
-
     def _fake_reload_success(*_args, **_kwargs):
         # Faithfully simulate a successful in-process reload: the real
         # _live_reload_base_model sets mode="local" on success, which the loop
-        # reads (app.py:11057) to take the gpu-restore branch. Establishing it
-        # here makes the test independent of any incoming _state["mode"] a prior
-        # test left behind (e.g. test_gpu_release leaves "cloud-only").
+        # reads to take the success-exit branch.  Establishing it here makes
+        # the test independent of any incoming _state["mode"] a prior test left.
         app_module._state["mode"] = "local"
 
     with (
@@ -107,7 +103,22 @@ def test_auto_reclaim_calls_live_reload_then_voice_gpu_on_success():
         asyncio.run(_run())
 
         mock_reload.assert_called_once()
-        mock_profile.assert_called_once_with("gpu")
+        # The loop wraps the call as lambda: _live_reload_base_model(lock_held=True)
+        # so the mock receives lock_held=True.  Dropping lock_held=True from the
+        # lambda would cause a deadlock (gpu_lock is held across run_in_executor and
+        # _set_voice_pipeline_profile must not re-acquire the non-reentrant lock).
+        assert mock_reload.call_args.kwargs.get("lock_held") is True, (
+            "_auto_reclaim_loop must forward lock_held=True to _live_reload_base_model; "
+            f"got call_args={mock_reload.call_args}"
+        )
+        # Voice restore to "gpu" is now inside _live_reload_base_model; the loop
+        # no longer calls it on success.  Voice may still be called with "cpu" on
+        # the decline branch; assert that "gpu" restore is NOT called by the loop.
+        gpu_calls = [c for c in mock_profile.call_args_list if c.args and c.args[0] == "gpu"]
+        assert not gpu_calls, (
+            "auto-reclaim loop must NOT call _set_voice_pipeline_profile('gpu') — "
+            f"that is now owned by the primitive; calls={mock_profile.call_args_list}"
+        )
         mock_restart.assert_not_called()
         assert app_module._state.get("last_reclaim_error") is None
 
@@ -163,7 +174,7 @@ def test_auto_reclaim_records_error_and_continues_on_reload_failure(caplog):
         if tick_count > 3:
             raise asyncio.CancelledError
 
-    def fake_reload():
+    def fake_reload(**_kw):
         nonlocal reload_calls
         reload_calls += 1
         if reload_calls == 1:
@@ -241,7 +252,7 @@ def test_auto_reclaim_retry_increments_attempt_count():
         if tick_count > 4:
             raise asyncio.CancelledError
 
-    def fake_reload_two_fail():
+    def fake_reload_two_fail(**_kw):
         nonlocal reload_calls
         reload_calls += 1
         if reload_calls <= 2:
@@ -300,7 +311,7 @@ def test_auto_reclaim_defers_when_reload_stays_cloud_only():
         if tick_count > 3:
             raise asyncio.CancelledError
 
-    def fake_reload_declines():
+    def fake_reload_declines(**_kw):
         nonlocal reload_calls
         reload_calls += 1
         # Pre-flight declined: base model not loaded, server stays cloud-only.

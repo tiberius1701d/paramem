@@ -3223,9 +3223,8 @@ async def gpu_acquire():
                 "In-process reload failed during /gpu/acquire; falling back to restart"
             )
         if reloaded_live:
-            await asyncio.get_running_loop().run_in_executor(
-                None, _set_voice_pipeline_profile, "gpu"
-            )
+            # Voice drain+restore is now owned by _live_reload_base_model
+            # (partial-path success restore runs inside the primitive).
             # ── Base-swap deferred-resume hook ────────────────────────────────
             # When a phaseA_done base-swap marker exists and the orchestration
             # is not actively running (base_swap_active=False), the reload that
@@ -4058,6 +4057,7 @@ def _refresh_config_from_disk_into_state():
 def _live_reload_base_model(
     refresh_config_from_disk: bool = False,
     rebuild_session_buffer: bool = False,
+    lock_held: bool = False,
 ) -> None:
     """Release+reload the base model in-process to recover device memory.
 
@@ -4076,14 +4076,30 @@ def _live_reload_base_model(
     persisted per-cycle and is load-bearing for promotion + debug
     snapshots.
 
+    Voice-pipeline drain/restore (invariant owned by this primitive):
+    This function drains the voice pipeline to CPU before its VRAM gate
+    (when ``voice_profile=="gpu"``) and restores it after a successful
+    PARTIAL reload (``refresh_config_from_disk=False``).  The FULL-rebuild
+    path (``refresh_config_from_disk=True``) restores voice via
+    ``_build_config_derived_state`` — adding a restore here for that branch
+    would double-load.  Failure branches leave voice on CPU so the
+    cloud-only server holds ~0 GiB.
+
+    The drain is idempotent for cloud-only callers (``voice_profile=="cpu"``
+    → ``_set_voice_pipeline_profile`` early-returns on a matching profile).
+    It also closes the double-voice leak in ``_build_config_derived_state``
+    full-rebuild: the rebuild overwrites ``_state["stt_gpu"]``/``["tts_gpu"]``
+    without unloading the old GPU instances; the drain unloads and nulls them
+    first so the rebuild starts from a clean slate.
+
     Caller responsibilities:
     - ``_apply_config_live`` holds ``gpu_lock_sync()`` around this call and
-      MUST NOT be re-acquired internally (``threading.Lock`` is non-reentrant —
-      double-acquire from auto-reclaim / apply paths deadlocks).  Plain
-      ``/gpu/acquire`` dispatches this WITHOUT holding ``gpu_lock`` (correction
-      N-1, verified at ``app.py:3196``); only auto-reclaim and
-      ``_apply_config_live`` hold it.  Therefore this function must NOT acquire
-      the lock internally.
+      MUST pass ``lock_held=True`` so the internal
+      ``_set_voice_pipeline_profile`` calls do not re-acquire the non-reentrant
+      lock (deadlock).  ``_auto_reclaim_loop`` holds ``gpu_lock()`` across this
+      call and likewise passes ``lock_held=True``.  Plain ``/gpu/acquire``
+      dispatches this WITHOUT holding ``gpu_lock`` (correction N-1, verified at
+      ``app.py:3196``) and keeps the default ``lock_held=False``.
     - Must accept ~25-30 s of model-load latency. Mode is flipped to
       cloud-only for the duration so any concurrent /chat handler
       routes to SOTA rather than crashing on a None model.
@@ -4122,6 +4138,14 @@ def _live_reload_base_model(
         so the ``SessionBuffer`` is rebuilt.  Always ``False`` on the plain
         reclaim path (``refresh_config_from_disk=False``) — the session config
         did not change.
+    lock_held:
+        When ``True``, the caller already holds ``gpu_lock_sync()`` (the shared
+        non-reentrant threading.Lock from ``paramem/server/gpu_lock.py``).
+        The internal ``_set_voice_pipeline_profile`` calls forward this flag so
+        they skip re-acquisition.  Must be ``True`` for ``_apply_config_live``
+        and ``_auto_reclaim_loop`` callers (both hold the lock); must be
+        ``False`` (default) for ``/gpu/acquire`` and base-swap step-6 callers
+        (neither holds the lock).
 
     Note on the synchronous maintenance guard (correction S-4, §3.12):
     When ``refresh_config_from_disk=True`` the CALLER (``_apply_config_live``)
@@ -4144,6 +4168,19 @@ def _live_reload_base_model(
     )
     _state["mode"] = "cloud-only"
     _state["cloud_only_reason"] = "live_reload"
+
+    # Entry drain: move the voice pipeline to CPU before releasing the base
+    # model and before the VRAM gate.  Without this drain the gate sees
+    # ~4.3 GiB still occupied by STT large-v3-turbo + TTS on 8 GiB hardware
+    # and defers to cloud-only (observed 2026-05-29: effective free 3.28 GiB,
+    # needed 5.00 GiB).  Idempotent: _set_voice_pipeline_profile early-returns
+    # when voice_profile already matches ("cpu" for cloud-only callers).
+    # Also closes the double-voice leak in _build_config_derived_state
+    # full-rebuild: the rebuild overwrites _state["stt_gpu"]/_state["tts_gpu"]
+    # without unloading the old GPU instances; draining here unloads and nulls
+    # them first so the rebuild constructs on a clean slate.
+    if _state.get("voice_profile") == "gpu":
+        _set_voice_pipeline_profile("cpu", lock_held=lock_held)
 
     # No local refs to ConsolidationLoop / BackgroundTrainer — saving
     # them in this function's frame would re-pin the model graph
@@ -4293,6 +4330,11 @@ def _live_reload_base_model(
         if not rebuild_failed:
             _state["mode"] = "local"
             _state["cloud_only_reason"] = None
+            # Partial-path success restore: the entry-drain moved voice to CPU;
+            # put it back now that the base model is live.  The full-rebuild path
+            # (refresh_config_from_disk=True) skips this — _build_config_derived_state
+            # already reconstructed voice on GPU and set voice_profile="gpu".
+            _set_voice_pipeline_profile("gpu", lock_held=lock_held)
             logger.info("Live model reload — complete; mode=local")
         else:
             _release_base_model_in_process()
@@ -4324,35 +4366,28 @@ def _release_base_model_in_process() -> None:
     The base model is reachable through five holders:
 
     1. ``_state["model"]`` — primary handle.
-    2. ``_state["consolidation_loop"].model`` — captured at
-       ``ConsolidationLoop.__init__`` (``self.model = model`` in
-       ``paramem/training/consolidation.py``); persists across cycles
-       by design so adapter+SimHash state is reused.
+    2. ``_state["consolidation_loop"].model`` (and ``.extraction.model``) —
+       captured at ``ConsolidationLoop.__init__``; released via
+       ``loop.release()``.
     3. ``_state["background_trainer"].model`` — captured at
-       ``BackgroundTrainer.__init__`` (``self.model = model`` in
-       ``paramem/server/background_trainer.py``).
-    4. **The bg-trainer worker thread's frame.** After a train-mode
-       cycle, ``bt._worker_thread`` is parked on
-       ``self._job_queue.get()`` (``paramem/server/background_trainer.py``,
-       ``_run_callable_queue``) with stale locals from the prior job:
-       ``fn = _run_interim_training`` (closure cell capturing ``loop``),
-       ``fallback_adapter``, ``item``, ``sentinel``. Until a NEW job
-       arrives, those locals stay referenced and ``loop.model`` stays alive.
-       ``_state[...] = None`` on the dict entries does not affect the worker
-       frame.
-
+       ``BackgroundTrainer.__init__``; released via ``bt.release()``.
+    4. **The bg-trainer worker thread's frame.** After a train-mode cycle,
+       ``bt._worker_thread`` is parked on ``self._job_queue.get()`` with
+       stale locals from the prior job (closure-captured ``loop``).  Until a
+       NEW job arrives those locals pin ``loop.model``.  ``bt.release()``
+       calls ``_stop_callable_worker()``, which sends ``_WORKER_STOP``,
+       joins the thread, then nulls ``_worker_thread`` — breaking the
+       ``bt ↔ Thread._target (bound method)`` cycle that ``join`` alone
+       does not sever.  Verified by a live ``gc.get_referrers`` walk
+       (2026-05-29): 2.796 GiB still allocated after join-only; 0 GiB
+       after the explicit null.
     5. ``intent._classifier_model_singleton`` — the ``_ClassifierModelHandle``
-       set by ``set_classifier_model`` for ``intent.mode=llm`` (it holds the
-       base model + tokenizer). Cleared here via ``set_classifier_model(None,
-       None)`` — exactly the "before a model unload / cloud-only switch" use
-       its docstring documents.
+       set by ``set_classifier_model`` for ``intent.mode=llm``. Cleared
+       here via ``set_classifier_model(None, None)``.
 
-    The first three are addressed by nulling, the fourth by
-    ``bt._stop_callable_worker()`` — sends ``_WORKER_STOP`` through the queue,
-    the worker breaks out of its loop, the function returns, its frame
-    collapses, the closure cell drops. Joining is bounded by the helper's 5-s
-    timeout. A fresh worker thread is started by the next ``BackgroundTrainer``
-    instance the next consolidation cycle creates. The fifth is cleared below.
+    Holders 2–4 are encapsulated in ``bt.release()`` and ``loop.release()``.
+    Holder 5 is cleared below.  See ``BackgroundTrainer.release()`` and
+    ``ConsolidationLoop.release()`` for the ownership contract.
 
     NOTE: this function CANNOT reach references held in the **lifespan
     async-generator frame** (it stays suspended at ``yield`` for the app's
@@ -4360,28 +4395,27 @@ def _release_base_model_in_process() -> None:
     ``_classifier_model`` local — are dropped in the lifespan itself
     (``_source = None`` / ``_classifier_model = None`` after use), mirroring
     why :func:`_load_model_into_state` keeps the model out of its caller's
-    frame. Verified by a live ``gc.get_referrers`` trace: those three were the
-    only survivors after the four-holder nulling.
+    frame.
 
-    Idempotent: callable when the model is already absent;
-    ``_stop_callable_worker`` is safe even if no worker has ever
-    started.
+    Idempotent: callable when the model is already absent.
     """
     from paramem.server.intent import set_classifier_model
 
-    # Stop the bg-trainer worker thread first — without this, its
-    # frame's stale locals (closure-captured `loop`) would pin the
-    # model graph through any number of subsequent gc.collect +
-    # empty_cache calls.
     bt = _state.get("background_trainer")
+    loop = _state.get("consolidation_loop")
     if bt is not None:
         try:
-            bt._stop_callable_worker()
+            bt.release()  # stops worker, breaks cycle, drops model/tokenizer
         except Exception:
-            logger.exception("Error stopping bg-trainer worker during release")
-    # Now null the dict-entry holders. With the worker dead, dropping
-    # _state["consolidation_loop"] / _state["background_trainer"] /
-    # _state["model"] actually drives refcounts to zero.
+            logger.exception("Error releasing bg-trainer during model release")
+    if loop is not None:
+        try:
+            loop.release()  # drops model + extraction.model + _bg_trainer
+        except Exception:
+            logger.exception("Error releasing consolidation loop during model release")
+    # Now null the dict-entry holders. With the worker dead and the model
+    # refs severed on bt/loop, dropping the _state entries drives refcounts
+    # to zero even if gc hasn't yet collected the bt/_worker_thread cycle.
     _state["consolidation_loop"] = None
     _state["background_trainer"] = None
     if _state.get("model") is not None:
@@ -4400,6 +4434,132 @@ def _release_base_model_in_process() -> None:
     # running it again now that they're gone collapses the allocator
     # pool slack the cycle accumulated while the model was alive.
     safe_empty_cache()
+    # === RELPROBE — permanent debug-gated holder diagnostic ===
+    # The cheap tripwire (allocated/reserved/mem_get_info_free) runs on every
+    # release call so stale holders surface in logs without GPU overhead.
+    # The heavy leak branch (module census + memory_summary + referrer walk)
+    # runs only when config.debug=True so it is never active in production.
+    try:
+        import torch as _torch
+
+        if _torch.cuda.is_available():
+            _st = _torch.cuda.memory_stats()
+            _alloc = _torch.cuda.memory_allocated()
+            logger.info(
+                "RELPROBE post-release: allocated=%.3f reserved=%.3f inactive_split=%.3f "
+                "mem_get_info_free=%.3f GiB alloc_retries=%d",
+                _alloc / 2**30,
+                _torch.cuda.memory_reserved() / 2**30,
+                _st.get("inactive_split_bytes.all.current", 0) / 2**30,
+                _torch.cuda.mem_get_info(0)[0] / 2**30,
+                _st.get("num_alloc_retries", 0),
+            )
+            # Tripwire: always-on WARNING when base model was not fully freed.
+            # >1 GiB still allocated after a full release means a live object
+            # somewhere holds a reference to the base model (see INVARIANT
+            # header above for the canonical holder registry).  This fires
+            # regardless of config.debug so a future regression is an
+            # immediate greppable alarm; the heavy census walk below is still
+            # gated on debug to avoid production overhead.
+            if _alloc > 2**30:
+                logger.warning(
+                    "RELPROBE: possible base-model holder leak — %.3f GiB still "
+                    "allocated after release (expected ~0; set debug=true for a "
+                    "gc.get_referrers holder walk).",
+                    _alloc / 2**30,
+                )
+            # Heavy holder census: gated on config.debug to avoid production overhead.
+            # >1 GiB still ALLOCATED after a full release => a live object still
+            # holds GPU tensors. Census live modules, print memory_summary, and
+            # walk referrers to name the holder.
+            _config = _state.get("config")
+            _debug = bool(getattr(_config, "debug", False))
+            if _alloc > 2**30 and _debug:
+                import gc as _gc
+                from collections import Counter as _Counter
+
+                _mods = [_o for _o in _gc.get_objects() if isinstance(_o, _torch.nn.Module)]
+                logger.info(
+                    "RELPROBE LEAK: %.3f GiB allocated after release; "
+                    "live nn.Module count=%d top=%s",
+                    _alloc / 2**30,
+                    len(_mods),
+                    _Counter(type(_m).__name__ for _m in _mods).most_common(15),
+                )
+                logger.info(
+                    "RELPROBE memory_summary:\n%s",
+                    _torch.cuda.memory_summary(abbreviated=True),
+                )
+                # --- referrer walk: NAME the live holder of the base model ---
+                # Bounded: depth ≤5, total-visit budget ≤300, per-object
+                # referrer cap ≤40. Frames are terminal (not recursed into).
+                # Must not raise — wrapped by the outer try/except.
+                import types as _types
+
+                _roots = [
+                    _o
+                    for _o in _gc.get_objects()
+                    if isinstance(_o, _torch.nn.Module)
+                    and (
+                        type(_o).__name__.endswith("ForCausalLM")
+                        or "PeftModel" in type(_o).__name__
+                    )
+                ]
+                logger.info("RELPROBE roots: %s", [type(_o).__name__ for _o in _roots[:8]])
+                _ignore = {id(_roots)}
+                _seen: set[int] = set()
+                _frontier = [(_r, 0) for _r in _roots[:3]]
+                _ignore.add(id(_frontier))
+                _ignore.add(id(_seen))
+                _budget = 300
+                while _frontier and _budget > 0:
+                    _obj, _depth = _frontier.pop()
+                    _budget -= 1
+                    if id(_obj) in _seen or _depth > 5:
+                        continue
+                    _seen.add(id(_obj))
+                    try:
+                        _refs = _gc.get_referrers(_obj)
+                    except Exception:
+                        continue
+                    for _ref in _refs[:40]:
+                        if id(_ref) in _ignore or id(_ref) in _seen or _ref is _refs:
+                            continue
+                        if isinstance(_ref, _types.FrameType):
+                            logger.info(
+                                "RELPROBE HOLDER frame: %s @ %s:%d (depth %d)",
+                                _ref.f_code.co_name,
+                                _ref.f_code.co_filename,
+                                _ref.f_lineno,
+                                _depth,
+                            )
+                            # frames are terminal — do not recurse (entire interpreter)
+                        elif _ref is _state:
+                            logger.info("RELPROBE HOLDER: _state dict (depth %d)", _depth)
+                        elif isinstance(_ref, _types.CellType):
+                            logger.info("RELPROBE HOLDER cell (depth %d) — walking up", _depth)
+                            _frontier.append((_ref, _depth + 1))
+                        elif isinstance(_ref, dict):
+                            _keys = [k for k in list(_ref.keys())[:10] if isinstance(k, str)]
+                            logger.info(
+                                "RELPROBE HOLDER dict (depth %d) keys=%s",
+                                _depth,
+                                _keys,
+                            )
+                            _frontier.append((_ref, _depth + 1))
+                        elif isinstance(_ref, _torch.nn.Module):
+                            _frontier.append((_ref, _depth + 1))
+                        else:
+                            logger.info(
+                                "RELPROBE HOLDER obj (depth %d) type=%s",
+                                _depth,
+                                type(_ref).__name__,
+                            )
+                            _frontier.append((_ref, _depth + 1))
+                # --- end referrer walk ---
+    except Exception:
+        logger.exception("RELPROBE failed")
+    # === END RELPROBE ===
 
 
 # GPU-lock timeout for _apply_config_live: long enough for a post-cycle lock
@@ -4745,9 +4905,13 @@ def _apply_config_live() -> dict:
                 )
 
         # ── full live apply: reload model + rebuild all components ────────────
+        # lock_held=True: _apply_config_live holds gpu_lock_sync() (acquired
+        # above at ~4508); the primitive's internal _set_voice_pipeline_profile
+        # calls must not re-acquire the non-reentrant threading.Lock.
         _live_reload_base_model(
             refresh_config_from_disk=True,
             rebuild_session_buffer=_rebuild_session_buf,
+            lock_held=True,
         )
 
         if _state.get("mode") == "local":
@@ -6601,14 +6765,18 @@ async def _run_base_swap_orchestration(
        ``MigrationState.all_tiers_done`` check inside ``migrate()`` catches it
        and the state file stays on disk.
     6. **Post-Phase-B in-process reload** — call
-       ``_live_reload_base_model(refresh_config_from_disk=False)`` so the
-       in-RAM ``model.peft_config`` matches disk.  Phase B's per-tier
-       ``migrate()`` loop leaves the PeftModel mounted in the last tier's
-       transient shape; without this reload, the published
+       ``_live_reload_base_model(refresh_config_from_disk=False)`` to
+       align the in-RAM ``model.peft_config`` with disk.  Phase B's
+       per-tier ``migrate()`` loop leaves the PeftModel mounted in the
+       last tier's transient shape; without this reload, the published
        ``adapter_available`` topology (and recall behaviour) stays stale
-       until the next systemctl restart.  Best-effort: on internal reload
-       failure the server lands in cloud-only with ``cloud_only_reason``
-       set, but the swap is complete on disk so step 7 still fires.
+       until the next systemctl restart.  Voice drain/restore is owned by
+       the primitive: it drains STT/TTS to CPU before its VRAM gate
+       (preventing the ~4.3 GiB voice footprint from blocking the gate on
+       8 GiB hardware) and restores voice to GPU after a successful
+       partial reload.  Best-effort: on internal reload failure the server
+       lands in cloud-only with ``cloud_only_reason`` set, but the swap
+       is complete on disk so step 7 still fires.
     7. **Success** — clear the active-store state file (already done by
        ``migrate()`` on all_tiers_done), clear the trial marker, clear the
        base-swap marker in the in-memory trial stash, set
@@ -7163,13 +7331,22 @@ async def _run_base_swap_orchestration(
         # Drop our locals so they do not pin the old base graph (same pattern
         # as the Phase A → Phase B reload at Step 3).  base_swap_active is
         # still True throughout, so /gpu/release and /gpu/acquire cannot race
-        # us.  If the reload fails internally it leaves the server cloud-only
-        # with cloud_only_reason set; the swap is already complete on disk,
-        # so we still mark status=pass and let the next /gpu/acquire recover.
+        # us.
+        #
+        # Voice drain/restore is owned by _live_reload_base_model: the
+        # primitive drains STT/TTS to CPU before its VRAM gate (preventing
+        # the ~4.3 GiB voice footprint from blocking the gate) and restores
+        # to GPU after a successful partial reload.  This caller does not hold
+        # the GPU lock, so lock_held=False (default) is correct.
+        #
+        # If the reload fails internally it leaves the server cloud-only with
+        # cloud_only_reason set; the swap is already complete on disk, so we
+        # still mark status=pass and let the next /gpu/acquire recover.
         loop_b = None
         bt_b = None
         try:
-            await asyncio.get_running_loop().run_in_executor(None, _live_reload_base_model)
+            _loop = asyncio.get_running_loop()
+            await _loop.run_in_executor(None, _live_reload_base_model)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "base-swap: post-Phase-B live reload raised; weights are on disk "
@@ -11484,8 +11661,16 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
             try:
                 from paramem.server.gpu_lock import gpu_lock
 
+                # lock_held=True: gpu_lock() holds the non-reentrant threading.Lock
+                # across run_in_executor; the primitive's internal
+                # _set_voice_pipeline_profile calls must not re-acquire it.
+                # Use a lambda to bind lock_held so run_in_executor (which takes
+                # positional args only) delivers the keyword argument correctly.
                 async with gpu_lock():
-                    await loop.run_in_executor(None, _live_reload_base_model)
+                    await loop.run_in_executor(
+                        None,
+                        lambda: _live_reload_base_model(lock_held=True),
+                    )
                 if _state.get("mode") != "local":
                     # Reload was declined (insufficient free VRAM) or failed
                     # and self-cleaned — the base model is NOT loaded. Do not
@@ -11500,7 +11685,8 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
                         _state.get("cloud_only_reason"),
                     )
                     continue
-                await loop.run_in_executor(None, _set_voice_pipeline_profile, "gpu")
+                # Voice drain+restore is now owned by _live_reload_base_model
+                # (partial-path success restore runs inside the primitive).
                 _state["last_reclaim_error"] = None
                 logger.info("Auto-reclaim: GPU reclaimed in-process")
                 return

@@ -1059,6 +1059,112 @@ class TestBackgroundTrainerClose:
         bt.close(timeout=5.0)
         bt.close(timeout=5.0)  # must not raise
 
+    def test_release_nulls_model_tokenizer_and_thread(self, tmp_path):
+        """release() stops the worker and drops model/tokenizer/_worker_thread.
+
+        After submit_and_wait the worker is alive.  release() must join the
+        thread (via _stop_callable_worker), null _worker_thread, null model,
+        and null tokenizer so no live attribute retains the base-model reference.
+        """
+        bt = _make_bt_for_close(tmp_path)
+        job_ran = threading.Event()
+
+        def _job():
+            job_ran.set()
+
+        with patch("paramem.server.gpu_lock.gpu_lock_sync", new=_noop_gpu_lock):
+            bt.submit_and_wait(_job)
+
+        assert job_ran.is_set(), "Job must have run before release() is tested"
+        assert bt._worker_thread is not None, "Worker must be alive before release()"
+
+        bt.release()
+
+        assert bt.model is None, "release() must null model"
+        assert bt.tokenizer is None, "release() must null tokenizer"
+        assert bt._worker_thread is None, "release() must null _worker_thread"
+        assert bt._current_job is None, "release() must null _current_job"
+
+    def test_release_on_fresh_trainer_is_noop(self, tmp_path):
+        """release() on a freshly-constructed trainer (no worker started) does not raise."""
+        bt = _make_bt_for_close(tmp_path)
+        assert bt._worker_thread is None
+        bt.release()  # must not raise
+        assert bt.model is None
+        assert bt.tokenizer is None
+        assert bt._worker_thread is None
+
+
+# ---------------------------------------------------------------------------
+# N2b — TestConsolidationLoopRelease
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidationLoopRelease:
+    """ConsolidationLoop.release() drops all base-model references."""
+
+    def test_release_nulls_model_extraction_and_bg_trainer(self):
+        """release() nulls model, tokenizer, _bg_trainer, and extraction.model.
+
+        Uses a bare ConsolidationLoop instance (no __init__) with sentinel
+        objects injected directly, matching the pattern in other bare-loop tests.
+        """
+        from paramem.graph.extraction_pipeline import ExtractionPipeline
+        from paramem.training.consolidation import ConsolidationLoop
+
+        sentinel_model = MagicMock(name="base_model")
+        sentinel_tokenizer = MagicMock(name="tokenizer")
+        sentinel_bt = MagicMock(name="bg_trainer")
+
+        # Build a minimal ExtractionPipeline with the sentinel model.
+        ep = ExtractionPipeline.__new__(ExtractionPipeline)
+        ep.model = sentinel_model
+        ep.tokenizer = sentinel_tokenizer
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = sentinel_model
+        loop.tokenizer = sentinel_tokenizer
+        loop._bg_trainer = sentinel_bt
+        loop.extraction = ep
+
+        loop.release()
+
+        assert loop.model is None, "release() must null loop.model"
+        assert loop.tokenizer is None, "release() must null loop.tokenizer"
+        assert loop._bg_trainer is None, "release() must null loop._bg_trainer"
+        assert loop.extraction is None, "release() must null loop.extraction"
+        # The ExtractionPipeline's own model reference must also be cleared
+        # before the pipeline is dropped.
+        assert ep.model is None, "release() must null extraction.model before clearing extraction"
+
+    def test_release_without_extraction_is_noop(self):
+        """release() tolerates a loop with no extraction attribute."""
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock(name="model")
+        loop.tokenizer = MagicMock(name="tokenizer")
+        loop._bg_trainer = None
+        # No loop.extraction set.
+
+        loop.release()  # must not raise
+
+        assert loop.model is None
+        assert loop.tokenizer is None
+
+    def test_release_is_idempotent(self):
+        """Calling release() twice does not raise."""
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock(name="model")
+        loop.tokenizer = MagicMock(name="tokenizer")
+        loop._bg_trainer = None
+        loop.extraction = None
+
+        loop.release()
+        loop.release()  # must not raise
+
 
 # ---------------------------------------------------------------------------
 # N3 — TestCommitTierSlotCleanup
